@@ -370,18 +370,23 @@ impl ProxyHttp for HydraProxy {
         let (candidates, model_for_route) = match model_opt {
             Some(m) => {
                 let model_key = m;
-                let cands =
-                    match router::resolve(cfg, self.state.breaker.as_ref(), &tenant, &model_key) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            ctx.route_error = Some(e);
-                            ctx.model_key = Some(model_key.clone());
-                            let status = route_error_status(e);
-                            let reason = route_error_reason(e);
-                            crate::admin::metrics::record_route_error(&tenant_id, reason);
-                            return short_circuit(session, status, reason).await;
-                        }
-                    };
+                let cands = match router::resolve(
+                    cfg,
+                    self.state.breaker.as_ref(),
+                    &tenant,
+                    &model_key,
+                    Some(api_key.as_str()),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        ctx.route_error = Some(e);
+                        ctx.model_key = Some(model_key.clone());
+                        let status = route_error_status(e);
+                        let reason = route_error_reason(e);
+                        crate::admin::metrics::record_route_error(&tenant_id, reason);
+                        return short_circuit(session, status, reason).await;
+                    }
+                };
                 (cands, Some(model_key))
             }
             None => {
@@ -393,7 +398,7 @@ impl ProxyHttp for HydraProxy {
                         return short_circuit(session, 400, "no_model_field").await;
                     }
                     config::NonRouteStrategy::Passthrough => {
-                        match passthrough_candidates(cfg, &tenant_id) {
+                        match passthrough_candidates(cfg, &tenant_id, Some(api_key.as_str())) {
                             Some(c) => (c, None),
                             None => {
                                 ctx.route_error = Some(RouteError::NoAvailableProvider);
@@ -953,12 +958,26 @@ async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> Ping
 /// mode passthrough is just a one-element failover loop — no upstream_peer /
 /// retry-buffer machinery.
 ///
+/// The §7.1b binding gate applies: an api-key matching an enabled prefix
+/// binding may only pass through to the bound provider (fail-closed; no match
+/// ⇒ unrestricted).
+///
 /// Returns `None` when no live provider exists (caller maps to 503).
-fn passthrough_candidates(cfg: &ConfigData, tenant_id: &str) -> Option<Vec<Candidate>> {
+fn passthrough_candidates(
+    cfg: &ConfigData,
+    tenant_id: &str,
+    client_api_key: Option<&str>,
+) -> Option<Vec<Candidate>> {
     let providers = cfg.tenant_providers.get(tenant_id)?;
+    let bound = client_api_key.and_then(|k| router::match_key_binding(&cfg.key_prefix_bindings, k));
     let mut pids: Vec<&String> = providers.iter().collect();
     pids.sort(); // deterministic ordering
     for pid in pids {
+        if let Some(b) = bound {
+            if pid != &b.provider_id {
+                continue;
+            }
+        }
         let Some(provider) = cfg.providers.get(pid) else {
             continue;
         };

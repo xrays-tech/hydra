@@ -228,7 +228,7 @@ function confirmDialog({ title = "Are you sure?", message, target, confirmText =
 }
 
 /* ===========================================================================
- * Entity configuration (the 7 CRUD entities)
+ * Entity configuration (the 8 CRUD entities)
  * ======================================================================== */
 const STATUS_OPTS = [
   { value: "1", label: "online" },
@@ -385,6 +385,23 @@ const CRUD = {
       { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
+  "provider-key-bindings": {
+    title: "Key Prefix Bindings", nav: "Key Bindings", icon: "key2", path: "/provider-key-bindings", singular: "binding",
+    desc: "Route gate — client api-keys whose raw value starts with a prefix are pinned to one provider (longest prefix wins, fail-closed).",
+    columns: [
+      { key: "id", label: "ID", mono: true },
+      { key: "key_prefix", label: "Prefix", mono: true },
+      { key: "provider_id", label: "Provider", fk: "providers" },
+      { key: "enabled", label: "Enabled", render: (v) => boolPill(v) },
+    ],
+    fields: [
+      { name: "id", label: "ID", placeholder: "auto if blank" },
+      { name: "key_prefix", label: "Key prefix", required: true, placeholder: "sk_aaa_",
+        tip: "client api-key prefix; e.g. sk_aaa_ → keys starting with sk_aaa_ use this provider" },
+      { name: "provider_id", label: "Provider", type: "select", fk: "providers", required: true },
+      { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
+    ],
+  },
 };
 
 function monoOrAll(v) {
@@ -417,7 +434,7 @@ const CUSTOM = {
 
 /* ordered nav with section dividers */
 const NAV = [
-  { label: "Configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles"] },
+  { label: "Configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
   { label: "Operations", items: ["auth-cache", "breaker", "health"] },
 ];
 function sectionConfig(key) { return CRUD[key] || CUSTOM[key]; }

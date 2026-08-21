@@ -103,7 +103,7 @@ fn resolve_tenant_model_gate_reject() {
     let cfg = base_cfg();
     let tenant = tenant();
     let b = alive_breaker();
-    let err = resolve(&cfg, &b, &tenant, "claude").unwrap_err();
+    let err = resolve(&cfg, &b, &tenant, "claude", None).unwrap_err();
     assert_eq!(err, RouteError::ModelNotAllowed);
 }
 
@@ -125,15 +125,16 @@ fn resolve_tenant_model_gate_default_open() {
     let tenant = tenant();
     let b = alive_breaker();
     assert_eq!(
-        resolve(&cfg, &b, &tenant, "gpt-5").unwrap_err(),
+        resolve(&cfg, &b, &tenant, "gpt-5", None).unwrap_err(),
         RouteError::ModelNotAllowed
     );
     // Drop the mapping → default-open: gpt-5 now resolves.
     cfg.tenant_models.remove("t_acme");
-    let cands = resolve(&cfg, &b, &tenant, "gpt-5").expect("no mapping → all models allowed");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-5", None).expect("no mapping → all models allowed");
     assert!(!cands.is_empty());
     // And the previously-whitelisted model still resolves.
-    let cands2 = resolve(&cfg, &b, &tenant, "gpt-4o").expect("no mapping → all models allowed");
+    let cands2 =
+        resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("no mapping → all models allowed");
     assert!(!cands2.is_empty());
 }
 
@@ -143,7 +144,7 @@ fn resolve_tenant_model_gate_pass() {
     let cfg = base_cfg();
     let tenant = tenant();
     let b = alive_breaker();
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("gate passes → resolves");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("gate passes → resolves");
     assert!(!cands.is_empty());
 }
 
@@ -159,7 +160,7 @@ fn resolve_model_not_found() {
         .insert("gpt-5".into());
     let tenant = tenant();
     let b = alive_breaker();
-    let err = resolve(&cfg, &b, &tenant, "gpt-5").unwrap_err();
+    let err = resolve(&cfg, &b, &tenant, "gpt-5", None).unwrap_err();
     assert_eq!(err, RouteError::ModelNotFound);
 }
 
@@ -170,7 +171,7 @@ fn resolve_tenant_no_providers() {
     cfg.tenant_providers.remove("t_acme");
     let tenant = tenant();
     let b = alive_breaker();
-    let err = resolve(&cfg, &b, &tenant, "gpt-4o").unwrap_err();
+    let err = resolve(&cfg, &b, &tenant, "gpt-4o", None).unwrap_err();
     assert_eq!(err, RouteError::TenantForbidden);
 }
 
@@ -184,7 +185,7 @@ fn resolve_intersection_empty() {
         .insert("t_acme".into(), HashSet::from(["p_d".into()]));
     let tenant = tenant();
     let b = alive_breaker();
-    let err = resolve(&cfg, &b, &tenant, "gpt-4o").unwrap_err();
+    let err = resolve(&cfg, &b, &tenant, "gpt-4o", None).unwrap_err();
     assert_eq!(err, RouteError::NoAvailableProvider);
 }
 
@@ -199,7 +200,7 @@ fn resolve_intersection_subset() {
     );
     let tenant = tenant();
     let b = alive_breaker();
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("non-empty intersection");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("non-empty intersection");
     // model ∈ {a,b,c} ∩ tenant {b,c,d} = {b,c}
     assert_eq!(
         resolve_set(&cands),
@@ -216,7 +217,7 @@ fn resolve_filter_no_keys() {
     cfg.provider_keys.remove("p_a"); // p_a now keyless
     let tenant = tenant();
     let b = alive_breaker();
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("p_b,p_c still have keys");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("p_b,p_c still have keys");
     assert_eq!(
         resolve_set(&cands),
         HashSet::from(["p_b".into(), "p_c".into()]),
@@ -226,7 +227,7 @@ fn resolve_filter_no_keys() {
     // (b) every candidate keyless ⇒ error.
     let mut cfg2 = base_cfg();
     cfg2.provider_keys.clear();
-    let err = resolve(&cfg2, &b, &tenant, "gpt-4o").unwrap_err();
+    let err = resolve(&cfg2, &b, &tenant, "gpt-4o", None).unwrap_err();
     assert_eq!(err, RouteError::NoAvailableProvider);
 }
 
@@ -237,7 +238,7 @@ fn resolve_filter_weight_zero() {
     cfg.providers.insert("p_a".into(), provider("p_a", 0)); // soft-disabled
     let tenant = tenant();
     let b = alive_breaker();
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("p_b,p_c remain");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("p_b,p_c remain");
     assert_eq!(
         resolve_set(&cands),
         HashSet::from(["p_b".into(), "p_c".into()]),
@@ -251,7 +252,7 @@ fn resolve_filter_breaker_dead() {
     let cfg = base_cfg();
     let tenant = tenant();
     let b = breaker_with_dead("p_a");
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("p_b,p_c remain");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("p_b,p_c remain");
     assert_eq!(
         resolve_set(&cands),
         HashSet::from(["p_b".into(), "p_c".into()]),
@@ -270,7 +271,7 @@ fn resolve_all_filtered() {
     b.on_failure("p_a");
     b.on_failure("p_b");
     b.on_failure("p_c");
-    let err = resolve(&cfg, &b, &tenant, "gpt-4o").unwrap_err();
+    let err = resolve(&cfg, &b, &tenant, "gpt-4o", None).unwrap_err();
     assert_eq!(err, RouteError::NoAvailableProvider);
 }
 
@@ -303,7 +304,7 @@ fn resolve_ok_returns_candidates_with_weight() {
     );
     let tenant = tenant();
     let b = alive_breaker();
-    let cands = resolve(&cfg, &b, &tenant, "gpt-4o").expect("full resolve");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("full resolve");
 
     assert_eq!(cands.len(), 3, "all three survive");
     // The returned slice is sorted by provider_id for determinism.
@@ -319,4 +320,98 @@ fn resolve_ok_returns_candidates_with_weight() {
     assert_eq!(by_id.get("p_c").copied(), Some(1));
     // Endpoints carried through from the provider snapshot.
     assert_eq!(cands[0].endpoint, "https://p_a.example.com");
+}
+
+fn binding(
+    id: &str,
+    prefix: &str,
+    provider_id: &str,
+    enabled: bool,
+) -> hydra_core::model::ProviderKeyBinding {
+    hydra_core::model::ProviderKeyBinding {
+        id: id.into(),
+        key_prefix: prefix.into(),
+        provider_id: provider_id.into(),
+        enabled,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    }
+}
+
+/// T2.12 — an api-key matching an enabled prefix binding restricts the
+/// candidate set to the bound provider.
+#[test]
+fn resolve_key_binding_restricts() {
+    let mut cfg = base_cfg();
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", Some("sk_aaa_123")).expect("bound provider");
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_a".into()]));
+}
+
+/// T2.13 — longest prefix wins when several enabled bindings match.
+#[test]
+fn resolve_key_binding_longest_prefix_wins() {
+    let mut cfg = base_cfg();
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_", "p_a", true));
+    cfg.key_prefix_bindings
+        .push(binding("b2", "sk_aaa_", "p_b", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands =
+        resolve(&cfg, &b, &tenant, "gpt-4o", Some("sk_aaa_123")).expect("longest prefix p_b");
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_b".into()]));
+}
+
+/// T2.14 — disabled bindings never match (no restriction).
+#[test]
+fn resolve_key_binding_disabled_ignored() {
+    let mut cfg = base_cfg();
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", false));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", Some("sk_aaa_123")).expect("no restriction");
+    assert_eq!(
+        resolve_set(&cands),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()])
+    );
+}
+
+/// T2.15 — fail-closed: the bound provider is not in the eligible set ⇒ error.
+#[test]
+fn resolve_key_binding_bound_provider_ineligible() {
+    let mut cfg = base_cfg();
+    // p_a serves gpt-4o but is NOT in the tenant's authorised provider set.
+    cfg.tenant_providers
+        .insert("t_acme".into(), HashSet::from(["p_b".into(), "p_c".into()]));
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let err = resolve(&cfg, &b, &tenant, "gpt-4o", Some("sk_aaa_123")).unwrap_err();
+    assert_eq!(err, RouteError::NoAvailableProvider);
+}
+
+/// T2.16 — no matching prefix (or None api-key) ⇒ no restriction.
+#[test]
+fn resolve_key_binding_no_match_no_restriction() {
+    let mut cfg = base_cfg();
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", Some("hk_bbb_1")).expect("no match");
+    assert_eq!(
+        resolve_set(&cands),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()])
+    );
+    let cands2 = resolve(&cfg, &b, &tenant, "gpt-4o", None).expect("None → no restriction");
+    assert_eq!(
+        resolve_set(&cands2),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()])
+    );
 }

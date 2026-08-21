@@ -153,4 +153,22 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'model_key', kind: 'string', flag: '--model-key <key>', help: 'Model key', required: true },
     ],
   },
+  {
+    route: 'provider-key-bindings',
+    command: 'provider-key-bindings',
+    label: 'key-prefix binding',
+    labelPlural: 'key-prefix bindings',
+    columns: [
+      { field: 'id', header: 'ID', width: 18 },
+      { field: 'key_prefix', header: 'PREFIX', width: 24 },
+      { field: 'provider_id', header: 'PROVIDER', width: 18 },
+      { field: 'enabled', header: 'ENABLED', width: 8 },
+    ],
+    fields: [
+      { field: 'id', kind: 'string', flag: '--id <id>', help: 'Binding id', required: true },
+      { field: 'key_prefix', kind: 'string', flag: '--key-prefix <prefix>', help: 'Client api-key prefix', required: true },
+      { field: 'provider_id', kind: 'string', flag: '--provider-id <id>', help: 'Provider id', required: true },
+      { field: 'enabled', kind: 'boolean', flag: '--enabled', falseFlag: '--disabled', help: 'Enable (--enabled) or disable (--disabled)', default: true },
+    ],
+  },
 ];

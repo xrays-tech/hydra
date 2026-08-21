@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
-use hydra_core::model::LimitRole;
+use hydra_core::model::{LimitRole, ProviderKeyBinding};
 use hydra_core::swrr::SwrrState;
 
 use crate::crypto::KeyProvider;
@@ -134,6 +134,13 @@ pub async fn build_config(
         .filter(|r| r.enabled)
         .collect();
 
+    // provider_key_bindings: only enabled bindings participate (design §7.1b).
+    let key_prefix_bindings: Vec<ProviderKeyBinding> = db::list_provider_key_bindings(pool)
+        .await?
+        .into_iter()
+        .filter(|b| b.enabled)
+        .collect();
+
     let cfg = ConfigData {
         tenants_by_domain,
         models_by_key,
@@ -142,6 +149,7 @@ pub async fn build_config(
         providers,
         provider_keys,
         limit_roles,
+        key_prefix_bindings,
         certs,
     };
 

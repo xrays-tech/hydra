@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use http::Response;
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
+    TenantProvider,
 };
 use pingora_core::protocols::http::ServerSession;
 use serde::{Deserialize, Serialize};
@@ -735,6 +736,110 @@ pub(super) async fn limit_role_item(
             }
         }
         "DELETE" => match crate::db::delete_limit_role(&state.pool, id).await {
+            Ok(()) => {
+                reload_best_effort(state, trace_id).await;
+                empty(204)
+            }
+            Err(e) => db_err_resp(e, trace_id),
+        },
+        _ => method_not_allowed(trace_id),
+    }
+}
+
+// ===========================================================================
+// Provider key bindings (design §7.1b)
+// ===========================================================================
+
+pub(super) async fn provider_key_binding_collection(
+    state: &AdminState,
+    session: &mut ServerSession,
+    method: &str,
+    trace_id: &str,
+) -> Resp {
+    if method == "GET" {
+        match crate::db::list_provider_key_bindings(&state.pool).await {
+            Ok(rows) => ok_json(200, &rows),
+            Err(e) => db_err_resp(e, trace_id),
+        }
+    } else if method == "POST" {
+        let body = read_body(session).await;
+        let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
+        if b.key_prefix.trim().is_empty() {
+            return err_json(
+                400,
+                "empty_key_prefix",
+                "key_prefix must be a non-empty string",
+                trace_id,
+            );
+        }
+        if b.id.is_empty() {
+            b.id = gen_id();
+        }
+        let ts = now_ts();
+        if b.created_at.is_empty() {
+            b.created_at = ts.clone();
+        }
+        if b.updated_at.is_empty() {
+            b.updated_at = ts;
+        }
+        match crate::db::insert_provider_key_binding(&state.pool, &b).await {
+            Ok(()) => {}
+            Err(e) => return db_err_resp(e, trace_id),
+        }
+        reload_best_effort(state, trace_id).await;
+        ok_json(201, &b)
+    } else {
+        method_not_allowed(trace_id)
+    }
+}
+
+pub(super) async fn provider_key_binding_item(
+    state: &AdminState,
+    session: &mut ServerSession,
+    method: &str,
+    id: &str,
+    trace_id: &str,
+) -> Resp {
+    match method {
+        "GET" => match crate::db::get_provider_key_binding(&state.pool, id).await {
+            Ok(b) => ok_json(200, &b),
+            Err(e) if is_not_found(&e) => {
+                err_json(404, "not_found", "provider_key_binding not found", trace_id)
+            }
+            Err(e) => db_err_resp(e, trace_id),
+        },
+        "PUT" => {
+            let body = read_body(session).await;
+            let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
+                Ok(b) => b,
+                Err(resp) => return resp,
+            };
+            if b.key_prefix.trim().is_empty() {
+                return err_json(
+                    400,
+                    "empty_key_prefix",
+                    "key_prefix must be a non-empty string",
+                    trace_id,
+                );
+            }
+            b.id = id.to_string();
+            b.updated_at = now_ts();
+            match crate::db::update_provider_key_binding(&state.pool, &b).await {
+                Ok(()) => {}
+                Err(e) => return db_err_resp(e, trace_id),
+            }
+            match crate::db::get_provider_key_binding(&state.pool, id).await {
+                Ok(b) => {
+                    reload_best_effort(state, trace_id).await;
+                    ok_json(200, &b)
+                }
+                Err(_) => err_json(404, "not_found", "provider_key_binding not found", trace_id),
+            }
+        }
+        "DELETE" => match crate::db::delete_provider_key_binding(&state.pool, id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)

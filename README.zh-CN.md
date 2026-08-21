@@ -19,7 +19,7 @@
 | ⏱️ | **~0.3 ms** 单请求网关开销 | 相对 LLM 延迟可忽略 |
 | 🛡️ | **0** 处生产 `unwrap`/`panic`/`unsafe` | 两个 crate 均 `#![forbid(unsafe_code)]` |
 | 🔐 | provider 密钥 **AES-256-GCM** 落库加密 | fail-closed 启动；管理面永不返回明文 |
-| 🧪 | **core 106 + server 163** 测试，`clippy -D warnings` 干净 | CI 硬门禁 |
+| 🧪 | **core 114 + server 173** 测试，`clippy -D warnings` 干净 | CI 硬门禁 |
 
 **生产就绪度：9.2 / 10** —— 完整[评测报告](docs/evaluation-report.html)。
 
@@ -41,6 +41,7 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 
 - **终止模式代理（Terminate-in-Pingora）**：在 `request_filter` 内读取完整请求体（model 提取适用于任意位置/schema，不再受首 chunk 限制）；通过专用 reqwest client 调用供应商；SSE 响应经 Pingora session 流式回写。返回 `Ok(true)`，Pingora 不拨号 upstream。
 - **路由**：模型名 → 供应商 ∩ 租户授权供应商；平滑加权轮询（Nginx SWRR）。
+- **api-key 前缀绑定闸门**：按原始前缀把客户端 api-key 固定到指定供应商（`sk_aaa_*` → Provider A）；最长前缀优先，fail-closed（绑定供应商不可用 ⇒ 503，绝不回落）。
 - **外部认证**：每个租户配置自己的 `auth_url`；Hydra 缓存判定 5 分钟，并提供失效接口（欠费/封禁由租户自决）。
 - **故障转移 + 熔断**：failover 循环依次尝试每个候选供应商；连续失败触发 dead-set，后台探活恢复。全 body 重放 O(1)。
 - **限流**：内存滑动窗口（请求数 + token），按角色，m/h/d 窗口。

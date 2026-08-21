@@ -20,8 +20,8 @@ HYDRA_DB_URL=sqlite:hydra.db?mode=rwc  ./target/release/hydra     # or ~/.cargo/
 # (note: this project's shell wrapper `rtk` uses a global target dir at ~/.cargo/global-target)
 
 # Test (offline sqlx cache — no DATABASE_URL needed)
-SQLX_OFFLINE=true cargo test -p hydra-core                       # 101 tests
-SQLX_OFFLINE=true cargo test -p hydra-server --features server   # 159 tests
+SQLX_OFFLINE=true cargo test -p hydra-core                       # 114 tests
+SQLX_OFFLINE=true cargo test -p hydra-server --features server   # 173 tests
 SQLX_OFFLINE=true cargo clippy --features server --workspace --all-targets -- -D warnings
 ```
 

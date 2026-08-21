@@ -104,6 +104,28 @@ pub struct TenantModel {
 }
 
 // ---------------------------------------------------------------------------
+// Key-prefix binding（路由闸门, design §7.1b）
+// ---------------------------------------------------------------------------
+
+/// An api-key-prefix → provider binding (routing gate, design §7.1b).
+///
+/// When a client api-key's raw value starts with `key_prefix`, the routing
+/// candidate set is restricted to `provider_id` (fail-closed; longest prefix
+/// wins when several prefixes match). Only `enabled == true` rows are loaded
+/// into `ConfigData::key_prefix_bindings` (mirrors `LimitRole`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderKeyBinding {
+    pub id: String,
+    /// Client api-key prefix, e.g. `sk_aaa_`. Empty prefixes are invalid
+    /// (rejected at the admin handler, warned by `config::validate`).
+    pub key_prefix: String,
+    pub provider_id: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ---------------------------------------------------------------------------
 // Limiting
 // ---------------------------------------------------------------------------
 

@@ -374,10 +374,7 @@ impl AuthChecker for HttpAuthChecker {
                     // denial (cached with deny_ttl); any other 2xx body —
                     // `{"status":true}`, `{"allowed":true,"expires_in":60}`,
                     // empty, unparseable — stays an allow.
-                    let text = match resp.text().await {
-                        Ok(t) => t,
-                        Err(_) => String::new(),
-                    };
+                    let text = resp.text().await.unwrap_or_default();
                     if body_says_denied(&text) {
                         cache.set(&tenant_id, &api_key_owned, false, deny_ttl);
                         return AuthVerdict::Denied {

@@ -25,7 +25,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::SqlitePool;
 
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
+    TenantProvider,
 };
 
 use crate::crypto::{self, CryptoError, KeyProvider, Sealed};
@@ -276,6 +277,29 @@ impl From<LimitRoleRow> for LimitRole {
             window: r.window,
             enabled: r.enabled != 0,
             created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct ProviderKeyBindingRow {
+    id: String,
+    key_prefix: String,
+    provider_id: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<ProviderKeyBindingRow> for ProviderKeyBinding {
+    fn from(r: ProviderKeyBindingRow) -> Self {
+        ProviderKeyBinding {
+            id: r.id,
+            key_prefix: r.key_prefix,
+            provider_id: r.provider_id,
+            enabled: r.enabled != 0,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }
@@ -785,6 +809,85 @@ pub async fn update_limit_role(pool: &SqlitePool, r: &LimitRole) -> Result<(), s
 
 pub async fn delete_limit_role(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query!("DELETE FROM limit_role WHERE id = ?", id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CRUD — provider_key_binding (design §7.1b)
+// ---------------------------------------------------------------------------
+
+/// Insert a binding. Violating the UNIQUE `key_prefix` constraint returns a
+/// sqlx UNIQUE violation (→ 409 by the admin layer).
+pub async fn insert_provider_key_binding(
+    pool: &SqlitePool,
+    b: &ProviderKeyBinding,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "INSERT INTO provider_key_binding (id, key_prefix, provider_id, enabled, created_at, \
+         updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        b.id,
+        b.key_prefix,
+        b.provider_id,
+        b.enabled,
+        b.created_at,
+        b.updated_at
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_provider_key_binding(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<ProviderKeyBinding, sqlx::Error> {
+    let row = sqlx::query_as!(
+        ProviderKeyBindingRow,
+        r#"SELECT id as "id!", key_prefix, provider_id, enabled, created_at, updated_at
+           FROM provider_key_binding WHERE id = ?"#,
+        id
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.into())
+}
+
+pub async fn list_provider_key_bindings(
+    pool: &SqlitePool,
+) -> Result<Vec<ProviderKeyBinding>, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        ProviderKeyBindingRow,
+        r#"SELECT id as "id!", key_prefix, provider_id, enabled, created_at, updated_at
+           FROM provider_key_binding ORDER BY key_prefix"#
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Update a binding's mutable fields (prefix / provider / enabled).
+pub async fn update_provider_key_binding(
+    pool: &SqlitePool,
+    b: &ProviderKeyBinding,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "UPDATE provider_key_binding SET key_prefix = ?, provider_id = ?, enabled = ?, \
+         updated_at = ? WHERE id = ?",
+        b.key_prefix,
+        b.provider_id,
+        b.enabled,
+        b.updated_at,
+        b.id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_provider_key_binding(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query!("DELETE FROM provider_key_binding WHERE id = ?", id)
         .execute(pool)
         .await?;
     Ok(())

@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{LimitRole, Provider, Tenant};
+use crate::model::{LimitRole, Provider, ProviderKeyBinding, Tenant};
 
 /// In-memory configuration snapshot. All indexes are built once at load time
 /// and read lock-free thereafter (the server holds it inside `ArcSwap`).
@@ -56,6 +56,11 @@ pub struct ConfigData {
 
     /// Enabled limit roles (priority order decided by the loader).
     pub limit_roles: Vec<LimitRole>,
+
+    /// Enabled api-key-prefix → provider bindings (design §7.1b; only
+    /// `enabled == true` rows, like `limit_roles`). Matching is longest-prefix
+    /// wins; see [`crate::router::match_key_binding`].
+    pub key_prefix_bindings: Vec<ProviderKeyBinding>,
 
     /// `domain` → certificate metadata. Plain value here (see module docs);
     /// W1–W2 carries `CertMeta`, W4 resolves to a parsed `ResolvedCert` on the
@@ -231,6 +236,22 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
             issues.push(ValidationIssue::warn(format!(
                 "limit_role '{}' has both limit_count and limit_token NULL",
                 role.id
+            )));
+        }
+    }
+
+    // provider_key_bindings → prefix non-empty + provider must exist.
+    for b in &cfg.key_prefix_bindings {
+        if b.key_prefix.is_empty() {
+            issues.push(ValidationIssue::warn(format!(
+                "provider_key_binding '{}' has an empty key_prefix; it can never match",
+                b.id
+            )));
+        }
+        if !cfg.providers.contains_key(&b.provider_id) {
+            issues.push(ValidationIssue::warn(format!(
+                "provider_key_binding '{}' references unknown provider_id '{}'",
+                b.id, b.provider_id
             )));
         }
     }

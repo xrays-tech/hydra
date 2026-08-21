@@ -19,7 +19,7 @@
 | ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency |
 | 🛡️ | **0** production `unwrap`/`panic`/`unsafe` | both crates `#![forbid(unsafe_code)]` |
 | 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
-| 🧪 | **core 106 + server 163** tests, `clippy -D warnings` clean | CI hard gate |
+| 🧪 | **core 114 + server 173** tests, `clippy -D warnings` clean | CI hard gate |
 
 **Production-readiness: 9.2 / 10** — see the [full report](docs/evaluation-report.html).
 
@@ -42,6 +42,7 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 - **Terminate-mode proxy**: reads the full request body in `request_filter` (model extraction works for ANY position/schema — no first-chunk peeking); calls the provider via a dedicated reqwest client; streams the SSE response back through Pingora's session writer. Returns `Ok(true)` so Pingora never dials upstream.
 - **Two client protocols, format-homogeneous**: accept OpenAI (`POST /v1/chat/completions`) **and** Anthropic (`POST /v1/messages`). The path you call selects the format end-to-end — the upstream URL, request body, and usage parser all match (no OpenAI↔Anthropic conversion). `UsageScanner` picks `ProviderKind::Anthropic` for `/v1/messages` (parses `input_tokens`/`output_tokens`/`cache_read_input_tokens`), `Generic` otherwise.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
+- **Key-prefix binding gate**: pin client api-keys by raw prefix to one provider (`sk_aaa_*` → Provider A); longest prefix wins, fail-closed (bound provider unavailable ⇒ 503, never falls back).
 - **External auth**: each tenant points to its own `auth_url`; Hydra caches verdicts 5 min and exposes an invalidation endpoint (the tenant decides欠费/封禁).
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.

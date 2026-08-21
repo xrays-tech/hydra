@@ -357,3 +357,30 @@ async fn loader_excludes_disabled_limit_roles() {
     assert_eq!(cfg.limit_roles.len(), 1);
     assert_eq!(cfg.limit_roles[0].id, "lr_on");
 }
+
+#[tokio::test]
+async fn load_key_prefix_bindings_enabled_only() {
+    let pool = common::setup_pool().await;
+    seed(&pool).await;
+    let mk = |id: &str, prefix: &str, provider_id: &str, enabled: bool| {
+        hydra_core::model::ProviderKeyBinding {
+            id: id.into(),
+            key_prefix: prefix.into(),
+            provider_id: provider_id.into(),
+            enabled,
+            created_at: now().into(),
+            updated_at: now().into(),
+        }
+    };
+    repo::insert_provider_key_binding(&pool, &mk("b1", "sk_aaa_", "p1", true))
+        .await
+        .expect("b1");
+    repo::insert_provider_key_binding(&pool, &mk("b2", "hk_", "p2", false))
+        .await
+        .expect("b2");
+
+    let cfg = build_config(&pool, &kp()).await.expect("build_config");
+    assert_eq!(cfg.key_prefix_bindings.len(), 1, "only enabled rows load");
+    assert_eq!(cfg.key_prefix_bindings[0].id, "b1");
+    assert_eq!(cfg.key_prefix_bindings[0].provider_id, "p1");
+}

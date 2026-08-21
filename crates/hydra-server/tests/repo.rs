@@ -573,3 +573,50 @@ async fn provider_key_encrypted_at_rest() {
         "wrong master key must fail to decrypt"
     );
 }
+
+/// T4.10 — provider_key_binding CRUD round-trip + CASCADE with its provider.
+#[tokio::test]
+async fn provider_key_binding_crud() {
+    let pool = common::setup_pool().await;
+    repo::insert_provider(&pool, &provider("p1", "openai", 1))
+        .await
+        .expect("seed provider");
+
+    let b = hydra_core::model::ProviderKeyBinding {
+        id: "b1".into(),
+        key_prefix: "sk_aaa_".into(),
+        provider_id: "p1".into(),
+        enabled: true,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    repo::insert_provider_key_binding(&pool, &b)
+        .await
+        .expect("insert");
+    assert_eq!(
+        repo::get_provider_key_binding(&pool, "b1").await.unwrap(),
+        b
+    );
+
+    let mut upd = b.clone();
+    upd.key_prefix = "hk_bbb_".into();
+    upd.enabled = false;
+    repo::update_provider_key_binding(&pool, &upd)
+        .await
+        .expect("update");
+    assert_eq!(
+        repo::get_provider_key_binding(&pool, "b1").await.unwrap(),
+        upd
+    );
+
+    let all = repo::list_provider_key_bindings(&pool).await.expect("list");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].key_prefix, "hk_bbb_");
+
+    // CASCADE: deleting the provider removes its binding.
+    repo::delete_provider(&pool, "p1").await.expect("delete p1");
+    assert!(
+        repo::get_provider_key_binding(&pool, "b1").await.is_err(),
+        "binding must be CASCADE-deleted with its provider"
+    );
+}

@@ -22,6 +22,9 @@
 //! 2. **Tenant providers** — the tenant's authorised provider set (fail-closed:
 //!    absent ⇒ [`RouteError::TenantForbidden`]).
 //! 3. **Intersection** of (1) and (2); empty ⇒ [`RouteError::NoAvailableProvider`].
+//!    - **Key-prefix binding gate** — a client api-key matching an enabled
+//!      prefix binding restricts the set to the bound provider (fail-closed;
+//!      longest prefix wins; no match ⇒ no restriction).
 //! 4. **Filter** — drop dead (`breaker.is_dead`), keyless (no api-keys), and
 //!    soft-disabled (`weight <= 0`); empty ⇒ [`RouteError::NoAvailableProvider`].
 //! 5. **Order** — the returned candidates are sorted by `provider_id` for a
@@ -33,9 +36,23 @@ use std::collections::HashSet;
 
 use crate::breaker::BreakerView;
 use crate::config::ConfigData;
-use crate::model::Tenant;
+use crate::model::{ProviderKeyBinding, Tenant};
 
 pub use crate::model::{Candidate, RouteError};
+
+/// Longest-prefix match of a client api-key against the enabled prefix
+/// bindings (design §7.1b). Returns the binding with the longest `key_prefix`
+/// that `api_key` starts with; `None` when no enabled binding matches
+/// (⇒ no routing restriction).
+pub fn match_key_binding<'a>(
+    bindings: &'a [ProviderKeyBinding],
+    api_key: &str,
+) -> Option<&'a ProviderKeyBinding> {
+    bindings
+        .iter()
+        .filter(|b| b.enabled && api_key.starts_with(&b.key_prefix))
+        .max_by_key(|b| b.key_prefix.len())
+}
 
 /// Resolve the candidate set for one `(tenant, model_key)` request.
 ///
@@ -43,11 +60,15 @@ pub use crate::model::{Candidate, RouteError};
 /// `provider_id` (deterministic regardless of `HashSet` iteration order); the
 /// caller then applies [`crate::swrr::order`] with its own per-`(tenant, model)`
 /// state to pick the first attempt and order failover.
+///
+/// `client_api_key` feeds the §7.1b key-prefix binding gate; `None` (or no
+/// matching binding) leaves the candidate set unrestricted.
 pub fn resolve(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
     tenant: &Tenant,
     model_key: &str,
+    client_api_key: Option<&str>,
 ) -> Result<Vec<Candidate>, RouteError> {
     // (0) TenantModel access gate (design §7.1, revised — default-open): a
     // tenant with NO `tenant_models` mapping is unrestricted (all models
@@ -77,9 +98,22 @@ pub fn resolve(
         .ok_or(RouteError::TenantForbidden)?;
 
     // (3) Intersection.
-    let intersection: Vec<String> = by_model.intersection(tenant_ok).cloned().collect();
+    let mut intersection: Vec<String> = by_model.intersection(tenant_ok).cloned().collect();
     if intersection.is_empty() {
         return Err(RouteError::NoAvailableProvider);
+    }
+
+    // (3.5) Key-prefix binding gate (design §7.1b): a client api-key whose raw
+    // value matches an enabled prefix binding restricts the candidate set to
+    // the bound provider — fail-closed (never falls back to unbound
+    // providers). Longest prefix wins; no match ⇒ no restriction.
+    if let Some(api_key) = client_api_key {
+        if let Some(binding) = match_key_binding(&cfg.key_prefix_bindings, api_key) {
+            intersection.retain(|pid| pid == &binding.provider_id);
+            if intersection.is_empty() {
+                return Err(RouteError::NoAvailableProvider);
+            }
+        }
     }
 
     // (4) Filter: not dead, has ≥1 api-key, weight > 0.

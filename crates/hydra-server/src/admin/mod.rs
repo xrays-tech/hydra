@@ -237,6 +237,12 @@ impl AdminService {
             ("limit-roles", Some(id)) => {
                 handlers::limit_role_item(state, session, method, id, trace_id).await
             }
+            ("provider-key-bindings", None) => {
+                handlers::provider_key_binding_collection(state, session, method, trace_id).await
+            }
+            ("provider-key-bindings", Some(id)) => {
+                handlers::provider_key_binding_item(state, session, method, id, trace_id).await
+            }
             _ => handlers::err_json(404, "not_found", "unknown path", trace_id),
         }
     }

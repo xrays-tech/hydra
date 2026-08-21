@@ -320,6 +320,16 @@ CREATE TABLE limit_role (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- api-key 前缀 → provider 绑定（§7.1b 路由闸门）
+CREATE TABLE provider_key_binding (
+    id          TEXT PRIMARY KEY,
+    key_prefix  TEXT NOT NULL UNIQUE,          -- 客户端 api-key 前缀，如 'sk_aaa_'
+    provider_id TEXT NOT NULL REFERENCES provider(id) ON DELETE CASCADE,
+    enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 用量记录（默认 SQLite Sink）。token 列为 provider-中性命名（§9.5）：
 --   tokens_in        请求发送的 token 数（含缓存命中；OpenAI prompt_tokens /
 --                    Anthropic input_tokens）
@@ -720,6 +730,25 @@ pub fn resolve(
     Ok(cands)
 }
 ```
+
+### 7.1b api-key 前缀绑定闸门（provider_key_binding）
+
+新增 `provider_key_binding` 表（§4.1）：`key_prefix`（UNIQUE）→ `provider_id`。
+
+- **匹配**：客户端 api-key（Authorization Bearer / x-api-key 的**原始值**）以某条
+  `enabled=1` 的 `key_prefix` 开头 ⇒ 候选集被限制为该 provider；
+- **最长前缀优先**：多条前缀同时命中时取 `key_prefix` 最长者（最具体）；
+- **fail-closed**：绑定的 provider 不在候选集（不提供该模型 / 未被租户授权 /
+  熔断 / 软禁用）⇒ `503 NoAvailableProvider`，绝不回落其他后端；
+- **无命中** ⇒ 不限制（保持 §7.1 现有语义）；
+- **passthrough**（无 model 字段）同样受闸门约束，只允许命中绑定的 provider；
+- **管理面**：`/api/v1/provider-key-bindings` CRUD（§13.2 模式），写后热加载；
+- **隐私**：仅对原始 key 做前缀比较，key 明文不落库、不进日志（与 §16.4 一致）；
+- loader 只加载 `enabled=1` 的行（与 limit_role 同约定）；`config::validate`
+  对空前缀 / 未知 provider 告警（Warn）。
+
+对应纯实现位于 `crates/hydra-core/src/router.rs`：`match_key_binding`（最长前缀
+匹配）+ `resolve` 候选计算 step 3.5（交集之后、过滤之前）。
 
 ### 7.2 加权 Round Robin（Nginx SWRR）
 

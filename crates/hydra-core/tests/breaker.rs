@@ -140,7 +140,7 @@ fn breaker_dead_view_filtered_by_resolve() {
     assert!(b.is_dead("p_a"));
 
     let view: &dyn BreakerView = &b;
-    let cands = resolve(&cfg, view, &tenant, "gpt-4o").expect("p_b still alive");
+    let cands = resolve(&cfg, view, &tenant, "gpt-4o", None).expect("p_b still alive");
     let ids: HashSet<&str> = cands.iter().map(|c| c.provider_id.as_str()).collect();
     assert_eq!(
         ids,

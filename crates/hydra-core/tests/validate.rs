@@ -280,7 +280,45 @@ fn validate_empty_config_is_clean() {
         providers: HashMap::new(),
         provider_keys: HashMap::new(),
         limit_roles: Vec::new(),
+        key_prefix_bindings: Vec::new(),
         certs: HashMap::new(),
     };
     assert!(validate(&cfg).is_empty());
+}
+
+fn binding(id: &str, prefix: &str, provider_id: &str) -> hydra_core::model::ProviderKeyBinding {
+    hydra_core::model::ProviderKeyBinding {
+        id: id.into(),
+        key_prefix: prefix.into(),
+        provider_id: provider_id.into(),
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    }
+}
+
+/// T9.8 — provider_key_binding references an unknown provider ⇒ Warn.
+#[test]
+fn validate_binding_unknown_provider() {
+    let mut cfg = clean_config();
+    cfg.key_prefix_bindings.push(binding("b1", "sk_", "ghost"));
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns
+            .iter()
+            .any(|m| m.contains("ghost") && m.contains("provider_key_binding")),
+        "expected a dangling-provider warning, got {warns:?}"
+    );
+}
+
+/// T9.9 — provider_key_binding with an empty prefix ⇒ Warn.
+#[test]
+fn validate_binding_empty_prefix() {
+    let mut cfg = clean_config();
+    cfg.key_prefix_bindings.push(binding("b1", "", "p1"));
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns.iter().any(|m| m.contains("empty key_prefix")),
+        "expected an empty-prefix warning, got {warns:?}"
+    );
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM provider_key_binding WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "932e30f4a0c47e7f25ad8fe4fae90fb564fec54bd4835648150ac48033bb4f4c"
+}

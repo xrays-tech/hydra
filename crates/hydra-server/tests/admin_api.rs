@@ -1009,3 +1009,143 @@ async fn concurrency_snapshot_requires_admin_token() {
     .await;
     assert_eq!(r.status(), 401);
 }
+
+#[tokio::test]
+async fn provider_key_bindings_crud_http() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // Seed a provider so the FK holds.
+    let p = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let _ = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(p),
+    )
+    .await;
+
+    // Create → 201.
+    let b = r#"{"id":"b1","key_prefix":"sk_aaa_","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(b),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let created: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(created["key_prefix"], "sk_aaa_");
+
+    // Hot reload: the in-memory snapshot now carries the enabled binding.
+    let snap = state.store.snapshot();
+    assert_eq!(snap.key_prefix_bindings.len(), 1);
+    assert_eq!(snap.key_prefix_bindings[0].provider_id, "p1");
+    drop(snap);
+
+    // Duplicate prefix → 409 (UNIQUE).
+    let dup = r#"{"id":"b2","key_prefix":"sk_aaa_","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(dup),
+    )
+    .await;
+    assert_eq!(r.status(), 409);
+
+    // Empty prefix → 400 (handler guard).
+    let empty = r#"{"id":"b3","key_prefix":"","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(empty),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+
+    // Unknown provider → 400 (FK violation).
+    let ghost = r#"{"id":"b4","key_prefix":"hk_","provider_id":"ghost","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(ghost),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+
+    // List → 1 row.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let list: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // Update (PUT) → 200, disabled reflected.
+    let upd = r#"{"id":"b1","key_prefix":"sk_aaa_v2","provider_id":"p1","enabled":false,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-key-bindings/b1",
+        Some(TOKEN),
+        Some(upd),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let item: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(item["enabled"], serde_json::Value::Bool(false));
+
+    // Disabled binding leaves the hot snapshot.
+    let snap2 = state.store.snapshot();
+    assert_eq!(
+        snap2.key_prefix_bindings.len(),
+        0,
+        "disabled binding not loaded"
+    );
+    drop(snap2);
+
+    // Single GET → 200; unknown id → 404.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-key-bindings/b1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-key-bindings/nope",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 404);
+
+    // DELETE → 204.
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/provider-key-bindings/b1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
+}

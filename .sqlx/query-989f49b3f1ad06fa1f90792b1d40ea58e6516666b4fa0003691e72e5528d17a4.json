@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO provider_key_binding (id, key_prefix, provider_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "989f49b3f1ad06fa1f90792b1d40ea58e6516666b4fa0003691e72e5528d17a4"
+}

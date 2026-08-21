@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE provider_key_binding SET key_prefix = ?, provider_id = ?, enabled = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "1eda43d78545763b19b25bbe67432f41f3be81efa64cc4ac89593ea30d410a23"
+}

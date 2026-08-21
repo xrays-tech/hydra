@@ -115,7 +115,7 @@ fn swrr_weight_distribution_3_to_1() {
     let mut state = SwrrState::default();
     let mut counts: HashMap<String, u32> = HashMap::new();
     for _ in 0..n {
-        let mut cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+        let mut cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
         order(&mut cands, &mut state);
         let picked = cands[0].provider_id.clone();
         *counts.entry(picked).or_insert(0) += 1;
@@ -151,7 +151,7 @@ fn breaker_excludes_dead_then_revives_on_success() {
     let tenant = tenant_t();
 
     // Baseline: both providers survive.
-    let cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+    let cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
     assert_eq!(cands.len(), 2, "both providers selectable initially");
 
     // Trip the breaker for pA (threshold=3 consecutive failures).
@@ -161,7 +161,7 @@ fn breaker_excludes_dead_then_revives_on_success() {
     assert!(breaker.is_dead("pA"));
 
     // resolve must now exclude pA — only pB survives.
-    let cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+    let cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
     assert_eq!(cands.len(), 1, "dead pA excluded");
     assert_eq!(cands[0].provider_id, "pB", "pB is the only survivor");
 
@@ -170,7 +170,7 @@ fn breaker_excludes_dead_then_revives_on_success() {
     assert!(!breaker.is_dead("pA"));
 
     // pA is back in the candidate set.
-    let cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+    let cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
     assert_eq!(cands.len(), 2, "pA revived after on_success");
     let ids: HashSet<&str> = cands.iter().map(|c| c.provider_id.as_str()).collect();
     assert!(ids.contains("pA") && ids.contains("pB"));
@@ -192,7 +192,7 @@ fn swrr_converges_to_sole_survivor_when_other_is_dead() {
     let mut state = SwrrState::default();
     let mut counts: HashMap<String, u32> = HashMap::new();
     for _ in 0..200 {
-        let mut cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+        let mut cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
         order(&mut cands, &mut state);
         *counts.entry(cands[0].provider_id.clone()).or_insert(0) += 1;
     }
@@ -217,7 +217,7 @@ fn soft_disabled_weight_zero_excluded() {
     let cfg = two_provider_cfg(0, 1); // pA soft-disabled
     let breaker = CircuitBreaker::new(BreakerConfig::new(5));
     let tenant = tenant_t();
-    let cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+    let cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
     assert_eq!(cands.len(), 1);
     assert_eq!(cands[0].provider_id, "pB");
 }
@@ -239,7 +239,7 @@ fn swrr_exact_cycle_shape_3_to_1() {
 
     let mut picks: Vec<String> = Vec::new();
     for _ in 0..4 {
-        let mut cands = resolve(&cfg, &breaker, &tenant, "m").expect("candidates");
+        let mut cands = resolve(&cfg, &breaker, &tenant, "m", None).expect("candidates");
         // resolve returns sorted by provider_id → [pA, pB]. order() reorders.
         order(&mut cands, &mut state);
         picks.push(cands[0].provider_id.clone());
@@ -266,6 +266,6 @@ fn breaker_view_erasure_no_keys_visible() {
     // The BreakerView trait surface is only `is_dead` — confirm the router
     // path works through that erasure.
     let view: &dyn BreakerView = &breaker;
-    let cands = resolve(&cfg, view, &tenant, "m").expect("candidates");
+    let cands = resolve(&cfg, view, &tenant, "m", None).expect("candidates");
     assert_eq!(cands.len(), 2);
 }
