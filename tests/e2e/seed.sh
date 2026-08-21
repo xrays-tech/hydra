@@ -20,7 +20,7 @@ curl_admin() {  # curl_admin METHOD path [json-file-field-name]
 echo "==> seeding hydra at http://${ADMIN} from $SEED"
 
 # Idempotent cleanup (ignore 404s).
-for id in r-seed tm-seed tp-seed m-seed k-seed t-seed p-seed; do
+for id in b-seed r-seed tm-seed tp-seed m-seed k-seed t-seed p-seed; do
   # Try the resource that owns this id; failures are expected/ignored.
   curl -sS -X DELETE "http://${ADMIN}/api/v1/limit-roles/$id"     -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
   curl -sS -X DELETE "http://${ADMIN}/api/v1/tenant-models/$id"   -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
@@ -45,6 +45,7 @@ post tenants            "$(jq -c '.tenants[0]'            "$SEED")"
 post tenant-providers   "$(jq -c '.tenant_providers[0]'   "$SEED")"
 post tenant-models      "$(jq -c '.tenant_models[0]'      "$SEED")"
 post limit-roles        "$(jq -c '.limit_roles[0]'        "$SEED")"
+post provider-key-bindings "$(jq -c '.provider_key_bindings[0]' "$SEED")"
 
 echo "==> seed complete. Health:"
 curl_admin GET /api/v1/health

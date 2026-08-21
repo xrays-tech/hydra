@@ -20,6 +20,9 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
 - **T2.5** `e2e_breaker_reset` — UI force-resets a provider id; toast confirms.
 - **T2.6** `e2e_reload` — UI triggers `POST /api/v1/reload`; new snapshot
   counts surface.
+- **T2.7** `e2e_key_prefix_binding_crud` — Key Bindings section: create a
+  prefix→provider binding via UI → row appears → `/api` confirms persistence
+  → edit (disable) → delete → 404 via `/api`.
 
 ## Prerequisites
 

@@ -215,4 +215,54 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     await page.click('#reload-btn');
     await expect(toast).toContainText(/Reloaded \d+ providers,\s*\d+ tenants/);
   });
+
+  test('T2.7 key-prefix binding CRUD via UI', async ({ page }) => {
+    await signIn(page);
+
+    // Seed a provider to bind to (the FK select source).
+    const pid = `${RUN_ID}-bind-prov`;
+    await api('POST', '/providers', {
+      body: {
+        id: pid, key: `${RUN_ID}-bindk`, name: 'Bind Provider', endpoint: 'https://bind.example.com',
+        weight: 1, created_at: '', updated_at: '',
+      },
+    });
+
+    // Create a binding via the UI.
+    await navItem(page, 'provider-key-bindings').click();
+    await newButton(page, 'New binding').click();
+    const bid = `${RUN_ID}-bind`;
+    await page.fill('[data-field="id"]', bid);
+    await page.fill('[data-field="key_prefix"]', `${RUN_ID}_`);
+    await page.selectOption('[data-field="provider_id"]', pid);
+    await page.locator('.modal-foot button.btn.primary').click();
+
+    // The modal hides on success and the list shows the new row.
+    await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
+    await expect(page.locator('#content table tbody')).toContainText(bid);
+    await expect(page.locator('#content table tbody')).toContainText(`${RUN_ID}_`);
+
+    // DB persistence via /api.
+    const { status, json } = await api('GET', `/provider-key-bindings/${bid}`);
+    expect(status).toBe(200);
+    expect(json.key_prefix).toBe(`${RUN_ID}_`);
+    expect(json.provider_id).toBe(pid);
+    expect(json.enabled).toBe(true);
+
+    // Edit: disable the binding via the row Edit button.
+    const row = page.locator(`#content table tbody tr:has-text("${bid}")`);
+    await row.locator('button[title="Edit"]').click();
+    await page.uncheck('[data-field="enabled"]');
+    await page.locator('.modal-foot button.btn.primary').click();
+    await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
+    const { json: updated } = await api('GET', `/provider-key-bindings/${bid}`);
+    expect(updated.enabled).toBe(false);
+
+    // Delete via the row Delete button + confirm dialog.
+    await page.locator(`#content table tbody tr:has-text("${bid}") button[title="Delete"]`).click();
+    await page.locator('.modal-overlay button.btn.danger.solid').click();
+    await expect(page.locator('#content table tbody')).not.toContainText(bid);
+    const { status: delStatus } = await api('GET', `/provider-key-bindings/${bid}`);
+    expect(delStatus).toBe(404);
+  });
 });

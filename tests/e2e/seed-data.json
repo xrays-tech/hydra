@@ -20,5 +20,8 @@
   ],
   "limit_roles": [
     { "id": "r-seed", "name": "Seed 10/min", "matching_tenant": "t-seed", "matching_key": null, "matching_model": null, "matching_provider": null, "limit_count": 10, "limit_token": null, "window": "m", "enabled": true, "created_at": "" }
+  ],
+  "provider_key_bindings": [
+    { "id": "b-seed", "key_prefix": "sk-seed_", "provider_id": "p-seed", "enabled": true, "created_at": "", "updated_at": "" }
   ]
 }

@@ -777,6 +777,7 @@ function collectBody(cfg, inputs, record) {
   for (const f of cfg.fields) body[f.name] = readValue(f, inputs[f.name]);
   // preserve server-managed timestamps on edit
   if (record && record.created_at) body.created_at = record.created_at;
+  if (record && record.updated_at) body.updated_at = record.updated_at;
   if (!record) {
     // The admin API deserialises the request body directly into the entity
     // structs, where the timestamp columns are REQUIRED fields (the server
