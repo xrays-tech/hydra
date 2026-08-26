@@ -8,6 +8,8 @@
 //! pure counter (`check_and_inc`/`add`) are called directly — no internal logic
 //! is faked here.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,35 @@ use dashmap::DashMap;
 use hydra_core::limit::{match_roles, MatchCtx, SlidingWindow};
 use hydra_core::model::LimitRole;
 use tracing::debug;
+
+/// Rate-limiter abstraction (cluster P4): the in-memory [`RateLimiter`]
+/// (single node) and the Redis-backed [`crate::redis::rate_limit::RedisRateLimiter`]
+/// (cluster) both implement it, so the proxy's hot path is agnostic. Boxed
+/// futures for object safety (same pattern as `UsageSink` / `LeaseStore`).
+pub trait Limiter: Send + Sync {
+    /// Pre-gate count check (request count): deny when any matched window is
+    /// over its limit.
+    fn check_count<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = CountVerdict> + Send + 'a>>;
+
+    /// Record token usage in the `logging` phase (always counted; overage is
+    /// flagged for next time, §10.3).
+    fn add_tokens<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        tokens: u64,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Drop empty windows (background GC). Redis-backed windows expire
+    /// themselves, so the shared limiter's `gc` is a no-op.
+    fn gc(&self);
+}
 
 /// One counter slot: `(role_id, bucket)` (design §10.2). `bucket` is the
 /// deterministic join of the role's matching dimensions known at pre-gate
@@ -134,6 +165,31 @@ impl Default for RateLimiter {
     }
 }
 
+impl Limiter for RateLimiter {
+    fn check_count<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = CountVerdict> + Send + 'a>> {
+        Box::pin(async move { RateLimiter::check_count(self, roles, ctx, now) })
+    }
+
+    fn add_tokens<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        tokens: u64,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move { RateLimiter::add_tokens(self, roles, ctx, tokens, now) })
+    }
+
+    fn gc(&self) {
+        RateLimiter::gc(self);
+    }
+}
+
 /// Outcome of the pre-gate count check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CountVerdict {
@@ -175,7 +231,7 @@ fn bucket_for(role: &LimitRole, ctx: &MatchCtx<'_>) -> String {
 }
 
 /// Spawn a background GC sweep that drops empty windows every `interval`.
-pub fn spawn_gc_task(limiter: Arc<RateLimiter>, interval: Duration) {
+pub fn spawn_gc_task(limiter: Arc<dyn Limiter>, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // skip the immediate first tick

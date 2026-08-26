@@ -263,6 +263,86 @@ async fn tenant_crud() {
     assert!(repo::get_tenant(&pool, "t1").await.is_err());
 }
 
+/// T4.4b — tenant certificate content (migration 0007): the private key is
+/// sealed at the DB boundary (ciphertext at rest), round-trips through
+/// `update_tenant_cert` / `get_tenant_cert`, and the plaintext is never
+/// stored.
+#[tokio::test]
+async fn tenant_cert_content_roundtrip() {
+    let pool = common::setup_pool().await;
+    let kp = kp();
+
+    let t = tenant("t1", "acme.com", true);
+    repo::insert_tenant(&pool, &t).await.expect("insert");
+
+    // No cert yet (the row exists, so the Option is Some — presence is about
+    // the `cert_pem` field, not the row).
+    let none_cert = repo::get_tenant_cert(&pool, &kp, "t1")
+        .await
+        .expect("get")
+        .expect("tenant row exists");
+    assert!(none_cert.cert_pem.is_none() && none_cert.cert_key_pem.is_none());
+
+    let cert = repo::TenantCert {
+        tenant_id: "t1".into(),
+        cert_pem: Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into()),
+        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".into()),
+    };
+    repo::update_tenant_cert(&pool, &kp, &cert)
+        .await
+        .expect("write cert");
+
+    let got = repo::get_tenant_cert(&pool, &kp, "t1")
+        .await
+        .expect("get cert")
+        .expect("cert present");
+    assert_eq!(got, cert);
+
+    // At rest: the private key must be ciphertext, never the plaintext PEM.
+    let row: (Option<String>, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT cert_pem, cert_key_ciphertext FROM tenant WHERE id = 't1'")
+            .fetch_one(&pool)
+            .await
+            .expect("raw row");
+    assert_eq!(
+        row.0.as_deref(),
+        Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n")
+    );
+    let ct = row.1.expect("ciphertext present");
+    assert_ne!(
+        ct,
+        b"-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".to_vec(),
+        "plaintext key must never be persisted"
+    );
+
+    // list_tenant_certs returns it too.
+    let all = repo::list_tenant_certs(&pool, &kp).await.expect("list");
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].cert_key_pem.as_deref(),
+        Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n")
+    );
+
+    // Wrong master key → fail-closed decode error.
+    let wrong_kp = StaticKeyProvider::new([2u8; 32], 1);
+    assert!(
+        repo::get_tenant_cert(&pool, &wrong_kp, "t1").await.is_err(),
+        "wrong master key must not decrypt the cert key"
+    );
+
+    // Explicit clear: both None → columns NULLed.
+    let cleared = repo::TenantCert {
+        tenant_id: "t1".into(),
+        cert_pem: None,
+        cert_key_pem: None,
+    };
+    repo::update_tenant_cert(&pool, &kp, &cleared)
+        .await
+        .expect("clear cert");
+    let got2 = repo::get_tenant_cert(&pool, &kp, "t1").await.unwrap();
+    assert_eq!(got2, Some(cleared));
+}
+
 /// T4.5 — tenant_provider CRUD: UNIQUE(tenant_id,provider_id) + FK cascade.
 #[tokio::test]
 async fn tenant_provider_crud() {

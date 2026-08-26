@@ -39,6 +39,21 @@ pub mod db;
 #[cfg(feature = "db")]
 pub mod store;
 
+// --- Cluster mode (v8 plan) ------------------------------------------------
+/// Node role (`HYDRA_ROLE`: all/leader/edge), control config, snapshot wire
+/// and the control-plane client. Needs the full proxy shell (`proxy` implies
+/// `db` + `http-client`).
+#[cfg(feature = "proxy")]
+pub mod cluster;
+
+// --- Redis backbone (cluster P2+, v8 plan Q5/Q6) ---------------------------
+/// Shared Redis state: leader lease (P2), node registry / invalidation bus /
+/// shared limits / auth L2 (P4). Opt-in via `cluster-redis` so the default
+/// single-node build keeps zero external deps. Requires the proxy shell (the
+/// lease store plugs into the cluster module).
+#[cfg(all(feature = "cluster-redis", feature = "proxy"))]
+pub mod redis;
+
 // --- W3: external boundaries ----------------------------------------------
 /// `HttpAuthChecker` (reqwest) + admin `ServeHttp` HTTP helpers.
 #[cfg(feature = "http-client")]

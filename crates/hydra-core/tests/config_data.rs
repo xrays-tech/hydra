@@ -153,6 +153,8 @@ fn configdata_construct_and_index() {
             domain: "acme.com".into(),
             cert_file: None,
             cert_key: None,
+            cert_pem: None,
+            cert_key_pem: None,
         },
     );
     assert_eq!(

@@ -209,7 +209,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     });
 
     let admin_state = Arc::new(AdminState::new(
-        pool,
+        Some(pool),
         store,
         auth,
         breaker,
@@ -217,6 +217,10 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         Some(TOKEN.to_string()),
         None,
         hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None, // no cluster token in tests
+        None, // no leader election in tests
+        None, // no forward target in tests
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------

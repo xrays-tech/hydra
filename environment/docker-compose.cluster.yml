@@ -1,0 +1,129 @@
+# Hydra cluster full-stack: redis + leader pair + stateless edges.
+#
+# Build the image first:  ./environment/build.sh   (with cluster-redis feature:
+#   cargo build --release --features server,cluster-redis  → stage to bin/hydra)
+#
+# Prereqs:
+#   export HYDRA_ADMIN_TOKEN=admin-secret
+#   export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
+#   python3 environment/init.py  (point it at the leader admin port)
+#
+# Start:
+#   docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+#
+# NOTE: the leader's data volume is per-container; failover is state-based
+# (the standby materializes the config snapshot into its OWN replica DB), so
+# no shared volume is required — certs ship inside the snapshot (migration
+# 0007), not via mounts.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  hydra-control-a:
+    image: hydra:latest
+    container_name: hydra-control-a
+    environment: &control-env
+      HYDRA_ROLE: leader
+      HYDRA_REDIS_URL: "redis://redis:6379"
+      HYDRA_REDIS_MODE: single
+      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:-cluster-tok}
+      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-control-a:8081"
+      HYDRA_NODE_ID: control-a
+      HYDRA_LEADER_LEASE_MS: "15000"
+      HYDRA_CONTROL_POLL_MS: "500"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_USAGE_SINK: clickhouse
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:?set HYDRA_ADMIN_TOKEN}
+      HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY}
+      RUST_LOG: info
+    ports:
+      - "8081:8081"   # admin (the second leader is on 8082, see below)
+    volumes:
+      - control-a-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Second leader candidate: expose its admin on 8082 for local drills.
+  hydra-control-b:
+    image: hydra:latest
+    container_name: hydra-control-b
+    environment:
+      <<: *control-env
+      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-control-b:8081"
+      HYDRA_NODE_ID: control-b
+    ports:
+      - "8082:8081"
+    volumes:
+      - control-b-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hydra-edge:
+    image: hydra:latest
+    environment:
+      HYDRA_ROLE: edge
+      HYDRA_REDIS_URL: "redis://redis:6379"
+      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:-cluster-tok}
+      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-edge:8081"
+      HYDRA_CONTROL_POLL_MS: "500"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_USAGE_SINK: clickhouse
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY}
+      RUST_LOG: info
+    ports:
+      - "8080"   # proxy — no host port mapping needed beyond the LB
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  control-a-data:
+  control-b-data:
+  clickhouse-data:

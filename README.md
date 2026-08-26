@@ -139,6 +139,13 @@ integration/          Python CRUD test suite + e2e proxy test + mock LLM/auth
 docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 ```
 
+## Cluster Mode
+
+Single node stays zero-dependency. A cluster is opt-in: set `HYDRA_ROLE=leader|edge`
+with a Redis (the one required external dependency) — self-sustaining (automatic
+election, failover, join/leave, self-healing) and orchestration-agnostic
+(compose / k3s / k8s / bare metal). See **[`docs/cluster.md`](docs/cluster.md)**.
+
 ## More
 
 - Design & architecture: [`docs/design.md`](docs/design.md)

@@ -48,7 +48,7 @@ async fn admin_state() -> Arc<AdminState> {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     Arc::new(AdminState::new(
-        pool,
+        Some(pool),
         store,
         auth,
         breaker,
@@ -56,6 +56,10 @@ async fn admin_state() -> Arc<AdminState> {
         Some(TOKEN.to_string()),
         None,
         hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None, // no cluster token in tests
+        None, // no leader election in tests
+        None, // no forward target in tests
     ))
 }
 
@@ -555,6 +559,167 @@ async fn tenant_crud_http() {
     assert_eq!(r.status(), 204);
 }
 
+/// Tenant cert content via the admin API (migration 0007): PEM fields are
+/// accepted, the private key is sealed at rest, and the API never echoes the
+/// key back (management-plane plaintext rule, design §16.2).
+#[tokio::test]
+async fn tenant_cert_content_http() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    let cert_pem = "-----BEGIN CERTIFICATE-----\nCERTBODY\n-----END CERTIFICATE-----\n";
+    let key_pem = "-----BEGIN PRIVATE KEY-----\nKEYBODY\n-----END PRIVATE KEY-----\n";
+
+    // POST with content.
+    let body = format!(
+        r#"{{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":{cert_pem:?},"cert_key_pem":{key_pem:?}}}"#,
+        cert_pem = cert_pem,
+        key_pem = key_pem
+    );
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let resp = r.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(resp["id"], "t1");
+    // The response must not leak the private key (or any cert content).
+    let resp_text = serde_json::to_string(&resp).unwrap();
+    assert!(
+        !resp_text.contains("KEYBODY"),
+        "admin response must never contain the private key"
+    );
+    assert!(
+        !resp_text.contains("CERTBODY"),
+        "admin response has no cert content"
+    );
+
+    // GET also stays content-free.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let resp = r.json::<serde_json::Value>().await.unwrap();
+    let resp_text = serde_json::to_string(&resp).unwrap();
+    assert!(!resp_text.contains("KEYBODY"));
+    assert!(!resp_text.contains("CERTBODY"));
+
+    // The content IS stored (sealed) — verify through the repo.
+    let kp = hydra_server::crypto::StaticKeyProvider::new([1u8; 32], 1);
+    let got = hydra_server::db::get_tenant_cert(state.db(), &kp, "t1")
+        .await
+        .expect("get cert")
+        .expect("cert present");
+    assert_eq!(got.cert_pem.as_deref(), Some(cert_pem));
+    assert_eq!(got.cert_key_pem.as_deref(), Some(key_pem));
+
+    // cert_key_pem without cert_pem → 400.
+    let bad = format!(
+        r#"{{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_key_pem":{key_pem:?}}}"#,
+        key_pem = key_pem
+    );
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/tenants/t1",
+        Some(TOKEN),
+        Some(&bad),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+
+    // Explicit clear: cert_pem "" → cert removed.
+    let clear = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"","cert_key_pem":null}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/tenants/t1",
+        Some(TOKEN),
+        Some(clear),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let got = hydra_server::db::get_tenant_cert(state.db(), &kp, "t1")
+        .await
+        .expect("get cert")
+        .expect("cert row present");
+    assert_eq!(got.cert_pem, None, "empty cert_pem clears the cert");
+    assert_eq!(got.cert_key_pem, None);
+}
+
+/// Edge data-plane admin (cluster P0b): pool-less state serving ONLY the
+/// probe endpoints (`/metrics` `/healthz` `/readyz`); no admin UI, no CRUD —
+/// everything else is 404, even with a valid admin token.
+#[tokio::test]
+async fn edge_admin_probes_only() {
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::from_snapshot(
+        hydra_core::config::ConfigData::default(),
+        key_provider.clone(),
+    );
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let state = Arc::new(AdminState::new(
+        None, // edge: no local SQLite
+        store,
+        auth,
+        breaker,
+        key_provider,
+        Some(TOKEN.to_string()),
+        None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
+        true, // edge_mode
+        None, // no cluster token in tests
+        None, // no leader election in tests
+        None, // no forward target in tests
+    ));
+    let port = start_admin(state);
+
+    // Probe endpoints are token-free.
+    let r = req(port, reqwest::Method::GET, "/healthz", None, None).await;
+    assert_eq!(r.status(), 200);
+    let r = req(port, reqwest::Method::GET, "/metrics", None, None).await;
+    assert_eq!(r.status(), 200);
+    let r = req(port, reqwest::Method::GET, "/readyz", None, None).await;
+    assert_eq!(r.status(), 200);
+
+    // Admin API + UI are gone, even with the token.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 404, "edge has no CRUD GET");
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#),
+    )
+    .await;
+    assert_eq!(r.status(), 404, "edge has no CRUD POST");
+    let r = req(port, reqwest::Method::GET, "/admin/", None, None).await;
+    assert_eq!(r.status(), 404, "edge has no admin UI");
+}
+
 // ===========================================================================
 // §2.5 / §2.6 — tenant-provider / tenant-model (UNIQUE conflict)
 // ===========================================================================
@@ -702,7 +867,7 @@ async fn reload_endpoint_triggers_reload_all() {
     let port = start_admin(state.clone());
     // Insert a provider directly via repo, then POST /reload to pick it up.
     repo::insert_provider(
-        &state.pool,
+        state.db(),
         &hydra_core::model::Provider {
             id: "px".into(),
             key: "direct".into(),
@@ -753,15 +918,18 @@ async fn auth_cache_invalidate() {
     state
         .auth
         .cache()
-        .set("t1", "sk-aaa", true, Duration::from_secs(300));
+        .set("t1", "sk-aaa", true, Duration::from_secs(300))
+        .await;
     state
         .auth
         .cache()
-        .set("t1", "sk-bbb", true, Duration::from_secs(300));
+        .set("t1", "sk-bbb", true, Duration::from_secs(300))
+        .await;
     state
         .auth
         .cache()
-        .set("t2", "sk-ccc", true, Duration::from_secs(300));
+        .set("t2", "sk-ccc", true, Duration::from_secs(300))
+        .await;
     assert_eq!(state.auth.cache().len(), 3);
 
     // By keys for t1 → invalidates 2.
@@ -933,7 +1101,7 @@ async fn concurrency_snapshot_reports_live_gates() {
     drop(_idle_permit); // p-idle back to inflight=0
 
     let state = Arc::new(AdminState::new(
-        pool,
+        Some(pool),
         store,
         auth,
         breaker,
@@ -941,6 +1109,10 @@ async fn concurrency_snapshot_reports_live_gates() {
         Some(TOKEN.to_string()),
         None,
         admission,
+        false,
+        None, // no cluster token in tests
+        None, // no leader election in tests
+        None, // no forward target in tests
     ));
     let port = start_admin(state);
 

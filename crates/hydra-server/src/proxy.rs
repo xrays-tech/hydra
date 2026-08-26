@@ -64,7 +64,7 @@ use crate::proxy::admission::{AdmissionControl, AdmissionError};
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::proxy::config::ProxyConfig;
 use crate::proxy::ctx::RequestContext;
-use crate::proxy::limiter::{CountVerdict, RateLimiter};
+use crate::proxy::limiter::CountVerdict;
 use crate::proxy::peer::parse_endpoint;
 use crate::proxy::provider_client::ProviderClient;
 use crate::sink::UsageSink;
@@ -102,8 +102,8 @@ pub struct AppState {
     pub auth: Arc<HttpAuthChecker>,
     /// Concurrent circuit breaker (feeds `router::resolve` via `BreakerView`).
     pub breaker: Arc<CircuitBreaker>,
-    /// Concurrent rate limiter.
-    pub limiter: Arc<RateLimiter>,
+    /// Rate limiter (in-memory on single node; Redis-backed in cluster, P4).
+    pub limiter: Arc<dyn crate::proxy::limiter::Limiter>,
     /// Per-provider bounded admission queue (design-admission-queue §3).
     /// The concurrency valve: `acquire` before send, RAII permit released on
     /// scope-exit. All-zero default policy ⇒ `Passthrough` (no-op for
@@ -356,10 +356,11 @@ impl ProxyHttp for HydraProxy {
             provider: None,
         };
         let now = Instant::now();
-        if let CountVerdict::Denied { role_id } =
-            self.state
-                .limiter
-                .check_count(&cfg.limit_roles, &match_ctx, now)
+        if let CountVerdict::Denied { role_id } = self
+            .state
+            .limiter
+            .check_count(&cfg.limit_roles, &match_ctx, now)
+            .await
         {
             debug!(role = %role_id, tenant = %tenant_id, "rate-limited (count)");
             crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
@@ -846,7 +847,8 @@ impl ProxyHttp for HydraProxy {
                 let cfg = self.state.store.snapshot();
                 self.state
                     .limiter
-                    .add_tokens(&cfg.limit_roles, &match_ctx, total, Instant::now());
+                    .add_tokens(&cfg.limit_roles, &match_ctx, total, Instant::now())
+                    .await;
             }
         }
     }

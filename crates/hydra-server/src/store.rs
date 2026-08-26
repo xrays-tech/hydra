@@ -43,6 +43,10 @@ pub enum StoreError {
     /// published (the caller keeps the previous one).
     #[error("fatal config validation: {0}")]
     FatalValidation(String),
+    /// The store was built snapshot-fed (edge mode) and has no local DB to
+    /// rebuild from; `apply_snapshot` is the only mutation path.
+    #[error("config store has no local database (edge/snapshot-fed mode)")]
+    NoDatabase,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,9 +94,11 @@ pub async fn build_config(
             .push(k.api_key);
     }
 
-    // tenants (+ certs meta from cert paths). domain is lowercased, incl. the
-    // `localhost` special case (design §5.2).
+    // tenants (+ certs meta). domain is lowercased, incl. the `localhost`
+    // special case (design §5.2). Certs resolve content-first (migration
+    // 0007); legacy path rows are carried too so the TLS layer can fall back.
     let mut tenants_by_domain: HashMap<String, hydra_core::model::Tenant> = HashMap::new();
+    let mut tenant_domains: HashMap<String, String> = HashMap::new();
     let mut certs: HashMap<String, CertMeta> = HashMap::new();
     for t in db::list_tenants(pool).await? {
         let domain = t.domain.to_lowercase();
@@ -103,10 +109,36 @@ pub async fn build_config(
                     domain: domain.clone(),
                     cert_file: t.cert_file.clone(),
                     cert_key: t.cert_key.clone(),
+                    cert_pem: None,
+                    cert_key_pem: None,
                 },
             );
         }
+        tenant_domains.insert(t.id.clone(), domain.clone());
         tenants_by_domain.insert(domain, t);
+    }
+
+    // Overlay stored cert content (migration 0007): a tenant with content in
+    // the DB wins over its (possibly stale) legacy path fields. The loader
+    // decrypts the sealed key at this boundary; plaintext lives in the
+    // snapshot in-memory only.
+    for tc in db::list_tenant_certs(pool, kp).await? {
+        if tc.cert_pem.is_none() {
+            continue;
+        }
+        let Some(domain) = tenant_domains.get(&tc.tenant_id) else {
+            continue;
+        };
+        certs.insert(
+            domain.clone(),
+            CertMeta {
+                domain: domain.clone(),
+                cert_file: None,
+                cert_key: None,
+                cert_pem: tc.cert_pem,
+                cert_key_pem: tc.cert_key_pem,
+            },
+        );
     }
 
     // tenant_providers
@@ -224,24 +256,55 @@ fn is_usable_endpoint(endpoint: &str) -> bool {
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<ArcSwap<ConfigData>>,
-    pool: SqlitePool,
+    /// Local SQLite pool (leader/all mode). `None` on snapshot-fed stores
+    /// (edge mode — no local config DB by design, cluster P0b).
+    pool: Option<SqlitePool>,
     swrr: Arc<DashMap<(String, String), SwrrState>>,
     key_provider: Arc<dyn KeyProvider>,
+    /// Monotonic config version (cluster P1): bumped on every local reload
+    /// and set to the control-plane version on `apply_snapshot`. The control
+    /// endpoint serves `?since=` against it; the control client skips
+    /// re-applying unchanged snapshots.
+    version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConfigStore {
-    /// Build the initial snapshot from the DB and wrap it in `ArcSwap`.
+    /// Build the initial snapshot from the DB and wrap it in `ArcSwap`
+    /// (leader/all mode).
     pub async fn load(
         pool: SqlitePool,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
         let cfg = build_config(&pool, key_provider.as_ref()).await?;
+        // Resume the config version from the DB instead of restarting at 1:
+        // a restarted leader otherwise serves a LOW version watermark and
+        // peers (`since` comparison) never re-sync from it — even when its
+        // snapshot is newer (accepted live: failover-then-rejoin regressed
+        // the config). Monotonicity across restarts is what makes the
+        // control channel's `?since=` watermark meaningful.
+        let persisted = db::get_config_version(&pool).await.ok().flatten();
+        let version = persisted.unwrap_or(1).max(1);
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
-            pool,
+            pool: Some(pool),
             swrr: Arc::new(DashMap::new()),
             key_provider,
+            version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
         })
+    }
+
+    /// Build a store without a local DB (edge mode, cluster P0b): starts from
+    /// a shipped snapshot (initially empty; the control client replaces it via
+    /// [`Self::apply_snapshot`] once wired).
+    #[must_use]
+    pub fn from_snapshot(cfg: ConfigData, key_provider: Arc<dyn KeyProvider>) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(cfg)),
+            pool: None,
+            swrr: Arc::new(DashMap::new()),
+            key_provider,
+            version: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        }
     }
 
     /// Lock-free hot-path read. Returns a [`Guard`] that derefs to
@@ -257,18 +320,125 @@ impl ConfigStore {
         &self.swrr
     }
 
+    /// The local SQLite pool, when present (leader/all mode). `None` on
+    /// snapshot-fed edge stores.
+    #[must_use]
+    pub fn pool(&self) -> Option<&SqlitePool> {
+        self.pool.as_ref()
+    }
+
+    /// Current config version (cluster P1): the `since` watermark for the
+    /// control channel and the local last-applied version on edges.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Atomically apply a snapshot received from the control plane (edge /
+    /// standby, cluster P1). Same COW semantics as [`Self::reload_all`]:
+    /// the swap is lock-free for readers and the SWRR map is cleared so stale
+    /// per-`(tenant, model)` weights never survive a config change. The store
+    /// adopts the control-plane `version` (monotonic across the cluster).
+    pub fn apply_snapshot(&self, cfg: ConfigData, version: u64) {
+        self.inner.store(Arc::new(cfg));
+        self.swrr.clear();
+        self.version
+            .store(version, std::sync::atomic::Ordering::Release);
+    }
+
     /// Rebuild the snapshot from the DB and atomically swap it in (design §5.3).
     ///
     /// On a **fatal** validation issue the old snapshot is kept (`Err`
     /// returned, `inner` untouched). On success the new snapshot is published
-    /// and the SWRR map is cleared so per-`(tenant, model)` weights are
-    /// rebuilt lazily on the next request.
+    /// (version bumped) and the SWRR map is cleared so per-`(tenant, model)`
+    /// weights are rebuilt lazily on the next request. Snapshot-fed stores
+    /// (edge) have no DB to reload from and return [`StoreError::NoDatabase`].
     pub async fn reload_all(&self) -> Result<(), StoreError> {
-        let new_cfg = build_config(&self.pool, self.key_provider.as_ref()).await?;
+        let pool = self.pool.as_ref().ok_or(StoreError::NoDatabase)?;
+        let new_cfg = build_config(pool, self.key_provider.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
         // so the previous snapshot is preserved.
         self.inner.store(Arc::new(new_cfg));
         self.swrr.clear();
+        let next = self
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        // Persist so a restart resumes at this version (monotonic watermark;
+        // see `load`). Best-effort — the in-memory value still governs this
+        // process; a failed write only risks a lower watermark after restart.
+        if let Err(e) = db::set_config_version(pool, next).await {
+            tracing::warn!(version = next, error = %e, "failed to persist config version");
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hydra_core::config::ConfigData;
+
+    fn kp() -> std::sync::Arc<dyn KeyProvider> {
+        std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1))
+    }
+
+    fn cfg_with_tenant(cfg: &mut ConfigData) {
+        cfg.tenants_by_domain.insert(
+            "acme.com".to_string(),
+            hydra_core::model::Tenant {
+                id: "t1".into(),
+                name: "T".into(),
+                domain: "acme.com".into(),
+                auth_url: "https://auth.acme.com/v".into(),
+                cert_key: None,
+                cert_file: None,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn from_snapshot_serves_and_applies() {
+        let mut c1 = ConfigData::default();
+        cfg_with_tenant(&mut c1);
+        let store = ConfigStore::from_snapshot(c1, kp());
+        assert!(store.pool().is_none(), "snapshot-fed store has no DB");
+        assert_eq!(store.version(), 1);
+
+        // Initial snapshot is served.
+        assert!(store.snapshot().tenants_by_domain.contains_key("acme.com"));
+
+        // Seed some SWRR state, then apply a new snapshot: it replaces the
+        // config AND clears SWRR (same semantics as reload_all).
+        store.swrr().insert(
+            ("t1".into(), "gpt-4".into()),
+            hydra_core::swrr::SwrrState::default(),
+        );
+        assert!(!store.swrr().is_empty());
+
+        let c2 = ConfigData::default();
+        store.apply_snapshot(c2, 42);
+        assert!(
+            store.snapshot().tenants_by_domain.is_empty(),
+            "apply_snapshot replaced the config"
+        );
+        assert!(store.swrr().is_empty(), "apply_snapshot cleared SWRR state");
+        assert_eq!(
+            store.version(),
+            42,
+            "apply_snapshot adopts the control-plane version"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_all_without_db_errors() {
+        let store = ConfigStore::from_snapshot(ConfigData::default(), kp());
+        assert!(matches!(
+            store.reload_all().await,
+            Err(StoreError::NoDatabase)
+        ));
     }
 }

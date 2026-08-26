@@ -637,6 +637,195 @@ pub async fn delete_tenant(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Erro
 }
 
 // ---------------------------------------------------------------------------
+// Tenant certificate content (migration 0007, cluster P0a)
+// ---------------------------------------------------------------------------
+//
+// The cert is the tenant row itself: `cert_pem` (public, plaintext) +
+// `cert_key_*` (AES-256-GCM sealed with the same master key as provider
+// api-keys). The in-memory [`TenantCert`] carries the private key as
+// plaintext only — it is decrypted at the DB boundary and never persisted or
+// serialised.
+
+/// Certificate content for one tenant, plaintext in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantCert {
+    pub tenant_id: String,
+    /// Public cert PEM (`None` = no cert configured).
+    pub cert_pem: Option<String>,
+    /// Private key PEM, plaintext in memory only.
+    pub cert_key_pem: Option<String>,
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct TenantCertRow {
+    tenant_id: String,
+    cert_pem: Option<String>,
+    cert_key_ciphertext: Option<Vec<u8>>,
+    cert_key_nonce: Option<Vec<u8>>,
+    cert_key_version: Option<i64>,
+}
+
+impl TenantCertRow {
+    /// Decrypt the sealed private key into a plaintext [`TenantCert`]. A row
+    /// with ciphertext but a bad/missing nonce or version is a hard decode
+    /// error (tampered / wrong master key — fail-closed, like provider keys).
+    fn to_model(&self, kp: &dyn KeyProvider) -> Result<TenantCert, sqlx::Error> {
+        let cert_key_pem = match (
+            &self.cert_key_ciphertext,
+            &self.cert_key_nonce,
+            self.cert_key_version,
+        ) {
+            (Some(ct), Some(nonce), Some(version)) => {
+                let nonce: [u8; crypto::NONCE_LEN] = nonce
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| crypto_to_sqlx(CryptoError::Decrypt))?;
+                let sealed = Sealed {
+                    ciphertext: ct.clone(),
+                    nonce,
+                    key_version: version as u32,
+                };
+                let plaintext = kp.open(&sealed).map_err(crypto_to_sqlx)?;
+                Some(
+                    String::from_utf8(plaintext)
+                        .map_err(|_| crypto_to_sqlx(CryptoError::NotUtf8))?,
+                )
+            }
+            _ => None,
+        };
+        Ok(TenantCert {
+            tenant_id: self.tenant_id.clone(),
+            cert_pem: self.cert_pem.clone(),
+            cert_key_pem,
+        })
+    }
+}
+
+/// Fetch one tenant's certificate content (`None` when the tenant is absent).
+pub async fn get_tenant_cert(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    tenant_id: &str,
+) -> Result<Option<TenantCert>, sqlx::Error> {
+    let row = sqlx::query_as!(
+        TenantCertRow,
+        r#"SELECT id as "tenant_id!", cert_pem, cert_key_ciphertext, cert_key_nonce,
+                  cert_key_version
+           FROM tenant WHERE id = ?"#,
+        tenant_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.to_model(kp)).transpose()
+}
+
+/// All tenants' certificate content (the loader overlays this onto the
+/// path-based `certs` map, content-first).
+pub async fn list_tenant_certs(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<Vec<TenantCert>, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        TenantCertRow,
+        r#"SELECT id as "tenant_id!", cert_pem, cert_key_ciphertext, cert_key_nonce,
+                  cert_key_version
+           FROM tenant ORDER BY id"#
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(|r| r.to_model(kp)).collect()
+}
+
+/// Write a tenant's certificate content. `None` fields clear the columns
+/// (explicit cert removal). The private key is sealed at the DB boundary —
+/// the caller passes plaintext, this function persists ciphertext only.
+pub async fn update_tenant_cert(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    cert: &TenantCert,
+) -> Result<(), sqlx::Error> {
+    let (ct, nonce, version) = match &cert.cert_key_pem {
+        Some(pem) => {
+            let sealed = kp.seal(pem.as_bytes()).map_err(crypto_to_sqlx)?;
+            (
+                Some(sealed.ciphertext),
+                Some(sealed.nonce.to_vec()),
+                Some(sealed.key_version as i64),
+            )
+        }
+        None => (None, None, None),
+    };
+    sqlx::query!(
+        "UPDATE tenant SET cert_pem = ?, cert_key_ciphertext = ?, cert_key_nonce = ?, \
+         cert_key_version = ? WHERE id = ?",
+        cert.cert_pem,
+        ct,
+        nonce,
+        version,
+        cert.tenant_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One-time backfill for migration 0007: tenants with legacy `cert_file` /
+/// `cert_key` paths but no stored content get their files read on this node
+/// and stored as content (so the DB becomes self-contained and the shared
+/// cert volume can be dropped). Best-effort: a failure is logged per tenant
+/// and never aborts startup — the path fallback keeps serving until the files
+/// become readable or the operator re-enters the cert via the admin API.
+pub async fn backfill_legacy_certs(pool: &SqlitePool, kp: &dyn KeyProvider) {
+    let tenants = match list_tenants(pool).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "cert backfill: list_tenants failed; skipping");
+            return;
+        }
+    };
+    let existing = match list_tenant_certs(pool, kp).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cert backfill: list_tenant_certs failed; skipping");
+            return;
+        }
+    };
+    let with_content: std::collections::HashSet<&str> = existing
+        .iter()
+        .filter(|c| c.cert_pem.is_some())
+        .map(|c| c.tenant_id.as_str())
+        .collect();
+
+    for t in tenants {
+        if with_content.contains(t.id.as_str()) {
+            continue;
+        }
+        let (Some(cert_path), Some(key_path)) = (&t.cert_file, &t.cert_key) else {
+            continue;
+        };
+        let (Ok(cert_bytes), Ok(key_bytes)) = (std::fs::read(cert_path), std::fs::read(key_path))
+        else {
+            tracing::warn!(
+                tenant = %t.id,
+                cert_path,
+                key_path,
+                "cert backfill: legacy cert paths not readable on this node; path fallback remains active"
+            );
+            continue;
+        };
+        let cert = TenantCert {
+            tenant_id: t.id.clone(),
+            cert_pem: Some(String::from_utf8_lossy(&cert_bytes).into_owned()),
+            cert_key_pem: Some(String::from_utf8_lossy(&key_bytes).into_owned()),
+        };
+        match update_tenant_cert(pool, kp, &cert).await {
+            Ok(()) => tracing::info!(tenant = %t.id, "cert backfill: legacy paths -> content"),
+            Err(e) => tracing::warn!(tenant = %t.id, error = %e, "cert backfill: store failed"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CRUD — TenantProvider
 // ---------------------------------------------------------------------------
 
@@ -891,4 +1080,245 @@ pub async fn delete_provider_key_binding(pool: &SqlitePool, id: &str) -> Result<
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config version metadata + full-table config restore (cluster P1/P2)
+// ---------------------------------------------------------------------------
+//
+// `config_meta` (migration 0008) holds control-plane bookkeeping; today the
+// standby replica's last-applied `config_version`. `restore_config` rebuilds
+// every config table from a snapshot in ONE transaction (standby replica
+// materialization, cluster P2) so a crash mid-restore never leaves a
+// half-config. It uses runtime-checked `sqlx::query` (like the sinks): the
+// statements run against a live migration-pinned DB and the tables are tiny.
+
+/// The stored last-applied config version (`None` when never set).
+pub async fn get_config_version(pool: &SqlitePool) -> Result<Option<u64>, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM config_meta WHERE key = 'config_version'")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(v,)| v.parse().ok()))
+}
+
+/// Persist the last-applied config version (upsert).
+pub async fn set_config_version(pool: &SqlitePool, version: u64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO config_meta (key, value) VALUES ('config_version', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(version.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Rebuild every config table from `cfg` (+ the fidelity rows) in a single
+/// transaction. Secrets are re-sealed at this boundary with `kp`.
+///
+/// Table order: parents first on insert (FK), children first on delete.
+pub async fn restore_config(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    cfg: &hydra_core::config::ConfigData,
+    provider_models: &[hydra_core::model::ProviderModel],
+    tenant_providers: &[hydra_core::model::TenantProvider],
+    tenant_models: &[hydra_core::model::TenantModel],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Wipe children before parents.
+    for table in [
+        "provider_key_binding",
+        "limit_role",
+        "tenant_model",
+        "tenant_provider",
+        "tenant",
+        "provider_key",
+        "provider_model",
+        "provider",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Providers.
+    for p in cfg.providers.values() {
+        sqlx::query(
+            "INSERT INTO provider (id, key, name, endpoint, weight, created_at, updated_at, \
+             max_concurrency, max_queue_depth, queue_wait_timeout_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&p.id)
+        .bind(&p.key)
+        .bind(&p.name)
+        .bind(&p.endpoint)
+        .bind(p.weight)
+        .bind(&p.created_at)
+        .bind(&p.updated_at)
+        .bind(p.max_concurrency.map(|v| v as i64))
+        .bind(p.max_queue_depth.map(|v| v as i64))
+        .bind(p.queue_wait_timeout_ms.map(|v| v as i64))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Provider models (fidelity rows — includes offline models).
+    for m in provider_models {
+        sqlx::query(
+            "INSERT INTO provider_model (id, key, name, provider_id, status) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&m.id)
+        .bind(&m.key)
+        .bind(&m.name)
+        .bind(&m.provider_id)
+        .bind(m.status)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Provider keys (sealed at the boundary).
+    for (provider_id, keys) in &cfg.provider_keys {
+        for api_key in keys {
+            let sealed = kp.seal(api_key.as_bytes()).map_err(crypto_to_sqlx)?;
+            let nonce: &[u8] = &sealed.nonce;
+            sqlx::query(
+                "INSERT INTO provider_key (id, provider_id, api_key_ciphertext, api_key_nonce, \
+                 key_version, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(gen_id_static())
+            .bind(provider_id)
+            .bind(sealed.ciphertext)
+            .bind(nonce)
+            .bind(sealed.key_version as i64)
+            .bind(now_static())
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    // Tenants (+ cert content columns).
+    for t in cfg.tenants_by_domain.values() {
+        sqlx::query(
+            "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&t.id)
+        .bind(&t.name)
+        .bind(&t.domain)
+        .bind(&t.auth_url)
+        .bind(&t.cert_key)
+        .bind(&t.cert_file)
+        .bind(t.enabled)
+        .bind(&t.created_at)
+        .bind(&t.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        // Cert content (migration 0007): sealed key, plaintext cert PEM.
+        let cert_meta = cfg.certs.get(&t.domain.to_lowercase());
+        if let Some(cm) = cert_meta {
+            if let Some(cert_pem) = &cm.cert_pem {
+                let (ct, nonce, version) = match &cm.cert_key_pem {
+                    Some(pem) => {
+                        let sealed = kp.seal(pem.as_bytes()).map_err(crypto_to_sqlx)?;
+                        (
+                            Some(sealed.ciphertext),
+                            Some(sealed.nonce.to_vec()),
+                            Some(sealed.key_version as i64),
+                        )
+                    }
+                    None => (None, None, None),
+                };
+                sqlx::query(
+                    "UPDATE tenant SET cert_pem = ?, cert_key_ciphertext = ?, \
+                     cert_key_nonce = ?, cert_key_version = ? WHERE id = ?",
+                )
+                .bind(cert_pem)
+                .bind(ct)
+                .bind(nonce)
+                .bind(version)
+                .bind(&t.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+    }
+
+    // Tenant provider / model grants (fidelity rows — ids preserved).
+    for tp in tenant_providers {
+        sqlx::query("INSERT INTO tenant_provider (id, tenant_id, provider_id) VALUES (?, ?, ?)")
+            .bind(&tp.id)
+            .bind(&tp.tenant_id)
+            .bind(&tp.provider_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for tm in tenant_models {
+        sqlx::query("INSERT INTO tenant_model (id, tenant_id, model_key) VALUES (?, ?, ?)")
+            .bind(&tm.id)
+            .bind(&tm.tenant_id)
+            .bind(&tm.model_key)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Limit roles.
+    for r in &cfg.limit_roles {
+        sqlx::query(
+            "INSERT INTO limit_role (id, name, matching_key, matching_model, matching_tenant, \
+             matching_provider, limit_count, limit_token, window, enabled, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&r.id)
+        .bind(&r.name)
+        .bind(&r.matching_key)
+        .bind(&r.matching_model)
+        .bind(&r.matching_tenant)
+        .bind(&r.matching_provider)
+        .bind(r.limit_count)
+        .bind(r.limit_token)
+        .bind(&r.window)
+        .bind(r.enabled)
+        .bind(&r.created_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // api-key prefix bindings.
+    for b in &cfg.key_prefix_bindings {
+        sqlx::query(
+            "INSERT INTO provider_key_binding (id, key_prefix, provider_id, enabled, created_at, \
+             updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&b.id)
+        .bind(&b.key_prefix)
+        .bind(&b.provider_id)
+        .bind(b.enabled)
+        .bind(&b.created_at)
+        .bind(&b.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `gen_id`-style id for restore (provider keys need fresh ids). Mirrors the
+/// admin handler helper without depending on it.
+fn gen_id_static() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("id-{nanos:x}")
+}
+
+/// `now_ts`-style timestamp for restore.
+fn now_static() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }

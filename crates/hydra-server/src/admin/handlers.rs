@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::AdminState;
 use crate::admin::metrics;
+use crate::cluster::snapshot::SnapshotWire;
 use crate::http::AuthChecker;
 
 /// A fully-built HTTP response (the `ServeHttp` return type).
@@ -163,7 +164,7 @@ fn gen_id() -> String {
 }
 
 /// Read the full request body into a vec (empty for bodyless requests).
-async fn read_body(session: &mut ServerSession) -> Vec<u8> {
+pub(super) async fn read_body(session: &mut ServerSession) -> Vec<u8> {
     let mut buf = Vec::new();
     while let Ok(Some(chunk)) = session.read_request_body().await {
         buf.extend_from_slice(&chunk);
@@ -196,7 +197,7 @@ pub(super) async fn provider_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_providers(&state.pool).await {
+        match crate::db::list_providers(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -216,7 +217,7 @@ pub(super) async fn provider_collection(
         if p.updated_at.is_empty() {
             p.updated_at = ts;
         }
-        match crate::db::insert_provider(&state.pool, &p).await {
+        match crate::db::insert_provider(state.db(), &p).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -235,7 +236,7 @@ pub(super) async fn provider_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_provider(&state.pool, id).await {
+        "GET" => match crate::db::get_provider(state.db(), id).await {
             Ok(p) => ok_json(200, &p),
             Err(e) if is_not_found(&e) => {
                 err_json(404, "not_found", "provider not found", trace_id)
@@ -250,11 +251,11 @@ pub(super) async fn provider_item(
             };
             p.id = id.to_string();
             p.updated_at = now_ts();
-            match crate::db::update_provider(&state.pool, &p).await {
+            match crate::db::update_provider(state.db(), &p).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_provider(&state.pool, id).await {
+            match crate::db::get_provider(state.db(), id).await {
                 Ok(p) => {
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &p)
@@ -262,7 +263,7 @@ pub(super) async fn provider_item(
                 Err(_) => err_json(404, "not_found", "provider not found", trace_id),
             }
         }
-        "DELETE" => match crate::db::delete_provider(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_provider(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -284,7 +285,7 @@ pub(super) async fn provider_model_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_provider_models(&state.pool).await {
+        match crate::db::list_provider_models(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -294,7 +295,7 @@ pub(super) async fn provider_model_collection(
             Ok(m) => m,
             Err(r) => return r,
         };
-        match crate::db::insert_provider_model(&state.pool, &m).await {
+        match crate::db::insert_provider_model(state.db(), &m).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -313,7 +314,7 @@ pub(super) async fn provider_model_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_provider_model(&state.pool, id).await {
+        "GET" => match crate::db::get_provider_model(state.db(), id).await {
             Ok(m) => ok_json(200, &m),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "model not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
@@ -325,11 +326,11 @@ pub(super) async fn provider_model_item(
                 Err(r) => return r,
             };
             m.id = id.to_string();
-            match crate::db::update_provider_model(&state.pool, &m).await {
+            match crate::db::update_provider_model(state.db(), &m).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_provider_model(&state.pool, id).await {
+            match crate::db::get_provider_model(state.db(), id).await {
                 Ok(m) => {
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &m)
@@ -337,7 +338,7 @@ pub(super) async fn provider_model_item(
                 Err(_) => err_json(404, "not_found", "model not found", trace_id),
             }
         }
-        "DELETE" => match crate::db::delete_provider_model(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_provider_model(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -364,7 +365,7 @@ pub(super) async fn provider_key_collection(
     // leak must not pull every upstream key.
     let _reveal = query.is_some_and(|q| q.split('&').any(|kv| kv == "reveal=1"));
     if method == "GET" {
-        match crate::db::list_provider_keys(&state.pool, state.key_provider.as_ref()).await {
+        match crate::db::list_provider_keys(state.db(), state.key_provider.as_ref()).await {
             Ok(rows) => {
                 let out: Vec<ProviderKey> = rows
                     .into_iter()
@@ -389,7 +390,7 @@ pub(super) async fn provider_key_collection(
         if k.created_at.is_empty() {
             k.created_at = now_ts();
         }
-        match crate::db::insert_provider_key(&state.pool, state.key_provider.as_ref(), &k).await {
+        match crate::db::insert_provider_key(state.db(), state.key_provider.as_ref(), &k).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -411,7 +412,7 @@ pub(super) async fn provider_key_item(
 ) -> Resp {
     match method {
         "GET" => {
-            match crate::db::get_provider_key(&state.pool, state.key_provider.as_ref(), id).await {
+            match crate::db::get_provider_key(state.db(), state.key_provider.as_ref(), id).await {
                 Ok(mut k) => {
                     k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
                     ok_json(200, &k)
@@ -432,8 +433,8 @@ pub(super) async fn provider_key_item(
             if k.created_at.is_empty() {
                 k.created_at = now_ts();
             }
-            let _ = crate::db::delete_provider_key(&state.pool, id).await;
-            match crate::db::insert_provider_key(&state.pool, state.key_provider.as_ref(), &k).await
+            let _ = crate::db::delete_provider_key(state.db(), id).await;
+            match crate::db::insert_provider_key(state.db(), state.key_provider.as_ref(), &k).await
             {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
@@ -442,7 +443,7 @@ pub(super) async fn provider_key_item(
             k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
             ok_json(200, &k)
         }
-        "DELETE" => match crate::db::delete_provider_key(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_provider_key(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -456,6 +457,133 @@ pub(super) async fn provider_key_item(
 // ===========================================================================
 // Tenants
 // ===========================================================================
+// Tenant CRUD (design §13.2)
+// ===========================================================================
+
+/// Tenant create/update body: the existing [`Tenant`] fields (legacy cert
+/// paths included, kept for read compatibility) plus the migration-0007 PEM
+/// certificate content fields. The private key PEM is consumed here and
+/// sealed at the DB boundary; it is **never** echoed back in responses.
+#[derive(Deserialize)]
+struct TenantUpsert {
+    #[serde(flatten)]
+    tenant: Tenant,
+    /// Public cert PEM (content mode, primary). `Some("")` clears the cert.
+    #[serde(default)]
+    cert_pem: Option<String>,
+    /// Private key PEM (content mode, primary). Required when `cert_pem` set.
+    #[serde(default)]
+    cert_key_pem: Option<String>,
+}
+
+/// Resolve and persist a tenant's certificate per the upsert body (cluster
+/// P0a: the DB becomes self-contained — PEM content wins, legacy paths are
+/// converted at write time so the shared cert volume can be dropped).
+///
+/// Rules:
+/// - `cert_pem` non-empty → store content (seal the key); missing `cert_key_pem` → 400;
+/// - `cert_pem` empty string → explicit removal (clear the cert columns);
+/// - `cert_key_pem` without `cert_pem` → 400;
+/// - neither given → legacy `cert_file`/`cert_key` paths (already persisted
+///   in the tenant row by the caller): convert by reading the files **on this
+///   node**; unreadable → 400 with a hint to switch to PEM content.
+async fn apply_tenant_cert(
+    state: &AdminState,
+    tenant_id: &str,
+    cert_pem: &Option<String>,
+    cert_key_pem: &Option<String>,
+    trace_id: &str,
+) -> Result<(), Resp> {
+    match (
+        cert_pem.as_deref().map(str::trim),
+        cert_key_pem.as_deref().map(str::trim),
+    ) {
+        // Explicit removal: `cert_pem: ""`.
+        (Some(""), _) => {
+            let cert = crate::db::TenantCert {
+                tenant_id: tenant_id.to_string(),
+                cert_pem: None,
+                cert_key_pem: None,
+            };
+            crate::db::update_tenant_cert(state.db(), state.key_provider.as_ref(), &cert)
+                .await
+                .map_err(|e| db_err_resp(e, trace_id))?;
+        }
+        // Content mode: non-empty `cert_pem` (+ required `cert_key_pem`).
+        // Note: `pem`/`key` above are trimmed only for the emptiness check;
+        // the stored content is the RAW body (a trailing newline is PEM-normal
+        // and must round-trip untouched).
+        (Some(_), Some(key)) => {
+            if key.is_empty() {
+                return Err(err_json(
+                    400,
+                    "missing_required_field",
+                    "cert_key_pem is required when cert_pem is set",
+                    trace_id,
+                ));
+            }
+            let cert = crate::db::TenantCert {
+                tenant_id: tenant_id.to_string(),
+                cert_pem: cert_pem.clone(),
+                cert_key_pem: cert_key_pem.clone(),
+            };
+            crate::db::update_tenant_cert(state.db(), state.key_provider.as_ref(), &cert)
+                .await
+                .map_err(|e| db_err_resp(e, trace_id))?;
+        }
+        (Some(_), None) => {
+            return Err(err_json(
+                400,
+                "missing_required_field",
+                "cert_key_pem is required when cert_pem is set",
+                trace_id,
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(err_json(
+                400,
+                "missing_required_field",
+                "cert_pem is required when cert_key_pem is set",
+                trace_id,
+            ));
+        }
+        (None, None) => {
+            // Legacy path form: convert at write time (the tenant row already
+            // carries the paths — the caller persisted them before this call).
+            let t = crate::db::get_tenant(state.db(), tenant_id)
+                .await
+                .map_err(|e| db_err_resp(e, trace_id))?;
+            if let (Some(cert_path), Some(key_path)) = (&t.cert_file, &t.cert_key) {
+                match (std::fs::read(cert_path), std::fs::read(key_path)) {
+                    (Ok(cert_bytes), Ok(key_bytes)) => {
+                        let cert = crate::db::TenantCert {
+                            tenant_id: tenant_id.to_string(),
+                            cert_pem: Some(String::from_utf8_lossy(&cert_bytes).into_owned()),
+                            cert_key_pem: Some(String::from_utf8_lossy(&key_bytes).into_owned()),
+                        };
+                        crate::db::update_tenant_cert(
+                            state.db(),
+                            state.key_provider.as_ref(),
+                            &cert,
+                        )
+                        .await
+                        .map_err(|e| db_err_resp(e, trace_id))?;
+                    }
+                    _ => {
+                        return Err(err_json(
+                            400,
+                            "cert_file_unreadable",
+                            "cert_file/cert_key paths given but not readable on this node; \
+                             provide cert_pem/cert_key_pem content instead",
+                            trace_id,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(super) async fn tenant_collection(
     state: &AdminState,
@@ -464,16 +592,17 @@ pub(super) async fn tenant_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_tenants(&state.pool).await {
+        match crate::db::list_tenants(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
         let body = read_body(session).await;
-        let mut t: Tenant = match parse_body(&body, trace_id) {
-            Ok(t) => t,
+        let up: TenantUpsert = match parse_body(&body, trace_id) {
+            Ok(u) => u,
             Err(r) => return r,
         };
+        let mut t = up.tenant;
         // auth_url is mandatory (design §11.1): empty ⇒ 400 (NOT NULL only
         // catches SQL NULL, not the empty string).
         if t.auth_url.trim().is_empty() {
@@ -494,9 +623,16 @@ pub(super) async fn tenant_collection(
         if t.updated_at.is_empty() {
             t.updated_at = ts;
         }
-        match crate::db::insert_tenant(&state.pool, &t).await {
+        match crate::db::insert_tenant(state.db(), &t).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
+        }
+        // Certificate content (migration 0007): PEM wins, legacy paths are
+        // converted here so the DB is self-contained (no shared cert volume).
+        if let Err(resp) =
+            apply_tenant_cert(state, &t.id, &up.cert_pem, &up.cert_key_pem, trace_id).await
+        {
+            return resp;
         }
         reload_best_effort(state, trace_id).await;
         ok_json(201, &t)
@@ -513,24 +649,31 @@ pub(super) async fn tenant_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_tenant(&state.pool, id).await {
+        "GET" => match crate::db::get_tenant(state.db(), id).await {
             Ok(t) => ok_json(200, &t),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "tenant not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
             let body = read_body(session).await;
-            let mut t: Tenant = match parse_body(&body, trace_id) {
-                Ok(t) => t,
+            let up: TenantUpsert = match parse_body(&body, trace_id) {
+                Ok(u) => u,
                 Err(r) => return r,
             };
+            let mut t = up.tenant;
             t.id = id.to_string();
             t.updated_at = now_ts();
-            match crate::db::update_tenant(&state.pool, &t).await {
+            match crate::db::update_tenant(state.db(), &t).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_tenant(&state.pool, id).await {
+            // Certificate content (migration 0007) — same rules as POST.
+            if let Err(resp) =
+                apply_tenant_cert(state, &t.id, &up.cert_pem, &up.cert_key_pem, trace_id).await
+            {
+                return resp;
+            }
+            match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &t)
@@ -538,7 +681,7 @@ pub(super) async fn tenant_item(
                 Err(_) => err_json(404, "not_found", "tenant not found", trace_id),
             }
         }
-        "DELETE" => match crate::db::delete_tenant(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_tenant(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -560,7 +703,7 @@ pub(super) async fn tenant_provider_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_tenant_providers(&state.pool).await {
+        match crate::db::list_tenant_providers(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -573,7 +716,7 @@ pub(super) async fn tenant_provider_collection(
         if tp.id.is_empty() {
             tp.id = gen_id();
         }
-        match crate::db::insert_tenant_provider(&state.pool, &tp).await {
+        match crate::db::insert_tenant_provider(state.db(), &tp).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -591,14 +734,14 @@ pub(super) async fn tenant_provider_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_tenant_provider(&state.pool, id).await {
+        "GET" => match crate::db::get_tenant_provider(state.db(), id).await {
             Ok(tp) => ok_json(200, &tp),
             Err(e) if is_not_found(&e) => {
                 err_json(404, "not_found", "tenant_provider not found", trace_id)
             }
             Err(e) => db_err_resp(e, trace_id),
         },
-        "DELETE" => match crate::db::delete_tenant_provider(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_tenant_provider(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -616,7 +759,7 @@ pub(super) async fn tenant_model_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_tenant_models(&state.pool).await {
+        match crate::db::list_tenant_models(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -629,7 +772,7 @@ pub(super) async fn tenant_model_collection(
         if tm.id.is_empty() {
             tm.id = gen_id();
         }
-        match crate::db::insert_tenant_model(&state.pool, &tm).await {
+        match crate::db::insert_tenant_model(state.db(), &tm).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -647,14 +790,14 @@ pub(super) async fn tenant_model_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_tenant_model(&state.pool, id).await {
+        "GET" => match crate::db::get_tenant_model(state.db(), id).await {
             Ok(tm) => ok_json(200, &tm),
             Err(e) if is_not_found(&e) => {
                 err_json(404, "not_found", "tenant_model not found", trace_id)
             }
             Err(e) => db_err_resp(e, trace_id),
         },
-        "DELETE" => match crate::db::delete_tenant_model(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_tenant_model(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -676,7 +819,7 @@ pub(super) async fn limit_role_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_limit_roles(&state.pool).await {
+        match crate::db::list_limit_roles(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -692,7 +835,7 @@ pub(super) async fn limit_role_collection(
         if r.created_at.is_empty() {
             r.created_at = now_ts();
         }
-        match crate::db::insert_limit_role(&state.pool, &r).await {
+        match crate::db::insert_limit_role(state.db(), &r).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -711,7 +854,7 @@ pub(super) async fn limit_role_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_limit_role(&state.pool, id).await {
+        "GET" => match crate::db::get_limit_role(state.db(), id).await {
             Ok(r) => ok_json(200, &r),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "role not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
@@ -723,11 +866,11 @@ pub(super) async fn limit_role_item(
                 Err(resp) => return resp,
             };
             r.id = id.to_string();
-            match crate::db::update_limit_role(&state.pool, &r).await {
+            match crate::db::update_limit_role(state.db(), &r).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_limit_role(&state.pool, id).await {
+            match crate::db::get_limit_role(state.db(), id).await {
                 Ok(r) => {
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &r)
@@ -735,7 +878,7 @@ pub(super) async fn limit_role_item(
                 Err(_) => err_json(404, "not_found", "role not found", trace_id),
             }
         }
-        "DELETE" => match crate::db::delete_limit_role(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_limit_role(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -757,7 +900,7 @@ pub(super) async fn provider_key_binding_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_provider_key_bindings(&state.pool).await {
+        match crate::db::list_provider_key_bindings(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -785,7 +928,7 @@ pub(super) async fn provider_key_binding_collection(
         if b.updated_at.is_empty() {
             b.updated_at = ts;
         }
-        match crate::db::insert_provider_key_binding(&state.pool, &b).await {
+        match crate::db::insert_provider_key_binding(state.db(), &b).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -804,7 +947,7 @@ pub(super) async fn provider_key_binding_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_provider_key_binding(&state.pool, id).await {
+        "GET" => match crate::db::get_provider_key_binding(state.db(), id).await {
             Ok(b) => ok_json(200, &b),
             Err(e) if is_not_found(&e) => {
                 err_json(404, "not_found", "provider_key_binding not found", trace_id)
@@ -827,11 +970,11 @@ pub(super) async fn provider_key_binding_item(
             }
             b.id = id.to_string();
             b.updated_at = now_ts();
-            match crate::db::update_provider_key_binding(&state.pool, &b).await {
+            match crate::db::update_provider_key_binding(state.db(), &b).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_provider_key_binding(&state.pool, id).await {
+            match crate::db::get_provider_key_binding(state.db(), id).await {
                 Ok(b) => {
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &b)
@@ -839,7 +982,7 @@ pub(super) async fn provider_key_binding_item(
                 Err(_) => err_json(404, "not_found", "provider_key_binding not found", trace_id),
             }
         }
-        "DELETE" => match crate::db::delete_provider_key_binding(&state.pool, id).await {
+        "DELETE" => match crate::db::delete_provider_key_binding(state.db(), id).await {
             Ok(()) => {
                 reload_best_effort(state, trace_id).await;
                 empty(204)
@@ -871,26 +1014,50 @@ pub(super) async fn auth_cache_invalidate(
     session: &mut ServerSession,
     trace_id: &str,
 ) -> Resp {
+    // An empty body means "invalidate everything" — tolerate it instead of
+    // failing the parse (curl -X DELETE with no body must work).
     let body = read_body(session).await;
-    let req: InvalidateRequest = match parse_body(&body, trace_id) {
-        Ok(r) => r,
-        Err(r) => return r,
+    let req: InvalidateRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        InvalidateRequest {
+            tenant_id: None,
+            api_keys: None,
+        }
+    } else {
+        match parse_body(&body, trace_id) {
+            Ok(r) => r,
+            Err(r) => return r,
+        }
     };
     let count = match (req.tenant_id.as_deref(), req.api_keys.as_deref()) {
-        (Some(tid), Some(keys)) => state.auth.invalidate(tid, keys),
-        (Some(tid), None) => state.auth.invalidate_tenant(tid),
+        (Some(tid), Some(keys)) => state.auth.invalidate(tid, keys).await,
+        (Some(tid), None) => state.auth.invalidate_tenant(tid).await,
         (None, Some(keys)) => {
             // No tenant: invalidate by api_key across every known tenant
             // (design §11.7 "跨租户匹配").
             let snap = state.store.snapshot();
             let mut total = 0usize;
             for t in snap.tenants_by_domain.values() {
-                total += state.auth.invalidate(&t.id, keys);
+                total += state.auth.invalidate(&t.id, keys).await;
             }
             total
         }
         (None, None) => 0,
     };
+    // Broadcast the invalidation cluster-wide (P4): every node drops the
+    // affected local cache entries via the stream; the L2 entries they
+    // re-hydrate from are gone too (they were deleted below on this node).
+    #[cfg(feature = "cluster-redis")]
+    if let Some(stream) = &state.invalidation {
+        if let Err(e) = stream
+            .publish(
+                req.tenant_id.clone(),
+                req.api_keys.clone().unwrap_or_default(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "invalidation publish failed");
+        }
+    }
     // Refresh the cache-size gauge after mutation.
     metrics::record_auth_cache_size(state.auth.cache().len());
     ok_json(
@@ -983,12 +1150,16 @@ struct ReloadBody {
 
 pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
     let snap = state.store.snapshot();
-    let (db_status, providers_count) = match crate::db::list_providers(&state.pool).await {
-        Ok(rows) => ("ok", rows.len()),
-        Err(e) => {
-            tracing::warn!(target: "hydra::admin", trace_id, error = %e, "health db probe failed");
-            ("error", snap.providers.len())
-        }
+    // Edge nodes have no local DB (cluster P0b) — skip the DB probe.
+    let (db_status, providers_count) = match &state.pool {
+        Some(pool) => match crate::db::list_providers(pool).await {
+            Ok(rows) => ("ok", rows.len()),
+            Err(e) => {
+                tracing::warn!(target: "hydra::admin", trace_id, error = %e, "health db probe failed");
+                ("error", snap.providers.len())
+            }
+        },
+        None => ("n/a", snap.providers.len()),
     };
     ok_json(
         200,
@@ -1000,6 +1171,84 @@ pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
             providers: providers_count,
         },
     )
+}
+
+// ===========================================================================
+// Internal control plane (cluster P1) — snapshot distribution
+// ===========================================================================
+
+/// Control-channel response: `snapshot` is present only when the caller's
+/// `since` is older than the current version.
+#[derive(Serialize)]
+struct InternalControlResponse {
+    version: u64,
+    snapshot: Option<SnapshotWire>,
+}
+
+/// `GET /api/v1/internal/control?since=N` (cluster-token gated): serve the
+/// current config snapshot (secrets sealed, versioned) to edge/standby
+/// nodes. `snapshot` is `null` when the caller is already current.
+pub(super) async fn internal_control(
+    state: &AdminState,
+    query: Option<&str>,
+    trace_id: &str,
+) -> Resp {
+    let since: u64 = query
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("since=")))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let current = state.store.version();
+    if since >= current {
+        return ok_json(
+            200,
+            &InternalControlResponse {
+                version: current,
+                snapshot: None,
+            },
+        );
+    }
+    let cfg: hydra_core::config::ConfigData =
+        hydra_core::config::ConfigData::clone(&state.store.snapshot());
+    match SnapshotWire::build(current, cfg, state.db(), state.key_provider.as_ref()).await {
+        Ok(snapshot) => ok_json(
+            200,
+            &InternalControlResponse {
+                version: current,
+                snapshot: Some(snapshot),
+            },
+        ),
+        Err(e) => err_json(
+            500,
+            "snapshot_build_failed",
+            &format!("control snapshot build failed: {e}"),
+            trace_id,
+        ),
+    }
+}
+
+/// `GET /healthz/leader` (cluster P2): 200 while this node holds the leader
+/// lease, 503 on standby, 404 on non-candidate nodes (`all` / edge).
+pub(super) fn leader_health(state: &AdminState, trace_id: &str) -> Resp {
+    match &state.leader_ready {
+        Some(f) if f() => ok_json(200, &LeaderHealth { leader: true }),
+        Some(_) => err_json(
+            503,
+            "not_leader",
+            "this node is not the active leader",
+            trace_id,
+        ),
+        None => err_json(
+            404,
+            "not_found",
+            "leader health is only available on leader-candidate nodes",
+            trace_id,
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct LeaderHealth {
+    leader: bool,
 }
 
 pub(super) async fn reload(state: &AdminState, trace_id: &str) -> Resp {

@@ -133,7 +133,29 @@ pub fn resolve_certs(certs: &HashMap<String, CertMeta>) -> HashMap<String, Resol
 
 /// Resolve a single tenant's cert. Kept separate so the caller can isolate
 /// failures per-tenant.
+///
+/// **Content-first (migration 0007 / cluster P0a):** when the snapshot carries
+/// `cert_pem` / `cert_key_pem` (the multi-node form — PEM content shipped via
+/// the config snapshot, no files), parse directly from memory with zero file
+/// I/O. Legacy pre-0007 rows fall back to reading `cert_file` / `cert_key`
+/// paths (single-node with files on disk).
 fn resolve_one(domain: &str, meta: &CertMeta) -> Result<ResolvedCert, CertError> {
+    if let (Some(cert_pem), Some(key_pem)) = (&meta.cert_pem, &meta.cert_key_pem) {
+        let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| CertError::ParseCert {
+            domain: domain.to_string(),
+            reason: e.to_string(),
+        })?;
+        let key =
+            PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| CertError::ParseKey {
+                domain: domain.to_string(),
+                reason: e.to_string(),
+            })?;
+        return Ok(ResolvedCert {
+            cert,
+            key: Arc::new(key),
+        });
+    }
+
     let cert_path = meta
         .cert_file
         .as_deref()
@@ -416,6 +438,8 @@ mod tests {
                 domain: "acme.com".to_string(),
                 cert_file: Some(format!("{fixtures}/acme.crt")),
                 cert_key: Some(format!("{fixtures}/acme.key")),
+                cert_pem: None,
+                cert_key_pem: None,
             },
         );
         certs.insert(
@@ -424,6 +448,8 @@ mod tests {
                 domain: "broken.example".to_string(),
                 cert_file: Some(format!("{fixtures}/bad.crt")),
                 cert_key: Some(format!("{fixtures}/acme.key")),
+                cert_pem: None,
+                cert_key_pem: None,
             },
         );
         certs.insert(
@@ -432,6 +458,8 @@ mod tests {
                 domain: "nopath.example".to_string(),
                 cert_file: None,
                 cert_key: None,
+                cert_pem: None,
+                cert_key_pem: None,
             },
         );
 
@@ -458,6 +486,8 @@ mod tests {
                 domain: "acme.com".to_string(),
                 cert_file: Some(format!("{fixtures}/acme.crt")),
                 cert_key: Some(format!("{fixtures}/acme.key")),
+                cert_pem: None,
+                cert_key_pem: None,
             },
         );
         let store = HydraCertStore::new(None);
@@ -471,5 +501,47 @@ mod tests {
         assert!(store.lookup("acme.com").is_some());
         // Unknown domain misses (no default).
         assert!(store.lookup("evil.example").is_none());
+    }
+
+    #[test]
+    fn resolve_certs_content_first_no_files() {
+        // Migration 0007 form: PEM content shipped in the snapshot, zero file
+        // I/O. This is the multi-node (shared-volume-free) resolution path.
+        let fixtures = env!("CARGO_MANIFEST_DIR").to_string() + "/tests/fixtures";
+        let cert_pem =
+            std::fs::read_to_string(format!("{fixtures}/acme.crt")).expect("read fixture cert");
+        let key_pem =
+            std::fs::read_to_string(format!("{fixtures}/acme.key")).expect("read fixture key");
+
+        let mut certs = HashMap::new();
+        certs.insert(
+            "acme.com".to_string(),
+            CertMeta {
+                domain: "acme.com".to_string(),
+                cert_file: None,
+                cert_key: None,
+                cert_pem: Some(cert_pem),
+                cert_key_pem: Some(key_pem),
+            },
+        );
+        // A content tenant whose PEM is garbage must be isolated, not fatal.
+        certs.insert(
+            "broken.example".to_string(),
+            CertMeta {
+                domain: "broken.example".to_string(),
+                cert_file: None,
+                cert_key: None,
+                cert_pem: Some("not a pem".to_string()),
+                cert_key_pem: Some("not a key".to_string()),
+            },
+        );
+
+        let out = resolve_certs(&certs);
+        assert!(out.contains_key("acme.com"), "content tenant resolves");
+        assert!(
+            !out.contains_key("broken.example"),
+            "garbage content PEM is skipped, not propagated"
+        );
+        assert_eq!(out.len(), 1, "only the good content tenant remains");
     }
 }

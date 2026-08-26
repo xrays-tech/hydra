@@ -351,6 +351,8 @@ async fn t6_3_single_source_shared_arcswap() {
             domain: "acme.com".to_string(),
             cert_file: Some(fixture("acme.crt")),
             cert_key: Some(fixture("acme.key")),
+            cert_pem: None,
+            cert_key_pem: None,
         },
     );
     store.resolve_and_store(&certs);
@@ -384,6 +386,8 @@ async fn t6_4_pem_parse_failure_isolated() {
             domain: "acme.com".to_string(),
             cert_file: Some(fixture("acme.crt")),
             cert_key: Some(fixture("acme.key")),
+            cert_pem: None,
+            cert_key_pem: None,
         },
     );
     // Bad tenant: garbage cert PEM (the key is valid, but the cert isn't).
@@ -393,6 +397,8 @@ async fn t6_4_pem_parse_failure_isolated() {
             domain: "broken.example".to_string(),
             cert_file: Some(fixture("bad.crt")),
             cert_key: Some(fixture("acme.key")),
+            cert_pem: None,
+            cert_key_pem: None,
         },
     );
     // Tenant missing paths entirely.
@@ -402,6 +408,8 @@ async fn t6_4_pem_parse_failure_isolated() {
             domain: "nopath.example".to_string(),
             cert_file: None,
             cert_key: None,
+            cert_pem: None,
+            cert_key_pem: None,
         },
     );
 

@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"tenant_id!\", cert_pem, cert_key_ciphertext, cert_key_nonce,\n                  cert_key_version\n           FROM tenant WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "tenant_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "cert_pem",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "cert_key_ciphertext",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "cert_key_nonce",
+        "ordinal": 3,
+        "type_info": "Blob"
+      },
+      {
+        "name": "cert_key_version",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "4bb637bc40f6a6d1ccdcb97f78bb18e93bfddc3d7987057eb6c4be4674ac5d2b"
+}

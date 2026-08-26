@@ -132,6 +132,13 @@ integration/          Python CRUD 测试套件 + e2e 代理测试 + mock LLM/aut
 docs/                 design.md、ops.md、dev-plan.md、架构分析
 ```
 
+## 集群模式（Cluster Mode）
+
+单节点零依赖；集群 = `HYDRA_ROLE=leader|edge` + Redis（唯一外置依赖），
+K8s/k3s 无关、自维持（自动选举/故障切换/加入退出/自愈）。
+详见 **[`docs/cluster.md`](docs/cluster.md)** 与
+[`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml)。
+
 ## 更多
 
 - 设计与架构：[`docs/design.md`](docs/design.md)

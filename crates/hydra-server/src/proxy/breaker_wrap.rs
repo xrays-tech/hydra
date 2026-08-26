@@ -18,6 +18,9 @@ use dashmap::DashSet;
 use hydra_core::breaker::{BreakerConfig, BreakerView};
 use tracing::{debug, info, warn};
 
+/// Cluster-vote hook type (P4): fired on local trip / revive.
+pub type ClusterHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Concurrent circuit-breaker: lock-free dead-set + per-provider consecutive
 /// failure counts (design §8.4).
 ///
@@ -27,9 +30,19 @@ use tracing::{debug, info, warn};
 /// probe task (see [`probe_task`]) calls `on_success` to recover a dead
 /// provider after a real HTTP/TCP probe succeeds.
 pub struct CircuitBreaker {
+    /// Locally-tripped providers (this node's own consecutive failures).
     dead: DashSet<String>,
+    /// Cluster-wide dead providers (shared votes, synced from Redis, P4).
+    cluster_dead: DashSet<String>,
     fails: DashMap<String, u32>,
     threshold: u32,
+    /// Optional hook fired when a provider enters the local dead-set (the
+    /// cluster votes it dead, P4). Sync `Fn`; async work is spawned by the
+    /// hook body.
+    on_trip: Option<ClusterHook>,
+    /// Optional hook fired when a provider is revived locally (the node's
+    /// vote is withdrawn, P4).
+    on_revive: Option<ClusterHook>,
 }
 
 impl CircuitBreaker {
@@ -40,8 +53,35 @@ impl CircuitBreaker {
     pub fn new(cfg: BreakerConfig) -> Self {
         Self {
             dead: DashSet::new(),
+            cluster_dead: DashSet::new(),
             fails: DashMap::new(),
             threshold: cfg.threshold,
+            on_trip: None,
+            on_revive: None,
+        }
+    }
+
+    /// Wire the cluster vote hooks (P4): fired on local trip / revive.
+    pub fn set_cluster_hooks(
+        &mut self,
+        on_trip: Option<ClusterHook>,
+        on_revive: Option<ClusterHook>,
+    ) {
+        self.on_trip = on_trip;
+        self.on_revive = on_revive;
+    }
+
+    /// Reconcile the cluster-wide dead set from the shared votes (P4):
+    /// providers with a live cluster vote are excluded from candidates even
+    /// before this node trips locally. Providers whose votes lapsed are
+    /// removed.
+    pub fn apply_cluster_dead(&self, providers: &std::collections::HashSet<String>) {
+        self.cluster_dead.retain(|p| providers.contains(p));
+        for p in providers {
+            if !self.cluster_dead.contains(p) {
+                self.cluster_dead.insert(p.clone());
+                crate::admin::metrics::record_breaker_dead(p, 1);
+            }
         }
     }
 
@@ -70,6 +110,10 @@ impl CircuitBreaker {
                     threshold = self.threshold,
                     "circuit breaker OPENED for provider"
                 );
+                // Cluster vote (P4): tell every node this provider is dead.
+                if let Some(hook) = &self.on_trip {
+                    hook(provider_id);
+                }
             }
         } else {
             debug!(
@@ -94,25 +138,45 @@ impl CircuitBreaker {
                 provider = provider_id,
                 "circuit breaker CLOSED (provider revived)"
             );
+            // Withdraw the cluster vote (P4).
+            if let Some(hook) = &self.on_revive {
+                hook(provider_id);
+            }
         }
     }
 
-    /// Whether `provider_id` is currently dead (excluded from candidates).
+    /// Whether `provider_id` is currently dead (excluded from candidates):
+    /// locally tripped OR voted dead cluster-wide (P4).
     #[must_use]
     pub fn is_dead(&self, provider_id: &str) -> bool {
-        self.dead.contains(provider_id)
+        self.dead.contains(provider_id) || self.cluster_dead.contains(provider_id)
     }
 
-    /// Snapshot of the dead-set (for introspection / metrics).
+    /// The LOCALLY-tripped providers only (the node's own votes; the cluster
+    /// heartbeat must re-vote based on this, not on the cluster view — else a
+    /// single vote would keep itself alive forever).
+    #[must_use]
+    pub fn locally_dead_providers(&self) -> Vec<String> {
+        self.dead.iter().map(|v| v.clone()).collect()
+    }
+
+    /// Snapshot of the dead-set (local ∪ cluster, for introspection / probes).
     #[must_use]
     pub fn dead_providers(&self) -> Vec<String> {
-        self.dead.iter().map(|v| v.clone()).collect()
+        let mut out: Vec<String> = self.dead.iter().map(|v| v.clone()).collect();
+        for p in self.cluster_dead.iter() {
+            if !out.contains(&*p) {
+                out.push(p.clone());
+            }
+        }
+        out
     }
 
     /// Remove breaker entries for providers no longer in the config (called on
     /// reload by the shell to prune deleted providers, §8.4).
     pub fn prune_to(&self, live_provider_ids: &std::collections::HashSet<String>) {
         self.dead.retain(|p| live_provider_ids.contains(p));
+        self.cluster_dead.retain(|p| live_provider_ids.contains(p));
         self.fails.retain(|p, _| live_provider_ids.contains(p));
     }
 }
@@ -202,7 +266,11 @@ pub async fn probe_task(
 async fn probe_one(client: &reqwest::Client, endpoint: &str) -> bool {
     let url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
     match client.get(&url).send().await {
-        Ok(_resp) => true,
+        // Only a healthy response revives the provider. A 5xx (or anything
+        // >= 500) means the upstream is still failing — reviving on any
+        // response made a 500-ing provider flap: trip → probe "revives" it
+        // seconds later → 5 more failures → trip again.
+        Ok(resp) => resp.status().as_u16() < 500,
         Err(_) => {
             // HTTP probe failed — try a bare TCP connect as a last resort.
             tcp_probe(endpoint).await

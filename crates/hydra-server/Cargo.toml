@@ -92,6 +92,14 @@ server = ["db", "http-client", "proxy", "tls-boringssl"]
 # the active one is chosen at runtime by HYDRA_USAGE_SINK.
 usage-clickhouse = ["dep:base64"]
 
+# Redis backbone (cluster P2+): leader lease, shared rate limits / breaker,
+# auth-cache L2 and the invalidation stream all ride one Redis. Opt-in so the
+# default single-node build keeps zero external deps. `fred` is the fixed
+# client choice (v8 plan Q8): full single/sentinel/cluster/streams/Lua
+# support; `mocks` powers in-process command-level test doubles; `i-scripts`
+# enables the Lua lease renew / rate-limit scripts.
+cluster-redis = ["dep:fred"]
+
 [dependencies]
 # Always link the pure core.
 hydra-core = { path = "../hydra-core" }
@@ -125,6 +133,9 @@ serde_json = { version = "1", optional = true }
 # Rust; does NOT touch the hydra-core dependency firewall.
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
+
+# --- Cluster Redis backbone (v8 plan, feature `cluster-redis`) --------------
+fred = { version = "10", features = ["mocks", "i-scripts"], optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,

@@ -179,8 +179,22 @@ fn entities_derive_roundtrip() {
         domain: "acme.com".into(),
         cert_file: Some("/certs/acme.crt".into()),
         cert_key: Some("/certs/acme.key".into()),
+        cert_pem: None,
+        cert_key_pem: None,
     };
     roundtrip(&cert_meta);
+
+    // Content form (migration 0007): PEM content serialises; the private key
+    // round-trips inside the snapshot (it is shipped sealed in the wire form;
+    // here we only assert the plain type is serde-compatible).
+    let cert_meta_content = CertMeta {
+        domain: "acme.com".into(),
+        cert_file: None,
+        cert_key: None,
+        cert_pem: Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into()),
+        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".into()),
+    };
+    roundtrip(&cert_meta_content);
 
     let endpoint = EndpointUrl {
         scheme: "https".into(),

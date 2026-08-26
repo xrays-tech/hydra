@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE tenant SET cert_pem = ?, cert_key_ciphertext = ?, cert_key_nonce = ?, cert_key_version = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "2d758604ae6add1daf4009c34935afc1dacb511ee6293c4639d1e7eb03b3bcb3"
+}

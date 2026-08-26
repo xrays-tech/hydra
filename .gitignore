@@ -42,3 +42,7 @@
 
 # Locally staged server binary (built by scripts/local_release.sh)
 /environment/bin/
+
+# Temporary local tooling (sqlx-cli bootstrap cache; deleted after .sqlx regen)
+/.cargo-cache/
+/.acceptance/

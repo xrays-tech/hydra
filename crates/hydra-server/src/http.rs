@@ -60,6 +60,14 @@ pub struct AuthCache {
     allow_ttl: Duration,
     deny_ttl: Duration,
     now: Clock,
+    /// Optional Redis L2 (cluster P4): consulted on L1 miss before the
+    /// upstream `auth_url`. `None` in single-node mode.
+    #[cfg(feature = "cluster-redis")]
+    l2: Option<Arc<crate::redis::auth_cache::RedisAuthL2>>,
+    /// Placeholder field (single-node builds never construct the L2).
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    l2: Option<()>,
 }
 
 impl AuthCache {
@@ -77,7 +85,17 @@ impl AuthCache {
             allow_ttl,
             deny_ttl,
             now,
+            l2: None,
         }
+    }
+
+    /// Attach the Redis L2 backend (cluster P4). L1 stays the hot path; the
+    /// L2 only sees L1 misses.
+    #[cfg(feature = "cluster-redis")]
+    #[must_use]
+    pub fn with_l2(mut self, l2: Arc<crate::redis::auth_cache::RedisAuthL2>) -> Self {
+        self.l2 = Some(l2);
+        self
     }
 
     /// Default allow TTL (design §11.5; default 5 min).
@@ -106,16 +124,34 @@ impl AuthCache {
 
     /// Look up a cached decision; delegates the hit/expiry verdict to the
     /// pure [`cache_decision`]. The api-key is SHA-256 hashed before lookup.
-    #[must_use]
-    pub fn check(&self, tenant_id: &str, api_key: &str) -> Verdict {
+    /// On an L1 miss, consults the Redis L2 (cluster P4) and hydrates L1 from
+    /// it, avoiding an upstream `auth_url` round trip on a cold node.
+    pub async fn check(&self, tenant_id: &str, api_key: &str) -> Verdict {
         let hash = sha256_hex(api_key.as_bytes());
         let entry = self.map.get(&(tenant_id.to_string(), hash));
-        cache_decision(entry.as_deref(), (self.now)())
+        if let Verdict::Hit(_) = cache_decision(entry.as_deref(), (self.now)()) {
+            return cache_decision(entry.as_deref(), (self.now)());
+        }
+        #[cfg(feature = "cluster-redis")]
+        if let Some(l2) = &self.l2 {
+            if let Ok(Some((allowed, ttl))) = l2.get(tenant_id, &hex_digest(&hash)).await {
+                let expires_at = (self.now)() + ttl;
+                self.map.insert(
+                    (tenant_id.to_string(), hash),
+                    AuthEntry {
+                        allowed,
+                        expires_at,
+                    },
+                );
+                return Verdict::Hit(allowed);
+            }
+        }
+        Verdict::Miss
     }
 
     /// Store a fresh decision: `expires_at = now + ttl`. Overwrites any prior
     /// entry for the same `(tenant_id, api_key)`.
-    pub fn set(&self, tenant_id: &str, api_key: &str, allowed: bool, ttl: Duration) {
+    pub async fn set(&self, tenant_id: &str, api_key: &str, allowed: bool, ttl: Duration) {
         let hash = sha256_hex(api_key.as_bytes());
         let expires_at = (self.now)() + ttl;
         self.map.insert(
@@ -125,16 +161,24 @@ impl AuthCache {
                 expires_at,
             },
         );
+        #[cfg(feature = "cluster-redis")]
+        if let Some(l2) = &self.l2 {
+            let _ = l2.set(tenant_id, &hex_digest(&hash), allowed, ttl).await;
+        }
     }
 
     /// Force-invalidate specific api-keys for a tenant (design §11.7).
     /// Returns the count actually removed; missing keys are ignored.
-    pub fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize {
+    pub async fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize {
         let mut removed = 0;
         for key in api_keys {
             let hash = sha256_hex(key.as_bytes());
             if self.map.remove(&(tenant_id.to_string(), hash)).is_some() {
                 removed += 1;
+            }
+            #[cfg(feature = "cluster-redis")]
+            if let Some(l2) = &self.l2 {
+                let _ = l2.del(tenant_id, &hex_digest(&hash)).await;
             }
         }
         removed
@@ -142,10 +186,21 @@ impl AuthCache {
 
     /// Force-invalidate ALL entries for a tenant (design §11.7). Returns the
     /// count removed.
-    pub fn invalidate_tenant(&self, tenant_id: &str) -> usize {
+    pub async fn invalidate_tenant(&self, tenant_id: &str) -> usize {
         let before = self.map.len();
         self.map.retain(|(tid, _), _| tid != tenant_id);
+        #[cfg(feature = "cluster-redis")]
+        if let Some(l2) = &self.l2 {
+            let _ = l2.del_tenant(tenant_id).await;
+        }
         before - self.map.len()
+    }
+
+    /// Clear the LOCAL cache entirely (cluster P4 generation bump: the
+    /// invalidation stream was trimmed past our watermark, so the safe action
+    /// is re-auth everything; L2 entries expire by TTL).
+    pub fn clear_all(&self) {
+        self.map.clear();
     }
 
     /// Evict all entries whose TTL has elapsed (`now >= expires_at`). Returns
@@ -232,9 +287,13 @@ pub trait AuthChecker: Send + Sync {
     /// calls the tenant's `auth_url`.
     fn check(&self, tenant: &Tenant, api_key: &str) -> impl Future<Output = AuthVerdict> + Send;
     /// Force-invalidate specific api-keys for a tenant; returns count removed.
-    fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize;
+    fn invalidate(
+        &self,
+        tenant_id: &str,
+        api_keys: &[String],
+    ) -> impl Future<Output = usize> + Send;
     /// Force-invalidate all entries for a tenant; returns count removed.
-    fn invalidate_tenant(&self, tenant_id: &str) -> usize;
+    fn invalidate_tenant(&self, tenant_id: &str) -> impl Future<Output = usize> + Send;
 }
 
 /// Production [`AuthChecker`] — reqwest-based upstream call to each tenant's
@@ -324,7 +383,7 @@ impl AuthChecker for HttpAuthChecker {
             }
 
             // (2) cache first (design §11.2) — pure verdict, zero network.
-            match cache.check(&tenant_id, &api_key_owned) {
+            match cache.check(&tenant_id, &api_key_owned).await {
                 v @ Verdict::Hit(true) => {
                     debug!(tenant = %tenant_id, verdict = ?v, "auth cache hit (allowed)");
                     return decide(v, 401, "denied");
@@ -376,7 +435,7 @@ impl AuthChecker for HttpAuthChecker {
                     // empty, unparseable — stays an allow.
                     let text = resp.text().await.unwrap_or_default();
                     if body_says_denied(&text) {
-                        cache.set(&tenant_id, &api_key_owned, false, deny_ttl);
+                        cache.set(&tenant_id, &api_key_owned, false, deny_ttl).await;
                         return AuthVerdict::Denied {
                             status: 401,
                             reason: "denied",
@@ -388,7 +447,9 @@ impl AuthChecker for HttpAuthChecker {
                     let effective_ttl = parse_expires_in(&text)
                         .map(Duration::from_secs)
                         .unwrap_or(ttl);
-                    cache.set(&tenant_id, &api_key_owned, true, effective_ttl);
+                    cache
+                        .set(&tenant_id, &api_key_owned, true, effective_ttl)
+                        .await;
                     decide(Verdict::Miss, 401, "denied") // → Allowed{Miss}
                 }
                 CacheOp::Set {
@@ -396,7 +457,7 @@ impl AuthChecker for HttpAuthChecker {
                     ttl,
                 } => {
                     // 401/403: cache the denial with the deny TTL (design §11.2).
-                    cache.set(&tenant_id, &api_key_owned, false, ttl);
+                    cache.set(&tenant_id, &api_key_owned, false, ttl).await;
                     AuthVerdict::Denied {
                         status: 401,
                         reason: "denied",
@@ -412,12 +473,12 @@ impl AuthChecker for HttpAuthChecker {
         }
     }
 
-    fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize {
-        self.cache.invalidate(tenant_id, api_keys)
+    async fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize {
+        self.cache.invalidate(tenant_id, api_keys).await
     }
 
-    fn invalidate_tenant(&self, tenant_id: &str) -> usize {
-        self.cache.invalidate_tenant(tenant_id)
+    async fn invalidate_tenant(&self, tenant_id: &str) -> usize {
+        self.cache.invalidate_tenant(tenant_id).await
     }
 }
 
@@ -529,6 +590,16 @@ fn json_field_is_false(body: &str, field: &str) -> bool {
         return false;
     };
     rest.trim_start().starts_with("false")
+}
+
+/// Hex-encode a SHA-256 digest for the L2 key (no base64 dep needed).
+#[cfg(feature = "cluster-redis")]
+fn hex_digest(hash: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in hash {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Generate a per-request trace id (dependency-free). W4 may instead inject

@@ -117,14 +117,31 @@ pub fn resolve_policy(
     }
 }
 
-/// W1–W2 certificate placeholder (paths only). W4 resolves these into a
-/// parsed certificate; until then the path fields stand in for validation
-/// (e.g. T9.7 "missing cert path" → fatal issue).
+/// Certificate metadata carried in the config snapshot (cluster P0a).
+///
+/// Two forms, resolved content-first:
+/// - **content** (`cert_pem` / `cert_key_pem`): PEM text in memory (migration
+///   0007). The private key is sealed at rest in the DB and decrypted locally
+///   by the shell; only plaintext-in-memory lives in this struct (same
+///   positioning as `ProviderKey::api_key`). This is the multi-node form — no
+///   files, no shared volume.
+/// - **legacy paths** (`cert_file` / `cert_key`): pre-0007 single-node rows.
+///   Kept for read compatibility; the loader falls back to them when no
+///   content is present.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertMeta {
     pub domain: String,
+    /// Legacy cert PEM path (pre-0007). `None` in content mode.
     pub cert_file: Option<String>,
+    /// Legacy cert key PEM path (pre-0007). `None` in content mode.
     pub cert_key: Option<String>,
+    /// Public cert PEM content (migration 0007 primary form).
+    #[serde(default)]
+    pub cert_pem: Option<String>,
+    /// Private key PEM content, plaintext in memory only. Never persisted as
+    /// plaintext; never serialised to admin responses.
+    #[serde(default)]
+    pub cert_key_pem: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -46,7 +46,10 @@ use handlers::Resp;
 /// Shared state for the admin service (design §13.1: a subset of `AppState`).
 /// Cheap to `Arc`-clone so tests can inspect it after requests.
 pub struct AdminState {
-    pub pool: SqlitePool,
+    /// Leader-mode SQLite pool. `None` on edge nodes (no local DB, cluster
+    /// P0b) — edge routes only serve `/metrics` `/healthz` `/readyz`, so no
+    /// CRUD handler ever touches a `None` pool.
+    pub pool: Option<SqlitePool>,
     pub store: ConfigStore,
     pub auth: Arc<HttpAuthChecker>,
     pub breaker: Arc<CircuitBreaker>,
@@ -71,6 +74,31 @@ pub struct AdminState {
     /// `Arc<DashMap>` backing the proxy's `AppState.admission` — the
     /// `GET /api/v1/concurrency` endpoint reads live gate state from here.
     pub admission: AdmissionControl,
+    /// Edge data-plane mode (cluster P0b): the admin service serves only
+    /// `/metrics` `/healthz` `/readyz`; everything else is 404 (no CRUD, no UI).
+    pub edge_mode: bool,
+    /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`): gates the internal
+    /// `/api/v1/internal/*` endpoints (cluster P1). `None` ⇒ internal
+    /// endpoints are denied (fail-closed).
+    pub cluster_token: Option<String>,
+    /// Whether this node currently holds the leader lease (cluster P2).
+    /// `Some(f)` on leader-candidate nodes: gates admin mutations (non-leader
+    /// ⇒ forward to the active, P3) and `/healthz/leader`. `None` on
+    /// single-node (`all`) and edge.
+    pub leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The active leader's admin base URL (cluster P3): standby nodes forward
+    /// admin mutations here instead of failing them. `None` on single-node /
+    /// edge and when no forward target is configured.
+    pub forward_to: Option<String>,
+    /// Invalidation-stream publisher (cluster P4): `DELETE /api/v1/auth/cache`
+    /// broadcasts the invalidation cluster-wide instead of clearing only the
+    /// local cache. `None` off-cluster / on the single-node build.
+    #[cfg(feature = "cluster-redis")]
+    pub invalidation: Option<crate::cluster::events::InvalidationStream>,
+    /// Placeholder so single-node builds keep a uniform shape.
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    pub invalidation: Option<()>,
 }
 
 impl AdminState {
@@ -79,7 +107,7 @@ impl AdminState {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: SqlitePool,
+        pool: Option<SqlitePool>,
         store: ConfigStore,
         auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
@@ -87,6 +115,10 @@ impl AdminState {
         admin_token: Option<String>,
         cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
         admission: AdmissionControl,
+        edge_mode: bool,
+        cluster_token: Option<String>,
+        leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        forward_to: Option<String>,
     ) -> Self {
         Self {
             pool,
@@ -98,7 +130,25 @@ impl AdminState {
             reload_lock: Mutex::new(()),
             cert_reloader,
             admission,
+            edge_mode,
+            cluster_token,
+            leader_ready,
+            forward_to,
+            #[cfg(feature = "cluster-redis")]
+            invalidation: None,
+            #[cfg(not(feature = "cluster-redis"))]
+            invalidation: None,
         }
+    }
+
+    /// The leader-mode SQLite pool. Only leader/all admin routes reach this —
+    /// edge mode short-circuits in the router before any CRUD dispatch, so the
+    /// `expect` never fires on edge nodes.
+    #[must_use]
+    pub fn db(&self) -> &SqlitePool {
+        self.pool
+            .as_ref()
+            .expect("admin SQLite pool (leader mode only)")
     }
 }
 
@@ -124,23 +174,26 @@ impl AdminService {
             .filter(|t| !t.is_empty())
     }
 
+    /// Extract the `Authorization: Bearer <token>` value, if present.
+    fn bearer_token(session: &ServerSession) -> Option<&str> {
+        session
+            .req_header()
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                s.strip_prefix("Bearer ")
+                    .or_else(|| s.strip_prefix("bearer "))
+            })
+    }
+
     /// Token gate (design §13.3): require `Authorization: Bearer <token>` to
     /// match the configured token. Fail-closed when no token is configured.
     fn check_auth(&self, session: &ServerSession) -> bool {
         let Some(token) = &self.state.admin_token else {
             return false;
         };
-        if let Some(val) = session.req_header().headers.get("authorization") {
-            if let Ok(s) = val.to_str() {
-                if let Some(rest) = s
-                    .strip_prefix("Bearer ")
-                    .or_else(|| s.strip_prefix("bearer "))
-                {
-                    return rest == token;
-                }
-            }
-        }
-        false
+        Self::bearer_token(session) == Some(token.as_str())
     }
 
     /// The lightweight router (method + path-segment match, design §13.1).
@@ -184,6 +237,10 @@ impl AdminService {
         // Concurrency admission snapshot (design §10 / §13.2).
         if parts == ["concurrency"] && method == "GET" {
             return handlers::concurrency_collection(&self.state);
+        }
+        // Internal control plane (cluster P1): snapshot distribution.
+        if parts == ["internal", "control"] && method == "GET" {
+            return handlers::internal_control(&self.state, query, trace_id).await;
         }
 
         // REST CRUD resources.
@@ -256,6 +313,39 @@ impl ServeHttp for AdminService {
         let path = session.req_header().uri.path().to_string();
         let query = session.req_header().uri.query().map(str::to_string);
 
+        // Edge data-plane node (cluster P0b): serve ONLY the probe endpoints
+        // (`/metrics` `/healthz` `/readyz`) — no token (healthchecks), no
+        // admin UI, no CRUD. Everything else is 404.
+        if self.state.edge_mode {
+            if path == "/metrics" || path == "/healthz" || path == "/readyz" {
+                return match path.as_str() {
+                    "/metrics" => handlers::metrics_endpoint(),
+                    _ => handlers::health(&self.state, &trace_id).await,
+                };
+            }
+            return handlers::err_json(404, "not_found", "edge node: no admin API", &trace_id);
+        }
+
+        // Leader-lease probe (cluster P2): 200 while this node holds the
+        // lease, 503 on standby, 404 on non-candidate nodes. Token-free so
+        // LBs / orchestrators can route to the active leader.
+        if path == "/healthz/leader" {
+            return handlers::leader_health(&self.state, &trace_id);
+        }
+
+        // Internal control-plane endpoints (cluster P1): gated by the SHARED
+        // cluster token (`HYDRA_CLUSTER_TOKEN`), not the admin token — edges
+        // hold only the cluster token. Fail-closed when unset.
+        if path.starts_with("/api/v1/internal/") {
+            let bearer = Self::bearer_token(session);
+            if self.state.cluster_token.as_deref() != bearer {
+                return handlers::err_json(401, "unauthorized", "invalid cluster token", &trace_id);
+            }
+            return self
+                .route(&method, &path, query.as_deref(), session, &trace_id)
+                .await;
+        }
+
         // Embedded UI (design §14): serve `/admin/*` WITHOUT the admin token
         // gate. The static HTML/CSS/JS contain no secrets; `app.js` collects
         // the admin token in-memory and attaches `Authorization: Bearer` to
@@ -275,6 +365,49 @@ impl ServeHttp for AdminService {
                 "missing or invalid admin token",
                 &trace_id,
             );
+        }
+
+        // Leader write gate (cluster P2/P3): on leader-candidate nodes that
+        // do NOT hold the lease, admin mutations are FORWARDED to the active
+        // leader (P3) — reads stay local (the replica serves them). When no
+        // forward target is configured, or the active is unreachable, the
+        // mutation fails 503 (fail-closed — a standby must never write
+        // locally; taking over is the lease machine's job).
+        if let Some(is_leader) = &self.state.leader_ready {
+            let mutation = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+            if mutation && !is_leader() {
+                if let Some(target) = self.state.forward_to.clone() {
+                    let path_and_query = match &query {
+                        Some(q) => format!("{path}?{q}"),
+                        None => path.clone(),
+                    };
+                    let body = handlers::read_body(session).await;
+                    return match crate::cluster::forward::forward_mutation(
+                        &target,
+                        &method,
+                        &path_and_query,
+                        body,
+                        &session.req_header().headers,
+                        &trace_id,
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(e) => handlers::err_json(
+                            502,
+                            "forward_failed",
+                            &format!("{e}; the active leader is unreachable (no local write)"),
+                            &trace_id,
+                        ),
+                    };
+                }
+                return handlers::err_json(
+                    503,
+                    "not_leader",
+                    "this node is not the active leader and no forward target is configured",
+                    &trace_id,
+                );
+            }
         }
 
         self.route(&method, &path, query.as_deref(), session, &trace_id)

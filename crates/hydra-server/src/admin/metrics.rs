@@ -88,6 +88,11 @@ struct Metrics {
     /// Mid-stream errors: a chunk read/write failed AFTER the 200 + first
     /// chunk was already sent to the client (failover impossible).
     mid_stream_errors: IntCounterVec,
+    // ── Control plane (cluster P1) ──────────────────────────────────────
+    /// Control-channel poll outcomes (result=ok|error).
+    control_poll: IntCounterVec,
+    /// Last config snapshot version applied (edge/standby).
+    control_snapshot_version: IntGauge,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -225,6 +230,18 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_mid_stream_errors_total",
                 "Mid-stream failures after 200 + first byte sent (no failover possible)",
                 &["provider"]
+            )
+            .ok()?,
+            // ── Control plane (cluster P1) ────────────────────────────────
+            control_poll: register_int_counter_vec!(
+                "hydra_control_poll_total",
+                "Control-channel poll outcomes (result=ok|error)",
+                &["result"]
+            )
+            .ok()?,
+            control_snapshot_version: register_int_gauge!(
+                "hydra_control_snapshot_version",
+                "Last config snapshot version applied from the control plane"
             )
             .ok()?,
         })
@@ -365,6 +382,26 @@ pub fn record_cached_tokens(tenant: &str, provider: &str, model: &str, n: u64) {
         m.cached_tokens
             .with_label_values(&[tenant, provider, model])
             .inc_by(n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane metrics (cluster P1)
+// ---------------------------------------------------------------------------
+
+/// Count a control-channel poll outcome (`result` = "ok" | "error").
+#[allow(dead_code)]
+pub fn record_control_poll(result: &str) {
+    if let Some(m) = metrics() {
+        m.control_poll.with_label_values(&[result]).inc();
+    }
+}
+
+/// Set the last applied config snapshot version (edge/standby).
+#[allow(dead_code)]
+pub fn record_control_snapshot_version(version: u64) {
+    if let Some(m) = metrics() {
+        m.control_snapshot_version.set(version as i64);
     }
 }
 

@@ -327,6 +327,98 @@ async fn loader_cert_meta_from_paths() {
     assert!(!cfg2.certs.contains_key("plain.com"));
 }
 
+/// T5.6b — stored cert CONTENT (migration 0007) overlays the snapshot,
+/// content-first: the CertMeta carries the PEM text and the loader decrypts
+/// the sealed private key into memory.
+#[tokio::test]
+async fn loader_cert_meta_from_content() {
+    let pool = common::setup_pool().await;
+    let kp = kp();
+
+    // A tenant with only legacy paths, no content → paths survive.
+    let mut t = tenant_full("t1", "legacy.com");
+    t.cert_file = Some("/etc/hydra/legacy.crt".into());
+    t.cert_key = Some("/etc/hydra/legacy.key".into());
+    repo::insert_tenant(&pool, &t).await.expect("insert legacy");
+
+    // A tenant with stored content → content wins in the snapshot.
+    let tc = tenant_full("t2", "content.com");
+    repo::insert_tenant(&pool, &tc)
+        .await
+        .expect("insert content tenant");
+    let cert = hydra_server::db::TenantCert {
+        tenant_id: "t2".into(),
+        cert_pem: Some("-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n".into()),
+        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n".into()),
+    };
+    hydra_server::db::update_tenant_cert(&pool, &kp, &cert)
+        .await
+        .expect("write cert content");
+
+    let cfg = build_config(&pool, &kp).await.expect("build");
+
+    let legacy = cfg.certs.get("legacy.com").expect("legacy meta");
+    assert_eq!(legacy.cert_file.as_deref(), Some("/etc/hydra/legacy.crt"));
+    assert_eq!(
+        legacy.cert_pem, None,
+        "no content stored for the legacy tenant"
+    );
+
+    let content = cfg.certs.get("content.com").expect("content meta");
+    assert_eq!(
+        content.cert_pem.as_deref(),
+        Some("-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n")
+    );
+    assert_eq!(
+        content.cert_key_pem.as_deref(),
+        Some("-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n"),
+        "the loader decrypts the sealed key into the snapshot"
+    );
+    assert_eq!(content.cert_file, None, "content form carries no paths");
+}
+
+/// T5.6c — backfill: a legacy path-based tenant gets its files read and
+/// stored as content, making the DB self-contained (shared-volume-free).
+#[tokio::test]
+async fn loader_cert_backfill() {
+    let pool = common::setup_pool().await;
+    let kp = kp();
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+
+    let mut t = tenant_full("t1", "backfill.com");
+    t.cert_file = Some(format!("{fixtures}/acme.crt"));
+    t.cert_key = Some(format!("{fixtures}/acme.key"));
+    repo::insert_tenant(&pool, &t).await.expect("insert");
+
+    // Before backfill: paths only, no stored content (the row exists, so
+    // the Option is Some — presence is about `cert_pem`, not the row).
+    let before = repo::get_tenant_cert(&pool, &kp, "t1")
+        .await
+        .expect("get")
+        .expect("tenant row exists");
+    assert!(before.cert_pem.is_none() && before.cert_key_pem.is_none());
+
+    repo::backfill_legacy_certs(&pool, &kp).await;
+
+    let got = repo::get_tenant_cert(&pool, &kp, "t1")
+        .await
+        .expect("get")
+        .expect("backfilled");
+    assert!(got.cert_pem.unwrap().contains("BEGIN CERTIFICATE"));
+    assert!(got.cert_key_pem.unwrap().contains("BEGIN PRIVATE KEY"));
+
+    // Idempotent: content already present → not re-read/re-written.
+    let before = repo::get_tenant_cert(&pool, &kp, "t1").await.unwrap();
+    repo::backfill_legacy_certs(&pool, &kp).await;
+    let after = repo::get_tenant_cert(&pool, &kp, "t1").await.unwrap();
+    assert_eq!(before, after, "backfill must be idempotent");
+    // Snapshot now resolves content-first.
+    let cfg = build_config(&pool, &kp).await.expect("build");
+    let cert = cfg.certs.get("backfill.com").expect("meta");
+    assert!(cert.cert_pem.is_some());
+    assert!(cert.cert_key_pem.is_some());
+}
+
 /// T5.7 (extra) — disabled limit roles are excluded from `ConfigData.limit_roles`.
 #[tokio::test]
 async fn loader_excludes_disabled_limit_roles() {

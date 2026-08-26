@@ -44,7 +44,7 @@ async fn admin_state() -> Arc<AdminState> {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     Arc::new(AdminState::new(
-        pool,
+        Some(pool),
         store,
         auth,
         breaker,
@@ -52,6 +52,10 @@ async fn admin_state() -> Arc<AdminState> {
         Some(TOKEN.to_string()),
         None,
         hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None, // no cluster token in tests
+        None, // no leader election in tests
+        None, // no forward target in tests
     ))
 }
 

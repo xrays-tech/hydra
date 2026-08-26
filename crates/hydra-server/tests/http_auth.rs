@@ -496,7 +496,9 @@ async fn invalidate_forces_reauth() {
     );
 
     // force-invalidate → next call re-goes-upstream
-    let n = checker.invalidate(&tenant.id, &["sk-inv".to_string()]);
+    let n = checker
+        .invalidate(&tenant.id, &["sk-inv".to_string()])
+        .await;
     assert_eq!(n, 1);
     let v3 = checker.check(&tenant, "sk-inv").await;
     assert_eq!(
@@ -522,7 +524,7 @@ async fn invalidate_tenant_forces_reauth() {
     // both cached now
     assert_eq!(checker.cache().len(), 2);
 
-    let n = checker.invalidate_tenant(&tenant.id);
+    let n = checker.invalidate_tenant(&tenant.id).await;
     assert_eq!(n, 2);
     assert_eq!(checker.cache().len(), 0);
 }

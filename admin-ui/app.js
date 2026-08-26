@@ -324,8 +324,16 @@ const CRUD = {
       { name: "domain", label: "Domain", required: true, placeholder: "acme.com", tip: "lowercased; localhost is special" },
       { name: "auth_url", label: "Auth URL", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
         tip: "mandatory — empty ⇒ all requests 401" },
-      { name: "cert_file", label: "Cert file (path)", placeholder: "absolute or relative to data/", tip: "optional" },
-      { name: "cert_key", label: "Cert key (path)", placeholder: "absolute or relative to data/", tip: "optional" },
+      { name: "cert_file", label: "Cert file (path, legacy)", placeholder: "absolute or relative to data/",
+        tip: "deprecated — converted to PEM content on save; prefer cert_pem/cert_key_pem" },
+      { name: "cert_key", label: "Cert key (path, legacy)", placeholder: "absolute or relative to data/",
+        tip: "deprecated — converted to PEM content on save; prefer cert_pem/cert_key_pem" },
+      { name: "cert_pem", label: "Cert PEM", type: "textarea", full: true, rows: 4, map: "opt",
+        placeholder: "-----BEGIN CERTIFICATE----- …",
+        tip: "optional — leave blank to keep the current cert; clearing via the API uses cert_pem:\"\"" },
+      { name: "cert_key_pem", label: "Cert private key PEM", type: "password", full: true, map: "opt",
+        placeholder: "-----BEGIN PRIVATE KEY----- …",
+        tip: "optional; required when Cert PEM is set — stored encrypted, never returned by the API" },
       { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
@@ -716,7 +724,11 @@ function buildField(f, value, { disabled, isEdit } = {}) {
   group.appendChild(el("label", { text: f.label },
     f.required ? el("span", { class: "req", text: " *" }) : null));
   let input;
-  if (f.type === "select") {
+  if (f.type === "textarea") {
+    input = el("textarea", { dataset: { field: f.name }, disabled, rows: f.rows || 3,
+      placeholder: f.placeholder || "" });
+    input.value = value === null || value === undefined ? "" : String(value);
+  } else if (f.type === "select") {
     input = el("select", { dataset: { field: f.name }, disabled });
     if (f.fk) {
       const fk = FK[f.fk] || { list: [] };
