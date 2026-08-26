@@ -551,12 +551,87 @@ is longer than the test window.
 
 ## 12. v1 boundaries (what NOT to expect)
 
-- **Single instance only.** Multi-instance needs Redis-backed rate-limit
-  counters + shared auth cache (v2, design §16.6).
+- **Single instance is the default, not the ceiling.** The default single-node
+  mode remains one process with a local SQLite; **cluster mode is now
+  implemented** (Redis-backed, see §13): multi-instance with shared rate-limit
+  counters, shared circuit breaker, shared auth cache L2 and a leader-lease
+  failover is available via `HYDRA_ROLE=leader|edge` — no longer a v2 backlog
+  item (design §16.6 updated).
 - **Single static admin token.** No RBAC, no token rotation (v2, §16.6 / §13.3).
 - **No web UI auth** beyond the in-memory token prompt. The UI is a power-user
   tool; for fleet management use the REST API.
-- **SQLite is the only bundled store.** ClickHouse is supported as an optional
-  usage sink; PostgreSQL/MySQL are not supported for the config DB in v1.
+- **SQLite is the only bundled config store.** ClickHouse is supported as an
+  optional usage sink (mandatory in cluster mode); PostgreSQL/MySQL are not
+  supported for the config DB.
 
-For the v2 backlog see design §16.6.
+For the remaining v2 backlog see design §16.6.
+
+---
+
+## 13. Cluster mode operations (design §20 / docs/cluster.md)
+
+Cluster mode is opt-in (`HYDRA_ROLE=leader|edge`) with **Redis as the only
+external dependency** (K8s/k3s-agnostic, self-sustaining). The authoritative
+reference is **[`cluster.md`](cluster.md)** — env table, shared-state
+map, Redis failure matrix, deploy manifests, failover drill and the live
+acceptance record (§5.1). This section is the runbook-level index.
+
+### 13.1 Build
+
+```bash
+cargo build --release --features server,cluster-redis,usage-clickhouse
+# single-node builds stay feature-free: cargo build --release --features server
+```
+
+### 13.2 Minimal leader pair + edge (compose)
+
+```bash
+cd environment
+export HYDRA_ADMIN_TOKEN=admin-secret
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
+docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+curl -H "Authorization: Bearer admin-secret" http://localhost:8081/api/v1/tenants
+```
+
+k3s / k8s manifests and bare-metal systemd live in `docs/cluster.md` §4.
+
+### 13.3 Cluster environment variables (quick map)
+
+| Variable | Notes |
+|---|---|
+| `HYDRA_ROLE` | `leader` / `edge`; unset = single-node (unchanged behavior) |
+| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired, sentinel/cluster fail-fast |
+| `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes) |
+| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint / this node's registered URL |
+| `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
+| `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
+| `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
+| `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
+
+### 13.4 Failover drill
+
+```bash
+for p in 8081 8082; do curl -s -o /dev/null -w "port $p: %{http_code}\n" localhost:$p/healthz/leader; done
+docker compose -f docker-compose.cluster.yml stop hydra-control-a   # kill the active
+curl -s localhost:8082/healthz/leader    # → 200 after ≤ ~20s (measured 11–18s)
+docker compose -f docker-compose.cluster.yml start hydra-control-a  # rejoins as standby
+```
+
+Edges and standbys follow the new active automatically (registry rotation +
+lease-aware rotation); a rejoining leader rebuilds its replica from the current
+active (no shared volume). Full checklist: `docs/cluster.md` §5.
+
+### 13.5 Redis outage behavior
+
+Data plane keeps serving (last-known-good snapshot + local caches). Election is
+**fail-closed**: a leader that cannot renew demotes immediately (writes stop)
+until Redis recovers. See `docs/cluster.md` §3 for the full matrix.
+
+### 13.6 Known limitations (as of the 2025-08 acceptance)
+
+- Disabled `limit_role` / `provider_key_binding` rows are not carried in config
+  snapshots (`build_config` keeps enabled rows only) — after a failover they are
+  lost from replicas and must be re-created.
+- `HYDRA_FAILOVER_GRACE_MS` is documented but not wired; `HYDRA_BREAKER_QUORUM`
+  and `HYDRA_RATE_LIMIT_FAIL_MODE` use in-code defaults.
+- Redis sentinel/cluster deployment modes fail fast (single mode wired).

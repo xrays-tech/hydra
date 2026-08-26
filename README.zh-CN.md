@@ -136,7 +136,16 @@ docs/                 design.md、ops.md、dev-plan.md、架构分析
 
 单节点零依赖；集群 = `HYDRA_ROLE=leader|edge` + Redis（唯一外置依赖），
 K8s/k3s 无关、自维持（自动选举/故障切换/加入退出/自愈）。
-详见 **[`docs/cluster.md`](docs/cluster.md)** 与
+
+```bash
+cargo build --release --features server,cluster-redis,usage-clickhouse
+cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+```
+
+已通过真实环境验收（双 leader 候选 + 无状态 edge，docker Redis）：故障切换
+~11–18s、跨节点限流、共享熔断、认证失效总线、无共享卷证书轮换。
+详见 **[`docs/cluster.md`](docs/cluster.md)**（环境变量表、Redis 故障矩阵、
+故障切换演练与实测记录）与
 [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml)。
 
 ## 更多

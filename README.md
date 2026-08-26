@@ -144,7 +144,18 @@ docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 Single node stays zero-dependency. A cluster is opt-in: set `HYDRA_ROLE=leader|edge`
 with a Redis (the one required external dependency) — self-sustaining (automatic
 election, failover, join/leave, self-healing) and orchestration-agnostic
-(compose / k3s / k8s / bare metal). See **[`docs/cluster.md`](docs/cluster.md)**.
+(compose / k3s / k8s / bare metal).
+
+```bash
+cargo build --release --features server,cluster-redis,usage-clickhouse
+cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+```
+
+Live-acceptance verified (dual leader + stateless edges, docker Redis):
+failover ~11–18 s, cross-node rate limiting, shared circuit breaker,
+auth-cache invalidation bus, cert rotation without shared volumes.
+See **[`docs/cluster.md`](docs/cluster.md)** (env table, failure matrix,
+failover drill + acceptance record).
 
 ## More
 

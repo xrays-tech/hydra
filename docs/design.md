@@ -29,6 +29,7 @@
 17. [可观测性指标目录](#17-可观测性指标目录)
 18. [分阶段实施计划](#18-分阶段实施计划)
 19. [附录](#19-附录)
+20. [集群模式（Cluster Mode）](#20-集群模式cluster-mode)
 
 ---
 
@@ -68,6 +69,8 @@
 - libSQL 不能与 rusqlite/sqlx 共存于同一依赖树（`libsqlite3-sys` links 冲突）。
 
 > 若未来需要多实例云同步，可后续将 `sqlx` SQLite 切换为 Turso 云端，迁移成本可控。
+> （集群模式未走这条路径：多节点配置同步由「快照分发 + 每节点本地 SQLite 副本」实现，
+> 见 §20.3，无需共享/云端 DB。）
 
 ### 1.3 关键决策记录（已确认）
 
@@ -991,7 +994,8 @@ impl SlidingWindow {
 
 ### 10.4 单实例语义
 
-内存实现天然单实例；多实例部署需迁移到 Redis（已在 §1.3 标注为后续选项）。
+内存实现天然单实例；**集群模式下限流已迁移到 Redis 共享计数**（`RedisRateLimiter`，
+见 §20.4，Lua 滑动窗口 + hash tag 键）。默认单节点模式仍为内存实现，行为不变。
 
 ---
 
@@ -1391,7 +1395,7 @@ PRAGMA mmap_size = 134217728;
 ### 16.6 待办（v2 候选，不阻塞 v1）
 
 - Admin 鉴权升级：多用户 + RBAC + Token 轮换（当前单一静态 Token，§13.3）；
-- 限流计数器 Redis 化以支持多实例；
+- ~~限流计数器 Redis 化以支持多实例~~ —— **已实现**（共享限流/熔断/认证 L2/失效总线，见 §20 集群模式）；
 - 用量记录多 Sink 并行（同时写 SQLite + ClickHouse）。
 
 ---
@@ -1549,3 +1553,84 @@ PRAGMA mmap_size = 134217728;
 | 零拷贝（用户强制需求） | — | ✅ §6 原则 + §6.3/§6.6/§8.5/§9.4 改 `memchr` 扫描 + `Vec<Bytes>` 重放，禁 body JSON 反复编解码 |
 
 **结论**：P0 已修复，P1 全部处置，P2 已记录/接入，零拷贝架构已贯穿热路径。文档具备进入实现阶段的完成度。
+
+---
+
+## 20. 集群模式（Cluster Mode）
+
+> 本文是集群模式的**概述与设计要点**；完整的角色/环境变量/部署/故障矩阵/实测记录见
+> **[`docs/cluster.md`](cluster.md)**（单文档权威源，本节只做索引与设计定位）。
+
+### 20.1 定位
+
+集群模式是 **opt-in**：不设置任何集群环境变量时，Hydra 以单节点模式运行（本设计
+§1–§19 全部保持，零外部依赖、零行为变化）。设置 `HYDRA_ROLE=leader|edge` 即进入集群：
+
+- **Redis 是唯一必选外置依赖**，一个 Redis 承载七个用途（见 §20.4）；
+- **K8s/k3s 完全无关**：不调用任何编排 API，compose / k3s / k8s / 裸机同一镜像同一行为；
+- **自维持**：自举（注册表发现）、自动选举（租约）、自动故障切换、自动加入/退出、自愈
+  （时间栅栏杜绝双写、投票 TTL 自清理、失效事件流跨故障切换幂等重放）。
+
+### 20.2 角色模型
+
+| 角色（`HYDRA_ROLE`） | 本地 SQLite | 管理 API | 说明 |
+|---|---|---|---|
+| 未设置 / `all` | ✅ | ✅ 全部 | 单节点（默认），§1–§19 行为 |
+| `leader` | ✅（副本随快照重建） | ✅ 读本地 + 变更转发给 active（P3） | leader 候选，租约竞争，恰一个 active |
+| `edge` | ❌ | ❌（仅 `/metrics` `/healthz` `/readyz`） | 无状态数据面，任意扩缩 |
+
+**单写多读**：租约持有者（active）是唯一配置写者；standby 的管理变更透明转发到 active
+（P3，保留 Authorization/content-type/trace-id，5s 超时），无目标 503 / 不可达 502 / 绝不本地写。
+
+### 20.3 控制面
+
+- **配置快照**（`SnapshotWire`）：`{version, cfg(秘密剥离), sealed_provider_keys, sealed_certs,
+  provider_models, tenant_providers, tenant_models}`。秘密（provider key、证书私钥）AES-256-GCM
+  密封（`HYDRA_ENCRYPTION_KEY` 全集群一致），节点本地解密；hydrate fail-closed（任一解密失败
+  拒绝整快照）。edge 无本地 DB，配置随快照分发 —— **无共享卷**（证书内嵌快照，migration 0007）。
+- **租约**（`hydra:{lease:leader}`）：`SET NX PX` 抢租 + Lua compare-and-renew 续约（只续自己的），
+  时间栅栏（续约失败立即降级 Uncertain，fail-closed），新鲜度闸门（最近 3×poll 内成功同步才可参选）。
+  实测故障切换约 11–18s（租约 15s + 选举 tick ≤5s，见 cluster.md §5.1）。
+- **节点注册表**（`hydra:{nodes}` + 心跳 TTL 30s）：edge/standby 轮询失败 ≥2 次经
+  `rotate_from_registry` 旋转；**租约感知轮换**（`active_leader_url`）让回归的旧 leader 即使
+  `HYDRA_CONTROL_URL` 指向自己也会跟随当前 active 重建副本。
+- **版本持久化**：`config_meta` 表持久化 config version，重启后 `since` 水位单调（不重置为 1）。
+
+### 20.4 共享状态（一个 Redis，七个用途）
+
+| 子系统 | Key | 说明 |
+|---|---|---|
+| leader 租约 | `hydra:{lease:leader}` | 抢租 + Lua 原子续约 |
+| 节点注册表 | `hydra:{nodes}` / `hydra:{node:hb}:<id>` | 注册/心跳/leader 发现 |
+| 失效总线 | `hydra:{ctl:events}` + `hydra:{ctl:gen}` | Streams 持久可重放 + generation 兜底 |
+| 共享限流 | `hydra:{rl:role:bucket}:count|tokens` | Lua 滑动窗口（同 hash tag） |
+| 共享熔断 | `hydra:{br}:dead:{p}` + `hydra:{br}:alldead` | 投票 + 心跳 TTL + 本地 1s 同步 |
+| 认证缓存 L2 | `hydra:{auth}:{tenant}:{keyhash}` + 租户索引 | L1 miss 才访问，租户索引免 SCAN |
+| — | 命名空间规则 | 多 key 操作同 hash tag；禁 SCAN/MATCH（Cluster 安全） |
+
+### 20.5 Redis 故障行为（数据面永不受影响）
+
+| 子系统 | Redis 宕机行为 |
+|---|---|
+| 配置快照 | 暂停更新（快照走 leader HTTP，edge 持 last-known-good） |
+| 限流 | fail-open（`HYDRA_RATE_LIMIT_FAIL_MODE` 可配 closed）+ 告警指标 |
+| 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
+| 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
+| 选举 | 续约失败 → 立即降级停写（fail-closed）；无切换直至 Redis 恢复 |
+
+### 20.6 构建与部署
+
+```bash
+cargo build --release --features server,cluster-redis,usage-clickhouse   # 集群二进制
+```
+
+- compose：`environment/docker-compose.cluster.yml`（redis + 双 leader + `--scale hydra-edge=N` + clickhouse）
+- k3s / k8s：纯容器清单（`docs/cluster.md` §4.2），StatefulSet 稳定 leader 身份，readiness 探针
+  `/healthz/leader` 路由到 active；edge 无状态 HPA 扩缩
+- 裸机：同一二进制 + systemd；`HYDRA_PUBLIC_URL` 用主机名或 VIP
+
+### 20.7 验收与已知限制
+
+live 验收（真实 Redis + 双 leader + 双 edge）的实测记录、验收中发现并修复的缺陷、
+以及**已知限制**（禁用 limit_role 不进快照、新鲜度闸门极端场景、`HYDRA_FAILOVER_GRACE_MS`
+未接线等）见 **[`docs/cluster.md`](cluster.md) §5.1**，不在此重复。
