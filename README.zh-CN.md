@@ -153,6 +153,7 @@ cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hyd
 - 设计与架构：[`docs/design.md`](docs/design.md)
 - 架构变更（终止模式）：[`docs/design-change-terminate-mode.md`](docs/design-change-terminate-mode.md)
 - 运维手册：[`docs/ops.md`](docs/ops.md)
+- 部署方案（单节点 / compose / K3s / K8s）：[`docs/deployment.md`](docs/deployment.md)
 - 交互式流程图：[`docs/workflow.html`](docs/workflow.html)
 
 Rust 1.83+ · Pingora 0.8.x

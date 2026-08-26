@@ -162,6 +162,7 @@ failover drill + acceptance record).
 - Design & architecture: [`docs/design.md`](docs/design.md)
 - Architecture change (terminate-mode): [`docs/design-change-terminate-mode.md`](docs/design-change-terminate-mode.md)
 - Operations runbook: [`docs/ops.md`](docs/ops.md)
+- Deployment guide (single node / compose / K3s / K8s): [`docs/deployment.md`](docs/deployment.md)
 - Interactive workflow diagram: [`docs/workflow.html`](docs/workflow.html)
 
 Rust 1.83+ · Pingora 0.8.x

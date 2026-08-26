@@ -124,6 +124,7 @@ spec:
           args: ["--features=server,cluster-redis"]   # 构建时启用
           env:
             - { name: HYDRA_ROLE, value: leader }
+            - { name: HYDRA_ADMIN_ADDR, value: 0.0.0.0:8081 }   # 探针/Service 需从 Pod 外访问 admin
             - { name: HYDRA_REDIS_URL, value: redis://redis:6379 }
             - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: token } } }
             - { name: HYDRA_CONTROL_URL, value: http://hydra-control-0.hydra-control:8081 }
@@ -161,6 +162,7 @@ spec:
           image: hydra:latest
           env:
             - { name: HYDRA_ROLE, value: edge }
+            - { name: HYDRA_ADMIN_ADDR, value: 0.0.0.0:8081 }
             - { name: HYDRA_REDIS_URL, value: redis://redis:6379 }
             - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: token } } }
             - { name: HYDRA_CONTROL_URL, value: http://hydra-control-0.hydra-control:8081 }
