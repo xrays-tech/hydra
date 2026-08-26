@@ -50,6 +50,11 @@ fn ephemeral_port() -> u16 {
 }
 
 /// Start a real Pingora `Service` hosting `AdminService` on an ephemeral port.
+///
+/// Blocks until the listener actually accepts connections: `run_forever` binds
+/// asynchronously on the spawned thread, and a test that fires a request the
+/// moment `start_admin` returns can race the bind (CI flake: ConnectionRefused
+/// on the first probe). Polling a TCP connect keeps every caller race-free.
 fn start_admin(state: Arc<AdminState>) -> u16 {
     let port = ephemeral_port();
     let addr = format!("127.0.0.1:{port}");
@@ -60,7 +65,17 @@ fn start_admin(state: Arc<AdminState>) -> u16 {
     svc.add_tcp(&addr);
     server.add_service(svc);
     std::thread::spawn(move || server.run_forever());
-    port
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            return port;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "admin service did not start listening on {addr} within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Leader-side components: a real DB-backed store + a cluster-token admin.
