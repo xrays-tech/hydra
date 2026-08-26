@@ -565,7 +565,15 @@ pub async fn delete_provider_key(pool: &SqlitePool, id: &str) -> Result<(), sqlx
 
 /// Insert a tenant. `auth_url` is NOT NULL → inserting with an empty/non-null
 /// value is fine; a NULL would error at the SQLite layer.
+///
+/// Empty/blank `cert_file`/`cert_key` strings are normalized to `NULL`:
+/// optional legacy cert paths arrive as `""` from the admin UI (and other
+/// clients) when left blank, and an empty string is not a path — persisting
+/// it would poison `build_config`/TLS resolution and the legacy cert
+/// conversion (see `apply_tenant_cert`).
 pub async fn insert_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Error> {
+    let cert_key = non_empty_path(t.cert_key.as_deref());
+    let cert_file = non_empty_path(t.cert_file.as_deref());
     sqlx::query!(
         "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
          created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -573,8 +581,8 @@ pub async fn insert_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Er
         t.name,
         t.domain,
         t.auth_url,
-        t.cert_key,
-        t.cert_file,
+        cert_key,
+        cert_file,
         t.enabled,
         t.created_at,
         t.updated_at,
@@ -582,6 +590,13 @@ pub async fn insert_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Er
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Blank certificate paths are stored as `NULL` (empty string is not a path).
+fn non_empty_path(p: Option<&str>) -> Option<String> {
+    p.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub async fn get_tenant(pool: &SqlitePool, id: &str) -> Result<Tenant, sqlx::Error> {
@@ -610,16 +625,19 @@ pub async fn list_tenants(pool: &SqlitePool) -> Result<Vec<Tenant>, sqlx::Error>
 }
 
 /// Update a tenant's mutable fields (`name`, `domain`, `auth_url`, cert paths,
-/// `enabled`, `updated_at`).
+/// `enabled`, `updated_at`). Blank cert paths are normalized to `NULL`
+/// (same rule as `insert_tenant`).
 pub async fn update_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Error> {
+    let cert_key = non_empty_path(t.cert_key.as_deref());
+    let cert_file = non_empty_path(t.cert_file.as_deref());
     sqlx::query!(
         "UPDATE tenant SET name = ?, domain = ?, auth_url = ?, cert_key = ?, cert_file = ?, \
          enabled = ?, updated_at = ? WHERE id = ?",
         t.name,
         t.domain,
         t.auth_url,
-        t.cert_key,
-        t.cert_file,
+        cert_key,
+        cert_file,
         t.enabled,
         t.updated_at,
         t.id,

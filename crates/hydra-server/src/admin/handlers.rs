@@ -476,117 +476,135 @@ struct TenantUpsert {
     cert_key_pem: Option<String>,
 }
 
-/// Resolve and persist a tenant's certificate per the upsert body (cluster
-/// P0a: the DB becomes self-contained — PEM content wins, legacy paths are
-/// converted at write time so the shared cert volume can be dropped).
+/// Certificate write resolved from an upsert body (see
+/// [`resolve_tenant_cert_write`]).
+enum CertWrite {
+    /// No cert change (no PEM content and no usable legacy paths).
+    None,
+    /// Explicit removal (`cert_pem: ""`).
+    Clear,
+    /// Persist this PEM content (content mode, or legacy paths converted).
+    Content {
+        cert_pem: String,
+        cert_key_pem: String,
+    },
+}
+
+/// Certificate write resolved from an upsert body — PURE input validation
+/// (no DB access), so a 4xx is returned BEFORE the tenant row is persisted
+/// and can never leave a "reported as failed but actually created" tenant
+/// behind (the empty-string legacy-path bug: the admin UI sends `""` for a
+/// blank optional `cert_file`/`cert_key`, which was treated as a real path).
 ///
 /// Rules:
 /// - `cert_pem` non-empty → store content (seal the key); missing `cert_key_pem` → 400;
 /// - `cert_pem` empty string → explicit removal (clear the cert columns);
 /// - `cert_key_pem` without `cert_pem` → 400;
-/// - neither given → legacy `cert_file`/`cert_key` paths (already persisted
-///   in the tenant row by the caller): convert by reading the files **on this
-///   node**; unreadable → 400 with a hint to switch to PEM content.
+/// - neither given → legacy `cert_file`/`cert_key` paths: convert by
+///   reading the files **on this node**; unreadable → 400 with a hint to
+///   switch to PEM content. Empty strings are NOT paths (skip).
 // `Resp` is the admin-wide `http::Response<Vec<u8>>` (large by design, shared
 // by every handler); clippy's `result_large_err` (default-warn since 1.98)
 // fires on the unit-Err shape here — boxed responses would ripple through the
 // whole admin layer for no benefit.
 #[allow(clippy::result_large_err)]
-async fn apply_tenant_cert(
-    state: &AdminState,
-    tenant_id: &str,
+fn resolve_tenant_cert_write(
     cert_pem: &Option<String>,
     cert_key_pem: &Option<String>,
+    cert_file: Option<&str>,
+    cert_key: Option<&str>,
     trace_id: &str,
-) -> Result<(), Resp> {
-    match (
-        cert_pem.as_deref().map(str::trim),
-        cert_key_pem.as_deref().map(str::trim),
-    ) {
+) -> Result<CertWrite, Resp> {
+    let pem_raw = cert_pem.as_deref();
+    let key_raw = cert_key_pem.as_deref();
+    let pem = pem_raw.map(str::trim);
+    let key = key_raw.map(str::trim);
+    match (pem, key) {
         // Explicit removal: `cert_pem: ""`.
-        (Some(""), _) => {
-            let cert = crate::db::TenantCert {
-                tenant_id: tenant_id.to_string(),
-                cert_pem: None,
-                cert_key_pem: None,
-            };
-            crate::db::update_tenant_cert(state.db(), state.key_provider.as_ref(), &cert)
-                .await
-                .map_err(|e| db_err_resp(e, trace_id))?;
-        }
+        (Some(""), _) => Ok(CertWrite::Clear),
         // Content mode: non-empty `cert_pem` (+ required `cert_key_pem`).
-        // Note: `pem`/`key` above are trimmed only for the emptiness check;
-        // the stored content is the RAW body (a trailing newline is PEM-normal
-        // and must round-trip untouched).
-        (Some(_), Some(key)) => {
-            if key.is_empty() {
-                return Err(err_json(
-                    400,
-                    "missing_required_field",
-                    "cert_key_pem is required when cert_pem is set",
-                    trace_id,
-                ));
-            }
-            let cert = crate::db::TenantCert {
-                tenant_id: tenant_id.to_string(),
-                cert_pem: cert_pem.clone(),
-                cert_key_pem: cert_key_pem.clone(),
-            };
-            crate::db::update_tenant_cert(state.db(), state.key_provider.as_ref(), &cert)
-                .await
-                .map_err(|e| db_err_resp(e, trace_id))?;
-        }
-        (Some(_), None) => {
-            return Err(err_json(
-                400,
-                "missing_required_field",
-                "cert_key_pem is required when cert_pem is set",
-                trace_id,
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(err_json(
-                400,
-                "missing_required_field",
-                "cert_pem is required when cert_key_pem is set",
-                trace_id,
-            ));
-        }
+        // Note: the trim above is only for the emptiness check; the stored
+        // content is the RAW body (a trailing newline is PEM-normal and must
+        // round-trip untouched).
+        (Some(_), Some(k)) if !k.is_empty() => Ok(CertWrite::Content {
+            cert_pem: pem_raw.unwrap_or_default().to_string(),
+            cert_key_pem: key_raw.unwrap_or_default().to_string(),
+        }),
+        (Some(_), Some(_)) => Err(err_json(
+            400,
+            "missing_required_field",
+            "cert_key_pem is required when cert_pem is set",
+            trace_id,
+        )),
+        (Some(_), None) => Err(err_json(
+            400,
+            "missing_required_field",
+            "cert_key_pem is required when cert_pem is set",
+            trace_id,
+        )),
+        (None, Some(_)) => Err(err_json(
+            400,
+            "missing_required_field",
+            "cert_pem is required when cert_key_pem is set",
+            trace_id,
+        )),
         (None, None) => {
-            // Legacy path form: convert at write time (the tenant row already
-            // carries the paths — the caller persisted them before this call).
-            let t = crate::db::get_tenant(state.db(), tenant_id)
-                .await
-                .map_err(|e| db_err_resp(e, trace_id))?;
-            if let (Some(cert_path), Some(key_path)) = (&t.cert_file, &t.cert_key) {
-                match (std::fs::read(cert_path), std::fs::read(key_path)) {
-                    (Ok(cert_bytes), Ok(key_bytes)) => {
-                        let cert = crate::db::TenantCert {
-                            tenant_id: tenant_id.to_string(),
-                            cert_pem: Some(String::from_utf8_lossy(&cert_bytes).into_owned()),
-                            cert_key_pem: Some(String::from_utf8_lossy(&key_bytes).into_owned()),
-                        };
-                        crate::db::update_tenant_cert(
-                            state.db(),
-                            state.key_provider.as_ref(),
-                            &cert,
-                        )
-                        .await
-                        .map_err(|e| db_err_resp(e, trace_id))?;
-                    }
-                    _ => {
-                        return Err(err_json(
+            // Legacy path form: convert by reading the files on this node.
+            // Empty strings are NOT paths (a blank optional field arrives as
+            // "" from the admin UI) — convert only when BOTH sides carry a
+            // non-empty path; otherwise no cert change.
+            let cf = cert_file.map(str::trim).filter(|s| !s.is_empty());
+            let ck = cert_key.map(str::trim).filter(|s| !s.is_empty());
+            match (cf, ck) {
+                (Some(cert_path), Some(key_path)) => {
+                    match (std::fs::read(cert_path), std::fs::read(key_path)) {
+                        (Ok(cert_bytes), Ok(key_bytes)) => Ok(CertWrite::Content {
+                            cert_pem: String::from_utf8_lossy(&cert_bytes).into_owned(),
+                            cert_key_pem: String::from_utf8_lossy(&key_bytes).into_owned(),
+                        }),
+                        _ => Err(err_json(
                             400,
                             "cert_file_unreadable",
                             "cert_file/cert_key paths given but not readable on this node; \
                              provide cert_pem/cert_key_pem content instead",
                             trace_id,
-                        ));
+                        )),
                     }
                 }
+                _ => Ok(CertWrite::None),
             }
         }
     }
+}
+
+/// Persist the resolved certificate write for a tenant (post-insert; the
+/// tenant row must already exist — migration 0007 makes the DB self-contained).
+#[allow(clippy::result_large_err)]
+async fn apply_tenant_cert_write(
+    state: &AdminState,
+    tenant_id: &str,
+    action: CertWrite,
+    trace_id: &str,
+) -> Result<(), Resp> {
+    let cert = match action {
+        CertWrite::None => return Ok(()),
+        CertWrite::Clear => crate::db::TenantCert {
+            tenant_id: tenant_id.to_string(),
+            cert_pem: None,
+            cert_key_pem: None,
+        },
+        CertWrite::Content {
+            cert_pem,
+            cert_key_pem,
+        } => crate::db::TenantCert {
+            tenant_id: tenant_id.to_string(),
+            cert_pem: Some(cert_pem),
+            cert_key_pem: Some(cert_key_pem),
+        },
+    };
+    crate::db::update_tenant_cert(state.db(), state.key_provider.as_ref(), &cert)
+        .await
+        .map_err(|e| db_err_resp(e, trace_id))?;
     Ok(())
 }
 
@@ -628,15 +646,25 @@ pub(super) async fn tenant_collection(
         if t.updated_at.is_empty() {
             t.updated_at = ts;
         }
+        // Certificate inputs are validated BEFORE the row is written so a 4xx
+        // can never leave a "reported as failed but actually created" tenant
+        // behind; the resolved cert is applied after insert (migration 0007:
+        // the DB becomes self-contained).
+        let cert_action = match resolve_tenant_cert_write(
+            &up.cert_pem,
+            &up.cert_key_pem,
+            t.cert_file.as_deref(),
+            t.cert_key.as_deref(),
+            trace_id,
+        ) {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
         match crate::db::insert_tenant(state.db(), &t).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        // Certificate content (migration 0007): PEM wins, legacy paths are
-        // converted here so the DB is self-contained (no shared cert volume).
-        if let Err(resp) =
-            apply_tenant_cert(state, &t.id, &up.cert_pem, &up.cert_key_pem, trace_id).await
-        {
+        if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
             return resp;
         }
         reload_best_effort(state, trace_id).await;
@@ -668,14 +696,23 @@ pub(super) async fn tenant_item(
             let mut t = up.tenant;
             t.id = id.to_string();
             t.updated_at = now_ts();
+            // Certificate inputs validated BEFORE the update (same rule as
+            // POST); applied after the row write (migration 0007).
+            let cert_action = match resolve_tenant_cert_write(
+                &up.cert_pem,
+                &up.cert_key_pem,
+                t.cert_file.as_deref(),
+                t.cert_key.as_deref(),
+                trace_id,
+            ) {
+                Ok(a) => a,
+                Err(r) => return r,
+            };
             match crate::db::update_tenant(state.db(), &t).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            // Certificate content (migration 0007) — same rules as POST.
-            if let Err(resp) =
-                apply_tenant_cert(state, &t.id, &up.cert_pem, &up.cert_key_pem, trace_id).await
-            {
+            if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
                 return resp;
             }
             match crate::db::get_tenant(state.db(), id).await {

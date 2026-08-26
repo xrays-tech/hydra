@@ -654,6 +654,115 @@ async fn tenant_cert_content_http() {
     assert_eq!(got.cert_key_pem, None);
 }
 
+/// Regression (admin UI create-tenant): the UI sends blank optional
+/// `cert_file`/`cert_key` as `""` (empty string), which was treated as a
+/// real path — the tenant was INSERTED first, then the legacy-path conversion
+/// failed with 400 `cert_file_unreadable`, so the UI reported failure while
+/// the tenant was actually created. Fix: empty strings are not paths (stored
+/// as NULL), and certificate inputs are validated BEFORE the row is written,
+/// so a 4xx can never leave a "reported as failed but created" tenant behind.
+#[tokio::test]
+async fn tenant_create_ui_payload_no_zombie_on_400() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // 1. Exact admin-UI payload: blank legacy paths arrive as "" (not null).
+    let ui = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(ui),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        201,
+        "blank cert fields must not fail the create"
+    );
+
+    // The stored row normalizes "" to NULL (empty string is not a path).
+    let list = repo::list_tenants(state.db()).await.expect("list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].cert_file, None, "\"\" stored as NULL");
+    assert_eq!(list[0].cert_key, None, "\"\" stored as NULL");
+
+    // 2. cert_pem without cert_key_pem → 400 BEFORE the row is written.
+    let bad = r#"{"id":"t2","name":"T2","domain":"acme2.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----"}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(bad),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "missing cert_key_pem → 400");
+    let list = repo::list_tenants(state.db()).await.expect("list");
+    assert_eq!(
+        list.len(),
+        1,
+        "the 400 must NOT leave a partially-created tenant behind"
+    );
+
+    // 3. Non-empty but unreadable legacy path → 400 BEFORE the row is written.
+    let bad_path = r#"{"id":"t3","name":"T3","domain":"acme3.com","auth_url":"https://auth.acme.com/v","cert_file":"/nonexistent/cert.pem","cert_key":"/nonexistent/key.pem","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(bad_path),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "unreadable legacy path → 400");
+    let list = repo::list_tenants(state.db()).await.expect("list");
+    assert_eq!(
+        list.len(),
+        1,
+        "the 400 must NOT leave a partially-created tenant behind"
+    );
+
+    // 4. Valid legacy paths still convert (PEM content stored, sealed).
+    let dir = std::env::temp_dir();
+    let cert_path = dir.join(format!("hydra-test-cert-{}.pem", std::process::id()));
+    let key_path = dir.join(format!("hydra-test-key-{}.pem", std::process::id()));
+    std::fs::write(
+        &cert_path,
+        "-----BEGIN CERTIFICATE-----\nLEGCERT\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &key_path,
+        "-----BEGIN PRIVATE KEY-----\nLEGKEY\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let legacy = format!(
+        r#"{{"id":"t4","name":"T4","domain":"acme4.com","auth_url":"https://auth.acme.com/v","cert_file":{:?},"cert_key":{:?},"cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}}"#,
+        cert_path.to_string_lossy(),
+        key_path.to_string_lossy()
+    );
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(&legacy),
+    )
+    .await;
+    assert_eq!(r.status(), 201, "readable legacy paths convert on create");
+    let kp = StaticKeyProvider::new([1u8; 32], 1);
+    let got = repo::get_tenant_cert(state.db(), &kp, "t4")
+        .await
+        .expect("get cert")
+        .expect("cert present");
+    assert!(got.cert_pem.as_deref().unwrap_or("").contains("LEGCERT"));
+    assert!(got.cert_key_pem.as_deref().unwrap_or("").contains("LEGKEY"));
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
 /// Edge data-plane admin (cluster P0b): pool-less state serving ONLY the
 /// probe endpoints (`/metrics` `/healthz` `/readyz`); no admin UI, no CRUD —
 /// everything else is 404, even with a valid admin token.
