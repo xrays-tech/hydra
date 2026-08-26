@@ -1,4 +1,7 @@
-# syntax=docker/dockerfile:1
+# NOTE: no `# syntax=` frontend pin is used — the built-in BuildKit frontend
+# handles this Dockerfile (standard instructions only), so builds never pull
+# the docker/dockerfile frontend image from a (possibly rate-limited/mirrored)
+# registry at build start.
 #
 # Hydra — Linux runtime image.
 #
