@@ -487,6 +487,11 @@ struct TenantUpsert {
 /// - neither given → legacy `cert_file`/`cert_key` paths (already persisted
 ///   in the tenant row by the caller): convert by reading the files **on this
 ///   node**; unreadable → 400 with a hint to switch to PEM content.
+// `Resp` is the admin-wide `http::Response<Vec<u8>>` (large by design, shared
+// by every handler); clippy's `result_large_err` (default-warn since 1.98)
+// fires on the unit-Err shape here — boxed responses would ripple through the
+// whole admin layer for no benefit.
+#[allow(clippy::result_large_err)]
 async fn apply_tenant_cert(
     state: &AdminState,
     tenant_id: &str,
