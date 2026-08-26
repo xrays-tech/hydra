@@ -28,6 +28,16 @@ pub struct NodeRecord {
     pub control_url: String,
 }
 
+/// One fleet node as reported by [`NodeRegistry::list_nodes`] (registry entry
+/// + heartbeat liveness).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub role: String,
+    pub control_url: String,
+    pub alive: bool,
+}
+
 /// Redis-backed node registry.
 #[derive(Clone)]
 pub struct NodeRegistry {
@@ -38,6 +48,18 @@ pub struct NodeRegistry {
 }
 
 impl NodeRegistry {
+    /// This node's registry id.
+    #[must_use]
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// This node's role as registered.
+    #[must_use]
+    pub fn role(&self) -> NodeRole {
+        self.role
+    }
+
     /// Build the registry for THIS node. `control_url` is the node's own
     /// control endpoint (what peers should poll).
     #[must_use]
@@ -111,6 +133,34 @@ impl NodeRegistry {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Every registered node with its liveness (heartbeat TTL). Used by the
+    /// admin cluster-status endpoint (`GET /api/v1/cluster/status`) so the
+    /// Admin UI Health page can render the whole fleet.
+    pub async fn list_nodes(&self) -> Result<Vec<NodeStatus>, RedisError> {
+        let fields: Vec<(String, String)> = self.pool.hgetall(NODES_KEY).await?;
+        let mut out = Vec::new();
+        for (id, value) in fields {
+            let Some((role, url)) = value.split_once('|') else {
+                continue;
+            };
+            let alive = self.node_alive(&id).await?;
+            out.push(NodeStatus {
+                node_id: id,
+                role: role.to_string(),
+                control_url: url.to_string(),
+                alive,
+            });
+        }
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(out)
+    }
+
+    /// The current leader-lease holder's node id (the active writer), if any.
+    pub async fn lease_holder(&self) -> Result<Option<String>, RedisError> {
+        let holder: Option<String> = self.pool.get(crate::redis::LEASE_KEY).await?;
+        Ok(holder)
     }
 
     /// The control URL of the CURRENT lease holder (the active writer), if
@@ -217,5 +267,48 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let urls = a.leader_control_urls().await.expect("discover");
         assert!(urls.is_empty(), "expired heartbeat ⇒ node considered gone");
+    }
+
+    #[tokio::test]
+    async fn list_nodes_reports_liveness_and_lease_holder() {
+        let pool = pool_with_mock().await;
+        let a = NodeRegistry::new(
+            pool.clone(),
+            "node-a".into(),
+            NodeRole::Leader,
+            "http://a:8081".into(),
+        );
+        let b = NodeRegistry::new(
+            pool.clone(),
+            "node-b".into(),
+            NodeRole::Edge,
+            "http://b:8081".into(),
+        );
+        a.register(60).await.expect("register a");
+        b.register(60).await.expect("register b");
+        // node-a holds the leader lease (value = holder node id).
+        let _: Option<String> = pool
+            .set(crate::redis::LEASE_KEY, "node-a", None, None, false)
+            .await
+            .expect("set lease");
+
+        let nodes = a.list_nodes().await.expect("list");
+        assert_eq!(nodes.len(), 2, "leader + edge both listed");
+        let ids: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(ids.contains(&"node-a") && ids.contains(&"node-b"));
+        assert!(nodes.iter().all(|n| n.alive), "fresh heartbeats ⇒ alive");
+        assert_eq!(
+            a.lease_holder().await.expect("holder").as_deref(),
+            Some("node-a")
+        );
+
+        // Expire b's heartbeat → still listed, but not alive.
+        let _: i64 = pool.del("hydra:{node:hb}:node-b").await.expect("del hb");
+        let nodes = a.list_nodes().await.expect("list2");
+        let b_entry = nodes
+            .iter()
+            .find(|n| n.node_id == "node-b")
+            .expect("b listed");
+        assert!(!b_entry.alive, "expired heartbeat ⇒ down but still visible");
     }
 }

@@ -99,6 +99,15 @@ pub struct AdminState {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     pub invalidation: Option<()>,
+    /// Fleet registry (cluster P4): backs `GET /api/v1/cluster/status` for
+    /// the Admin UI Health page (whole-cluster view: nodes, roles, liveness,
+    /// lease holder). `None` off-cluster.
+    #[cfg(feature = "cluster-redis")]
+    pub cluster_registry: Option<Arc<crate::cluster::registry::NodeRegistry>>,
+    /// Placeholder so single-node builds keep a uniform shape.
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    pub cluster_registry: Option<()>,
 }
 
 impl AdminState {
@@ -138,6 +147,10 @@ impl AdminState {
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
             invalidation: None,
+            #[cfg(feature = "cluster-redis")]
+            cluster_registry: None,
+            #[cfg(not(feature = "cluster-redis"))]
+            cluster_registry: None,
         }
     }
 
@@ -241,6 +254,10 @@ impl AdminService {
         // Internal control plane (cluster P1): snapshot distribution.
         if parts == ["internal", "control"] && method == "GET" {
             return handlers::internal_control(&self.state, query, trace_id).await;
+        }
+        // Cluster status (cluster P4): whole-fleet view for the Health page.
+        if parts == ["cluster", "status"] && method == "GET" {
+            return handlers::cluster_status(&self.state, trace_id).await;
         }
 
         // REST CRUD resources.

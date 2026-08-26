@@ -576,6 +576,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         invalidation_stream,
         #[cfg(not(feature = "cluster-redis"))]
         invalidation_stream,
+        #[cfg(feature = "cluster-redis")]
+        cluster_registry: registry,
+        #[cfg(not(feature = "cluster-redis"))]
+        cluster_registry: None,
     })
 }
 
@@ -597,6 +601,13 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     invalidation_stream: Option<()>,
+    /// Fleet registry (cluster P4): handed to the admin service for the
+    /// whole-cluster status endpoint (`/api/v1/cluster/status`).
+    #[cfg(feature = "cluster-redis")]
+    cluster_registry: Option<Arc<hydra_server::cluster::registry::NodeRegistry>>,
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    cluster_registry: Option<()>,
 }
 
 /// Synchronous Pingora setup: build the proxy + admin services and call
@@ -710,6 +721,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     #[cfg(feature = "cluster-redis")]
     {
         admin_state.invalidation = c.invalidation_stream;
+        admin_state.cluster_registry = c.cluster_registry;
     }
     let admin_state = Arc::new(admin_state);
     let admin_app = AdminService::new(admin_state);

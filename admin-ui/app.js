@@ -978,16 +978,67 @@ async function renderHealth() {
     el("div", { class: "stat-grid", id: "health-stats" },
       el("span", { class: "skeleton", style: "width:100%;height:60px" }),
     ),
-    el("pre", { class: "json", id: "health-json" }, "{}"),
   ));
+  // Whole-cluster view (cluster P4): fleet nodes + lease holder.
+  content.appendChild(el("div", { class: "panel" },
+    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: "Cluster" })), el("div", { class: "spacer" })),
+    el("div", { class: "stat-grid", id: "cluster-stats" },
+      el("span", { class: "skeleton", style: "width:100%;height:60px" }),
+    ),
+    el("div", { id: "cluster-nodes" }),
+  ));
+  content.appendChild(el("pre", { class: "json", id: "health-json" }, "{}"));
   try {
-    const h = await api("GET", "/health");
+    const [h, c] = await Promise.all([
+      api("GET", "/health"),
+      api("GET", "/cluster/status"),
+    ]);
     renderHealthStats(h);
-    $("#health-json").innerHTML = highlightJson(h);
+    renderClusterStatus(c);
+    $("#health-json").innerHTML = highlightJson({ health: h, cluster: c });
   } catch (e) {
     $("#health-json").textContent = `error: ${e.message}`;
     toast(e.message, "err");
   }
+}
+function renderClusterStatus(c) {
+  const stats = $("#cluster-stats");
+  const nodes = $("#cluster-nodes");
+  clear(stats); clear(nodes);
+  if (!c || !c.cluster) {
+    stats.appendChild(el("div", { class: "stat" },
+      el("div", { class: "sl", text: "mode" }), el("div", { class: "sv", text: "single-node" })));
+    nodes.appendChild(el("p", { class: "muted",
+      text: "集群模式未启用（HYDRA_ROLE 未设置）—— 本页仅显示本节点状态。" }));
+    return;
+  }
+  const alive = c.nodes.filter((n) => n.alive).length;
+  const cards = [
+    { l: "mode", v: c.mode, cls: "" },
+    { l: "lease holder", v: c.lease_holder ?? "—", cls: c.lease_holder ? "ok" : "warn" },
+    { l: "nodes alive", v: `${alive}/${c.nodes.length}`, cls: alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn" },
+    { l: "self", v: c.node_id || "—", cls: "" },
+  ];
+  for (const k of cards) stats.appendChild(el("div", { class: `stat ${k.cls}` },
+    el("div", { class: "sl", text: k.l }), el("div", { class: "sv", text: String(k.v) })));
+
+  const th = (t) => el("th", { text: t });
+  const rows = [el("tr", {}, th("NODE"), th("ROLE"), th("CONTROL URL"), th("STATE"))];
+  for (const n of c.nodes) {
+    const name = el("span", { text: n.node_id });
+    if (n.is_self) name.appendChild(el("span", { class: "pill info", text: "self" }));
+    if (n.is_lease_holder) name.appendChild(el("span", { class: "pill ok", text: "active" }));
+    rows.push(el("tr", {},
+      el("td", {}, name),
+      el("td", {}, el("span", { class: `pill ${n.role === "leader" ? "info" : "warn"}`, text: n.role })),
+      el("td", { class: "mono" }, n.control_url || "—"),
+      el("td", {}, n.alive
+        ? el("span", { class: "pill ok", text: "alive" })
+        : el("span", { class: "pill dead", text: "down" })),
+    ));
+  }
+  nodes.appendChild(el("div", { class: "table-wrap" },
+    el("table", {}, el("thead", {}, rows[0]), el("tbody", {}, ...rows.slice(1)))));
 }
 function renderHealthStats(h) {
   const grid = $("#health-stats");

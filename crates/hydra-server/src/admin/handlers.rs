@@ -1075,6 +1075,99 @@ pub(super) async fn auth_cache_invalidate(
 }
 
 // ===========================================================================
+// Cluster status (cluster P4) — whole-fleet view for the Admin UI Health page
+// ===========================================================================
+
+/// One fleet node as rendered by `GET /api/v1/cluster/status`.
+#[derive(Serialize)]
+struct ClusterNodeDto {
+    node_id: String,
+    role: String,
+    control_url: String,
+    alive: bool,
+    is_lease_holder: bool,
+    is_self: bool,
+}
+
+/// Whole-cluster status. `cluster=false` on the single-node build / default
+/// mode — the UI then renders just the local Health panel.
+#[derive(Serialize)]
+struct ClusterStatusDto {
+    cluster: bool,
+    mode: String,
+    node_id: String,
+    this_node_leader: bool,
+    lease_holder: Option<String>,
+    nodes: Vec<ClusterNodeDto>,
+}
+
+/// `GET /api/v1/cluster/status` (admin-token gated): fleet nodes from the
+/// registry (role + control URL + heartbeat liveness) plus the current
+/// leader-lease holder. Single-node mode reports `cluster=false`.
+#[allow(unused_variables)] // params are unused on the single-node build
+pub(super) async fn cluster_status(state: &AdminState, trace_id: &str) -> Resp {
+    #[cfg(feature = "cluster-redis")]
+    {
+        let Some(registry) = &state.cluster_registry else {
+            return ok_json(200, &single_node_status());
+        };
+        let (nodes, holder) = match (registry.list_nodes().await, registry.lease_holder().await) {
+            (Ok(nodes), Ok(holder)) => (nodes, holder),
+            _ => {
+                return err_json(
+                    502,
+                    "cluster_unavailable",
+                    "cannot read the cluster registry (Redis unreachable?)",
+                    trace_id,
+                );
+            }
+        };
+        let self_id = registry.node_id().to_string();
+        let mode = match registry.role() {
+            crate::cluster::NodeRole::Leader => "leader",
+            crate::cluster::NodeRole::Edge => "edge",
+            crate::cluster::NodeRole::All => "all",
+        }
+        .to_string();
+        let dto = ClusterStatusDto {
+            cluster: true,
+            mode,
+            this_node_leader: holder.as_deref() == Some(registry.node_id()),
+            node_id: self_id.clone(),
+            lease_holder: holder.clone(),
+            nodes: nodes
+                .into_iter()
+                .map(|n| ClusterNodeDto {
+                    is_lease_holder: holder.as_deref() == Some(n.node_id.as_str()),
+                    is_self: n.node_id == self_id,
+                    node_id: n.node_id,
+                    role: n.role,
+                    control_url: n.control_url,
+                    alive: n.alive,
+                })
+                .collect(),
+        };
+        ok_json(200, &dto)
+    }
+    #[cfg(not(feature = "cluster-redis"))]
+    {
+        ok_json(200, &single_node_status())
+    }
+}
+
+/// The single-node status payload (shared by both cfg branches).
+fn single_node_status() -> ClusterStatusDto {
+    ClusterStatusDto {
+        cluster: false,
+        mode: "single".to_string(),
+        node_id: String::new(),
+        this_node_leader: false,
+        lease_holder: None,
+        nodes: Vec::new(),
+    }
+}
+
+// ===========================================================================
 // Breaker inspect / reset (design §8.4 / §13.2)
 // ===========================================================================
 
