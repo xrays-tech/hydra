@@ -602,7 +602,7 @@ k3s / k8s manifests and bare-metal systemd live in `docs/cluster.md` §4.
 | `HYDRA_ROLE` | `leader` / `edge`; unset = single-node (unchanged behavior) |
 | `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired, sentinel/cluster fail-fast |
 | `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes) |
-| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint / this node's registered URL |
+| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `docs/cluster.md` §5.2) |
 | `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
@@ -619,7 +619,10 @@ docker compose -f docker-compose.cluster.yml start hydra-control-a  # rejoins as
 
 Edges and standbys follow the new active automatically (registry rotation +
 lease-aware rotation); a rejoining leader rebuilds its replica from the current
-active (no shared volume). Full checklist: `docs/cluster.md` §5.
+active (no shared volume). Admin writes on a standby are forwarded to the
+actual lease holder (registry-resolved, with a forward-once loop guard) — you
+can point the admin UI at ANY leader candidate, including one whose
+`HYDRA_CONTROL_URL` points at itself. Full checklist: `docs/cluster.md` §5.
 
 ### 13.5 Redis outage behavior
 

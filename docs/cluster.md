@@ -19,7 +19,7 @@
 **自维持**（集群在任何编排环境下自我管理）：
 1. **自举**：节点只需 `HYDRA_REDIS_URL` + `HYDRA_CLUSTER_TOKEN` → 注册表发现 leader → 拉全量快照（含证书）→ 开始服务；
 2. **自动选举**：leader 候选经 Redis 租约竞争，恰一个 active；
-3. **自动故障切换**：active 死亡 → 租约过期 → 合格候选提升（实测 ≤ 租约 15s + 选举 tick 5s，约 11–18s），edge 数据面与控制面均无感（edge 轮询失败自动经注册表旋转到新 active；standby 也按**租约持有者**轮换 —— 即使它的静态 `HYDRA_CONTROL_URL` 指向自己，见 §5.1）；
+3. **自动故障切换**：active 死亡 → 租约过期 → 合格候选提升（实测 ≤ 租约 15s + 选举 tick 5s，约 11–18s），edge 数据面与控制面均无感（edge 轮询失败自动经注册表旋转到新 active；standby 也按**租约持有者**轮换 —— 即使它的静态 `HYDRA_CONTROL_URL` 指向自己，见 §5.1）；**管理变更同样按租约持有者转发**：standby 的管理写入目标在转发时从注册表实时解析（绝不使用静态 `HYDRA_CONTROL_URL`，它可能指向节点自身），且每个转发请求带 once 标记，任何自转发/互转循环都会立即 fail-closed 503 而不是超时递归（见 §5.2）；
 4. **自动加入/退出**：edge 无状态任意增删；leader 候选可加可减；
 5. **自愈**：租约时间栅栏杜绝双写、快照版本冲突由胜方覆盖、熔断投票 TTL 自清理、失效事件流跨故障切换不丢（幂等重放）。
 
@@ -33,7 +33,7 @@
 | `HYDRA_REDIS_URL` | — | **集群必填**（fail-closed）；如 `redis://redis:6379` |
 | `HYDRA_REDIS_MODE` | `single` | `single`（默认）/ `sentinel` / `cluster`（后两者接线中，fail-fast） |
 | `HYDRA_CLUSTER_TOKEN` | — | **集群必填**：控制通道共享 token（leader 服务、edge/standby 调用） |
-| `HYDRA_CONTROL_URL` | — | leader/edge 必填：active leader 的管理端点（如 `http://hydra-control:8081`） |
+| `HYDRA_CONTROL_URL` | — | leader/edge 必填：**控制面快照轮询**端点（active leader 的管理端点，如 `http://hydra-control:8081`）。注意它不是管理变更的转发目标 —— 转发目标在转发时按**租约持有者**从注册表实时解析（见 §5.2），因此候选节点把该变量指向自己也是安全的 |
 | `HYDRA_PUBLIC_URL` | — | 本节点注册到注册表的可达管理端点（如 `http://hydra-control-a:8081`）；leader 建议必填 |
 | `HYDRA_CONTROL_POLL_MS` | `1000` | 控制快照轮询间隔（standby 副本同步可收紧至 200） |
 | `HYDRA_LEADER_LEASE_MS` | `15000` | 租约时长（续约每 lease/3） |
@@ -230,6 +230,28 @@ docker compose -f docker-compose.cluster.yml start hydra-control-a
 - 禁用的 `limit_role`/`provider_key_binding` 只存在于 active 本地 DB，**不进快照**（`build_config` 只带 enabled 行，契约见 T5.7）—— 故障切换后该行在副本/新 active 上丢失，需重新创建。修复方向：快照单独携带禁用行。
 - 新鲜度闸门基于"最近一次轮询成功"：重启后立刻提升的极端场景（active 同时死亡）仍可能以旧副本上任（租约感知轮换只覆盖"active 存活时回归"的常规路径）。
 - `HYDRA_FAILOVER_GRACE_MS` 已文档化但未接线；`HYDRA_BREAKER_QUORUM`/`HYDRA_RATE_LIMIT_FAIL_MODE` 为代码内默认值。
+
+### 5.2 管理变更转发（standby → active）与循环防护
+
+**转发目标 = 实际租约持有者（绝不使用静态 URL）**：standby 收到管理变更
+（POST/PUT/DELETE）时，转发目标在转发时刻从节点注册表实时解析
+（`NodeRegistry::active_leader_url()`，即 Redis 租约持有者注册的
+`HYDRA_PUBLIC_URL`）。静态 `HYDRA_CONTROL_URL` **只**用于控制面快照轮询，
+不作为转发目标——它可能指向节点自身（主候选的常见配置），且无法跨故障切换
+跟踪租约。
+
+**三层防护**（缺一不可，防御纵深）：
+1. **注册表解析**（主修复）：目标始终跟随实际租约持有者，故障切换后无需
+   重配置；
+2. **自转发护栏**：若解析出的目标恰是本节点自己的注册 URL（误注册/共用
+   URL），拒绝转发并 fail-closed 503，绝不自转发；
+3. **forward-once 标记**（`x-hydra-forwarded`）：每个转发请求携带标记，
+   收到带标记变更的非 active 节点直接 503，不再二次转发——任何自转发或
+   节点间互转循环都会立即终止，而不是 5s 超时递归。
+
+**验证**：standby 上 `POST /api/v1/providers` → 成功落盘到 active 并回 201；
+向 standby 直接构造带 `x-hydra-forwarded` 的变更 → 503 `forward_loop`；
+目标不可达/无租约 → 503 `not_leader`（fail-closed，绝不本地代写）。
 
 ---
 

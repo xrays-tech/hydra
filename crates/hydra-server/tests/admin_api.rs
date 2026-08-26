@@ -59,7 +59,6 @@ async fn admin_state() -> Arc<AdminState> {
         false,
         None, // no cluster token in tests
         None, // no leader election in tests
-        None, // no forward target in tests
     ))
 }
 
@@ -685,7 +684,6 @@ async fn edge_admin_probes_only() {
         true, // edge_mode
         None, // no cluster token in tests
         None, // no leader election in tests
-        None, // no forward target in tests
     ));
     let port = start_admin(state);
 
@@ -1112,7 +1110,6 @@ async fn concurrency_snapshot_reports_live_gates() {
         false,
         None, // no cluster token in tests
         None, // no leader election in tests
-        None, // no forward target in tests
     ));
     let port = start_admin(state);
 

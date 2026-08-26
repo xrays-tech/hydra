@@ -105,7 +105,6 @@ async fn leader() -> (sqlx::SqlitePool, ConfigStore, u16) {
         false,
         Some(CLUSTER_TOKEN.to_string()),
         None, // no leader election in the leader() test harness
-        None, // no forward target
     ));
     let port = start_admin(state);
     (pool, store, port)
@@ -439,7 +438,6 @@ async fn leader_health_and_write_gate() {
         false,
         None,
         Some(Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>),
-        None, // no forward target in the gate test
     ));
     let port = start_admin(state);
 
@@ -480,7 +478,6 @@ async fn leader_health_and_write_gate() {
         false,
         None,
         None, // single-node: no election
-        None, // no forward target
     ));
     let port_all = start_admin(state_all);
     let r = http(port_all, reqwest::Method::GET, "/healthz/leader", None).await;
@@ -514,6 +511,7 @@ async fn http(
     panic!("server on {port} did not come up");
 }
 
+#[cfg(feature = "cluster-redis")]
 async fn admin_components(
     pool: sqlx::SqlitePool,
     kp: Arc<dyn KeyProvider>,
@@ -532,11 +530,31 @@ async fn admin_components(
     (store, auth, breaker)
 }
 
-/// T-CL-7 — a standby FORWARDS admin mutations to the active (transparent
-/// failover for operators), serves reads locally, and never writes locally;
-/// a dead active yields 502 (fail-closed, no self-promotion via forwarding).
+/// T-CL-7 — a standby FORWARDS admin mutations to the ACTUAL lease holder
+/// (resolved live from the cluster registry — the target is never a static
+/// `HYDRA_CONTROL_URL`, which for a primary candidate points at the node
+/// itself), serves reads locally, and never writes locally. A dead active
+/// yields 502 (fail-closed, no self-promotion via forwarding); a mutation
+/// that already carries the forward-once marker is refused (loop guard).
+#[cfg(feature = "cluster-redis")]
 #[tokio::test]
 async fn standby_forwards_mutations_to_active() {
+    use fred::prelude::*;
+    use hydra_server::cluster::registry::NodeRegistry;
+    use hydra_server::cluster::NodeRole;
+    use hydra_server::redis::mock::MockRedis;
+    use hydra_server::redis::LEASE_KEY;
+
+    // Shared Redis double: the lease + the registry entries the forward
+    // target is resolved from (MockRedis — no external Redis needed).
+    let mock = Arc::new(MockRedis::new());
+    let cfg = Config {
+        mocks: Some(mock),
+        ..Default::default()
+    };
+    let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
+    pool.init().await.expect("init");
+
     let active_pool = common::setup_pool().await;
     let kp_arc: Arc<dyn KeyProvider> = Arc::new(kp());
     let (active_store, auth, breaker) = admin_components(active_pool.clone(), kp_arc.clone()).await;
@@ -552,14 +570,28 @@ async fn standby_forwards_mutations_to_active() {
         false,
         None,
         Some(Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
-        None, // active has no forward target
     ));
     let active_port = start_admin(active);
+
+    // Register the ACTIVE in the registry and hand it the lease: the standby
+    // must resolve THIS node as its forward target — the node id it polls
+    // (`HYDRA_CONTROL_URL`) is irrelevant to forwarding.
+    let active_registry = NodeRegistry::new(
+        pool.clone(),
+        "active".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{active_port}"),
+    );
+    active_registry.register(60).await.expect("register active");
+    let _: Option<String> = pool
+        .set(LEASE_KEY, "active", None, None, false)
+        .await
+        .expect("set lease");
 
     let standby_pool = common::setup_pool().await;
     let (standby_store, auth2, breaker2) =
         admin_components(standby_pool.clone(), kp_arc.clone()).await;
-    let standby = Arc::new(AdminState::new(
+    let mut standby_state = AdminState::new(
         Some(standby_pool.clone()),
         standby_store,
         auth2,
@@ -571,8 +603,14 @@ async fn standby_forwards_mutations_to_active() {
         false,
         None,
         Some(Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>),
-        Some(format!("http://127.0.0.1:{active_port}")),
-    ));
+    );
+    standby_state.cluster_registry = Some(Arc::new(NodeRegistry::new(
+        pool.clone(),
+        "standby".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{}", ephemeral_port()), // own URL; never the target here
+    )));
+    let standby = Arc::new(standby_state);
     let standby_port = start_admin(standby);
 
     // POST a provider to the STANDBY → forwarded to the active → 201, and the
@@ -631,11 +669,28 @@ async fn standby_forwards_mutations_to_active() {
     .await;
     assert_eq!(r.status().as_u16(), 200, "DELETE forwarded to the active");
 
+    // Forward-once loop guard: a mutation that already carries the marker is
+    // refused with 503 even though we are a standby — it must never be
+    // forwarded a second time (self-/mutual-forward loop termination).
+    let r = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{standby_port}/api/v1/providers"))
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-hydra-forwarded", "1")
+        .json(&serde_json::json!({"id":"loop","key":"l","name":"L","endpoint":"https://l.example.com","weight":1,"created_at":"","updated_at":""}))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        r.status().as_u16(),
+        503,
+        "forward-once guard refuses re-forwarding"
+    );
+
     // Dead active → 502 (fail-closed), never a local write.
     let dead_port = ephemeral_port(); // nothing listening there
     let dead_pool = common::setup_pool().await;
     let (dead_store, auth3, breaker3) = admin_components(dead_pool.clone(), Arc::new(kp())).await;
-    let dead = Arc::new(AdminState::new(
+    let mut dead_state = AdminState::new(
         Some(dead_pool.clone()),
         dead_store,
         auth3,
@@ -647,8 +702,29 @@ async fn standby_forwards_mutations_to_active() {
         false,
         None,
         Some(Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>),
-        Some(format!("http://127.0.0.1:{dead_port}")),
-    ));
+    );
+    dead_state.cluster_registry = Some(Arc::new(NodeRegistry::new(
+        pool.clone(),
+        "dead-standby".into(),
+        NodeRole::Leader,
+        String::new(),
+    )));
+    // A "dead active" registered in the registry with an unreachable URL.
+    let dead_active = NodeRegistry::new(
+        pool.clone(),
+        "dead-active".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{dead_port}"),
+    );
+    dead_active
+        .register(60)
+        .await
+        .expect("register dead active");
+    let _: Option<String> = pool
+        .set(LEASE_KEY, "dead-active", None, None, false)
+        .await
+        .expect("set dead lease");
+    let dead = Arc::new(dead_state);
     let dead_standby_port = start_admin(dead);
     let r = http(
         dead_standby_port,

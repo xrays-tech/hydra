@@ -17,6 +17,13 @@
 //! - **Write-after consistency**: every successful config write calls
 //!   `ConfigStore::reload_all()` then re-resolves certs (design §13.2 / W4b
 //!   cert-reload contract), serialised by a per-state mutex.
+//! - **Standby mutation forwarding (cluster P3)**: a leader candidate that
+//!   does not hold the lease forwards every admin mutation to the ACTUAL
+//!   lease holder, resolved live from the cluster registry — never to a
+//!   static `HYDRA_CONTROL_URL` (which for a primary candidate points at the
+//!   node itself). Forwarded mutations carry a forward-once marker so any
+//!   (self- or mutual-) forward loop terminates fail-closed with 503 instead
+//!   of a timeout recursion (see `cluster::forward`).
 
 use std::sync::Arc;
 
@@ -86,10 +93,6 @@ pub struct AdminState {
     /// ⇒ forward to the active, P3) and `/healthz/leader`. `None` on
     /// single-node (`all`) and edge.
     pub leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    /// The active leader's admin base URL (cluster P3): standby nodes forward
-    /// admin mutations here instead of failing them. `None` on single-node /
-    /// edge and when no forward target is configured.
-    pub forward_to: Option<String>,
     /// Invalidation-stream publisher (cluster P4): `DELETE /api/v1/auth/cache`
     /// broadcasts the invalidation cluster-wide instead of clearing only the
     /// local cache. `None` off-cluster / on the single-node build.
@@ -127,7 +130,6 @@ impl AdminState {
         edge_mode: bool,
         cluster_token: Option<String>,
         leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-        forward_to: Option<String>,
     ) -> Self {
         Self {
             pool,
@@ -142,7 +144,6 @@ impl AdminState {
             edge_mode,
             cluster_token,
             leader_ready,
-            forward_to,
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
@@ -162,6 +163,31 @@ impl AdminState {
         self.pool
             .as_ref()
             .expect("admin SQLite pool (leader mode only)")
+    }
+
+    /// Resolve the URL admin mutations should be forwarded to: the ACTUAL
+    /// lease holder from the cluster registry (cluster P3/P4). The target is
+    /// resolved LIVE at forward time — never from a static
+    /// `HYDRA_CONTROL_URL`, which for a primary leader candidate may point
+    /// at THIS node itself (the self-forward loop bug) and cannot track the
+    /// lease across failover.
+    ///
+    /// `Ok(None)` ⇒ no forward target is resolvable right now — the caller
+    /// must fail closed (503, never a local write on a standby).
+    async fn resolve_forward_target(&self) -> Result<Option<String>, String> {
+        #[cfg(feature = "cluster-redis")]
+        {
+            match &self.cluster_registry {
+                Some(registry) => {
+                    crate::cluster::forward::forward_target_from_registry(registry).await
+                }
+                None => Ok(None), // no registry → cannot know the active leader
+            }
+        }
+        #[cfg(not(feature = "cluster-redis"))]
+        {
+            Ok(None)
+        }
     }
 }
 
@@ -386,44 +412,77 @@ impl ServeHttp for AdminService {
 
         // Leader write gate (cluster P2/P3): on leader-candidate nodes that
         // do NOT hold the lease, admin mutations are FORWARDED to the active
-        // leader (P3) — reads stay local (the replica serves them). When no
-        // forward target is configured, or the active is unreachable, the
-        // mutation fails 503 (fail-closed — a standby must never write
-        // locally; taking over is the lease machine's job).
+        // leader (P3) — reads stay local (the replica serves them). The
+        // forward target is resolved LIVE from the cluster registry (the
+        // ACTUAL lease holder), never from a static HYDRA_CONTROL_URL: a
+        // static URL may point at this node itself (the self-forward loop
+        // bug) and cannot track the lease across failover. Fail-closed: when
+        // no target is resolvable, or the active is unreachable, the mutation
+        // fails 503/502 (a standby must never write locally; taking over is
+        // the lease machine's job).
         if let Some(is_leader) = &self.state.leader_ready {
             let mutation = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
             if mutation && !is_leader() {
-                if let Some(target) = self.state.forward_to.clone() {
-                    let path_and_query = match &query {
-                        Some(q) => format!("{path}?{q}"),
-                        None => path.clone(),
-                    };
-                    let body = handlers::read_body(session).await;
-                    return match crate::cluster::forward::forward_mutation(
-                        &target,
-                        &method,
-                        &path_and_query,
-                        body,
-                        &session.req_header().headers,
+                // Forward-once marker (loop guard): a mutation that already
+                // travelled through a standby must never be forwarded again —
+                // this terminates any (self- or mutual-) forward loop with an
+                // immediate fail-closed 503 instead of a timeout recursion.
+                if session
+                    .req_header()
+                    .headers
+                    .contains_key(crate::cluster::forward::FORWARD_ONCE_HEADER)
+                {
+                    return handlers::err_json(
+                        503,
+                        "forward_loop",
+                        "mutation already forwarded once; refusing to forward again (forward loop guard)",
                         &trace_id,
-                    )
-                    .await
-                    {
-                        Ok(resp) => resp,
-                        Err(e) => handlers::err_json(
-                            502,
-                            "forward_failed",
-                            &format!("{e}; the active leader is unreachable (no local write)"),
-                            &trace_id,
-                        ),
-                    };
+                    );
                 }
-                return handlers::err_json(
-                    503,
-                    "not_leader",
-                    "this node is not the active leader and no forward target is configured",
+                let path_and_query = match &query {
+                    Some(q) => format!("{path}?{q}"),
+                    None => path.clone(),
+                };
+                let target = match self.state.resolve_forward_target().await {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        return handlers::err_json(
+                            503,
+                            "not_leader",
+                            "this node is not the active leader and no forward target is resolvable (lease holder unknown)",
+                            &trace_id,
+                        );
+                    }
+                    Err(e) => {
+                        return handlers::err_json(
+                            503,
+                            "not_leader",
+                            &format!(
+                                "this node is not the active leader; forward target resolution failed: {e}"
+                            ),
+                            &trace_id,
+                        );
+                    }
+                };
+                let body = handlers::read_body(session).await;
+                return match crate::cluster::forward::forward_mutation(
+                    &target,
+                    &method,
+                    &path_and_query,
+                    body,
+                    &session.req_header().headers,
                     &trace_id,
-                );
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => handlers::err_json(
+                        502,
+                        "forward_failed",
+                        &format!("{e}; the active leader is unreachable (no local write)"),
+                        &trace_id,
+                    ),
+                };
             }
         }
 

@@ -220,7 +220,6 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         false,
         None, // no cluster token in tests
         None, // no leader election in tests
-        None, // no forward target in tests
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------

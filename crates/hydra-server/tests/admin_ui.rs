@@ -55,7 +55,6 @@ async fn admin_state() -> Arc<AdminState> {
         false,
         None, // no cluster token in tests
         None, // no leader election in tests
-        None, // no forward target in tests
     ))
 }
 

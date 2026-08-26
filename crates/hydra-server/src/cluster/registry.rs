@@ -60,6 +60,14 @@ impl NodeRegistry {
         self.role
     }
 
+    /// This node's own control URL as registered (what peers should poll and
+    /// where admin mutations should be forwarded to reach THIS node). Used by
+    /// the forward-target resolution's self-forward guard.
+    #[must_use]
+    pub fn control_url(&self) -> &str {
+        &self.control_url
+    }
+
     /// Build the registry for THIS node. `control_url` is the node's own
     /// control endpoint (what peers should poll).
     #[must_use]

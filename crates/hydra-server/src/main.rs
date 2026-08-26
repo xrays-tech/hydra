@@ -711,10 +711,10 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         // Internal control-plane endpoints (cluster P1).
         c.cluster.cluster_token.clone(),
         // Leader-lease gate (/healthz/leader + admin mutation forwarding, P2/P3).
+        // The forward target is resolved LIVE from the cluster registry (the
+        // actual lease holder) at forward time — never from HYDRA_CONTROL_URL,
+        // which for a primary leader candidate points at this node itself.
         c.leader_ready,
-        // Forward admin mutations to the active leader (P3): the same URL the
-        // standby polls for snapshots.
-        c.cluster.control_url.clone(),
     );
     // Invalidation bus publisher (P4): admin auth-cache invalidations are
     // broadcast cluster-wide, not just applied locally.
