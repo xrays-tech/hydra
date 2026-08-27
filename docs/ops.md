@@ -642,14 +642,20 @@ until Redis recovers. See `docs/cluster.md` §3 for the full matrix.
 
 ## 14. GitHub pull fails: `GnuTLS recv error (-110)` (HTTPS over unstable links)
 
-> **Finalized fix (2026-08, verified).** Symptom: `git pull`/`git fetch` from
-> GitHub over HTTPS intermittently dies with
+> **Finalized fix (2026-08, verified on dev box + test server).** Symptom:
+> `git pull`/`git fetch` from GitHub over HTTPS intermittently dies with
 > `GnuTLS recv error (-110): The TLS connection was non-properly terminated`.
-> Root cause: distro git built against GnuTLS is sensitive to packet loss /
-> middlebox interference on cross-border links, and HTTP/2 multiplexing makes
-> it worse. The fix below forces HTTP/1.1 + bigger buffers + no low-speed
-> cutoff. Applied **globally** on this machine and verified with 8/8
-> consecutive `git fetch` + an ALPN trace showing `http/1.1` negotiated.
+> Root cause (test server `172.16.48.71`): `github.com:443` is **intermittently
+> dropped at the TCP layer** by the network (probes: 3/3 TCP fails then OK;
+> `github.com:22`/`:80` and `api.github.com:443` always reachable) — git
+> client config cannot fix L3/L4 drops. **Decision: use SSH for GitHub on the
+> test server** (port 22 is stable and the host key is registered), keep the
+> HTTP/1.1 config below as an HTTPS fallback.
+>
+> **Test-server record (2026-08-27):** global HTTP/1.1 config applied; the
+> hydra checkout `/opt/ru_deployer/src/hydra/main` origin switched to
+> `git@github.com:xrays-tech/hydra.git`; verified with a real fetch
+> (`7af8a17..a4440a4`) + 8/8 consecutive fetches over SSH.
 
 ### 14.1 Apply (simplest fix — no side effects, covers every repo)
 
