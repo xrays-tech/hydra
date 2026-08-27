@@ -11,24 +11,28 @@ export function addGlobalOptions(cmd: Command): Command {
   return cmd;
 }
 
-function rootOf(cmd: Command): Command {
-  let c: Command = cmd;
-  while (c.parent) c = c.parent;
-  return c;
+function ancestors(cmd: Command): Command[] {
+  const chain: Command[] = [];
+  let c: Command | null = cmd;
+  while (c) {
+    chain.unshift(c);
+    c = c.parent;
+  }
+  return chain;
 }
 
 /**
- * Merge root-level options with the leaf command's options. Leaf values win,
- * but undefined leaf values never clobber a value supplied at the root (so
- * `hydra-admin --token X providers list` and `hydra-admin providers list --token X`
- * both work).
+ * Merge global options from every ancestor command with the leaf command's
+ * options. Leaf values win, but undefined leaf values never clobber a value
+ * supplied on a parent (so `--token X cmd sub` and `cmd sub --token X` both
+ * work, as do options on intermediate command groups).
  */
 export function effectiveOpts(cmd: Command): EffectiveOpts {
-  const root = rootOf(cmd).opts() as GlobalOpts;
-  const leaf = cmd.opts() as Record<string, unknown>;
-  const merged: Record<string, unknown> = { ...root };
-  for (const [k, v] of Object.entries(leaf)) {
-    if (v !== undefined) merged[k] = v;
+  const merged: Record<string, unknown> = {};
+  for (const c of ancestors(cmd)) {
+    for (const [k, v] of Object.entries(c.opts() as Record<string, unknown>)) {
+      if (v !== undefined) merged[k] = v;
+    }
   }
   return merged as EffectiveOpts;
 }

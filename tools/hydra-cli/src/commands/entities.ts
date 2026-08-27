@@ -25,8 +25,9 @@ function parseNumber(value: string, nullable?: boolean): number | null {
 /**
  * Build the JSON body for create/update from parsed options.
  *
- * The server requires created_at/updated_at to be present (it fills the real
- * values); we send "" so callers never have to.
+ * Some server entities auto-fill created_at/updated_at when blank; for those
+ * we send "" so callers never have to. Entities without timestamps (or with
+ * only created_at) are handled by `def.timestamps`.
  *
  * @param isCreate when true, defaults are applied for omitted fields.
  */
@@ -55,8 +56,12 @@ function buildBody(
     }
   }
 
-  body['created_at'] = '';
-  body['updated_at'] = '';
+  if (def.timestamps !== 'none') {
+    body['created_at'] = '';
+    if (def.timestamps !== 'created') {
+      body['updated_at'] = '';
+    }
+  }
   return body;
 }
 
@@ -84,7 +89,7 @@ function recordId(res: unknown, fallback: string): string {
  *   <entity> list [--json]          (default subcommand)
  *   <entity> get <id>
  *   <entity> create --id ... [fields]
- *   <entity> update <id> [fields]
+ *   <entity> update <id> [fields]   (only when supportsUpdate is not false)
  *   <entity> delete <id> [-y]
  */
 export function buildEntityCommand(def: EntityDef): Command {
@@ -159,25 +164,27 @@ export function buildEntityCommand(def: EntityDef): Command {
   );
 
   // ---- update -------------------------------------------------------------
-  const updateCmd = addGlobalOptions(
-    group.command('update <id>').description(`Update a ${def.label}.`),
-  );
-  attachFieldFlags(updateCmd, def, false);
-  updateCmd.action(
-    withErrorHandler(async (...args: unknown[]) => {
-      const id = String(args[0]);
-      const actionCmd = args[args.length - 1] as Command;
-      const opts = effectiveOpts(actionCmd);
-      const client = new HydraClient(resolveConfig(opts));
-      const body = buildBody(def, opts, false);
-      const res = await client.update(def.route, id, body);
-      if (opts.json) {
-        printJson(res);
-        return;
-      }
-      printSuccess(`${def.label} ${id} updated`);
-    }),
-  );
+  if (def.supportsUpdate !== false) {
+    const updateCmd = addGlobalOptions(
+      group.command('update <id>').description(`Update a ${def.label}.`),
+    );
+    attachFieldFlags(updateCmd, def, false);
+    updateCmd.action(
+      withErrorHandler(async (...args: unknown[]) => {
+        const id = String(args[0]);
+        const actionCmd = args[args.length - 1] as Command;
+        const opts = effectiveOpts(actionCmd);
+        const client = new HydraClient(resolveConfig(opts));
+        const body = buildBody(def, opts, false);
+        const res = await client.update(def.route, id, body);
+        if (opts.json) {
+          printJson(res);
+          return;
+        }
+        printSuccess(`${def.label} ${id} updated`);
+      }),
+    );
+  }
 
   // ---- delete -------------------------------------------------------------
   const deleteCmd = addGlobalOptions(

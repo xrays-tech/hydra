@@ -55,15 +55,56 @@ before(async () => {
       if (last.url === '/api/v1/reload' && last.method === 'POST') {
         return json(res, 200, { reloaded: true });
       }
-      if (last.url === '/api/v1/metrics' && last.method === 'GET') {
+      if (last.url === '/metrics' && last.method === 'GET') {
         const text = '# HELP hydra_x A metric\n# TYPE hydra_x gauge\nhydra_x 42\n';
         res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': Buffer.byteLength(text) });
         return res.end(text);
       }
       if (last.url === '/api/v1/concurrency' && last.method === 'GET') {
-        return json(res, 200, [
-          { provider_id: 'p1', gated: true, max_concurrency: 10, inflight: 2, available: 8, queue_depth: 0 },
-        ]);
+        return json(res, 200, {
+          providers: [
+            { provider_id: 'p1', gated: true, max_concurrency: 10, inflight: 2, available: 8, queue_depth: 0 },
+          ],
+        });
+      }
+      if (last.url === '/api/v1/breaker' && last.method === 'GET') {
+        return json(res, 200, { dead: ['p1'] });
+      }
+      if (last.url === '/api/v1/breaker/p1' && last.method === 'DELETE') {
+        return json(res, 200, { reset: 'p1', was_dead: true, dead: [] });
+      }
+      if (last.url === '/api/v1/auth/cache' && last.method === 'DELETE') {
+        return json(res, 200, { invalidated: 2, tenant_id: 't1' });
+      }
+      if (last.url === '/api/v1/stats/usage' && last.method === 'GET') {
+        return json(res, 200, {
+          generated_at: '2026-01-01T00:00:00+00:00',
+          totals: { requests: 42, tokens: 1000, tokens_prompt: 600, tokens_completion: 400, tenants: 1, providers: 1 },
+          by_tenant: [{ name: 't1', requests: 42, tokens: 1000, tokens_prompt: 600, tokens_completion: 400 }],
+          by_provider: [{ name: 'p1', requests: 42, tokens: 1000, tokens_prompt: 600, tokens_completion: 400 }],
+        });
+      }
+      if (last.url === '/api/v1/cluster/status' && last.method === 'GET') {
+        return json(res, 200, {
+          cluster: false,
+          mode: 'single',
+          node_id: '',
+          this_node_leader: false,
+          lease_holder: null,
+          nodes: [],
+        });
+      }
+      if (last.url === '/api/v1/tenants/auth/test' && last.method === 'POST') {
+        return json(res, 200, {
+          ok: true,
+          reachable: true,
+          status: 401,
+          protocol_ok: true,
+          verdict: 'denied',
+          detail: 'auth service rejected the simulated api-key',
+          duration_ms: 42,
+          body_snippet: '',
+        });
       }
       if (last.url === '/api/v1/providers' && last.method === 'GET') {
         return json(res, 200, [
@@ -144,13 +185,50 @@ describe('HydraClient transport', () => {
   it('returns raw Prometheus text for metrics (text/plain accept)', async () => {
     const text = await client().metrics();
     assert.match(text, /# HELP/);
+    assert.equal(last.url, '/metrics');
     assert.equal(last.accept, 'text/plain');
   });
 
-  it('parses concurrency as an array of gate rows', async () => {
-    const res = await client().concurrency();
-    assert.ok(Array.isArray(res));
-    assert.equal((res as Array<Record<string, unknown>>)[0]?.['provider_id'], 'p1');
+  it('parses concurrency as the latest {providers:[...]} payload', async () => {
+    const res = await client().concurrency() as Record<string, unknown>;
+    assert.ok(Array.isArray(res['providers']));
+    assert.equal((res['providers'] as Array<Record<string, unknown>>)[0]?.['provider_id'], 'p1');
+  });
+
+  it('lists and resets circuit breakers', async () => {
+    const list = await client().breakerList() as Record<string, unknown>;
+    assert.deepEqual(list['dead'], ['p1']);
+    const reset = await client().breakerReset('p1') as Record<string, unknown>;
+    assert.equal(reset['reset'], 'p1');
+    assert.equal(last.method, 'DELETE');
+    assert.equal(last.url, '/api/v1/breaker/p1');
+  });
+
+  it('invalidates the auth cache with a JSON body', async () => {
+    const res = await client().authCacheInvalidate({ tenant_id: 't1', api_keys: ['sk-a', 'sk-b'] }) as Record<string, unknown>;
+    assert.equal(res['invalidated'], 2);
+    assert.equal(last.method, 'DELETE');
+    assert.equal(last.url, '/api/v1/auth/cache');
+    const sent = JSON.parse(last.body) as Record<string, unknown>;
+    assert.equal(sent['tenant_id'], 't1');
+    assert.deepEqual(sent['api_keys'], ['sk-a', 'sk-b']);
+  });
+
+  it('fetches usage stats and cluster status', async () => {
+    const usage = await client().statsUsage() as Record<string, unknown>;
+    assert.equal((usage['totals'] as Record<string, unknown>)['requests'], 42);
+    const cluster = await client().clusterStatus() as Record<string, unknown>;
+    assert.equal(cluster['cluster'], false);
+  });
+
+  it('probes a tenant auth URL', async () => {
+    const res = await client().tenantAuthTest({ auth_url: 'https://auth.example.test/v' }) as Record<string, unknown>;
+    assert.equal(res['ok'], true);
+    assert.equal(res['verdict'], 'denied');
+    assert.equal(last.method, 'POST');
+    assert.equal(last.url, '/api/v1/tenants/auth/test');
+    const sent = JSON.parse(last.body) as Record<string, unknown>;
+    assert.equal(sent['auth_url'], 'https://auth.example.test/v');
   });
 
   it('parses health as an object', async () => {

@@ -6,6 +6,13 @@ import { buildReloadCommand } from './commands/reload.js';
 import { buildMetricsCommand } from './commands/metrics.js';
 import { buildConcurrencyCommand } from './commands/concurrency.js';
 import { buildEntityCommand } from './commands/entities.js';
+import {
+  buildAuthCacheCommand,
+  buildBreakerCommand,
+  buildClusterCommand,
+  buildStatsCommand,
+  buildTenantAuthTestCommand,
+} from './commands/system.js';
 import { ENTITY_DEFS } from './types.js';
 
 const program = new Command();
@@ -28,10 +35,18 @@ program.addCommand(buildHealthCommand());
 program.addCommand(buildReloadCommand());
 program.addCommand(buildMetricsCommand());
 program.addCommand(buildConcurrencyCommand());
+program.addCommand(buildBreakerCommand());
+program.addCommand(buildAuthCacheCommand());
+program.addCommand(buildStatsCommand());
+program.addCommand(buildClusterCommand());
 
-// Six CRUD entity groups, all produced by one generic factory.
+// CRUD entity groups, all produced by one generic factory.
 for (const def of ENTITY_DEFS) {
-  program.addCommand(buildEntityCommand(def));
+  const cmd = buildEntityCommand(def);
+  if (def.command === 'tenants') {
+    cmd.addCommand(buildTenantAuthTestCommand());
+  }
+  program.addCommand(cmd);
 }
 
 /**

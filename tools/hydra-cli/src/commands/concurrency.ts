@@ -29,7 +29,9 @@ export function buildConcurrencyCommand(): Command {
       }
       const rows = Array.isArray(res)
         ? (res as Array<Record<string, unknown>>)
-        : [];
+        : Array.isArray((res as Record<string, unknown> | null)?.providers)
+          ? ((res as Record<string, unknown>).providers as Array<Record<string, unknown>>)
+          : [];
       printTable(CONCURRENCY_COLUMNS, rows);
     }),
   );

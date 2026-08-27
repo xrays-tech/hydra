@@ -3,8 +3,10 @@
 A command-line client for the **Hydra** LLM gateway admin REST API.
 
 `hydra-admin` drives every admin endpoint — health, hot-reload, metrics, live
-concurrency, and full CRUD for providers, provider-models, provider-keys,
-tenants, tenant-providers and tenant-models — straight from the terminal.
+concurrency, circuit breakers, auth-cache invalidation, usage stats, cluster
+status, tenant auth-url probing, and full CRUD for providers, provider-models,
+provider-keys, tenants, tenant-providers, tenant-models, limit-roles and
+key-prefix bindings — straight from the terminal.
 
 The npm package and the command you run are both called **`hydra-admin`**:
 `npm i -g hydra-admin`, then `hydra-admin ...`.
@@ -79,15 +81,21 @@ hydra-admin providers list --token s3cret
 ### Service endpoints
 
 ```bash
-hydra-admin health           # service health
-hydra-admin reload           # hot-reload config snapshot
-hydra-admin metrics          # Prometheus text (raw, pipe to a file / scraper)
-hydra-admin concurrency      # live admission / gate state
+hydra-admin health                # service health
+hydra-admin reload                # hot-reload config snapshot
+hydra-admin metrics               # Prometheus text (raw, pipe to a file / scraper)
+hydra-admin concurrency           # live admission / gate state
+hydra-admin breaker               # list circuit-breaker dead providers
+hydra-admin breaker reset <id>    # force-clear a provider's breaker
+hydra-admin auth-cache invalidate # invalidate cached auth decisions
+hydra-admin stats usage           # aggregated usage stats by tenant/provider
+hydra-admin cluster status        # whole-cluster fleet status
+hydra-admin tenants auth-test <auth-url> [--tenant-id <id>]  # probe a tenant auth URL
 ```
 
 ### Entity CRUD
 
-All six entity groups share the same shape:
+All entity groups share the same shape:
 
 ```
 hydra-admin <entity> list [--json]        # list all (default subcommand)
@@ -98,7 +106,11 @@ hydra-admin <entity> delete <id> [-y]
 ```
 
 Entities: `providers`, `provider-models`, `provider-keys`, `tenants`,
-`tenant-providers`, `tenant-models`.
+`tenant-providers`, `tenant-models`, `limit-roles`, `provider-key-bindings`.
+
+Most entities support `update`; the mapping-only entities
+(`tenant-providers` and `tenant-models`) intentionally omit it because the
+server treats them as create/delete grants.
 
 `delete` prompts for confirmation unless you pass `-y` / `--yes`.
 
@@ -157,21 +169,54 @@ hydra-admin tenants create \
 hydra-admin tenants update acme --disabled --cert-key ./certs/acme.key
 ```
 
-| Field      | Flag          | Type    |
-| ---------- | ------------- | ------- |
-| `id`       | `--id`        | string  |
-| `name`     | `--name`      | string  |
-| `domain`   | `--domain`    | string  |
-| `auth_url` | `--auth-url`  | string  |
-| `enabled`  | `--enabled` / `--disabled` | boolean |
-| `cert_key` | `--cert-key`  | string  |
-| `cert_file`| `--cert-file` | string  |
+| Field            | Flag                  | Type    |
+| ---------------- | --------------------- | ------- |
+| `id`             | `--id`                | string  |
+| `name`           | `--name`              | string  |
+| `domain`         | `--domain`            | string  |
+| `auth_url`       | `--auth-url`          | string  |
+| `enabled`        | `--enabled` / `--disabled` | boolean |
+| `cert_key`       | `--cert-key`          | string  |
+| `cert_file`      | `--cert-file`         | string  |
+| `cert_pem`       | `--cert-pem`          | string  |
+| `cert_key_pem`   | `--cert-key-pem`      | string  |
+| `access_token`   | `--access-token`      | string  |
+
+`access_token` is write-only: it is stored as a SHA-256 hash, never echoed
+back. Blank on edit keeps the current token; `--access-token ""` clears it.
 
 #### tenant-providers / tenant-models
+
+These are grant mappings; the server does not implement a PUT update for them.
+Use delete + create to change a mapping.
 
 ```bash
 hydra-admin tenant-providers create --id tp1 --tenant-id acme --provider-id openai
 hydra-admin tenant-models   create --id tm1 --tenant-id acme --model-key gpt-4o
+hydra-admin tenant-providers delete tp1 -y
+```
+
+#### limit-roles
+
+Rate-limit roles matched by tenant / key / model / provider.
+
+```bash
+hydra-admin limit-roles create \
+  --id rl1 --name basic --matching-tenant acme \
+  --limit-count 100 --limit-token 100000 --window h --enabled
+
+hydra-admin limit-roles update rl1 --limit-count 50 --disabled
+hydra-admin limit-roles list
+```
+
+#### provider-key-bindings
+
+Client api-keys whose raw value starts with `key_prefix` are pinned to one
+provider.
+
+```bash
+hydra-admin provider-key-bindings create --id b1 --key-prefix sk_aaa_ --provider-id openai
+hydra-admin provider-key-bindings update b1 --provider-id anthropic --disabled
 ```
 
 ---

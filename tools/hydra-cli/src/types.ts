@@ -33,12 +33,16 @@ export interface EntityDef {
   columns: ColDef[];
   /** Fields used to build create/update bodies. */
   fields: FieldDef[];
+  /** Whether the API supports PUT update for this entity. Defaults to true. */
+  supportsUpdate?: boolean;
+  /** Which timestamp placeholders to send in create/update bodies. */
+  timestamps?: 'both' | 'created' | 'none';
 }
 
 /**
  * Declarative description of every CRUD entity. The generic factory in
  * `commands/entities.ts` turns each entry into a full set of subcommands,
- * keeping the six entity groups DRY.
+ * keeping the CRUD entity groups DRY.
  */
 export const ENTITY_DEFS: EntityDef[] = [
   {
@@ -83,6 +87,7 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'provider_id', kind: 'string', flag: '--provider-id <id>', help: 'Owning provider id', required: true },
       { field: 'status', kind: 'number', flag: '--status <n>', help: 'Status (1 = active)', default: 1 },
     ],
+    timestamps: 'none',
   },
   {
     route: 'provider-keys',
@@ -99,6 +104,7 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'provider_id', kind: 'string', flag: '--provider-id <id>', help: 'Owning provider id', required: true },
       { field: 'api_key', kind: 'string', flag: '--api-key <key>', help: 'Upstream API key value (stored masked server-side)', required: true },
     ],
+    timestamps: 'created',
   },
   {
     route: 'tenants',
@@ -109,6 +115,8 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'id', header: 'ID', width: 18 },
       { field: 'name', header: 'NAME', width: 22 },
       { field: 'domain', header: 'DOMAIN', width: 26 },
+      { field: 'auth_url', header: 'AUTH_URL', width: 34 },
+      { field: 'has_access_token', header: 'TOKEN', width: 7 },
       { field: 'enabled', header: 'ENABLED', width: 8 },
     ],
     fields: [
@@ -117,8 +125,11 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'domain', kind: 'string', flag: '--domain <domain>', help: 'Tenant domain', required: true },
       { field: 'auth_url', kind: 'string', flag: '--auth-url <url>', help: 'Auth URL', required: true },
       { field: 'enabled', kind: 'boolean', flag: '--enabled', falseFlag: '--disabled', help: 'Enable (--enabled) or disable (--disabled) the tenant', default: true },
-      { field: 'cert_key', kind: 'string', flag: '--cert-key <key>', help: 'Cert key (nullable)' },
-      { field: 'cert_file', kind: 'string', flag: '--cert-file <path>', help: 'Cert file path (nullable)' },
+      { field: 'cert_key', kind: 'string', flag: '--cert-key <key>', help: 'Legacy cert key path (nullable)' },
+      { field: 'cert_file', kind: 'string', flag: '--cert-file <path>', help: 'Legacy cert file path (nullable)' },
+      { field: 'cert_pem', kind: 'string', flag: '--cert-pem <pem>', help: 'Public cert PEM (content mode)' },
+      { field: 'cert_key_pem', kind: 'string', flag: '--cert-key-pem <pem>', help: 'Private key PEM (content mode)' },
+      { field: 'access_token', kind: 'string', flag: '--access-token <token>', help: 'Tenant self-service access token (write-only, blank keeps on edit)' },
     ],
   },
   {
@@ -136,6 +147,8 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'tenant_id', kind: 'string', flag: '--tenant-id <id>', help: 'Tenant id', required: true },
       { field: 'provider_id', kind: 'string', flag: '--provider-id <id>', help: 'Provider id', required: true },
     ],
+    supportsUpdate: false,
+    timestamps: 'none',
   },
   {
     route: 'tenant-models',
@@ -152,6 +165,39 @@ export const ENTITY_DEFS: EntityDef[] = [
       { field: 'tenant_id', kind: 'string', flag: '--tenant-id <id>', help: 'Tenant id', required: true },
       { field: 'model_key', kind: 'string', flag: '--model-key <key>', help: 'Model key', required: true },
     ],
+    supportsUpdate: false,
+    timestamps: 'none',
+  },
+  {
+    route: 'limit-roles',
+    command: 'limit-roles',
+    label: 'rate-limit role',
+    labelPlural: 'rate-limit roles',
+    columns: [
+      { field: 'id', header: 'ID', width: 18 },
+      { field: 'name', header: 'NAME', width: 22 },
+      { field: 'matching_tenant', header: 'TENANT', width: 18 },
+      { field: 'matching_key', header: 'KEY', width: 18 },
+      { field: 'matching_model', header: 'MODEL', width: 18 },
+      { field: 'matching_provider', header: 'PROVIDER', width: 18 },
+      { field: 'limit_count', header: 'LIMIT', width: 8 },
+      { field: 'limit_token', header: 'TOKENS', width: 10 },
+      { field: 'window', header: 'WINDOW', width: 7 },
+      { field: 'enabled', header: 'ENABLED', width: 8 },
+    ],
+    fields: [
+      { field: 'id', kind: 'string', flag: '--id <id>', help: 'Role id', required: true },
+      { field: 'name', kind: 'string', flag: '--name <name>', help: 'Role name', required: true },
+      { field: 'matching_tenant', kind: 'string', flag: '--matching-tenant <id>', help: 'Match tenant id (omit for all)' },
+      { field: 'matching_key', kind: 'string', flag: '--matching-key <key>', help: 'Match client api-key (omit for all)' },
+      { field: 'matching_model', kind: 'string', flag: '--matching-model <model>', help: 'Match model key (omit for all)' },
+      { field: 'matching_provider', kind: 'string', flag: '--matching-provider <id>', help: 'Match provider id (omit for all)' },
+      { field: 'limit_count', kind: 'number', flag: '--limit-count <n>', help: 'Request limit (omit or 0 for unlimited)', nullable: true },
+      { field: 'limit_token', kind: 'number', flag: '--limit-token <n>', help: 'Token limit (omit or 0 for unlimited)', nullable: true },
+      { field: 'window', kind: 'string', flag: '--window <m|h|d>', help: 'Limit window: m, h or d', required: true },
+      { field: 'enabled', kind: 'boolean', flag: '--enabled', falseFlag: '--disabled', help: 'Enable (--enabled) or disable (--disabled)', default: true },
+    ],
+    timestamps: 'created',
   },
   {
     route: 'provider-key-bindings',

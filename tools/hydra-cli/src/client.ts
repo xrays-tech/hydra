@@ -35,11 +35,35 @@ export class HydraClient {
 
   /** Raw Prometheus text — returned unchanged (NOT parsed as JSON). */
   async metrics(): Promise<string> {
-    return this.doRequest('GET', '/api/v1/metrics', undefined, true);
+    return this.doRequest('GET', '/metrics', undefined, true);
   }
 
   async concurrency(): Promise<Json> {
     return this.jsonRequest('GET', '/api/v1/concurrency');
+  }
+
+  async breakerList(): Promise<Json> {
+    return this.jsonRequest('GET', '/api/v1/breaker');
+  }
+
+  async breakerReset(providerId: string): Promise<Json> {
+    return this.jsonRequest('DELETE', `/api/v1/breaker/${encodeURIComponent(providerId)}`);
+  }
+
+  async authCacheInvalidate(body: Body = {}): Promise<Json> {
+    return this.jsonRequest('DELETE', '/api/v1/auth/cache', body);
+  }
+
+  async statsUsage(): Promise<Json> {
+    return this.jsonRequest('GET', '/api/v1/stats/usage');
+  }
+
+  async clusterStatus(): Promise<Json> {
+    return this.jsonRequest('GET', '/api/v1/cluster/status');
+  }
+
+  async tenantAuthTest(body: Body): Promise<Json> {
+    return this.jsonRequest('POST', '/api/v1/tenants/auth/test', body);
   }
 
   async list(entity: string): Promise<Json> {
