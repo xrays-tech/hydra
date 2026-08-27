@@ -1,5 +1,5 @@
 //! Per-provider bounded admission queue — the concurrency valve
-//! (design `docs/design-admission-queue.md` §3 / §7 / §10 / §11 P0.2+P0.5).
+//! (design `dev-docs/design-admission-queue.md` §3 / §7 / §10 / §11 P0.2+P0.5).
 //!
 //! [`AdmissionControl`] owns a `DashMap<provider_id, Arc<ProviderGate>>`. Each
 //! gate wraps a `tokio::sync::Semaphore` (`max_concurrency` permits) plus an

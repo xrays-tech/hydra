@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 # Minimum Supported Rust Version. Pingora 0.8 requires a recent toolchain;
 # 1.83 is the floor we guarantee. Enforced here as metadata (CI uses `stable`
-# via rust-toolchain.toml). See docs/dev-plan.md §2.
+# via rust-toolchain.toml). See dev-docs/dev-plan.md §2.
 rust-version = "1.83"
 license = "Apache-2.0"
 repository = "https://github.com/alex/hydra"

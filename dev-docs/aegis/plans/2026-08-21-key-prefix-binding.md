@@ -47,10 +47,10 @@
 
 ## Baseline / Authority Refs
 
-- `docs/design.md` §4.1（schema）、§5.2/§5.3（loader / ConfigData）、§7.1（候选计算）、§10.1（limit_role matching 语义，绑定表沿用其 enabled 过滤约定）、§13（admin REST）、§14（admin-UI）
-- `docs/waves/wave-1-pure-core.md`（纯核心约定：resolve 候选管线）、`wave-4-proxy-shell.md`（request_filter 生命周期）
+- `dev-docs/design.md` §4.1（schema）、§5.2/§5.3（loader / ConfigData）、§7.1（候选计算）、§10.1（limit_role matching 语义，绑定表沿用其 enabled 过滤约定）、§13（admin REST）、§14（admin-UI）
+- `dev-docs/waves/wave-1-pure-core.md`（纯核心约定：resolve 候选管线）、`wave-4-proxy-shell.md`（request_filter 生命周期）
 - `crates/hydra-core/src/router.rs`、`config.rs`、`model.rs`；`crates/hydra-server/src/{db,store,proxy,admin}/*`
-- `docs/HANDOFF.md`（sqlx prepare 流程、测试基数：hydra-core 101 / hydra-server 159）
+- `dev-docs/HANDOFF.md`（sqlx prepare 流程、测试基数：hydra-core 101 / hydra-server 159）
 - 需求来源：用户本轮对话（全局绑定 / 最长前缀优先 / fail-closed / 1:1，四项均已确认）
 
 ### Requirement Ready Check
@@ -147,7 +147,7 @@ TDD Route:
 | `crates/hydra-server/tests/loader.rs` | 修改（enabled-only 加载） | 7 |
 | `crates/hydra-server/tests/admin_api.rs` | 修改（HTTP CRUD + snapshot 断言） | 7 |
 | `admin-ui/app.js` | 修改（CRUD section + NAV + 注释） | 6 |
-| `docs/design.md` / `README.md` / `README.zh-CN.md` / `docs/HANDOFF.md` | 修改 | 8 |
+| `dev-docs/design.md` / `README.md` / `README.zh-CN.md` / `dev-docs/HANDOFF.md` | 修改 | 8 |
 | `tools/hydra-cli/src/types.ts` | 可选修改（ENTITY_DEF） | 8（可选） |
 
 ---
@@ -1180,7 +1180,7 @@ async fn provider_key_bindings_crud_http() {
 # Task 8 — 文档 +（可选）hydra-cli
 
 **Files**
-- 修改 `docs/design.md`、`README.md`、`README.zh-CN.md`、`docs/HANDOFF.md`
+- 修改 `dev-docs/design.md`、`README.md`、`README.zh-CN.md`、`dev-docs/HANDOFF.md`
 - 可选修改 `tools/hydra-cli/src/types.ts`
 
 **Why**：仓库文档即权威（design.md 是 schema/语义来源）；README 与 HANDOFF 保持同步。
@@ -1191,7 +1191,7 @@ async fn provider_key_bindings_crud_http() {
 
 **Verification**：无编译门禁；文档 diff 自查。
 
-## 步骤 8.1 — docs/design.md
+## 步骤 8.1 — dev-docs/design.md
 
 (a) §4.1 schema 列表追加：
 
@@ -1235,7 +1235,7 @@ CREATE TABLE provider_key_binding (
 - api-key 前缀绑定路由闸门（key_prefix → provider，最长前缀优先，fail-closed）
 ```
 
-## 步骤 8.3 — docs/HANDOFF.md
+## 步骤 8.3 — dev-docs/HANDOFF.md
 
 按最终 `cargo test` 实际输出更新两处测试基数（原 101 / 159）。
 

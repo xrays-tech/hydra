@@ -7,7 +7,7 @@ license.workspace = true
 description = "Hydra pure domain core — zero I/O, zero mock, exhaustively unit-testable."
 
 [dependencies]
-# Allowed pure deps ONLY (see docs/dev-plan.md §2, docs/waves/wave-1-pure-core.md §1).
+# Allowed pure deps ONLY (see dev-docs/dev-plan.md §2, dev-docs/waves/wave-1-pure-core.md §1).
 # CI enforces that none of tokio/pingora/sqlx/reqwest/hyper ever appear here.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

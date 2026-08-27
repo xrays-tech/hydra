@@ -4,7 +4,7 @@
 //! here in `config::validate`; the I/O-dependent ones are explicitly the W2
 //! loader's responsibility (see module docs in `config.rs`).
 //!
-//! See `docs/waves/wave-1-pure-core.md` §3.9.
+//! See `dev-docs/waves/wave-1-pure-core.md` §3.9.
 
 use std::collections::{HashMap, HashSet};
 

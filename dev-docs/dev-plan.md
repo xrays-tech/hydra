@@ -2,15 +2,15 @@
 
 > 本文件是 Hydra 实现阶段的总纲，定义**开发纪律**、**架构分层**、**波次划分**与**出入准则**。
 >
-> 配套详档：`docs/waves/wave-{1..6}-*.md`。设计依据：`docs/design.md`。
+> 配套详档：`dev-docs/waves/wave-{1..6}-*.md`。设计依据：`dev-docs/design.md`。
 
 ---
 
 ## 0. 阅读顺序
 
 1. 本文件（纪律 + 分层 + 波次地图）
-2. `docs/design.md`（系统设计，权威）
-3. `docs/waves/wave-N-*.md`（当前波次的具体 TDD 任务）
+2. `dev-docs/design.md`（系统设计，权威）
+3. `dev-docs/waves/wave-N-*.md`（当前波次的具体 TDD 任务）
 
 ---
 
@@ -45,7 +45,7 @@
 - 故障转移是**简单 for 循环**（`Bytes::clone` O(1) 重放）；不再依赖 Pingora 的 `enable_retry_buffering` / `set_retry` / `fail_to_connect` / `error_while_proxy`。
 - 少量元数据（`"model"`、`"usage"`）仍一律用 **`memchr` SIMD 字节扫描**提取（零分配、早退），命中处仅反序列化该小切片。
 - 诚实边界：放弃 kernel-level 零拷贝（body 经过 userspace buffer），但保留"零 JSON 往返"的核心语义（body 字节未被 serde 处理）。
-- 详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md)（原 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4 描述的是已废弃的 stream-through 架构）。
+- 详见 [`dev-docs/design-change-terminate-mode.md`](design-change-terminate-mode.md)（原 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4 描述的是已废弃的 stream-through 架构）。
 
 ---
 
@@ -80,7 +80,7 @@ hydra/
 │           └── main.rs
 ├── migrations/
 ├── admin-ui/
-└── docs/
+└── dev-docs/
 ```
 
 **强制点**：`hydra-core` 的 `Cargo.toml` **不得**出现 `tokio`/`pingora`/`sqlx`/`reqwest`/`hyper` 任何 I/O 依赖（`memchr`/`bytes`/`sha2` 为纯计算/引用计数/密码库，**允许且必需**，用于零拷贝提取与 api-key 哈希）。这样：
@@ -148,7 +148,7 @@ hydra/
 
 ## 5. 每波次统一模板（详档结构）
 
-每个 `docs/waves/wave-N-*.md` 必含：
+每个 `dev-docs/waves/wave-N-*.md` 必含：
 
 1. **目标与范围**（in-scope / out-of-scope）
 2. **依赖与前置**（上一波次的产出契约）
@@ -180,11 +180,11 @@ hydra/
 
 | 风险 | 缓解 |
 | --- | --- |
-| ~~Pingora 0.8.1 body 转发机制（`read_body_bytes` 消费首 chunk 后需 `enable_retry_buffering` 回放）~~ | ✅ **已废弃**：terminate-mode 在 `request_filter` 内读全 body（`read_request_body()` 循环）后用自有 reqwest client 调供应商，不再依赖 Pingora 的首 chunk 回放 / retry buffer / `Vec<Bytes>` 累加器。详见 `docs/design-change-terminate-mode.md`。 |
+| ~~Pingora 0.8.1 body 转发机制（`read_body_bytes` 消费首 chunk 后需 `enable_retry_buffering` 回放）~~ | ✅ **已废弃**：terminate-mode 在 `request_filter` 内读全 body（`read_request_body()` 循环）后用自有 reqwest client 调供应商，不再依赖 Pingora 的首 chunk 回放 / retry buffer / `Vec<Bytes>` 累加器。详见 `dev-docs/design-change-terminate-mode.md`。 |
 | 纯/外壳切分导致类型在 crate 间频繁搬运 | core 拥有领域类型；外壳只做 `Into/From` 转换，约定边界转换集中在 `bridge` 模块 |
 | wiremock 与 Pingora 上游集成测试复杂 | 外壳集成测试用独立 mock upstream server（真实 HTTP），不通过 Pingora mock 内部路由 |
 | 覆盖率门槛卡进度 | 仅对 `hydra-core` 设硬门槛；外壳以集成测试覆盖关键路径 |
 
 ---
 
-下一步：进入 **Wave 1**（`docs/waves/wave-1-pure-core.md`）。
+下一步：进入 **Wave 1**（`dev-docs/waves/wave-1-pure-core.md`）。

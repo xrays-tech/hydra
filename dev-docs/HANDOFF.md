@@ -90,7 +90,7 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
    provider (`None`/`0` ⇒ Passthrough no-op, zero default regression); wired into the failover loop;
    **§7 boundary: admission errors never trip the breaker**; 503+Retry-After only when all candidates
    exhausted; migration 0004; 6 metrics; `GET /api/v1/concurrency` inspect endpoint. See
-   **`docs/design-admission-queue.md`** (the authoritative design).
+   **`dev-docs/design-admission-queue.md`** (the authoritative design).
 3. **sqlx compile-time SQL checking** (P1-6) — all 33 queries are `query!`/`query_as!`; `.sqlx/`
    offline cache; `SQLX_OFFLINE=true` in CI (SQL drift fails the build).
 4. **Admin API no longer returns plaintext keys** (P1-5) — always masked (`前十 + 中星 + 后四`);
@@ -125,7 +125,7 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
 ## 5. Configuration (operator-facing)
 
 Required env (fail-closed without): `HYDRA_ADMIN_TOKEN`, `HYDRA_ENCRYPTION_KEY` (base64 32B) or
-`HYDRA_ENCRYPTION_KEY_FILE` (raw 32B). See `README.md` / `README.zh-CN.md` / `docs/ops.md` §1.2.
+`HYDRA_ENCRYPTION_KEY_FILE` (raw 32B). See `README.md` / `README.zh-CN.md` / `dev-docs/ops.md` §1.2.
 
 Per-provider admission policy (opt-in, all `None` ⇒ unlimited):
 ```
@@ -149,17 +149,17 @@ queue_wait_timeout_ms # 1000-5000
 
 ## 7. Key documents
 
-- `docs/evaluation-report.html` — production-readiness report (verdict 9.2/10, self-contained HTML).
-- `docs/design-admission-queue.md` — the admission queue design (approved P0, opt-in; the spec).
-- `docs/design.md` — original architecture/design doc.
-- `docs/ops.md` — SRE runbook (env table, systemd, healthchecks, §1.3 encryption, §9 observability).
+- `dev-docs/evaluation-report.html` — production-readiness report (verdict 9.2/10, self-contained HTML).
+- `dev-docs/design-admission-queue.md` — the admission queue design (approved P0, opt-in; the spec).
+- `dev-docs/design.md` — original architecture/design doc.
+- `dev-docs/ops.md` — SRE runbook (env table, systemd, healthchecks, §1.3 encryption, §9 observability).
 - `README.md` / `README.zh-CN.md` — overview + config + deploy.
 
 ---
 
 ## 8. Resume hints for the next round
 
-- **Read first:** `docs/design-admission-queue.md` (admission), `docs/ops.md` (ops), this file.
+- **Read first:** `dev-docs/design-admission-queue.md` (admission), `dev-docs/ops.md` (ops), this file.
 - **The admission queue is fully wired and opt-in** — to use it, set the 3 fields on a `provider` row;
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,

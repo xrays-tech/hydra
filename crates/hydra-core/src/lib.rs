@@ -21,7 +21,7 @@
 //! auth cache entries) is driven by an explicitly-injected `now: Instant`, so
 //! tests are deterministic. There is no hidden `Instant::now()` in this crate.
 //!
-//! See `docs/dev-plan.md` §1–2 and `docs/waves/wave-1-pure-core.md`.
+//! See `dev-docs/dev-plan.md` §1–2 and `dev-docs/waves/wave-1-pure-core.md`.
 
 #![forbid(unsafe_code)]
 

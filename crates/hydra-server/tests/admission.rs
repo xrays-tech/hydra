@@ -1,6 +1,6 @@
 //! P0.2 — admission-controller semaphore tests (concurrent, tokio).
 //!
-//! Design `docs/design-admission-queue.md` §3 (algorithm), §7 (breaker
+//! Design `dev-docs/design-admission-queue.md` §3 (algorithm), §7 (breaker
 //! boundary — these tests assert the error VARIANT only; the no-trip wiring is
 //! a caller concern in P0.3), §11 P0.2.
 //!

@@ -3,7 +3,7 @@
 **/.git
 **/target
 **/.slim
-**/docs
+**/dev-docs
 **/tests
 **/admin-ui
 **/*.rs

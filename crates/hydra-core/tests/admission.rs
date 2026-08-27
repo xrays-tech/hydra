@@ -1,6 +1,6 @@
 //! P0.1 — admission-queue policy resolution + validation tests (pure core).
 //!
-//! Design `docs/design-admission-queue.md` §5 (config schema), §11 P0.1.
+//! Design `dev-docs/design-admission-queue.md` §5 (config schema), §11 P0.1.
 //!
 //! These cover the pure half of the admission queue:
 //! - [`resolve_policy`] field-by-field override resolution.

@@ -10,7 +10,7 @@
 
 ## 亮点 Highlights
 
-> 以下数据在 10 核机器 + 线程化 mock 上游实测（未触达任何真实付费上游）。完整方法学与 8 核 16G VPS 容量推算见[评测报告](docs/evaluation-report.html)。
+> 以下数据在 10 核机器 + 线程化 mock 上游实测（未触达任何真实付费上游）。完整方法学与 8 核 16G VPS 容量推算见[评测报告](dev-docs/evaluation-report.html)。
 
 | | 指标 | 说明 |
 |---|---|---|
@@ -21,7 +21,7 @@
 | 🔐 | provider 密钥 **AES-256-GCM** 落库加密 | fail-closed 启动；管理面永不返回明文 |
 | 🧪 | **core 114 + server 173** 测试，`clippy -D warnings` 干净 | CI 硬门禁 |
 
-**生产就绪度：9.2 / 10** —— 完整[评测报告](docs/evaluation-report.html)。
+**生产就绪度：9.2 / 10** —— 完整[评测报告](dev-docs/evaluation-report.html)。
 
 ---
 
@@ -129,7 +129,7 @@ crates/hydra-core/    纯领域逻辑（路由、SWRR、熔断、SSE 扫描、�
 crates/hydra-server/  Pingora 代理外壳（终止模式）、DB、认证、用量 Sink、TLS、管理 API
 environment/          Dockerfile + docker-compose + mock-tenant + 初始化脚本
 integration/          Python CRUD 测试套件 + e2e 代理测试 + mock LLM/auth
-docs/                 design.md、ops.md、dev-plan.md、架构分析
+dev-docs/                 design.md、ops.md、dev-plan.md、架构分析
 ```
 
 ## 集群模式（Cluster Mode）
@@ -144,16 +144,16 @@ cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hyd
 
 已通过真实环境验收（双 leader 候选 + 无状态 edge，docker Redis）：故障切换
 ~11–18s、跨节点限流、共享熔断、认证失效总线、无共享卷证书轮换。
-详见 **[`docs/cluster.md`](docs/cluster.md)**（环境变量表、Redis 故障矩阵、
+详见 **[`dev-docs/cluster.md`](dev-docs/cluster.md)**（环境变量表、Redis 故障矩阵、
 故障切换演练与实测记录）与
 [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml)。
 
 ## 更多
 
-- 设计与架构：[`docs/design.md`](docs/design.md)
-- 架构变更（终止模式）：[`docs/design-change-terminate-mode.md`](docs/design-change-terminate-mode.md)
-- 运维手册：[`docs/ops.md`](docs/ops.md)
-- 部署方案（单节点 / compose / K3s / K8s）：[`docs/deployment.md`](docs/deployment.md)
-- 交互式流程图：[`docs/workflow.html`](docs/workflow.html)
+- 设计与架构：[`dev-docs/design.md`](dev-docs/design.md)
+- 架构变更（终止模式）：[`dev-docs/design-change-terminate-mode.md`](dev-docs/design-change-terminate-mode.md)
+- 运维手册：[`dev-docs/ops.md`](dev-docs/ops.md)
+- 部署方案（单节点 / compose / K3s / K8s）：[`dev-docs/deployment.md`](dev-docs/deployment.md)
+- 交互式流程图：[`dev-docs/workflow.html`](dev-docs/workflow.html)
 
 Rust 1.83+ · Pingora 0.8.x

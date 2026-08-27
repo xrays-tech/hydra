@@ -46,7 +46,7 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
    There is no requirement on a real upstream or a real auth service for the
    UI CRUD flow (the proxy is not exercised here). If you also want to drive
    the proxy end-to-end, stand up a `wiremock` upstream + a `wiremock`
-   auth_url per `docs/design.md` §11.3.
+   auth_url per `dev-docs/design.md` §11.3.
 
 ## Run
 

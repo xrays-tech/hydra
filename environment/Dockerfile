@@ -39,7 +39,7 @@ WORKDIR /app
 COPY --chown=hydra:hydra bin/hydra /usr/local/bin/hydra
 
 # Runtime layout. Config + certs + SQLite data are supplied at run time
-# (volumes / mounts / env — see docs/ops.md).
+# (volumes / mounts / env — see dev-docs/ops.md).
 RUN mkdir -p /app/data /etc/hydra && chown -R hydra:hydra /app /etc/hydra
 
 # Sensible defaults; override at `docker run` with -e / mounts.

@@ -22,7 +22,7 @@
 
 ## 投放节奏建议
 
-1. **先发中文社区**（V2EX `/go/programmer` + 掘金同步），标题用「痛点控诉型」转化更高。掘金务必配 `docs/evaluation-report.html` 的 benchmark 截图——量化对比是性能向项目的命脉。
+1. **先发中文社区**（V2EX `/go/programmer` + 掘金同步），标题用「痛点控诉型」转化更高。掘金务必配 `dev-docs/evaluation-report.html` 的 benchmark 截图——量化对比是性能向项目的命脉。
 2. **隔 12 小时再发 X**（英文圈），配两张图：一张 11K RPS 的 `oha` 输出，一张 65MB RSS 的 `top` 截图。两张图比一万字管用。
 3. **README Banner** 已就位，老外一看就懂痛点（LiteLLM 的怨气全球通用）。
 
@@ -41,4 +41,4 @@
 | 8C16G VPS 容量推算 | 2,000–3,000 并发流 / 400–600 RPS 真实 LLM | **弱**（推算非实测，谨慎使用） |
 | 生产就绪度 9.2/10 | — | **弱**（自评，对外请写「内部评测」） |
 
-**铁律**：对外引用 11K RPS 时，必须带 *"mock 上游、本地 10 核机器实测"* 的限定，不要拿它对标厂商 SLA。诚实写在 `docs/evaluation-report.html` 里了。
+**铁律**：对外引用 11K RPS 时，必须带 *"mock 上游、本地 10 核机器实测"* 的限定，不要拿它对标厂商 SLA。诚实写在 `dev-docs/evaluation-report.html` 里了。

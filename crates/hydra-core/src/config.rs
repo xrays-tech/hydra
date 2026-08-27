@@ -7,7 +7,7 @@
 //!
 //! ## Concurrency boundary
 //!
-//! Per `docs/waves/wave-1-pure-core.md` §3.1, the concurrency wrappers
+//! Per `dev-docs/waves/wave-1-pure-core.md` §3.1, the concurrency wrappers
 //! (`ArcSwap`, `DashMap`, `Arc<CircuitBreaker>`) do **not** live in core. In
 //! particular `certs` is a plain `HashMap<String, CertMeta>` here; the server
 //! wraps the whole `ConfigData` (and, for independent cert hot-reload per

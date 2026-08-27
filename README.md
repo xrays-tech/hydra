@@ -10,7 +10,7 @@
 
 ## Highlights
 
-> Measured on a 10-core machine against a threaded mock upstream (no real paid provider hit). Full methodology + 8C16G VPS capacity extrapolation in the [evaluation report](docs/evaluation-report.html).
+> Measured on a 10-core machine against a threaded mock upstream (no real paid provider hit). Full methodology + 8C16G VPS capacity extrapolation in the [evaluation report](dev-docs/evaluation-report.html).
 
 | | metric | note |
 |---|---|---|
@@ -21,7 +21,7 @@
 | 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
 | 🧪 | **core 114 + server 173** tests, `clippy -D warnings` clean | CI hard gate |
 
-**Production-readiness: 9.2 / 10** — see the [full report](docs/evaluation-report.html).
+**Production-readiness: 9.2 / 10** — see the [full report](dev-docs/evaluation-report.html).
 
 ---
 
@@ -136,7 +136,7 @@ crates/hydra-core/    pure domain logic (router, SWRR, breaker, SSE scan, limits
 crates/hydra-server/  Pingora proxy shell (terminate-mode), DB, auth, usage sink, TLS, admin
 environment/          Dockerfile + docker-compose + mock-tenant + init script
 integration/          Python CRUD test suite + e2e proxy test + mock LLM/auth
-docs/                 design.md, ops.md, dev-plan.md, architecture analysis
+dev-docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 ```
 
 ## Cluster Mode
@@ -154,15 +154,15 @@ cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hyd
 Live-acceptance verified (dual leader + stateless edges, docker Redis):
 failover ~11–18 s, cross-node rate limiting, shared circuit breaker,
 auth-cache invalidation bus, cert rotation without shared volumes.
-See **[`docs/cluster.md`](docs/cluster.md)** (env table, failure matrix,
+See **[`dev-docs/cluster.md`](dev-docs/cluster.md)** (env table, failure matrix,
 failover drill + acceptance record).
 
 ## More
 
-- Design & architecture: [`docs/design.md`](docs/design.md)
-- Architecture change (terminate-mode): [`docs/design-change-terminate-mode.md`](docs/design-change-terminate-mode.md)
-- Operations runbook: [`docs/ops.md`](docs/ops.md)
-- Deployment guide (single node / compose / K3s / K8s): [`docs/deployment.md`](docs/deployment.md)
-- Interactive workflow diagram: [`docs/workflow.html`](docs/workflow.html)
+- Design & architecture: [`dev-docs/design.md`](dev-docs/design.md)
+- Architecture change (terminate-mode): [`dev-docs/design-change-terminate-mode.md`](dev-docs/design-change-terminate-mode.md)
+- Operations runbook: [`dev-docs/ops.md`](dev-docs/ops.md)
+- Deployment guide (single node / compose / K3s / K8s): [`dev-docs/deployment.md`](dev-docs/deployment.md)
+- Interactive workflow diagram: [`dev-docs/workflow.html`](dev-docs/workflow.html)
 
 Rust 1.83+ · Pingora 0.8.x

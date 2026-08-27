@@ -1,7 +1,7 @@
 # Hydra 部署方案
 
 > 覆盖三种形态：**单节点**（默认，零外部依赖）、**docker-compose 多节点**（双 leader + 无状态 edge）、
-> **K3s / K8s 多节点**（同一镜像，零编排 API 依赖）。设计细节见 `docs/cluster.md`，运维见 `docs/ops.md`。
+> **K3s / K8s 多节点**（同一镜像，零编排 API 依赖）。设计细节见 `dev-docs/cluster.md`，运维见 `dev-docs/ops.md`。
 
 ---
 

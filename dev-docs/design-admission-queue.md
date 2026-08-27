@@ -2,7 +2,7 @@
 
 **Status:** Approved for implementation (P0 opt-in).
 **Author:** Architecture review (@oracle) — 2026-08-09.
-**Supersedes / relates to:** `docs/design.md` §rate-limit, §breaker (this fills the concurrency gap those sections do not address).
+**Supersedes / relates to:** `dev-docs/design.md` §rate-limit, §breaker (this fills the concurrency gap those sections do not address).
 
 ---
 
@@ -300,7 +300,7 @@ onto `max_concurrency` / `max_queue_depth`.
 - ❌ **Compounding with long SSE holds (the big one).** Permits held for the whole stream means saturated streaming-heavy workloads drain queues *slowly* — each permit frees only when a generation completes (seconds to minutes). **Inherent to LLM gateways** — cannot be designed away; only mitigated by honest sizing of `max_concurrency` to the upstream's real SSE concurrency, and accepting the queue acts as a slow-draining buffer under heavy load.
 - ❌ **Cross-tenant fairness.** A single noisy tenant can monopolize the queue. Mitigation (P1): per-tenant reservation (Envoy priority levels).
 - ❌ **Client-disconnect-during-wait waste.** A queued request whose client left still consumes a permit when one frees. Mitigation floor: `queue_wait_timeout_ms`; proper fix: `select!` against disconnect (P1).
-- ❌ **Single-instance only.** Like the existing `SlidingWindow` and `Breaker`, the semaphore is in-process. Multi-instance Hydra needs Redis or a shared counter (`docs/design.md` §10.4 already calls this out for rate limits). Same constraint, same future workaround.
+- ❌ **Single-instance only.** Like the existing `SlidingWindow` and `Breaker`, the semaphore is in-process. Multi-instance Hydra needs Redis or a shared counter (`dev-docs/design.md` §10.4 already calls this out for rate limits). Same constraint, same future workaround.
 
 ---
 

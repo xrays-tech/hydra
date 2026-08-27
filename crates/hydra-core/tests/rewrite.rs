@@ -4,7 +4,7 @@
 //! - `rewrite_path(req_path, &EndpointUrl) -> String`
 //! - `mask_key(&str) -> String`
 //!
-//! See `docs/waves/wave-1-pure-core.md` §3.8.
+//! See `dev-docs/waves/wave-1-pure-core.md` §3.8.
 
 use hydra_core::rewrite::{mask_key, rewrite_path, EndpointUrl};
 use pretty_assertions::assert_eq;

@@ -12,7 +12,7 @@
 
 - **问题真实且具体**：当前 `request_filter` 只读首个 body chunk 并用 `memchr` 扫 `"model"`（`crates/hydra-server/src/proxy.rs:267`、`crates/hydra-core/src/extract.rs:40-69`）。对 `model` 字段后置的请求（如 Hermes 智能体：tools/history 大段前言在先）会得到 `None` → 落入 `passthrough`（`proxy.rs:292-307`）→ 路由错误。这是确凿的正确性缺陷。
 - **2-tier 方案"能解决"，但是用核弹打蚊子**：把请求体完整缓冲到 router 进程后，model 提取、跨 schema、故障转移重放确实都变平凡。代价是：**请求侧的零拷贝被打破**（router 必须 `await req.bytes()` 才能路由）、增加一个进程内 hop（延迟 + 连接管理）、router 用 reqwest/hyper 自建代理严格慢于 Pingora 的共享池零拷贝转发、SSE 链路多一级缓冲、部署/观测面翻倍。
-- **历史背景被忽视**：用户当前的 1-tier 架构**不是初始设计**。`docs/proposal.md` 的架构图本来就是 2-tier（`Pingora → Router → Http Client → Model`）。`design.md` 在 Oracle Gate Review 中**显式将 2-tier 合并为 1-tier**，唯一理由就是用户的"零拷贝强制需求"（§6 / §1.4 / §19.4 末行）。本次"新提案"本质是**推翻一项已记录的 Gate Review 决策**——必须以同等正式程度修订需求，而不是当作实现细节悄悄改回去。
+- **历史背景被忽视**：用户当前的 1-tier 架构**不是初始设计**。`dev-docs/proposal.md` 的架构图本来就是 2-tier（`Pingora → Router → Http Client → Model`）。`design.md` 在 Oracle Gate Review 中**显式将 2-tier 合并为 1-tier**，唯一理由就是用户的"零拷贝强制需求"（§6 / §1.4 / §19.4 末行）。本次"新提案"本质是**推翻一项已记录的 Gate Review 决策**——必须以同等正式程度修订需求，而不是当作实现细节悄悄改回去。
 - **零拷贝并非不可放弃，但要诚实地标价**：放弃零拷贝 = 写入 1–10 MiB 请求体的内存副本、TTFT 增加"整 body 接收 + 二次上传"窗口、并发压力从 `O(活跃连接)` 跳到 `O(并发请求数 × 平均 body)`。这些成本在 design.md §6 的"零拷贝修订（用户强制需求）"段落里被刻意回避掉了。
 - **存在与硬性需求相容的解法**：保留 1-tier，把"读首 chunk"扩展为"循环读 chunk 直到命中 `model` 或到达 cap（如 64 KiB）"——`memchr` 增量扫描、retry buffer 已被验证可回放（`tests/spike_zero_copy.rs`）、故障转移的 `Vec<Bytes>` 累加器（§8.5）天然复用。再叠加 per-tenant 提取 schema 配置（JSON pointer），可覆盖 ≥95% 真实流量而**不放弃零拷贝**。
 - **推荐**：默认走"1-tier + read-until-found + 可选 per-tenant schema"。**仅当** ≥30% 流量是 `model` 后置/嵌套/非标 schema 的智能体流量、且项目方正式书面修订零拷贝硬需求时，才考虑 2-tier。
@@ -29,7 +29,7 @@
 | 零拷贝是立项硬需求 | `design.md §6`「零拷贝与最小拷贝架构（Zero-Copy，**强制**）」、§1.4「零拷贝修订（用户强制需求）」、§19.4 末行 | 评审任何打破零拷贝的方案 = 评审一次需求变更 |
 | 零拷贝机制经实测验证 | `crates/hydra-server/tests/spike_zero_copy.rs:323-326`（断言 upstream 收到的 body 与 client 发出的字节完全一致） | 当前架构的 body 转发是**已被证据证明**的，不是假设 |
 | 64 KiB retry buffer 是真实约束 | `design.md §6.3 §5`、§8.5；Pingora `BODY_BUF_LIMIT` | 任何"多读 chunk"的方案必须考虑 cap 与正常转发的交互（详见 §7.1） |
-| **原始提案本就是 2-tier** | `docs/proposal.md` 架构图：`Agent → Pingora → Router → Http Client → Media Model`；工作过程第 2 步："pingora直接将请求upstream转发到 Router" | 现提案不是"新设计"，是回退到合并前的状态 |
+| **原始提案本就是 2-tier** | `dev-docs/proposal.md` 架构图：`Agent → Pingora → Router → Http Client → Media Model`；工作过程第 2 步："pingora直接将请求upstream转发到 Router" | 现提案不是"新设计"，是回退到合并前的状态 |
 
 ---
 
@@ -342,7 +342,7 @@ while total < EXTRACT_CAP {
 仅当以下**全部**成立：
 
 1. 实测受害流量 > 总流量 30%（agent 主导），且 (a)+(b) 无法覆盖（典型：客户端 schema 频繁变更、无法预先配置提取路径）。
-2. 用户**正式书面修订** design.md §6、§1.4、§19.4，把零拷贝从"强制"降为"偏好"，并在 docs/ops.md 标注新的容量规划公式（C × B 内存模型）。
+2. 用户**正式书面修订** design.md §6、§1.4、§19.4，把零拷贝从"强制"降为"偏好"，并在 dev-docs/ops.md 标注新的容量规划公式（C × B 内存模型）。
 3. 部署侧接受 2 进程 + IPC + 双侧配置热更新联动 + 双侧指标合并的运维成本。
 4. TTFT 退化（+50–200 ms）与内存上涨（C × B）对业务可接受。
 
@@ -356,7 +356,7 @@ while total < EXTRACT_CAP {
 
 1. 修订 `design.md` §6 标题去"强制"字样，新增段落说明零拷贝被放弃的理由与新成本。
 2. 修订 §1.4、§19.4 末行的"用户强制需求"记录，新增一行 Gate Review 决策推翻记录（这是项目自己的规约要求）。
-3. 在 `docs/ops.md` 写入：2 进程部署、edge↔router 信任边界（co-located 用 UDS，否则 HMAC/mTLS）、新容量规划公式、TTFT 影响、限流被劈成两半的实施细节。
+3. 在 `dev-docs/ops.md` 写入：2 进程部署、edge↔router 信任边界（co-located 用 UDS，否则 HMAC/mTLS）、新容量规划公式、TTFT 影响、限流被劈成两半的实施细节。
 4. 重新评估 §17 指标目录在跨进程下的合并方案。
 5. 决定 router 是用 Pingora（保留 graceful upgrade/H2）还是裸 hyper（更轻但要自实现运维坚强性）——若选后者，§1.1 表格中"Pingora 选型理由"也要修。
 

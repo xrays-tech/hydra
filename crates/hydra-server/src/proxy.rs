@@ -29,7 +29,7 @@
 //! when `"model"` sat in the *first* body chunk. Late-model clients (large
 //! system/tools/history prefixes) broke routing. Terminating in Pingora makes
 //! model extraction trivial and failover a plain `for` loop. See
-//! `docs/design-change-terminate-mode.md` (§1/§4.5) and `tests/terminate_mode.rs`.
+//! `dev-docs/design-change-terminate-mode.md` (§1/§4.5) and `tests/terminate_mode.rs`.
 //!
 //! ## What this module does NOT do
 //!

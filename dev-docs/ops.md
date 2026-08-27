@@ -1,7 +1,7 @@
 # Hydra — Operations Runbook (v1)
 
 > Audience: SRE / on-call for a single-instance `hydra` deployment.
-> Reference: `docs/design.md` (§6 lifecycle, §8 failover/breaker, §11 auth,
+> Reference: `dev-docs/design.md` (§6 lifecycle, §8 failover/breaker, §11 auth,
 > §12 TLS, §13 admin, §15 deploy, §16 security, §17 metrics).
 
 This runbook covers **deployment, configuration, graceful zero-downtime upgrade,
@@ -370,7 +370,7 @@ authoritative "live" view, and `status` as a human override.
 >
 > Terminate-mode（当前实现）的故障转移是一个**简单 `for candidate in candidates { try send; on fail continue; }` 循环**：全 body 已缓存（`Bytes`），重放零成本（`Bytes::clone` O(1)）。失败时 `breaker.on_failure` + `record_retry("terminate_loop")`，成功则 `breaker.on_success`。
 >
-> 不再有 `retry_after_connect` 配置、不再有 `upstream_bytes_seen` / `body_too_large` 守卫、不再有 Pingora 的 `set_retry` / `fail_to_connect` / `error_while_proxy` 钩子。详见 `docs/design-change-terminate-mode.md` §4.3。
+> 不再有 `retry_after_connect` 配置、不再有 `upstream_bytes_seen` / `body_too_large` 守卫、不再有 Pingora 的 `set_retry` / `fail_to_connect` / `error_while_proxy` 钩子。详见 `dev-docs/design-change-terminate-mode.md` §4.3。
 
 > **READ THIS BEFORE ENABLING.** This is the single most dangerous knob in
 > Hydra. ~~（已删除）~~
@@ -432,7 +432,7 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
 
 **Trade-off**（terminate-mode）：~~更大的软上限意味着更多请求可以安全故障转移（有利于可用性）~~ **不再适用**——全 body 已缓存，所有候选都能 O(1) 重放。内存占用 = 并发请求数 × 平均 body 大小（500 并发 × 2MB avg ≈ 1GB）。如需降低内存峰值，调低 `max_request_body_hard`（超过即 413）。
 
-> ~~H2 paths are truly zero-copy on the forward leg; H1 paths incur one kernel copy per chunk (Pingora core limitation, design §8.5).~~ **（已废弃）** Terminate-mode 放弃 kernel-level 零拷贝（body 经 userspace buffer 传给 reqwest），但保留"零 JSON 往返"（body 字节未被 serde 处理）。详见 `docs/design-change-terminate-mode.md` §5。
+> ~~H2 paths are truly zero-copy on the forward leg; H1 paths incur one kernel copy per chunk (Pingora core limitation, design §8.5).~~ **（已废弃）** Terminate-mode 放弃 kernel-level 零拷贝（body 经 userspace buffer 传给 reqwest），但保留"零 JSON 往返"（body 字节未被 serde 处理）。详见 `dev-docs/design-change-terminate-mode.md` §5。
 
 ---
 
@@ -588,7 +588,7 @@ For the remaining v2 backlog see design §16.6.
 
 ---
 
-## 13. Cluster mode operations (design §20 / docs/cluster.md)
+## 13. Cluster mode operations (design §20 / dev-docs/cluster.md)
 
 Cluster mode is opt-in (`HYDRA_ROLE=leader|edge`) with **Redis as the only
 external dependency** (K8s/k3s-agnostic, self-sustaining). The authoritative
@@ -613,7 +613,7 @@ docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
 curl -H "Authorization: Bearer admin-secret" http://localhost:8081/api/v1/tenants
 ```
 
-k3s / k8s manifests and bare-metal systemd live in `docs/cluster.md` §4.
+k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 
 ### 13.3 Cluster environment variables (quick map)
 
@@ -622,7 +622,7 @@ k3s / k8s manifests and bare-metal systemd live in `docs/cluster.md` §4.
 | `HYDRA_ROLE` | `leader` / `edge`; unset = single-node (unchanged behavior) |
 | `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired, sentinel/cluster fail-fast |
 | `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes) |
-| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `docs/cluster.md` §5.2) |
+| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `dev-docs/cluster.md` §5.2) |
 | `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
@@ -642,13 +642,13 @@ lease-aware rotation); a rejoining leader rebuilds its replica from the current
 active (no shared volume). Admin writes on a standby are forwarded to the
 actual lease holder (registry-resolved, with a forward-once loop guard) — you
 can point the admin UI at ANY leader candidate, including one whose
-`HYDRA_CONTROL_URL` points at itself. Full checklist: `docs/cluster.md` §5.
+`HYDRA_CONTROL_URL` points at itself. Full checklist: `dev-docs/cluster.md` §5.
 
 ### 13.5 Redis outage behavior
 
 Data plane keeps serving (last-known-good snapshot + local caches). Election is
 **fail-closed**: a leader that cannot renew demotes immediately (writes stop)
-until Redis recovers. See `docs/cluster.md` §3 for the full matrix.
+until Redis recovers. See `dev-docs/cluster.md` §3 for the full matrix.
 
 ### 13.6 Known limitations (as of the 2025-08 acceptance)
 

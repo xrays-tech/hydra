@@ -43,7 +43,7 @@ Body: {"api_keys": ["sk-aaa", ...]}                 # 可选；缺省/空 = 清�
 ### 新增
 - `crates/hydra-server/migrations/0009_tenant_access_token.sql` — ALTER TABLE tenant ADD COLUMN access_token_hash TEXT;（可空，向后兼容）
 - `crates/hydra-server/tests/tenant_cache.rs` — 端点集成测试（含生成按钮对应 API 语义的断言）
-- `docs/aegis/plans/2026-08-27-tenant-access-token.md` — 本计划
+- `dev-docs/aegis/plans/2026-08-27-tenant-access-token.md` — 本计划
 
 ### 修改
 - `crates/hydra-server/src/db.rs` — 新增 set_tenant_access_token（写哈希/NULL）+ list_tenant_access_token_hashes（读 (tenant_id, hash) 供比对）+ tenant_has_access_token（供响应视图）
@@ -52,7 +52,7 @@ Body: {"api_keys": ["sk-aaa", ...]}                 # 可选；缺省/空 = 清�
 - `.sqlx/` — 重新 cargo sqlx prepare 生成新 query 的离线缓存（CI SQLX_OFFLINE=true）
 - `admin-ui/app.js` — tenants fields 加 access_token（type password, map opt, blank=keep）；columns 加 Token 列（set/—）
 - `admin-ui/api-docs.js` — 新端点文档条目（租户令牌鉴权说明）
-- `docs/design.md`（§11.7 / §13.2 端点表）、`docs/ops.md`（新增节：租户自助失效）
+- `dev-docs/design.md`（§11.7 / §13.2 端点表）、`dev-docs/ops.md`（新增节：租户自助失效）
 
 ## 分步任务（bite-sized）
 

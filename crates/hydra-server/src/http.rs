@@ -17,7 +17,7 @@
 //! network-layer double of a third party, never a fake of our own functions
 //! (dev-plan §1 铁律 2).
 //!
-//! See `docs/waves/wave-3-boundaries.md` §2.1/§2.2 and `docs/design.md`
+//! See `dev-docs/waves/wave-3-boundaries.md` §2.1/§2.2 and `dev-docs/design.md`
 //! §11.2–§11.6.
 
 use std::fmt;

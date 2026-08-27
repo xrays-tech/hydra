@@ -1,6 +1,6 @@
 # V2EX / 掘金 / 开发者头条 · 技术社区长文
 
-> 中文技术社区投放用。建议标题用「痛点控诉型」；掘金务必配 `docs/evaluation-report.html` 的 benchmark 截图。
+> 中文技术社区投放用。建议标题用「痛点控诉型」；掘金务必配 `dev-docs/evaluation-report.html` 的 benchmark 截图。
 
 ---
 
@@ -45,7 +45,7 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 
 ### 【硬核亮点】
 
-- **🪶 满载 65 MiB，~0.3ms 开销**：10 核机器 + 线程化 mock 上游实测（没打真实付费上游），c=25 峰值 **11,056 RPS，p99=4.39ms**。单请求网关开销 ~0.3ms，相对 LLM 延迟约等于不存在。作为对比——LiteLLM 的 Rust 重写目标是 32MB，我们今天就在这儿了。*（注：11K 是 mock 上游的合成峰值，真实 LLM 延迟主导时大约 400-600 RPS，别拿这个去对标厂商 SLA，老老实实写在 [评测报告](../../docs/evaluation-report.html) 里了。）*
+- **🪶 满载 65 MiB，~0.3ms 开销**：10 核机器 + 线程化 mock 上游实测（没打真实付费上游），c=25 峰值 **11,056 RPS，p99=4.39ms**。单请求网关开销 ~0.3ms，相对 LLM 延迟约等于不存在。作为对比——LiteLLM 的 Rust 重写目标是 32MB，我们今天就在这儿了。*（注：11K 是 mock 上游的合成峰值，真实 LLM 延迟主导时大约 400-600 RPS，别拿这个去对标厂商 SLA，老老实实写在 [评测报告](../../dev-docs/evaluation-report.html) 里了。）*
 
 - **🔀 双协议原生直通，零转换**：OpenAI `/v1/chat/completions` 和 Anthropic `/v1/messages` **都是一等公民，端到端同一格式，绝不互转**。没有 `input: {}`，没有 `cache_control` 被剥，没有 thinking 被拍平。你的 Anthropic SDK 客户端打过来，body 字节级透传到 Anthropic-compatible 上游，响应字节级回来。
 
@@ -68,7 +68,7 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 ### 【传送门】
 
 GitHub: `<你的仓库地址>`
-评测报告（怎么测的、8C16G VPS 怎么推算的，全摊开了）：`docs/evaluation-report.html`
+评测报告（怎么测的、8C16G VPS 怎么推算的，全摊开了）：`dev-docs/evaluation-report.html`
 
 ---
 

@@ -40,7 +40,7 @@ services:
       # Control-plane SNAPSHOT URL (standbys/edges poll this for config).
       # It is NOT the admin-mutation forward target: forwarding follows the
       # actual lease holder via the registry, so pointing at this node itself
-      # is safe (see docs/cluster.md §5.2).
+      # is safe (see dev-docs/cluster.md §5.2).
       HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
       HYDRA_PUBLIC_URL: "http://hydra-control-a:8081"
       HYDRA_NODE_ID: control-a

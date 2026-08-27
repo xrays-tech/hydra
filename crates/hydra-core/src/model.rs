@@ -1,6 +1,6 @@
 //! Domain entities — pure data structures (no logic).
 //!
-//! These mirror the SQLite schema in `docs/design.md` §4.1. Timestamps are
+//! These mirror the SQLite schema in `dev-docs/design.md` §4.1. Timestamps are
 //! stored as ISO-8601 `String` (the core has no `chrono` dependency by design;
 //! the server translates to/from `DateTime` at the I/O boundary). `enabled`
 //! and `status` use idiomatic Rust types (`bool`/`i32`); the DB-layer
