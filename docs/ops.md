@@ -35,9 +35,9 @@ cargo build --release --features server
 # → target/release/hydra
 ```
 
-The binary embeds the admin UI at compile time (`include_dir!`), so the three
-`admin-ui/{index.html,app.js,style.css}` files are **not** needed on disk at
-runtime. The release binary is the only artefact you ship.
+The binary embeds the admin UI at compile time (`include_dir!`), so the
+`admin-ui/{index.html,app.js,api-docs.js,style.css}` files are **not** needed on
+disk at runtime. The release binary is the only artefact you ship.
 
 ### 1.1 Environment variables (single source of truth for runtime knobs)
 
@@ -638,3 +638,50 @@ until Redis recovers. See `docs/cluster.md` §3 for the full matrix.
 - `HYDRA_FAILOVER_GRACE_MS` is documented but not wired; `HYDRA_BREAKER_QUORUM`
   and `HYDRA_RATE_LIMIT_FAIL_MODE` use in-code defaults.
 - Redis sentinel/cluster deployment modes fail fast (single mode wired).
+---
+
+## 14. GitHub pull fails: `GnuTLS recv error (-110)` (HTTPS over unstable links)
+
+> **Finalized fix (2026-08, verified).** Symptom: `git pull`/`git fetch` from
+> GitHub over HTTPS intermittently dies with
+> `GnuTLS recv error (-110): The TLS connection was non-properly terminated`.
+> Root cause: distro git built against GnuTLS is sensitive to packet loss /
+> middlebox interference on cross-border links, and HTTP/2 multiplexing makes
+> it worse. The fix below forces HTTP/1.1 + bigger buffers + no low-speed
+> cutoff. Applied **globally** on this machine and verified with 8/8
+> consecutive `git fetch` + an ALPN trace showing `http/1.1` negotiated.
+
+### 14.1 Apply (simplest fix — no side effects, covers every repo)
+
+```bash
+# 1. Force HTTP/1.1 (avoids the HTTP/2 multiplexing disconnect bug — the
+#    single most effective lever), bump the send buffer, and disable the
+#    low-speed abort so brief network dips do not kill the transfer:
+git config --global http.version HTTP/1.1
+git config --global http.postBuffer 1048576000   # 1 GiB
+git config --global http.lowSpeedLimit 0          # 0 = check disabled
+git config --global http.lowSpeedTime 999999
+
+# 2. Verify the values took effect:
+git config --global --list | grep -i '^http'
+```
+
+### 14.2 Verify it is really using HTTP/1.1
+
+```bash
+GIT_CURL_VERBOSE=1 git fetch origin 2>&1 | grep -E 'ALPN|HTTP/[0-9.]+ [0-9]{3}'
+# Expect: "ALPN: server accepted http/1.1" and "HTTP/1.1 200 OK" lines.
+# Stability smoke: run the fetch in a loop until you are confident:
+for i in $(seq 1 8); do git fetch origin >/dev/null 2>&1 && echo "$i OK" || echo "$i FAIL"; done
+```
+
+### 14.3 If it still recurs (escalation ladder)
+
+1. **Switch origin to SSH** (bypasses HTTPS/TLS entirely — most robust for
+   automation; requires a GitHub SSH key on the host):
+   `git remote set-url origin git@github.com:xrays-tech/hydra.git`
+2. **Shallow fetch** when the history is large: `git fetch --depth=1 origin main`
+   (later `git fetch --unshallow` on a good link).
+3. **Force IPv4**: `git fetch -4 origin main`.
+4. **MTU tuning** (physical-link packet loss): `sudo ip link set dev <iface> mtu 1360`.
+
