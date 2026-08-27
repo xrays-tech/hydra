@@ -14,14 +14,14 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Pin the toolchain explicitly (dtolnay/rust-toolchain sets
-      # RUSTUP_TOOLCHAIN, overriding rust-toolchain.toml's "stable"): a
-      # latest-stable drift changed the clippy lint set mid-flight (1.97 →
-      # 1.98 turned on `result_large_err`), making CI non-reproducible. This
-      # repo's rust-toolchain.toml stays "stable" for local development;
-      # CI always evaluates against the pinned version. Bump deliberately.
+      # RUSTUP_TOOLCHAIN, overriding rust-toolchain.toml): a latest-stable
+      # drift changed the clippy lint set mid-flight (1.97 → 1.98 turned on
+      # `result_large_err`), making CI non-reproducible. rust-toolchain.toml
+      # pins the same 1.98.0 for local development, so local fmt/clippy match
+      # the CI gate exactly. Bump deliberately.
       - name: Install Rust toolchain (pinned 1.98.0)
         uses: dtolnay/rust-toolchain@v1
         with:
