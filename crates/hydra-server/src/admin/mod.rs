@@ -285,6 +285,13 @@ impl AdminService {
         if parts == ["cluster", "status"] && method == "GET" {
             return handlers::cluster_status(&self.state, trace_id).await;
         }
+        // Tenant auth-url probe (Admin UI "Test" button on the Tenants form):
+        // POSTs a simulated auth request to the given auth_url and reports
+        // reachability / protocol / verdict. Non-mutating (no DB write), but
+        // POST so it carries the URL in the body.
+        if parts == ["tenants", "auth", "test"] && method == "POST" {
+            return handlers::tenant_auth_test(&self.state, session, trace_id).await;
+        }
 
         // REST CRUD resources.
         let resource = parts.first().copied().unwrap_or("");

@@ -70,6 +70,12 @@ const API_DOCS = [
       query: [{ name: "since", type: "integer", desc: "Local config version; the leader only sends a snapshot when newer" }],
       resp: ["200 — {\"version\":7,\"snapshot\":null}", "200 — {\"version\":7,\"snapshot\":{...sealed config...}}"],
       errors: [{ status: 401, code: "unauthorized", desc: "invalid cluster token" }] },
+    { method: "POST", path: "/api/v1/tenants/auth/test", summary: "Probe a tenant auth URL (Admin UI Test button)",
+      desc: "Sends a simulated auth request (same headers + body as the real auth path, with a clearly fake api-key) to the given auth_url and reports reachability / protocol / verdict. A fake key MUST be rejected, so 401/403 or an explicit denial flag in a 2xx body ({status:false}/{allowed:false}) is a PASS; an allow, 404/405, 422, 5xx or an unreachable URL is a FAIL. Non-mutating.",
+      auth: true,
+      body: { auth_url: "https://auth.acme.com/v1/verify", tenant_id: "acme" },
+      resp: ["200 — {\"ok\":true,\"reachable\":true,\"status\":401,\"protocol_ok\":true,\"verdict\":\"denied\",\"detail\":\"auth service rejected the simulated api-key (expected: key not found / auth failed)\",\"duration_ms\":42}", "200 — {\"ok\":false,\"reachable\":false,\"status\":null,\"protocol_ok\":false,\"verdict\":\"unreachable\",\"detail\":\"URL not reachable: ...\",\"duration_ms\":2000}"],
+      errors: [{ status: 400, code: "missing_auth_url", desc: "auth_url is required" }] },
   ]},
 
   { tag: "Providers", endpoints: [

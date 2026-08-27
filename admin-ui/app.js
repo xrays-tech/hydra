@@ -324,7 +324,8 @@ const CRUD = {
       { name: "name", label: "Name", required: true, placeholder: "Acme" },
       { name: "domain", label: "Domain", required: true, placeholder: "acme.com", tip: "lowercased; localhost is special" },
       { name: "auth_url", label: "Auth URL", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
-        tip: "mandatory — empty ⇒ all requests 401" },
+        tip: "mandatory — empty ⇒ all requests 401",
+        test: { label: "Test", action: (input) => testAuthUrl(input) } },
       { name: "cert_pem", label: "Cert PEM", type: "textarea", full: true, rows: 4, map: "opt",
         placeholder: "-----BEGIN CERTIFICATE----- …",
         tip: "optional — leave blank for no cert (or to keep the current cert on edit); clearing via the API uses cert_pem:\"\"" },
@@ -754,7 +755,18 @@ function buildField(f, value, { disabled, isEdit } = {}) {
     input.value = value === null || value === undefined ? "" : String(value);
     if (isEdit && f.name === "id") input.classList.add("mono");
   }
-  group.appendChild(input);
+  if (f.test) {
+    // Input + an inline action button (e.g. the Tenants "Test" auth-URL
+    // probe). The button is type="button" so it never submits the form.
+    const wrap = el("div", { class: "input-wrap" });
+    input.style.flex = "1";
+    wrap.appendChild(input);
+    wrap.appendChild(el("button", { class: "btn sm ghost", type: "button", text: f.test.label || "Test",
+      onClick: () => f.test.action(input, group) }));
+    group.appendChild(wrap);
+  } else {
+    group.appendChild(input);
+  }
   const err = el("div", { class: "field-error hidden", text: "" });
   group.appendChild(err);
   if (f.tip) group.appendChild(el("div", { class: "field-tip", text: f.tip }));
@@ -816,6 +828,29 @@ function setLoading(btn, loading, label) {
     if (btn._prevHTML !== undefined) { btn.innerHTML = btn._prevHTML; }
   }
 }
+
+/* ===========================================================================
+ * Tenant auth-url probe ("Test" button on the Tenants form)
+ * ======================================================================== */
+async function testAuthUrl(input) {
+  const url = (input.value || "").trim();
+  if (!url) { toast("Enter an auth URL first", "err"); return; }
+  const wrap = input.closest(".input-wrap");
+  const btn = wrap ? wrap.querySelector("button") : null;
+  if (btn) setLoading(btn, true, "Testing…");
+  try {
+    const r = await api("POST", "/tenants/auth/test", { body: { auth_url: url } });
+    const ms = typeof r.duration_ms === "number" ? " · " + r.duration_ms + "ms" : "";
+    const head = typeof r.status === "number" ? "HTTP " + r.status + ms : ms;
+    if (r.ok) toast(r.detail + " (" + head + ")", "ok", { title: "Auth URL OK" });
+    else toast(r.detail + " (" + head + ")", "err", { title: "Auth URL test failed" });
+  } catch (e) {
+    toast(e.message, "err", { title: "Auth URL test failed" });
+  } finally {
+    if (btn) setLoading(btn, false);
+  }
+}
+
 
 /* ===========================================================================
  * Delete

@@ -1111,6 +1111,200 @@ pub(super) async fn auth_cache_invalidate(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Tenant auth-url connectivity test (Admin UI "Test" button, design §11.3)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/v1/tenants/auth/test`.
+#[derive(Deserialize)]
+struct AuthTestRequest {
+    /// The tenant `auth_url` to probe (may not be saved yet — the UI tests
+    /// the field as typed).
+    auth_url: String,
+    /// Optional tenant id — sent as `X-Hydra-Tenant` and in the request body,
+    /// exactly like the real auth path would.
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
+
+/// Result of the simulated auth probe.
+#[derive(Serialize)]
+struct AuthTestResult {
+    /// Overall outcome: true when the URL is reachable, accepts POST, does
+    /// not 4xx/5xx, and the simulated key was REJECTED (denial is the
+    /// expected verdict for a fake key — see `verdict`).
+    ok: bool,
+    /// Whether the HTTP round-trip completed (no connect/timeout error).
+    reachable: bool,
+    /// The status the auth service returned (`None` when unreachable).
+    status: Option<u16>,
+    /// Whether the URL accepted POST (`false` on 404/405 — wrong path or a
+    /// GET-only endpoint).
+    protocol_ok: bool,
+    /// Classification: `denied` | `allowed` | `unreachable` | `timeout` |
+    /// `not_found` | `method_not_allowed` | `unprocessable` |
+    /// `server_error` | `unexpected_status`.
+    verdict: &'static str,
+    /// Human-readable outcome for the UI toast.
+    detail: String,
+    /// Round-trip duration (ms).
+    duration_ms: u64,
+    /// Truncated response body for debugging (empty when unreachable).
+    body_snippet: String,
+}
+
+/// Simulated probe against a tenant `auth_url`: POSTs the exact request the
+/// proxy would send (same headers + body via `http::auth_request_body`) with a
+/// clearly fake api-key and reports whether the endpoint is usable. A fake key
+/// MUST be denied — so "api-key not found" / "auth failed" (401/403, or an
+/// explicit `status:false`/`allowed:false` in a 2xx body) is a PASS; an allow,
+/// a 422, a 404/405, a 5xx or an unreachable URL is a FAIL.
+pub(super) async fn tenant_auth_test(
+    state: &AdminState,
+    session: &mut ServerSession,
+    trace_id: &str,
+) -> Resp {
+    let body = read_body(session).await;
+    let req: AuthTestRequest = match parse_body(&body, trace_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let url = req.auth_url.trim();
+    if url.is_empty() {
+        return err_json(400, "missing_auth_url", "auth_url is required", trace_id);
+    }
+
+    // A clearly-fake key — it can never be a real tenant credential, so the
+    // auth service MUST reject it. Derives from the trace id for debuggability.
+    let api_key = format!("sk-hydra-auth-test-{trace_id}");
+    let tenant_id = req.tenant_id.clone().unwrap_or_default();
+    let timeout = state.auth.config().timeout;
+
+    let started = std::time::Instant::now();
+    let send = state
+        .auth
+        .client()
+        .post(url)
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("x-hydra-tenant", &tenant_id)
+        .header("x-hydra-trace-id", trace_id)
+        .header("content-type", "application/json")
+        .body(crate::http::auth_request_body(&api_key, &tenant_id))
+        .send();
+
+    let resp = match tokio::time::timeout(timeout, send).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return ok_json(
+                200,
+                &AuthTestResult {
+                    ok: false,
+                    reachable: false,
+                    status: None,
+                    protocol_ok: false,
+                    verdict: "unreachable",
+                    detail: format!("URL not reachable: {e}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    body_snippet: String::new(),
+                },
+            );
+        }
+        Err(_) => {
+            return ok_json(
+                200,
+                &AuthTestResult {
+                    ok: false,
+                    reachable: false,
+                    status: None,
+                    protocol_ok: false,
+                    verdict: "timeout",
+                    detail: format!("URL timed out after {}ms", timeout.as_millis()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    body_snippet: String::new(),
+                },
+            );
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let text = resp.text().await.unwrap_or_default();
+    let body_snippet: String = text.chars().take(400).collect();
+
+    let (ok, protocol_ok, verdict, detail): (bool, bool, &'static str, String) = match status {
+        401 | 403 => (
+            true,
+            true,
+            "denied",
+            "auth service rejected the simulated api-key (expected: key not found / auth failed)"
+                .to_string(),
+        ),
+        200..=299 => {
+            if crate::http::body_says_denied(&text) {
+                (
+                    true,
+                    true,
+                    "denied",
+                    "auth service rejected the simulated api-key (status:false/allowed:false in body)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    false,
+                    true,
+                    "allowed",
+                    "auth service ALLOWED the simulated api-key — the URL may not be the real auth endpoint"
+                        .to_string(),
+                )
+            }
+        }
+        404 => (
+            false,
+            false,
+            "not_found",
+            "URL returns 404 — not an auth endpoint or wrong path".to_string(),
+        ),
+        405 => (
+            false,
+            false,
+            "method_not_allowed",
+            "URL does not accept POST — check the protocol (GET-only endpoint?)".to_string(),
+        ),
+        422 => (
+            false,
+            true,
+            "unprocessable",
+            "URL rejected the auth payload (422) — not the expected auth endpoint".to_string(),
+        ),
+        500..=599 => (
+            false,
+            true,
+            "server_error",
+            format!("auth service returned {status} (server error)"),
+        ),
+        other => (
+            false,
+            true,
+            "unexpected_status",
+            format!("unexpected status {other}"),
+        ),
+    };
+
+    ok_json(
+        200,
+        &AuthTestResult {
+            ok,
+            reachable: true,
+            status: Some(status),
+            protocol_ok,
+            verdict,
+            detail,
+            duration_ms,
+            body_snippet,
+        },
+    )
+}
+
 // ===========================================================================
 // Cluster status (cluster P4) — whole-fleet view for the Admin UI Health page
 // ===========================================================================

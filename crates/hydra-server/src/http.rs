@@ -534,7 +534,10 @@ fn json_escape_into(out: &mut String, s: &str) {
 /// ignore unknown JSON fields, so the superset body satisfies both contracts:
 /// the mock tenant / §11.3 readers use `api_key`, the Dogress `/auth/api_key`
 /// handler reads `key`.
-fn auth_request_body(api_key: &str, tenant_id: &str) -> String {
+///
+/// `pub(crate)` so the admin auth-url test endpoint (`tenant_auth_test`)
+/// probes with the exact same body the proxy would send.
+pub(crate) fn auth_request_body(api_key: &str, tenant_id: &str) -> String {
     let mut out = String::with_capacity(api_key.len() * 2 + tenant_id.len() + 48);
     out.push_str("{\"api_key\":\"");
     json_escape_into(&mut out, api_key);
@@ -573,7 +576,10 @@ fn parse_expires_in(body: &str) -> Option<u64> {
 /// flat top-level JSON booleans when present, so a false positive on nested /
 /// string occurrences is structurally impossible for the response shapes both
 /// contracts use.
-fn body_says_denied(body: &str) -> bool {
+///
+/// `pub(crate)` so the admin auth-url test endpoint can classify the mock
+/// response exactly as the proxy would.
+pub(crate) fn body_says_denied(body: &str) -> bool {
     const STATUS: &str = "\"status\"";
     const ALLOWED: &str = "\"allowed\"";
     json_field_is_false(body, STATUS) || json_field_is_false(body, ALLOWED)
