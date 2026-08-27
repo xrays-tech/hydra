@@ -425,11 +425,8 @@ function renderApiDocs() {
   content.appendChild(el("div", { class: "panel" },
     el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("apidocs.chrome.pageTitle") })), el("div", { class: "spacer" })),
     el("div", { class: "docs-intro" },
-      el("p", { html: "All management endpoints live under <code>/api/v1/*</code> on the <b>admin port</b> (<code>:8081</code>). " +
-        "Every <code>/api/v1/*</code> request needs <code>Authorization: Bearer &lt;admin-token&gt;</code> — the same token you use to log into this UI — " +
-        "except <code>/metrics</code>, <code>/healthz/leader</code> (token-free) and <code>/api/v1/internal/*</code> (cluster token)." }),
-      el("p", { html: "Config writes are hot-reloaded automatically. In cluster mode, a mutation sent to a standby node is " +
-        "forwarded to the active leader transparently, so you can point the API at any leader-candidate node." }),
+      el("p", { html: t("apidocs.chrome.introEndpoints") }),
+      el("p", { html: t("apidocs.chrome.introClusterWrites") }),
     ),
   ));
   for (const tag of API_DOCS) {
