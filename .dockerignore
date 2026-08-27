@@ -4,6 +4,7 @@
 **/target
 **/.slim
 **/dev-docs
+**/docs
 **/tests
 **/admin-ui
 **/*.rs

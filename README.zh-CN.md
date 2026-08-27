@@ -1,6 +1,6 @@
 # Hydra
 
-[English](README.md)
+[English](README.md) · [🌐 项目主页](https://xrays-tech.github.io/hydra/)
 
 > **受够了 Python LLM 网关——闲置就吃掉 20GB 内存，还在 OpenAI↔Anthropic 的有损转换里默默吞掉你的工具调用？**
 >
