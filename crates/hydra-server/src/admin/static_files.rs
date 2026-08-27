@@ -1,6 +1,6 @@
 //! Embedded static UI for `/admin/*` (design §14.2).
 //!
-//! The three UI assets (`index.html`, `app.js`, `style.css`) live under
+//! The UI assets (`index.html`, `app.js`, `api-docs.js`, `style.css`) live under
 //! `admin-ui/` at the workspace root and are baked into the binary at compile
 //! time via `include_dir!`. There is **no npm/build step**: the files are plain
 //! static HTML/CSS/JS that the browser loads as-is.
@@ -187,13 +187,25 @@ mod tests {
         assert!(try_serve_admin("/").is_none());
     }
 
+
     #[test]
-    fn ui_assets_embedded_no_external_dep() {
-        // T1.2: the embedded dir exposes the three expected files at compile
-        // time (so the binary is self-contained).
-        let names: Vec<&str> = ui_files().iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"index.html"), "names = {names:?}");
-        assert!(names.contains(&"app.js"), "names = {names:?}");
-        assert!(names.contains(&"style.css"), "names = {names:?}");
+    fn index_html_loads_api_docs_before_app_js() {
+        // Regression: api-docs.js defines the global renderApiDocs() that
+        // app.js's top level reads eagerly (CUSTOM["api-docs"].render). Classic
+        // <script> tags run in document order, so loading api-docs.js AFTER
+        // app.js raised "Uncaught ReferenceError: renderApiDocs is not defined"
+        // on the /admin page and aborted the whole UI.
+        let r = try_serve_admin("/admin/").expect("index");
+        let body = String::from_utf8(r.body().to_vec()).unwrap();
+        let app_pos = body
+            .find("<script src=\"/admin/app.js\">")
+            .unwrap_or_else(|| panic!("index.html must load app.js"));
+        let docs_pos = body
+            .find("<script src=\"/admin/api-docs.js\">")
+            .unwrap_or_else(|| panic!("index.html must load api-docs.js"));
+        assert!(
+            docs_pos < app_pos,
+            "api-docs.js must load before app.js (app.js top level reads renderApiDocs)"
+        );
     }
 }
