@@ -140,10 +140,17 @@ async fn auth_url_403_denied_passes() {
 #[tokio::test]
 async fn auth_url_2xx_status_false_denied_passes() {
     // Dogress-style: 200 + {"status":false} = explicit denial → PASS.
-    let r = probe_with(200, Some(serde_json::json!({ "status": false, "reason": "invalid_key" }))).await;
+    let r = probe_with(
+        200,
+        Some(serde_json::json!({ "status": false, "reason": "invalid_key" })),
+    )
+    .await;
     assert_eq!(r["ok"], true, "got {r}");
     assert_eq!(r["verdict"], "denied", "got {r}");
-    assert!(r["body_snippet"].as_str().unwrap_or("").contains("status"), "got {r}");
+    assert!(
+        r["body_snippet"].as_str().unwrap_or("").contains("status"),
+        "got {r}"
+    );
 }
 
 #[tokio::test]

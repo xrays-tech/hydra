@@ -702,11 +702,15 @@ mod tests {
         // valid contract shapes → true
         assert!(auth_body_is_json_object("{}"));
         assert!(auth_body_is_json_object("{\"status\":true}"));
-        assert!(auth_body_is_json_object("{\"allowed\":false,\"expires_in\":60}"));
+        assert!(auth_body_is_json_object(
+            "{\"allowed\":false,\"expires_in\":60}"
+        ));
         assert!(auth_body_is_json_object("  {\"status\" : true }  "));
         // non-verdict bodies → false (must never silently allow)
         assert!(!auth_body_is_json_object(""));
-        assert!(!auth_body_is_json_object("<html><body>sign in</body></html>"));
+        assert!(!auth_body_is_json_object(
+            "<html><body>sign in</body></html>"
+        ));
         assert!(!auth_body_is_json_object("<!DOCTYPE html>"));
         assert!(!auth_body_is_json_object("[1,2,3]"));
         assert!(!auth_body_is_json_object("\"just a string\""));

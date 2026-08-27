@@ -250,7 +250,9 @@ impl RecordingSink {
 async fn v1_messages_selects_anthropic_usage_scanner() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .mount(&auth_server)
         .await;
 
@@ -341,7 +343,9 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
 async fn v1_chat_completions_regression_generic_scanner() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .mount(&auth_server)
         .await;
 

@@ -803,9 +803,13 @@ pub async fn set_tenant_access_token_hash(
     tenant_id: &str,
     hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query!("UPDATE tenant SET access_token_hash = ? WHERE id = ?", hash, tenant_id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "UPDATE tenant SET access_token_hash = ? WHERE id = ?",
+        hash,
+        tenant_id
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -814,9 +818,11 @@ pub async fn set_tenant_access_token_hash(
 pub async fn list_tenant_access_token_hashes(
     pool: &SqlitePool,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let rows = sqlx::query!("SELECT id, access_token_hash FROM tenant WHERE access_token_hash IS NOT NULL")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query!(
+        "SELECT id, access_token_hash FROM tenant WHERE access_token_hash IS NOT NULL"
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         // `id` is `TEXT PRIMARY KEY` without NOT NULL, so sqlx types it
@@ -830,9 +836,12 @@ pub async fn tenant_has_access_token(
     pool: &SqlitePool,
     tenant_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!("SELECT access_token_hash FROM tenant WHERE id = ?", tenant_id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query!(
+        "SELECT access_token_hash FROM tenant WHERE id = ?",
+        tenant_id
+    )
+    .fetch_optional(pool)
+    .await?;
     Ok(row.and_then(|r| r.access_token_hash).is_some())
 }
 

@@ -119,10 +119,17 @@ async fn create_tenant(port: u16, id: &str, token: Option<&str>) -> serde_json::
     .await
 }
 
-async fn invalidate(port: u16, tenant_id: &str, bearer: &str, body: Option<serde_json::Value>) -> (u16, serde_json::Value) {
+async fn invalidate(
+    port: u16,
+    tenant_id: &str,
+    bearer: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
     let c = client();
     let mut req = c
-        .post(format!("http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/auth/cache/invalidate"))
+        .post(format!(
+            "http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/auth/cache/invalidate"
+        ))
         .header("authorization", format!("Bearer {bearer}"));
     if let Some(b) = body {
         req = req.json(&b);
@@ -151,9 +158,17 @@ async fn tenant_token_set_never_echoed_and_has_flag() {
         .json()
         .await
         .expect("json");
-    let row = list.as_array().unwrap().iter().find(|r| r["id"] == "t-acme").expect("row");
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "t-acme")
+        .expect("row");
     assert_eq!(row["has_access_token"], true, "got {list}");
-    assert!(!row.to_string().contains("access_token_hash"), "hash leaked in list");
+    assert!(
+        !row.to_string().contains("access_token_hash"),
+        "hash leaked in list"
+    );
 }
 
 #[tokio::test]
@@ -175,7 +190,10 @@ async fn tenant_token_blank_keeps_and_empty_clears() {
         .await
         .expect("put");
     let updated: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(updated["has_access_token"], true, "blank must keep: got {updated}");
+    assert_eq!(
+        updated["has_access_token"], true,
+        "blank must keep: got {updated}"
+    );
     // explicit "" clears
     let body2 = serde_json::json!({
         "id": "t-rot", "name": "Rot", "domain": "t-rot.test",
@@ -190,7 +208,10 @@ async fn tenant_token_blank_keeps_and_empty_clears() {
         .await
         .expect("put2");
     let cleared: serde_json::Value = r2.json().await.expect("json");
-    assert_eq!(cleared["has_access_token"], false, "empty must clear: got {cleared}");
+    assert_eq!(
+        cleared["has_access_token"], false,
+        "empty must clear: got {cleared}"
+    );
 }
 
 #[tokio::test]
@@ -241,8 +262,16 @@ async fn tenant_token_invalidates_selected_keys() {
     let state = admin_state().await;
     let port = start_admin(state.clone());
     create_tenant(port, "t-sel", Some(TENANT_TOKEN)).await;
-    state.auth.cache().set("t-sel", "sk-a", true, Duration::from_secs(300)).await;
-    state.auth.cache().set("t-sel", "sk-b", true, Duration::from_secs(300)).await;
+    state
+        .auth
+        .cache()
+        .set("t-sel", "sk-a", true, Duration::from_secs(300))
+        .await;
+    state
+        .auth
+        .cache()
+        .set("t-sel", "sk-b", true, Duration::from_secs(300))
+        .await;
     let (status, json) = invalidate(
         port,
         "t-sel",

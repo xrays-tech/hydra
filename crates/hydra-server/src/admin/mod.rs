@@ -422,7 +422,9 @@ impl AdminService {
                 return Some(handlers::err_json(
                     503,
                     "not_leader",
-                    &format!("this node is not the active leader; forward target resolution failed: {e}"),
+                    &format!(
+                        "this node is not the active leader; forward target resolution failed: {e}"
+                    ),
                     trace_id,
                 ));
             }
@@ -447,7 +449,6 @@ impl AdminService {
             )),
         }
     }
-
 }
 
 #[async_trait]
@@ -513,13 +514,29 @@ impl ServeHttp for AdminService {
         if let Some(url_tenant) = tenant_self_path {
             if method == "POST" && !url_tenant.is_empty() && !url_tenant.contains('/') {
                 let Some(bearer) = Self::bearer_token(session).map(str::to_string) else {
-                    return handlers::err_json(401, "unauthorized", "invalid tenant access token", &trace_id);
+                    return handlers::err_json(
+                        401,
+                        "unauthorized",
+                        "invalid tenant access token",
+                        &trace_id,
+                    );
                 };
-                let Some(tenant_id) = handlers::tenant_id_for_token(&self.state, &bearer).await else {
-                    return handlers::err_json(401, "unauthorized", "invalid tenant access token", &trace_id);
+                let Some(tenant_id) = handlers::tenant_id_for_token(&self.state, &bearer).await
+                else {
+                    return handlers::err_json(
+                        401,
+                        "unauthorized",
+                        "invalid tenant access token",
+                        &trace_id,
+                    );
                 };
                 if tenant_id != url_tenant {
-                    return handlers::err_json(403, "forbidden", "token does not match tenant_id", &trace_id);
+                    return handlers::err_json(
+                        403,
+                        "forbidden",
+                        "token does not match tenant_id",
+                        &trace_id,
+                    );
                 }
                 // Leader write gate: a standby forwards the invalidation to
                 // the ACTUAL lease holder (which re-validates the token).
@@ -530,7 +547,10 @@ impl ServeHttp for AdminService {
                     return resp;
                 }
                 return handlers::tenant_auth_cache_invalidate(
-                    &self.state, session, &tenant_id, &trace_id,
+                    &self.state,
+                    session,
+                    &tenant_id,
+                    &trace_id,
                 )
                 .await;
             }

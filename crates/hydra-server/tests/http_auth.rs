@@ -75,7 +75,9 @@ async fn auth_upstream_2xx_caches_allowed() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .expect(1) // second call MUST hit the cache, not the wiremock
         .mount(&server)
         .await;
@@ -313,7 +315,9 @@ async fn auth_request_contract() {
         .and(header("authorization", "Bearer sk-contract"))
         .and(header("x-hydra-tenant", "t1"))
         .and(header_exists("x-hydra-trace-id"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -362,7 +366,9 @@ async fn auth_upstream_2xx_html_body_fail_closed() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<html><head><title>Sign in</title></head><body>login page</body></html>"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<html><head><title>Sign in</title></head><body>login page</body></html>",
+        ))
         .mount(&server)
         .await;
 
@@ -482,7 +488,6 @@ async fn auth_upstream_504_fail_closed() {
     assert_eq!(checker.cache().len(), 0);
 }
 
-
 // ---------------------------------------------------------------------------
 // T2.8 — 2xx body `expires_in` overrides the default allow TTL.
 // ---------------------------------------------------------------------------
@@ -582,7 +587,9 @@ async fn auth_independent_client_pool() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -605,7 +612,9 @@ async fn invalidate_forces_reauth() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .expect(2) // initial allow + post-invalidate re-auth
         .mount(&server)
         .await;
@@ -647,7 +656,9 @@ async fn invalidate_tenant_forces_reauth() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .mount(&server)
         .await;
 

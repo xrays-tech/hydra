@@ -187,7 +187,6 @@ mod tests {
         assert!(try_serve_admin("/").is_none());
     }
 
-
     #[test]
     fn index_html_loads_api_docs_before_app_js() {
         // Regression: api-docs.js defines the global renderApiDocs() that
@@ -230,7 +229,10 @@ mod tests {
         let ct = r.headers().get("content-type").unwrap().to_str().unwrap();
         assert!(ct.starts_with("application/javascript"), "got {ct}");
         let body = String::from_utf8(r.body().to_vec()).unwrap();
-        assert!(body.contains("I18N"), "i18n.js must define the I18N dictionary");
+        assert!(
+            body.contains("I18N"),
+            "i18n.js must define the I18N dictionary"
+        );
         for marker in ["\"zh\"", "\"fr\"", "\"de\"", "\"en\""] {
             assert!(body.contains(marker), "missing locale marker {marker}");
         }

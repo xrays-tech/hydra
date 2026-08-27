@@ -1,9 +1,10 @@
 # Toolchain pin for CI reproducibility. MSRV (1.83) is declared as
-# `rust-version` in the workspace Cargo.toml; this file selects the installed
-# `stable` toolchain so sandboxes/CI without a specific old toolchain
-# pre-installed are not forced to download one. rustfmt + clippy are required
-# by the CI gate (cargo fmt --check, cargo clippy -D warnings).
+# `rust-version` in the workspace Cargo.toml. Pinned to the same 1.98.0 that
+# CI evaluates against (.github/workflows/ci.yml) so local rustfmt/clippy
+# results match the CI gate exactly; rustup auto-installs this channel on
+# first use if missing. rustfmt + clippy are required by the CI gate
+# (cargo fmt --check, cargo clippy -D warnings).
 [toolchain]
-channel = "stable"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

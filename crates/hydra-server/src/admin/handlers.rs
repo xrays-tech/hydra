@@ -505,7 +505,10 @@ impl TenantView {
 /// SHA-256 of `s` as a lowercase hex string (the `_hex`-suffixed core
 /// helper returns the raw `[u8; 32]` — the suffix is historical).
 fn sha256_hex_str(s: &str) -> String {
-    sha256_hex(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    sha256_hex(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Constant-time byte comparison (no timing side-channel on the token).
@@ -701,10 +704,11 @@ pub(super) async fn tenant_collection(
     if method == "GET" {
         match crate::db::list_tenants(state.db()).await {
             Ok(rows) => {
-                let with_token: HashSet<String> = crate::db::list_tenant_access_token_hashes(state.db())
-                    .await
-                    .map(|pairs| pairs.into_iter().map(|(id, _)| id).collect())
-                    .unwrap_or_default();
+                let with_token: HashSet<String> =
+                    crate::db::list_tenant_access_token_hashes(state.db())
+                        .await
+                        .map(|pairs| pairs.into_iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default();
                 let views: Vec<TenantView> = rows
                     .into_iter()
                     .map(|t| {
@@ -764,7 +768,9 @@ pub(super) async fn tenant_collection(
         if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
             return resp;
         }
-        if let Err(resp) = apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await {
+        if let Err(resp) =
+            apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await
+        {
             return resp;
         }
         let has = crate::db::tenant_has_access_token(state.db(), &t.id)
@@ -823,7 +829,9 @@ pub(super) async fn tenant_item(
             if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
                 return resp;
             }
-            if let Err(resp) = apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await {
+            if let Err(resp) =
+                apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await
+            {
                 return resp;
             }
             match crate::db::get_tenant(state.db(), id).await {
@@ -1271,13 +1279,12 @@ struct AuthTestResult {
 /// token, migration 0009): SHA-256 of the presented token compared
 /// constant-time against the stored hashes. `None` ⇒ unknown / missing /
 /// unconfigured token (fail-closed 401).
-pub(super) async fn tenant_id_for_token(
-    state: &AdminState,
-    bearer: &str,
-) -> Option<String> {
+pub(super) async fn tenant_id_for_token(state: &AdminState, bearer: &str) -> Option<String> {
     let presented = sha256_hex_str(bearer);
     let pool = state.pool.as_ref()?;
-    let pairs = crate::db::list_tenant_access_token_hashes(pool).await.ok()?;
+    let pairs = crate::db::list_tenant_access_token_hashes(pool)
+        .await
+        .ok()?;
     for (tid, stored) in pairs {
         if constant_time_eq(&presented, &stored) {
             return Some(tid);
@@ -1306,14 +1313,15 @@ pub(super) async fn tenant_auth_cache_invalidate(
     trace_id: &str,
 ) -> Resp {
     let body = read_body(session).await;
-    let req: TenantCacheInvalidateRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
-        TenantCacheInvalidateRequest { api_keys: None }
-    } else {
-        match parse_body(&body, trace_id) {
-            Ok(r) => r,
-            Err(r) => return r,
-        }
-    };
+    let req: TenantCacheInvalidateRequest =
+        if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+            TenantCacheInvalidateRequest { api_keys: None }
+        } else {
+            match parse_body(&body, trace_id) {
+                Ok(r) => r,
+                Err(r) => return r,
+            }
+        };
     let count = match req.api_keys.as_deref() {
         Some(keys) if !keys.is_empty() => state.auth.invalidate(tenant_id, keys).await,
         _ => state.auth.invalidate_tenant(tenant_id).await,
