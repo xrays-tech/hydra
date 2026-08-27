@@ -187,15 +187,23 @@ pub fn spawn_invalidation_consumer(
         loop {
             match stream.read_since(&last_id, 100).await {
                 Ok(events) => {
-                    for (id, inv) in events {
-                        let known: Vec<String> = store
-                            .snapshot()
-                            .tenants_by_domain
-                            .values()
-                            .map(|t| t.id.clone())
-                            .collect();
-                        apply_invalidation(auth.cache(), &inv, &known).await;
-                        last_id = id;
+                    if !events.is_empty() {
+                        for (id, inv) in events {
+                            let known: Vec<String> = store
+                                .snapshot()
+                                .tenants_by_domain
+                                .values()
+                                .map(|t| t.id.clone())
+                                .collect();
+                            apply_invalidation(auth.cache(), &inv, &known).await;
+                            last_id = id;
+                        }
+                        // Keep the local `hydra_auth_cache_size` gauge
+                        // truthful: entries cleared HERE never pass through
+                        // the admin invalidation handlers (which run only on
+                        // the node that received the request — never on an
+                        // edge data-plane node consuming the stream).
+                        crate::admin::metrics::record_auth_cache_size(auth.cache().len());
                     }
                     match stream.generation().await {
                         Ok(g) if g != gen => {
@@ -205,6 +213,7 @@ pub fn spawn_invalidation_consumer(
                                 "invalidation generation bumped; clearing local auth cache"
                             );
                             auth.cache().clear_all();
+                            crate::admin::metrics::record_auth_cache_size(0);
                         }
                         _ => {}
                     }
