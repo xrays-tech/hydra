@@ -76,6 +76,14 @@ const API_DOCS = [
       body: { auth_url: "https://auth.acme.com/v1/verify", tenant_id: "acme" },
       resp: ["200 — {\"ok\":true,\"reachable\":true,\"status\":401,\"protocol_ok\":true,\"verdict\":\"denied\",\"detail\":\"auth service rejected the simulated api-key (expected: key not found / auth failed)\",\"duration_ms\":42}", "200 — {\"ok\":false,\"reachable\":false,\"status\":null,\"protocol_ok\":false,\"verdict\":\"unreachable\",\"detail\":\"URL not reachable: ...\",\"duration_ms\":2000}"],
       errors: [{ status: 400, code: "missing_auth_url", desc: "auth_url is required" }] },
+    { method: "POST", path: "/api/v1/tenants/{tenant_id}/auth/cache/invalidate", summary: "Tenant self-service: invalidate own auth cache",
+      desc: "Gated by the TENANT access token (Authorization: Bearer <access_token> — NOT the admin token; set on the tenant via the admin UI/API). Clears the tenant's cached api-key auth decisions, forcing re-authentication on the next request — 欠费停机 / 付费恢复 access scenarios. The URL tenant_id must match the token's tenant (403 otherwise, no cross-tenant spoofing). Body api_keys optional: absent/empty clears ALL cached decisions for the tenant. Cluster: broadcast cluster-wide; a standby forwards to the active leader.",
+      auth: "tenant",
+      body: { api_keys: ["sk-aaa", "sk-bbb"] },
+      resp: ["200 — {\"invalidated\":2,\"tenant_id\":\"acme\"}", "200 — {\"invalidated\":0,\"tenant_id\":\"acme\"} (empty body = clear all)"],
+      errors: [
+        { status: 401, code: "unauthorized", desc: "missing or invalid tenant access token" },
+        { status: 403, code: "forbidden", desc: "token does not match tenant_id" } ] },
   ]},
 
   { tag: "Providers", endpoints: [

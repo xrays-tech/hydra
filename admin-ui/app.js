@@ -317,6 +317,7 @@ const CRUD = {
       { key: "name", label: "Name" },
       { key: "domain", label: "Domain", mono: true },
       { key: "auth_url", label: "Auth URL", mono: true, truncate: true },
+      { key: "has_access_token", label: "Token", render: (v) => (v ? "set" : "—") },
       { key: "enabled", label: "Enabled", render: (v) => boolPill(v) },
     ],
     fields: [
@@ -325,7 +326,11 @@ const CRUD = {
       { name: "domain", label: "Domain", required: true, placeholder: "acme.com", tip: "lowercased; localhost is special" },
       { name: "auth_url", label: "Auth URL", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
         tip: "mandatory — empty ⇒ all requests 401",
-        test: { label: "Test", action: (input) => testAuthUrl(input) } },
+        action: { label: "Test", action: (input) => testAuthUrl(input) } },
+      { name: "access_token", label: "Access token", type: "password", map: "opt", full: true,
+        placeholder: "blank = keep current token",
+        tip: "tenant self-service token: POST /api/v1/tenants/{id}/auth/cache/invalidate with it to force re-auth (欠费停机 / 付费恢复). Blank on edit keeps the current token; a new value rotates it; never shown again after save.",
+        action: { label: "Generate", action: (input) => generateToken(input) } },
       { name: "cert_pem", label: "Cert PEM", type: "textarea", full: true, rows: 4, map: "opt",
         placeholder: "-----BEGIN CERTIFICATE----- …",
         tip: "optional — leave blank for no cert (or to keep the current cert on edit); clearing via the API uses cert_pem:\"\"" },
@@ -755,14 +760,15 @@ function buildField(f, value, { disabled, isEdit } = {}) {
     input.value = value === null || value === undefined ? "" : String(value);
     if (isEdit && f.name === "id") input.classList.add("mono");
   }
-  if (f.test) {
+  if (f.action) {
     // Input + an inline action button (e.g. the Tenants "Test" auth-URL
-    // probe). The button is type="button" so it never submits the form.
+    // probe or the "Generate" access-token button). The button is
+    // type="button" so it never submits the form.
     const wrap = el("div", { class: "input-wrap" });
     input.style.flex = "1";
     wrap.appendChild(input);
-    wrap.appendChild(el("button", { class: "btn sm ghost", type: "button", text: f.test.label || "Test",
-      onClick: () => f.test.action(input, group) }));
+    wrap.appendChild(el("button", { class: "btn sm ghost", type: "button", text: f.action.label || "Action",
+      onClick: () => f.action.action(input, group) }));
     group.appendChild(wrap);
   } else {
     group.appendChild(input);
@@ -849,6 +855,18 @@ async function testAuthUrl(input) {
   } finally {
     if (btn) setLoading(btn, false);
   }
+}
+
+/* ---- tenant access-token generator (Generate button, migration 0009) ---- */
+function generateToken(input) {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  input.value = token;
+  // reveal once so the operator can copy it — the API never returns it
+  input.type = "text";
+  setTimeout(() => { input.type = "password"; }, 20000);
+  toast("Random access token generated — copy it now; it is never shown again", "info", { title: "Access token" });
 }
 
 

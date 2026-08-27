@@ -297,6 +297,26 @@ is refreshed after mutation (§17).
 > side can still pass. Shorten `[auth] allow_ttl_secs` or call invalidate
 > proactively on tenant-side revocation (design §16.1).
 
+### 5.1 Tenant self-service invalidation (欠费停机 / 付费恢复, migration 0009)
+
+Each tenant can be given an **Access Token** (admin UI Tenants form →
+`Access token` field + Generate button; stored as a SHA-256 hash, never
+echoed, rotate by setting a new value). The tenant then clears its OWN auth
+cache without the operator:
+
+```bash
+curl -X POST http://<admin-addr>/api/v1/tenants/<tenant_id>/auth/cache/invalidate \
+  -H "Authorization: Bearer <tenant-access-token>" \
+  -H "content-type: application/json" \
+  -d '{"api_keys":["sk-aaa"]}'     # optional; empty body = clear ALL for the tenant
+→ {"invalidated":1,"tenant_id":"<tenant_id>"}
+```
+
+The token's tenant must match the URL's `tenant_id` (403 otherwise); an
+invalid/missing/unconfigured token is 401 (fail-closed). Cluster mode
+broadcasts the invalidation fleet-wide; a standby forwards to the active
+leader. Lost token ⇒ operator rotates it (the API never returns it).
+
 ---
 
 ## 6. Circuit-breaker operations (design §8.4)

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT access_token_hash FROM tenant WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "access_token_hash",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "1344230183a15b0a653f4705cacd18a6ed891af7cf9df01743ef0239895da729"
+}

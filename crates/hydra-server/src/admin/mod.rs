@@ -353,6 +353,96 @@ impl AdminService {
             _ => handlers::err_json(404, "not_found", "unknown path", trace_id),
         }
     }
+
+    /// Leader write gate (cluster P2/P3): on leader-candidate nodes that do
+    /// NOT hold the lease, admin mutations are FORWARDED to the active
+    /// leader (P3) — reads stay local (the replica serves them). The
+    /// forward target is resolved LIVE from the cluster registry (the
+    /// ACTUAL lease holder), never from a static HYDRA_CONTROL_URL: a
+    /// static URL may point at this node itself (the self-forward loop
+    /// bug) and cannot track the lease across failover. Fail-closed: when
+    /// no target is resolvable, or the active is unreachable, the mutation
+    /// fails 503/502 (a standby must never write locally; taking over is
+    /// the lease machine's job).
+    ///
+    /// Returns `Some(resp)` when the request was handled (forwarded /
+    /// loop-guarded / forward failed); `None` when the node is the lease
+    /// holder (or there is no election) — the caller executes locally.
+    async fn maybe_forward_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        session: &mut ServerSession,
+        trace_id: &str,
+    ) -> Option<Resp> {
+        let Some(is_leader) = &self.state.leader_ready else {
+            return None;
+        };
+        let mutation = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+        if !mutation || is_leader() {
+            return None;
+        }
+        // Forward-once marker (loop guard): a mutation that already
+        // travelled through a standby must never be forwarded again —
+        // this terminates any (self- or mutual-) forward loop with an
+        // immediate fail-closed 503 instead of a timeout recursion.
+        if session
+            .req_header()
+            .headers
+            .contains_key(crate::cluster::forward::FORWARD_ONCE_HEADER)
+        {
+            return Some(handlers::err_json(
+                503,
+                "forward_loop",
+                "mutation already forwarded once; refusing to forward again (forward loop guard)",
+                trace_id,
+            ));
+        }
+        let path_and_query = match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        };
+        let target = match self.state.resolve_forward_target().await {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                return Some(handlers::err_json(
+                    503,
+                    "not_leader",
+                    "this node is not the active leader and no forward target is resolvable (lease holder unknown)",
+                    trace_id,
+                ));
+            }
+            Err(e) => {
+                return Some(handlers::err_json(
+                    503,
+                    "not_leader",
+                    &format!("this node is not the active leader; forward target resolution failed: {e}"),
+                    trace_id,
+                ));
+            }
+        };
+        let body = handlers::read_body(session).await;
+        match crate::cluster::forward::forward_mutation(
+            &target,
+            method,
+            &path_and_query,
+            body,
+            &session.req_header().headers,
+            trace_id,
+        )
+        .await
+        {
+            Ok(resp) => Some(resp),
+            Err(e) => Some(handlers::err_json(
+                502,
+                "forward_failed",
+                &format!("{e}; the active leader is unreachable (no local write)"),
+                trace_id,
+            )),
+        }
+    }
+
 }
 
 #[async_trait]
@@ -406,6 +496,41 @@ impl ServeHttp for AdminService {
             }
         }
 
+        // Tenant self-service endpoint (migration 0009): POST
+        // /api/v1/tenants/{tenant_id}/auth/cache/invalidate — gated by the
+        // TENANT access token (NOT the admin token). Identity comes from the
+        // token; the URL tenant_id must match it or the call is rejected
+        // (no cross-tenant spoofing). Runs before the admin-token gate so a
+        // tenant never needs the operator's admin token (欠费停机 / 付费恢复).
+        let tenant_self_path = path
+            .strip_prefix("/api/v1/tenants/")
+            .and_then(|r| r.strip_suffix("/auth/cache/invalidate"));
+        if let Some(url_tenant) = tenant_self_path {
+            if method == "POST" && !url_tenant.is_empty() && !url_tenant.contains('/') {
+                let Some(bearer) = Self::bearer_token(session).map(str::to_string) else {
+                    return handlers::err_json(401, "unauthorized", "invalid tenant access token", &trace_id);
+                };
+                let Some(tenant_id) = handlers::tenant_id_for_token(&self.state, &bearer).await else {
+                    return handlers::err_json(401, "unauthorized", "invalid tenant access token", &trace_id);
+                };
+                if tenant_id != url_tenant {
+                    return handlers::err_json(403, "forbidden", "token does not match tenant_id", &trace_id);
+                }
+                // Leader write gate: a standby forwards the invalidation to
+                // the ACTUAL lease holder (which re-validates the token).
+                if let Some(resp) = self
+                    .maybe_forward_mutation(&method, &path, query.as_deref(), session, &trace_id)
+                    .await
+                {
+                    return resp;
+                }
+                return handlers::tenant_auth_cache_invalidate(
+                    &self.state, session, &tenant_id, &trace_id,
+                )
+                .await;
+            }
+        }
+
         // Admin-token gate (design §13.3) — every request to the admin port.
         if !self.check_auth(session) {
             debug!(target: "hydra::admin", path = %path, "admin auth denied");
@@ -417,80 +542,12 @@ impl ServeHttp for AdminService {
             );
         }
 
-        // Leader write gate (cluster P2/P3): on leader-candidate nodes that
-        // do NOT hold the lease, admin mutations are FORWARDED to the active
-        // leader (P3) — reads stay local (the replica serves them). The
-        // forward target is resolved LIVE from the cluster registry (the
-        // ACTUAL lease holder), never from a static HYDRA_CONTROL_URL: a
-        // static URL may point at this node itself (the self-forward loop
-        // bug) and cannot track the lease across failover. Fail-closed: when
-        // no target is resolvable, or the active is unreachable, the mutation
-        // fails 503/502 (a standby must never write locally; taking over is
-        // the lease machine's job).
-        if let Some(is_leader) = &self.state.leader_ready {
-            let mutation = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
-            if mutation && !is_leader() {
-                // Forward-once marker (loop guard): a mutation that already
-                // travelled through a standby must never be forwarded again —
-                // this terminates any (self- or mutual-) forward loop with an
-                // immediate fail-closed 503 instead of a timeout recursion.
-                if session
-                    .req_header()
-                    .headers
-                    .contains_key(crate::cluster::forward::FORWARD_ONCE_HEADER)
-                {
-                    return handlers::err_json(
-                        503,
-                        "forward_loop",
-                        "mutation already forwarded once; refusing to forward again (forward loop guard)",
-                        &trace_id,
-                    );
-                }
-                let path_and_query = match &query {
-                    Some(q) => format!("{path}?{q}"),
-                    None => path.clone(),
-                };
-                let target = match self.state.resolve_forward_target().await {
-                    Ok(Some(target)) => target,
-                    Ok(None) => {
-                        return handlers::err_json(
-                            503,
-                            "not_leader",
-                            "this node is not the active leader and no forward target is resolvable (lease holder unknown)",
-                            &trace_id,
-                        );
-                    }
-                    Err(e) => {
-                        return handlers::err_json(
-                            503,
-                            "not_leader",
-                            &format!(
-                                "this node is not the active leader; forward target resolution failed: {e}"
-                            ),
-                            &trace_id,
-                        );
-                    }
-                };
-                let body = handlers::read_body(session).await;
-                return match crate::cluster::forward::forward_mutation(
-                    &target,
-                    &method,
-                    &path_and_query,
-                    body,
-                    &session.req_header().headers,
-                    &trace_id,
-                )
-                .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => handlers::err_json(
-                        502,
-                        "forward_failed",
-                        &format!("{e}; the active leader is unreachable (no local write)"),
-                        &trace_id,
-                    ),
-                };
-            }
+        // Leader write gate (cluster P2/P3) — see `maybe_forward_mutation`.
+        if let Some(resp) = self
+            .maybe_forward_mutation(&method, &path, query.as_deref(), session, &trace_id)
+            .await
+        {
+            return resp;
         }
 
         self.route(&method, &path, query.as_deref(), session, &trace_id)

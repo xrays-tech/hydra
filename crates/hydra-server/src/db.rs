@@ -787,6 +787,55 @@ pub async fn update_tenant_cert(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Tenant access token (migration 0009, self-service auth-cache invalidation)
+// ---------------------------------------------------------------------------
+//
+// The tenant self-service credential is stored as a SHA-256 hex HASH only —
+// one-way, never echoed, never recoverable (lost token => rotate via the
+// admin API / UI). It is compared, never used for outbound calls, so a hash
+// is the correct primitive (same reasoning as the AuthCache's api-key
+// digests).
+
+/// Set (or clear, `None`) a tenant's access-token hash.
+pub async fn set_tenant_access_token_hash(
+    pool: &SqlitePool,
+    tenant_id: &str,
+    hash: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!("UPDATE tenant SET access_token_hash = ? WHERE id = ?", hash, tenant_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// All `(tenant_id, access_token_hash)` pairs — the tenant-token gate scans
+/// these and compares the presented token's digest (constant-time).
+pub async fn list_tenant_access_token_hashes(
+    pool: &SqlitePool,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows = sqlx::query!("SELECT id, access_token_hash FROM tenant WHERE access_token_hash IS NOT NULL")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        // `id` is `TEXT PRIMARY KEY` without NOT NULL, so sqlx types it
+        // Option<String> — a PK can never be NULL, unwrap_or_default is safe.
+        .filter_map(|r| r.access_token_hash.map(|h| (r.id.unwrap_or_default(), h)))
+        .collect())
+}
+
+/// Whether a tenant has an access token configured (for the admin view).
+pub async fn tenant_has_access_token(
+    pool: &SqlitePool,
+    tenant_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query!("SELECT access_token_hash FROM tenant WHERE id = ?", tenant_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.access_token_hash).is_some())
+}
+
 /// One-time backfill for migration 0007: tenants with legacy `cert_file` /
 /// `cert_key` paths but no stored content get their files read on this node
 /// and stored as content (so the DB becomes self-contained and the shared

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE tenant SET access_token_hash = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ed5a6838c4aa4d81a45f2ab79af9af31b7b3b5fbf992e3c4bb459074b6f4858b"
+}

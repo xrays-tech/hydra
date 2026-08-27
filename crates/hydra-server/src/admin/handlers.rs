@@ -7,9 +7,11 @@
 //! drives the real `db::repo`, `ConfigStore`, `AuthChecker`, `CircuitBreaker`
 //! and `HydraCertStore`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use http::Response;
+use hydra_core::auth::sha256_hex;
 use hydra_core::model::{
     LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
     TenantProvider,
@@ -462,8 +464,9 @@ pub(super) async fn provider_key_item(
 
 /// Tenant create/update body: the existing [`Tenant`] fields (legacy cert
 /// paths included, kept for read compatibility) plus the migration-0007 PEM
-/// certificate content fields. The private key PEM is consumed here and
-/// sealed at the DB boundary; it is **never** echoed back in responses.
+/// certificate content fields and the migration-0009 self-service access
+/// token. The private key PEM and the access token are consumed here and
+/// never echoed back in responses.
 #[derive(Deserialize)]
 struct TenantUpsert {
     #[serde(flatten)]
@@ -474,6 +477,47 @@ struct TenantUpsert {
     /// Private key PEM (content mode, primary). Required when `cert_pem` set.
     #[serde(default)]
     cert_key_pem: Option<String>,
+    /// Tenant self-service access token (migration 0009): stored as a
+    /// SHA-256 hex hash only, never echoed. `Some("")` clears the token;
+    /// `None` (or a missing field) keeps the current token on edit.
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+/// Tenant response view: the entity plus a derived `has_access_token` flag.
+/// The token hash itself is one-way and write-only — never serialized.
+#[derive(Serialize)]
+struct TenantView {
+    #[serde(flatten)]
+    tenant: Tenant,
+    has_access_token: bool,
+}
+
+impl TenantView {
+    fn new(tenant: Tenant, has_access_token: bool) -> Self {
+        Self {
+            tenant,
+            has_access_token,
+        }
+    }
+}
+
+/// SHA-256 of `s` as a lowercase hex string (the `_hex`-suffixed core
+/// helper returns the raw `[u8; 32]` — the suffix is historical).
+fn sha256_hex_str(s: &str) -> String {
+    sha256_hex(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time byte comparison (no timing side-channel on the token).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Certificate write resolved from an upsert body (see
@@ -608,6 +652,46 @@ async fn apply_tenant_cert_write(
     Ok(())
 }
 
+/// Apply a tenant access-token write resolved from an upsert body:
+/// - `Some(non-empty)` → set / rotate (stored as SHA-256 hex);
+/// - `Some("")` → clear the token;
+/// - `None` → keep the current token (no change).
+///
+/// Runs AFTER the tenant row write (like the cert write) so a 4xx (e.g. a
+/// too-short token) is returned before the row is persisted — see the
+/// no-zombie-create rule in [`apply_tenant_cert_write`].
+#[allow(clippy::result_large_err)]
+async fn apply_tenant_access_token_write(
+    state: &AdminState,
+    tenant_id: &str,
+    access_token: &Option<String>,
+    trace_id: &str,
+) -> Result<(), Resp> {
+    let Some(raw) = access_token else {
+        return Ok(());
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        crate::db::set_tenant_access_token_hash(state.db(), tenant_id, None)
+            .await
+            .map_err(|e| db_err_resp(e, trace_id))?;
+        return Ok(());
+    }
+    if token.len() < 16 {
+        return Err(err_json(
+            400,
+            "invalid_access_token",
+            "access_token must be at least 16 characters",
+            trace_id,
+        ));
+    }
+    let hash = sha256_hex_str(token);
+    crate::db::set_tenant_access_token_hash(state.db(), tenant_id, Some(&hash))
+        .await
+        .map_err(|e| db_err_resp(e, trace_id))?;
+    Ok(())
+}
+
 pub(super) async fn tenant_collection(
     state: &AdminState,
     session: &mut ServerSession,
@@ -616,7 +700,20 @@ pub(super) async fn tenant_collection(
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_tenants(state.db()).await {
-            Ok(rows) => ok_json(200, &rows),
+            Ok(rows) => {
+                let with_token: HashSet<String> = crate::db::list_tenant_access_token_hashes(state.db())
+                    .await
+                    .map(|pairs| pairs.into_iter().map(|(id, _)| id).collect())
+                    .unwrap_or_default();
+                let views: Vec<TenantView> = rows
+                    .into_iter()
+                    .map(|t| {
+                        let has = with_token.contains(&t.id);
+                        TenantView::new(t, has)
+                    })
+                    .collect();
+                ok_json(200, &views)
+            }
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
@@ -667,8 +764,14 @@ pub(super) async fn tenant_collection(
         if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
             return resp;
         }
+        if let Err(resp) = apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await {
+            return resp;
+        }
+        let has = crate::db::tenant_has_access_token(state.db(), &t.id)
+            .await
+            .unwrap_or(false);
         reload_best_effort(state, trace_id).await;
-        ok_json(201, &t)
+        ok_json(201, &TenantView::new(t, has))
     } else {
         method_not_allowed(trace_id)
     }
@@ -683,7 +786,12 @@ pub(super) async fn tenant_item(
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_tenant(state.db(), id).await {
-            Ok(t) => ok_json(200, &t),
+            Ok(t) => {
+                let has = crate::db::tenant_has_access_token(state.db(), id)
+                    .await
+                    .unwrap_or(false);
+                ok_json(200, &TenantView::new(t, has))
+            }
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "tenant not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
         },
@@ -715,10 +823,16 @@ pub(super) async fn tenant_item(
             if let Err(resp) = apply_tenant_cert_write(state, &t.id, cert_action, trace_id).await {
                 return resp;
             }
+            if let Err(resp) = apply_tenant_access_token_write(state, &t.id, &up.access_token, trace_id).await {
+                return resp;
+            }
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
+                    let has = crate::db::tenant_has_access_token(state.db(), id)
+                        .await
+                        .unwrap_or(false);
                     reload_best_effort(state, trace_id).await;
-                    ok_json(200, &t)
+                    ok_json(200, &TenantView::new(t, has))
                 }
                 Err(_) => err_json(404, "not_found", "tenant not found", trace_id),
             }
@@ -1151,6 +1265,81 @@ struct AuthTestResult {
     duration_ms: u64,
     /// Truncated response body for debugging (empty when unreachable).
     body_snippet: String,
+}
+
+/// Resolve the tenant id owning `bearer` (the tenant self-service access
+/// token, migration 0009): SHA-256 of the presented token compared
+/// constant-time against the stored hashes. `None` ⇒ unknown / missing /
+/// unconfigured token (fail-closed 401).
+pub(super) async fn tenant_id_for_token(
+    state: &AdminState,
+    bearer: &str,
+) -> Option<String> {
+    let presented = sha256_hex_str(bearer);
+    let pool = state.pool.as_ref()?;
+    let pairs = crate::db::list_tenant_access_token_hashes(pool).await.ok()?;
+    for (tid, stored) in pairs {
+        if constant_time_eq(&presented, &stored) {
+            return Some(tid);
+        }
+    }
+    None
+}
+
+/// Body of the tenant self-service invalidation endpoint (optional).
+#[derive(Deserialize)]
+struct TenantCacheInvalidateRequest {
+    /// api-keys to invalidate for the tenant; absent/empty ⇒ clear ALL of
+    /// the tenant's cached auth decisions.
+    #[serde(default)]
+    api_keys: Option<Vec<String>>,
+}
+
+/// Tenant self-service auth-cache invalidation (migration 0009): clears the
+/// authenticated tenant's own cached auth decisions — 欠费停机 / 付费恢复等
+/// 场景。The tenant id is NOT client-chosen here: the router resolved it from
+/// the access token and already verified it matches the URL's tenant_id.
+pub(super) async fn tenant_auth_cache_invalidate(
+    state: &AdminState,
+    session: &mut ServerSession,
+    tenant_id: &str,
+    trace_id: &str,
+) -> Resp {
+    let body = read_body(session).await;
+    let req: TenantCacheInvalidateRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        TenantCacheInvalidateRequest { api_keys: None }
+    } else {
+        match parse_body(&body, trace_id) {
+            Ok(r) => r,
+            Err(r) => return r,
+        }
+    };
+    let count = match req.api_keys.as_deref() {
+        Some(keys) if !keys.is_empty() => state.auth.invalidate(tenant_id, keys).await,
+        _ => state.auth.invalidate_tenant(tenant_id).await,
+    };
+    // Broadcast the invalidation cluster-wide (P4), mirroring the admin
+    // auth-cache endpoint: every node drops the affected local cache entries.
+    #[cfg(feature = "cluster-redis")]
+    if let Some(stream) = &state.invalidation {
+        if let Err(e) = stream
+            .publish(
+                Some(tenant_id.to_string()),
+                req.api_keys.clone().unwrap_or_default(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "invalidation publish failed");
+        }
+    }
+    metrics::record_auth_cache_size(state.auth.cache().len());
+    ok_json(
+        200,
+        &InvalidateResponse {
+            invalidated: count,
+            tenant_id: Some(tenant_id.to_string()),
+        },
+    )
 }
 
 /// Simulated probe against a tenant `auth_url`: POSTs the exact request the

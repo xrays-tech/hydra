@@ -1159,6 +1159,7 @@ pub trait AuthChecker: Send + Sync {
 | --- | --- |
 | 租户系统判定某些 key 欠费/封禁 | 调 Admin 接口删除这些 key 的缓存（见 §13.2），租户侧 auth 服务随后返回拒绝 |
 | 某租户整体策略变更 | 调 Admin 接口按 `tenant_id` 清空该租户全部缓存 |
+| **租户自助**（欠费停机 / 付费恢复） | 租户持自己的 **Access Token** 调 `POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate` 清除自己名下缓存（见 §13.2；令牌→租户身份由服务端校验，URL 的 tenant_id 必须与令牌归属一致，防越权） |
 
 失效后：缓存内允许项被删 → 下次请求 `Miss` → 回源 → 由租户 `auth_url` 重新决定（是否欠费、是否阻断全由租户自决）。
 
@@ -1256,6 +1257,19 @@ impl TlsAccept for HydraCertStore {
 - `tenant_id` 缺省时仅按 `api_keys` 跨租户匹配（因 key 在缓存中以 `sha256(api_key)` 为值，可定位）；
 - `tenant_id` 提供且 `api_keys` 缺省 → 清空该租户全部缓存项；
 - 返回：`{ "invalidated": <n>, "tenant_id": "..." }`。
+
+**租户自助失效接口**（`POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate`，迁移 0009）：
+
+```jsonc
+// 鉴权：Authorization: Bearer <tenant-access-token>  （租户令牌，非 admin token）
+// 请求体（可选；缺省/空 = 清空该租户全部缓存）
+{ "api_keys": ["sk-aaa", "sk-bbb"] }
+```
+
+- 租户令牌在 admin-UI / admin API 为租户配置（`tenant.access_token_hash`，SHA-256 单向存储，永不回显；编辑留空=保留，改值=轮换，显式 `""`=清除）；
+- 服务端以令牌反查租户 id 并校验 == URL 的 tenant_id（不一致 → 403）；未配置令牌/令牌无效 → 401（fail-closed）；
+- 语义同管理端 `DELETE /api/v1/auth/cache`：清除该租户缓存项 → 下次请求强制回源；集群模式广播全节点（P4），standby 转发至活跃 leader；
+- 返回：`{ "invalidated": <n>, "tenant_id": "..." }`；edge 节点不提供（无 DB）。
 
 **写后一致性**：除认证缓存失效/熔断复位外，每个配置写 handler 成功后立即 `store.reload_all()`，确保内存与 DB 一致；返回最新快照给调用方。
 
