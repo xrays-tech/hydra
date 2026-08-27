@@ -521,3 +521,32 @@ pre.json .b { color: #56d4dd; }
 .lang-tab { font-size: 11.5px; padding: 3px 12px; border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0; background: var(--panel-2); color: var(--muted); cursor: pointer; }
 .lang-tab:hover { color: var(--text); }
 .lang-tab.active { background: var(--panel); color: var(--text); }
+
+/* ===================== Usage Stats (charts) ===================== */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); gap: 18px; }
+.chart h3 { margin: 0 0 12px; font-size: 13px; font-weight: 700; display: flex; align-items: baseline; gap: 8px; }
+.chart-rows { display: flex; flex-direction: column; gap: 8px; }
+.chart-row {
+  display: grid; grid-template-columns: minmax(90px, 1.1fr) minmax(120px, 2fr) 60px;
+  align-items: center; gap: 10px;
+}
+.chart-label {
+  font-size: 12px; color: var(--text-2); font-family: var(--mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chart-track { display: flex; height: 16px; border-radius: 4px; background: var(--panel); border: 1px solid var(--border); overflow: hidden; }
+.chart-value { font-size: 12px; color: var(--muted); font-family: var(--mono); text-align: right; }
+.bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--violet)); border-radius: 3px; min-width: 2px; }
+.bar-seg { height: 100%; min-width: 2px; }
+.seg-prompt { background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+.seg-completion { background: linear-gradient(90deg, #7c5cd6, var(--violet)); }
+.chart-legend { display: flex; gap: 12px; font-size: 11.5px; color: var(--muted); align-items: center; }
+.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.legend-item .sw { width: 10px; height: 10px; border-radius: 3px; }
+.sw-prompt { background: var(--accent); }
+.sw-completion { background: var(--violet); }
+
+@media (max-width: 560px) {
+  .chart-row { grid-template-columns: minmax(64px, 1fr) minmax(80px, 2fr) 48px; gap: 7px; }
+}
+

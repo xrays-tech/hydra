@@ -203,9 +203,14 @@ mod tests {
         let docs_pos = body
             .find("<script src=\"/admin/api-docs.js\">")
             .unwrap_or_else(|| panic!("index.html must load api-docs.js"));
+        // Same eager-read pattern for the stats page (CUSTOM["stats"].render =
+        // renderStats defined in stats.js).
+        let stats_pos = body
+            .find("<script src=\"/admin/stats.js\">")
+            .unwrap_or_else(|| panic!("index.html must load stats.js"));
         assert!(
-            docs_pos < app_pos,
-            "api-docs.js must load before app.js (app.js top level reads renderApiDocs)"
+            docs_pos < app_pos && stats_pos < app_pos,
+            "api-docs.js and stats.js must load before app.js (app.js top level reads renderApiDocs / renderStats)"
         );
     }
 }

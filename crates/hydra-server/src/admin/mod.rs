@@ -277,6 +277,11 @@ impl AdminService {
         if parts == ["concurrency"] && method == "GET" {
             return handlers::concurrency_collection(&self.state);
         }
+        // Usage statistics (design §17): token totals + request counts by
+        // tenant and by provider, for the Admin UI Stats page.
+        if parts == ["stats", "usage"] && method == "GET" {
+            return handlers::stats_usage();
+        }
         // Internal control plane (cluster P1): snapshot distribution.
         if parts == ["internal", "control"] && method == "GET" {
             return handlers::internal_control(&self.state, query, trace_id).await;

@@ -1824,6 +1824,15 @@ pub(super) fn metrics_endpoint() -> Resp {
         .unwrap_or_else(|_| Response::new(vec![]))
 }
 
+/// `GET /api/v1/stats/usage` — aggregated usage statistics for the Admin UI
+/// Stats page: request counts + token totals (prompt / completion) broken down
+/// by tenant and by provider, derived live from the prometheus counters
+/// (`hydra_requests_total` / `hydra_tokens_total`). Cumulative since process
+/// start; token-gated like every other `/api/v1/*` route.
+pub(super) fn stats_usage() -> Resp {
+    ok_json(200, &metrics::usage_aggregate())
+}
+
 // ===========================================================================
 // Shared small helpers
 // ===========================================================================

@@ -1295,9 +1295,9 @@ Admin 端口仅绑内网 + 单一 Admin Token（`Authorization: Bearer <ADMIN_TO
 - 纯静态资源 `admin-ui/{index.html,app.js,style.css}`（vanilla JS + `<table>` 渲染）；
 - 编译期内嵌：`include_dir` 宏打包进二进制；
 - `AdminService` 在 `/admin/*` 路径提供静态资源，`/api/*` 提供数据；UI 用 `fetch` 调用同源 `/api/v1/*`；
-- 页面分区：Providers / Models / Keys / Tenants（含 auth_url 编辑） / TenantAccess / TenantModels / LimitRoles / AuthCache（失效操作）/ Breaker（dead-set 查看+复位） / Health。
+- 页面分区：Providers / Models / Keys / Tenants（含 auth_url 编辑） / TenantAccess / TenantModels / LimitRoles / AuthCache（失效操作）/ Breaker（dead-set 查看+复位） / Health / Stats（用量统计：`GET /api/v1/stats/usage` 按 tenant/provider 聚合 `hydra_requests_total` 与 `hydra_tokens_total`，图表对比 token 总量与请求次数）。
 
-> 复杂可视化（用量趋势）v1 不做，由外部 BI 直查 SQLite/ClickHouse。
+> 复杂可视化（用量趋势）v1 不做，由外部 BI 直查 SQLite/ClickHouse；Stats 页展示的是进程启动以来的累计快照，非时间窗口趋势。
 
 ---
 

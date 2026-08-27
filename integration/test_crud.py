@@ -29,6 +29,7 @@ edge cases and non-CRUD endpoints covered by the Rust suite:
     - POST /api/v1/reload      → 200 {status:reloaded}
     - DELETE /api/v1/auth/cache → 200 {invalidated:<int>}
     - GET  /api/v1/breaker     → 200 {dead:[…]}
+    - GET  /api/v1/stats/usage → 200 {totals, by_tenant, by_provider} (usage stats)
 
 Configuration:
     HYDRA_BASE_URL   (default http://localhost:8081)  — admin listener origin
@@ -267,7 +268,7 @@ def test_provider_models(parent_provider_body: dict) -> None:
 
 
 def test_provider_keys(parent_provider_body: dict) -> None:
-    print("\n[provider-keys] CRUD + masking (default masked, ?reveal=1 plaintext)")
+    print("\n[provider-keys] CRUD + masking (P1-5: ALWAYS masked, ?reveal=1 no-op)")
     req("POST", "/api/v1/providers", parent_provider_body, expect=201)
 
     plaintext = "sk-it-supersecret-12345"
@@ -280,8 +281,8 @@ def test_provider_keys(parent_provider_body: dict) -> None:
         masked = d.get("api_key")
         check("  provider-keys POST masks api_key (≠ plaintext)",
               masked != plaintext, f"got {masked!r}")
-        check("  provider-keys POST mask uses ellipsis (first4…last4)",
-              isinstance(masked, str) and "…" in masked, f"got {masked!r}")
+        check("  provider-keys POST mask uses stars (first10…last4)",
+              isinstance(masked, str) and "*" in masked, f"got {masked!r}")
     # GET list masked
     s, j = req("GET", "/api/v1/provider-keys", expect=200)
     rows = as_list(j) or []
@@ -289,12 +290,12 @@ def test_provider_keys(parent_provider_body: dict) -> None:
         k = rows[0].get("api_key")
         check("  provider-keys list masks api_key (≠ plaintext)",
               k != plaintext, f"got {k!r}")
-    # ?reveal=1 -> plaintext
+    # ?reveal=1 is a NO-OP since P1-5 (admin API never returns plaintext)
     s, j = req("GET", "/api/v1/provider-keys?reveal=1", expect=200)
     rows = as_list(j) or []
     if rows and isinstance(rows[0], dict):
-        assert_eq("  provider-keys ?reveal=1 returns plaintext",
-                  rows[0].get("api_key"), plaintext)
+        check("  provider-keys ?reveal=1 stays masked (P1-5 no-op)",
+              rows[0].get("api_key") != plaintext, f"got {rows[0].get('api_key')!r}")
     # GET item (masked)
     s, j = req("GET", "/api/v1/provider-keys/it-pk", expect=200)
     d = as_dict(j)
@@ -505,6 +506,19 @@ def test_health_reload_authcache_breaker() -> None:
     d = as_dict(j)
     if d:
         check("  breaker returns dead array", isinstance(d.get("dead"), list))
+
+    # usage stats (Admin UI Stats page) -> 200, well-formed aggregate
+    s, j = req("GET", "/api/v1/stats/usage", expect=200)
+    d = as_dict(j)
+    if d:
+        check("  stats/usage has totals", isinstance(d.get("totals"), dict))
+        check("  stats/usage totals.requests is int",
+              isinstance((d.get("totals") or {}).get("requests"), int))
+        check("  stats/usage totals.tokens is int",
+              isinstance((d.get("totals") or {}).get("tokens"), int))
+        check("  stats/usage by_tenant is list", isinstance(d.get("by_tenant"), list))
+        check("  stats/usage by_provider is list", isinstance(d.get("by_provider"), list))
+        check("  stats/usage generated_at present", bool(d.get("generated_at")))
 
 
 # ---------------------------------------------------------------------------

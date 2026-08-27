@@ -327,4 +327,58 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         text.contains("model=\"gpt-4\""),
         "model label missing in:\n{text}"
     );
+
+    // --- GET /api/v1/stats/usage (Admin UI Stats page) ---------------------
+    // The same counters aggregated per tenant / per provider.
+    let stats_url = format!("http://127.0.0.1:{admin_port}/api/v1/stats/usage");
+    let stats_resp = client
+        .get(&stats_url)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("stats endpoint reachable");
+    assert_eq!(stats_resp.status(), 200, "stats/usage must return 200");
+    let stats: serde_json::Value = stats_resp.json().await.expect("stats/usage must be JSON");
+
+    let totals = stats.get("totals").expect("totals present");
+    assert!(
+        totals["requests"].as_u64().unwrap_or(0) >= 1,
+        "totals.requests must reflect the proxied request: {stats}"
+    );
+
+    let tenant_rows = stats
+        .get("by_tenant")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let t1 = tenant_rows
+        .iter()
+        .find(|r| r["name"].as_str() == Some("t1"))
+        .unwrap_or_else(|| panic!("by_tenant must contain t1: {stats}"));
+    assert!(
+        t1["requests"].as_u64().unwrap_or(0) >= 1,
+        "t1.requests must be >= 1: {t1}"
+    );
+
+    let provider_rows = stats
+        .get("by_provider")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let p1 = provider_rows
+        .iter()
+        .find(|r| r["name"].as_str() == Some("p1"))
+        .unwrap_or_else(|| panic!("by_provider must contain p1: {stats}"));
+    assert!(
+        p1["requests"].as_u64().unwrap_or(0) >= 1,
+        "p1.requests must be >= 1: {p1}"
+    );
+
+    // The stats endpoint must still be admin-token-gated (fail-closed).
+    let anon = client
+        .get(&stats_url)
+        .send()
+        .await
+        .expect("stats endpoint reachable");
+    assert_eq!(anon.status(), 401, "stats/usage without token must be 401");
 }

@@ -102,10 +102,12 @@
   <div id="modal-root"></div>
   <div id="toast-root" class="toast-stack" aria-live="polite"></div>
 
-  <!-- Load order matters: app.js's top level registers the "api-docs"
-       custom page by eagerly reading the global renderApiDocs() defined in
-       api-docs.js — so api-docs.js must be loaded FIRST. -->
+  <!-- Load order matters: app.js's top level registers the "api-docs" and
+       "stats" custom pages by eagerly reading the globals renderApiDocs() /
+       renderStats() defined in api-docs.js / stats.js — so both must be
+       loaded FIRST. -->
   <script src="/admin/api-docs.js"></script>
+  <script src="/admin/stats.js"></script>
   <script src="/admin/app.js"></script>
 </body>
 </html>

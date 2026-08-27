@@ -39,12 +39,14 @@
 //! (registered there); it shares the same default registry and thus appears on
 //! `/metrics` automatically once a TLS backend is compiled in.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use prometheus::{
     register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
     HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
+use serde::Serialize;
 
 /// Histogram buckets for latency: 5 ms → 120 s (LLM requests are slow).
 const LATENCY_BUCKETS: &[f64] = &[
@@ -492,6 +494,184 @@ pub fn render() -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage aggregation - `GET /api/v1/stats/usage` (Admin UI Stats page)
+// ---------------------------------------------------------------------------
+
+/// Per-dimension usage totals for one tenant or provider (derived live from the
+/// prometheus counters - cumulative since process start, not time-windowed).
+#[derive(Serialize, Default, Clone, Debug)]
+pub struct UsageRow {
+    /// Tenant id or provider id (as recorded in the metric labels).
+    pub name: String,
+    /// Proxied request count (`hydra_requests_total`).
+    pub requests: u64,
+    /// Total tokens (`hydra_tokens_total`, prompt + completion).
+    pub tokens: u64,
+    /// Prompt (input) tokens.
+    pub tokens_prompt: u64,
+    /// Completion (output) tokens.
+    pub tokens_completion: u64,
+}
+
+/// Whole-gateway totals for the Stats page header.
+#[derive(Serialize, Default, Clone, Debug)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub tokens: u64,
+    pub tokens_prompt: u64,
+    pub tokens_completion: u64,
+    /// Number of distinct tenants / providers seen in the counters.
+    pub tenants: usize,
+    pub providers: usize,
+}
+
+/// Response body of `GET /api/v1/stats/usage`.
+#[derive(Serialize, Debug)]
+pub struct UsageAggregate {
+    /// RFC3339 timestamp of the aggregation (for the UI "updated at" line).
+    pub generated_at: String,
+    pub totals: UsageTotals,
+    /// Sorted by tokens desc, then requests desc, then name.
+    pub by_tenant: Vec<UsageRow>,
+    pub by_provider: Vec<UsageRow>,
+}
+
+impl UsageRow {
+    fn add_request(&mut self, n: u64) {
+        self.requests = self.requests.saturating_add(n);
+    }
+    fn add_tokens(&mut self, prompt: u64, completion: u64) {
+        self.tokens = self
+            .tokens
+            .saturating_add(prompt)
+            .saturating_add(completion);
+        self.tokens_prompt = self.tokens_prompt.saturating_add(prompt);
+        self.tokens_completion = self.tokens_completion.saturating_add(completion);
+    }
+    fn has_usage(&self) -> bool {
+        self.requests > 0 || self.tokens > 0
+    }
+}
+
+/// Read one label value from a prometheus metric label set ("" when absent).
+fn label_value<'a>(labels: &'a [prometheus::proto::LabelPair], key: &str) -> &'a str {
+    for lp in labels {
+        if lp.get_name() == key {
+            return lp.get_value();
+        }
+    }
+    ""
+}
+
+/// Aggregate the live prometheus counters into per-tenant / per-provider usage
+/// (Admin UI Stats page, design §17). Only the request + token counters are
+/// consumed; every other family is skipped. Zero-count series (e.g. a label
+/// combo touched but never incremented) are dropped from the output.
+#[must_use]
+pub fn usage_aggregate() -> UsageAggregate {
+    let mut tenants: BTreeMap<String, UsageRow> = BTreeMap::new();
+    let mut providers: BTreeMap<String, UsageRow> = BTreeMap::new();
+    let mut totals = UsageTotals::default();
+
+    for family in prometheus::gather() {
+        match family.get_name() {
+            "hydra_requests_total" => {
+                for m in family.get_metric() {
+                    let n = counter_value(m.get_counter().get_value());
+                    if n == 0 {
+                        continue;
+                    }
+                    let tenant = label_value(m.get_label(), "tenant").to_string();
+                    let provider = label_value(m.get_label(), "provider").to_string();
+                    totals.requests = totals.requests.saturating_add(n);
+                    tenants.entry(tenant).or_default().add_request(n);
+                    providers.entry(provider).or_default().add_request(n);
+                }
+            }
+            "hydra_tokens_total" => {
+                for m in family.get_metric() {
+                    let n = counter_value(m.get_counter().get_value());
+                    if n == 0 {
+                        continue;
+                    }
+                    let tenant = label_value(m.get_label(), "tenant").to_string();
+                    let provider = label_value(m.get_label(), "provider").to_string();
+                    let kind = label_value(m.get_label(), "kind");
+                    let (prompt, completion) = if kind == "completion" {
+                        (0, n)
+                    } else {
+                        (n, 0) // "prompt" (or any unknown kind is counted as prompt)
+                    };
+                    totals.tokens = totals
+                        .tokens
+                        .saturating_add(prompt)
+                        .saturating_add(completion);
+                    totals.tokens_prompt = totals.tokens_prompt.saturating_add(prompt);
+                    totals.tokens_completion = totals.tokens_completion.saturating_add(completion);
+                    tenants
+                        .entry(tenant)
+                        .or_default()
+                        .add_tokens(prompt, completion);
+                    providers
+                        .entry(provider)
+                        .or_default()
+                        .add_tokens(prompt, completion);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Move the map keys into the rows (the entry API only defaulted them),
+    // order deterministically (usage desc, then name asc) and drop rows
+    // without any recorded usage.
+    let mut by_tenant: Vec<UsageRow> = tenants
+        .into_iter()
+        .map(|(name, mut row)| {
+            row.name = name;
+            row
+        })
+        .filter(UsageRow::has_usage)
+        .collect();
+    let mut by_provider: Vec<UsageRow> = providers
+        .into_iter()
+        .map(|(name, mut row)| {
+            row.name = name;
+            row
+        })
+        .filter(UsageRow::has_usage)
+        .collect();
+    by_tenant.sort_by(usage_cmp);
+    by_provider.sort_by(usage_cmp);
+
+    totals.tenants = by_tenant.len();
+    totals.providers = by_provider.len();
+
+    UsageAggregate {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        totals,
+        by_tenant,
+        by_provider,
+    }
+}
+
+fn counter_value(v: f64) -> u64 {
+    if v.is_finite() && v > 0.0 {
+        v as u64
+    } else {
+        0
+    }
+}
+
+/// Desc by tokens, then requests, then name asc (deterministic for tests/UI).
+fn usage_cmp(a: &UsageRow, b: &UsageRow) -> std::cmp::Ordering {
+    b.tokens
+        .cmp(&a.tokens)
+        .then_with(|| b.requests.cmp(&a.requests))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,5 +723,110 @@ mod tests {
         use prometheus::register_int_counter;
         let _ = register_int_counter!("hydra_unused_test_marker", "test").ok();
         let _ = SNI_MISMATCH_METRIC;
+    }
+
+    #[test]
+    fn usage_aggregate_groups_by_tenant_and_provider() {
+        // Unique labels so the assertion is delta-based (the registry is
+        // process-global and shared with other tests in this binary).
+        let tag = format!("agg_{}", std::process::id());
+        let tenant_a = format!("{tag}_tenant_a");
+        let tenant_b = format!("{tag}_tenant_b");
+        let prov_a = format!("{tag}_prov_a");
+        let prov_b = format!("{tag}_prov_b");
+
+        record_request(&tenant_a, &prov_a, "m", 200);
+        record_request(&tenant_a, &prov_a, "m", 200);
+        record_request(&tenant_a, &prov_b, "m", 500);
+        record_request(&tenant_b, &prov_a, "m", 200);
+        record_tokens(&tenant_a, &prov_a, "m", "prompt", 100);
+        record_tokens(&tenant_a, &prov_a, "m", "completion", 40);
+        record_tokens(&tenant_a, &prov_b, "m", "prompt", 10);
+
+        let agg = usage_aggregate();
+
+        // Totals: 4 requests, 150 tokens (110 prompt + 40 completion).
+        assert!(
+            agg.totals.requests >= 4,
+            "totals.requests={}",
+            agg.totals.requests
+        );
+        assert!(
+            agg.totals.tokens >= 150,
+            "totals.tokens={}",
+            agg.totals.tokens
+        );
+        assert!(
+            agg.totals.tokens_prompt >= 110,
+            "totals.tokens_prompt={}",
+            agg.totals.tokens_prompt
+        );
+        assert!(
+            agg.totals.tokens_completion >= 40,
+            "totals.tokens_completion={}",
+            agg.totals.tokens_completion
+        );
+
+        // By tenant: tenant_a sees 3 requests / 150 tokens.
+        let row_a = agg
+            .by_tenant
+            .iter()
+            .find(|r| r.name == tenant_a)
+            .expect("tenant_a row");
+        assert!(row_a.requests >= 3, "tenant_a.requests={}", row_a.requests);
+        assert!(row_a.tokens >= 150, "tenant_a.tokens={}", row_a.tokens);
+        assert!(
+            row_a.tokens_prompt >= 110,
+            "tenant_a.tokens_prompt={}",
+            row_a.tokens_prompt
+        );
+        assert!(
+            row_a.tokens_completion >= 40,
+            "tenant_a.tokens_completion={}",
+            row_a.tokens_completion
+        );
+        let row_b = agg
+            .by_tenant
+            .iter()
+            .find(|r| r.name == tenant_b)
+            .expect("tenant_b row");
+        assert!(row_b.requests >= 1, "tenant_b.requests={}", row_b.requests);
+        assert_eq!(row_b.tokens, 0, "tenant_b has no token usage");
+
+        // By provider: prov_a sees 3 requests / 140 tokens.
+        let row_pa = agg
+            .by_provider
+            .iter()
+            .find(|r| r.name == prov_a)
+            .expect("prov_a row");
+        assert!(row_pa.requests >= 3, "prov_a.requests={}", row_pa.requests);
+        assert!(row_pa.tokens >= 140, "prov_a.tokens={}", row_pa.tokens);
+        assert!(
+            row_pa.tokens_prompt >= 100,
+            "prov_a.tokens_prompt={}",
+            row_pa.tokens_prompt
+        );
+        assert!(
+            row_pa.tokens_completion >= 40,
+            "prov_a.tokens_completion={}",
+            row_pa.tokens_completion
+        );
+        let row_pb = agg
+            .by_provider
+            .iter()
+            .find(|r| r.name == prov_b)
+            .expect("prov_b row");
+        assert!(row_pb.requests >= 1, "prov_b.requests={}", row_pb.requests);
+        assert!(row_pb.tokens >= 10, "prov_b.tokens={}", row_pb.tokens);
+
+        // Sorting: primary key is tokens desc.
+        if let (Some(first), Some(second)) = (agg.by_tenant.first(), agg.by_tenant.get(1)) {
+            assert!(
+                first.tokens >= second.tokens,
+                "by_tenant must be tokens-desc, got {} vs {}",
+                first.tokens,
+                second.tokens
+            );
+        }
     }
 }

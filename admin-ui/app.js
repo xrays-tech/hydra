@@ -64,6 +64,7 @@ const ICONS = {
   inbox:      '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6Z"/>',
   key2:       '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9"/>',
   book:       '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/>',
+  chart:      '<path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="8" rx="1"/><rect x="12" y="6" width="3" height="12" rx="1"/><rect x="17" y="13" width="3" height="5" rx="1"/>',
 };
 function icon(name, size = 17) {
   const wrap = document.createElement("span");
@@ -446,12 +447,17 @@ const CUSTOM = {
     desc: "OpenAPI-style reference for every admin REST endpoint (curl / Python / TypeScript examples).",
     render: renderApiDocs,
   },
+  stats: {
+    title: "Usage Stats", nav: "Stats", icon: "chart",
+    desc: "Token usage & request counts by tenant and provider (cumulative since process start).",
+    render: renderStats,
+  },
 };
 
 /* ordered nav with section dividers */
 const NAV = [
   { label: "Configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
-  { label: "Operations", items: ["auth-cache", "breaker", "health"] },
+  { label: "Operations", items: ["auth-cache", "breaker", "health", "stats"] },
   { label: "Reference", items: ["api-docs"] },
 ];
 function sectionConfig(key) { return CRUD[key] || CUSTOM[key]; }
