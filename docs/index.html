@@ -227,7 +227,8 @@ h2{font-size:clamp(1.8rem,3.6vw,2.7rem);letter-spacing:-.03em;line-height:1.12;f
 
 /* ---------- architecture ---------- */
 .arch{background:var(--ink-2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
-.pipeline{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin-bottom:26px}
+.pipeline{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.pipeline + .pipeline{margin-top:0}
 .pnode{
   flex:1;min-width:120px;background:var(--ink);border:1px solid var(--line-2);
   border-radius:10px;padding:14px 12px;position:relative;text-align:center;
@@ -239,6 +240,14 @@ h2{font-size:clamp(1.8rem,3.6vw,2.7rem);letter-spacing:-.03em;line-height:1.12;f
 .pnode.hot .pt{color:var(--accent)}
 .parrow{display:flex;align-items:center;color:var(--accent);font-size:16px;flex-shrink:0}
 .parrow svg{width:18px;height:18px}
+.cp-bar{
+  margin:18px 0 30px;border:1px solid var(--line-2);border-radius:12px;
+  background:linear-gradient(180deg,rgba(255,90,31,.05),transparent 70%);
+  padding:14px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+}
+.cp-bar .cp-t{font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--accent);text-transform:uppercase;white-space:nowrap}
+.cp-bar .cp-items{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em}
+.cp-bar .cp-items b{color:var(--teal);font-weight:600}
 .arch .note{
   font-family:var(--mono);font-size:12px;color:var(--muted);line-height:1.8;
   border:1px dashed var(--line-2);border-radius:10px;padding:16px 18px;max-width:760px;
@@ -464,9 +473,9 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
           <text class="node-label" x="251" y="238" fill="#FF5A1F">breaker</text>
         </svg>
         <div class="hv-foot">
-          <span class="chip"><b class="o">11,056</b>&nbsp;<span data-l="zh">峰值 RPS</span><span data-l="en">peak RPS</span></span>
+          <span class="chip"><b class="o">11,056</b>&nbsp;<span data-l="zh">单节点峰值 RPS</span><span data-l="en">single-node peak RPS</span></span>
           <span class="chip"><b>0.3ms</b>&nbsp;<span data-l="zh">网关开销</span><span data-l="en">overhead</span></span>
-          <span class="chip"><b>65MiB</b>&nbsp;<span data-l="zh">内存占用</span><span data-l="en">RSS</span></span>
+          <span class="chip"><b>65MiB</b>&nbsp;<span data-l="zh">单节点 RSS</span><span data-l="en">RSS / node</span></span>
         </div>
       </div>
     </div>
@@ -476,8 +485,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 <!-- ================= marquee ================= -->
 <div class="marquee" aria-hidden="true">
   <div class="track">
-    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
-    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
+    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>Control Plane<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
+    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>Control Plane<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
   </div>
 </div>
 
@@ -486,8 +495,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
   <div class="wrap">
     <div class="stat reveal">
       <div class="num"><span data-count="11056" data-fmt="toLocaleString">0</span><em>RPS</em></div>
-      <div class="lab" data-l="zh">峰值吞吐（c=25，p99 4.39ms）</div>
-      <div class="lab" data-l="en">Peak throughput (c=25, p99 4.39ms)</div>
+      <div class="lab" data-l="zh">单节点峰值吞吐（c=25，p99 4.39ms）</div>
+      <div class="lab" data-l="en">Single-node peak throughput (c=25, p99 4.39ms)</div>
     </div>
     <div class="stat reveal" data-d="1">
       <div class="num"><span data-count="0.3" data-fmt="1dec">0</span><span class="unit">ms</span></div>
@@ -630,36 +639,64 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
   <div class="wrap">
     <div class="sec-head reveal">
       <span class="sec-tag" data-l="zh">// 架构</span><span class="sec-tag" data-l="en">// ARCHITECTURE</span>
-      <h2 data-l="zh">Terminate-mode：把复杂性关在网关里。</h2>
-      <h2 data-l="en">Terminate-mode: keep the complexity inside the gateway.</h2>
-      <p class="sec-sub" data-l="zh">完整读取请求体后，Hydra 用自己的 HTTP 客户端调用上游并把 SSE 流式写回——任何位置的 model 字段都能被提取，故障重放天然 O(1)。</p>
-      <p class="sec-sub" data-l="en">Hydra reads the full request body, calls the provider with its own HTTP client and streams SSE back — model extraction works from any position, failover replay is naturally O(1).</p>
+      <h2 data-l="zh">一个节点，就是完整网关；<br>一群节点，是一个控制面。</h2>
+      <h2 data-l="en">One node is already a gateway.<br>A fleet of them is a control plane.</h2>
+      <p class="sec-sub" data-l="zh">请求在边缘终结，状态在集群共享。限流、熔断、认证判定在任何节点上都一致；写变更只有一个权威，其余节点透明跟随——规模不是重新设计，是加一台机器。</p>
+      <p class="sec-sub" data-l="en">Requests end at the edge; state is shared across the cluster. Rate limits, breaker verdicts and auth decisions are identical on every node. There is exactly one writer — the rest follow transparently. Scaling is adding a machine, not redesigning.</p>
     </div>
 
     <div class="pipeline reveal">
-      <div class="pnode"><div class="pt" data-l="zh">客户端</div><div class="pt" data-l="en">Client</div><div class="pd" data-l="zh">任意 OpenAI / Anthropic 客户端</div><div class="pd" data-l="en">any OpenAI / Anthropic client</div></div>
+      <div class="pnode"><div class="pt" data-l="zh">客户端</div><div class="pt" data-l="en">Clients</div><div class="pd" data-l="zh">同一入口，任意节点</div><div class="pd" data-l="en">one entry, any node</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode"><div class="pt">Pingora</div><div class="pd">request_filter</div></div>
+      <div class="pnode hot"><div class="pt">leader</div><div class="pd" data-l="zh">active · 唯一写者</div><div class="pd" data-l="en">active · sole writer</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode"><div class="pt" data-l="zh">Hydra 核心</div><div class="pt" data-l="en">Hydra core</div><div class="pd" data-l="zh">租户解析 → 外部认证 → 读全 body → 提取 model → 路由 → 换钥</div><div class="pd" data-l="en">tenant → auth → full body → model → route → swap key</div></div>
+      <div class="pnode"><div class="pt" data-l="zh">提供方</div><div class="pt" data-l="en">Providers</div><div class="pd">OpenAI · Anthropic · …</div></div>
+    </div>
+    <div class="pipeline reveal" data-d="1">
+      <div class="pnode"><div class="pt" data-l="zh">客户端</div><div class="pt" data-l="en">Clients</div><div class="pd" data-l="zh">直连数据面</div><div class="pd" data-l="en">straight to the plane</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode hot"><div class="pt" data-l="zh">真实上游</div><div class="pt" data-l="en">Upstream</div><div class="pd" data-l="zh">reqwest 调用 + SSE 流式回写 + 用量扫描</div><div class="pd" data-l="en">reqwest + SSE stream + usage scan</div></div>
+      <div class="pnode"><div class="pt">edge ×N</div><div class="pd" data-l="zh">无状态 · 任意扩缩</div><div class="pd" data-l="en">stateless · scale freely</div></div>
+      <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
+      <div class="pnode"><div class="pt" data-l="zh">提供方</div><div class="pt" data-l="en">Providers</div><div class="pd" data-l="zh">与 leader 相同的路由</div><div class="pd" data-l="en">same routes as leader</div></div>
+    </div>
+    <div class="cp-bar reveal" data-d="2">
+      <span class="cp-t" data-l="zh">控制面 · 一个 Redis，七种用途</span>
+      <span class="cp-t" data-l="en">CONTROL PLANE · ONE REDIS, SEVEN JOBS</span>
+      <span class="cp-items"><b>lease</b> · <b>registry</b> · <b>shared limits</b> · <b>shared breaker</b> · <b>auth L2</b> · <b>invalidation bus</b></span>
+    </div>
+
+    <div class="grid" style="margin-bottom:30px">
+      <article class="fcard reveal">
+        <span class="idx">α</span>
+        <h3 data-l="zh">恰一个写者</h3><h3 data-l="en">Exactly one writer</h3>
+        <p data-l="zh">Redis 租约裁定唯一 active；时间栅栏杜绝双写。故障切换 ≈ 11–18s，数据面与调用方都无感。</p>
+        <p data-l="en">A Redis lease crowns a single active; fencing forbids double writes. Failover ≈ 11–18s, invisible to the data plane.</p>
+      </article>
+      <article class="fcard reveal" data-d="1">
+        <span class="idx">β</span>
+        <h3 data-l="zh">无状态数据面</h3><h3 data-l="en">Stateless data plane</h3>
+        <p data-l="zh">edge 只持 last-known-good 快照与本地缓存，可任意增删；Redis 失联，数据面依旧应答。</p>
+        <p data-l="en">Edges carry only last-known-good snapshots and local caches; they come and go freely. Redis goes dark — the plane keeps answering.</p>
+      </article>
+      <article class="fcard reveal" data-d="2">
+        <span class="idx">γ</span>
+        <h3 data-l="zh">一个 Redis，七种用途</h3><h3 data-l="en">One Redis, seven jobs</h3>
+        <p data-l="zh">租约、注册表、共享限流、共享熔断、认证 L2、失效总线……共享是架构属性，不是插件。</p>
+        <p data-l="en">Leases, registry, shared limits, shared breaker, auth L2, invalidation bus… sharing is an architectural property, not a plugin.</p>
+      </article>
     </div>
 
     <div class="note reveal">
-      <span data-l="zh">零 JSON 往返：body 字节流不被 serde 处理；<code>UsageScanner</code> 用 <code>memchr</code> SIMD 扫描用量字段（含缓存 Token）。供应商失败 → 自动故障转移，重放为 <code>Bytes::clone()</code>。</span>
-      <span data-l="en">Zero JSON round-trips: body bytes never pass through serde; <code>UsageScanner</code> finds usage (incl. cached tokens) with <code>memchr</code> SIMD. Provider failure → automatic failover, replay is <code>Bytes::clone()</code>.</span>
+      <span data-l="zh">请求在边缘终结：全量上下文在手，没有半途状态需要跨节点协调——故障重放是常数时间，缓存判定处处一致。</span>
+      <span data-l="en">Requests end at the edge: the full context is in hand, no halfway state needs cross-node coordination — failover replay is constant-time, cached verdicts are identical everywhere.</span>
     </div>
 
     <div class="term reveal">
-      <div class="term-head"><i></i><i></i><i></i><span class="t">hydra — boot</span></div>
-      <pre><span class="c">$</span> cargo run --release --features server
+      <div class="term-head"><i></i><i></i><i></i><span class="t">hydra — join the cluster</span></div>
+      <pre><span class="c">$</span> <span class="k">HYDRA_ROLE</span>=edge <span class="k">HYDRA_REDIS_URL</span>=redis://… <span class="k">HYDRA_CLUSTER_TOKEN</span>=… ./hydra
 <span class="c"># …</span>
-<span class="k">listening</span> <span class="a">0.0.0.0:8080</span> <span class="c">// proxy (OpenAI + Anthropic)</span>
-<span class="k">listening</span> <span class="a">127.0.0.1:8081</span> <span class="c">// admin REST + UI + /metrics</span>
-<span class="k">config</span> reloaded <span class="c">// 2 providers · 3 models · 1 tenant</span>
-<span class="c"># agent → hydra → openai</span>
-<span class="k">200</span> <span class="a">gpt-4o</span> <span class="c">ttft=212ms tokens=42+128 cached=0 · 23ms total</span><span class="cursor"></span></pre>
+<span class="a">[edge]</span> bootstrap → <span class="k">snapshot v42</span> · routes synced · serving <span class="a">:8080</span>
+<span class="a">[edge]</span> limits <span class="k">shared</span> · breaker <span class="k">shared</span> · auth L2 <span class="k">hot</span><span class="cursor"></span></pre>
     </div>
   </div>
 </section>
@@ -672,12 +709,14 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
         <span class="sec-tag" data-l="zh">// 性能</span><span class="sec-tag" data-l="en">// PERFORMANCE</span>
         <h2 data-l="zh">不解释，直接看数字。</h2>
         <h2 data-l="en">Numbers over adjectives.</h2>
+        <p class="sec-sub" data-l="zh">左列均为<strong style="color:var(--text)">单节点</strong>实测（10 核机器，线程化 mock 上游）——单节点已经够快，集群则把这份吞吐乘以节点数。</p>
+        <p class="sec-sub" data-l="en">Left column is measured on a <strong style="color:var(--text)">single node</strong> (10-core, threaded mock upstream) — fast enough alone, and the cluster multiplies it by the number of nodes.</p>
       </div>
       <div class="perf-nums">
         <div class="perf-row reveal">
           <div class="big"><em>11,056</em> RPS</div>
-          <div class="meta" data-l="zh">峰值吞吐，并发 25，p99 = <b>4.39ms</b></div>
-          <div class="meta" data-l="en">peak throughput at c=25, p99 = <b>4.39ms</b></div>
+          <div class="meta" data-l="zh">单节点峰值吞吐 · c=25 · p99 = <b>4.39ms</b></div>
+          <div class="meta" data-l="en">single-node peak · c=25 · p99 = <b>4.39ms</b></div>
         </div>
         <div class="perf-row reveal">
           <div class="big"><em>0.3</em> ms</div>
@@ -704,6 +743,10 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <div class="note" style="margin-top:16px;border-style:solid">
         <span data-l="zh">正确性门禁：<code>114 core + 173 server</code> 测试、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
         <span data-l="en">Correctness gates: <code>114 core + 173 server</code> tests, <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
+      </div>
+      <div class="note" style="margin-top:16px;border-style:solid;border-color:var(--accent);background:rgba(255,90,31,.05)">
+        <span data-l="zh"><b style="color:var(--accent)">横向扩展 ∝ N：</b>数据面无状态，吞吐随节点数近似线性增长——K8s HPA 就绪，加副本就是加吞吐。集群 ≈ 单节点 × N（受上游与网络约束）。</span>
+        <span data-l="en"><b style="color:var(--accent)">Scale-out ∝ N:</b> the data plane is stateless — throughput grows ~linearly with nodes. K8s HPA-ready: add replicas, add capacity. Cluster ≈ single node × N (upstream- and network-bound).</span>
       </div>
     </div>
   </div>
