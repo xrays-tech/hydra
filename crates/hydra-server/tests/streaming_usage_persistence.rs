@@ -290,7 +290,7 @@ async fn build_state_with_sqlite_sink(pool: sqlx::SqlitePool) -> std::sync::Arc<
 async fn openai_streaming_usage_persists_to_sqlite() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -352,7 +352,7 @@ async fn openai_streaming_usage_persists_to_sqlite() {
 async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 

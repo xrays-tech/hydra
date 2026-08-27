@@ -1073,7 +1073,8 @@ X-Hydra-Trace-Id: <trace_id>
 
 - **`{"status": false}`**（Dogress `AuthApiKeyResponse.status`）→ 拒绝：写缓存 `allowed=false`（deny_ttl），返回 401。Dogress 认证服务**恒返回 HTTP 200**，拒绝仅通过 `status` 字段表达，必须读 body 而非仅看状态码；
 - **`{"allowed": false}`**（本契约可选细化）→ 同样视为拒绝；
-- 其余 2xx body（`{"status":true}`、`{"allowed":true,...}`、空、不可解析）→ 允许。
+- 其余 **合法 JSON 对象** body（`{"status":true}`、`{"allowed":true,...}`）→ 允许；
+- **非 JSON 对象**（空、HTML 网页、WAF/登录页、JSON 数组/标量、不可解析）→ **不是有效判定**，视为服务异常，按 §11.4 `fail_mode` 处理（默认 `closed` → 503 拒绝，**不缓存**）—— 防止 auth_url 误指向网页时静默放行所有 key。
 
 **可选精细化响应体**（租户侧可选返回，Hydra 向后兼容）：
 
@@ -1085,7 +1086,7 @@ X-Hydra-Trace-Id: <trace_id>
 }
 ```
 
-> 2xx 且 `status=false` 或 `allowed=false` 视为拒绝；非 2xx 但带合法 JSON 也以 `status`/`allowed` 字段为准；解析失败退回按 HTTP 状态判定。
+> 2xx 且 `status=false` 或 `allowed=false` 视为拒绝；2xx 必须是**可解析的 JSON 对象**才可能是允许（否则按 §11.4 服务异常处理，默认拒绝 503）；非 2xx（404/5xx 等）按 HTTP 状态判定（`CacheOp::None` → §11.4）。
 
 ### 11.4 `auth_url` 不可用 / 超时的策略
 

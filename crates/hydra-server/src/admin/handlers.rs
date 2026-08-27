@@ -1437,6 +1437,13 @@ pub(super) async fn tenant_auth_test(
                     "auth service rejected the simulated api-key (status:false/allowed:false in body)"
                         .to_string(),
                 )
+            } else if !crate::http::auth_body_is_json_object(&text) {
+                (
+                    false,
+                    true,
+                    "not_json",
+                    "auth service returned a non-JSON body (e.g. an HTML login/WAF page) — hydra treats a 2xx non-JSON verdict as auth_unavailable and DENIES; check the auth endpoint".to_string(),
+                )
             } else {
                 (
                     false,

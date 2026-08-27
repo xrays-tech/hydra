@@ -160,7 +160,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     let upstream_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 

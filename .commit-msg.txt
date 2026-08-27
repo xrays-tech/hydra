@@ -1,0 +1,15 @@
+fix(auth): 2xx auth response must be a JSON object - non-JSON treated as unavailable (fail-closed)
+
+An auth_url that returns a webpage / HTML / WAF / redirect landing page on 2xx
+previously ALLOWED every key (2xx body only scanned for status:false /
+allowed:false; content-type and JSON validity ignored) - observed live on the
+test server (token.do.top 301 -> login page -> all keys allowed). Now a 2xx
+verdict must parse as a JSON object (serde_json), otherwise it is treated like
+any other service anomaly: fail_mode (default closed -> 503
+auth_upstream_unavailable, NOT cached). 404/502/504 already fail-closed via
+CacheOp::None - now explicitly covered by tests. The admin auth-URL Test
+button reports the new not_json verdict so the misconfiguration is
+diagnosable. Docs updated (design 11.3). Tests: new http_auth cases (HTML
+body / JSON array / 404 / 502 / 504), http unit cases for
+auth_body_is_json_object, admin_auth_test not_json; existing bare-200 auth
+mocks across 6 test files updated to return {"status":true}.

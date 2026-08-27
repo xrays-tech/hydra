@@ -430,9 +430,7 @@ impl AuthChecker for HttpAuthChecker {
                     // `AuthApiKeyResponse`) ALWAYS answers HTTP 200 and flags
                     // denials as `{"status":false}`; design §11.3 likewise
                     // allows `{"allowed":false}`. An explicit false flag is a
-                    // denial (cached with deny_ttl); any other 2xx body —
-                    // `{"status":true}`, `{"allowed":true,"expires_in":60}`,
-                    // empty, unparseable — stays an allow.
+                    // denial (cached with deny_ttl).
                     let text = resp.text().await.unwrap_or_default();
                     if body_says_denied(&text) {
                         cache.set(&tenant_id, &api_key_owned, false, deny_ttl).await;
@@ -441,6 +439,17 @@ impl AuthChecker for HttpAuthChecker {
                             reason: "denied",
                             source: CacheSource::Miss,
                         };
+                    }
+                    // Contract guard: a 2xx verdict MUST be a parseable JSON
+                    // object (the §11.3 / Dogress response shapes). A webpage,
+                    // HTML/WAF capture page, empty or unparseable body is NOT a
+                    // trustworthy decision — treat it like any other service
+                    // anomaly (fail_mode: fail-closed ⇒ 503 deny, NOT cached)
+                    // instead of silently allowing (e.g. an auth_url that 301s
+                    // to a login page previously ALLOWED every key).
+                    if !auth_body_is_json_object(&text) {
+                        warn!(tenant = %tenant_id, status, "auth upstream 2xx body is not a JSON verdict; treating as unavailable");
+                        return fail_mode_verdict(fail_mode);
                     }
                     // optional `expires_in` overrides the default allow TTL
                     // (design §11.3).
@@ -499,11 +508,12 @@ fn fail_mode_verdict(fail_mode: FailMode) -> AuthVerdict {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny JSON helpers — reqwest's `json` feature brings serde/serde_json only
-// transitively, so this crate cannot `use serde_json` directly. The auth
-// contract body is tiny and well-defined, so a correct, allocation-light
-// hand-build (request) and a defensive scan (response `expires_in`) are both
-// safe and dependency-free.
+// Tiny JSON helpers — `serde_json` IS a direct optional dependency (gated
+// behind `runtime`, always on in server builds); the hand-built request and
+// the defensive flat-field scans below remain dependency-light and precise
+// for the tiny contract shapes. A real `serde_json` parse is used only for
+// the 2xx contract guard ([`auth_body_is_json_object`]) where correctness,
+// not allocation, is what matters.
 // ---------------------------------------------------------------------------
 
 /// Escape `s` into `out` as a JSON string body (without the surrounding
@@ -583,6 +593,18 @@ pub(crate) fn body_says_denied(body: &str) -> bool {
     const STATUS: &str = "\"status\"";
     const ALLOWED: &str = "\"allowed\"";
     json_field_is_false(body, STATUS) || json_field_is_false(body, ALLOWED)
+}
+
+/// Whether a 2xx auth response body is a parseable JSON **object** (the
+/// §11.3 / Dogress `AuthApiKeyResponse` shapes). Everything else — HTML,
+/// empty, malformed, or a JSON array/scalar — is NOT a valid verdict and
+/// must never silently allow (an auth_url that returns a webpage, WAF
+/// capture page or redirect landing page previously allowed every key).
+pub(crate) fn auth_body_is_json_object(body: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(body),
+        Ok(serde_json::Value::Object(_)),
+    )
 }
 
 /// Scan `body` for a top-level JSON boolean field `<field>: false`
@@ -673,6 +695,24 @@ mod tests {
         assert!(!body_says_denied("{\"reason\":\"status is false\"}"));
         // `"status":"false"` (string, not boolean) must NOT count either
         assert!(!body_says_denied("{\"status\":\"false\"}"));
+    }
+
+    #[test]
+    fn auth_body_is_json_object_cases() {
+        // valid contract shapes → true
+        assert!(auth_body_is_json_object("{}"));
+        assert!(auth_body_is_json_object("{\"status\":true}"));
+        assert!(auth_body_is_json_object("{\"allowed\":false,\"expires_in\":60}"));
+        assert!(auth_body_is_json_object("  {\"status\" : true }  "));
+        // non-verdict bodies → false (must never silently allow)
+        assert!(!auth_body_is_json_object(""));
+        assert!(!auth_body_is_json_object("<html><body>sign in</body></html>"));
+        assert!(!auth_body_is_json_object("<!DOCTYPE html>"));
+        assert!(!auth_body_is_json_object("[1,2,3]"));
+        assert!(!auth_body_is_json_object("\"just a string\""));
+        assert!(!auth_body_is_json_object("42"));
+        assert!(!auth_body_is_json_object("{not json"));
+        assert!(!auth_body_is_json_object("not json"));
     }
 
     #[test]

@@ -280,7 +280,7 @@ async fn send_until_ready(client: &reqwest::Client, url: &str, body: &str) -> re
 async fn full_body_forwarded_intact_and_key_swapped() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -332,7 +332,7 @@ async fn full_body_forwarded_intact_and_key_swapped() {
 async fn tenant_without_tenant_model_mapping_is_default_open() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -415,7 +415,7 @@ async fn tenant_without_tenant_model_mapping_is_default_open() {
 async fn sse_stream_is_forwarded_chunk_by_chunk() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -459,7 +459,7 @@ async fn sse_stream_is_forwarded_chunk_by_chunk() {
 async fn failover_advances_on_provider_error_then_breaker_records() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -616,7 +616,7 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
 async fn breaker_success_clears_failures() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -655,7 +655,7 @@ async fn breaker_success_clears_failures() {
 async fn usage_tokens_extracted_from_response() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -726,7 +726,7 @@ async fn usage_tokens_extracted_from_response() {
 async fn error_404_when_model_not_found() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -791,7 +791,7 @@ async fn error_401_when_auth_denied() {
 async fn error_502_when_all_providers_fail() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -866,7 +866,7 @@ async fn tighten_limit_to_2(pool: &sqlx::SqlitePool) {
 async fn rate_limit_429_on_third_request() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -918,7 +918,7 @@ async fn rate_limit_429_on_third_request() {
 async fn rate_limit_429_even_when_routing_would_503() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -1041,7 +1041,7 @@ async fn seed_provider_capped(
 async fn default_no_concurrency_config_is_passthrough_200() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -1102,7 +1102,7 @@ async fn default_no_concurrency_config_is_passthrough_200() {
 async fn admission_wait_timeout_does_not_trip_breaker() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 
@@ -1253,7 +1253,7 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
 async fn admission_capped_provider_does_not_block_second_request() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&auth_server)
         .await;
 

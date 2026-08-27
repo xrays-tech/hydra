@@ -147,6 +147,16 @@ async fn auth_url_2xx_status_false_denied_passes() {
 }
 
 #[tokio::test]
+async fn auth_url_2xx_html_not_json_fails() {
+    // 200 + non-JSON body (bare 200 = empty body here; an HTML login page
+    // behaves identically) is NOT a valid verdict — the Test button must
+    // report it as a failure (hydra now treats 2xx non-JSON as unavailable).
+    let r = probe_with(200, None).await;
+    assert_eq!(r["ok"], false, "got {r}");
+    assert_eq!(r["verdict"], "not_json", "got {r}");
+}
+
+#[tokio::test]
 async fn auth_url_2xx_allowed_fails() {
     // A fake key being ALLOWED means the URL is not the real auth endpoint.
     let r = probe_with(200, Some(serde_json::json!({ "status": true }))).await;

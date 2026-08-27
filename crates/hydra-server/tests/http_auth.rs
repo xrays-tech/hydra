@@ -75,7 +75,7 @@ async fn auth_upstream_2xx_caches_allowed() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .expect(1) // second call MUST hit the cache, not the wiremock
         .mount(&server)
         .await;
@@ -313,7 +313,7 @@ async fn auth_request_contract() {
         .and(header("authorization", "Bearer sk-contract"))
         .and(header("x-hydra-tenant", "t1"))
         .and(header_exists("x-hydra-trace-id"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .expect(1)
         .mount(&server)
         .await;
@@ -349,6 +349,139 @@ async fn auth_request_contract() {
     assert!(body.contains("\"key\":\"sk-contract\""), "body: {body}");
     assert!(body.contains("\"tenant_id\":\"t1\""), "body: {body}");
 }
+
+// ---------------------------------------------------------------------------
+// T2.9 — 2xx with a NON-JSON body (HTML page / array / empty) is NOT a
+// trustworthy verdict → fail-closed 503 (auth_unavailable), NOT cached,
+// never silently allowed (an auth_url 301ing to a login page previously
+// allowed every key).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_upstream_2xx_html_body_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html><head><title>Sign in</title></head><body>login page</body></html>"))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-html").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(checker.cache().len(), 0, "non-JSON 2xx must not be cached");
+    // not cached → second call goes upstream again
+    let v2 = checker.check(&tenant, "sk-html").await;
+    assert_eq!(
+        v2,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+}
+
+#[tokio::test]
+async fn auth_upstream_2xx_non_object_json_fail_closed() {
+    // A JSON array is not the §11.3 object contract — must not allow.
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[1,2,3]"))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-arr").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// T2.10 — 404 / 502 / 504 (unmappable statuses) → fail-closed 503, not cached.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_upstream_404_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-404").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
+
+#[tokio::test]
+async fn auth_upstream_502_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-502").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
+
+#[tokio::test]
+async fn auth_upstream_504_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(504))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-504").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
+
 
 // ---------------------------------------------------------------------------
 // T2.8 — 2xx body `expires_in` overrides the default allow TTL.
@@ -449,7 +582,7 @@ async fn auth_independent_client_pool() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .expect(1)
         .mount(&server)
         .await;
@@ -472,7 +605,7 @@ async fn invalidate_forces_reauth() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .expect(2) // initial allow + post-invalidate re-auth
         .mount(&server)
         .await;
@@ -514,7 +647,7 @@ async fn invalidate_tenant_forces_reauth() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
     Mock::given(method("POST"))
         .and(path("/auth"))
-        .respond_with(ResponseTemplate::new(200))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })))
         .mount(&server)
         .await;
 
