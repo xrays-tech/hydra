@@ -24,19 +24,19 @@
         </svg>
       </div>
       <h1>Hydra <span class="grad">Admin</span></h1>
-      <p class="auth-help">
+      <p class="auth-help" data-i18n-html="common.auth.help">
         Enter the admin token (<code>HYDRA_ADMIN_TOKEN</code>). It is kept in
         memory only and sent as <code>Authorization: Bearer</code>.
       </p>
       <form id="login-form" class="auth-form" autocomplete="off">
         <div class="input-group">
-          <label for="login-token">Admin token</label>
+          <label for="login-token" data-i18n="common.auth.tokenLabel">Admin token</label>
           <div class="input-wrap">
             <input type="password" id="login-token" autocomplete="off" autofocus
-                   placeholder="paste token…" />
+                   placeholder="paste token…" data-i18n-placeholder="common.auth.tokenPlaceholder" />
           </div>
         </div>
-        <button class="btn primary block" id="login-btn" type="submit">Sign in</button>
+        <button class="btn primary block" id="login-btn" type="submit" data-i18n="common.auth.signin">Sign in</button>
         <div id="login-error" class="alert err hidden"></div>
       </form>
     </div>
@@ -57,7 +57,7 @@
         </div>
         <div class="brand-text">
           <span class="brand-name"><span class="grad">Hydra</span></span>
-          <span class="brand-sub">admin console</span>
+          <span class="brand-sub" data-i18n="common.brand.sub">admin console</span>
         </div>
       </div>
 
@@ -65,16 +65,16 @@
 
       <div class="sidebar-foot">
         <div class="token-status" id="token-status">
-          <span class="dot"></span><span class="t">not authenticated</span>
+          <span class="dot"></span><span class="t" data-i18n="common.auth.notAuthenticated">not authenticated</span>
         </div>
         <div class="foot-actions">
-          <button class="btn ghost sm" id="reload-btn" title="POST /api/v1/reload">
+          <button class="btn ghost sm" id="reload-btn" title="POST /api/v1/reload" data-i18n-title="common.action.reload">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v4h-4"/></svg>
-            Reload
+            <span data-i18n="common.action.reload">Reload</span>
           </button>
-          <button class="btn ghost sm danger" id="logout-btn" title="clear token">
+          <button class="btn ghost sm danger" id="logout-btn" title="clear token" data-i18n-title="common.action.signout">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
-            Sign out
+            <span data-i18n="common.action.signout">Sign out</span>
           </button>
         </div>
       </div>
@@ -85,12 +85,20 @@
     <!-- Main column -->
     <div class="main">
       <header class="topbar">
-        <button class="icon-btn menu-toggle" id="menu-toggle" aria-label="toggle navigation">
+        <button class="icon-btn menu-toggle" id="menu-toggle" aria-label="toggle navigation" data-i18n-aria-label="common.action.menu">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
         <div class="topbar-title">
           <h1 id="page-title">—</h1>
           <p id="page-sub" class="muted"></p>
+        </div>
+        <div class="topbar-lang">
+          <select id="lang-select" data-i18n-aria-label="common.lang.select">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+          </select>
         </div>
         <div class="topbar-actions" id="page-actions"></div>
       </header>
@@ -102,10 +110,12 @@
   <div id="modal-root"></div>
   <div id="toast-root" class="toast-stack" aria-live="polite"></div>
 
-  <!-- Load order matters: app.js's top level registers the "api-docs" and
-       "stats" custom pages by eagerly reading the globals renderApiDocs() /
-       renderStats() defined in api-docs.js / stats.js — so both must be
-       loaded FIRST. -->
+  <!-- Load order matters: i18n.js defines the global t()/setLang()/applyStaticI18n()
+       used by every other script, and app.js's top level registers the "api-docs"
+       and "stats" custom pages by eagerly reading the globals renderApiDocs() /
+       renderStats() defined in api-docs.js / stats.js — so i18n.js must come
+       FIRST, then both page scripts, then app.js. -->
+  <script src="/admin/i18n.js"></script>
   <script src="/admin/api-docs.js"></script>
   <script src="/admin/stats.js"></script>
   <script src="/admin/app.js"></script>

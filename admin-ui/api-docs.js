@@ -410,11 +410,20 @@ const API_EXAMPLE_FNS = { curl: apiExCurl, python: apiExPython, typescript: apiE
 // ---------------------------------------------------------------------------
 // Renderer
 // ---------------------------------------------------------------------------
+/* i18n key for an endpoint summary: "apidocs.summary.<METHOD>.<path>" with
+ * path segments joined by "." (leading / stripped, / → ., - → _, { } removed).
+ * Keep in sync with the apidocs.summary.* entries in i18n.js when
+ * adding/removing endpoints. */
+function apiSummaryKey(e) {
+  return "apidocs.summary." + e.method + "." + e.path
+    .replace(/^\//, "").replaceAll("/", ".").replaceAll("-", "_").replaceAll("{", "").replaceAll("}", "");
+}
+
 function renderApiDocs() {
   const content = $("#content");
   clear(content);
   content.appendChild(el("div", { class: "panel" },
-    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: "Admin REST API" })), el("div", { class: "spacer" })),
+    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("apidocs.chrome.pageTitle") })), el("div", { class: "spacer" })),
     el("div", { class: "docs-intro" },
       el("p", { html: "All management endpoints live under <code>/api/v1/*</code> on the <b>admin port</b> (<code>:8081</code>). " +
         "Every <code>/api/v1/*</code> request needs <code>Authorization: Bearer &lt;admin-token&gt;</code> — the same token you use to log into this UI — " +
@@ -425,7 +434,7 @@ function renderApiDocs() {
   ));
   for (const tag of API_DOCS) {
     const panel = el("div", { class: "panel docs-group" },
-      el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: tag.tag })), el("div", { class: "spacer" })),
+      el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("apidocs.tag." + tag.tag) })), el("div", { class: "spacer" })),
     );
     for (const e of tag.endpoints) panel.appendChild(renderApiEndpoint(e));
     content.appendChild(panel);
@@ -439,7 +448,7 @@ function renderApiEndpoint(e) {
   }},
     el("span", { class: "method method-" + e.method.toLowerCase() }, e.method),
     el("code", { class: "api-path", text: e.path }),
-    el("span", { class: "api-summary", text: e.summary }),
+    el("span", { class: "api-summary", text: t(apiSummaryKey(e)) }),
     el("span", { class: "api-chev", text: "▾" }),
   );
   detail.appendChild(apiDetail(e));
@@ -450,38 +459,38 @@ function apiDetail(e) {
   if (e.desc) root.appendChild(el("p", { class: "api-desc", text: e.desc }));
   root.appendChild(el("div", { class: "api-meta" },
     el("span", { class: "auth-badge " + (e.auth === false ? "noauth" : e.auth === "cluster" ? "clusterauth" : "adminauth") },
-      e.auth === false ? "no auth" : e.auth === "cluster" ? "cluster token" : "admin token"),
+      e.auth === false ? t("apidocs.chrome.noAuth") : e.auth === "cluster" ? t("apidocs.chrome.clusterToken") : t("apidocs.chrome.adminToken")),
   ));
   const params = [
     ...(e.pathParams || []).map((p) => ({ ...p, in: "path" })),
     ...(e.query || []).map((q) => ({ ...q, in: "query" })),
   ];
   if (params.length) {
-    root.appendChild(el("h4", { text: "Parameters" }));
+    root.appendChild(el("h4", { text: t("apidocs.chrome.parameters") }));
     root.appendChild(el("table", { class: "api-table" },
-      el("thead", {}, el("tr", {}, el("th", { text: "Name" }), el("th", { text: "In" }), el("th", { text: "Type" }), el("th", { text: "Description" }))),
+      el("thead", {}, el("tr", {}, el("th", { text: t("apidocs.chrome.name") }), el("th", { text: t("apidocs.chrome.in") }), el("th", { text: t("apidocs.chrome.type") }), el("th", { text: t("apidocs.chrome.description") }))),
       el("tbody", {}, ...params.map((p) =>
         el("tr", {}, el("td", { class: "mono", text: p.name }), el("td", { text: p.in }), el("td", { text: p.type || "string" }), el("td", { text: p.desc || "" })))),
     ));
   }
   if (e.body) {
-    root.appendChild(el("h4", { text: "Request body (application/json)" }));
+    root.appendChild(el("h4", { text: t("apidocs.chrome.requestBody") }));
     root.appendChild(el("pre", { class: "api-code" }, JSON.stringify(e.body, null, 2)));
   }
-  root.appendChild(el("h4", { text: "Responses" }));
+  root.appendChild(el("h4", { text: t("apidocs.chrome.responses") }));
   root.appendChild(el("ul", { class: "api-list" }, ...e.resp.map((r) => el("li", { html: esc(r) }))));
   if (e.errors && e.errors.length) {
-    root.appendChild(el("h4", { text: "Errors" }));
+    root.appendChild(el("h4", { text: t("apidocs.chrome.errors") }));
     root.appendChild(el("table", { class: "api-table" },
-      el("thead", {}, el("tr", {}, el("th", { text: "Status" }), el("th", { text: "Code" }), el("th", { text: "Description" }))),
+      el("thead", {}, el("tr", {}, el("th", { text: t("apidocs.chrome.status") }), el("th", { text: t("apidocs.chrome.code") }), el("th", { text: t("apidocs.chrome.description") }))),
       el("tbody", {}, ...e.errors.map((x) =>
         el("tr", {}, el("td", { text: x.status }), el("td", { class: "mono", text: x.code }), el("td", { text: x.desc })))),
     ));
   }
-  root.appendChild(el("h4", { text: "Examples" }));
+  root.appendChild(el("h4", { text: t("apidocs.chrome.examples") }));
   const tabs = ["curl", "python", "typescript"];
   const code = el("pre", { class: "api-code lang-example" });
-  const copyBtn = el("button", { class: "btn sm api-copy", text: "Copy" });
+  const copyBtn = el("button", { class: "btn sm api-copy", text: t("common.action.copy") });
   const bar = el("div", { class: "lang-tabs" },
     ...tabs.map((l) => {
       const btn = el("button", { class: "lang-tab", text: l, dataset: { lang: l } });
@@ -501,8 +510,8 @@ function apiDetail(e) {
 }
 function copyText(text, btn) {
   const flash = () => {
-    const old = btn.textContent;
-    btn.textContent = "Copied ✓";
+    const old = t("common.action.copy");
+    btn.textContent = t("common.action.copied");
     setTimeout(() => { btn.textContent = old; }, 1200);
   };
   const fallback = () => {

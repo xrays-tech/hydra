@@ -22,9 +22,9 @@ function renderStats() {
 
   // page actions: auto-refresh toggle + manual refresh
   clear($("#page-actions"));
-  const auto = el("label", { class: "toggle-pill", title: "refresh every 10s" },
+  const auto = el("label", { class: "toggle-pill", title: t("stats.autorefreshTip") },
     el("input", { type: "checkbox", id: "stats-autorefresh" }),
-    el("span", { text: "auto" }),
+    el("span", { text: t("stats.auto") }),
   );
   $("#page-actions").appendChild(auto);
   $("#stats-autorefresh").addEventListener("change", (e) => {
@@ -33,7 +33,7 @@ function renderStats() {
   });
   $("#page-actions").appendChild(
     el("button", { class: "btn sm", onClick: renderStats },
-      icon("refresh", 14), el("span", { class: "btn-label", text: "Refresh" })),
+      icon("refresh", 14), el("span", { class: "btn-label", text: t("stats.refresh") })),
   );
 
   // skeleton
@@ -48,8 +48,8 @@ function renderStats() {
 
   api("GET", "/stats/usage").then(renderStatsData).catch((e) => {
     clear(content);
-    content.appendChild(emptyState("alert", "Couldn't load stats", e.message));
-    toast(e.message, "err", { title: "Failed to load usage stats" });
+    content.appendChild(emptyState("alert", t("stats.couldNotLoad"), e.message));
+    toast(e.message, "err", { title: t("stats.failedLoad") });
   });
 }
 
@@ -57,21 +57,21 @@ function renderStatsData(d) {
   const content = $("#content");
   clear(content);
 
-  const t = d.totals || {};
+  const t_ = d.totals || {};
   const cards = [
-    { l: "requests", v: fmtNum(t.requests) },
-    { l: "tokens", v: fmtNum(t.tokens) },
-    { l: "prompt tokens", v: fmtNum(t.tokens_prompt) },
-    { l: "completion tokens", v: fmtNum(t.tokens_completion) },
-    { l: "tenants", v: String(t.tenants || 0) },
-    { l: "providers", v: String(t.providers || 0) },
+    { l: t("stats.cardRequests"), v: fmtNum(t_.requests) },
+    { l: t("stats.cardTokens"), v: fmtNum(t_.tokens) },
+    { l: t("stats.cardPromptTokens"), v: fmtNum(t_.tokens_prompt) },
+    { l: t("stats.cardCompletionTokens"), v: fmtNum(t_.tokens_completion) },
+    { l: t("stats.cardTenants"), v: String(t_.tenants || 0) },
+    { l: t("stats.cardProviders"), v: String(t_.providers || 0) },
   ];
 
   content.appendChild(el("div", { class: "panel" },
     el("div", { class: "panel-head" },
-      el("h2", {}, el("span", { text: "Totals" })),
+      el("h2", {}, el("span", { text: t("stats.totals") })),
       el("div", { class: "spacer" }),
-      el("span", { class: "muted", text: "updated " + (shortTime(d.generated_at) || "-") }),
+      el("span", { class: "muted", text: t("stats.updated") + " " + (shortTime(d.generated_at) || "-") }),
     ),
     el("div", { class: "stat-grid", id: "stats-totals" }),
   ));
@@ -83,21 +83,18 @@ function renderStatsData(d) {
     ));
   }
 
-  const noData = (t.requests || 0) === 0 && (t.tokens || 0) === 0;
+  const noData = (t_.requests || 0) === 0 && (t_.tokens || 0) === 0;
   if (noData) {
     content.appendChild(el("div", { class: "panel" },
-      emptyState("chart", "No usage recorded yet",
-        "The counters are cumulative since process start. Send a few proxied requests (or check /metrics) and hit Refresh."),
+      emptyState("chart", t("stats.noUsageTitle"), t("stats.noUsageMsg")),
     ));
     return;
   }
 
-  content.appendChild(renderDimensionPanel("By tenant", d.by_tenant || []));
-  content.appendChild(renderDimensionPanel("By provider", d.by_provider || []));
+  content.appendChild(renderDimensionPanel(t("stats.byTenant"), d.by_tenant || []));
+  content.appendChild(renderDimensionPanel(t("stats.byProvider"), d.by_provider || []));
 
-  content.appendChild(el("p", { class: "note" },
-    "Counters are cumulative since the process started (prometheus counters). " +
-    "For trend-over-time analytics, scrape /metrics into an external BI system."));
+  content.appendChild(el("p", { class: "note" }, t("stats.noteCumulative")));
 }
 
 function renderDimensionPanel(title, rows) {
@@ -107,13 +104,13 @@ function renderDimensionPanel(title, rows) {
         el("span", { class: "count", text: String(rows.length) })),
       el("div", { class: "spacer" }),
       el("div", { class: "chart-legend" },
-        el("span", { class: "legend-item" }, el("i", { class: "sw sw-prompt" }), " prompt"),
-        el("span", { class: "legend-item" }, el("i", { class: "sw sw-completion" }), " completion"),
+        el("span", { class: "legend-item" }, el("i", { class: "sw sw-prompt" }), " " + t("stats.prompt")),
+        el("span", { class: "legend-item" }, el("i", { class: "sw sw-completion" }), " " + t("stats.completion")),
       ),
     ),
     el("div", { class: "stats-grid" },
-      barChart({ title: "Tokens", rows, metric: "tokens", stacked: true }),
-      barChart({ title: "Requests", rows, metric: "requests" }),
+      barChart({ title: t("stats.tokens"), rows, metric: "tokens", stacked: true }),
+      barChart({ title: t("stats.requests"), rows, metric: "requests" }),
     ),
   );
 }
@@ -134,7 +131,7 @@ function barChart(opts) {
   const wrap = el("div", { class: "chart" },
     el("h3", {},
       el("span", { text: opts.title }), " ",
-      el("span", { class: "muted", text: shown.length < sorted.length ? "top " + shown.length + "/" + sorted.length : "" }),
+      el("span", { class: "muted", text: shown.length < sorted.length ? t("stats.top", { shown: shown.length, total: sorted.length }) : "" }),
     ),
     el("div", { class: "chart-rows" }),
   );
@@ -145,8 +142,10 @@ function barChart(opts) {
     const pct = (v / max) * 100;
     const prompt = r.tokens_prompt || 0;
     const completion = r.tokens_completion || 0;
-    const tip = r.name + ": " + v.toLocaleString() +
-      (opts.stacked ? " tokens (prompt " + prompt.toLocaleString() + " / completion " + completion.toLocaleString() + ")" : " requests");
+    const tip = r.name + ": " + v.toLocaleString() + " " +
+      (opts.stacked
+        ? t("stats.tipTokens", { prompt: prompt.toLocaleString(), completion: completion.toLocaleString() })
+        : t("stats.tipRequests"));
     const row = el("div", { class: "chart-row", title: tip },
       el("div", { class: "chart-label", text: r.name }),
       el("div", { class: "chart-track" }),
@@ -165,7 +164,7 @@ function barChart(opts) {
   }
 
   if (!shown.length) {
-    rowsEl.appendChild(el("p", { class: "muted", text: "no data yet" }));
+    rowsEl.appendChild(el("p", { class: "muted", text: t("stats.noData") }));
   }
   return wrap;
 }

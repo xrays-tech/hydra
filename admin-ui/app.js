@@ -98,7 +98,7 @@ function invalidateFK(kind) { delete FK[kind]; }
  * HTTP
  * ======================================================================== */
 async function api(method, path, { body, query } = {}) {
-  if (!TOKEN) throw new Error("not authenticated");
+  if (!TOKEN) throw new Error(t("common.auth.notAuthenticated"));
   const headers = { Authorization: `Bearer ${TOKEN}` };
   let url = API + path;
   if (query) url += query;
@@ -137,19 +137,19 @@ async function writeAndReload(op) {
 const TOAST_ICONS = { ok: "check", err: "alert", info: "info" };
 function toast(message, kind = "info", { title } = {}) {
   const root = $("#toast-root");
-  const t = el("div", { class: `toast ${kind}` },
+  const toastEl = el("div", { class: `toast ${kind}` },
     el("span", { class: "ti" }, icon(TOAST_ICONS[kind] || "info", 18)),
     el("div", { class: "tm" },
       title ? el("strong", { text: title }) : null,
       el("div", { class: "ts", text: message }),
     ),
-    el("button", { class: "tx", "aria-label": "dismiss", title: "dismiss",
-      onClick: () => dismiss(t) }, icon("close", 15)),
+    el("button", { class: "tx", "aria-label": t("common.action.dismiss"), title: t("common.action.dismiss"),
+      onClick: () => dismiss(toastEl) }, icon("close", 15)),
   );
-  root.appendChild(t);
-  const timer = setTimeout(() => dismiss(t), 3500);
-  t._timer = timer;
-  return t;
+  root.appendChild(toastEl);
+  const timer = setTimeout(() => dismiss(toastEl), 3500);
+  toastEl._timer = timer;
+  return toastEl;
   function dismiss(node) {
     if (node._timer) clearTimeout(node._timer);
     if (!node.parentNode) return;
@@ -184,7 +184,7 @@ function openModal({ icon: iconName, iconKind = "", title, sub, body, size = "",
         el("h3", { text: title }),
         sub ? el("p", { class: "modal-sub", text: sub }) : null,
       ),
-      el("button", { class: "icon-btn close", "aria-label": "close", title: "close (esc)",
+      el("button", { class: "icon-btn close", "aria-label": t("common.action.close"), title: t("common.action.closeEsc"),
         onClick: () => ctrl.close(false) }, icon("close", 17)),
     ),
     el("div", { class: "modal-body" }, body),
@@ -206,7 +206,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 /** Promise-based confirm dialog (replaces native confirm()). */
-function confirmDialog({ title = "Are you sure?", message, target, confirmText = "Delete", danger = true }) {
+function confirmDialog({ title = t("common.confirm.areYouSure"), message, target, confirmText = t("common.action.delete"), danger = true }) {
   return new Promise((resolve) => {
     let done = false;
     const settle = (v) => { if (!done) { done = true; closeModal(); resolve(v); } };
@@ -220,7 +220,7 @@ function confirmDialog({ title = "Are you sure?", message, target, confirmText =
     const m = openModal({
       title, body, size: "",
       actions: [
-        el("button", { class: "btn", text: "Cancel", onClick: () => settle(false) }),
+        el("button", { class: "btn", text: t("common.action.cancel"), onClick: () => settle(false) }),
         el("button", { class: `btn ${danger ? "danger solid" : "primary"}`, text: confirmText,
           onClick: () => settle(true) }),
       ],
@@ -233,185 +233,185 @@ function confirmDialog({ title = "Are you sure?", message, target, confirmText =
  * Entity configuration (the 8 CRUD entities)
  * ======================================================================== */
 const STATUS_OPTS = [
-  { value: "1", label: "online" },
-  { value: "0", label: "offline · manual" },
-  { value: "-1", label: "offline · probe" },
+  { value: "1", label: "opts.status.1" },
+  { value: "0", label: "opts.status.0" },
+  { value: "-1", label: "opts.status.-1" },
 ];
 const WINDOW_OPTS = [
-  { value: "m", label: "minute" },
-  { value: "h", label: "hour" },
-  { value: "d", label: "day" },
+  { value: "m", label: "opts.window.m" },
+  { value: "h", label: "opts.window.h" },
+  { value: "d", label: "opts.window.d" },
 ];
 
 function statusPill(s) {
-  const map = { 1: ["ok", "online"], 0: ["warn", "offline"], [-1]: ["err", "probe"] };
-  const [cls, label] = map[s] ?? ["", String(s)];
-  return el("span", { class: `pill ${cls}`, text: label });
+  const map = { 1: ["ok", "common.status.online"], 0: ["warn", "common.status.offline"], [-1]: ["err", "common.status.probe"] };
+  const [cls, key] = map[s] ?? ["", String(s)];
+  return el("span", { class: `pill ${cls}`, text: key.startsWith("common.") ? t(key) : key });
 }
 function boolPill(v) {
-  return el("span", { class: `pill ${v ? "ok" : "warn"}`, text: v ? "true" : "false" });
+  return el("span", { class: `pill ${v ? "ok" : "warn"}`, text: t(v ? "common.status.true" : "common.status.false") });
 }
 
 const CRUD = {
   providers: {
-    title: "Providers", nav: "Providers", icon: "providers", path: "/providers", singular: "provider",
-    desc: "Upstream LLM providers — endpoint + routing weight.",
+    title: "crud.providers.title", nav: "crud.providers.nav", icon: "providers", path: "/providers", singular: "crud.providers.singular",
+    desc: "crud.providers.desc",
     clearsFK: ["providers"],
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "key", label: "Key", mono: true },
-      { key: "name", label: "Name" },
-      { key: "endpoint", label: "Endpoint", mono: true, truncate: true },
-      { key: "weight", label: "Weight", align: "right", num: true },
-      { key: "updated_at", label: "Updated", mono: true, muted: true },
+      { key: "id", label: "col.id", mono: true },
+      { key: "key", label: "col.key", mono: true },
+      { key: "name", label: "col.name" },
+      { key: "endpoint", label: "col.endpoint", mono: true, truncate: true },
+      { key: "weight", label: "col.weight", align: "right", num: true },
+      { key: "updated_at", label: "col.updated", mono: true, muted: true },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank", tip: "leave blank to auto-assign" },
-      { name: "key", label: "Key", required: true, placeholder: "openai" },
-      { name: "name", label: "Display name", required: true, placeholder: "OpenAI" },
-      { name: "endpoint", label: "Endpoint", type: "url", required: true, placeholder: "https://api.openai.com", full: true },
-      { name: "weight", label: "Weight", type: "number", map: "int", value: 1, tip: "SWRR weight; 0 = soft-disabled" },
+      { name: "id", label: "field.id", placeholder: "ph.autoId", tip: "tip.autoId" },
+      { name: "key", label: "field.key", required: true, placeholder: "openai" },
+      { name: "name", label: "field.displayName", required: true, placeholder: "OpenAI" },
+      { name: "endpoint", label: "field.endpoint", type: "url", required: true, placeholder: "https://api.openai.com", full: true },
+      { name: "weight", label: "field.weight", type: "number", map: "int", value: 1, tip: "tip.weight" },
     ],
   },
   "provider-models": {
-    title: "Provider Models", nav: "Models", icon: "models", path: "/provider-models", singular: "model",
-    desc: "Models exposed by each provider (the routing key).",
+    title: "crud.provider-models.title", nav: "crud.provider-models.nav", icon: "models", path: "/provider-models", singular: "crud.provider-models.singular",
+    desc: "crud.provider-models.desc",
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "key", label: "Key", mono: true },
-      { key: "name", label: "Name" },
-      { key: "provider_id", label: "Provider", fk: "providers" },
-      { key: "status", label: "Status", render: (v) => statusPill(v) },
+      { key: "id", label: "col.id", mono: true },
+      { key: "key", label: "col.key", mono: true },
+      { key: "name", label: "col.name" },
+      { key: "provider_id", label: "col.provider", fk: "providers" },
+      { key: "status", label: "col.status", render: (v) => statusPill(v) },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "key", label: "Key (model_key)", required: true, placeholder: "gpt-4" },
-      { name: "name", label: "Display name", required: true, placeholder: "GPT-4" },
-      { name: "provider_id", label: "Provider", type: "select", fk: "providers", required: true },
-      { name: "status", label: "Status", type: "select", options: STATUS_OPTS, map: "int", value: 1, required: true },
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "key", label: "field.modelKey", required: true, placeholder: "gpt-4" },
+      { name: "name", label: "field.displayName", required: true, placeholder: "GPT-4" },
+      { name: "provider_id", label: "field.provider", type: "select", fk: "providers", required: true },
+      { name: "status", label: "field.status", type: "select", options: STATUS_OPTS, map: "int", value: 1, required: true },
     ],
   },
   "provider-keys": {
-    title: "Provider Keys", nav: "Keys", icon: "keys", path: "/provider-keys", singular: "key",
-    desc: "API keys stored per provider. Masked by default; reveal is audit-logged.",
+    title: "crud.provider-keys.title", nav: "crud.provider-keys.nav", icon: "keys", path: "/provider-keys", singular: "crud.provider-keys.singular",
+    desc: "crud.provider-keys.desc",
     maskedKeys: true,
     noEdit: true,
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "provider_id", label: "Provider", fk: "providers" },
-      { key: "api_key", label: "API key", mono: true, render: (v) => el("span", { class: "mono", text: v || "—" }) },
-      { key: "created_at", label: "Created", mono: true, muted: true },
+      { key: "id", label: "col.id", mono: true },
+      { key: "provider_id", label: "col.provider", fk: "providers" },
+      { key: "api_key", label: "col.apiKey", mono: true, render: (v) => el("span", { class: "mono", text: v || "—" }) },
+      { key: "created_at", label: "col.created", mono: true, muted: true },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "provider_id", label: "Provider", type: "select", fk: "providers", required: true },
-      { name: "api_key", label: "API key", type: "password", required: true, placeholder: "sk-…", full: true,
-        tip: "stored masked after create" },
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "provider_id", label: "field.provider", type: "select", fk: "providers", required: true },
+      { name: "api_key", label: "field.apiKey", type: "password", required: true, placeholder: "sk-…", full: true,
+        tip: "tip.masked" },
     ],
   },
   tenants: {
-    title: "Tenants", nav: "Tenants", icon: "tenants", path: "/tenants", singular: "tenant",
-    desc: "Tenants identified by Host domain, with an external auth endpoint.",
+    title: "crud.tenants.title", nav: "crud.tenants.nav", icon: "tenants", path: "/tenants", singular: "crud.tenants.singular",
+    desc: "crud.tenants.desc",
     clearsFK: ["tenants"],
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "name", label: "Name" },
-      { key: "domain", label: "Domain", mono: true },
-      { key: "auth_url", label: "Auth URL", mono: true, truncate: true },
-      { key: "has_access_token", label: "Token", render: (v) => (v ? "set" : "—") },
-      { key: "enabled", label: "Enabled", render: (v) => boolPill(v) },
+      { key: "id", label: "col.id", mono: true },
+      { key: "name", label: "col.name" },
+      { key: "domain", label: "col.domain", mono: true },
+      { key: "auth_url", label: "col.authUrl", mono: true, truncate: true },
+      { key: "has_access_token", label: "col.token", render: (v) => (v ? t("common.status.set") : "—") },
+      { key: "enabled", label: "col.enabled", render: (v) => boolPill(v) },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "name", label: "Name", required: true, placeholder: "Acme" },
-      { name: "domain", label: "Domain", required: true, placeholder: "acme.com", tip: "lowercased; localhost is special" },
-      { name: "auth_url", label: "Auth URL", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
-        tip: "mandatory — empty ⇒ all requests 401",
-        action: { label: "Test", action: (input) => testAuthUrl(input) } },
-      { name: "access_token", label: "Access token", type: "password", map: "opt", full: true,
-        placeholder: "blank = keep current token",
-        tip: "tenant self-service token: POST /api/v1/tenants/{id}/auth/cache/invalidate with it to force re-auth (欠费停机 / 付费恢复). Blank on edit keeps the current token; a new value rotates it; never shown again after save.",
-        action: { label: "Generate", action: (input) => generateToken(input) } },
-      { name: "cert_pem", label: "Cert PEM", type: "textarea", full: true, rows: 4, map: "opt",
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "name", label: "field.name", required: true, placeholder: "Acme" },
+      { name: "domain", label: "field.domain", required: true, placeholder: "acme.com", tip: "tip.domain" },
+      { name: "auth_url", label: "field.authUrl", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
+        tip: "tip.authUrl",
+        action: { label: "common.action.test", action: (input) => testAuthUrl(input) } },
+      { name: "access_token", label: "field.accessToken", type: "password", map: "opt", full: true,
+        placeholder: "ph.blankKeepToken",
+        tip: "tip.blankKeep",
+        action: { label: "common.action.generate", action: (input) => generateToken(input) } },
+      { name: "cert_pem", label: "field.certPem", type: "textarea", full: true, rows: 4, map: "opt",
         placeholder: "-----BEGIN CERTIFICATE----- …",
-        tip: "optional — leave blank for no cert (or to keep the current cert on edit); clearing via the API uses cert_pem:\"\"" },
-      { name: "cert_key_pem", label: "Cert private key PEM", type: "textarea", full: true, rows: 4, map: "opt",
+        tip: "tip.certPem" },
+      { name: "cert_key_pem", label: "field.certKeyPem", type: "textarea", full: true, rows: 4, map: "opt",
         placeholder: "-----BEGIN PRIVATE KEY----- …",
-        tip: "optional; required when Cert PEM is set — stored encrypted, never returned by the API; left blank ⇒ no cert" },
-      { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
+        tip: "tip.certKey" },
+      { name: "enabled", label: "field.enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
   "tenant-providers": {
-    title: "Tenant ↔ Provider Access", nav: "Tenant Access", icon: "access", path: "/tenant-providers", singular: "access",
-    desc: "Which providers each tenant may route to.",
+    title: "crud.tenant-providers.title", nav: "crud.tenant-providers.nav", icon: "access", path: "/tenant-providers", singular: "crud.tenant-providers.singular",
+    desc: "crud.tenant-providers.desc",
     noEdit: true,
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "tenant_id", label: "Tenant", fk: "tenants" },
-      { key: "provider_id", label: "Provider", fk: "providers" },
+      { key: "id", label: "col.id", mono: true },
+      { key: "tenant_id", label: "col.tenant", fk: "tenants" },
+      { key: "provider_id", label: "col.provider", fk: "providers" },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "tenant_id", label: "Tenant", type: "select", fk: "tenants", required: true },
-      { name: "provider_id", label: "Provider", type: "select", fk: "providers", required: true },
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "tenant_id", label: "field.tenant", type: "select", fk: "tenants", required: true },
+      { name: "provider_id", label: "field.provider", type: "select", fk: "providers", required: true },
     ],
   },
   "tenant-models": {
-    title: "Tenant Models", nav: "Tenant Models", icon: "gate", path: "/tenant-models", singular: "model gate",
-    desc: "Model gate — default-open: a tenant with NO rows here can request ALL models; once any row exists, only listed models are allowed.",
+    title: "crud.tenant-models.title", nav: "crud.tenant-models.nav", icon: "gate", path: "/tenant-models", singular: "crud.tenant-models.singular",
+    desc: "crud.tenant-models.desc",
     noEdit: true,
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "tenant_id", label: "Tenant", fk: "tenants" },
-      { key: "model_key", label: "Model key", mono: true },
+      { key: "id", label: "col.id", mono: true },
+      { key: "tenant_id", label: "col.tenant", fk: "tenants" },
+      { key: "model_key", label: "col.modelKey", mono: true },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "tenant_id", label: "Tenant", type: "select", fk: "tenants", required: true },
-      { name: "model_key", label: "Model key", required: true, placeholder: "gpt-4" },
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "tenant_id", label: "field.tenant", type: "select", fk: "tenants", required: true },
+      { name: "model_key", label: "field.modelKey", required: true, placeholder: "gpt-4" },
     ],
   },
   "limit-roles": {
-    title: "Limit Roles", nav: "Limit Roles", icon: "limits", path: "/limit-roles", singular: "limit role",
-    desc: "Rate-limit roles matched by tenant / key / model / provider.",
+    title: "crud.limit-roles.title", nav: "crud.limit-roles.nav", icon: "limits", path: "/limit-roles", singular: "crud.limit-roles.singular",
+    desc: "crud.limit-roles.desc",
     columns: [
-      { key: "name", label: "Name" },
-      { key: "matching_tenant", label: "Tenant", mono: true, render: (v) => monoOrAll(v) },
-      { key: "matching_key", label: "Key", mono: true, render: (v) => monoOrAll(v) },
-      { key: "matching_model", label: "Model", mono: true, render: (v) => monoOrAll(v) },
-      { key: "matching_provider", label: "Provider", mono: true, render: (v) => monoOrAll(v) },
-      { key: "limit_count", label: "Count", align: "right", num: true, render: (v) => numOrDash(v) },
-      { key: "limit_token", label: "Token", align: "right", num: true, render: (v) => numOrDash(v) },
-      { key: "window", label: "Window", mono: true },
-      { key: "enabled", label: "Enabled", render: (v) => boolPill(v) },
+      { key: "name", label: "col.name" },
+      { key: "matching_tenant", label: "col.matchingTenant", mono: true, render: (v) => monoOrAll(v) },
+      { key: "matching_key", label: "col.matchingKey", mono: true, render: (v) => monoOrAll(v) },
+      { key: "matching_model", label: "col.matchingModel", mono: true, render: (v) => monoOrAll(v) },
+      { key: "matching_provider", label: "col.matchingProvider", mono: true, render: (v) => monoOrAll(v) },
+      { key: "limit_count", label: "col.limitCount", align: "right", num: true, render: (v) => numOrDash(v) },
+      { key: "limit_token", label: "col.limitToken", align: "right", num: true, render: (v) => numOrDash(v) },
+      { key: "window", label: "col.window", mono: true },
+      { key: "enabled", label: "col.enabled", render: (v) => boolPill(v) },
     ],
     fields: [
-      { name: "name", label: "Name", required: true, placeholder: "acme-default" },
-      { name: "matching_tenant", label: "Match tenant", placeholder: "blank = all", map: "opt", tip: "tenant id" },
-      { name: "matching_key", label: "Match key", placeholder: "blank = all", map: "opt" },
-      { name: "matching_model", label: "Match model", placeholder: "blank = all", map: "opt" },
-      { name: "matching_provider", label: "Match provider", placeholder: "blank = all", map: "opt" },
-      { name: "limit_count", label: "Limit (count)", type: "number", map: "optint", placeholder: "requests" },
-      { name: "limit_token", label: "Limit (tokens)", type: "number", map: "optint", placeholder: "tokens" },
-      { name: "window", label: "Window", type: "select", options: WINDOW_OPTS, value: "m" },
-      { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
+      { name: "name", label: "field.name", required: true, placeholder: "acme-default" },
+      { name: "matching_tenant", label: "field.matchTenant", placeholder: "ph.blankAll", map: "opt", tip: "tip.tenantId" },
+      { name: "matching_key", label: "field.matchKey", placeholder: "ph.blankAll", map: "opt" },
+      { name: "matching_model", label: "field.matchModel", placeholder: "ph.blankAll", map: "opt" },
+      { name: "matching_provider", label: "field.matchProvider", placeholder: "ph.blankAll", map: "opt" },
+      { name: "limit_count", label: "field.limitCount", type: "number", map: "optint", placeholder: "ph.requests" },
+      { name: "limit_token", label: "field.limitToken", type: "number", map: "optint", placeholder: "ph.tokens" },
+      { name: "window", label: "field.window", type: "select", options: WINDOW_OPTS, value: "m" },
+      { name: "enabled", label: "field.enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
   "provider-key-bindings": {
-    title: "Key Prefix Bindings", nav: "Key Bindings", icon: "key2", path: "/provider-key-bindings", singular: "binding",
-    desc: "Route gate — client api-keys whose raw value starts with a prefix are pinned to one provider (longest prefix wins, fail-closed).",
+    title: "crud.provider-key-bindings.title", nav: "crud.provider-key-bindings.nav", icon: "key2", path: "/provider-key-bindings", singular: "crud.provider-key-bindings.singular",
+    desc: "crud.provider-key-bindings.desc",
     columns: [
-      { key: "id", label: "ID", mono: true },
-      { key: "key_prefix", label: "Prefix", mono: true },
-      { key: "provider_id", label: "Provider", fk: "providers" },
-      { key: "enabled", label: "Enabled", render: (v) => boolPill(v) },
+      { key: "id", label: "col.id", mono: true },
+      { key: "key_prefix", label: "col.prefix", mono: true },
+      { key: "provider_id", label: "col.provider", fk: "providers" },
+      { key: "enabled", label: "col.enabled", render: (v) => boolPill(v) },
     ],
     fields: [
-      { name: "id", label: "ID", placeholder: "auto if blank" },
-      { name: "key_prefix", label: "Key prefix", required: true, placeholder: "sk_aaa_",
-        tip: "client api-key prefix; e.g. sk_aaa_ → keys starting with sk_aaa_ use this provider" },
-      { name: "provider_id", label: "Provider", type: "select", fk: "providers", required: true },
-      { name: "enabled", label: "Enabled", type: "checkbox", map: "bool", value: true },
+      { name: "id", label: "field.id", placeholder: "ph.autoId" },
+      { name: "key_prefix", label: "field.keyPrefix", required: true, placeholder: "sk_aaa_",
+        tip: "tip.keyPrefix" },
+      { name: "provider_id", label: "field.provider", type: "select", fk: "providers", required: true },
+      { name: "enabled", label: "field.enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
 };
@@ -428,37 +428,37 @@ function numOrDash(v) {
 /* ---- custom sections (auth-cache / breaker / health) ---- */
 const CUSTOM = {
   "auth-cache": {
-    title: "Auth Cache", nav: "Auth Cache", icon: "authcache",
-    desc: "Force re-authentication for cached verdicts.",
+    title: "custom.authcache.title", nav: "custom.authcache.title", icon: "authcache",
+    desc: "custom.authcache.pageDesc",
     render: renderAuthCache,
   },
   breaker: {
-    title: "Circuit Breaker", nav: "Breaker", icon: "breaker",
-    desc: "Dead-set of providers excluded from routing.",
+    title: "custom.breaker.pageTitle", nav: "custom.breaker.nav", icon: "breaker",
+    desc: "custom.breaker.pageDesc",
     render: renderBreaker,
   },
   health: {
-    title: "Health", nav: "Health", icon: "health",
-    desc: "Live service status.",
+    title: "custom.health.pageTitle", nav: "custom.health.nav", icon: "health",
+    desc: "custom.health.pageDesc",
     render: renderHealth,
   },
   "api-docs": {
-    title: "API Docs", nav: "API Docs", icon: "book",
-    desc: "OpenAPI-style reference for every admin REST endpoint (curl / Python / TypeScript examples).",
+    title: "custom.apidocs.title", nav: "custom.apidocs.nav", icon: "book",
+    desc: "custom.apidocs.desc",
     render: renderApiDocs,
   },
   stats: {
-    title: "Usage Stats", nav: "Stats", icon: "chart",
-    desc: "Token usage & request counts by tenant and provider (cumulative since process start).",
+    title: "custom.stats.title", nav: "custom.stats.nav", icon: "chart",
+    desc: "custom.stats.desc",
     render: renderStats,
   },
 };
 
 /* ordered nav with section dividers */
 const NAV = [
-  { label: "Configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
-  { label: "Operations", items: ["auth-cache", "breaker", "health", "stats"] },
-  { label: "Reference", items: ["api-docs"] },
+  { labelKey: "common.nav.configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
+  { labelKey: "common.nav.operations", items: ["auth-cache", "breaker", "health", "stats"] },
+  { labelKey: "common.nav.reference", items: ["api-docs"] },
 ];
 function sectionConfig(key) { return CRUD[key] || CUSTOM[key]; }
 
@@ -469,7 +469,7 @@ function renderNav() {
   const nav = $("#nav");
   clear(nav);
   for (const group of NAV) {
-    nav.appendChild(el("div", { class: "nav-section", text: group.label }));
+    nav.appendChild(el("div", { class: "nav-section", text: t(group.labelKey) }));
     for (const key of group.items) {
       const cfg = sectionConfig(key);
       const btn = el("button", {
@@ -478,7 +478,7 @@ function renderNav() {
         onClick: () => go(key),
       },
         icon(cfg.icon, 17),
-        el("span", { text: cfg.nav }),
+        el("span", { text: t(cfg.nav) }),
         el("span", { class: "nav-badge", dataset: { badge: key }, text: "" }),
       );
       if (!CRUD[key]) btn.querySelector(".nav-badge").classList.add("hidden");
@@ -499,8 +499,8 @@ function go(key) {
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.key === key));
   closeSidebar();
   const cfg = sectionConfig(key);
-  $("#page-title").textContent = cfg.title;
-  $("#page-sub").textContent = cfg.desc || "";
+  $("#page-title").textContent = t(cfg.title);
+  $("#page-sub").textContent = t(cfg.desc || "");
   clear($("#page-actions"));
   clear($("#content"));
   if (CRUD[key]) loadEntity(key);
@@ -539,7 +539,7 @@ async function loadEntity(key) {
     if (fks.length) await Promise.all(fks.map(ensureFK));
   } catch (e) {
     renderErrorPanel(e);
-    toast(e.message, "err", { title: `Failed to load ${cfg.nav}` });
+    toast(e.message, "err", { title: t("common.toast.failedLoad", { nav: t(cfg.nav) }) });
     return;
   }
   COUNTS[key] = rows.length;
@@ -549,7 +549,7 @@ async function loadEntity(key) {
 
 function renderErrorPanel(e) {
   clear($("#content"));
-  $("#content").appendChild(emptyState("alert", "Couldn't load", e.message || "unknown error"));
+  $("#content").appendChild(emptyState("alert", t("common.empty.couldNotLoad"), e.message || t("common.empty.unknownError")));
 }
 
 function renderEntityPanel(cfg, rows) {
@@ -558,7 +558,7 @@ function renderEntityPanel(cfg, rows) {
 
   const panel = el("div", { class: "panel" });
   const head = el("div", { class: "panel-head" },
-    el("h2", {}, el("span", { text: cfg.title }), " ",
+    el("h2", {}, el("span", { text: t(cfg.title) }), " ",
       el("span", { class: "count", text: String(rows.length) })),
     el("div", { class: "spacer" }),
   );
@@ -568,17 +568,17 @@ function renderEntityPanel(cfg, rows) {
     head.appendChild(el("label", { class: "toggle-pill" },
       el("input", { type: "checkbox", id: "keys-reveal",
         onChange: (e) => { STATE.revealKeys = e.target.checked; loadEntity("provider-keys"); } }),
-      el("span", { text: "reveal plaintext" }),
+      el("span", { text: t("common.form.reveal") }),
     ));
   }
   head.appendChild(el("button", { class: "btn primary sm", onClick: () => openCreate(cfg) },
-    icon("plus", 14), el("span", { class: "btn-label", text: `New ${cfg.singular}` }),
+    icon("plus", 14), el("span", { class: "btn-label", text: t("common.action.new", { singular: t(cfg.singular) }) }),
   ));
   panel.appendChild(head);
 
   if (!rows.length) {
-    panel.appendChild(emptyState("inbox", `No ${cfg.nav.toLowerCase()} yet`,
-      `Create your first ${cfg.singular} to get started.`, { primary: `+ New ${cfg.singular}`, onClick: () => openCreate(cfg) }));
+    panel.appendChild(emptyState("inbox", t("common.empty.noRows", { nav: t(cfg.nav).toLowerCase() }),
+      t("common.empty.first", { singular: t(cfg.singular) }), { primary: t("common.empty.new", { singular: t(cfg.singular) }), onClick: () => openCreate(cfg) }));
   } else {
     panel.appendChild(renderTable(cfg, rows));
   }
@@ -590,7 +590,7 @@ const STATE = { revealKeys: false };
 function renderTable(cfg, rows) {
   const cols = cfg.columns;
   const thead = el("thead", {}, el("tr", {},
-    ...cols.map((c) => el("th", { class: c.align === "right" ? "num" : "", text: c.label })),
+    ...cols.map((c) => el("th", { class: c.align === "right" ? "num" : "", text: t(c.label) })),
     el("th", { text: "" }),
   ));
   const tbody = el("tbody", {});
@@ -606,8 +606,8 @@ function renderTable(cfg, rows) {
       }),
       el("td", { class: "actions" },
         el("div", { class: "row-actions" },
-          cfg.noEdit ? null : iconBtn("edit", "Edit", () => openEdit(cfg, r)),
-          iconBtn("trash", "Delete", () => doDelete(cfg, r), "danger"),
+          cfg.noEdit ? null : iconBtn("edit", t("common.action.edit"), () => openEdit(cfg, r)),
+          iconBtn("trash", t("common.action.delete"), () => doDelete(cfg, r), "danger"),
         ),
       ),
     );
@@ -677,14 +677,14 @@ async function openForm(cfg, record) {
   }
 
   const submitBtn = el("button", { class: "btn primary", type: "submit" },
-    el("span", { class: "btn-label", text: isEdit ? "Save changes" : `Create ${cfg.singular}` }));
+    el("span", { class: "btn-label", text: isEdit ? t("common.action.saveChanges") : t("common.action.create", { singular: t(cfg.singular) }) }));
 
   const body = form;
   const m = openModal({
-    icon: isEdit ? "edit" : "plus", title: isEdit ? `Edit ${cfg.singular}` : `New ${cfg.singular}`,
-    sub: cfg.desc, body, size: "lg",
+    icon: isEdit ? "edit" : "plus", title: isEdit ? t("common.form.edit", { singular: t(cfg.singular) }) : t("common.form.new", { singular: t(cfg.singular) }),
+    sub: t(cfg.desc), body, size: "lg",
     actions: [
-      el("button", { class: "btn", text: "Cancel", onClick: () => closeModal() }),
+      el("button", { class: "btn", text: t("common.action.cancel"), onClick: () => closeModal() }),
       submitBtn,
     ],
   });
@@ -704,9 +704,9 @@ async function openForm(cfg, record) {
       const ok = validateField(f, input);
       if (!ok && !firstInvalid) firstInvalid = input;
     }
-    if (firstInvalid) { firstInvalid.focus(); toast("Please complete the highlighted fields", "err"); return; }
+    if (firstInvalid) { firstInvalid.focus(); toast(t("common.form.completeHighlighted"), "err"); return; }
 
-    setLoading(submitBtn, true, isEdit ? "Saving…" : "Creating…");
+    setLoading(submitBtn, true, isEdit ? t("common.action.saving") : t("common.action.creating"));
     try {
       const bodyObj = collectBody(cfg, inputs, record);
       await writeAndReload(() =>
@@ -714,11 +714,11 @@ async function openForm(cfg, record) {
                : api("POST", cfg.path, { body: bodyObj }));
       (cfg.clearsFK || []).forEach(invalidateFK);
       closeModal();
-      toast(`${isEdit ? "Updated" : "Created"} ${cfg.singular}`, "ok");
+      toast(t(isEdit ? "common.toast.updated" : "common.toast.created", { singular: t(cfg.singular) }), "ok");
       await loadEntity(CURRENT);
     } catch (e) {
       setLoading(submitBtn, false);
-      toast(e.message, "err", { title: `Failed to ${isEdit ? "update" : "create"} ${cfg.singular}` });
+      toast(e.message, "err", { title: t(isEdit ? "common.toast.failedUpdate" : "common.toast.failedCreate", { singular: t(cfg.singular) }) });
     }
   }
 }
@@ -729,29 +729,30 @@ function buildField(f, value, { disabled, isEdit } = {}) {
     group.classList.add("full");
     const c = el("label", { class: "check" },
       el("input", { type: "checkbox", dataset: { field: f.name }, disabled }),
-      el("span", { text: `${f.label}${f.required ? " *" : ""}` }),
+      el("span", { text: `${t(f.label)}${f.required ? " *" : ""}` }),
     );
     const input = c.querySelector("input");
     input.checked = !!value;
     group.appendChild(c);
     return group;
   }
-  group.appendChild(el("label", { text: f.label },
+  group.appendChild(el("label", { text: t(f.label) },
     f.required ? el("span", { class: "req", text: " *" }) : null));
   let input;
+  const placeholder = f.placeholder && f.placeholder.startsWith("ph.") ? t(f.placeholder) : (f.placeholder || "");
   if (f.type === "textarea") {
     input = el("textarea", { dataset: { field: f.name }, disabled, rows: f.rows || 3,
-      placeholder: f.placeholder || "" });
+      placeholder });
     input.value = value === null || value === undefined ? "" : String(value);
   } else if (f.type === "select") {
     input = el("select", { dataset: { field: f.name }, disabled });
     if (f.fk) {
       const fk = FK[f.fk] || { list: [] };
-      if (!f.required) input.appendChild(el("option", { value: "", text: "— none —" }));
-      if (!fk.list.length) input.appendChild(el("option", { value: "", text: `(no ${f.fk} yet)` }));
+      if (!f.required) input.appendChild(el("option", { value: "", text: t("common.form.none") }));
+      if (!fk.list.length) input.appendChild(el("option", { value: "", text: t("common.form.noFk", { kind: t("crud." + f.fk + ".nav") }) }));
       for (const r of fk.list) input.appendChild(el("option", { value: String(r.id), text: `${r.name || r.id} · ${r.id}` }));
     } else {
-      for (const o of (f.options || [])) input.appendChild(el("option", { value: o.value, text: o.label }));
+      for (const o of (f.options || [])) input.appendChild(el("option", { value: o.value, text: t(o.label) }));
     }
     const targetVal = String(value ?? "");
     if (targetVal !== "") input.value = targetVal;        // edit / explicit default
@@ -761,7 +762,7 @@ function buildField(f, value, { disabled, isEdit } = {}) {
     input = el("input", {
       type: f.type === "password" ? "password" : (f.type === "number" ? "number" : (f.type === "url" ? "url" : "text")),
       dataset: { field: f.name }, disabled,
-      placeholder: f.placeholder || "",
+      placeholder,
     });
     input.value = value === null || value === undefined ? "" : String(value);
     if (isEdit && f.name === "id") input.classList.add("mono");
@@ -773,7 +774,7 @@ function buildField(f, value, { disabled, isEdit } = {}) {
     const wrap = el("div", { class: "input-wrap" });
     input.style.flex = "1";
     wrap.appendChild(input);
-    wrap.appendChild(el("button", { class: "btn sm ghost", type: "button", text: f.action.label || "Action",
+    wrap.appendChild(el("button", { class: "btn sm ghost", type: "button", text: t(f.action.label),
       onClick: () => f.action.action(input, group) }));
     group.appendChild(wrap);
   } else {
@@ -781,7 +782,7 @@ function buildField(f, value, { disabled, isEdit } = {}) {
   }
   const err = el("div", { class: "field-error hidden", text: "" });
   group.appendChild(err);
-  if (f.tip) group.appendChild(el("div", { class: "field-tip", text: f.tip }));
+  if (f.tip) group.appendChild(el("div", { class: "field-tip", text: t(f.tip) }));
   return group;
 }
 
@@ -791,7 +792,7 @@ function validateField(f, input) {
   const val = (input.value || "").trim();
   if (f.required && !val) {
     input.classList.add("invalid");
-    if (err) { err.textContent = `${f.label} is required`; err.classList.remove("hidden"); }
+    if (err) { err.textContent = t("common.form.required", { label: t(f.label) }); err.classList.remove("hidden"); }
     return false;
   }
   input.classList.remove("invalid");
@@ -846,18 +847,18 @@ function setLoading(btn, loading, label) {
  * ======================================================================== */
 async function testAuthUrl(input) {
   const url = (input.value || "").trim();
-  if (!url) { toast("Enter an auth URL first", "err"); return; }
+  if (!url) { toast(t("common.auth.testEnter"), "err"); return; }
   const wrap = input.closest(".input-wrap");
   const btn = wrap ? wrap.querySelector("button") : null;
-  if (btn) setLoading(btn, true, "Testing…");
+  if (btn) setLoading(btn, true, t("common.auth.testing"));
   try {
     const r = await api("POST", "/tenants/auth/test", { body: { auth_url: url } });
     const ms = typeof r.duration_ms === "number" ? " · " + r.duration_ms + "ms" : "";
     const head = typeof r.status === "number" ? "HTTP " + r.status + ms : ms;
-    if (r.ok) toast(r.detail + " (" + head + ")", "ok", { title: "Auth URL OK" });
-    else toast(r.detail + " (" + head + ")", "err", { title: "Auth URL test failed" });
+    if (r.ok) toast(r.detail + " (" + head + ")", "ok", { title: t("common.auth.testTitle") });
+    else toast(r.detail + " (" + head + ")", "err", { title: t("common.auth.testFailTitle") });
   } catch (e) {
-    toast(e.message, "err", { title: "Auth URL test failed" });
+    toast(e.message, "err", { title: t("common.auth.testFailTitle") });
   } finally {
     if (btn) setLoading(btn, false);
   }
@@ -872,7 +873,7 @@ function generateToken(input) {
   // reveal once so the operator can copy it — the API never returns it
   input.type = "text";
   setTimeout(() => { input.type = "password"; }, 20000);
-  toast("Random access token generated — copy it now; it is never shown again", "info", { title: "Access token" });
+  toast(t("common.token.generated"), "info", { title: t("common.token.title") });
 }
 
 
@@ -882,19 +883,19 @@ function generateToken(input) {
 async function doDelete(cfg, record) {
   const label = record.name || record.key || record.id;
   const ok = await confirmDialog({
-    title: `Delete ${cfg.singular}?`,
-    message: `This will permanently remove the ${cfg.singular}.`,
-    target: `${cfg.nav}: ${label} (${record.id})`,
-    confirmText: "Delete",
+    title: t("common.confirm.deleteTitle", { singular: t(cfg.singular) }),
+    message: t("common.confirm.deleteMsg", { singular: t(cfg.singular) }),
+    target: t("common.confirm.target", { nav: t(cfg.nav), label, id: record.id }),
+    confirmText: t("common.action.delete"),
   });
   if (!ok) return;
   try {
     await writeAndReload(() => api("DELETE", `${cfg.path}/${record.id}`));
     (cfg.clearsFK || []).forEach(invalidateFK);
-    toast(`Deleted ${cfg.singular}`, "ok");
+    toast(t("common.toast.deleted", { singular: t(cfg.singular) }), "ok");
     await loadEntity(CURRENT);
   } catch (e) {
-    toast(e.message, "err", { title: `Failed to delete ${cfg.singular}` });
+    toast(e.message, "err", { title: t("common.toast.failedDelete", { singular: t(cfg.singular) }) });
   }
 }
 
@@ -906,22 +907,22 @@ function renderAuthCache() {
   clear(content);
   const panel = el("div", { class: "panel" },
     el("div", { class: "panel-head" },
-      el("h2", {}, el("span", { text: "Auth Cache" })), el("div", { class: "spacer" })),
+      el("h2", {}, el("span", { text: t("custom.authcache.title") })), el("div", { class: "spacer" })),
     el("p", { class: "note" },
-      "Invalidation forces the next request for the given key/tenant to re-authenticate against ",
-      el("code", { text: "tenant.auth_url" }), ". Leave both blank to clear everything."),
+      t("custom.authcache.desc"), " ",
+      el("code", { text: "tenant.auth_url" }), t("custom.authcache.desc2")),
     el("div", { class: "field-row" },
       el("div", { class: "input-group" },
-        el("label", { text: "tenant_id (optional)" }),
+        el("label", { text: t("custom.authcache.tenantLabel") }),
         el("input", { type: "text", id: "inv-tenant", placeholder: "e.g. t1" }),
       ),
       el("div", { class: "input-group" },
-        el("label", { text: "api_keys (comma-separated, optional)" }),
+        el("label", { text: t("custom.authcache.keysLabel") }),
         el("input", { type: "text", id: "inv-keys", placeholder: "sk-aaa, sk-bbb" }),
       ),
     ),
     el("div", { style: "margin-top:14px" },
-      el("button", { class: "btn primary", onClick: doInvalidate }, icon("trash", 15), " Invalidate"),
+      el("button", { class: "btn primary", onClick: doInvalidate }, icon("trash", 15), " " + t("custom.authcache.invalidate")),
     ),
     el("div", { id: "inv-result", class: "hidden", style: "margin-top:14px" }),
   );
@@ -932,17 +933,18 @@ async function doInvalidate() {
   const tenant = $("#inv-tenant").value.trim();
   const keysRaw = $("#inv-keys").value.trim();
   const keys = keysRaw ? keysRaw.split(",").map((s) => s.trim()).filter(Boolean) : null;
-  if (!tenant && !keys) { toast("Provide tenant_id and/or api_keys", "err"); return; }
+  if (!tenant && !keys) { toast(t("common.token.provide"), "err"); return; }
   const body = {};
   if (tenant) body.tenant_id = tenant;
   if (keys) body.api_keys = keys;
   const box = $("#inv-result");
+  const invalidatedMsg = (n) => t("common.token.invalidated", { n, y: n === 1 ? "y" : "ies" });
   try {
     const r = await api("DELETE", "/auth/cache", { body });
     box.className = "alert ok";
-    box.textContent = `Invalidated ${r.invalidated} entr${r.invalidated === 1 ? "y" : "ies"}.`;
+    box.textContent = invalidatedMsg(r.invalidated) + ".";
     box.classList.remove("hidden");
-    toast(`Invalidated ${r.invalidated} entr${r.invalidated === 1 ? "y" : "ies"}`, "ok");
+    toast(invalidatedMsg(r.invalidated), "ok");
   } catch (e) {
     box.className = "alert err";
     box.textContent = e.message;
@@ -959,25 +961,25 @@ function renderBreaker() {
   clear(content);
   const panel = el("div", { class: "panel" },
     el("div", { class: "panel-head" },
-      el("h2", {}, el("span", { text: "Dead-set" }), " ", el("span", { class: "count", id: "breaker-count", text: "" })),
+      el("h2", {}, el("span", { text: t("custom.breaker.title") }), " ", el("span", { class: "count", id: "breaker-count", text: "" })),
       el("div", { class: "spacer" }),
-      el("button", { class: "btn sm", onClick: loadBreaker }, icon("refresh", 14), el("span", { class: "btn-label", text: "Refresh" })),
+      el("button", { class: "btn sm", onClick: loadBreaker }, icon("refresh", 14), el("span", { class: "btn-label", text: t("common.action.refresh") })),
     ),
-    el("p", { class: "note" }, "Dead providers are excluded from candidate selection. A background probe revives them; force a reset here."),
+    el("p", { class: "note" }, t("custom.breaker.desc")),
     el("div", { id: "breaker-table-wrap" }),
   );
   content.appendChild(panel);
   // manual reset form
   content.appendChild(el("div", { class: "panel" },
-    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: "Force reset" }))),
+    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("custom.breaker.forceReset") }))),
     el("div", { class: "field-row" },
       el("div", { class: "input-group" },
-        el("label", { text: "provider_id" }),
-        el("input", { type: "text", id: "breaker-reset-id", placeholder: "provider_id" }),
+        el("label", { text: t("custom.breaker.providerId") }),
+        el("input", { type: "text", id: "breaker-reset-id", placeholder: t("custom.breaker.providerId") }),
       ),
     ),
     el("div", { style: "margin-top:12px" },
-      el("button", { class: "btn primary", onClick: resetBreakerById }, icon("refresh", 15), " Reset"),
+      el("button", { class: "btn primary", onClick: resetBreakerById }, icon("refresh", 15), " " + t("custom.breaker.reset")),
     ),
   ));
   loadBreaker();
@@ -994,17 +996,17 @@ async function loadBreaker() {
   const cnt = $("#breaker-count"); if (cnt) cnt.textContent = String(dead.length);
   clear(wrap);
   if (!dead.length) {
-    wrap.appendChild(emptyState("check", "No dead providers", "All candidates are selectable."));
+    wrap.appendChild(emptyState("check", t("custom.breaker.emptyTitle"), t("custom.breaker.emptyMsg")));
     return;
   }
   wrap.appendChild(el("div", { class: "table-wrap" },
     el("table", {},
-      el("thead", {}, el("tr", {}, el("th", { text: "provider_id" }), el("th", { text: "state" }), el("th", { text: "" }))),
+      el("thead", {}, el("tr", {}, el("th", { text: t("custom.breaker.providerId") }), el("th", { text: t("custom.breaker.state") }), el("th", { text: "" }))),
       el("tbody", {}, ...dead.map((pid) =>
         el("tr", {},
           el("td", {}, el("span", { class: "mono", text: pid })),
-          el("td", {}, el("span", { class: "pill dead", text: "DEAD" })),
-          el("td", { class: "actions" }, iconBtn("refresh", "Reset", () => resetBreaker(pid))),
+          el("td", {}, el("span", { class: "pill dead", text: t("custom.breaker.dead") })),
+          el("td", { class: "actions" }, iconBtn("refresh", t("common.action.reset"), () => resetBreaker(pid))),
         ),
       )),
     ),
@@ -1013,13 +1015,13 @@ async function loadBreaker() {
 async function resetBreaker(id) {
   try {
     await api("DELETE", `/breaker/${encodeURIComponent(id)}`);
-    toast(`Reset ${id}`, "ok");
+    toast(t("custom.breaker.resetToast", { id }), "ok");
     await loadBreaker();
   } catch (e) { toast(e.message, "err"); }
 }
 async function resetBreakerById() {
   const id = $("#breaker-reset-id").value.trim();
-  if (!id) { toast("provider id required", "err"); return; }
+  if (!id) { toast(t("custom.breaker.required"), "err"); return; }
   await resetBreaker(id);
   const inp = $("#breaker-reset-id"); if (inp) inp.value = "";
 }
@@ -1033,17 +1035,17 @@ async function renderHealth() {
   // actions
   clear($("#page-actions"));
   $("#page-actions").appendChild(el("button", { class: "btn sm", onClick: renderHealth },
-    icon("refresh", 14), el("span", { class: "btn-label", text: "Refresh" })));
+    icon("refresh", 14), el("span", { class: "btn-label", text: t("common.action.refresh") })));
 
   content.appendChild(el("div", { class: "panel" },
-    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: "Status" })), el("div", { class: "spacer" })),
+    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("custom.health.status") })), el("div", { class: "spacer" })),
     el("div", { class: "stat-grid", id: "health-stats" },
       el("span", { class: "skeleton", style: "width:100%;height:60px" }),
     ),
   ));
   // Whole-cluster view (cluster P4): fleet nodes + lease holder.
   content.appendChild(el("div", { class: "panel" },
-    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: "Cluster" })), el("div", { class: "spacer" })),
+    el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("custom.health.cluster") })), el("div", { class: "spacer" })),
     el("div", { class: "stat-grid", id: "cluster-stats" },
       el("span", { class: "skeleton", style: "width:100%;height:60px" }),
     ),
@@ -1069,34 +1071,34 @@ function renderClusterStatus(c) {
   clear(stats); clear(nodes);
   if (!c || !c.cluster) {
     stats.appendChild(el("div", { class: "stat" },
-      el("div", { class: "sl", text: "mode" }), el("div", { class: "sv", text: "single-node" })));
+      el("div", { class: "sl", text: t("custom.health.mode") }), el("div", { class: "sv", text: t("custom.health.singleNode") })));
     nodes.appendChild(el("p", { class: "muted",
-      text: "集群模式未启用（HYDRA_ROLE 未设置）—— 本页仅显示本节点状态。" }));
+      text: t("custom.health.clusterNotEnabled") }));
     return;
   }
   const alive = c.nodes.filter((n) => n.alive).length;
   const cards = [
-    { l: "mode", v: c.mode, cls: "" },
-    { l: "lease holder", v: c.lease_holder ?? "—", cls: c.lease_holder ? "ok" : "warn" },
-    { l: "nodes alive", v: `${alive}/${c.nodes.length}`, cls: alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn" },
-    { l: "self", v: c.node_id || "—", cls: "" },
+    { l: t("custom.health.mode"), v: c.mode, cls: "" },
+    { l: t("custom.health.leaseHolder"), v: c.lease_holder ?? "—", cls: c.lease_holder ? "ok" : "warn" },
+    { l: t("custom.health.nodesAlive"), v: `${alive}/${c.nodes.length}`, cls: alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn" },
+    { l: t("custom.health.self"), v: c.node_id || "—", cls: "" },
   ];
   for (const k of cards) stats.appendChild(el("div", { class: `stat ${k.cls}` },
     el("div", { class: "sl", text: k.l }), el("div", { class: "sv", text: String(k.v) })));
 
-  const th = (t) => el("th", { text: t });
-  const rows = [el("tr", {}, th("NODE"), th("ROLE"), th("CONTROL URL"), th("STATE"))];
+  const th = (label) => el("th", { text: label });
+  const rows = [el("tr", {}, th(t("custom.health.node")), th(t("custom.health.role")), th(t("custom.health.controlUrl")), th(t("custom.health.state")))];
   for (const n of c.nodes) {
     const name = el("span", { text: n.node_id });
-    if (n.is_self) name.appendChild(el("span", { class: "pill info", text: "self" }));
-    if (n.is_lease_holder) name.appendChild(el("span", { class: "pill ok", text: "active" }));
+    if (n.is_self) name.appendChild(el("span", { class: "pill info", text: t("custom.health.selfPill") }));
+    if (n.is_lease_holder) name.appendChild(el("span", { class: "pill ok", text: t("custom.health.activePill") }));
     rows.push(el("tr", {},
       el("td", {}, name),
       el("td", {}, el("span", { class: `pill ${n.role === "leader" ? "info" : "warn"}`, text: n.role })),
       el("td", { class: "mono" }, n.control_url || "—"),
       el("td", {}, n.alive
-        ? el("span", { class: "pill ok", text: "alive" })
-        : el("span", { class: "pill dead", text: "down" })),
+        ? el("span", { class: "pill ok", text: t("custom.health.alivePill") })
+        : el("span", { class: "pill dead", text: t("custom.health.downPill") })),
     ));
   }
   nodes.appendChild(el("div", { class: "table-wrap" },
@@ -1107,11 +1109,11 @@ function renderHealthStats(h) {
   clear(grid);
   const up = (h.status === "ok" || h.status === "healthy" || h.status === "up");
   const cards = [
-    { l: "status", v: h.status ?? "—", cls: up ? "ok" : "err" },
-    { l: "db", v: h.db ?? "—", cls: h.db === "ok" ? "ok" : "err" },
-    { l: "breaker dead", v: fmtNum(h.breaker_dead), cls: "" },
-    { l: "tenants", v: fmtNum(h.tenants), cls: "" },
-    { l: "providers", v: fmtNum(h.providers), cls: "" },
+    { l: t("custom.health.statusVal"), v: h.status ?? "—", cls: up ? "ok" : "err" },
+    { l: t("custom.health.db"), v: h.db ?? "—", cls: h.db === "ok" ? "ok" : "err" },
+    { l: t("custom.health.breakerDead"), v: fmtNum(h.breaker_dead), cls: "" },
+    { l: t("custom.health.tenants"), v: fmtNum(h.tenants), cls: "" },
+    { l: t("custom.health.providers"), v: fmtNum(h.providers), cls: "" },
   ];
   for (const c of cards) grid.appendChild(el("div", { class: `stat ${c.cls}` },
     el("div", { class: "sl", text: c.l }), el("div", { class: "sv", text: String(c.v) })));
@@ -1138,27 +1140,33 @@ function showLogin() {
   $("#login-overlay").classList.remove("hidden");
   $("#app").setAttribute("aria-hidden", "true");
   const ts = $("#token-status");
-  ts.classList.remove("ok"); ts.classList.add("bad"); ts.querySelector(".t").textContent = "not authenticated";
+  ts.classList.remove("ok"); ts.classList.add("bad");
+  const tEl = ts.querySelector(".t");
+  tEl.dataset.i18n = "common.auth.notAuthenticated";
+  tEl.textContent = t("common.auth.notAuthenticated");
   const inp = $("#login-token"); inp.value = ""; setTimeout(() => inp.focus(), 50);
 }
 async function tryLogin(token) {
   TOKEN = token;
   const btn = $("#login-btn");
-  setLoading(btn, true, "Signing in…");
+  setLoading(btn, true, t("common.auth.signingIn"));
   try {
     await api("GET", "/health");
     document.body.dataset.state = "ready";
     $("#login-overlay").classList.add("hidden");
     $("#app").setAttribute("aria-hidden", "false");
     const ts = $("#token-status");
-    ts.classList.remove("bad"); ts.classList.add("ok"); ts.querySelector(".t").textContent = "authenticated";
+    ts.classList.remove("bad"); ts.classList.add("ok");
+    const tEl = ts.querySelector(".t");
+    tEl.dataset.i18n = "common.auth.authenticated";
+    tEl.textContent = t("common.auth.authenticated");
     renderNav();
     go(CURRENT);
-    toast("Signed in", "ok");
+    toast(t("common.toast.signedIn"), "ok");
   } catch (e) {
     TOKEN = null;
     const err = $("#login-error");
-    err.textContent = `Authentication failed: ${e.message}`;
+    err.textContent = t("common.auth.failed", { msg: e.message });
     err.classList.remove("hidden");
   } finally {
     setLoading(btn, false);
@@ -1181,7 +1189,7 @@ function wireEvents() {
     try {
       const r = await api("POST", "/reload", { body: {} });
       const n = (p) => (p === undefined ? "" : ` ${p}`);
-      toast(`Reloaded${n(r?.providers)} providers,${n(r?.tenants)} tenants`, "ok", { title: "Config reloaded" });
+      toast(t("common.toast.reloaded", { providers: n(r?.providers), tenants: n(r?.tenants) }), "ok", { title: t("common.toast.configReloaded") });
       await loadEntity(CURRENT);
     } catch (e) { toast(e.message, "err"); }
   });
@@ -1189,9 +1197,26 @@ function wireEvents() {
     document.body.classList.toggle("nav-open");
   });
   $("#sidebar-scrim").addEventListener("click", closeSidebar);
+  const langSel = $("#lang-select");
+  if (langSel) {
+    langSel.value = currentLang();
+    langSel.addEventListener("change", (e) => setLang(e.target.value));
+  }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  // Language switch hook (set by i18n.js's setLang): re-render the static
+  // shell, the nav and the current page. A modal is closed first so a form
+  // never shows a mix of languages.
+  window.__onLangChanged = (code) => {
+    closeModal();
+    applyStaticI18n();
+    const sel = $("#lang-select");
+    if (sel) sel.value = code;
+    renderNav();
+    go(CURRENT);
+  };
   wireEvents();
+  applyStaticI18n();
   showLogin();
 });

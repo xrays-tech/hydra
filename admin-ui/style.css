@@ -256,6 +256,13 @@ body[data-state="ready"] #login-overlay { display: none; }
 .topbar-title h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 .topbar-title p { margin: 1px 0 0; font-size: 12.5px; }
 .topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.topbar-lang { display: flex; align-items: center; margin-left: auto; margin-right: 10px; }
+.topbar-lang select {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.topbar-lang select:hover { border-color: var(--border-2); }
 
 .content { padding: 22px 24px 60px; max-width: 1320px; width: 100%; }
 

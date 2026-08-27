@@ -208,9 +208,31 @@ mod tests {
         let stats_pos = body
             .find("<script src=\"/admin/stats.js\">")
             .unwrap_or_else(|| panic!("index.html must load stats.js"));
+        // i18n.js defines the globals t()/setLang()/applyStaticI18n() that
+        // every other script uses at load/render time, so it must come FIRST.
+        let i18n_pos = body
+            .find("<script src=\"/admin/i18n.js\">")
+            .unwrap_or_else(|| panic!("index.html must load i18n.js"));
+        assert!(
+            i18n_pos < docs_pos && i18n_pos < stats_pos && i18n_pos < app_pos,
+            "i18n.js must load before api-docs.js / stats.js / app.js"
+        );
         assert!(
             docs_pos < app_pos && stats_pos < app_pos,
             "api-docs.js and stats.js must load before app.js (app.js top level reads renderApiDocs / renderStats)"
         );
+    }
+
+    #[test]
+    fn i18n_js_served_with_four_locales() {
+        let r = try_serve_admin("/admin/i18n.js").expect("i18n.js");
+        assert_eq!(r.status().as_u16(), 200);
+        let ct = r.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.starts_with("application/javascript"), "got {ct}");
+        let body = String::from_utf8(r.body().to_vec()).unwrap();
+        assert!(body.contains("I18N"), "i18n.js must define the I18N dictionary");
+        for marker in ["\"zh\"", "\"fr\"", "\"de\"", "\"en\""] {
+            assert!(body.contains(marker), "missing locale marker {marker}");
+        }
     }
 }

@@ -10,3 +10,4 @@ Entries are workspace records, not authoritative runtime decisions.
 | 2026-08-26 | doc | docs/design.md | 主设计文档 §20 集群模式章节（概述 + 与既有章节的索引） |
 | 2026-08-26 | doc | docs/ops.md | 运维手册 §13 集群模式运维（部署/演练/Redis 故障/已知限制） |
 | 2026-08-26 | doc | docs/deployment.md | 部署方案（单节点 / docker-compose 多节点 / K3s / K8s 多节点） |
+| 2026-08-27 | plan | docs/aegis/plans/2026-08-27-admin-ui-i18n.md | Admin-UI 多语言国际化（中/英/法/德 四语切换） |
