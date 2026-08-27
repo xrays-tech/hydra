@@ -39,7 +39,7 @@ function renderStats() {
   // skeleton
   content.appendChild(el("div", { class: "panel" },
     el("div", { class: "stat-grid", style: "grid-template-columns:repeat(auto-fit,minmax(150px,1fr))" },
-      Array.from({ length: 6 }).map(() =>
+      ...Array.from({ length: 6 }).map(() =>
         el("div", { class: "stat" },
           el("span", { class: "skeleton", style: "width:100%;height:100%;display:block" })),
       ),
