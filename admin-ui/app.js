@@ -63,6 +63,7 @@ const ICONS = {
   info:       '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
   inbox:      '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13l3.5 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6Z"/>',
   key2:       '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9"/>',
+  book:       '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/>',
 };
 function icon(name, size = 17) {
   const wrap = document.createElement("span");
@@ -434,12 +435,18 @@ const CUSTOM = {
     desc: "Live service status.",
     render: renderHealth,
   },
+  "api-docs": {
+    title: "API Docs", nav: "API Docs", icon: "book",
+    desc: "OpenAPI-style reference for every admin REST endpoint (curl / Python / TypeScript examples).",
+    render: renderApiDocs,
+  },
 };
 
 /* ordered nav with section dividers */
 const NAV = [
   { label: "Configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
   { label: "Operations", items: ["auth-cache", "breaker", "health"] },
+  { label: "Reference", items: ["api-docs"] },
 ];
 function sectionConfig(key) { return CRUD[key] || CUSTOM[key]; }
 
