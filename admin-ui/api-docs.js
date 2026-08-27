@@ -441,7 +441,7 @@ function apiDetail(e) {
     root.appendChild(el("h4", { text: "Parameters" }));
     root.appendChild(el("table", { class: "api-table" },
       el("thead", {}, el("tr", {}, el("th", { text: "Name" }), el("th", { text: "In" }), el("th", { text: "Type" }), el("th", { text: "Description" }))),
-      el("tbody", {}, params.map((p) =>
+      el("tbody", {}, ...params.map((p) =>
         el("tr", {}, el("td", { class: "mono", text: p.name }), el("td", { text: p.in }), el("td", { text: p.type || "string" }), el("td", { text: p.desc || "" })))),
     ));
   }
@@ -450,12 +450,12 @@ function apiDetail(e) {
     root.appendChild(el("pre", { class: "api-code" }, JSON.stringify(e.body, null, 2)));
   }
   root.appendChild(el("h4", { text: "Responses" }));
-  root.appendChild(el("ul", { class: "api-list" }, e.resp.map((r) => el("li", { html: esc(r) }))));
+  root.appendChild(el("ul", { class: "api-list" }, ...e.resp.map((r) => el("li", { html: esc(r) }))));
   if (e.errors && e.errors.length) {
     root.appendChild(el("h4", { text: "Errors" }));
     root.appendChild(el("table", { class: "api-table" },
       el("thead", {}, el("tr", {}, el("th", { text: "Status" }), el("th", { text: "Code" }), el("th", { text: "Description" }))),
-      el("tbody", {}, e.errors.map((x) =>
+      el("tbody", {}, ...e.errors.map((x) =>
         el("tr", {}, el("td", { text: x.status }), el("td", { class: "mono", text: x.code }), el("td", { text: x.desc })))),
     ));
   }
@@ -464,7 +464,7 @@ function apiDetail(e) {
   const code = el("pre", { class: "api-code lang-example" });
   const copyBtn = el("button", { class: "btn sm api-copy", text: "Copy" });
   const bar = el("div", { class: "lang-tabs" },
-    tabs.map((l) => {
+    ...tabs.map((l) => {
       const btn = el("button", { class: "lang-tab", text: l, dataset: { lang: l } });
       btn.addEventListener("click", () => {
         tabs.forEach((t) => bar.querySelector("[data-lang=\"" + t + "\"]").classList.toggle("active", t === l));
