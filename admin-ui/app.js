@@ -649,7 +649,7 @@ function emptyState(iconName, title, msg, action) {
     el("p", { text: msg }),
   );
   if (action) body.appendChild(el("button", { class: "btn primary sm", style: "margin-top:14px",
-    onClick: action.onClick }, icon("plus", 14), action.primary));
+    onClick: action.onClick }, icon("plus", 14), el("span", { class: "btn-label", text: action.primary })));
   return body;
 }
 
