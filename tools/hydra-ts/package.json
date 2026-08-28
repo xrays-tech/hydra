@@ -1,0 +1,37 @@
+{
+  "name": "hydra-tenant-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Hydra tenant self-service auth-cache invalidation",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/client.test.js"
+  },
+  "keywords": [
+    "hydra",
+    "llm",
+    "gateway",
+    "tenant",
+    "sdk"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.3"
+  },
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  }
+}
