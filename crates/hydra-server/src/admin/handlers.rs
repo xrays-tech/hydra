@@ -973,6 +973,142 @@ pub(super) async fn tenant_model_item(
 }
 
 // ===========================================================================
+// Tenant model catalog (design-tenant-model-catalog §2.3, P1)
+// ===========================================================================
+
+/// One configured provider behind a catalog model, with its CURRENT online
+/// status (a live runtime probe, not config).
+#[derive(Serialize)]
+struct CatalogProvider {
+    provider_id: String,
+    /// True when the provider can currently route traffic for this model:
+    /// circuit-breaker open? no — weight > 0 (soft-enabled) and ≥ 1 api-key
+    /// present. False ⇒ listed for diagnosis but unroutable right now.
+    online: bool,
+}
+
+/// One model in the tenant's catalog with every configured provider behind it.
+#[derive(Serialize)]
+struct CatalogModelEntry {
+    model: String,
+    providers: Vec<CatalogProvider>,
+}
+
+/// `GET /api/v1/tenants/{tenant_id}/models` response body.
+#[derive(Serialize)]
+struct TenantModelCatalog {
+    tenant_id: String,
+    models: Vec<CatalogModelEntry>,
+}
+
+/// Read-only aggregate: every model a tenant may route, across ALL providers
+/// that serve it (design-tenant-model-catalog §2.3).
+///
+/// **View calibre** — the CONFIG full-set view (management/ops side): same
+/// gates as the data-plane catalog (hydra_core::router::accessible_models)
+/// — tenant_models whitelist (default-open), tenant_providers ∩ models_by_key,
+/// and the cfg.providers existence guard (orphan references dropped; never a
+/// bare index into cfg.providers) — but it does **not** apply the runtime
+/// online filter: a dead / weight<=0 / keyless provider is STILL listed, only
+/// flagged online:false. The data-plane GET /v1/models (and accessible_models)
+/// return the runtime online view; this endpoint exists so operators can see
+/// the full configured set and diagnose WHY a model is currently unroutable.
+/// No key-prefix binding applies (client_api_key is None on admin reads ⇒
+/// match_key_binding never fires, mirroring router::accessible_models). A
+/// model is listed as long as it keeps ≥ 1 configured AND existing
+/// (cfg.providers-present) authorised provider.
+///
+/// Tenant existence: ConfigData has NO tenant-id index (only
+/// tenants_by_domain) ⇒ scan the domain index's values for the id
+/// (domain is mandatory, exactly one row per tenant) — the presence of a
+/// tenant_providers entry is NOT a valid existence probe (a tenant with no
+/// grants is a valid tenant and returns 200 with models: []).
+///
+/// Deterministic output: models ascending, providers ascending per model.
+pub(super) async fn tenant_model_catalog(
+    state: &AdminState,
+    tenant_id: &str,
+    trace_id: &str,
+) -> Resp {
+    let snap = state.store.snapshot();
+
+    // 404 for an unknown tenant before any enumeration (see calibre note).
+    let tenant_exists = snap.tenants_by_domain.values().any(|t| t.id == tenant_id);
+    if !tenant_exists {
+        return err_json(404, "not_found", "tenant not found", trace_id);
+    }
+
+    // A tenant without any provider grants has an empty catalog — still 200
+    // (the chat path would 403 TenantForbidden; catalog semantics = no rows).
+    let Some(authorized) = snap.tenant_providers.get(tenant_id) else {
+        return ok_json(
+            200,
+            &TenantModelCatalog {
+                tenant_id: tenant_id.to_string(),
+                models: Vec::new(),
+            },
+        );
+    };
+
+    let mut models: Vec<CatalogModelEntry> = Vec::new();
+    for (model_key, serving) in &snap.models_by_key {
+        // Gate 1 — tenant_models whitelist (default-open): with a mapping, a
+        // model outside it is skipped entirely.
+        if let Some(allowed) = snap.tenant_models.get(tenant_id) {
+            if !allowed.contains(model_key) {
+                continue;
+            }
+        }
+        // Gates 2+3 — serving providers ∩ tenant-authorised providers.
+        let mut providers: Vec<CatalogProvider> = Vec::new();
+        for row in serving {
+            let pid = &row.provider_id;
+            if !authorized.contains(pid) {
+                continue;
+            }
+            // Existence guard — never a bare index into cfg.providers: a
+            // serving row referencing a provider missing from the snapshot
+            // (orphan; config::validate only Warns) is silently dropped.
+            let Some(p) = snap.providers.get(pid) else {
+                continue;
+            };
+            // online is a live probe, NOT the static filter: dead / weight<=0 /
+            // keyless providers stay listed (for diagnosis) with online=false.
+            // weight is read from the provider snapshot reference obtained by
+            // the existence guard above (Provider.weight), never bare-indexed.
+            let online = !state.breaker.is_dead(pid)
+                && p.weight > 0
+                && snap
+                    .provider_keys
+                    .get(pid)
+                    .is_some_and(|keys| !keys.is_empty());
+            providers.push(CatalogProvider {
+                provider_id: pid.clone(),
+                online,
+            });
+        }
+        // Deterministic per-model order (provider_id ascending). DB
+        // UNIQUE(key, provider_id) makes duplicates impossible at load time.
+        providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        if !providers.is_empty() {
+            models.push(CatalogModelEntry {
+                model: model_key.clone(),
+                providers,
+            });
+        }
+    }
+    // Deterministic overall order (model ascending).
+    models.sort_by(|a, b| a.model.cmp(&b.model));
+    ok_json(
+        200,
+        &TenantModelCatalog {
+            tenant_id: tenant_id.to_string(),
+            models,
+        },
+    )
+}
+
+// ===========================================================================
 // Limit roles
 // ===========================================================================
 

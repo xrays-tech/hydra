@@ -625,10 +625,11 @@ pub struct SelectedRoute {
 
 #### 6.3a 非 JSON / 无 `model` 字段路径的处理（修订 P2-C2）
 
-- **路径前缀非 `/v1/`**（如 `GET /v1/models`、健康检查、webhook 回调）或 body 无 `model` 字段：
+- **路径前缀非 `/v1/`**（如健康检查、webhook 回调）或 body 无 `model` 字段：
   - 默认策略 **`passthrough`**：不走路由算法，**按域名→租户→该租户任一可用 provider 直连**（首选权重最高且非 dead），仅做认证与限流；
   - 由配置 `[proxy] non_route_strategy = "passthrough" | "reject"` 控制；`reject` → 400；
-  - 用例：OpenAI 兼容客户端的 `GET /v1/models` 探测、`/health` 等无需 model 路由的请求。
+  - 用例：OpenAI 兼容客户端的 `/health` 等无需 model 路由的请求。
+  - **例外（新，design-tenant-model-catalog §2.2 + dev-docs/aegis/plans/2026-09-08-public-models-catalog.md）**：`GET /v1/models` 不再直通——**免认证**在本地聚合应答**该租户可调用模型目录**（跨授权 provider 并集 × 租户模型白名单 × 在线 provider 过滤，OpenAI 兼容形状；目录只读公开，聊天等调用仍须 api-key，出示的 key 仍走外部鉴权并按前缀绑定收窄目录）；管理面另提供只读配置全集 `GET /api/v1/tenants/{tenant_id}/models`。
 
 ### 6.4 `upstream_peer`：选择当前候选
 

@@ -165,6 +165,26 @@ async fn admin_unknown_path_404() {
         .starts_with("hydra"));
 }
 
+#[tokio::test]
+async fn tenant_models_path_rejects_non_get() {
+    // The tenant model catalog endpoint is GET-only: a POST on the same path
+    // (design-tenant-model-catalog §2.3 route branch guards method == GET)
+    // must fall through to the generic deep-path 404, never reach the handler.
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants/t1/models",
+        Some(TOKEN),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(r.status(), 404);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
 // ===========================================================================
 // §2.2 — provider CRUD (incl. UNIQUE conflict + reload snapshot)
 // ===========================================================================
@@ -825,6 +845,17 @@ async fn edge_admin_probes_only() {
     assert_eq!(r.status(), 404, "edge has no CRUD POST");
     let r = req(port, reqwest::Method::GET, "/admin/", None, None).await;
     assert_eq!(r.status(), 404, "edge has no admin UI");
+    // The read-only model-catalog endpoint is admin API too ⇒ 404 on edge
+    // (edge short-circuits BEFORE the token gate / router).
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1/models",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 404, "edge has no tenant model catalog");
 }
 
 // ===========================================================================
@@ -1426,4 +1457,423 @@ async fn provider_key_bindings_crud_http() {
     )
     .await;
     assert_eq!(r.status(), 204);
+}
+
+// ===========================================================================
+// §2.10 — tenant model catalog (design-tenant-model-catalog §2.3, P1):
+// GET /api/v1/tenants/{tenant_id}/models — read-only config-full-set view.
+// ===========================================================================
+
+const CAT_NOW: &str = "2026-01-01 00:00:00";
+
+/// Direct-repo provider insert (fixture row: weight as given).
+async fn cat_seed_provider(state: &AdminState, id: &str, key: &str, weight: i32) {
+    repo::insert_provider(
+        state.db(),
+        &hydra_core::model::Provider {
+            id: id.into(),
+            key: key.into(),
+            name: key.into(),
+            endpoint: format!("https://api.{key}.example.com"),
+            weight,
+            created_at: CAT_NOW.into(),
+            updated_at: CAT_NOW.into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("insert provider");
+}
+
+/// Direct-repo provider_model insert.
+async fn cat_seed_model(state: &AdminState, id: &str, key: &str, provider_id: &str, status: i32) {
+    repo::insert_provider_model(
+        state.db(),
+        &hydra_core::model::ProviderModel {
+            id: id.into(),
+            key: key.into(),
+            name: key.into(),
+            provider_id: provider_id.into(),
+            status,
+        },
+    )
+    .await
+    .expect("insert provider_model");
+}
+
+/// Direct-repo provider_key insert (plaintext sealed at the repo boundary).
+async fn cat_seed_key(state: &AdminState, id: &str, provider_id: &str) {
+    repo::insert_provider_key(
+        state.db(),
+        state.key_provider.as_ref(),
+        &hydra_core::model::ProviderKey {
+            id: id.into(),
+            provider_id: provider_id.into(),
+            api_key: format!("sk-{provider_id}"),
+            created_at: CAT_NOW.into(),
+        },
+    )
+    .await
+    .expect("insert provider_key");
+}
+
+/// Direct-repo tenant insert (domain lowercased by the loader).
+async fn cat_seed_tenant(state: &AdminState, id: &str, domain: &str) {
+    repo::insert_tenant(
+        state.db(),
+        &hydra_core::model::Tenant {
+            id: id.into(),
+            name: id.into(),
+            domain: domain.into(),
+            auth_url: "https://auth.example.com/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: CAT_NOW.into(),
+            updated_at: CAT_NOW.into(),
+        },
+    )
+    .await
+    .expect("insert tenant");
+}
+
+async fn cat_seed_tenant_provider(
+    state: &AdminState,
+    id: &str,
+    tenant_id: &str,
+    provider_id: &str,
+) {
+    repo::insert_tenant_provider(
+        state.db(),
+        &hydra_core::model::TenantProvider {
+            id: id.into(),
+            tenant_id: tenant_id.into(),
+            provider_id: provider_id.into(),
+        },
+    )
+    .await
+    .expect("insert tenant_provider");
+}
+
+async fn cat_seed_tenant_model(state: &AdminState, id: &str, tenant_id: &str, model_key: &str) {
+    repo::insert_tenant_model(
+        state.db(),
+        &hydra_core::model::TenantModel {
+            id: id.into(),
+            tenant_id: tenant_id.into(),
+            model_key: model_key.into(),
+        },
+    )
+    .await
+    .expect("insert tenant_model");
+}
+
+/// Fetch one model entry (by model key) from the catalog JSON.
+fn cat_entry<'a>(body: &'a serde_json::Value, model: &str) -> &'a serde_json::Value {
+    body["models"]
+        .as_array()
+        .expect("models array")
+        .iter()
+        .find(|e| e["model"] == model)
+        .unwrap_or_else(|| panic!("model {model} missing from catalog"))
+}
+
+#[tokio::test]
+async fn tenant_model_catalog_config_view() {
+    let state = admin_state().await;
+
+    // Providers: pA live · pB breaker-dead below · pC weight=0 (soft-disabled) ·
+    // pD keyless. All four are authorised to tenant t1.
+    cat_seed_provider(&state, "pA", "openai", 1).await;
+    cat_seed_provider(&state, "pB", "anthropic", 1).await;
+    cat_seed_provider(&state, "pC", "azure", 0).await;
+    cat_seed_provider(&state, "pD", "local", 1).await;
+
+    // Tenant t1 (catalog target) + t2 (exists, no grants — control).
+    cat_seed_tenant(&state, "t1", "acme.test").await;
+    cat_seed_tenant(&state, "t2", "other.test").await;
+
+    // Models (all status=1 except `offline`): `union` is served by pA+pB+pD,
+    // `echo` is served but NOT whitelisted, `offline` is whitelisted but the
+    // loader excludes status!=1 rows from models_by_key.
+    cat_seed_model(&state, "m1", "alpha", "pA", 1).await;
+    cat_seed_model(&state, "m2", "beta", "pB", 1).await;
+    cat_seed_model(&state, "m3", "gamma", "pC", 1).await;
+    cat_seed_model(&state, "m4", "delta", "pD", 1).await;
+    cat_seed_model(&state, "m5", "union", "pA", 1).await;
+    cat_seed_model(&state, "m6", "union", "pB", 1).await;
+    cat_seed_model(&state, "m7", "union", "pD", 1).await;
+    cat_seed_model(&state, "m8", "echo", "pA", 1).await;
+    cat_seed_model(&state, "m9", "offline", "pA", 0).await;
+
+    // tenant_providers: t1 → all four providers.
+    for pid in ["pA", "pB", "pC", "pD"] {
+        cat_seed_tenant_provider(&state, &format!("tp-{pid}"), "t1", pid).await;
+    }
+    // tenant_models whitelist for t1 = SUBSET: alpha/beta/gamma/delta/union +
+    // `offline` (which can never appear — no status==1 row). `echo` is served
+    // but outside the whitelist ⇒ must be filtered.
+    for key in ["alpha", "beta", "gamma", "delta", "union", "offline"] {
+        cat_seed_tenant_model(&state, &format!("tm-{key}"), "t1", key).await;
+    }
+
+    // provider_keys: pA, pB and pC have keys; pD is keyless.
+    cat_seed_key(&state, "k-a", "pA").await;
+    cat_seed_key(&state, "k-b", "pB").await;
+    cat_seed_key(&state, "k-c", "pC").await;
+
+    // Trip the breaker for pB (threshold=2 in the fixture).
+    state.breaker.on_failure("pB");
+    state.breaker.on_failure("pB");
+    assert!(state.breaker.is_dead("pB"));
+
+    // Publish the seeded rows into the live snapshot (repo writes bypass the
+    // store; the admin endpoints reload on write, but direct inserts don't).
+    state.store.reload_all().await.expect("reload_all");
+
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1/models",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["tenant_id"], "t1");
+
+    let models = body["models"].as_array().expect("models array");
+    // Deterministic ordering: model ascending.
+    let keys: Vec<&str> = models
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["alpha", "beta", "delta", "gamma", "union"]);
+
+    // alpha — served by live pA only ⇒ online.
+    let e = cat_entry(&body, "alpha");
+    assert_eq!(e["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(e["providers"][0]["provider_id"], "pA");
+    assert_eq!(e["providers"][0]["online"], true);
+
+    // beta — breaker-dead pB: still LISTED (config view) but online=false.
+    let e = cat_entry(&body, "beta");
+    assert_eq!(e["providers"][0]["provider_id"], "pB");
+    assert_eq!(e["providers"][0]["online"], false);
+
+    // gamma — weight=0 provider: listed, online=false.
+    let e = cat_entry(&body, "gamma");
+    assert_eq!(e["providers"][0]["provider_id"], "pC");
+    assert_eq!(e["providers"][0]["online"], false);
+
+    // delta — keyless provider: listed, online=false.
+    let e = cat_entry(&body, "delta");
+    assert_eq!(e["providers"][0]["provider_id"], "pD");
+    assert_eq!(e["providers"][0]["online"], false);
+
+    // union — cross-provider union incl. unroutable members, providers sorted.
+    let e = cat_entry(&body, "union");
+    let provs = e["providers"].as_array().expect("providers array");
+    let ids: Vec<&str> = provs
+        .iter()
+        .map(|p| p["provider_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["pA", "pB", "pD"],
+        "providers ascending, union kept"
+    );
+    assert_eq!(provs[0]["online"], true); // pA live
+    assert_eq!(provs[1]["online"], false); // pB dead
+    assert_eq!(provs[2]["online"], false); // pD keyless
+
+    // Whitelist filtering: `echo` is served by an authorised provider but not
+    // whitelisted ⇒ absent. `offline` (status=0) never enters models_by_key ⇒
+    // absent even though whitelisted.
+    assert!(body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["model"] != "echo"));
+    assert!(body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["model"] != "offline"));
+}
+
+/// Unknown tenant ⇒ 404 (existence decided by scanning tenants_by_domain, NOT
+/// by the presence of a tenant_providers entry).
+#[tokio::test]
+async fn tenant_model_catalog_unknown_tenant_404() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/no-such-tenant/models",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 404);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+/// A tenant that EXISTS but has no tenant_providers entry is a valid tenant:
+/// 200 with an empty catalog (catalog semantics; the chat path would 403).
+#[tokio::test]
+async fn tenant_model_catalog_existing_tenant_no_grants_is_200_empty() {
+    let state = admin_state().await;
+    // One provider serves a model, but tenant t1 has no grants.
+    cat_seed_provider(&state, "pA", "openai", 1).await;
+    cat_seed_model(&state, "m1", "alpha", "pA", 1).await;
+    cat_seed_tenant(&state, "t1", "acme.test").await;
+    state.store.reload_all().await.expect("reload_all");
+
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1/models",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["tenant_id"], "t1");
+    assert_eq!(body["models"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn tenant_model_catalog_requires_admin_token() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1/models",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 401);
+}
+
+/// Existence-guard regression at the handler: a snapshot whose models_by_key
+/// references a provider MISSING from cfg.providers (an orphan row — reachable
+/// at load, config::validate only Warns) must be silently dropped via
+/// cfg.providers.get(P) — never a bare index panic. Built snapshot-fed because
+/// the DB FK + ON DELETE CASCADE cannot produce orphans (design §2.3 note).
+#[tokio::test]
+async fn tenant_model_catalog_orphan_provider_row_dropped() {
+    use std::collections::{HashMap, HashSet};
+    let mut cfg = hydra_core::config::ConfigData::default();
+    cfg.tenants_by_domain.insert(
+        "acme.test".into(),
+        hydra_core::model::Tenant {
+            id: "t1".into(),
+            name: "T1".into(),
+            domain: "acme.test".into(),
+            auth_url: "https://auth.example.com/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: CAT_NOW.into(),
+            updated_at: CAT_NOW.into(),
+        },
+    );
+    let mut tenant_providers: HashMap<String, HashSet<String>> = HashMap::new();
+    tenant_providers.insert(
+        "t1".into(),
+        ["ghost", "real"].iter().map(|s| s.to_string()).collect(),
+    );
+    cfg.tenant_providers = tenant_providers;
+    let mut tenant_models: HashMap<String, HashSet<String>> = HashMap::new();
+    tenant_models.insert(
+        "t1".into(),
+        ["ghost-model", "real-model"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    cfg.tenant_models = tenant_models;
+    cfg.providers.insert(
+        "real".into(),
+        hydra_core::model::Provider {
+            id: "real".into(),
+            key: "real".into(),
+            name: "Real".into(),
+            endpoint: "https://api.real.example.com".into(),
+            weight: 1,
+            created_at: CAT_NOW.into(),
+            updated_at: CAT_NOW.into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    );
+    cfg.provider_keys
+        .insert("real".into(), vec!["sk-real".into()]);
+    cfg.models_by_key.insert(
+        "ghost-model".into(),
+        vec![hydra_core::config::ModelProvider {
+            provider_id: "ghost".into(),
+            weight: 0,
+        }],
+    );
+    cfg.models_by_key.insert(
+        "real-model".into(),
+        vec![hydra_core::config::ModelProvider {
+            provider_id: "real".into(),
+            weight: 1,
+        }],
+    );
+
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::from_snapshot(cfg, key_provider.clone());
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let state = Arc::new(AdminState::new(
+        None,
+        store,
+        auth,
+        breaker,
+        key_provider,
+        Some(TOKEN.to_string()),
+        None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None,
+        None,
+    ));
+    let port = start_admin(state);
+
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t1/models",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "orphan row must not panic the handler");
+    let body: serde_json::Value = r.json().await.expect("json");
+    let models = body["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 1, "only the existing-provider model survives");
+    assert_eq!(models[0]["model"], "real-model");
+    assert_eq!(models[0]["providers"][0]["provider_id"], "real");
+    assert_eq!(models[0]["providers"][0]["online"], true);
 }

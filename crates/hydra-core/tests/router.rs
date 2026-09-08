@@ -1,4 +1,5 @@
-//! T2.1–T2.11 — pure `router::resolve`.
+//! T2.1–T2.16 — pure `router::resolve`; C1–C7 — `accessible_models`
+//! (tenant model catalog, design §2.1 — the resolve gates as an all-set).
 //!
 //! `resolve` computes the candidate set for one `(tenant, model_key)` against a
 //! config snapshot and a breaker view. Pipeline (design §7.1):
@@ -13,7 +14,8 @@ use std::collections::HashSet;
 use hydra_core::breaker::{Breaker, BreakerConfig};
 use hydra_core::config::{ConfigData, ModelProvider};
 use hydra_core::model::{Provider, RouteError, Tenant};
-use hydra_core::router::resolve;
+use hydra_core::router::CatalogEntry;
+use hydra_core::router::{accessible_models, resolve};
 
 fn provider(id: &str, weight: i32) -> Provider {
     Provider {
@@ -413,5 +415,320 @@ fn resolve_key_binding_no_match_no_restriction() {
     assert_eq!(
         resolve_set(&cands2),
         HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()])
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C1–C7 — pure `accessible_models` (design §2.1: tenant model catalog).
+// Same fixtures/builders as the resolve tests above; `tenant_id` = "t_acme".
+// ---------------------------------------------------------------------------
+
+/// C1 — tenant without a `tenant_providers` entry (or unknown tenant) ⇒ empty
+/// catalog. No error: per-request resolve would 403 TenantForbidden, but the
+/// catalog semantics is an empty list.
+#[test]
+fn catalog_tenant_without_providers_empty() {
+    let mut cfg = base_cfg();
+    cfg.tenant_providers.remove("t_acme");
+    let b = alive_breaker();
+    assert!(
+        accessible_models(&cfg, &b, "t_acme", None).is_empty(),
+        "no tenant_providers → empty catalog"
+    );
+    let cfg2 = base_cfg();
+    assert!(
+        accessible_models(&cfg2, &b, "t_unknown", None).is_empty(),
+        "unknown tenant id → empty catalog"
+    );
+}
+
+/// C2 — tenant_models whitelist filters models out; default-open (no mapping)
+/// admits every served model.
+#[test]
+fn catalog_whitelist_filter_and_default_open() {
+    let mut cfg = base_cfg();
+    cfg.models_by_key.insert(
+        "gpt-5".into(),
+        vec![ModelProvider {
+            provider_id: "p_a".into(),
+            weight: 1,
+        }],
+    );
+    let b = alive_breaker();
+    // Whitelist {gpt-4o} present ⇒ gpt-5 is skipped.
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(entries.len(), 1, "whitelist keeps only gpt-4o");
+    assert_eq!(entries[0].model, "gpt-4o");
+    // Drop the mapping ⇒ default-open: both served models are listed.
+    cfg.tenant_models.remove("t_acme");
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    let models: Vec<&str> = entries.iter().map(|e| e.model.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["gpt-4o", "gpt-5"],
+        "default-open lists both, sorted"
+    );
+}
+
+/// C3 — several providers serve one model ⇒ a single entry whose provider list
+/// is deduplicated and sorted (duplicate serving rows collapse).
+#[test]
+fn catalog_multi_provider_single_entry() {
+    let mut cfg = base_cfg();
+    // Duplicate serving row for p_a — must collapse, not duplicate.
+    cfg.models_by_key
+        .get_mut("gpt-4o")
+        .unwrap()
+        .push(ModelProvider {
+            provider_id: "p_a".into(),
+            weight: 1,
+        });
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(entries.len(), 1, "one model → one entry");
+    assert_eq!(entries[0].model, "gpt-4o");
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string()],
+        "deduped + sorted provider ids"
+    );
+}
+
+/// C4a — an api-key matching an enabled prefix binding narrows the catalog to
+/// the bound provider; a model served only by other providers drops out.
+#[test]
+fn catalog_key_binding_restricts() {
+    let mut cfg = base_cfg();
+    // gpt-5 is served only by p_b ⇒ vanishes once the key binds to p_a.
+    cfg.tenant_models
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("gpt-5".into());
+    cfg.models_by_key.insert(
+        "gpt-5".into(),
+        vec![ModelProvider {
+            provider_id: "p_b".into(),
+            weight: 1,
+        }],
+    );
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", Some("sk_aaa_123"));
+    assert_eq!(entries.len(), 1, "only gpt-4o survives binding to p_a");
+    assert_eq!(entries[0].model, "gpt-4o");
+    assert_eq!(entries[0].providers, vec!["p_a".to_string()]);
+}
+
+/// C4b — a non-matching key, a `None` key, or a disabled binding leave the
+/// catalog unrestricted (mirrors the resolve binding tests).
+#[test]
+fn catalog_key_binding_unrestricted_cases() {
+    let all = || vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string()];
+    // (a) enabled binding exists but the key does not match it.
+    let mut cfg = base_cfg();
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", Some("hk_bbb_1"));
+    assert_eq!(
+        entries[0].providers,
+        all(),
+        "non-matching key → no restriction"
+    );
+    // (b) None api-key ⇒ no restriction.
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(entries[0].providers, all(), "None key → no restriction");
+    // (c) disabled binding is ignored even when the prefix matches.
+    let mut cfg2 = base_cfg();
+    cfg2.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", false));
+    let entries = accessible_models(&cfg2, &b, "t_acme", Some("sk_aaa_123"));
+    assert_eq!(entries[0].providers, all(), "disabled binding ignored");
+}
+
+/// C5a — a breaker-dead provider is dropped from its model's entry.
+#[test]
+fn catalog_filter_dead_provider() {
+    let cfg = base_cfg();
+    let b = breaker_with_dead("p_a");
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_b".to_string(), "p_c".to_string()],
+        "dead p_a filtered out"
+    );
+}
+
+/// C5b — a soft-disabled (weight = 0) provider is dropped.
+#[test]
+fn catalog_filter_weight_zero() {
+    let mut cfg = base_cfg();
+    cfg.providers.insert("p_a".into(), provider("p_a", 0));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_b".to_string(), "p_c".to_string()],
+        "weight=0 p_a filtered out"
+    );
+}
+
+/// C5c — keyless providers are dropped; when none survive the entry (and the
+/// whole catalog) is empty rather than an error.
+#[test]
+fn catalog_filter_no_key() {
+    // (a) p_a keyless ⇒ dropped, p_b/p_c remain.
+    let mut cfg = base_cfg();
+    cfg.provider_keys.remove("p_a");
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_b".to_string(), "p_c".to_string()],
+        "keyless p_a filtered out"
+    );
+    // (b) every provider keyless ⇒ entry disappears, empty catalog (no error).
+    let mut cfg2 = base_cfg();
+    cfg2.provider_keys.clear();
+    let entries = accessible_models(&cfg2, &b, "t_acme", None);
+    assert!(entries.is_empty(), "all keyless → empty catalog");
+}
+
+/// C5d — weight is read from the `cfg.providers` snapshot (`Provider.weight`),
+/// not from the load-time mirror row in `models_by_key`.
+#[test]
+fn catalog_weight_from_provider_not_row() {
+    let mut cfg = base_cfg();
+    // The serving row still claims weight 5 for p_a, but the provider snapshot
+    // is soft-disabled (weight 0) — the snapshot must win.
+    cfg.models_by_key.get_mut("gpt-4o").unwrap()[0] = ModelProvider {
+        provider_id: "p_a".into(),
+        weight: 5,
+    };
+    cfg.providers.insert("p_a".into(), provider("p_a", 0));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_b".to_string(), "p_c".to_string()],
+        "provider snapshot weight 0 filters p_a despite row weight 5"
+    );
+}
+
+/// C6 — a serving row referencing a provider absent from `cfg.providers` (an
+/// orphan) is dropped without panicking — even when that provider is in the
+/// tenant's authorised set (config validate only Warns on orphan references).
+#[test]
+fn catalog_orphan_provider_dropped_no_panic() {
+    let mut cfg = base_cfg();
+    cfg.tenant_providers
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("ghost".into());
+    // ghost appears in gpt-4o's serving rows and is the sole provider of a
+    // whitelisted model — only the existence guard can stop it.
+    cfg.models_by_key
+        .get_mut("gpt-4o")
+        .unwrap()
+        .push(ModelProvider {
+            provider_id: "ghost".into(),
+            weight: 7,
+        });
+    cfg.models_by_key.insert(
+        "m-ghost".into(),
+        vec![ModelProvider {
+            provider_id: "ghost".into(),
+            weight: 7,
+        }],
+    );
+    cfg.tenant_models
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("m-ghost".into());
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    assert_eq!(entries.len(), 1, "orphan-only m-ghost has no entry");
+    assert_eq!(entries[0].model, "gpt-4o");
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string()],
+        "orphan ghost row dropped"
+    );
+}
+
+/// C7 — deterministic output regardless of map iteration order: entries sorted
+/// by model; each provider list sorted by provider id and deduplicated.
+#[test]
+fn catalog_deterministic_sort() {
+    let mut cfg = ConfigData::default();
+    cfg.tenant_providers.insert(
+        "t_acme".into(),
+        HashSet::from([
+            "p_a".into(),
+            "p_b".into(),
+            "p_c".into(),
+            "p_m".into(),
+            "p_z".into(),
+        ]),
+    );
+    for id in ["p_a", "p_b", "p_c", "p_m", "p_z"] {
+        cfg.providers.insert(id.into(), provider(id, 1));
+        cfg.provider_keys
+            .insert(id.into(), vec![format!("sk-{id}")]);
+    }
+    // Deliberately scrambled insertion order; providers out of order too.
+    cfg.models_by_key.insert(
+        "charlie".into(),
+        vec![
+            ModelProvider {
+                provider_id: "p_z".into(),
+                weight: 1,
+            },
+            ModelProvider {
+                provider_id: "p_a".into(),
+                weight: 1,
+            },
+            ModelProvider {
+                provider_id: "p_m".into(),
+                weight: 1,
+            },
+        ],
+    );
+    cfg.models_by_key.insert(
+        "bravo".into(),
+        vec![ModelProvider {
+            provider_id: "p_c".into(),
+            weight: 1,
+        }],
+    );
+    cfg.models_by_key.insert(
+        "alpha".into(),
+        vec![ModelProvider {
+            provider_id: "p_b".into(),
+            weight: 1,
+        }],
+    );
+    // No tenant_models mapping ⇒ default-open.
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", None);
+    let expected = vec![
+        CatalogEntry {
+            model: "alpha".into(),
+            providers: vec!["p_b".to_string()],
+        },
+        CatalogEntry {
+            model: "bravo".into(),
+            providers: vec!["p_c".to_string()],
+        },
+        CatalogEntry {
+            model: "charlie".into(),
+            providers: vec!["p_a".to_string(), "p_m".to_string(), "p_z".to_string()],
+        },
+    ];
+    assert_eq!(
+        entries, expected,
+        "entries by model asc, providers by id asc"
     );
 }

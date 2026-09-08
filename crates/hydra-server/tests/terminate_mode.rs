@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
-    UsageRecord,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
+    TenantProvider, UsageRecord,
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
@@ -1432,4 +1432,771 @@ impl RecordingSink {
     fn records(&self) -> Vec<UsageRecord> {
         self.inner.lock().unwrap().clone()
     }
+}
+
+// ===========================================================================
+// Tenant model catalog — GET /v1/models answered locally
+// (dev-docs/design-tenant-model-catalog.md §2.2, Task 2 P0)
+// ===========================================================================
+
+/// GET `url` with the given client api-key, retrying until the proxy is ready.
+/// Mirrors `send_until_ready` for the body-less catalog request.
+async fn get_until_ready(client: &reqwest::Client, url: &str, api_key: &str) -> reqwest::Response {
+    let mut last_err = None;
+    for _ in 0..60 {
+        match client
+            .get(url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .send()
+            .await
+        {
+            Ok(r) => return r,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "proxy never became ready: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+/// An external-auth MockServer that allows every key (`POST` → 200
+/// `{"status":true}`).
+async fn allowing_auth_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// (Task 2a) Whitelist filtering + cross-provider union, fully local. Two
+/// providers each serve models; the tenant's `tenant_models` whitelist is a
+/// SUBSET of the union. `GET /v1/models` must return the whitelisted union — a
+/// model served by an authorised provider but outside the whitelist never
+/// appears, while models from BOTH providers do. Zero-upstream assertion: no
+/// provider mock is mounted, and neither upstream server may record any
+/// request (wiremock records strays; the auth MockServer is separate and not
+/// counted — see terminate_mode.rs:321 precedent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_get_v1_models_union_whitelist_answered_locally() {
+    let auth_server = allowing_auth_server().await;
+    let upstream_a = MockServer::start().await;
+    let upstream_b = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    // pA serves alpha + shared; pB serves beta + shared.
+    seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
+    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
+    for (mid, pid, key) in [
+        ("m_a_alpha", "pA", "alpha"),
+        ("m_a_shared", "pA", "shared"),
+        ("m_b_beta", "pB", "beta"),
+        ("m_b_shared", "pB", "shared"),
+    ] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: key.into(),
+                name: key.into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .expect("insert provider_model");
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_provider");
+    }
+    // tenant_models whitelist = SUBSET {alpha, beta}: `shared` is served by
+    // both authorised providers yet must be filtered out; `beta` (pB-only)
+    // must still appear — proving the union spans both providers.
+    for (tmid, key) in [("tm_alpha", "alpha"), ("tm_beta", "beta")] {
+        repo::insert_tenant_model(
+            &pool,
+            &TenantModel {
+                id: tmid.into(),
+                tenant_id: "t1".into(),
+                model_key: key.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_model");
+    }
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_a",
+        "pA",
+        "sk-a",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_b",
+        "pB",
+        "sk-b",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
+    assert_eq!(resp.status(), 200, "local catalog must answer 200");
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "catalog responses must carry Content-Type: application/json"
+    );
+    assert!(
+        resp.headers().get("x-hydra-trace-id").is_some(),
+        "catalog responses must echo X-Hydra-Trace-Id"
+    );
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body,
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"beta","object":"model"}]}"#,
+        "catalog = whitelisted union across both providers, ascending; shared (outside whitelist) must be absent"
+    );
+    // Zero-upstream assertion (F10): the directory is computed locally.
+    for (label, upstream) in [("upstream_a", &upstream_a), ("upstream_b", &upstream_b)] {
+        let received = upstream.received_requests().await.expect("recording on");
+        assert!(
+            received.is_empty(),
+            "{label} must receive ZERO requests (local catalog): {}",
+            received.len()
+        );
+    }
+}
+
+/// (Task 2b — design §6 R11 pin) A NON-intercepted GET still passes through:
+/// `GET /v1/models/{model_id}` is not the exact `/v1/models` path, so it keeps
+/// the existing passthrough behaviour — the provider mock receives the GET and
+/// its body is echoed back downstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_get_v1_models_id_still_passes_through_upstream() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models/gpt-4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(r#"{"object":"list","data":[{"id":"gpt-4"}]}"#),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready(
+        &client,
+        &format!("{root}/v1/models/gpt-4"),
+        "test-client-key",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /v1/models/{{id}} must keep passing through to the upstream"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("gpt-4"),
+        "upstream body must be echoed: {body}"
+    );
+    let received = upstream.received_requests().await.expect("recording on");
+    assert!(
+        received
+            .iter()
+            .any(|r| r.method.as_str() == "GET" && r.url.path() == "/v1/models/gpt-4"),
+        "upstream must receive the GET /v1/models/gpt-4 request"
+    );
+}
+
+/// (Task 2c) The catalog shares the external-auth boundary unchanged: an
+/// unauthorised client key gets 401 from the existing auth path before any
+/// catalog computation happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_get_v1_models_unauthorised_key_returns_401() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "catalog must share the auth boundary (bad key ⇒ 401)"
+    );
+}
+
+/// (Task 2d) A tenant with NO `tenant_providers` row gets `200` with an empty
+/// `data` array (directory semantics — the catalog never errors; the per-
+/// request chat path would 403 TenantForbidden for the same tenant).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_get_v1_models_tenant_without_providers_returns_empty() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    // Config holds a live provider + model + key, but the tenant has NO
+    // tenant_providers authorisation row.
+    seed_provider(&pool, "p1", "openai", "OpenAI", &upstream.uri()).await;
+    repo::insert_provider_model(
+        &pool,
+        &ProviderModel {
+            id: "m1".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .expect("insert provider_model");
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    // NOTE: deliberately NO insert_tenant_provider here.
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-secret",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "catalog for a tenant without providers is 200 (directory semantics)"
+    );
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body, r#"{"object":"list","data":[]}"#,
+        "empty data array expected for a tenant without providers: {body}"
+    );
+}
+
+/// (Task 2e) Key-prefix binding gate: a client api-key matching an enabled
+/// prefix binding restricts the catalog to the bound provider (fail-closed).
+/// pA serves alpha + shared; pB serves beta + shared; no tenant_models rows
+/// (default-open). With key `test-client-key` bound to pA, the catalog lists
+/// only pA's models — pB's beta must be dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_get_v1_models_key_prefix_binding_restricts_providers() {
+    let auth_server = allowing_auth_server().await;
+    let upstream_a = MockServer::start().await;
+    let upstream_b = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
+    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
+    for (mid, pid, key) in [
+        ("m_a_alpha", "pA", "alpha"),
+        ("m_a_shared", "pA", "shared"),
+        ("m_b_beta", "pB", "beta"),
+        ("m_b_shared", "pB", "shared"),
+    ] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: key.into(),
+                name: key.into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .expect("insert provider_model");
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_provider");
+    }
+    // NOTE: no tenant_models rows — default-open gate.
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_a",
+        "pA",
+        "sk-a",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_b",
+        "pB",
+        "sk-b",
+    )
+    .await;
+    // Bind the client key prefix `test-client` to provider pA.
+    repo::insert_provider_key_binding(
+        &pool,
+        &ProviderKeyBinding {
+            id: "bind_test_client".into(),
+            key_prefix: "test-client".into(),
+            provider_id: "pA".into(),
+            enabled: true,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("insert provider_key_binding");
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body,
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"shared","object":"model"}]}"#,
+        "binding to pA must drop pB's beta from the catalog (fail-closed): {body}"
+    );
+}
+// ===========================================================================
+// Tenant model catalog — PUBLIC read revision (anonymous access)
+// (dev-docs/aegis/plans/2026-09-08-public-models-catalog.md §4; oracle P2-1)
+// ===========================================================================
+
+/// GET `url` with NO client api-key, retrying until the proxy is ready.
+/// Mirrors `get_until_ready` for anonymous reads of the public catalog.
+async fn get_until_ready_anonymous(client: &reqwest::Client, url: &str) -> reqwest::Response {
+    let mut last_err = None;
+    for _ in 0..60 {
+        match client.get(url).send().await {
+            Ok(r) => return r,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "proxy never became ready: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+/// HEAD `url` with NO client api-key, retrying until the proxy is ready.
+async fn head_until_ready_anonymous(client: &reqwest::Client, url: &str) -> reqwest::Response {
+    let mut last_err = None;
+    for _ in 0..60 {
+        match client.head(url).send().await {
+            Ok(r) => return r,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "proxy never became ready: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+/// (Public-read) ANONYMOUS `GET /v1/models` — no auth header at all — is
+/// answered 200 with the tenant whitelisted union, fully locally (zero
+/// upstream requests). Whitelist + default-open semantics are identical to the
+/// keyed directory; only the missing api-key 401 is lifted. Fixture mirrors
+/// `catalog_get_v1_models_union_whitelist_answered_locally` minus the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_get_v1_models_200_union_zero_upstream() {
+    let auth_server = allowing_auth_server().await;
+    let upstream_a = MockServer::start().await;
+    let upstream_b = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
+    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
+    for (mid, pid, key) in [
+        ("m_a_alpha", "pA", "alpha"),
+        ("m_a_shared", "pA", "shared"),
+        ("m_b_beta", "pB", "beta"),
+        ("m_b_shared", "pB", "shared"),
+    ] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: key.into(),
+                name: key.into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .expect("insert provider_model");
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_provider");
+    }
+    for (tmid, key) in [("tm_alpha", "alpha"), ("tm_beta", "beta")] {
+        repo::insert_tenant_model(
+            &pool,
+            &TenantModel {
+                id: tmid.into(),
+                tenant_id: "t1".into(),
+                model_key: key.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_model");
+    }
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_a",
+        "pA",
+        "sk-a",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_b",
+        "pB",
+        "sk-b",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready_anonymous(&client, &format!("{root}/v1/models")).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "anonymous catalog must answer 200 (public read, no api-key)"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "anonymous catalog responses must carry Content-Type: application/json"
+    );
+    assert!(
+        resp.headers().get("x-hydra-trace-id").is_some(),
+        "anonymous catalog responses must echo X-Hydra-Trace-Id"
+    );
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body,
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"beta","object":"model"}]}"#,
+        "anonymous catalog = whitelisted union (whitelist still applies), shared absent: {body}"
+    );
+    // Zero-upstream assertion: no auth mock POST either — the request must
+    // never hit the external-auth endpoint when no key is presented.
+    let auth_hits = auth_server.received_requests().await.expect("recording on");
+    assert!(
+        auth_hits.is_empty(),
+        "anonymous catalog must NOT call the external auth endpoint: {}",
+        auth_hits.len()
+    );
+    for (label, upstream) in [("upstream_a", &upstream_a), ("upstream_b", &upstream_b)] {
+        let received = upstream.received_requests().await.expect("recording on");
+        assert!(
+            received.is_empty(),
+            "{label} must receive ZERO requests (local anonymous catalog): {}",
+            received.len()
+        );
+    }
+}
+
+/// (Public-read, query pin) The query string is ignored for the exact path
+/// match — `GET /v1/models?client=…` without a key is still the public
+/// catalog (200), not a passthrough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_get_v1_models_query_ignored() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready_anonymous(&client, &format!("{root}/v1/models?client=1")).await;
+    assert_eq!(resp.status(), 200, "query string must be ignored: {root}");
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body, r#"{"object":"list","data":[{"id":"gpt-4","object":"model"}]}"#,
+        "anonymous catalog with query: {body}"
+    );
+    let received = upstream.received_requests().await.expect("recording on");
+    assert!(
+        received.is_empty(),
+        "catalog with query must stay local (zero upstream): {}",
+        received.len()
+    );
+}
+
+/// (Negative pin — method boundary R11) `HEAD /v1/models` is NOT the GET
+/// catalog path, so it keeps the mandatory-auth behaviour: anonymous HEAD ⇒
+/// 401 missing_api_key, no catalog, no upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_head_v1_models_still_requires_key() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = head_until_ready_anonymous(&client, &format!("{root}/v1/models")).await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "HEAD /v1/models must keep requiring an api-key (only GET is public)"
+    );
+    let received = upstream.received_requests().await.expect("recording on");
+    assert!(
+        received.is_empty(),
+        "anonymous HEAD must not reach the upstream: {}",
+        received.len()
+    );
+}
+
+/// (Negative pin) `GET /v1/models/{id}` is not the exact `/v1/models` path,
+/// so anonymous access is still rejected at the mandatory api-key gate (401)
+/// before any passthrough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_get_v1_models_id_still_requires_key() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready_anonymous(&client, &format!("{root}/v1/models/gpt-4")).await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "anonymous GET /v1/models/{{id}} must still require an api-key"
+    );
+    let received = upstream.received_requests().await.expect("recording on");
+    assert!(
+        received.is_empty(),
+        "anonymous /v1/models/{{id}} must not reach the upstream: {}",
+        received.len()
+    );
+}
+
+/// (Negative pin) A DISABLED tenant's directory is not served even
+/// anonymously: `GET /v1/models` without a key on a disabled tenant ⇒ 403
+/// tenant_disabled (the enabled gate runs before the catalog branch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_get_v1_models_disabled_tenant_403() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "p1", "openai", "OpenAI", &upstream.uri()).await;
+    repo::insert_tenant(
+        &pool,
+        &Tenant {
+            id: "t1".into(),
+            name: "t1".into(),
+            domain: "localhost".into(),
+            auth_url: format!("{}/auth", auth_server.uri()),
+            cert_key: None,
+            cert_file: None,
+            enabled: false,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("insert disabled tenant");
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    let resp = get_until_ready_anonymous(&client, &format!("{root}/v1/models")).await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "anonymous catalog on a disabled tenant must stay 403 tenant_disabled"
+    );
+}
+
+/// (Negative pin) An UNKNOWN Host domain is 404 even for the anonymous
+/// catalog: the tenant-resolution gate runs first. Sent over a raw TCP socket
+/// because reqwest owns the Host header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_public_anonymous_get_v1_models_unknown_domain_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let hostport = root.trim_start_matches("http://").to_string();
+
+    // Retry the raw connect until Pingora has bound the ephemeral port.
+    let mut status = 0u16;
+    for _ in 0..60 {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(&hostport).await {
+            let req =
+                "GET /v1/models HTTP/1.1\r\nHost: unknown.do.top\r\nConnection: close\r\n\r\n"
+                    .to_string();
+            let _ = stream.write_all(req.as_bytes()).await;
+            let mut buf = Vec::new();
+            // Bounded read: the gateway closes after the short-circuit body, but
+            // never let a lingering connection hang the test.
+            let _ =
+                tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
+            let head = String::from_utf8_lossy(&buf);
+            if let Some(line) = head.lines().next() {
+                if let Some(code) = line.split_whitespace().nth(1) {
+                    if let Ok(c) = code.parse::<u16>() {
+                        status = c;
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert_eq!(
+        status, 404,
+        "anonymous catalog on an unknown Host domain must be 404 unknown_domain"
+    );
 }

@@ -5,18 +5,24 @@
 //!
 //! The whole gateway lifecycle happens inside [`ProxyHttp::request_filter`]:
 //!
-//! 1. Domain → tenant, api-key parse, external auth (cache-first).
-//! 2. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
-//! 3. `extract_model` over the *full* body (memchr — trivial for any
+//! 1. Domain → tenant + tenant-enabled gate. `GET /v1/models` is answered
+//!    locally as the tenant model catalog right after the enabled gate:
+//!    anonymous ⇒ public 200 read; a presented key is auth-checked first
+//!    (denied ⇒ 401/403) and narrows the listing via key-prefix binding;
+//!    unknown domain ⇒ 404 / disabled tenant ⇒ 403 still apply.
+//! 2. Mandatory client api-key parse + external auth (cache-first) for every
+//!    other request (missing key ⇒ 401 `missing_api_key`).
+//! 3. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
+//! 4. `extract_model` over the *full* body (memchr — trivial for any
 //!    position/schema; the stream-through "first-chunk gamble" is gone).
-//! 4. `router::resolve` + `swrr::order` → ordered candidate list.
-//! 5. Pre-limit count gate.
-//! 6. **Failover loop**: for each candidate, build the upstream request
+//! 5. `router::resolve` + `swrr::order` → ordered candidate list.
+//! 6. Pre-limit count gate.
+//! 7. **Failover loop**: for each candidate, build the upstream request
 //!    (swap key, `/v1` rewrite, Host) via [`ProviderClient`], send it, and on
 //!    success stream the response back chunk-by-chunk through the downstream
 //!    `Session`. On failure, `breaker.on_failure` + `continue` to the next
 //!    candidate (the body is `Bytes` — O(1) clone per replay).
-//! 7. `return Ok(true)` so Pingora **never dials an upstream itself**.
+//! 8. `return Ok(true)` so Pingora **never dials an upstream itself**.
 //!
 //! `upstream_peer` is a mandatory trait method but returns a sentinel peer that
 //! is never contacted.
@@ -172,6 +178,57 @@ impl HydraProxy {
         }
         None
     }
+
+    /// Cache-first external auth boundary (§6.3 §4 / §11). Runs the
+    /// `AuthChecker`, records auth metrics (§17) and — when the verdict is
+    /// Denied — writes the structured 401/403 response body.
+    ///
+    /// Returns `Ok(true)` when the request has been answered (denied ⇒ the
+    /// caller must short-circuit), `Ok(false)` when it may proceed. Shared by
+    /// the mandatory-auth step (4) and the keyed sub-path of the tenant model
+    /// catalog (2.5) so the two can never drift.
+    async fn enforce_auth(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        tenant: &hydra_core::model::Tenant,
+        api_key: &str,
+    ) -> PingoraResult<bool> {
+        let verdict = self.state.auth.check(tenant, api_key).await;
+        ctx.auth_verdict = Some(verdict.clone());
+        // Metrics (§17): auth decision + cache size (+ upstream-error counter).
+        {
+            let src = match &verdict {
+                AuthVerdict::Allowed { source } | AuthVerdict::Denied { source, .. } => {
+                    match source {
+                        CacheSource::Hit => "hit",
+                        CacheSource::Miss => "miss",
+                        CacheSource::Local => "local",
+                    }
+                }
+            };
+            let vlabel = match &verdict {
+                AuthVerdict::Allowed { .. } => "allowed",
+                AuthVerdict::Denied { .. } => "denied",
+            };
+            crate::admin::metrics::record_auth_decision(&tenant.id, vlabel, src);
+            crate::admin::metrics::record_auth_cache_size(self.state.auth.cache().len());
+            if let AuthVerdict::Denied { reason, .. } = &verdict {
+                if *reason == "auth_upstream_unavailable" {
+                    crate::admin::metrics::record_auth_upstream_error(&tenant.id);
+                }
+            }
+        }
+        if let AuthVerdict::Denied { status, reason, .. } = &verdict {
+            let body = Bytes::from(format!(
+                "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"auth_error\"}}}}"
+            ));
+            session.set_keepalive(None);
+            session.respond_error_with_body(*status, body).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 /// Generate a per-request trace id (dependency-free, monotonic-ish). Echoed
@@ -200,16 +257,21 @@ impl ProxyHttp for HydraProxy {
     // request_filter — the FULL terminate-mode gateway lifecycle.
     // -----------------------------------------------------------------------
     //
-    // Steps (design-change §4.1):
-    //   ①  domain → tenant
-    //   ②  api-key parse
-    //   ③  external auth (cache-first) + metrics
-    //   ④  read the FULL downstream body (loop → Bytes)
-    //   ⑤  extract_model over the full body (memchr — any position/schema)
-    //   ⑥  pre-limit count gate (BEFORE routing: 429 even if routing would 503)
-    //   ⑦  router::resolve + swrr::order  (+ passthrough fallback)
-    //   ⑧  failover loop: build → send → stream-back, breaker on success/fail
-    //   ⑨  return Ok(true)  ← Pingora never dials upstream itself
+    // Steps (design-change §4.1; + tenant-model-catalog public-read revision):
+    //   (1) domain → tenant
+    //   (2) tenant enabled gate
+    //   (2.5) GET /v1/models — tenant model directory, BEFORE the mandatory
+    //         key gate: anonymous ⇒ 200 public read; a presented key must pass
+    //         external auth (denied ⇒ 401/403) and narrows the listing via
+    //         key-prefix binding; answered fully locally, never proxied.
+    //   (3) mandatory api-key parse for every other request (401 missing_api_key)
+    //   (4) external auth (cache-first) + metrics
+    //   (5) read the FULL downstream body (loop → Bytes)
+    //   (6) extract_model over the full body (memchr — any position/schema)
+    //   (7) pre-limit count gate (BEFORE routing: 429 even if routing would 503)
+    //   (8) router::resolve + swrr::order  (+ passthrough fallback)
+    //   (9) failover loop: build → send → stream-back, breaker on success/fail
+    //       then return Ok(true)  ← Pingora never dials upstream itself
     //
     // On any short-circuit we write a structured error body and return Ok(true).
     async fn request_filter(
@@ -247,46 +309,70 @@ impl ProxyHttp for HydraProxy {
         let tenant_id = tenant.id.clone();
         ctx.tenant = Some(tenant.clone());
 
-        // (3) api-key parse (§6.3 §3).
-        let api_key = Self::extract_api_key(session);
-        let api_key = match api_key {
+        // (3) Client api-key parse (§6.3 §3). Mandatory for every non-catalog
+        //     request; OPTIONAL for `GET /v1/models` where an absent key means
+        //     an anonymous read of the tenant model catalog (2.5 below).
+        let api_key_opt = Self::extract_api_key(session);
+
+        // (2.5) Tenant model catalog (design-tenant-model-catalog §2.2, P0;
+        //       public-read revision — dev-docs/aegis/plans/2026-09-08).
+        //
+        // Intercept `GET /v1/models` — the tenant model directory — BEFORE the
+        // mandatory api-key gate and answer from the LOCAL union of this
+        // tenant's currently routable models (`router::accessible_models`,
+        // design §2.1), serialised OpenAI-style:
+        //   {"object":"list","data":[{"id":<model>,"object":"model"}, ...]}
+        // Auth semantics for the directory:
+        //   - no key (anonymous): auth is skipped — the directory is publicly
+        //     readable per tenant (tenant resolved from Host, steps 1-2 above);
+        //   - a PRESENTED key must still verify through the same cache-first
+        //     external-auth boundary as chat requests (denied ⇒ 401/403 with
+        //     the existing verdict body) and, when valid, narrows the listing
+        //     to the bound provider via key-prefix binding inside
+        //     `accessible_models` (key = Some). Unknown domain (1) and
+        //     disabled-tenant (2) short-circuits still apply unchanged.
+        // Only method GET on the exact path `/v1/models` is intercepted (the
+        // query string is ignored via `uri.path()`); HEAD `/v1/models`,
+        // `/v1/models/{id}`, health checks and every other path keep their
+        // existing behaviour (design §6 R11). The response is fully local — it
+        // never reaches body-read / limit gate / routing / upstream dial (R8/R9:
+        // the no_model_field strategy and the count quota are bypassed for this
+        // precise path) — no usage record is emitted (logging only fires when a
+        // provider was selected), and `record_catalog` fires exactly once per
+        // SERVED directory request.
+        let is_catalog_get = {
+            let req_header = session.req_header();
+            req_header.method.as_str() == "GET" && req_header.uri.path() == "/v1/models"
+        };
+        if is_catalog_get {
+            if let Some(key) = &api_key_opt {
+                // A presented credential must be valid: run the exact same
+                // external-auth boundary as chat; the 401/403 verdict body is
+                // written inside `enforce_auth` when denied.
+                if self.enforce_auth(session, ctx, &tenant, key).await? {
+                    return Ok(true);
+                }
+                ctx.client_api_key = Some(key.clone());
+            }
+            crate::admin::metrics::record_catalog(&tenant.id);
+            let entries = router::accessible_models(
+                cfg,
+                self.state.breaker.as_ref(),
+                &tenant.id,
+                api_key_opt.as_deref(),
+            );
+            return respond_catalog(session, ctx, &entries).await;
+        }
+
+        // (3') Mandatory api-key for every other request (§6.3 §3).
+        let api_key = match api_key_opt {
             Some(k) => k,
             None => return short_circuit(session, 401, "missing_api_key").await,
         };
         ctx.client_api_key = Some(api_key.clone());
 
         // (4) External auth (§6.3 §4 / §11). Cache-first via AuthChecker.
-        let verdict = self.state.auth.check(&tenant, &api_key).await;
-        ctx.auth_verdict = Some(verdict.clone());
-        // Metrics (§17): auth decision + cache size (+ upstream-error counter).
-        {
-            let src = match &verdict {
-                AuthVerdict::Allowed { source } | AuthVerdict::Denied { source, .. } => {
-                    match source {
-                        CacheSource::Hit => "hit",
-                        CacheSource::Miss => "miss",
-                        CacheSource::Local => "local",
-                    }
-                }
-            };
-            let vlabel = match &verdict {
-                AuthVerdict::Allowed { .. } => "allowed",
-                AuthVerdict::Denied { .. } => "denied",
-            };
-            crate::admin::metrics::record_auth_decision(&tenant_id, vlabel, src);
-            crate::admin::metrics::record_auth_cache_size(self.state.auth.cache().len());
-            if let AuthVerdict::Denied { reason, .. } = &verdict {
-                if *reason == "auth_upstream_unavailable" {
-                    crate::admin::metrics::record_auth_upstream_error(&tenant_id);
-                }
-            }
-        }
-        if let AuthVerdict::Denied { status, reason, .. } = &verdict {
-            let body = Bytes::from(format!(
-                "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"auth_error\"}}}}"
-            ));
-            session.set_keepalive(None);
-            session.respond_error_with_body(*status, body).await?;
+        if self.enforce_auth(session, ctx, &tenant, &api_key).await? {
             return Ok(true);
         }
 
@@ -941,6 +1027,55 @@ impl HydraProxy {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Serialise a tenant model catalog as the OpenAI-compatible directory body
+/// (design-tenant-model-catalog §2.2 response example):
+/// `{"object":"list","data":[{"id":<model>,"object":"model"}, ...]}`
+/// in the deterministic order returned by [`router::accessible_models`] (model
+/// asc — the catalog entry order is preserved; only the `id` is exposed to the
+/// tenant, never the internal provider topology, design §2.0).
+fn catalog_json(entries: &[router::CatalogEntry]) -> Bytes {
+    let mut body = String::from("{\"object\":\"list\",\"data\":[");
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str("{\"id\":");
+        // A String always serialises — yields a fully escaped JSON string
+        // literal (quotes included), so model keys with special characters
+        // cannot corrupt the envelope.
+        body.push_str(&serde_json::to_string(&e.model).expect("model key serialises"));
+        body.push_str(",\"object\":\"model\"}");
+    }
+    body.push_str("]}");
+    Bytes::from(body)
+}
+
+/// Write the local `GET /v1/models` 200 response (design-tenant-model-catalog
+/// §2.2, P0). Short-response conventions aligned with `short_circuit` /
+/// `stream_response`: keep-alive disabled, explicit response header (Content-
+/// Type: application/json + `X-Hydra-Trace-Id`) then body with terminal EOS.
+/// Records the status into `ctx.status_code` (defaults to 0, `ctx.rs`) so the
+/// logging phase does not fall back to `response_written`. Returns `Ok(true)`
+/// so the caller short-circuits the Pingora pipeline — Pingora never dials an
+/// upstream itself.
+async fn respond_catalog(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    entries: &[router::CatalogEntry],
+) -> PingoraResult<bool> {
+    let body = catalog_json(entries);
+    ctx.status_code = 200;
+    session.set_keepalive(None);
+    let mut resp_header = ResponseHeader::build(200, Some(3))?;
+    resp_header.insert_header("Content-Type", "application/json")?;
+    resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+    session
+        .write_response_header(Box::new(resp_header), false)
+        .await?;
+    session.write_response_body(Some(body), true).await?;
+    Ok(true)
+}
 
 /// Write a short error response and return `Ok(true)` (short-circuit the
 /// pipeline). Mirrors the gateway example's `respond_error_with_body` pattern

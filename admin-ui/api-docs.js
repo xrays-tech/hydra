@@ -220,6 +220,12 @@ const API_DOCS = [
       pathParams: [{ name: "id", type: "string", desc: "Tenant id" }],
       resp: ["204 No Content"],
       errors: [] },
+    { method: "GET", path: "/api/v1/tenants/{tenant_id}/models", summary: "Get a tenant's model catalog (config view)",
+      desc: "Read-only aggregate over the live config snapshot (no DB read): every model the tenant may route — tenant_models whitelist (default-open) ∩ tenant_providers ∩ provider_model rows (status=1 only) — across ALL serving providers, each with its current online flag (!breaker-dead && weight>0 && has api-key). Unlike the data-plane GET /v1/models (runtime online view), dead / soft-disabled / keyless providers are still listed so operators can diagnose why a model is currently unroutable. Unknown tenant_id ⇒ 404 (ConfigData has no id index; the tenants_by_domain values are scanned).",
+      auth: true, exId: "acme",
+      pathParams: [{ name: "tenant_id", type: "string", desc: "Tenant id" }],
+      resp: ["200 — {\"tenant_id\":\"acme\",\"models\":[{\"model\":\"gpt-4o\",\"providers\":[{\"provider_id\":\"openai\",\"online\":true}]}]}", "200 — {\"tenant_id\":\"acme\",\"models\":[]} (tenant with no provider grants)"],
+      errors: [{ status: 404, code: "not_found", desc: "tenant not found" }, { status: 401, code: "unauthorized", desc: "missing or invalid admin token" }] },
   ]},
 
   { tag: "Tenant Access", endpoints: [

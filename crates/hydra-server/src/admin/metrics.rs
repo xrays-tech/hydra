@@ -63,6 +63,7 @@ struct Metrics {
     tokens: IntCounterVec,
     auth_decisions: IntCounterVec,
     auth_upstream_error: IntCounterVec,
+    catalog_requests: IntCounterVec,
     auth_cache_size: IntGauge,
     breaker_dead: IntGaugeVec,
     breaker_transitions: IntCounterVec,
@@ -147,6 +148,12 @@ fn metrics() -> Option<&'static Metrics> {
             auth_upstream_error: register_int_counter_vec!(
                 "hydra_auth_upstream_error_total",
                 "Auth upstream failures",
+                &["tenant"]
+            )
+            .ok()?,
+            catalog_requests: register_int_counter_vec!(
+                "hydra_catalog_requests_total",
+                "Tenant model catalog GETs answered locally (GET /v1/models)",
                 &["tenant"]
             )
             .ok()?,
@@ -319,6 +326,16 @@ pub fn record_auth_decision(tenant: &str, verdict: &str, source: &str) {
 pub fn record_auth_upstream_error(tenant: &str) {
     if let Some(m) = metrics() {
         m.auth_upstream_error.with_label_values(&[tenant]).inc();
+    }
+}
+
+/// Record a tenant model catalog GET answered locally (`GET /v1/models`, P0).
+/// Error paths (unknown domain / disabled tenant / unauthorised key) short-
+/// circuit before this point, so the counter counts served catalogs only.
+#[allow(dead_code)]
+pub fn record_catalog(tenant: &str) {
+    if let Some(m) = metrics() {
+        m.catalog_requests.with_label_values(&[tenant]).inc();
     }
 }
 

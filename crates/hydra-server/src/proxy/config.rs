@@ -16,7 +16,10 @@ use hydra_core::config::ConcurrencyPolicy;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NonRouteStrategy {
     /// Connect directly to the tenant's first live provider (default; serves
-    /// `GET /v1/models`, health checks, webhooks).
+    /// health checks, webhooks and other model-less requests). Note:
+    /// `GET /v1/models` is answered LOCALLY as the tenant model catalog
+    /// (design-tenant-model-catalog §2.2) before this strategy is consulted,
+    /// so it never reaches passthrough.
     #[default]
     Passthrough,
     /// Reject with 400.

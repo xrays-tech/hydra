@@ -297,6 +297,15 @@ impl AdminService {
         if parts == ["tenants", "auth", "test"] && method == "POST" {
             return handlers::tenant_auth_test(&self.state, session, trace_id).await;
         }
+        // Tenant model catalog (design-tenant-model-catalog §2.3, P1): GET
+        // /api/v1/tenants/{tenant_id}/models — read-only aggregate over the
+        // config snapshot (static full-set view with per-provider online
+        // flags; see the handler). Registered BEFORE the parts.len() > 2
+        // deep-path rejection below (this path is exactly 3 segments); GET
+        // only — any other method falls through to the depth rejection.
+        if method == "GET" && parts.len() == 3 && parts[0] == "tenants" && parts[2] == "models" {
+            return handlers::tenant_model_catalog(&self.state, parts[1], trace_id).await;
+        }
 
         // REST CRUD resources.
         let resource = parts.first().copied().unwrap_or("");

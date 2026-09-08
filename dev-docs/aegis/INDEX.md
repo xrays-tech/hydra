@@ -11,3 +11,5 @@ Entries are workspace records, not authoritative runtime decisions.
 | 2026-08-26 | doc | dev-docs/ops.md | 运维手册 §13 集群模式运维（部署/演练/Redis 故障/已知限制） |
 | 2026-08-26 | doc | dev-docs/deployment.md | 部署方案（单节点 / docker-compose 多节点 / K3s / K8s 多节点） |
 | 2026-08-27 | plan | dev-docs/aegis/plans/2026-08-27-admin-ui-i18n.md | Admin-UI 多语言国际化（中/英/法/德 四语切换） |
+| 2026-09-03 | doc | dev-docs/design-tenant-model-catalog.md | 租户模型目录接口（数据面本地聚合 GET /v1/models + 管理口只读聚合 GET /api/v1/tenants/{id}/models） |
+| 2026-09-08 | plan | dev-docs/aegis/plans/2026-09-08-public-models-catalog.md | 数据面 GET /v1/models 公开目录（免认证读取）——修订租户模型目录鉴权边界（oracle v1 GATE: PASS） |
