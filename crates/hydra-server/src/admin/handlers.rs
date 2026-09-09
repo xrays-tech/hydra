@@ -1491,7 +1491,9 @@ pub(super) async fn tenant_auth_cache_invalidate(
 /// clearly fake api-key and reports whether the endpoint is usable. A fake key
 /// MUST be denied — so "api-key not found" / "auth failed" (401/403, or an
 /// explicit `status:false`/`allowed:false` in a 2xx body) is a PASS; an allow,
-/// a 422, a 404/405, a 5xx or an unreachable URL is a FAIL.
+/// a 422, a 404/405, a 5xx or an unreachable URL is a FAIL. An HTTP 402 (insufficient balance) is
+/// treated as a denial PASS; a 2xx denial whose reason is insufficient_balance
+/// is reported with verdict "insufficient_balance".
 pub(super) async fn tenant_auth_test(
     state: &AdminState,
     session: &mut ServerSession,
@@ -1574,13 +1576,26 @@ pub(super) async fn tenant_auth_test(
         ),
         200..=299 => {
             if crate::http::body_says_denied(&text) {
-                (
-                    true,
-                    true,
-                    "denied",
-                    "auth service rejected the simulated api-key (status:false/allowed:false in body)"
-                        .to_string(),
-                )
+                if crate::http::json_string_field(&text, "\"reason\"")
+                    .map(|r| r.trim().eq_ignore_ascii_case("insufficient_balance"))
+                    .unwrap_or(false)
+                {
+                    (
+                        true,
+                        true,
+                        "insufficient_balance",
+                        "auth service rejected the simulated api-key (insufficient_balance — arrears gate active)"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        true,
+                        true,
+                        "denied",
+                        "auth service rejected the simulated api-key (status:false/allowed:false in body)"
+                            .to_string(),
+                    )
+                }
             } else if !crate::http::auth_body_is_json_object(&text) {
                 (
                     false,
@@ -1598,6 +1613,13 @@ pub(super) async fn tenant_auth_test(
                 )
             }
         }
+        402 => (
+            true,
+            true,
+            "denied",
+            "auth service answered 402 Payment Required (insufficient balance — a denial; endpoint usable, tenant may be in arrears)"
+                .to_string(),
+        ),
         404 => (
             false,
             false,

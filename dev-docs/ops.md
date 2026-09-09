@@ -275,8 +275,10 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 ## 5. Auth-cache invalidation (design §11.7 / §13.2)
 
 Hydra caches `sha256(api_key) → verdict` per `(tenant, key)` with a TTL (default
-allow 5 min / deny 30 s). The tenant auth service can force a re-check by
-invalidating entries:
+allow 5 min / deny 30 s). Exception (2026-09-09): **402 insufficient-balance
+denials are never cached** — balance is fast-changing, and a cached 402 would
+degrade into a 401 within the deny TTL (design §11.3). The tenant auth service
+can force a re-check by invalidating entries:
 
 ```bash
 # Invalidate specific keys for a tenant:

@@ -8,7 +8,8 @@
 use std::time::{Duration, Instant};
 
 use hydra_core::auth::{
-    apply_upstream, cache_decision, decide, AuthEntry, AuthVerdict, CacheOp, CacheSource, Verdict,
+    apply_upstream, cache_decision, decide, denial_status_for_reason, AuthEntry, AuthVerdict,
+    CacheOp, CacheSource, Verdict,
 };
 use pretty_assertions::assert_eq;
 
@@ -144,4 +145,26 @@ fn auth_verdict_carries_status() {
             source: CacheSource::Miss,
         }
     );
+}
+
+// T7.8 — denial_status_for_reason: an insufficient_balance reason (trimmed,
+// case-insensitive) maps to 402 Payment Required; anything unknown / missing
+// stays 401 (legacy: unclassified denials look like an invalid key).
+#[test]
+fn auth_denial_reason_insufficient_balance_is_402() {
+    assert_eq!(denial_status_for_reason(Some("insufficient_balance")), 402);
+    assert_eq!(denial_status_for_reason(Some("Insufficient_Balance")), 402);
+    assert_eq!(
+        denial_status_for_reason(Some("  INSUFFICIENT_BALANCE  ")),
+        402
+    );
+}
+
+#[test]
+fn auth_denial_reason_unknown_or_missing_is_401() {
+    assert_eq!(denial_status_for_reason(Some("invalid_key")), 401);
+    assert_eq!(denial_status_for_reason(Some("internal_error")), 401);
+    assert_eq!(denial_status_for_reason(Some("")), 401);
+    assert_eq!(denial_status_for_reason(Some("   ")), 401);
+    assert_eq!(denial_status_for_reason(None), 401);
 }

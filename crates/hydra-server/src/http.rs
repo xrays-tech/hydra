@@ -27,8 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hydra_core::auth::{
-    apply_upstream, cache_decision, decide, sha256_hex, AuthEntry, AuthVerdict, CacheOp,
-    CacheSource, Verdict,
+    apply_upstream, cache_decision, decide, denial_status_for_reason, sha256_hex, AuthEntry,
+    AuthVerdict, CacheOp, CacheSource, Verdict, REASON_INSUFFICIENT_BALANCE,
 };
 use hydra_core::model::Tenant;
 use tracing::{debug, warn};
@@ -422,6 +422,20 @@ impl AuthChecker for HttpAuthChecker {
 
             // (4) status → CacheOp via pure apply_upstream (design §11.3).
             let status = resp.status().as_u16();
+            // (4a) Out-of-band HTTP 402 (Payment Required): the tenant auth
+            // service answered a raw 402 for insufficient balance. Surface it
+            // verbatim and NEVER cache (design §11.3 — balance is fast-changing
+            // and a cached 402 would degrade into a 401 within deny_ttl; L1 and
+            // Redis L2 are both skipped because we never call cache::set). An
+            // explicit 402 is a denial, not an availability anomaly, so it
+            // bypasses fail_mode by design.
+            if status == 402 {
+                return AuthVerdict::Denied {
+                    status: 402,
+                    reason: "denied",
+                    source: CacheSource::Miss,
+                };
+            }
             let op = apply_upstream(status, allow_ttl, deny_ttl);
             match op {
                 CacheOp::Set { allowed: true, ttl } => {
@@ -433,6 +447,22 @@ impl AuthChecker for HttpAuthChecker {
                     // denial (cached with deny_ttl).
                     let text = resp.text().await.unwrap_or_default();
                     if body_says_denied(&text) {
+                        // Reason-aware denial (design §11.3 / Dogress
+                        // AuthApiKeyResponse): an insufficient_balance reason
+                        // (case-insensitive) maps to 402 and is NOT cached (we
+                        // never call cache::set here, so neither L1 nor Redis
+                        // L2 is written — a top-up is seen on the next
+                        // request). All other denials keep the legacy 401 +
+                        // deny-cache semantics (see the invalid_key regression
+                        // test).
+                        let reason = json_string_field(&text, "\"reason\"");
+                        if denial_status_for_reason(reason) == 402 {
+                            return AuthVerdict::Denied {
+                                status: 402,
+                                reason: REASON_INSUFFICIENT_BALANCE,
+                                source: CacheSource::Miss,
+                            };
+                        }
                         cache.set(&tenant_id, &api_key_owned, false, deny_ttl).await;
                         return AuthVerdict::Denied {
                             status: 401,
@@ -620,6 +650,39 @@ fn json_field_is_false(body: &str, field: &str) -> bool {
     rest.trim_start().starts_with("false")
 }
 
+/// Extract the value of a top-level JSON string field, whitespace tolerant, in
+/// the flat-scan style of parse_expires_in / json_field_is_false. `field` must
+/// be the QUOTED key token (e.g. "reason", quotes included) so the split
+/// consumes the key and the remainder starts at the `:` separator. Returns the
+/// value without its surrounding quotes; None when the field is absent or is
+/// not a quoted string. Escaped characters (\") inside the value are skipped
+/// when locating the closing quote — the value is returned verbatim, which is
+/// safe for the fixed vocabulary used here (no embedded escapes occur).
+/// Structurally safe for the flat contract bodies — see body_says_denied.
+///
+/// pub(crate) so the admin auth-url test endpoint classifies the reason
+/// exactly as the proxy would.
+pub(crate) fn json_string_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+    let rest = body.split_once(field)?.1.trim_start();
+    let rest = rest.strip_prefix(":")?.trim_start();
+    let rest = rest.strip_prefix("\"")?;
+    let bytes = rest.as_bytes();
+    let mut end = bytes.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x5C {
+            i += 2; // skip the escaped character (quote or backslash)
+        } else if b == 0x22 {
+            end = i;
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    Some(&rest[..end])
+}
+
 /// Hex-encode a SHA-256 digest for the L2 key (no base64 dep needed).
 #[cfg(feature = "cluster-redis")]
 fn hex_digest(hash: &[u8; 32]) -> String {
@@ -735,7 +798,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_expires_in_no_digits() {
-        assert_eq!(parse_expires_in("{\"expires_in\":}"), None);
+    fn json_string_field_extracts_reason() {
+        assert_eq!(
+            json_string_field(
+                r#"{"status":false,"reason":"insufficient_balance"}"#,
+                "\"reason\""
+            ),
+            Some("insufficient_balance")
+        );
+        assert_eq!(
+            json_string_field(
+                r#"{ "reason" : "invalid_key" , "status":false}"#,
+                "\"reason\""
+            ),
+            Some("invalid_key")
+        );
+    }
+
+    #[test]
+    fn json_string_field_absent_or_non_string() {
+        assert_eq!(json_string_field(r#"{"status":false}"#, "\"reason\""), None);
+        assert_eq!(json_string_field(r#"{"reason":42}"#, "\"reason\""), None);
+        assert_eq!(json_string_field("not json", "\"reason\""), None);
+        assert_eq!(
+            json_string_field(r#"{"reason":""}"#, "\"reason\""),
+            Some("")
+        );
     }
 }

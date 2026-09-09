@@ -802,6 +802,50 @@ async fn error_401_when_auth_denied() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn error_402_when_auth_denied_insufficient_balance() {
+    let auth_server = MockServer::start().await;
+    // Dogress-style in-band denial: always HTTP 200, the reason rides the body.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": false,
+            "reason": "insufficient_balance",
+        })))
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(
+        resp.status(),
+        402,
+        "insufficient balance must surface as HTTP 402 Payment Required"
+    );
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body, r#"{"error":{"message":"insufficient_balance","type":"insufficient_quota"}}"#,
+        "402 body must carry the reason and the mainstream gateway type"
+    );
+    let upstream_hits = upstream.received_requests().await.expect("recording on");
+    assert!(
+        upstream_hits.is_empty(),
+        "no upstream call may happen when auth denies: {}",
+        upstream_hits.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_502_when_all_providers_fail() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))

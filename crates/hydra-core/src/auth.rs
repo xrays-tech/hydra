@@ -52,7 +52,7 @@ pub enum Verdict {
 pub enum AuthVerdict {
     /// Allow the request to proceed.
     Allowed { source: CacheSource },
-    /// Deny; `status` is the HTTP code (401 / 503), `reason` a static label.
+    /// Deny; `status` is the HTTP code (401 / 402 / 503), `reason` a static label.
     Denied {
         status: u16,
         reason: &'static str,
@@ -135,6 +135,29 @@ pub fn apply_upstream(status: u16, allow_ttl: Duration, deny_ttl: Duration) -> C
             ttl: deny_ttl,
         },
         _ => CacheOp::None,
+    }
+}
+
+/// Canonical denial reason label used by the tenant auth service for an
+/// insufficient-balance verdict (design §11.3; Dogress crates/api /auth/api_key
+/// AuthApiKeyResponse.reason). Surfaces to the client as HTTP 402 with
+/// type "insufficient_quota" (see enforce_auth in the server crate).
+pub const REASON_INSUFFICIENT_BALANCE: &str = "insufficient_balance";
+
+/// Map a tenant auth denial `reason` to the downstream HTTP status.
+///
+/// - an `insufficient_balance` reason (case-insensitive after trim) => 402
+///   Payment Required (欠费; callers MUST NOT cache this verdict — see design
+///   §11.3: balance is fast-changing and a cached 402 would degrade into a 401
+///   within deny_ttl);
+/// - any other / missing reason => 401 (legacy behaviour: an unclassified
+///   denial is indistinguishable from an invalid key).
+///
+/// Pure and table-driven: extending the vocabulary means adding a row here.
+pub fn denial_status_for_reason(reason: Option<&str>) -> u16 {
+    match reason {
+        Some(r) if r.trim().eq_ignore_ascii_case(REASON_INSUFFICIENT_BALANCE) => 402,
+        _ => 401,
     }
 }
 

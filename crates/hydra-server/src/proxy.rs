@@ -182,7 +182,8 @@ impl HydraProxy {
 
     /// Cache-first external auth boundary (§6.3 §4 / §11). Runs the
     /// `AuthChecker`, records auth metrics (§17) and — when the verdict is
-    /// Denied — writes the structured 401/403 response body.
+    /// Denied — writes the structured 401/402/503 response body (402 carries the
+    /// reason label, e.g. insufficient_balance).
     ///
     /// Returns `Ok(true)` when the request has been answered (denied ⇒ the
     /// caller must short-circuit), `Ok(false)` when it may proceed. Used by
@@ -221,8 +222,16 @@ impl HydraProxy {
             }
         }
         if let AuthVerdict::Denied { status, reason, .. } = &verdict {
+            // An insufficient-balance denial (status 402) is surfaced with the
+            // mainstream OpenAI-compatible gateway type "insufficient_quota";
+            // every other auth denial keeps type "auth_error".
+            let err_type = if *status == 402 {
+                "insufficient_quota"
+            } else {
+                "auth_error"
+            };
             let body = Bytes::from(format!(
-                "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"auth_error\"}}}}"
+                "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"{err_type}\"}}}}"
             ));
             session.set_keepalive(None);
             session.respond_error_with_body(*status, body).await?;

@@ -154,6 +154,28 @@ async fn auth_url_2xx_status_false_denied_passes() {
 }
 
 #[tokio::test]
+async fn auth_url_2xx_insufficient_balance_denied_passes() {
+    // Dogress-style arrears denial: 200 + status:false + reason insufficient_balance.
+    let r = probe_with(
+        200,
+        Some(serde_json::json!({ "status": false, "reason": "insufficient_balance" })),
+    )
+    .await;
+    assert_eq!(r["ok"], true, "got {r}");
+    assert_eq!(r["verdict"], "insufficient_balance", "got {r}");
+    assert_eq!(r["status"], 200, "got {r}");
+}
+
+#[tokio::test]
+async fn auth_url_402_payment_required_denied_passes() {
+    // A raw 402 is a denial (insufficient balance) — endpoint usable => PASS.
+    let r = probe_with(402, None).await;
+    assert_eq!(r["ok"], true, "got {r}");
+    assert_eq!(r["verdict"], "denied", "got {r}");
+    assert_eq!(r["status"], 402, "got {r}");
+}
+
+#[tokio::test]
 async fn auth_url_2xx_html_not_json_fails() {
     // 200 + non-JSON body (bare 200 = empty body here; an HTML login page
     // behaves identically) is NOT a valid verdict — the Test button must

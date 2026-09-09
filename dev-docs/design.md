@@ -609,7 +609,7 @@ pub struct SelectedRoute {
 1. **解析域名**：`Host` 头 → 小写；若缺省或为 `localhost` → 用 `localhost` 匹配租户；匹配失败 → 写 404 错误响应，`return Ok(true)`。
 2. **租户校验**：租户存在且 `enabled=1`，否则 403。
 3. **解析客户端 api-key**：`Authorization: Bearer xxx` 或 `x-api-key`。
-4. **外部认证**：调用 `AuthChecker::check(&tenant, &api_key)`（缓存优先，详见 §11）；按 `AuthVerdict` 携带的状态码写错误响应（401/503），`return Ok(true)`。`auth_url` 缺失 → 一律拒绝（401）。
+4. **外部认证**：调用 `AuthChecker::check(&tenant, &api_key)`（缓存优先，详见 §11）；按 `AuthVerdict` 携带的状态码写错误响应（401/402/503），`return Ok(true)`。`auth_url` 缺失 → 一律拒绝（401）。
 5. **解析 model_key（零拷贝 memchr 扫描，见 §6 零拷贝原则）**：
    - **不**整体读取/反序列化请求体。`request_filter` 内 `read_body_bytes().await` 仅读**首个** chunk，用 `memchr::memmem::find(chunk, b"\"model\"")` SIMD 扫描（约 ~20 字节早退、零分配）得 `model_key`；
    - 该首 chunk 存入 `ctx.body_buffer`（`Vec<Bytes>`）；**首 chunk 转发机制**（W4 spike 验证）：`read_body_bytes` 消耗首 chunk 后，Pingora 自动转发只处理后续 chunk，故须在 `connected_to_upstream`/`upstream_request_filter` 阶段手动 `upstream_session.write_body(&first_chunk)` 预写首 chunk，再让自动转发接管后续；**回退方案**：若手动预写无法与自动转发干净交错，则 `request_body_filter` 首次调用时把存的首 chunk 与当前 chunk 拼接注入（一次小 memcpy，仅首 chunk 大小）；
@@ -1040,6 +1040,8 @@ impl SlidingWindow {
 ```
 
 > **拒绝结果同样缓存**：避免被拒绝的 key 持续打满 `auth_url`；但拒绝 TTL 可配置得更短（如 30s），便于租户侧解封后较快恢复。
+>
+> **例外（2026-09-09）**：**402 欠费拒绝不写缓存**（含 Redis L2）——余额快速变化，写入 deny_ttl 会把 402 在 TTL 内降级成 401，客户端误判 key 无效（见 §11.3）。
 
 ### 11.3 认证契约（通用接口）
 
@@ -1068,11 +1070,13 @@ X-Hydra-Trace-Id: <trace_id>
 | --- | --- | --- |
 | `200` | 允许/拒绝由响应体判定 | 见下方「响应体判定」；写缓存后放行或拒绝 |
 | `401` / `403` | 拒绝 | 写缓存 `allowed=false`（默认 deny_ttl），返回 401 |
+| `402` | 拒绝（欠费，余额不足） | **不写缓存**；透传客户端 402（`type:"insufficient_quota"`，2026-09-09） |
 | 其他 / 超时 / 连接错 | 服务异常 | 按策略（见 §11.4） |
 
 **响应体判定（2xx 时 Hydra 读取 body）**：
 
 - **`{"status": false}`**（Dogress `AuthApiKeyResponse.status`）→ 拒绝：写缓存 `allowed=false`（deny_ttl），返回 401。Dogress 认证服务**恒返回 HTTP 200**，拒绝仅通过 `status` 字段表达，必须读 body 而非仅看状态码；
+- **`reason` 字段（2026-09-09）**：2xx 拒绝体可携带 `"reason"`，大小写不敏感命中 `"insufficient_balance"` ⇒ 客户端 402（`type:"insufficient_quota"`，与主流 OpenAI 兼容网关对齐），**不写缓存**（余额快速变化，避免 deny_ttl 内 402 降级成 401）；其余 reason（`invalid_key` / `internal_error` / 缺失）⇒ 401 现状不变；
 - **`{"allowed": false}`**（本契约可选细化）→ 同样视为拒绝；
 - 其余 **合法 JSON 对象** body（`{"status":true}`、`{"allowed":true,...}`）→ 允许；
 - **非 JSON 对象**（空、HTML 网页、WAF/登录页、JSON 数组/标量、不可解析）→ **不是有效判定**，视为服务异常，按 §11.4 `fail_mode` 处理（默认 `closed` → 503 拒绝，**不缓存**）—— 防止 auth_url 误指向网页时静默放行所有 key。
@@ -1088,6 +1092,8 @@ X-Hydra-Trace-Id: <trace_id>
 ```
 
 > 2xx 且 `status=false` 或 `allowed=false` 视为拒绝；2xx 必须是**可解析的 JSON 对象**才可能是允许（否则按 §11.4 服务异常处理，默认拒绝 503）；非 2xx（404/5xx 等）按 HTTP 状态判定（`CacheOp::None` → §11.4）。
+>
+> **客户端错误透出（2026-09-09）**：欠费拒绝 → HTTP **402**，body `{"error":{"message":"insufficient_balance","type":"insufficient_quota"}}`（type 与主流 OpenAI 兼容网关对齐）；其余拒绝维持 401 + `type:"auth_error"`。
 
 ### 11.4 `auth_url` 不可用 / 超时的策略
 
@@ -1163,7 +1169,7 @@ pub trait AuthChecker: Send + Sync {
 | 某租户整体策略变更 | 调 Admin 接口按 `tenant_id` 清空该租户全部缓存 |
 | **租户自助**（欠费停机 / 付费恢复） | 租户持自己的 **Access Token** 调 `POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate` 清除自己名下缓存（见 §13.2；令牌→租户身份由服务端校验，URL 的 tenant_id 必须与令牌归属一致，防越权） |
 
-失效后：缓存内允许项被删 → 下次请求 `Miss` → 回源 → 由租户 `auth_url` 重新决定（是否欠费、是否阻断全由租户自决）。
+失效后：缓存内允许项被删 → 下次请求 `Miss` → 回源 → 由租户 `auth_url` 重新决定（是否欠费、是否阻断全由租户自决）；欠费拒绝 Hydra 以 402 + `type:"insufficient_quota"` 向客户端透出（§11.3，2026-09-09）。
 
 ---
 

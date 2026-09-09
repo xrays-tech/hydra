@@ -758,6 +758,112 @@ async fn auth_upstream_200_body_status_false_denies_cached() {
     assert_eq!(checker.cache().len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// 402 Payment Required (insufficient_balance) — in-band (Dogress) and
+// out-of-band (raw HTTP 402): surfaced verbatim and NEVER cached (design
+// §11.3 S3 — a cached 402 would degrade into a 401 within deny_ttl).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_upstream_200_insufficient_balance_denies_402_not_cached() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"status\":false,\"reason\":\"insufficient_balance\"}",
+            "application/json",
+        ))
+        .expect(2) // NOT cached — the second call MUST reach the upstream again
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+
+    let v1 = checker.check(&tenant, "sk-broke").await;
+    assert_eq!(
+        v1,
+        AuthVerdict::Denied {
+            status: 402,
+            reason: "insufficient_balance",
+            source: CacheSource::Miss
+        }
+    );
+
+    let v2 = checker.check(&tenant, "sk-broke").await;
+    assert_eq!(
+        v2,
+        AuthVerdict::Denied {
+            status: 402,
+            reason: "insufficient_balance",
+            source: CacheSource::Miss
+        }
+    );
+    assert_eq!(checker.cache().len(), 0, "402 denials must not be cached");
+}
+
+#[tokio::test]
+async fn auth_upstream_200_insufficient_balance_reason_case_insensitive() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"status\":false,\"reason\":\"Insufficient_Balance\"}",
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+
+    let v = checker.check(&tenant, "sk-broke").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 402,
+            reason: "insufficient_balance",
+            source: CacheSource::Miss
+        }
+    );
+}
+
+#[tokio::test]
+async fn auth_upstream_raw_402_passthrough_not_cached() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(402))
+        .expect(2) // not cached — see the in-band 402 test above
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+
+    let v1 = checker.check(&tenant, "sk-broke").await;
+    assert_eq!(
+        v1,
+        AuthVerdict::Denied {
+            status: 402,
+            reason: "denied",
+            source: CacheSource::Miss
+        }
+    );
+    let v2 = checker.check(&tenant, "sk-broke").await;
+    assert_eq!(
+        v2,
+        AuthVerdict::Denied {
+            status: 402,
+            reason: "denied",
+            source: CacheSource::Miss
+        }
+    );
+    assert_eq!(
+        checker.cache().len(),
+        0,
+        "raw 402 denials must not be cached"
+    );
+}
+
 #[tokio::test]
 async fn auth_upstream_200_body_status_true_allows_cached() {
     let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
