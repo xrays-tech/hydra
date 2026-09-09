@@ -1,7 +1,7 @@
 # 设计：租户模型目录接口（Tenant Model Catalog）
 
 - **日期**：2026-09-03
-- **状态**：已通过 oracle 深度复核（v3 GATE: PASS）→ 开发完成（Task 1-3 合入工作树）→ 代码 review APPROVE（无 P0/P1）→ 全套 CI 门禁（fmt/clippy/core/server/cluster-redis）全绿；**2026-09-08 缺陷修订**：数据面目录改为免认证读取（匿名 200；出示 key 仍校验并收窄），见 §8 v4 与 `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`
+- **状态**：已通过 oracle 深度复核（v3 GATE: PASS）→ 开发完成（Task 1-3 合入工作树）→ 代码 review APPROVE（无 P0/P1）→ 全套 CI 门禁（fmt/clippy/core/server/cluster-redis）全绿；**2026-09-08 缺陷修订**：数据面目录改为免认证读取（匿名 200；出示 key 仍校验并收窄），见 §8 v4 与 `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`；**2026-09-09 语义修订 v5**：目录**无条件公开**——带/不带 api-key 均可读（出示 key 不再校验，仅按前缀绑定收窄），见 §8 v5
 - **作者**：编码智能体（DeepSeek）｜深度复核：Architecture review (@oracle)（首轮 GATE: BLOCK，见 §8 修订记录）
 - **对应需求**：研究结论落地——用租户侧 token 访问 Hydra 时，需要一个接口返回“该租户当前可访问的所有 provider 下、所有可路由模型”的聚合列表（现状无任何此类接口）。
 - **前置研究简报**：本会话《租户模型目录接口可行性》结论：数据面 GET /v1/models 目前是单上游直通；权限模型为逐请求判定、无物化目录；建议数据面本地聚合 + 管理口只读聚合。
@@ -106,13 +106,13 @@ pub fn accessible_models(
 
 ### 2.2 数据面拦截（P0，hydra-server）
 
-**拦截点**（2026-09-08 修订：目录免认证读取，见 §8 v4）：`proxy.rs request_filter` 在租户 enabled 检查（proxy.rs:243-246）之后、**必填 api-key 闸门之前**插入（原设计为 auth 判定通过后（proxy.rs:284-291）插入——修订后目录分支上移，匿名请求不再被 401 `missing_api_key` 拦下；keyed 请求仍先过外部鉴权再应答）：
+**拦截点**（2026-09-08 修订：目录免认证读取，见 §8 v4；**2026-09-09 v5：出示 key 亦免认证**）：`proxy.rs request_filter` 在租户 enabled 检查（proxy.rs:243-246）之后、**必填 api-key 闸门之前**插入（原设计为 auth 判定通过后（proxy.rs:284-291）插入——修订后目录分支上移，匿名请求不再被 401 `missing_api_key` 拦下；v5 起 keyed 请求同样不过外部鉴权——目录对带/不带 api-key 一律 200）：
 
 ```text
 GET && path == "/v1/models"（path 取 req_header.uri.path()，忽略 query）
    ⇒ tenant resolve（未知域 404）+ tenant enabled（禁用 403）—— 不变，匿名同样执行
-   ⇒ api-key 可选：无 key ⇒ 匿名读取（跳过外部鉴权，公开目录）；
-      有 key ⇒ 走与聊天相同的 cache-first 外部鉴权（Denied ⇒ 401/403 原样回写）
+   ⇒ api-key 可选且永不校验：无 key ⇒ 匿名读取（公开目录）；
+      有 key ⇒ 同样跳过外部鉴权（v5：不再走 auth_url，无 401/403 可能）
    ⇒ 计算 accessible_models(cfg, breaker, &tenant.id, api_key: Option<&str>)
       （None ⇒ key-prefix 绑定闸门不触发 = 租户级并集；Some ⇒ 绑定收窄；不可失败）
    ⇒ 写本地 JSON 200：{"object":"list","data":[{"id":<model>,"object":"model"}, ...]}
@@ -121,7 +121,7 @@ GET && path == "/v1/models"（path 取 req_header.uri.path()，忽略 query）
 
 **要点**：
 
-- **鉴权语义（2026-09-08 修订，§8 v4）**：Host→租户（proxy.rs:226-240）、租户 enabled 检查（242-246）不变；api-key **可选**——未携带 ⇒ 匿名 200 读取该租户目录（公开只读）；携带 ⇒ auth_url 外部鉴权 + 缓存（proxy.rs:258-291）原样复用：未配置/失效 key 依旧 401/403，有效 key + 前缀绑定 ⇒ 目录收窄到绑定 provider。匿名并集 ⊇ 绑定 key 收窄视图为有意语义（模型 id 非机密，R12）。
+- **鉴权语义（2026-09-09 修订，§8 v5）**：Host→租户（proxy.rs:226-240）、租户 enabled 检查（242-246）不变；目录**无条件公开**——api-key **可选且永不校验**：未携带 ⇒ 匿名 200 读取该租户目录（公开只读）；携带 ⇒ **同样跳过外部鉴权**（不再 POST auth_url，无 401/403 可能），仅按 key-prefix 绑定收窄（命中绑定前缀 ⇒ 收窄到绑定 provider；未命中 ⇒ 租户级并集）。绑定视图 ⊆ 匿名并集为有意语义（出示 key 不增加任何信息；模型 id 非机密，R12）。
 - **响应写法（对齐仓库本地响应惯例）**：参照 short_circuit（proxy.rs:948-955）`session.set_keepalive(None)` 短响应惯例 + stream_response 的 header/EOS 写法（proxy.rs:905-936）；响应头带 `X-Hydra-Trace-Id`；写响应后把状态码记入 `ctx.status_code`（ctx.rs:59 默认 0，避免日志阶段依赖 response_written 兜底）；Content-Type: application/json。新增辅助 `respond_local_json`。
 - **可观测性**：目录 GET 不产生 provider 用量/请求记录（logging 仅在有 selected provider 时记录，proxy.rs:750、800-825）——沿用现状、不新增指标（P2，如需可后续加目录计数）。
 - **与 non_route_strategy 的关系（F4）**：拦截发生在策略消费（proxy.rs:397-400）之前 ⇒ 配置 `NonRouteStrategy::Reject` 的部署中，`GET /v1/models` 由 400 `no_model_field` 变为 200 目录——策略对该**精确路径**被静默旁路（HEAD/其他 GET 仍受策略约束），记录于 R8。
@@ -136,8 +136,7 @@ GET && path == "/v1/models"（path 取 req_header.uri.path()，忽略 query）
 |---|---|---|
 | unknown_domain / 租户不存在 | 404 | 沿用现状（proxy.rs:238-240） |
 | 租户 disabled | 403 tenant_disabled | 沿用现状 |
-| 缺 key（匿名 GET /v1/models） | 200 目录 | 免认证读取（2026-09-08 修订，§8 v4）；仅 GET 精确 /v1/models；HEAD 与 /v1/models/{id} 匿名仍 401 |
-| 出示失效 key | 401/403（上游 verdict） | 沿用现状，缓存语义不变；出示即须有效 |
+| 缺 key / 出示任意 key（GET /v1/models） | 200 目录 | 目录无条件公开（2026-09-09 修订，§8 v5）：带或不带 api-key 均免认证返回 200，key 仅按前缀绑定收窄（不校验）；仅 GET 精确 /v1/models；HEAD 与 /v1/models/{id} 匿名仍 401 |
 | 租户无 tenant_providers | 200 空列表 | 目录语义；聊天路径仍 403 TenantForbidden，两者不冲突 |
 
 **响应示例**：
@@ -248,7 +247,7 @@ cargo test -p hydra-server --features server,cluster-redis
 | R6 | provider 明细泄漏 | 数据面只回 model id（§2.0 决策） |
 | R7 | tenant_models 白名单里“不在 models_by_key”的 key | 目录天然不出现（无人提供）；聊天路径本就 404 ModelNotFound，无新语义 |
 | R8 | **Reject 策略旁路（F4）**：NonRouteStrategy::Reject 部署下 GET /v1/models 由 400 变 200 | 显式记录：目录语义对该精确路径优先于 no_model_field 策略；HEAD/其他 GET 仍受策略约束 |
-| R9 | **配额口径变更（F5）**：变更前 GET /v1/models 直通也消耗按 key/tenant 匹配的 count 配额；变更后目录查询不计额 | 防滥用仅剩 auth 缓存；**2026-09-08 修订：匿名目录无 key ⇒ auth 缓存防线也不存在**，仅剩本地只读 + CPU 有界（models_by_key × tenant_providers 遍历）+ 无上游；以 `hydra_catalog_requests_total` 观测匿名 QPS，如需按租户限频属后续独立项 |
+| R9 | **配额口径变更（F5）**：变更前 GET /v1/models 直通也消耗按 key/tenant 匹配的 count 配额；变更后目录查询不计额 | 防滥用仅剩 auth 缓存；**2026-09-08 修订：匿名目录无 key ⇒ auth 缓存防线也不存在**，仅剩本地只读 + CPU 有界（models_by_key × tenant_providers 遍历）+ 无上游；**2026-09-09 v5：keyed 读取同样不校验 key ⇒ auth 缓存防线对目录路径完全不存在**；以 `hydra_catalog_requests_total` 观测目录 QPS（匿名与 keyed 一并计入），如需按租户限频属后续独立项 |
 | R10 | **edge 快照时效（F10）**：控制面中断时目录基于 last-known-good 快照，可能短暂落后 leader 最新配置 | 与同节点聊天路径口径一致（同为该快照路由）；文档注明即可 |
 | R11 | **方法边界（F6）**：仅 GET 精确 /v1/models 被拦截；HEAD /v1/models、/v1/models/{id} 等继续直通 | 明确记录差异；钉住“非拦截 GET 仍走上游”测试；如需统一可后续扩展 |
 
@@ -271,6 +270,7 @@ cargo test -p hydra-server --features server,cluster-redis
 | v2（oracle 复审） | GATE: BLOCK（1×P1: R1） | R1 i18n 键名去花括号（apiSummaryKey 归一化删 { }，api-docs.js:417-420）；R2 weight 出处改引 model.rs:21-29；R3 统一“get(P) 所得引用取值、不再裸索引”表述；R4 伪码参数改 &tenant.id；R5 补 design.md §6.3a 叙述改写项 |
 | v3（oracle 复审） | GATE: PASS（残留 2×P2 不阻塞，已吸收） | P2-F1 §3 清单补 dev-docs/design.md；P2-F2 §2.3 online 措辞改 cfg.providers.get(P) |
 | v4（2026-09-08 缺陷修订） | 缺陷修复方案独立 oracle 复核 **GATE: PASS**（P0=0；P1-1 发布顺序声明 + P2-1..5 吸收，见计划 §8） | 数据面 GET /v1/models 改为**免认证读取**：目录拦截上移到必填 key 闸门之前（proxy.rs (2.5) 分支 + 共享 `enforce_auth` helper）；匿名 ⇒ 200 本地目录（跳过外部鉴权）；出示 key ⇒ 仍校验（401/403）并按前缀绑定收窄；HEAD/`/{id}`/其它路径与 chat/管理面全部不变。实现落档：`dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`；配套匿名正/负向钉住测试（200 并集零上游 / query 忽略 / HEAD 401 / /{id} 401 / disabled 403 / 未知域 404）与本文档 §2.2/错误契约/要点/R9 同步修订 |
+| v5（2026-09-09 语义修订） | 用户产品决策（未走 oracle 复核）：目录必须无条件可读 | `GET /v1/models` 出示 key 不再触发外部鉴权——(2.5) 删除 `enforce_auth` 调用与 `ctx.client_api_key` 赋值（`enforce_auth` 仅剩步骤 ④ 一处使用）；key 仅按 key-prefix 绑定收窄（绑定视图 ⊆ 匿名并集，出示 key 不增加信息）；HEAD / `/{id}` / 其它路径与 chat 鉴权语义不变。实现落档：计划 v2（§10）；401 用例反转为 200 + 零 auth/零上游钉住（`catalog_get_v1_models_denied_key_still_reads_200_no_auth`）；本文档 §2.2/错误契约/R9 与 README.zh-CN、design.md §6.3a、proxy.rs 模块头/步骤注释同步 |
 | 开发后 | 实现代码 review VERDICT: APPROVE（P0/P1=0，4×P2 已按下列吸收） | 代码 review P2 吸收：①proxy/config.rs NonRouteStrategy 文档与 design.md §6.3a 改写（GET /v1/models 不再为直通示例）；②新增 hydra_catalog_requests_total 计数器（metrics.rs + proxy 调用）；③README 模型目录说明 + aegis INDEX 登记；④CatalogEntry 保留 serde derive（对齐实体约定，无在库消费点已注明） |
 
 ---

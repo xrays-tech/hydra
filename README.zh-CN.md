@@ -122,7 +122,7 @@ curl https://acme.example.com/v1/chat/completions \
 
 Hydra 按域名解析租户 → 调 `auth_url` 鉴权 → 路由 `gpt-4o` 到授权供应商 → 换 key → 流式回写 → 记录用量。
 
-**模型目录**：`GET /v1/models` **免认证可读**（无需 api-key），返回**该租户当前可调用模型的目录**——Hydra 本地聚合（跨授权 provider 并集、按租户模型白名单过滤、剔除熔断/软禁用/无 key 的 provider），不再直通单一上游；聊天等调用仍须 api-key（出示的 key 会被校验，并按 key 前缀绑定收窄目录）。管理端另有只读聚合端点 `GET /api/v1/tenants/{tenant_id}/models`（admin token；含每个 provider 的在线状态，供运维诊断）。详见 `dev-docs/design-tenant-model-catalog.md` 与 `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`。
+**模型目录**：`GET /v1/models` **无条件公开可读**（带不带 api-key 均可访问——出示的 key 不会触发鉴权，仅按 key 前缀绑定收窄目录），返回**该租户当前可调用模型的目录**——Hydra 本地聚合（跨授权 provider 并集、按租户模型白名单过滤、剔除熔断/软禁用/无 key 的 provider），不再直通单一上游；聊天等调用仍须 api-key。管理端另有只读聚合端点 `GET /api/v1/tenants/{tenant_id}/models`（admin token；含每个 provider 的在线状态，供运维诊断）。详见 `dev-docs/design-tenant-model-catalog.md` 与 `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`。
 
 ## 工程结构
 

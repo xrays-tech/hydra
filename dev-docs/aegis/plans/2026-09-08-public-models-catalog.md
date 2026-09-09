@@ -1,7 +1,7 @@
 # 实施计划：数据面 GET /v1/models 公开目录（免认证读取）
 
 - **日期**：2026-09-08
-- **状态**：已通过 oracle 架构复核（v1 GATE: PASS）→ 已落档 → **2026-09-08 已实施**（proxy.rs (2.5) 上移 + `enforce_auth` 共享 helper + 匿名正/负向钉住测试 + 文档同步）→ 门禁见 §9 实施记录
+- **状态**：已通过 oracle 架构复核（v1 GATE: PASS）→ 已落档 → **2026-09-08 已实施**（proxy.rs (2.5) 上移 + `enforce_auth` 共享 helper + 匿名正/负向钉住测试 + 文档同步）→ 门禁见 §9 实施记录；**2026-09-09 v2 语义修订（用户决策，未走 oracle 复核）**：目录带/不带 api-key 一律 200（出示 key 不再鉴权、仅按前缀绑定收窄），见 §10
 - **作者**：编码智能体（DeepSeek）｜深度复核：Architecture review (@oracle)
 - **对应需求**：生产环境 https://api-dev.do.top/v1/models（数据面，无任何认证头）实测返回 `{"error":{"message":"missing_api_key","type":"proxy_error"}}`；产品结论：OpenAI 兼容的 `GET /v1/models` 目录必须**免认证可读**，聊天调用等其余路径鉴权语义不得受影响。
 - **前置设计**：dev-docs/design-tenant-model-catalog.md（2026-09-03，oracle v3 GATE: PASS，开发已合入工作树，未提交）；本计划**修订**其 §2.2「目录访问与聊天访问同权限边界」决策。
@@ -28,8 +28,8 @@
 (2.5) 若 GET && req_header.uri.path()=="/v1/models"（精确路径、忽略 query）：
     api_key = Self::extract_api_key(session)      // Option，不再必填
     if Some(k):
-        执行现有外部鉴权语义（cache-first auth.check + 原有指标；Denied ⇒ 401/403 原样回写）
-        —— 出示了凭据就必须有效；目录对绑定 key 收窄（与现状逐字一致）
+        跳过外部鉴权（v2：出示 key 不再校验——目录无条件可读）
+        目录按 key-prefix 绑定收窄（命中绑定前缀 ⇒ 绑定 provider 视图；未命中 ⇒ 并集）
     if None:
         跳过鉴权（匿名读目录）
     entries = router::accessible_models(cfg, breaker, &tenant.id, api_key.as_deref())
@@ -47,8 +47,8 @@
 | # | 决策 | 理由 / 影响面 |
 |---|---|---|
 | S1 | 未知域 404、disabled 租户 403 保留（目录也执行 ②，匿名不跳过） | 目录语义 = “该租户现在可路由的模型”；disabled 租户不广告 |
-| S2 | 出示 key ⇒ 无效 401/403 不变；有效 key + 前缀绑定 ⇒ 目录收窄到绑定 provider（不变） | 出示凭据必须有效；绑定是“哪家 provider 服务该 key 的流量” |
-| S3 | 匿名 ⇒ 跳过鉴权，返回租户级模型 id 并集（无 provider 拓扑） | **有意为之**（P2-5 记录）：模型 id 非机密；绑定 key 视图 ⊆ 匿名并集是设计结果，非缺陷 |
+| S2（v2 修订） | 出示 key ⇒ **不再校验**（删除 401/403 可能）；key + 前缀绑定 ⇒ 目录收窄到绑定 provider；未命中绑定 ⇒ 租户并集 | 目录无条件公开：出示 key 不增加信息（绑定视图 ⊆ 匿名并集）；401/403 行为面仅剩「HEAD / /{id} / 其它路径的匿名 401」 |
+| S3（v2 修订） | 匿名 / keyed ⇒ **均跳过鉴权**，返回租户级并集或绑定收窄视图（无 provider 拓扑） | **有意为之**（P2-5 记录）：模型 id 非机密；带/不带 key 可读一致，绑定 key 视图 ⊆ 匿名并集是设计结果，非缺陷 |
 | S4 | 仅 GET 精确 /v1/models 免认证；HEAD /v1/models、/v1/models/{id}、其它方法/路径不变（匿名仍 401，keyed 仍直通/受策略约束） | 行为面唯一变更格 = 「匿名 GET /v1/models」401→200（oracle 全组合核验） |
 | S5 | 不加配置开关（默认公开） | 仓库无请求语义类开关惯例（env 均为部署配置）；生产要求绝对公开；未来如某租户需 401 再按租户 opt-out（P2-5） |
 | S6 | 目录（keyed 与匿名）仍不计 count 配额（R9 延续）；匿名无角色可匹配 ⇒ 无配额 | 本地只读、CPU 有界（models_by_key × tenant_providers 遍历）、无上游、响应极小；以 hydra_catalog_requests_total 观测匿名 QPS（P2-4）；如需限频属后续独立项 |
@@ -72,7 +72,7 @@
 - 匿名 GET /v1/models/{id} ⇒ 401（负向钉住——现有 /{id} 用例只覆盖 keyed）；
 - disabled 租户匿名 GET /v1/models ⇒ 403；未知域 ⇒ 404（负向钉住）。
 
-钉住既有语义（不改不破）：无效 key ⇒ 401（现有 `catalog_get_v1_models_unauthorised_key_returns_401`）；有效 key + 绑定收窄（现有）；keyed /{id} 直通（现有）；keyed union/零上游/无 providers 200 空（现有）。回归：POST chat 全流程、限流、熔断、admin_api 全套既有用例。
+钉住既有语义（v2 反转 + 保留）：**出示会被 auth_url 拒绝的 key ⇒ 仍 200 且零 auth 调用 / 零上游**（`catalog_get_v1_models_denied_key_still_reads_200_no_auth`）；key 前缀绑定收窄（现有）；keyed /{id} 直通（现有）；keyed union/零上游/无 providers 200 空（现有）。回归：POST chat 全流程、限流、熔断、admin_api 全套既有用例。
 
 门禁命令（对齐 ci.yml）：`cargo fmt --check`、`cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings`、`cargo test -p hydra-core`、`cargo test -p hydra-server --features server`。
 
@@ -96,7 +96,7 @@
 
 | # | 风险 / 决策 | 处理 |
 |---|---|---|
-| R1 | 行为变更面 | 全组合核验仅「匿名 GET /v1/models」401→200；出示 key 的全部语义逐字不变 |
+| R1 | 行为变更面 | 全组合核验仅「匿名 GET /v1/models」401→200；**v2（2026-09-09）追加：出示 key 的目录读取 401/403→200（行为面 = 精确 GET /v1/models 带/不带 key 均可读；HEAD / /{id} / 其它路径与 chat 鉴权不变）** |
 | R2 | 匿名滥用 / 无配额 | 本地只读 + CPU 有界 + 无上游；以 hydra_catalog_requests_total 观测；租户级目录限频 = 后续独立项（P2-4） |
 | R3 | 与既有设计冲突 | 修订 catalog §2.2「同权限边界」决策；本计划为权威记录（GATE 通过） |
 | R4 | HEAD / 匿名 /{id} 无既有基准 | 新增负向钉住测试（§4） |
@@ -109,6 +109,7 @@
 | 轮次 | 结论 | 修订 |
 |---|---|---|
 | v1（本会话） | **GATE: PASS**（P0=0；P1-1 补发布/部署顺序声明后实施；P2-1..P2-5 按序吸收，均不阻塞） | P1-1→§5 发布/部署顺序（HEAD 无独立热修路径；catalog 同 release；最小降级方案不采纳仅记录）；P2-1→§4 匿名负向钉住（匿名 HEAD 401 / 匿名 /{id} 401 / query 忽略 / disabled 403 / 未知域 404）；P2-2→§3 抽共享鉴权 helper + record_catalog 恰一次；P2-3→§6 文档清单补 TL;DR/要点 121/R9/错误契约/§8/模块头注释；P2-4→§7 R2（匿名观测面）；P2-5→§2 S3+S5（默认公开不加开关成立；未来按租户 opt-out） |
+| v2（2026-09-09 语义修订） | 用户产品决策（未走 oracle 复核）：目录必须无条件可读 | (2.5) 删除出示 key 的外部鉴权（`enforce_auth` 仅剩步骤 ④ 一处调用；`ctx.client_api_key` 不再为目录请求赋值）；key 只按前缀绑定收窄；401 用例反转为 200+零 auth/零上游钉住；文档同步见 §10 |
 
 ---
 
@@ -120,3 +121,14 @@
 - **文档**：README.zh-CN（模型目录免认证说明）、dev-docs/design.md §6.3a、dev-docs/design-tenant-model-catalog.md（§2.2 拦截点/伪码/要点、错误契约、R9、状态、§8 v4）、本计划、dev-docs/aegis/INDEX.md（2026-09-08 行）。
 - **门禁（全绿）**：`cargo fmt --check` OK；`cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings` OK；`cargo test -p hydra-core` 全绿（router 28 / extract 9 / swrr 8 / …）；`cargo test -p hydra-server --features server` 全绿（terminate_mode 25 含 6 新用例、admin_api 26、cluster 6、http_auth 22、tls 4、…）。
 - **部署顺序（P1-1）**：与租户模型目录 catalog 功能（Task 1-3）**同一 release** 合入并发布；HEAD 无独立热修路径。
+
+---
+
+## 10. v2 语义修订实施记录（2026-09-09，已完成）
+
+- **决策**：产品结论——`GET /v1/models` 目录**无条件公开**：带不带 api-key 均可读（用户 2026-09-09 直接裁定，未走 oracle 复核；本修订不改变 chat 及其它路径的鉴权语义）。
+- **代码**（`crates/hydra-server/src/proxy.rs`）：(2.5) 分支删除出示 key 的 `enforce_auth` 调用与 `ctx.client_api_key` 赋值——目录路径不再触发外部鉴权，`enforce_auth` 仅剩步骤 (4) 一处使用；出示的 key 仅经 `accessible_models` 的 key-prefix 绑定闸门收窄（绑定视图 ⊆ 匿名并集，出示 key 不增加信息）；模块头、request_filter 步骤注释、`enforce_auth` doc 同步。
+- **测试**（`crates/hydra-server/tests/terminate_mode.rs`）：原 401 用例反转为 `catalog_get_v1_models_denied_key_still_reads_200_no_auth`——出示会被 auth_url 拒绝的 key ⇒ 200 本地目录 + 零 auth 调用 + 零上游（钉住"目录路径永不鉴权"）；匿名正/负向钉住、绑定收窄、HEAD / /{id} 边界用例不变。
+- **文档**：README.zh-CN（无条件公开说明）、dev-docs/design.md §6.3a、dev-docs/design-tenant-model-catalog.md（状态、§2.2 拦截点/伪码/要点、错误契约（删除"出示失效 key 401/403"行）、R9、§8 v5）、本计划（§1 伪码 / §2 S2/S3 / R1 / §4 / §8 v2 / 本 §10）。
+- **行为面变化（相对 v1）**：精确 `GET /v1/models` 出示 key 时 401/403 → 200（不再校验 key）。匿名 200、HEAD / `/{id}` / 其它路径、chat、管理面、限流、熔断、cluster/edge 全部不变。
+

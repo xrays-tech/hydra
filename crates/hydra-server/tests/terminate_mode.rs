@@ -1654,11 +1654,13 @@ async fn catalog_get_v1_models_id_still_passes_through_upstream() {
     );
 }
 
-/// (Task 2c) The catalog shares the external-auth boundary unchanged: an
-/// unauthorised client key gets 401 from the existing auth path before any
-/// catalog computation happens.
+/// (Task 2c — round-2 revision) The directory is public WITH a key too: the
+/// external-auth boundary never runs on the exact `GET /v1/models` path, so
+/// even a key the tenant auth_url would DENY reads the local catalog — 200,
+/// zero auth calls, zero upstream. A presented key only narrows via prefix
+/// binding (no binding in this seed ⇒ same union as anonymous).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_get_v1_models_unauthorised_key_returns_401() {
+async fn catalog_get_v1_models_denied_key_still_reads_200_no_auth() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(401))
@@ -1680,8 +1682,25 @@ async fn catalog_get_v1_models_unauthorised_key_returns_401() {
     let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
     assert_eq!(
         resp.status(),
-        401,
-        "catalog must share the auth boundary (bad key ⇒ 401)"
+        200,
+        "catalog must be readable with a presented key (no auth on this path)"
+    );
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body, r#"{"object":"list","data":[{"id":"gpt-4","object":"model"}]}"#,
+        "keyed catalog = same local directory as anonymous: {body}"
+    );
+    let auth_hits = auth_server.received_requests().await.expect("recording on");
+    assert!(
+        auth_hits.is_empty(),
+        "external auth must NOT be called for a keyed catalog read: {}",
+        auth_hits.len()
+    );
+    let upstream_hits = upstream.received_requests().await.expect("recording on");
+    assert!(
+        upstream_hits.is_empty(),
+        "upstream must receive ZERO requests (local catalog): {}",
+        upstream_hits.len()
     );
 }
 
@@ -1843,7 +1862,8 @@ async fn catalog_get_v1_models_key_prefix_binding_restricts_providers() {
     );
 }
 // ===========================================================================
-// Tenant model catalog — PUBLIC read revision (anonymous access)
+// Tenant model catalog — PUBLIC read revision (anonymous AND keyed access:
+// with or without a presented api-key the exact GET /v1/models reads locally)
 // (dev-docs/aegis/plans/2026-09-08-public-models-catalog.md §4; oracle P2-1)
 // ===========================================================================
 

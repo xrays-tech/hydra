@@ -6,10 +6,11 @@
 //! The whole gateway lifecycle happens inside [`ProxyHttp::request_filter`]:
 //!
 //! 1. Domain → tenant + tenant-enabled gate. `GET /v1/models` is answered
-//!    locally as the tenant model catalog right after the enabled gate:
-//!    anonymous ⇒ public 200 read; a presented key is auth-checked first
-//!    (denied ⇒ 401/403) and narrows the listing via key-prefix binding;
-//!    unknown domain ⇒ 404 / disabled tenant ⇒ 403 still apply.
+//!    locally as the tenant model catalog right after the enabled gate,
+//!    WITH OR WITHOUT a presented api-key (no external auth on this exact
+//!    path): anonymous ⇒ public 200 read; a presented key narrows the
+//!    listing via key-prefix binding only; unknown domain ⇒ 404 / disabled
+//!    tenant ⇒ 403 still apply.
 //! 2. Mandatory client api-key parse + external auth (cache-first) for every
 //!    other request (missing key ⇒ 401 `missing_api_key`).
 //! 3. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
@@ -184,9 +185,9 @@ impl HydraProxy {
     /// Denied — writes the structured 401/403 response body.
     ///
     /// Returns `Ok(true)` when the request has been answered (denied ⇒ the
-    /// caller must short-circuit), `Ok(false)` when it may proceed. Shared by
-    /// the mandatory-auth step (4) and the keyed sub-path of the tenant model
-    /// catalog (2.5) so the two can never drift.
+    /// caller must short-circuit), `Ok(false)` when it may proceed. Used by
+    /// the mandatory-auth step (4); the tenant model catalog (2.5) deliberately
+    /// does NOT call it — the directory is public with or without a key.
     async fn enforce_auth(
         &self,
         session: &mut Session,
@@ -257,13 +258,15 @@ impl ProxyHttp for HydraProxy {
     // request_filter — the FULL terminate-mode gateway lifecycle.
     // -----------------------------------------------------------------------
     //
-    // Steps (design-change §4.1; + tenant-model-catalog public-read revision):
+    // Steps (design-change §4.1; + tenant-model-catalog public-read revision,
+    // round 2 — unconditionally public directory):
     //   (1) domain → tenant
     //   (2) tenant enabled gate
     //   (2.5) GET /v1/models — tenant model directory, BEFORE the mandatory
-    //         key gate: anonymous ⇒ 200 public read; a presented key must pass
-    //         external auth (denied ⇒ 401/403) and narrows the listing via
-    //         key-prefix binding; answered fully locally, never proxied.
+    //         key gate, readable with or without a presented api-key: no
+    //         external auth on this exact path; a presented key only narrows
+    //         the listing via key-prefix binding; answered fully locally,
+    //         never proxied.
     //   (3) mandatory api-key parse for every other request (401 missing_api_key)
     //   (4) external auth (cache-first) + metrics
     //   (5) read the FULL downstream body (loop → Bytes)
@@ -310,12 +313,12 @@ impl ProxyHttp for HydraProxy {
         ctx.tenant = Some(tenant.clone());
 
         // (3) Client api-key parse (§6.3 §3). Mandatory for every non-catalog
-        //     request; OPTIONAL for `GET /v1/models` where an absent key means
-        //     an anonymous read of the tenant model catalog (2.5 below).
+        //     request; OPTIONAL for `GET /v1/models` — there a presented key
+        //     is never validated, it only narrows the catalog (2.5 below).
         let api_key_opt = Self::extract_api_key(session);
 
         // (2.5) Tenant model catalog (design-tenant-model-catalog §2.2, P0;
-        //       public-read revision — dev-docs/aegis/plans/2026-09-08).
+        //       public-read revision round 2 — dev-docs/aegis/plans/2026-09-08).
         //
         // Intercept `GET /v1/models` — the tenant model directory — BEFORE the
         // mandatory api-key gate and answer from the LOCAL union of this
@@ -323,14 +326,15 @@ impl ProxyHttp for HydraProxy {
         // design §2.1), serialised OpenAI-style:
         //   {"object":"list","data":[{"id":<model>,"object":"model"}, ...]}
         // Auth semantics for the directory:
-        //   - no key (anonymous): auth is skipped — the directory is publicly
-        //     readable per tenant (tenant resolved from Host, steps 1-2 above);
-        //   - a PRESENTED key must still verify through the same cache-first
-        //     external-auth boundary as chat requests (denied ⇒ 401/403 with
-        //     the existing verdict body) and, when valid, narrows the listing
-        //     to the bound provider via key-prefix binding inside
-        //     `accessible_models` (key = Some). Unknown domain (1) and
-        //     disabled-tenant (2) short-circuits still apply unchanged.
+        //   - the directory is unconditionally public for the tenant (resolved
+        //     from Host, steps 1-2 above) — the external-auth boundary NEVER
+        //     runs on this exact path, whether a key was presented or not;
+        //   - a presented key is therefore not validated; it only narrows the
+        //     listing to the bound provider via key-prefix binding inside
+        //     `accessible_models` (key = Some; the bound view is a subset of
+        //     the anonymous union, so presenting a key adds no information).
+        //     Unknown domain (1) and disabled-tenant (2) short-circuits still
+        //     apply unchanged.
         // Only method GET on the exact path `/v1/models` is intercepted (the
         // query string is ignored via `uri.path()`); HEAD `/v1/models`,
         // `/v1/models/{id}`, health checks and every other path keep their
@@ -345,15 +349,11 @@ impl ProxyHttp for HydraProxy {
             req_header.method.as_str() == "GET" && req_header.uri.path() == "/v1/models"
         };
         if is_catalog_get {
-            if let Some(key) = &api_key_opt {
-                // A presented credential must be valid: run the exact same
-                // external-auth boundary as chat; the 401/403 verdict body is
-                // written inside `enforce_auth` when denied.
-                if self.enforce_auth(session, ctx, &tenant, key).await? {
-                    return Ok(true);
-                }
-                ctx.client_api_key = Some(key.clone());
-            }
+            // Round-2 semantics: no external auth on the directory. A presented
+            // key (api_key_opt) is passed through ONLY for key-prefix binding
+            // narrowing — a bound view ⊆ the anonymous union, so the read is
+            // public with or without a key. record_catalog fires once per
+            // served directory request.
             crate::admin::metrics::record_catalog(&tenant.id);
             let entries = router::accessible_models(
                 cfg,
