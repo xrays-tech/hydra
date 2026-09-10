@@ -195,6 +195,50 @@ pub enum ProviderKind {
     Generic,
 }
 
+/// The client's request path selects the wire format end-to-end (design §9.4):
+/// `/v1/messages` is Anthropic-native, everything else is OpenAI-compatible.
+///
+/// **Single owner for the rule.** Both the usage-scanner family (proxy shell)
+/// and the upstream credential transport (`ProviderClient::build_request`) read
+/// it, so the two can never drift apart.
+///
+/// Boundary (deliberate, unchanged): only the exact `/v1/messages` tail matches.
+/// Sibling Anthropic endpoints (`/v1/messages/count_tokens`,
+/// `/v1/messages/batches`) stay on the OpenAI-compatible branch.
+#[must_use]
+pub fn protocol_for_path(path: &str) -> ProviderKind {
+    if path.ends_with("/v1/messages") {
+        ProviderKind::Anthropic
+    } else {
+        ProviderKind::Generic
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_for_path_matches_only_the_v1_messages_tail() {
+        assert_eq!(protocol_for_path("/v1/messages"), ProviderKind::Anthropic);
+        assert_eq!(
+            protocol_for_path("/gw/prefix/v1/messages"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            protocol_for_path("/v1/chat/completions"),
+            ProviderKind::Generic
+        );
+        assert_eq!(protocol_for_path("/v1/models"), ProviderKind::Generic);
+        // Deliberate boundary: siblings are NOT Anthropic-native here.
+        assert_eq!(
+            protocol_for_path("/v1/messages/count_tokens"),
+            ProviderKind::Generic
+        );
+        assert_eq!(protocol_for_path("/v1/messages/batches"), ProviderKind::Generic);
+    }
+}
+
 /// Normalised, provider-neutral token usage. All fields optional: some
 /// providers omit them (e.g. OpenAI without `stream_options.include_usage`).
 ///

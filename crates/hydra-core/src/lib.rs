@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apikey;
 pub mod auth;
 pub mod breaker;
 pub mod config;
