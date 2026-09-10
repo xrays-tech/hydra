@@ -537,6 +537,38 @@ Causes:
 
 ---
 
+### 10.7 Data-plane requests return 401 `missing_api_key`
+
+The gateway accepts a client api-key from any of these transports (first
+match in this order wins):
+
+| # | Transport | Typical client |
+|---|-----------|----------------|
+| 1 | `Authorization: Bearer <k>` | OpenAI SDK, Anthropic SDK (OAuth) |
+| 2 | `Authorization: <k>` (bare, no scheme) | self-rolled clients |
+| 3 | `x-api-key` | Anthropic SDK |
+| 4 | `api-key` | Azure OpenAI |
+| 5 | `x-goog-api-key` | Gemini CLI / google-genai |
+| 6 | query `?key=` / `?api_key=` / `?apikey=` / `?access_token=` | browser WebSocket |
+
+Check, in order:
+
+1. **Something is stripping the header.** Reverse proxies, CDNs and API
+   gateways routinely drop unknown `x-goog-api-key`/`api-key` headers, or
+   strip the query string entirely — verify with the gateway's own access log
+   or a direct call to the Hydra port.
+2. **A non-Bearer `Authorization` scheme is not a key.** `Basic …`/`Digest …`
+   are rejected on purpose; such a request falls through to the other
+   transports and, if none carries a key, ends in 401.
+3. **The query form depends on nothing in front of Hydra logging URLs.**
+   Hydra itself never logs request URIs and never forwards the query string
+   upstream, but a fronting proxy might log it — keep the credential out of
+   the query whenever a header is possible.
+4. **Multiple transports with different values** resolve to the first match
+   above and emit one `warn` (`source` + `conflicting` labels, never values)
+   — grep for *"differing api-key values"* when a call authenticates as an
+   unexpected key.
+
 ## 11. Load baseline (wave-6 §2.4)
 
 The wave-6 load harness lives in `scripts/load_test.sh` (orchestrates `oha`
@@ -712,4 +744,3 @@ for i in $(seq 1 8); do git fetch origin >/dev/null 2>&1 && echo "$i OK" || echo
    (later `git fetch --unshallow` on a good link).
 3. **Force IPv4**: `git fetch -4 origin main`.
 4. **MTU tuning** (physical-link packet loss): `sudo ip link set dev <iface> mtu 1360`.
-

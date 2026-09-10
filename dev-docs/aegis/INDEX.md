@@ -14,3 +14,4 @@ Entries are workspace records, not authoritative runtime decisions.
 | 2026-09-03 | doc | dev-docs/design-tenant-model-catalog.md | 租户模型目录接口（数据面本地聚合 GET /v1/models + 管理口只读聚合 GET /api/v1/tenants/{id}/models） |
 | 2026-09-08 | plan | dev-docs/aegis/plans/2026-09-08-public-models-catalog.md | 数据面 GET /v1/models 公开目录（免认证读取）——修订租户模型目录鉴权边界（oracle v1 GATE: PASS） |
 | 2026-09-09 | plan | dev-docs/aegis/plans/2026-09-09-auth-insufficient-balance-402.md | 认证拒绝原因透传：insufficient_balance ⇒ HTTP 402（Payment Required；拒绝语义 + 缓存策略 + admin 归类） |
+| 2026-09-10 | plan | dev-docs/aegis/plans/2026-09-10-inbound-credential-forms.md | 入口 api-key 多形式解析（Bearer / 裸 Authorization / x-api-key / api-key / x-goog-api-key / query；优先级 + 冲突告警，零 schema 变更） |

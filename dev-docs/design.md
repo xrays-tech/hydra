@@ -608,7 +608,7 @@ pub struct SelectedRoute {
 
 1. **解析域名**：`Host` 头 → 小写；若缺省或为 `localhost` → 用 `localhost` 匹配租户；匹配失败 → 写 404 错误响应，`return Ok(true)`。
 2. **租户校验**：租户存在且 `enabled=1`，否则 403。
-3. **解析客户端 api-key**：`Authorization: Bearer xxx` 或 `x-api-key`。
+3. **解析客户端 api-key**（多传输，2026-09-10 计划 `dev-docs/aegis/plans/2026-09-10-inbound-credential-forms.md`）：按固定优先级取第一个非空值 —— ① `Authorization: Bearer <k>`（scheme 大小写不敏感）→ ② `Authorization: <k>`（裸值，无任何空白）→ ③ `x-api-key` → ④ `api-key`（Azure 风格）→ ⑤ `x-goog-api-key`（Gemini 风格）→ ⑥ query 参数 `key`/`api_key`/`apikey`/`access_token`（`%XX` 解码，`+` 按字面保留）。多个传输同时携带**不同**值时，取最高优先级者并记一条不含值的 `warn`（标签 + trace_id）；全部缺失 ⇒ 401 `missing_api_key`（语义不变）。解析结果对下游（外部认证 / §7.1b 前缀绑定 / §9.5 脱敏记录）与来源形式无关。
 4. **外部认证**：调用 `AuthChecker::check(&tenant, &api_key)`（缓存优先，详见 §11）；按 `AuthVerdict` 携带的状态码写错误响应（401/402/503），`return Ok(true)`。`auth_url` 缺失 → 一律拒绝（401）。
 5. **解析 model_key（零拷贝 memchr 扫描，见 §6 零拷贝原则）**：
    - **不**整体读取/反序列化请求体。`request_filter` 内 `read_body_bytes().await` 仅读**首个** chunk，用 `memchr::memmem::find(chunk, b"\"model\"")` SIMD 扫描（约 ~20 字节早退、零分配）得 `model_key`；
@@ -652,7 +652,10 @@ async fn upstream_peer(&self, session: &mut Session, ctx: &mut RequestContext)
 
 ### 6.5 `upstream_request_filter`：改写
 
-- **替换鉴权**（仅路由路径）：移除客户端原始 `Authorization`/`x-api-key`，写入 `Authorization: Bearer <provider_api_key>`；
+- **替换鉴权**（仅路由路径，2026-09-10 修订）：移除客户端原始 `Authorization`/`x-api-key`/`api-key`/`x-goog-api-key`，按**线路格式**（`hydra_core::model::protocol_for_path`，与 usage 解析器同一判定）写入**恰好一个**凭据头：
+  - `/v1/messages`（Anthropic 原生）⇒ `x-api-key: <provider_api_key>`，并原样透传客户端的 `anthropic-version` / `anthropic-beta`（缺 `anthropic-version` 时真 Anthropic API 返回 400）；
+  - 其余路径（OpenAI 兼容）⇒ `Authorization: Bearer <provider_api_key>`。
+  - **绝不双发**：部分网关见到 `Authorization` 与 `x-api-key` 同时存在即 401（QwenLM/qwen-code PR #4385 因同样改动回滚）；
 - **重写 Host/路径**（修订 P2-C9，明确边界规则）：提案要求「`/v1` 前面的部分替换成供应商 endpoint」。
   - 规则：定位请求 path 中**首个** `/v1`，保留其（含）之后的尾部，拼接至供应商 endpoint 的 base；例：endpoint=`https://api.openai.com`，path=`/foo/v1/chat/completions` → 上游 path=`/v1/chat/completions`，Host=`api.openai.com`；
   - endpoint 含路径前缀（如 `https://gateway.provider.com/llm`）→ 拼接为 `https://gateway.provider.com/llm/v1/chat/completions`；
@@ -739,7 +742,7 @@ pub fn resolve(
 
 新增 `provider_key_binding` 表（§4.1）：`key_prefix`（UNIQUE）→ `provider_id`。
 
-- **匹配**：客户端 api-key（Authorization Bearer / x-api-key 的**原始值**）以某条
+- **匹配**：客户端 api-key（任意受支持传输解析出的**原始值**，见 §6.3 第 3 步）以某条
   `enabled=1` 的 `key_prefix` 开头 ⇒ 候选集被限制为该 provider；
 - **最长前缀优先**：多条前缀同时命中时取 `key_prefix` 最长者（最具体）；
 - **fail-closed**：绑定的 provider 不在候选集（不提供该模型 / 未被租户授权 /
