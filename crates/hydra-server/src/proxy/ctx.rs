@@ -38,7 +38,8 @@ pub struct RequestContext {
     pub started_at: Instant,
     /// Tenant resolved from the `Host` header (None ⇒ 404 short-circuit).
     pub tenant: Option<Tenant>,
-    /// The raw client api-key parsed from `Authorization`/`x-api-key`.
+    /// The raw client api-key, parsed from any supported credential
+    /// transport (see `hydra_core::apikey`).
     pub client_api_key: Option<String>,
     /// The external-auth verdict (carries the HTTP status to write back).
     pub auth_verdict: Option<AuthVerdict>,

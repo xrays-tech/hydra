@@ -416,3 +416,138 @@ async fn v1_chat_completions_regression_generic_scanner() {
     assert_eq!(r.model_key, "gpt-4");
     assert_eq!(r.status_code, 200);
 }
+
+
+/// Like [`send_until_ready`] but with an explicit header set (used to prove the
+/// upstream hop's credential transport).
+async fn send_until_ready_with(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> reqwest::Response {
+    let mut last_err = None;
+    for _ in 0..60 {
+        let mut req = client.post(url).header("content-type", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        match req.body(body.to_string()).send().await {
+            Ok(r) => return r,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "proxy never became ready: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+/// **Test C — the /v1/messages hop is Anthropic-native at the credential layer.**
+///
+/// The client authenticates with `x-api-key`; Hydra must replace it with the
+/// PROVIDER key and keep using `x-api-key` (never `Authorization: Bearer`:
+/// several gateways reject a request carrying both credential headers, see
+/// QwenLM/qwen-code PR #4385). The required `anthropic-version` must survive the
+/// hop — without it the real API answers 400 invalid_request_error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_messages_upstream_gets_x_api_key_and_anthropic_version() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+
+    let upstream = MockServer::start().await;
+    let anthropic_json = concat!(
+        r#"{"id":"msg_2","type":"message","role":"assistant","#,
+        r#""content":[{"type":"text","text":"Hi"}],"model":"claude-3-5-sonnet-test","#,
+        r#""stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}"#
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(anthropic_json.to_string()),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_routed(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+        "claude-3-5-sonnet-test",
+    )
+    .await;
+
+    let recording = Arc::new(RecordingSink::default());
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider)
+        .await
+        .expect("ConfigStore::load");
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker::new"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
+    let limiter = Arc::new(RateLimiter::new());
+    let state = Arc::new(AppState {
+        store,
+        auth,
+        breaker,
+        limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
+        sink: recording.clone(),
+        proxy: ProxyConfig::default(),
+    });
+    let root = start_proxy(state);
+    let client = test_client();
+    let body = r#"{"model":"claude-3-5-sonnet-test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    let resp = send_until_ready_with(
+        &client,
+        &format!("{root}/v1/messages"),
+        &[
+            ("x-api-key", "test-client-key"),
+            ("anthropic-version", "2023-06-01"),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("upstream recording on");
+    assert_eq!(received.len(), 1, "exactly one upstream call");
+    let headers = &received[0].headers;
+    assert_eq!(
+        headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        Some("sk-upstream-secret"),
+        "the PROVIDER key must travel in x-api-key on the Anthropic path"
+    );
+    assert!(
+        headers.get("authorization").is_none(),
+        "no Authorization header may accompany x-api-key"
+    );
+    assert_eq!(
+        headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("2023-06-01"),
+        "anthropic-version must survive the hop"
+    );
+}

@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use hydra_core::model::Provider;
+use hydra_core::model::{protocol_for_path, Provider, ProviderKind};
 use hydra_core::rewrite::rewrite_path;
 use pingora_http::RequestHeader;
 
@@ -70,8 +70,9 @@ impl ProviderClient {
     /// 1. **Path rewrite** — `rewrite_path` re-joins the downstream `/v1/…`
     ///    tail onto the provider's parsed endpoint base (`scheme://host[:port]`
     ///    + path prefix).
-    /// 2. **Key swap** — the client's `Authorization` is replaced with the
-    ///    provider api-key chosen for this attempt.
+    /// 2. **Key swap** — every client credential header is replaced by the
+    ///    provider api-key chosen for this attempt, in the transport the wire
+    ///    format requires (see the credential-injection block below).
     /// 3. **Host** — the `Host` header is set to the provider host.
     ///
     /// The body is attached as `reqwest::Body::from(body.clone())` — an O(1)
@@ -109,7 +110,6 @@ impl ProviderClient {
         let mut builder = self
             .client
             .request(original.method.clone(), &url)
-            .header("Authorization", format!("Bearer {upstream_key}"))
             .header("X-Hydra-Trace-Id", trace_id)
             .body(body.clone());
 
@@ -117,10 +117,34 @@ impl ProviderClient {
             builder = builder.header("Host", &ep.host);
         }
 
+        // Credential injection (§6.5). The wire format decides the transport,
+        // and exactly ONE credential header is ever sent: several gateways
+        // reject a request carrying both, which is why QwenLM/qwen-code
+        // reverted exactly such a double-emit (PR #4385 "regresses
+        // IdeaLab-style proxies").
+        //   /v1/messages    → Anthropic-native   ⇒ `x-api-key`
+        //   everything else → OpenAI-compatible  ⇒ `Authorization: Bearer`
+        match protocol_for_path(original.uri.path()) {
+            ProviderKind::Anthropic => {
+                builder = builder.header("x-api-key", upstream_key);
+                // Anthropic-only headers that affect provider behaviour must
+                // survive the hop: without `anthropic-version` the real API
+                // answers 400 `invalid_request_error`.
+                for name in ["anthropic-version", "anthropic-beta"] {
+                    if let Some(value) = original.headers.get(name).and_then(|v| v.to_str().ok()) {
+                        builder = builder.header(name, value);
+                    }
+                }
+            }
+            _ => {
+                builder = builder.header("Authorization", format!("Bearer {upstream_key}"));
+            }
+        }
+
         // Forward a minimal set of client hints that affect provider behaviour.
-        // We deliberately do NOT forward `Authorization` (swapped above) and we
-        // let providers set their own `Content-Type` default when the client
-        // omitted one.
+        // We deliberately do NOT forward any client credential header (all of
+        // them are replaced above) and we let providers set their own
+        // `Content-Type` default when the client omitted one.
         if let Some(accept) = original.headers.get("accept").and_then(|v| v.to_str().ok()) {
             builder = builder.header("Accept", accept);
         }
@@ -162,6 +186,14 @@ mod tests {
         h
     }
 
+    /// Same as [`header`] with one extra downstream header attached.
+    fn header_with(path: &str, name: &str, value: &str) -> RequestHeader {
+        let mut h = header(path);
+        h.insert_header(name.to_string(), value)
+            .expect("insert header");
+        h
+    }
+
     #[test]
     fn build_rewrites_path_and_swaps_key() {
         let pc = ProviderClient::new();
@@ -198,6 +230,10 @@ mod tests {
                 .get("authorization")
                 .and_then(|v| v.to_str().ok()),
             Some("Bearer sk-upstream-secret")
+        );
+        assert!(
+            req.headers().get("x-api-key").is_none(),
+            "exactly one credential header may be sent (OpenAI path)"
         );
         assert_eq!(
             req.headers().get("host").and_then(|v| v.to_str().ok()),
@@ -239,5 +275,77 @@ mod tests {
             req.url().as_str(),
             "https://gw.example.com/llm/v1/chat/completions"
         );
+    }
+
+    /// The Anthropic-native path gets `x-api-key` (and NOT `Authorization`),
+    /// and the Anthropic-only headers the client sent survive the hop — without
+    /// `anthropic-version` the real API answers 400.
+    #[test]
+    fn build_uses_x_api_key_and_forwards_anthropic_headers_for_v1_messages() {
+        let pc = ProviderClient::new();
+        let provider = Provider {
+            id: "p1".into(),
+            key: "anthropic".into(),
+            name: "Anthropic".into(),
+            endpoint: "https://api.anthropic.com".into(),
+            weight: 1,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        };
+        let body = Bytes::from_static(b"{\"model\":\"claude-3-5-sonnet\"}");
+        let original = header_with("/v1/messages", "anthropic-version", "2023-06-01");
+        let rb = pc.build_request(&original, &provider, "sk-ant-secret", &body, "trace-2");
+        let req = rb.build().expect("build request");
+
+        assert_eq!(
+            req.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("sk-ant-secret")
+        );
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "exactly one credential header may be sent (Anthropic path)"
+        );
+        assert_eq!(
+            req.headers()
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert_eq!(req.url().as_str(), "https://api.anthropic.com/v1/messages");
+    }
+
+    /// The OpenAI-compatible path never leaks the Anthropic-only headers it
+    /// may have received (they are meaningless to that family).
+    #[test]
+    fn build_does_not_forward_anthropic_headers_on_the_openai_path() {
+        let pc = ProviderClient::new();
+        let provider = Provider {
+            id: "p1".into(),
+            key: "openai".into(),
+            name: "OpenAI".into(),
+            endpoint: "https://api.openai.com".into(),
+            weight: 1,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        };
+        let body = Bytes::from_static(b"{}");
+        let original = header_with("/v1/chat/completions", "anthropic-version", "2023-06-01");
+        let rb = pc.build_request(&original, &provider, "sk-secret", &body, "trace-3");
+        let req = rb.build().expect("build request");
+
+        assert_eq!(
+            req.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-secret")
+        );
+        assert!(req.headers().get("anthropic-version").is_none());
+        assert!(req.headers().get("x-api-key").is_none());
     }
 }

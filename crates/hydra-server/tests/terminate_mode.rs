@@ -2264,3 +2264,342 @@ async fn catalog_public_anonymous_get_v1_models_unknown_domain_404() {
         "anonymous catalog on an unknown Host domain must be 404 unknown_domain"
     );
 }
+
+// ===========================================================================
+// Inbound credential transports (dev-docs/aegis/plans/2026-09-10-inbound-credential-forms.md)
+// ===========================================================================
+
+/// POST the standard chat body carrying an explicit set of credential
+/// transports, retrying until the proxy is ready (Pingora binds async).
+async fn send_with_headers(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> reqwest::Response {
+    let mut last_err = None;
+    for _ in 0..60 {
+        let mut req = client.post(url).header("content-type", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        match req.body(body.to_string()).send().await {
+            Ok(r) => return r,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    panic!(
+        "proxy never became ready: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    );
+}
+
+/// The bodies the tenant auth service actually received, concatenated. Proves
+/// the transport (not merely the header name) was understood — the auth
+/// service is a real wiremock server (dev-plan §1 铁律 2).
+async fn auth_seen_bodies(auth_server: &MockServer) -> String {
+    auth_server
+        .received_requests()
+        .await
+        .expect("auth recording on")
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// Every supported **header** transport authenticates and the raw key reaches
+/// the tenant auth service (fresh graph per case: the auth cache must not be
+/// able to mask a parse failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_header_credential_transport_authenticates() {
+    let body = r#"{"model":"gpt-4","messages":[]}"#;
+    let cases: [(&str, &str, &str); 5] = [
+        ("authorization bearer", "authorization", "Bearer test-client-key"),
+        ("authorization bare", "authorization", "test-client-key"),
+        ("x-api-key", "x-api-key", "test-client-key"),
+        ("api-key", "api-key", "test-client-key"),
+        ("x-goog-api-key", "x-goog-api-key", "test-client-key"),
+    ];
+
+    for (label, name, value) in cases {
+        let auth_server = allowing_auth_server().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-upstream-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let pool = common::setup_pool().await;
+        seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+        let root = start_proxy(build_state(&pool).await);
+        let client = test_client();
+
+        let resp = send_with_headers(
+            &client,
+            &format!("{root}/v1/chat/completions"),
+            &[(name, value)],
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "transport {label} must authenticate");
+
+        let seen = auth_seen_bodies(&auth_server).await;
+        assert!(
+            seen.contains("test-client-key"),
+            "transport {label}: the tenant auth service must receive the raw key, saw: {seen}"
+        );
+
+        let received = upstream
+            .received_requests()
+            .await
+            .expect("upstream recording on");
+        assert_eq!(received.len(), 1, "transport {label}: exactly one upstream call");
+    }
+}
+
+/// C6: the query transport authenticates, and the credential query string is
+/// NEVER forwarded upstream (the upstream URL is built from `uri.path()`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_credential_transport_authenticates_and_is_not_forwarded() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-upstream-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    let root = start_proxy(build_state(&pool).await);
+    let client = test_client();
+
+    let resp = send_with_headers(
+        &client,
+        &format!("{root}/v1/chat/completions?key=test-client-key"),
+        &[],
+        r#"{"model":"gpt-4","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the query transport must authenticate");
+
+    let seen = auth_seen_bodies(&auth_server).await;
+    assert!(
+        seen.contains("test-client-key"),
+        "the tenant auth service must receive the key: {seen}"
+    );
+
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("upstream recording on");
+    assert_eq!(received.len(), 1);
+    assert!(
+        received[0].url.query().is_none(),
+        "the credential query string must never reach the provider: {}",
+        received[0].url
+    );
+}
+
+/// C2/D4: differing transports still route, using the highest-precedence value —
+/// and the shadowing value never leaves the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differing_transports_use_the_highest_precedence_value() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    let root = start_proxy(build_state(&pool).await);
+    let client = test_client();
+
+    let resp = send_with_headers(
+        &client,
+        &format!("{root}/v1/chat/completions"),
+        &[
+            ("authorization", "Bearer test-client-key"),
+            ("x-api-key", "sk-shadow"),
+        ],
+        r#"{"model":"gpt-4","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "conflicting transports must still route");
+
+    let seen = auth_seen_bodies(&auth_server).await;
+    assert!(
+        seen.contains("test-client-key"),
+        "the highest-precedence value must be the one authenticated: {seen}"
+    );
+    assert!(
+        !seen.contains("sk-shadow"),
+        "the shadowed value must never reach the auth service: {seen}"
+    );
+}
+
+/// Negative pin (C3 + B8): no credential in any transport ⇒ 401
+/// `missing_api_key`, zero upstream, zero auth call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_credential_in_any_transport_is_401_missing_api_key() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    let root = start_proxy(build_state(&pool).await);
+    let client = test_client();
+
+    let resp = send_with_headers(
+        &client,
+        &format!("{root}/v1/chat/completions"),
+        &[],
+        r#"{"model":"gpt-4","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 401, "no credential ⇒ 401, unchanged");
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("\"message\":\"missing_api_key\""),
+        "the 401 body shape must stay stable: {body}"
+    );
+
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("upstream recording on");
+    assert!(received.is_empty(), "an unauthenticated call must not reach a provider");
+    let auth_calls = auth_server
+        .received_requests()
+        .await
+        .expect("auth recording on");
+    assert!(auth_calls.is_empty(), "no key ⇒ no auth round-trip");
+}
+
+/// Negative pin (C1/C4): a non-Bearer scheme is not a credential transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_bearer_authorization_scheme_is_rejected() {
+    let auth_server = allowing_auth_server().await;
+    let upstream = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    let root = start_proxy(build_state(&pool).await);
+    let client = test_client();
+
+    let resp = send_with_headers(
+        &client,
+        &format!("{root}/v1/chat/completions"),
+        &[("authorization", "Basic dXNlcjpwYXNz")],
+        r#"{"model":"gpt-4","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 401, "Basic is not an api-key transport");
+
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("upstream recording on");
+    assert!(received.is_empty());
+}
+
+/// C5 regression pin: the `GET /v1/models` directory is still narrowed by
+/// key-prefix binding through ANY transport — here the query form. Same seed as
+/// `catalog_get_v1_models_key_prefix_binding_restricts_providers`, but the key
+/// travels in the query string (the catalog read itself stays anonymous-free:
+/// external auth never runs for `GET /v1/models`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_narrowing_still_works_through_the_query_transport() {
+    let auth_server = allowing_auth_server().await;
+    let upstream_a = MockServer::start().await;
+    let upstream_b = MockServer::start().await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
+    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
+    for (mid, pid, key) in [
+        ("m_a_alpha", "pA", "alpha"),
+        ("m_a_shared", "pA", "shared"),
+        ("m_b_beta", "pB", "beta"),
+        ("m_b_shared", "pB", "shared"),
+    ] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: key.into(),
+                name: key.into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .expect("insert provider_model");
+    }
+    seed_tenant(&pool, "t1", "localhost", &format!("{}/auth", auth_server.uri())).await;
+    for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .expect("insert tenant_provider");
+    }
+    seed_key(&pool, &StaticKeyProvider::new([1u8; 32], 1), "pk_a", "pA", "sk-a").await;
+    seed_key(&pool, &StaticKeyProvider::new([1u8; 32], 1), "pk_b", "pB", "sk-b").await;
+    repo::insert_provider_key_binding(
+        &pool,
+        &ProviderKeyBinding {
+            id: "bind_test_client".into(),
+            key_prefix: "test-client".into(),
+            provider_id: "pA".into(),
+            enabled: true,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("insert provider_key_binding");
+    seed_default_role(&pool, "t1").await;
+
+    let root = start_proxy(build_state(&pool).await);
+    let client = test_client();
+
+    // Anonymous helper: the credential travels in the query string only.
+    let resp =
+        get_until_ready_anonymous(&client, &format!("{root}/v1/models?key=test-client-key")).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body,
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"shared","object":"model"}]}"#,
+        "the query transport must feed key-prefix binding exactly like a header: {body}"
+    );
+    let auth_calls = auth_server
+        .received_requests()
+        .await
+        .expect("auth recording on");
+    assert!(
+        auth_calls.is_empty(),
+        "GET /v1/models never runs external auth, whatever transport carried the key"
+    );
+}

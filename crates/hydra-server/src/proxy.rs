@@ -12,7 +12,10 @@
 //!    listing via key-prefix binding only; unknown domain ⇒ 404 / disabled
 //!    tenant ⇒ 403 still apply.
 //! 2. Mandatory client api-key parse + external auth (cache-first) for every
-//!    other request (missing key ⇒ 401 `missing_api_key`).
+//!    other request (missing key ⇒ 401 `missing_api_key`). The key may arrive
+//!    in any supported transport (Bearer / bare `Authorization` / `x-api-key` /
+//!    `api-key` / `x-goog-api-key` / query param — `hydra_core::apikey`);
+//!    disagreeing transports resolve to the highest-precedence value.
 //! 3. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
 //! 4. `extract_model` over the *full* body (memchr — trivial for any
 //!    position/schema; the stream-through "first-chunk gamble" is gone).
@@ -50,6 +53,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use hydra_core::apikey::{extract_client_key, ClientKeyInput, KeyExtraction};
 use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::extract_model;
@@ -155,29 +159,24 @@ impl HydraProxy {
         cfg.tenants_by_domain.get(lookup).cloned()
     }
 
-    /// Parse the client api-key from `Authorization: Bearer …` or `x-api-key`.
-    fn extract_api_key(session: &Session) -> Option<String> {
-        let headers = &session.req_header().headers;
-        if let Some(auth) = headers.get("authorization") {
-            if let Ok(s) = auth.to_str() {
-                if let Some(rest) = s
-                    .strip_prefix("Bearer ")
-                    .or_else(|| s.strip_prefix("bearer "))
-                {
-                    return Some(rest.to_string());
-                }
-                // Some clients send the key bare after `Bearer` with no space,
-                // or just the key in this header; fall through to x-api-key.
-            }
-        }
-        if let Some(k) = headers.get("x-api-key") {
-            if let Ok(s) = k.to_str() {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-        None
+    /// Parse the client api-key from **every** supported transport, in the
+    /// precedence order documented by `hydra_core::apikey` (design §6.3 §3).
+    ///
+    /// The shell owns header lookup (core carries no HTTP types). Values are
+    /// handed over verbatim; normalisation and conflict detection live in the
+    /// pure parser. The returned [`KeyExtraction`] carries the conflict list so
+    /// the caller can log one warning — key values are never logged.
+    fn extract_api_key(session: &Session) -> KeyExtraction {
+        let header = session.req_header();
+        let headers = &header.headers;
+        let lookup = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        extract_client_key(&ClientKeyInput {
+            authorization: lookup("authorization"),
+            x_api_key: lookup("x-api-key"),
+            api_key: lookup("api-key"),
+            x_goog_api_key: lookup("x-goog-api-key"),
+            query: header.uri.query(),
+        })
     }
 
     /// Cache-first external auth boundary (§6.3 §4 / §11). Runs the
@@ -324,7 +323,25 @@ impl ProxyHttp for HydraProxy {
         // (3) Client api-key parse (§6.3 §3). Mandatory for every non-catalog
         //     request; OPTIONAL for `GET /v1/models` — there a presented key
         //     is never validated, it only narrows the catalog (2.5 below).
-        let api_key_opt = Self::extract_api_key(session);
+        //     Every supported transport is accepted; when several transports
+        //     disagree the highest-precedence one wins and we log ONE warning
+        //     (labels only, never values) —
+        //     dev-docs/aegis/plans/2026-09-10-inbound-credential-forms.md.
+        let extraction = Self::extract_api_key(session);
+        if !extraction.conflicts.is_empty() {
+            warn!(
+                trace_id = %ctx.trace_id,
+                source = extraction.source.map_or("none", |s| s.label()),
+                conflicting = ?extraction
+                    .conflicts
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>(),
+                "client presented differing api-key values in several transports; \
+                 using the highest-precedence one"
+            );
+        }
+        let api_key_opt = extraction.key;
 
         // (2.5) Tenant model catalog (design-tenant-model-catalog §2.2, P0;
         //       public-read revision round 2 — dev-docs/aegis/plans/2026-09-08).
@@ -399,11 +416,7 @@ impl ProxyHttp for HydraProxy {
         // (input_tokens/output_tokens/cache_read_input_tokens); everything
         // else → Generic (OpenAI-compatible) — the safe default with ZERO
         // behaviour change for /v1/chat/completions.
-        let api_kind = if req_path.ends_with("/v1/messages") {
-            hydra_core::model::ProviderKind::Anthropic
-        } else {
-            hydra_core::model::ProviderKind::Generic
-        };
+        let api_kind = hydra_core::model::protocol_for_path(&req_path);
         ctx.scanner = hydra_core::sse::UsageScanner::new(api_kind);
         // Snapshot the original request header (method/path/headers) so
         // build_request can rebuild the upstream request from it later. The
