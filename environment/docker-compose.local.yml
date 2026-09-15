@@ -12,15 +12,22 @@
 # The ONLY stand-in is the tenant authentication hop (Hydra mandates an external
 # auth_url); it is the always-allow contract of environment/mock_tenant/app.py.
 #
-# NO IMAGE IS BUILT. Each Hydra node is a stock python:3.12-slim running the
-# binary staged at ./bin/hydra (bind-mounted read-only, executable). python3 is
-# used deliberately: the image ships ca-certificates, which is required to verify
-# api.siliconflow.cn over TLS and CANNOT be bind-mounted in this environment.
+# One small image is built from the repo Dockerfile (environment/Dockerfile),
+# which COPYs the staged ./bin/hydra and installs ca-certificates + tini. An
+# earlier revision of this file bind-mounted the binary instead and built
+# nothing, but host-path bind mounts proved unreliable here (files became
+# unreadable to the daemon mid-session), and the binary needs ca-certificates
+# to verify api.siliconflow.cn over TLS. The build context is streamed by the
+# docker CLI, so it works even when bind mounts do not; DOCKER_CONFIG and
+# BUILDX_CONFIG are redirected into the workspace because ~/.docker is not
+# writable here.
 #
-#   stage the binary:  cargo build --release \
-#                        --features "server,cluster-redis,usage-clickhouse"
-#                      mkdir -p environment/bin && \
-#                        cp target/release/hydra environment/bin/hydra
+#   build:  mkdir -p bin && cp -f target/release/hydra bin/hydra
+#           DOCKER_CONFIG=$PWD/.docker BUILDX_CONFIG=$PWD/.buildx \
+#             docker build -t hydra-local:latest -f environment/Dockerfile .
+#
+# Environment/Dockerfile is unchanged from the repo: it expects the binary
+# staged at bin/hydra and already sets ENTRYPOINT tini + hydra and USER hydra.
 #
 #   up:    docker compose -f environment/docker-compose.local.yml up -d
 #   seed:  python3 environment/init.py
@@ -30,10 +37,8 @@
 services:
   # ── Hydra node A - leader candidate ────────────────────────────────────────
   hydra-a:
-    image: python:3.12-slim
+    image: hydra-local:latest
     container_name: hydra-a
-    entrypoint: ["/usr/local/bin/hydra"]
-    init: true
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -45,7 +50,7 @@ services:
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
-      HYDRA_DB_URL: "sqlite:/data/hydra.db?mode=rwc"
+      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_LEADER_LEASE_MS: "15000"
@@ -55,8 +60,7 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       RUST_LOG: "info"
     volumes:
-      - ./bin/hydra:/usr/local/bin/hydra:ro
-      - hydra-a-data:/data
+      - hydra-a-data:/app/data
     ports:
       - "127.0.0.1:8080:8080"   # proxy entry (data plane)
       - "127.0.0.1:8081:8081"   # admin REST + UI + /metrics
@@ -65,7 +69,7 @@ services:
       clickhouse-init: { condition: service_completed_successfully }
       mock-tenant: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request;u='http://127.0.0.1:8081/api/v1/health';r=urllib.request.Request(u,headers={'Authorization':'Bearer '+os.environ['HYDRA_ADMIN_TOKEN']});urllib.request.urlopen(r,timeout=3)"]
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$HYDRA_ADMIN_TOKEN\" http://127.0.0.1:8081/api/v1/health"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -73,10 +77,8 @@ services:
 
   # ── Hydra node B - leader candidate (failover partner) ─────────────────────
   hydra-b:
-    image: python:3.12-slim
+    image: hydra-local:latest
     container_name: hydra-b
-    entrypoint: ["/usr/local/bin/hydra"]
-    init: true
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -88,7 +90,7 @@ services:
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
-      HYDRA_DB_URL: "sqlite:/data/hydra.db?mode=rwc"
+      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_LEADER_LEASE_MS: "15000"
@@ -96,8 +98,7 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       RUST_LOG: "info"
     volumes:
-      - ./bin/hydra:/usr/local/bin/hydra:ro
-      - hydra-b-data:/data
+      - hydra-b-data:/app/data
     ports:
       - "127.0.0.1:8083:8080"
       - "127.0.0.1:8082:8081"
@@ -106,7 +107,7 @@ services:
       clickhouse-init: { condition: service_completed_successfully }
       mock-tenant: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request;u='http://127.0.0.1:8081/api/v1/health';r=urllib.request.Request(u,headers={'Authorization':'Bearer '+os.environ['HYDRA_ADMIN_TOKEN']});urllib.request.urlopen(r,timeout=3)"]
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$HYDRA_ADMIN_TOKEN\" http://127.0.0.1:8081/api/v1/health"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -114,10 +115,8 @@ services:
 
   # ── Hydra node C - stateless edge (the client-facing entry) ────────────────
   hydra-c:
-    image: python:3.12-slim
+    image: hydra-local:latest
     container_name: hydra-c
-    entrypoint: ["/usr/local/bin/hydra"]
-    init: true
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -134,8 +133,6 @@ services:
       HYDRA_CONTROL_POLL_MS: "500"
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       RUST_LOG: "info"
-    volumes:
-      - ./bin/hydra:/usr/local/bin/hydra:ro
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here
       - "127.0.0.1:8084:8081"   # edge admin: /metrics /healthz /readyz only
@@ -145,7 +142,7 @@ services:
       mock-tenant: { condition: service_healthy }
     healthcheck:
       # Edge mode serves /healthz without a token (it has no admin API).
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=3)"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 6
