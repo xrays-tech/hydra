@@ -481,6 +481,17 @@ impl AuthChecker for HttpAuthChecker {
                         warn!(tenant = %tenant_id, status, "auth upstream 2xx body is not a JSON verdict; treating as unavailable");
                         return fail_mode_verdict(fail_mode);
                     }
+                    // An EXPLICIT allow verdict is required — the mirror of
+                    // the guard above. A 2xx JSON object carrying neither
+                    // flag (an empty `{}`, a bare `{"error":"invalid key"}`
+                    // envelope, another service's schema) is not a decision:
+                    // reading it as an allow authorized every key for the
+                    // allow TTL whenever the tenant auth service changed
+                    // shape or answered an error body with 200.
+                    if !body_says_allowed(&text) {
+                        warn!(tenant = %tenant_id, status, "auth upstream 2xx body carries no explicit allow verdict; treating as unavailable");
+                        return fail_mode_verdict(fail_mode);
+                    }
                     // optional `expires_in` overrides the default allow TTL
                     // (design §11.3).
                     let effective_ttl = parse_expires_in(&text)
@@ -608,21 +619,43 @@ fn parse_expires_in(body: &str) -> Option<u64> {
     }
 }
 
-/// Whether a 2xx auth response body carries an explicit denial flag:
+/// Read the TOP-LEVEL boolean verdict flag `key` ("status" or "allowed") from a
+/// JSON object body.
+///
+/// Uses `serde_json` rather than a substring scan so the verdict can only come
+/// from a real top-level member: a nested `{"data":{"status":true}}`, or the
+/// word `"status":true` inside a STRING, must not be able to decide whether a
+/// key is authorized. Returns `None` when the body is not a JSON object, the
+/// member is absent, or it is not a boolean.
+fn top_level_bool(body: &str, key: &str) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.as_object()?.get(key)?.as_bool()
+}
+
+/// Whether a 2xx auth response body carries an explicit DENIAL flag:
 /// `{"status":false}` (Dogress `crates/api` `AuthApiKeyResponse.status`) or
-/// `{"allowed":false}` (design §11.3 optional refinement). Any other body —
-/// `{"status":true}`, `{"allowed":true,...}`, empty, or unparseable — stays
-/// an allow. Tiny scans in the style of [`parse_expires_in`]: both flags are
-/// flat top-level JSON booleans when present, so a false positive on nested /
-/// string occurrences is structurally impossible for the response shapes both
-/// contracts use.
+/// `{"allowed":false}` (design §11.3 optional refinement).
 ///
 /// `pub(crate)` so the admin auth-url test endpoint can classify the mock
 /// response exactly as the proxy would.
 pub(crate) fn body_says_denied(body: &str) -> bool {
-    const STATUS: &str = "\"status\"";
-    const ALLOWED: &str = "\"allowed\"";
-    json_field_is_false(body, STATUS) || json_field_is_false(body, ALLOWED)
+    matches!(top_level_bool(body, "status"), Some(false))
+        || matches!(top_level_bool(body, "allowed"), Some(false))
+}
+
+/// Whether a 2xx auth response body carries an explicit ALLOW flag
+/// (`{"status":true}` or `{"allowed":true}`) — the mirror of
+/// [`body_says_denied`], and the security-relevant half.
+///
+/// A 2xx JSON object with NEITHER flag is NOT a decision. Reading it as an
+/// allow meant that an empty `{}`, a `{"error":"invalid api key"}` envelope, or
+/// any other service's schema authorized EVERY key for the full allow TTL, and
+/// propagated to the fleet through the Redis L2. The caller treats a missing
+/// verdict exactly like the non-JSON case: a service anomaly, fail_mode,
+/// never cached.
+pub(crate) fn body_says_allowed(body: &str) -> bool {
+    matches!(top_level_bool(body, "status"), Some(true))
+        || matches!(top_level_bool(body, "allowed"), Some(true))
 }
 
 /// Whether a 2xx auth response body is a parseable JSON **object** (the
@@ -637,21 +670,8 @@ pub(crate) fn auth_body_is_json_object(body: &str) -> bool {
     )
 }
 
-/// Scan `body` for a top-level JSON boolean field `<field>: false`
-/// (whitespace tolerant; `<field>` must be the quoted key, e.g. `"\"status\""`).
-fn json_field_is_false(body: &str, field: &str) -> bool {
-    let Some((_, rest)) = body.split_once(field) else {
-        return false;
-    };
-    let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix(':') else {
-        return false;
-    };
-    rest.trim_start().starts_with("false")
-}
-
 /// Extract the value of a top-level JSON string field, whitespace tolerant, in
-/// the flat-scan style of parse_expires_in / json_field_is_false. `field` must
+/// the flat-scan style of parse_expires_in. `field` must
 /// be the QUOTED key token (e.g. "reason", quotes included) so the split
 /// consumes the key and the remainder starts at the `:` separator. Returns the
 /// value without its surrounding quotes; None when the field is absent or is

@@ -921,3 +921,79 @@ async fn auth_upstream_200_body_design_allowed_false_denies() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION - a 2xx JSON object with NO verdict is not an allow.
+// ---------------------------------------------------------------------------
+// The verdict used to be deny-only: anything that was not an explicit
+// "status":false / "allowed":false was treated as an allow. So an empty
+// object, a bare error envelope, or any other service's schema authorized
+// EVERY key for the full allow TTL, and the allow propagated to the fleet
+// through the Redis L2. An explicit allow flag is now required, and it must be
+// a TOP-LEVEL member.
+
+#[tokio::test]
+async fn auth_upstream_2xx_error_envelope_without_verdict_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"error":"invalid api key","code":401}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-no-verdict").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        }
+    );
+    assert_eq!(
+        checker.cache().len(),
+        0,
+        "an unrecognized 2xx verdict must never be cached"
+    );
+}
+
+#[tokio::test]
+async fn auth_upstream_2xx_empty_object_fail_closed() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-empty").await;
+    assert!(
+        matches!(v, AuthVerdict::Denied { status: 503, .. }),
+        "an empty 2xx object must fail closed, got {v:?}"
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
+
+#[tokio::test]
+async fn auth_upstream_2xx_nested_status_is_not_a_verdict() {
+    // The flag has to be a top-level member: a nested one (or the same text
+    // inside a string) must not authorize anything.
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{"status":true}}"#))
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-nested").await;
+    assert!(
+        matches!(v, AuthVerdict::Denied { status: 503, .. }),
+        "a nested status flag is not a verdict, got {v:?}"
+    );
+    assert_eq!(checker.cache().len(), 0);
+}
