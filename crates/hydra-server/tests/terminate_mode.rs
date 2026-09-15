@@ -2663,3 +2663,96 @@ async fn catalog_narrowing_still_works_through_the_query_transport() {
         "GET /v1/models never runs external auth, whatever transport carried the key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION - model extraction must authorize on the ROOT `model` member.
+// ---------------------------------------------------------------------------
+//
+// The extracted model drives the `tenant_models` whitelist while the request
+// body is forwarded upstream verbatim, so a decoy elsewhere in the body let a
+// tenant call a model it was never granted. Both variants were reproduced
+// live against a real upstream before the fix:
+//
+//   {"model":123,"messages":[]}                    -> 200 (fell through to
+//                                                       the model-less
+//                                                       passthrough, which
+//                                                       skips the whitelist)
+//   {"metadata":{"model":"gpt-4"},"model":"nope"} -> 200, and the
+//                                                       upstream served "nope"
+//
+// `seed_one` grants tenant t1 ONLY the model `gpt-4` on p1, and the upstream
+// mock answers 200, so any leak past the whitelist shows up as a 200 here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_decoys_cannot_bypass_the_tenant_model_whitelist() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "leaked",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "leaked" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // (0) Control: the granted model is served, so a 200 below means a leak.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4","messages":[]}"#).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "control: the granted model must be served"
+    );
+
+    // (1) A root `model` that is not a string used to read as "no model" and
+    //     fall through to the model-less passthrough.
+    let resp = send_until_ready(&client, &url, r#"{"model":123,"messages":[]}"#).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "a non-string root model must be rejected"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("invalid_model_field"), "body: {body}");
+
+    // (2) A nested decoy must not be mistaken for the root model: authorization
+    //     runs on "unauthorized-model", which t1 was never granted.
+    let resp = send_until_ready(
+        &client,
+        &url,
+        r#"{"metadata":{"model":"gpt-4"},"model":"unauthorized-model","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "authorization must use the ROOT model member, not a nested decoy"
+    );
+
+    // The real leak check: neither violation may reach the upstream.
+    let hits = upstream.received_requests().await.expect("recording on");
+    let posts = hits.iter().filter(|r| r.method.as_str() == "POST").count();
+    assert_eq!(
+        posts, 1,
+        "only the control request may reach the upstream ({posts} did)"
+    );
+}

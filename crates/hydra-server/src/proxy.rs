@@ -56,7 +56,7 @@ use bytes::Bytes;
 use hydra_core::apikey::{extract_client_key, ClientKeyInput, KeyExtraction};
 use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
-use hydra_core::extract::extract_model;
+use hydra_core::extract::{extract_model_field, ModelField};
 use hydra_core::limit::MatchCtx;
 use hydra_core::model::{Candidate, RouteError};
 use hydra_core::rewrite::mask_key;
@@ -443,12 +443,28 @@ impl ProxyHttp for HydraProxy {
         };
 
         // (6) Model extraction over the FULL body (terminate-mode §4.1 ④').
-        //     memchr anywhere in the body — works for any position/schema, the
-        //     root cause fix for late-model clients. No JSON encode/decode.
-        let model_opt: Option<String> = if has_body && is_v1_route {
-            extract_model(body_bytes.as_ref()).map(|b| String::from_utf8_lossy(b).into_owned())
+        //     A single byte pass that tracks JSON depth, so it finds the ROOT
+        //     `model` member at any position/schema (the late-model fix) while
+        //     ignoring decoys nested elsewhere — which matters because this
+        //     value authorizes the request while the body goes upstream
+        //     verbatim. No JSON deserialisation.
+        let model_field = if has_body && is_v1_route {
+            extract_model_field(body_bytes.as_ref())
         } else {
-            None
+            ModelField::Absent
+        };
+        // A root `model` whose value is not a string must NOT be treated as
+        // "no model": that fell through to the model-less passthrough, which
+        // never consults the tenant model whitelist. Reject it instead. The
+        // body is still forwarded verbatim, so the upstream would otherwise
+        // read a model Hydra never authorized.
+        if matches!(model_field, ModelField::NotAString) {
+            debug!(tenant = %tenant_id, "root model member is not a string");
+            return short_circuit(session, 400, "invalid_model_field").await;
+        }
+        let model_opt: Option<String> = match model_field {
+            ModelField::Value(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            ModelField::Absent | ModelField::NotAString => None,
         };
 
         // (7) Pre-limit count gate (§6.3 §7 / §10.3). Runs BEFORE routing so a
