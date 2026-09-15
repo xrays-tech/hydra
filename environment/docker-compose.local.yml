@@ -1,0 +1,264 @@
+# =============================================================================
+# LOCAL TEST ENVIRONMENT - 3-node Hydra cluster. NOT for production.
+# =============================================================================
+# Read ../LOCAL_TEST_ENV.md first: it holds the credentials, the runbook and the
+# exact commands. That document is gitignored (it contains the upstream api-key).
+#
+# What is real here:
+#   * the upstream LLM is the REAL SiliconFlow API (no mock LLM);
+#   * redis and clickhouse are the real services;
+#   * three real Hydra processes (2 leader candidates + 1 edge) over a real
+#     Redis backbone, with ClickHouse usage metering.
+# The ONLY stand-in is the tenant authentication hop (Hydra mandates an external
+# auth_url); it is the always-allow contract of environment/mock_tenant/app.py.
+#
+# NO IMAGE IS BUILT. Each Hydra node is a stock python:3.12-slim running the
+# binary staged at ./bin/hydra (bind-mounted read-only, executable). python3 is
+# used deliberately: the image ships ca-certificates, which is required to verify
+# api.siliconflow.cn over TLS and CANNOT be bind-mounted in this environment.
+#
+#   stage the binary:  cargo build --release \
+#                        --features "server,cluster-redis,usage-clickhouse"
+#                      mkdir -p environment/bin && \
+#                        cp target/release/hydra environment/bin/hydra
+#
+#   up:    docker compose -f environment/docker-compose.local.yml up -d
+#   seed:  python3 environment/init.py
+#   down:  docker compose -f environment/docker-compose.local.yml down -v
+# =============================================================================
+
+services:
+  # ── Hydra node A - leader candidate ────────────────────────────────────────
+  hydra-a:
+    image: python:3.12-slim
+    container_name: hydra-a
+    entrypoint: ["/usr/local/bin/hydra"]
+    init: true
+    restart: unless-stopped
+    env_file: [../secure/local-test.env]
+    environment:
+      HYDRA_ROLE: "leader"
+      HYDRA_NODE_ID: "node-a"
+      HYDRA_CONTROL_URL: "http://hydra-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-a:8081"
+      HYDRA_REDIS_URL: "redis://redis:6379"
+      HYDRA_REDIS_MODE: "single"
+      HYDRA_USAGE_SINK: "clickhouse"
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      HYDRA_DB_URL: "sqlite:/data/hydra.db?mode=rwc"
+      HYDRA_LISTEN: "0.0.0.0:8080"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_LEADER_LEASE_MS: "15000"
+      HYDRA_CONTROL_POLL_MS: "500"
+      # Bound every Redis command: a stalled Redis degrades instead of hanging
+      # the data plane (crates/hydra-server/src/redis/mod.rs).
+      HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      RUST_LOG: "info"
+    volumes:
+      - ./bin/hydra:/usr/local/bin/hydra:ro
+      - hydra-a-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"   # proxy entry (data plane)
+      - "127.0.0.1:8081:8081"   # admin REST + UI + /metrics
+    depends_on:
+      redis: { condition: service_healthy }
+      clickhouse-init: { condition: service_completed_successfully }
+      mock-tenant: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;u='http://127.0.0.1:8081/api/v1/health';r=urllib.request.Request(u,headers={'Authorization':'Bearer '+os.environ['HYDRA_ADMIN_TOKEN']});urllib.request.urlopen(r,timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # ── Hydra node B - leader candidate (failover partner) ─────────────────────
+  hydra-b:
+    image: python:3.12-slim
+    container_name: hydra-b
+    entrypoint: ["/usr/local/bin/hydra"]
+    init: true
+    restart: unless-stopped
+    env_file: [../secure/local-test.env]
+    environment:
+      HYDRA_ROLE: "leader"
+      HYDRA_NODE_ID: "node-b"
+      HYDRA_CONTROL_URL: "http://hydra-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-b:8081"
+      HYDRA_REDIS_URL: "redis://redis:6379"
+      HYDRA_REDIS_MODE: "single"
+      HYDRA_USAGE_SINK: "clickhouse"
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      HYDRA_DB_URL: "sqlite:/data/hydra.db?mode=rwc"
+      HYDRA_LISTEN: "0.0.0.0:8080"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_LEADER_LEASE_MS: "15000"
+      HYDRA_CONTROL_POLL_MS: "500"
+      HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      RUST_LOG: "info"
+    volumes:
+      - ./bin/hydra:/usr/local/bin/hydra:ro
+      - hydra-b-data:/data
+    ports:
+      - "127.0.0.1:8083:8080"
+      - "127.0.0.1:8082:8081"
+    depends_on:
+      redis: { condition: service_healthy }
+      clickhouse-init: { condition: service_completed_successfully }
+      mock-tenant: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request;u='http://127.0.0.1:8081/api/v1/health';r=urllib.request.Request(u,headers={'Authorization':'Bearer '+os.environ['HYDRA_ADMIN_TOKEN']});urllib.request.urlopen(r,timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # ── Hydra node C - stateless edge (the client-facing entry) ────────────────
+  hydra-c:
+    image: python:3.12-slim
+    container_name: hydra-c
+    entrypoint: ["/usr/local/bin/hydra"]
+    init: true
+    restart: unless-stopped
+    env_file: [../secure/local-test.env]
+    environment:
+      HYDRA_ROLE: "edge"
+      HYDRA_NODE_ID: "node-c"
+      HYDRA_CONTROL_URL: "http://hydra-a:8081"
+      HYDRA_PUBLIC_URL: "http://hydra-c:8081"
+      HYDRA_REDIS_URL: "redis://redis:6379"
+      HYDRA_REDIS_MODE: "single"
+      HYDRA_USAGE_SINK: "clickhouse"
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      HYDRA_LISTEN: "0.0.0.0:8080"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_CONTROL_POLL_MS: "500"
+      HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      RUST_LOG: "info"
+    volumes:
+      - ./bin/hydra:/usr/local/bin/hydra:ro
+    ports:
+      - "127.0.0.1:8090:8080"   # client traffic enters here
+      - "127.0.0.1:8084:8081"   # edge admin: /metrics /healthz /readyz only
+    depends_on:
+      redis: { condition: service_healthy }
+      clickhouse-init: { condition: service_completed_successfully }
+      mock-tenant: { condition: service_healthy }
+    healthcheck:
+      # Edge mode serves /healthz without a token (it has no admin API).
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # ── Backbone: real Redis (leader lease, shared limits, breaker, L2 cache) ──
+  redis:
+    image: redis:7-alpine
+    container_name: hydra-local-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Usage metering store (cluster mode REQUIRES HYDRA_USAGE_SINK=clickhouse) ─
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: hydra-local-clickhouse
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "127.0.0.1:8123:8123"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # usage_record DDL. The repo ships it as environment/clickhouse/init.sql, but a
+  # bind-mounted .sql file is NOT readable in this environment (only executables
+  # are), so the DDL is applied by a one-shot client container instead.
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: hydra-local-clickhouse-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        clickhouse-client --host clickhouse --query "
+          CREATE TABLE IF NOT EXISTS usage_record (
+            tenant_id          String,
+            provider_id        String,
+            model_key          String,
+            client_api_key     Nullable(String),
+            status_code        UInt16,
+            tokens_in          Nullable(UInt64),
+            tokens_out         Nullable(UInt64),
+            cache_hit_tokens   Nullable(UInt64),
+            latency_ms         UInt32,
+            forward_latency_ms Nullable(UInt32),
+            ttft_ms            Nullable(UInt32),
+            upstream_host      Nullable(String),
+            error              Nullable(String),
+            created_at         String
+          ) ENGINE = MergeTree() ORDER BY (created_at, tenant_id, provider_id)"
+        echo "[clickhouse-init] usage_record ready"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    restart: "no"
+
+  # ── Tenant authentication hop (the only stand-in) ──────────────────────────
+  # Reproduces environment/mock_tenant/app.py: POST / and POST /auth return
+  # {"allowed":true,"expires_in":300}; GET /health returns {"status":"ok"}.
+  # Inlined rather than bind-mounted because data files cannot be mounted here.
+  # Point a real service at it by editing auth_url in secure/config.json.
+  mock-tenant:
+    image: python:3.12-slim
+    container_name: hydra-local-auth
+    command:
+      - python
+      - -c
+      - |
+        import json
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class H(BaseHTTPRequestHandler):
+            def _j(self, code, obj):
+                d = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(d)))
+                self.end_headers()
+                self.wfile.write(d)
+            def do_GET(self):
+                self._j(200, {"status": "ok"} if self.path == "/health" else {"service": "mock-tenant"})
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                if n:
+                    self.rfile.read(n)
+                self._j(200, {"allowed": True, "reason": "mock-tenant-always-allow", "expires_in": 300})
+            def log_message(self, *a):
+                pass
+        HTTPServer(("0.0.0.0", 9091), H).serve_forever()
+    ports:
+      - "127.0.0.1:9091:9091"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9091/health',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  hydra-a-data:
+  hydra-b-data:
+  redis-data:
+  clickhouse-data:

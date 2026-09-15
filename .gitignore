@@ -37,6 +37,9 @@
 # Secrets / certs / sensitive material (never commit)
 /secure/
 
+# Local 3-node test environment runbook -> contains a real upstream api-key
+/LOCAL_TEST_ENV.md
+
 # Local release script (per-developer convenience wrapper)
 /scripts/local_release.sh
 
