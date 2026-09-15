@@ -95,8 +95,18 @@ pub enum CertError {
 /// `X509` is already `Clone` (internally refcounted by the TLS library).
 #[derive(Clone)]
 pub struct ResolvedCert {
-    /// The leaf certificate (parsed from `cert_file` PEM).
+    /// The leaf certificate: the FIRST certificate in the PEM.
     pub cert: X509,
+    /// The intermediate certificates that follow the leaf in the same PEM, in
+    /// order. Empty for a single-certificate PEM.
+    ///
+    /// These MUST be presented in the handshake. TLS clients build the chain
+    /// from what the server sends (browsers cache intermediates; most API
+    /// clients do not), so dropping them made a normal `fullchain.pem` — what
+    /// every ACME client emits — work in a browser and fail everywhere else
+    /// with `unable to get local issuer certificate`, with nothing logged
+    /// because parsing the bundle SUCCEEDS either way.
+    pub chain: Vec<X509>,
     /// The matching private key (parsed from `cert_key` PEM), shared via `Arc`.
     pub key: Arc<PKey<Private>>,
 }
@@ -139,12 +149,28 @@ pub fn resolve_certs(certs: &HashMap<String, CertMeta>) -> HashMap<String, Resol
 /// the config snapshot, no files), parse directly from memory with zero file
 /// I/O. Legacy pre-0007 rows fall back to reading `cert_file` / `cert_key`
 /// paths (single-node with files on disk).
+/// Split a PEM bundle into its leaf and its intermediates.
+///
+/// A bundle is ordered leaf-first (RFC 8555 `fullchain.pem`), so the first
+/// certificate is the leaf and everything after it is the chain.
+fn parse_cert_chain(domain: &str, pem: &[u8]) -> Result<(X509, Vec<X509>), CertError> {
+    let mut stack = X509::stack_from_pem(pem).map_err(|e| CertError::ParseCert {
+        domain: domain.to_string(),
+        reason: e.to_string(),
+    })?;
+    if stack.is_empty() {
+        return Err(CertError::ParseCert {
+            domain: domain.to_string(),
+            reason: "no certificate found in the PEM".to_string(),
+        });
+    }
+    let leaf = stack.remove(0);
+    Ok((leaf, stack))
+}
+
 fn resolve_one(domain: &str, meta: &CertMeta) -> Result<ResolvedCert, CertError> {
     if let (Some(cert_pem), Some(key_pem)) = (&meta.cert_pem, &meta.cert_key_pem) {
-        let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| CertError::ParseCert {
-            domain: domain.to_string(),
-            reason: e.to_string(),
-        })?;
+        let (cert, chain) = parse_cert_chain(domain, cert_pem.as_bytes())?;
         let key =
             PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| CertError::ParseKey {
                 domain: domain.to_string(),
@@ -152,6 +178,7 @@ fn resolve_one(domain: &str, meta: &CertMeta) -> Result<ResolvedCert, CertError>
             })?;
         return Ok(ResolvedCert {
             cert,
+            chain,
             key: Arc::new(key),
         });
     }
@@ -174,10 +201,7 @@ fn resolve_one(domain: &str, meta: &CertMeta) -> Result<ResolvedCert, CertError>
         source,
     })?;
 
-    let cert = X509::from_pem(&cert_bytes).map_err(|e| CertError::ParseCert {
-        domain: domain.to_string(),
-        reason: e.to_string(),
-    })?;
+    let (cert, chain) = parse_cert_chain(domain, &cert_bytes)?;
     let key = PKey::private_key_from_pem(&key_bytes).map_err(|e| CertError::ParseKey {
         domain: domain.to_string(),
         reason: e.to_string(),
@@ -185,6 +209,7 @@ fn resolve_one(domain: &str, meta: &CertMeta) -> Result<ResolvedCert, CertError>
 
     Ok(ResolvedCert {
         cert,
+        chain,
         key: Arc::new(key),
     })
 }
@@ -283,6 +308,18 @@ impl TlsAccept for HydraCertStore {
         if let Err(e) = ext::ssl_use_certificate(ssl, &c.cert) {
             tracing::error!(target: "hydra::tls", error = %e, "ssl_use_certificate failed");
             return;
+        }
+        // Present the intermediates too. A client that is not given them has
+        // to find them itself, which browsers do and most API clients do not.
+        for (index, intermediate) in c.chain.iter().enumerate() {
+            if let Err(e) = ext::ssl_add_chain_cert(ssl, intermediate) {
+                tracing::error!(
+                    target: "hydra::tls",
+                    index,
+                    error = %e,
+                    "ssl_add_chain_cert failed; clients may be unable to build the chain"
+                );
+            }
         }
         if let Err(e) = ext::ssl_use_private_key(ssl, &c.key) {
             tracing::error!(target: "hydra::tls", error = %e, "ssl_use_private_key failed");

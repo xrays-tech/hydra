@@ -437,3 +437,155 @@ async fn t6_4_pem_parse_failure_isolated() {
     let der = cert.to_der().expect("good cert must be DER-encodable");
     assert_eq!(der, fixture_cert_der("acme.crt"));
 }
+
+// ===========================================================================
+// T6.5 / T6.6 - the FULL certificate chain must reach the handshake.
+// ===========================================================================
+
+/// Blocking TLS client returning EVERY certificate the server presented, leaf
+/// first. Same setup as `tls_peer_cert_der_blocking`.
+fn tls_peer_chain_der_blocking(addr: &str, sni: &str) -> Vec<Vec<u8>> {
+    let connector = SslConnector::builder(SslMethod::tls())
+        .expect("SslConnector builder")
+        .build();
+    let mut cfg = connector.configure().expect("configure");
+    cfg.set_verify(SslVerifyMode::NONE);
+    cfg.set_use_server_name_indication(true);
+
+    let stream = {
+        let mut last_err = None;
+        let mut connected: Option<std::net::TcpStream> = None;
+        for _ in 0..100 {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        connected.unwrap_or_else(|| {
+            panic!(
+                "server at {addr} never accepted TCP within 10s: {}",
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            )
+        })
+    };
+
+    let tls_stream = cfg
+        .connect(sni, stream)
+        .unwrap_or_else(|e| panic!("TLS handshake to {addr} (SNI={sni}) failed: {e}"));
+    tls_stream
+        .ssl()
+        .peer_cert_chain()
+        .map(|chain| {
+            chain
+                .iter()
+                .map(|c| c.to_der().expect("chain cert to_der"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Async wrapper for the blocking chain client.
+async fn tls_peer_chain_der(addr: &str, sni: &str) -> Vec<Vec<u8>> {
+    let addr = addr.to_string();
+    let sni = sni.to_string();
+    tokio::task::spawn_blocking(move || tls_peer_chain_der_blocking(&addr, &sni))
+        .await
+        .expect("spawn_blocking chain client")
+}
+
+/// T6.5 - a `fullchain.pem` (leaf + intermediate, what every ACME client
+/// emits) must present the intermediates. Only the leaf used to be installed,
+/// so clients that do not cache intermediates failed the chain build with
+/// "unable to get local issuer certificate" while browsers worked - and
+/// nothing was logged, because parsing the bundle succeeds either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t6_5_fullchain_pem_presents_the_intermediates() {
+    let leaf_pem = std::fs::read(fixture("acme.crt")).expect("leaf pem");
+    // Any second certificate stands in for an intermediate: it only has to
+    // prove the bundle is carried through to the handshake.
+    let second_pem = std::fs::read(fixture("beta.crt")).expect("second pem");
+    let mut bundle = leaf_pem.clone();
+    bundle.extend_from_slice(&second_pem);
+    let key_pem = std::fs::read_to_string(fixture("acme.key")).expect("key pem");
+
+    let mut certs = std::collections::HashMap::new();
+    certs.insert(
+        "acme.com".to_string(),
+        CertMeta {
+            domain: "acme.com".to_string(),
+            cert_file: None,
+            cert_key: None,
+            cert_pem: Some(String::from_utf8(bundle).expect("utf8 bundle")),
+            cert_key_pem: Some(key_pem),
+        },
+    );
+
+    let cert_store = HydraCertStore::new(None);
+    cert_store.resolve_and_store(&certs);
+    {
+        let loaded = cert_store.resolved();
+        let resolved = loaded.get("acme.com").expect("acme resolved");
+        assert_eq!(
+            resolved.chain.len(),
+            1,
+            "the bundle's second certificate must be kept as the chain"
+        );
+        assert_eq!(
+            resolved.cert.to_der().expect("leaf der"),
+            fixture_cert_der("acme.crt"),
+            "the FIRST certificate of the bundle is the leaf"
+        );
+        assert_eq!(
+            resolved.chain[0].to_der().expect("chain der"),
+            fixture_cert_der("beta.crt")
+        );
+    }
+
+    let pool = common::setup_pool().await;
+    let (_store, state) = build_state(pool).await;
+    let port = start_tls_server(state, &cert_store);
+    let chain = tls_peer_chain_der(&format!("127.0.0.1:{port}"), "acme.com").await;
+
+    assert_eq!(
+        chain.len(),
+        2,
+        "the handshake must present leaf + intermediate, not just the leaf"
+    );
+    assert_eq!(
+        chain[0],
+        fixture_cert_der("acme.crt"),
+        "first presented certificate is the leaf"
+    );
+    assert_eq!(
+        chain[1],
+        fixture_cert_der("beta.crt"),
+        "the intermediate must be presented too"
+    );
+}
+
+/// T6.6 - a single-certificate PEM still resolves, with an empty chain.
+#[test]
+fn t6_6_single_cert_pem_has_an_empty_chain() {
+    let mut certs = std::collections::HashMap::new();
+    certs.insert(
+        "acme.com".to_string(),
+        CertMeta {
+            domain: "acme.com".to_string(),
+            cert_file: None,
+            cert_key: None,
+            cert_pem: Some(std::fs::read_to_string(fixture("acme.crt")).expect("pem")),
+            cert_key_pem: Some(std::fs::read_to_string(fixture("acme.key")).expect("key")),
+        },
+    );
+    let cert_store = HydraCertStore::new(None);
+    cert_store.resolve_and_store(&certs);
+    let loaded = cert_store.resolved();
+    let resolved = loaded.get("acme.com").expect("resolved");
+    assert!(resolved.chain.is_empty(), "a single cert has no chain");
+}
