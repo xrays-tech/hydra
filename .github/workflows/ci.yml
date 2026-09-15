@@ -70,7 +70,38 @@ jobs:
           echo "OK: hydra-core has no I/O dependencies."
 
       # The full server suite runs with the `server` feature (W4+). It is a hard
-      # CI gate: the suite is green (138 tests across 17 binaries). If a test
-      # becomes genuinely flaky, quarantine + fix it rather than muting the gate.
+      # CI gate: keep it green. If a test becomes genuinely flaky, quarantine +
+      # fix it rather than muting the gate. (The `optional-features` job below
+      # covers `cluster-redis` / `usage-clickhouse`, which `server` does not
+      # pull in — and which nothing used to compile at all.)
       - name: Test hydra-server (shell)
         run: cargo test -p hydra-server --features server
+
+  # Neither `cluster-redis` (Redis-backed leader lease, cluster rate limits,
+  # shared breaker votes, auth-cache L2, invalidation stream) nor
+  # `usage-clickhouse` (the ClickHouse sink) is implied by `server`. Nothing
+  # used to compile them, so several thousand lines of production code and
+  # ~36 tests — including the entire cross-node suite — could break, or stop
+  # compiling, without CI noticing. environment/build.sh ships an image built
+  # from exactly this feature set, so a break here ships a broken binary.
+  optional-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings, optional features)
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse -- -D warnings
+
+      - name: Build workspace (optional features)
+        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
+
+      - name: Test hydra-server (optional features)
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse
