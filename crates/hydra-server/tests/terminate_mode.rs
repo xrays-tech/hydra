@@ -2834,3 +2834,139 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
         "the SHARED breaker must stay closed, or one tenant starves every other"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION - a transport error after the request was SENT must not be
+// replayed elsewhere unless retry_after_connect is on.
+// ---------------------------------------------------------------------------
+// A completion is non-idempotent: if the request reached the upstream the
+// provider may have generated (and billed) it before the response was lost, so
+// failing over bills the customer twice. FailoverConfig::retry_after_connect was
+// declared, documented as the guard for exactly this, and read by NOTHING —
+// every transport error was retried unconditionally. Only a CONNECT error (the
+// upstream never saw the request) is always safe to retry.
+//
+// NOTE: SWRR orders candidates by provider id, so the silent provider is named
+// to sort FIRST and be attempted first.
+
+/// An upstream that accepts the TCP connection, reads the request and then
+/// closes WITHOUT responding: reqwest reports a body/request error, not a
+/// connect error — exactly the ambiguous case.
+fn spawn_silent_drop_upstream() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent upstream");
+    let addr = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 4096];
+                // Drain whatever the client sent, then drop the socket.
+                let _ = s.read(&mut buf);
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_send_transport_error_is_not_failed_over_by_default() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    // The live provider must NOT be called: calling it is the double billing.
+    let live = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"ok"}"#))
+        .mount(&live)
+        .await;
+    let silent = spawn_silent_drop_upstream();
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "p_asilent", "silent", "Silent", &silent).await;
+    seed_provider(&pool, "p_zlive", "live", "Live", &live.uri()).await;
+    for (id, pid) in [("m_as", "p_asilent"), ("m_zl", "p_zlive")] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: id.into(),
+                key: "gpt-4".into(),
+                name: "gpt-4".into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (id, pid) in [("tp_as", "p_asilent"), ("tp_zl", "p_zlive")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: id.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    repo::insert_tenant_model(
+        &pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_as",
+        "p_asilent",
+        "sk-as",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_zl",
+        "p_zlive",
+        "sk-zl",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(
+        resp.status(),
+        502,
+        "a post-send transport error must surface, not silently re-bill elsewhere"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("upstream_transport_error"), "body: {body}");
+
+    let hits = live.received_requests().await.expect("recording on");
+    assert!(
+        hits.iter().all(|r| r.method.as_str() != "POST"),
+        "the second provider must NOT have been called (that is the double billing)"
+    );
+}

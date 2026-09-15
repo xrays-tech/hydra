@@ -751,12 +751,34 @@ impl ProxyHttp for HydraProxy {
                     }
                 }
                 Err(e) => {
-                    // Connect / transport failure → breaker + next candidate.
                     self.state.breaker.on_failure(&cand.provider_id);
                     last_error = Some(format!("provider {}: {e}", cand.provider_id));
+
+                    // A transport error is NOT automatically safe to retry.
+                    // A completion request is non-idempotent: if it reached
+                    // the upstream, the provider may have generated — and
+                    // billed — it before the response was lost, so replaying it
+                    // elsewhere bills the customer twice. ONLY a connect error
+                    // proves the upstream never saw the request; anything else
+                    // (a timeout, or a connection dropped after the request was
+                    // written) requires the documented opt-in
+                    // (`FailoverConfig::retry_after_connect`, which was declared
+                    // and documented but read by nothing).
+                    let never_reached_upstream = e.is_connect();
+                    if !never_reached_upstream && !self.state.proxy.failover.retry_after_connect {
+                        warn!(
+                            trace_id = %ctx.trace_id,
+                            provider_id = %cand.provider_id,
+                            error = %e,
+                            "upstream transport error after the request was sent; NOT failing over (double-billing risk)"
+                        );
+                        ctx.status_code = 502;
+                        return short_circuit(session, 502, "upstream_transport_error").await;
+                    }
                     debug!(
                         provider_id = %cand.provider_id,
                         error = %e,
+                        never_reached_upstream,
                         "provider send failed; trying next candidate"
                     );
                 }
