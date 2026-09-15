@@ -677,7 +677,7 @@ async function openForm(cfg, record) {
   }
 
   const submitBtn = el("button", { class: "btn primary", type: "submit" },
-    el("span", { class: "btn-label", text: isEdit ? t("common.action.saveChanges") : t("common.action.create", { singular: t(cfg.singular) }) }));
+    el("span", { class: "btn-label", text: isEdit ? t("common.action.saveChanges") : t("common.form.new", { singular: t(cfg.singular) }) }));
 
   const body = form;
   const m = openModal({
@@ -1184,7 +1184,7 @@ function closeSidebar() { document.body.classList.remove("nav-open"); }
  * ======================================================================== */
 function wireEvents() {
   $("#login-form").addEventListener("submit", (e) => { e.preventDefault(); tryLogin($("#login-token").value); });
-  $("#logout-btn").addEventListener("click", () => { sessionStorage.removeItem("hydra-admin-ok"); showLogin(); });
+  $("#logout-btn").addEventListener("click", () => { showLogin(); });
   $("#reload-btn").addEventListener("click", async () => {
     try {
       const r = await api("POST", "/reload", { body: {} });

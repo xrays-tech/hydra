@@ -13,6 +13,7 @@
 "use strict";
 
 let _statsTimer = null;
+let _statsAuto = false; // persistent auto-refresh switch (survives re-renders)
 
 function renderStats() {
   if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
@@ -23,12 +24,13 @@ function renderStats() {
   // page actions: auto-refresh toggle + manual refresh
   clear($("#page-actions"));
   const auto = el("label", { class: "toggle-pill", title: t("stats.autorefreshTip") },
-    el("input", { type: "checkbox", id: "stats-autorefresh" }),
+    el("input", { type: "checkbox", id: "stats-autorefresh", checked: _statsAuto }),
     el("span", { text: t("stats.auto") }),
   );
   $("#page-actions").appendChild(auto);
   $("#stats-autorefresh").addEventListener("change", (e) => {
-    if (e.target.checked) _statsTimer = setInterval(renderStats, 10000);
+    _statsAuto = e.target.checked;
+    if (_statsAuto) _statsTimer = setInterval(renderStats, 10000);
     else { clearInterval(_statsTimer); _statsTimer = null; }
   });
   $("#page-actions").appendChild(
@@ -51,6 +53,11 @@ function renderStats() {
     content.appendChild(emptyState("alert", t("stats.couldNotLoad"), e.message));
     toast(e.message, "err", { title: t("stats.failedLoad") });
   });
+
+  // Re-attach the auto-refresh interval so each render (including the one fired
+  // by the interval itself) reschedules the next tick. Without this, the leading
+  // clearInterval above would stop the refresh after a single cycle.
+  if (_statsAuto && !_statsTimer) _statsTimer = setInterval(renderStats, 10000);
 }
 
 function renderStatsData(d) {

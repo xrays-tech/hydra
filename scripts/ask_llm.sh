@@ -8,13 +8,14 @@
 #
 # CONFIG (override via env):
 #   LLM_API_URL   gateway address            (default http://api.do.top:18080/v1/chat/completions)
-#   LLM_API_KEY   api key                    (default sh-Ceciestunjetondetest001)
+#   LLM_API_KEY   api key                    (REQUIRED — no default; the script
+#                                              aborts before any request if unset)
 #   LLM_MODEL     model name                 (default deepseek-ai/DeepSeek-R1-0528-Qwen3-8B)
 #   LLM_TEMPERATURE  sampling temperature    (default 0.7)
 set -euo pipefail
 
 LLM_API_URL="${LLM_API_URL:-http://api.do.top:18080/v1/chat/completions}"
-LLM_API_KEY="${LLM_API_KEY:-sh-Ceciestunjetondetest001}"
+LLM_API_KEY="${LLM_API_KEY:?LLM_API_KEY is required (export it before running; no default)}"
 LLM_MODEL="${LLM_MODEL:-deepseek-ai/DeepSeek-R1-0528-Qwen3-8B}"
 LLM_TEMPERATURE="${LLM_TEMPERATURE:-0.7}"
 
