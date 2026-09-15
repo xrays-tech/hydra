@@ -144,6 +144,67 @@ async fn admin_requires_token() {
     assert_eq!(r.status(), 200);
 }
 
+/// Regression — the internal cluster control-plane gate must fail CLOSED when
+/// `HYDRA_CLUSTER_TOKEN` is unset (the single-node / default deployment).
+///
+/// The gate used to compare `Option<&str> != Option<&str>`. With an unset
+/// cluster token (`None`) AND no `Authorization` header (`None`),
+/// `None != None` is false, so the 401 was skipped and the request reached
+/// `route()` — *before* the admin-token gate — exposing the whole
+/// `SnapshotWire` (tenants, provider endpoints, grants) unauthenticated.
+/// An absent header was the only bypassing transport, which is why the cluster
+/// harness — it always configures a token — never caught it.
+#[tokio::test]
+async fn internal_control_denied_when_no_cluster_token_configured() {
+    // `admin_state()` passes `cluster_token: None`, the production default
+    // whenever HYDRA_ROLE is not leader|edge.
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    // (a) No Authorization header at all — the historical bypass.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/internal/control",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        401,
+        "internal/* must fail closed when no cluster token is configured"
+    );
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert!(
+        body.get("snapshot").is_none(),
+        "no config snapshot may be disclosed: {body}"
+    );
+
+    // (b) The admin token must NOT open the cluster channel.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/internal/control",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 401, "admin token is not the cluster token");
+
+    // (c) A non-internal admin route still works normally (no over-correction).
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/health",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+}
+
 #[tokio::test]
 async fn admin_unknown_path_404() {
     let state = admin_state().await;

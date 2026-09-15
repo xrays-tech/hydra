@@ -512,7 +512,10 @@ fn sha256_hex_str(s: &str) -> String {
 }
 
 /// Constant-time byte comparison (no timing side-channel on the token).
-fn constant_time_eq(a: &str, b: &str) -> bool {
+///
+/// `pub(super)` so the admin service's own gates (`cluster token` on
+/// `/api/v1/internal/*`) share the same primitive instead of using `==`.
+pub(super) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }

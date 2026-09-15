@@ -492,8 +492,22 @@ impl ServeHttp for AdminService {
         // cluster token (`HYDRA_CLUSTER_TOKEN`), not the admin token — edges
         // hold only the cluster token. Fail-closed when unset.
         if path.starts_with("/api/v1/internal/") {
-            let bearer = Self::bearer_token(session);
-            if self.state.cluster_token.as_deref() != bearer {
+            // Both sides must be PRESENT and equal. Comparing
+            // `Option != Option` made an unset `HYDRA_CLUSTER_TOKEN` (None —
+            // every single-node deployment) plus an absent Authorization header
+            // (also None) evaluate `None != None` == false, skipping the 401
+            // and dispatching to `route()` BEFORE the admin-token gate below.
+            // Explicitly deny the unset case so this stays fail-closed.
+            let authorized = match (
+                self.state.cluster_token.as_deref(),
+                Self::bearer_token(session),
+            ) {
+                (Some(expected), Some(presented)) => {
+                    handlers::constant_time_eq(expected, presented)
+                }
+                _ => false,
+            };
+            if !authorized {
                 return handlers::err_json(401, "unauthorized", "invalid cluster token", &trace_id);
             }
             return self
