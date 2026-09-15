@@ -417,7 +417,6 @@ async fn v1_chat_completions_regression_generic_scanner() {
     assert_eq!(r.status_code, 200);
 }
 
-
 /// Like [`send_until_ready`] but with an explicit header set (used to prove the
 /// upstream hop's credential transport).
 async fn send_until_ready_with(

@@ -235,7 +235,10 @@ mod tests {
             protocol_for_path("/v1/messages/count_tokens"),
             ProviderKind::Generic
         );
-        assert_eq!(protocol_for_path("/v1/messages/batches"), ProviderKind::Generic);
+        assert_eq!(
+            protocol_for_path("/v1/messages/batches"),
+            ProviderKind::Generic
+        );
     }
 }
 

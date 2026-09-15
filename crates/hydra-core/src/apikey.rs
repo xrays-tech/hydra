@@ -1,4 +1,3 @@
-
 //! Client credential extraction across HTTP transport forms (pure).
 //!
 //! Hydra accepts a client api-key from any of the transports real coding
@@ -311,7 +310,10 @@ mod tests {
     fn precedence_x_api_key_over_api_key_over_google() {
         let out = extract_client_key(&input(None, Some("A"), Some("B"), Some("C"), None));
         assert_eq!(out.key.as_deref(), Some("A"));
-        assert_eq!(out.conflicts, vec![KeySource::ApiKey, KeySource::XGoogApiKey]);
+        assert_eq!(
+            out.conflicts,
+            vec![KeySource::ApiKey, KeySource::XGoogApiKey]
+        );
 
         let out = extract_client_key(&input(None, None, Some("B"), Some("C"), None));
         assert_eq!(out.key.as_deref(), Some("B"));
@@ -398,7 +400,10 @@ mod tests {
 
     #[test]
     fn source_labels_are_stable_and_value_free() {
-        assert_eq!(KeySource::AuthorizationBearer.label(), "authorization_bearer");
+        assert_eq!(
+            KeySource::AuthorizationBearer.label(),
+            "authorization_bearer"
+        );
         assert_eq!(KeySource::AuthorizationBare.label(), "authorization_bare");
         assert_eq!(KeySource::XApiKey.label(), "x_api_key");
         assert_eq!(KeySource::ApiKey.label(), "api_key");

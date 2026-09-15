@@ -2317,7 +2317,11 @@ async fn auth_seen_bodies(auth_server: &MockServer) -> String {
 async fn every_header_credential_transport_authenticates() {
     let body = r#"{"model":"gpt-4","messages":[]}"#;
     let cases: [(&str, &str, &str); 5] = [
-        ("authorization bearer", "authorization", "Bearer test-client-key"),
+        (
+            "authorization bearer",
+            "authorization",
+            "Bearer test-client-key",
+        ),
         ("authorization bare", "authorization", "test-client-key"),
         ("x-api-key", "x-api-key", "test-client-key"),
         ("api-key", "api-key", "test-client-key"),
@@ -2337,7 +2341,12 @@ async fn every_header_credential_transport_authenticates() {
             .await;
 
         let pool = common::setup_pool().await;
-        seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+        seed_one(
+            &pool,
+            &format!("{}/auth", auth_server.uri()),
+            &upstream.uri(),
+        )
+        .await;
         let root = start_proxy(build_state(&pool).await);
         let client = test_client();
 
@@ -2360,7 +2369,11 @@ async fn every_header_credential_transport_authenticates() {
             .received_requests()
             .await
             .expect("upstream recording on");
-        assert_eq!(received.len(), 1, "transport {label}: exactly one upstream call");
+        assert_eq!(
+            received.len(),
+            1,
+            "transport {label}: exactly one upstream call"
+        );
     }
 }
 
@@ -2380,7 +2393,12 @@ async fn query_credential_transport_authenticates_and_is_not_forwarded() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2426,7 +2444,12 @@ async fn differing_transports_use_the_highest_precedence_value() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2440,7 +2463,11 @@ async fn differing_transports_use_the_highest_precedence_value() {
         r#"{"model":"gpt-4","messages":[]}"#,
     )
     .await;
-    assert_eq!(resp.status(), 200, "conflicting transports must still route");
+    assert_eq!(
+        resp.status(),
+        200,
+        "conflicting transports must still route"
+    );
 
     let seen = auth_seen_bodies(&auth_server).await;
     assert!(
@@ -2461,7 +2488,12 @@ async fn no_credential_in_any_transport_is_401_missing_api_key() {
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2483,7 +2515,10 @@ async fn no_credential_in_any_transport_is_401_missing_api_key() {
         .received_requests()
         .await
         .expect("upstream recording on");
-    assert!(received.is_empty(), "an unauthenticated call must not reach a provider");
+    assert!(
+        received.is_empty(),
+        "an unauthenticated call must not reach a provider"
+    );
     let auth_calls = auth_server
         .received_requests()
         .await
@@ -2498,7 +2533,12 @@ async fn non_bearer_authorization_scheme_is_rejected() {
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(&pool, &format!("{}/auth", auth_server.uri()), &upstream.uri()).await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2551,7 +2591,13 @@ async fn catalog_narrowing_still_works_through_the_query_transport() {
         .await
         .expect("insert provider_model");
     }
-    seed_tenant(&pool, "t1", "localhost", &format!("{}/auth", auth_server.uri())).await;
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
     for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
         repo::insert_tenant_provider(
             &pool,
@@ -2564,8 +2610,22 @@ async fn catalog_narrowing_still_works_through_the_query_transport() {
         .await
         .expect("insert tenant_provider");
     }
-    seed_key(&pool, &StaticKeyProvider::new([1u8; 32], 1), "pk_a", "pA", "sk-a").await;
-    seed_key(&pool, &StaticKeyProvider::new([1u8; 32], 1), "pk_b", "pB", "sk-b").await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_a",
+        "pA",
+        "sk-a",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_b",
+        "pB",
+        "sk-b",
+    )
+    .await;
     repo::insert_provider_key_binding(
         &pool,
         &ProviderKeyBinding {
