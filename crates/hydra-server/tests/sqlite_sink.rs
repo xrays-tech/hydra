@@ -389,3 +389,43 @@ async fn sink_trait_swap_by_config() {
         "unknown kind should be UnknownKind"
     );
 }
+
+/// The explicit `shutdown()` must flush the buffer WITHOUT relying on `Drop`,
+/// and must be idempotent (a later `Drop` is a no-op).
+///
+/// `Drop` alone is not enough: `main` runs pingora's `run_forever`, which ends
+/// in `std::process::exit(0)` — no destructors run — so on SIGTERM the
+/// in-flight batch, the records queued in the channel and up to `flush_secs` of
+/// traffic were discarded. This is the path the SIGTERM handler drives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_shutdown_flushes_without_drop() {
+    let pool = common::setup_pool().await;
+    // batch_size far above N and flush_secs far in the future: only an
+    // explicit shutdown can persist these.
+    let sink = SqliteSink::new(pool.clone(), 1000, 3600);
+    push_n(&sink, 4).await;
+    assert_eq!(
+        count_usage(&pool).await,
+        0,
+        "precondition: nothing flushed yet"
+    );
+
+    // Explicit shutdown with the sink still alive — no Drop involved.
+    sink.shutdown().await;
+    assert_eq!(
+        count_usage(&pool).await,
+        4,
+        "shutdown() must drain and flush the buffered records"
+    );
+
+    // Idempotent: a second call and the eventual Drop must neither hang nor
+    // re-insert anything.
+    sink.shutdown().await;
+    assert_eq!(count_usage(&pool).await, 4);
+    drop(sink);
+    assert_eq!(
+        count_usage(&pool).await,
+        4,
+        "Drop after shutdown is a no-op"
+    );
+}

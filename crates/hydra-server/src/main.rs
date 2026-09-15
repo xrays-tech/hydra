@@ -414,6 +414,21 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         proxy: proxy_cfg.clone(),
     });
 
+    // (2e-bis) Flush usage on SIGTERM/SIGINT.
+    //
+    // `run_forever` ends in std::process::exit(0), which runs NO destructors,
+    // so the sinks' Drop never fired: every SIGTERM (a k8s rolling update,
+    // `docker stop`) discarded the in-flight batch, everything queued in the
+    // sink channel and up to flush_secs of traffic. This must be spawned HERE,
+    // on the background runtime — `run_server` runs on the bare main thread,
+    // where tokio::spawn has no reactor.
+    //
+    // The handler deliberately does NOT exit: pingora's own SIGTERM handler
+    // performs the graceful connection drain, and jumping that queue would cut
+    // it short. Both observe the same signal (tokio broadcasts to every
+    // registered listener), so the flush runs alongside the drain.
+    spawn_sink_flush_on_shutdown(state.sink.clone());
+
     // (2f) Background tasks (spawned onto this background runtime; they live as
     //      long as the runtime, which is kept alive in `main`).
     let snapshot_provider = {
@@ -757,4 +772,28 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     server.run_forever();
+}
+
+/// Flush the usage sink when the process is asked to terminate.
+///
+/// The only chance to persist buffered usage: see the call site.
+fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            tracing::warn!("cannot listen for SIGTERM; buffered usage may be lost on shutdown");
+            return;
+        };
+        let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+            tracing::warn!("cannot listen for SIGINT; buffered usage may be lost on shutdown");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => info!("SIGTERM: flushing usage sinks"),
+            _ = interrupt.recv() => info!("SIGINT: flushing usage sinks"),
+        }
+        sink.shutdown().await;
+        info!("usage sinks flushed");
+    });
 }

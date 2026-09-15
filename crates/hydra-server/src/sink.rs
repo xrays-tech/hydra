@@ -46,6 +46,20 @@ use hydra_core::model::UsageRecord;
 pub trait UsageSink: Send + Sync {
     /// Buffer one usage record (non-blocking).
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Stop the background flusher after draining what is already buffered,
+    /// waiting (bounded) for the final flush to land.
+    ///
+    /// `Drop` is NOT enough: `main` runs pingora's `run_forever`, which ends in
+    /// `std::process::exit(0)` — no destructors run — so on SIGTERM (a k8s
+    /// rolling update, `docker stop`) the in-flight batch, everything queued in
+    /// the sink channel and up to `flush_secs` of traffic were discarded, which
+    /// is exactly what the sinks' `Drop` was written to prevent.
+    ///
+    /// Default: no-op, for sinks that hold nothing (the no-op test sink).
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 // ===========================================================================
@@ -163,8 +177,9 @@ use tokio::sync::mpsc;
 /// runtime it detaches, still completing the flush asynchronously).
 #[cfg(feature = "db")]
 pub struct SqliteSink {
-    tx: Option<mpsc::Sender<UsageRecord>>,
-    join: Option<tokio::task::JoinHandle<()>>,
+    /// `None` once the sink has been shut down (explicitly or via `Drop`).
+    tx: std::sync::Mutex<Option<mpsc::Sender<UsageRecord>>>,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "db")]
@@ -192,8 +207,8 @@ impl SqliteSink {
 
         let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
         Self {
-            tx: Some(tx),
-            join: Some(join),
+            tx: std::sync::Mutex::new(Some(tx)),
+            join: std::sync::Mutex::new(Some(join)),
         }
     }
 }
@@ -202,9 +217,12 @@ impl SqliteSink {
 impl UsageSink for SqliteSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let tx = match self.tx.as_ref() {
-                Some(tx) => tx,
-                None => return,
+            let tx = {
+                let guard = self.tx.lock().expect("sink tx mutex");
+                match guard.as_ref() {
+                    Some(tx) => tx.clone(),
+                    None => return,
+                }
             };
             if let Err(err) = tx.try_send(record) {
                 // Non-blocking: channel either full (backpressure) or closed
@@ -222,12 +240,27 @@ impl UsageSink for SqliteSink {
             }
         })
     }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let tx = self.tx.lock().expect("sink tx mutex").take();
+            let join = self.join.lock().expect("sink join mutex").take();
+            drop(tx); // the bg task observes closure and does its final drain
+            if let Some(join) = join {
+                let _ = tokio::time::timeout(MAX_SHUTDOWN_WAIT, join).await;
+            }
+        })
+    }
 }
 
 #[cfg(feature = "db")]
 impl Drop for SqliteSink {
     fn drop(&mut self) {
-        drain_on_drop(self.tx.take(), self.join.take());
+        // Take both out BEFORE the blocking wait: the guards must not be held
+        // across drain_on_drop's block_in_place/block_on.
+        let tx = self.tx.lock().expect("sink tx mutex").take();
+        let join = self.join.lock().expect("sink join mutex").take();
+        drain_on_drop(tx, join);
     }
 }
 
@@ -368,8 +401,9 @@ fn strip_crlf(s: &str) -> String {
 /// [`SqliteSink`]; only the insert transport differs.
 #[cfg(feature = "usage-clickhouse")]
 pub struct ClickHouseSink {
-    tx: Option<ch_mpsc::Sender<UsageRecord>>,
-    join: Option<tokio::task::JoinHandle<()>>,
+    /// `None` once the sink has been shut down (explicitly or via `Drop`).
+    tx: std::sync::Mutex<Option<ch_mpsc::Sender<UsageRecord>>>,
+    join: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "usage-clickhouse")]
@@ -395,8 +429,8 @@ impl ClickHouseSink {
 
         let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
         Self {
-            tx: Some(tx),
-            join: Some(join),
+            tx: std::sync::Mutex::new(Some(tx)),
+            join: std::sync::Mutex::new(Some(join)),
         }
     }
 }
@@ -405,9 +439,12 @@ impl ClickHouseSink {
 impl UsageSink for ClickHouseSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let tx = match self.tx.as_ref() {
-                Some(tx) => tx,
-                None => return,
+            let tx = {
+                let guard = self.tx.lock().expect("sink tx mutex");
+                match guard.as_ref() {
+                    Some(tx) => tx.clone(),
+                    None => return,
+                }
             };
             if let Err(err) = tx.try_send(record) {
                 tracing::warn!(
@@ -417,12 +454,25 @@ impl UsageSink for ClickHouseSink {
             }
         })
     }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let tx = self.tx.lock().expect("sink tx mutex").take();
+            let join = self.join.lock().expect("sink join mutex").take();
+            drop(tx); // the bg task observes closure and does its final drain
+            if let Some(join) = join {
+                let _ = tokio::time::timeout(MAX_SHUTDOWN_WAIT, join).await;
+            }
+        })
+    }
 }
 
 #[cfg(feature = "usage-clickhouse")]
 impl Drop for ClickHouseSink {
     fn drop(&mut self) {
-        drain_on_drop(self.tx.take(), self.join.take());
+        let tx = self.tx.lock().expect("sink tx mutex").take();
+        let join = self.join.lock().expect("sink join mutex").take();
+        drain_on_drop(tx, join);
     }
 }
 
