@@ -322,7 +322,7 @@ mod tests {
             let got = m
                 .run_script(
                     CHECK_AND_INC_SCRIPT,
-                    &[ck.clone()],
+                    std::slice::from_ref(&ck),
                     &["1000".into(), "60000".into(), "2".into(), format!("m{i}")],
                 )
                 .unwrap();
