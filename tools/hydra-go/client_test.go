@@ -2,6 +2,8 @@ package hydra
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -260,4 +262,28 @@ func TestBackgroundRecheckRestoresRemovedNode(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("node was not restored: active=%v removed=%v", c.Nodes(), c.RemovedNodes())
+}
+
+// TestIsNodeFailureTimeoutSemantics anchors the cross-SDK decision that a
+// timeout is not a node death. This test documents the reference semantics that
+// the TS and Python SDKs must align with:
+//   - context.DeadlineExceeded / context.Canceled -> not a node failure (do not
+//     quarantine)
+//   - a real network error (connection refused) -> node failure (quarantine)
+func TestIsNodeFailureTimeoutSemantics(t *testing.T) {
+	if isNodeFailure(context.DeadlineExceeded) {
+		t.Fatal("context.DeadlineExceeded should not be a node failure")
+	}
+	if isNodeFailure(context.Canceled) {
+		t.Fatal("context.Canceled should not be a node failure")
+	}
+	// A real network error (e.g. connection refused) must quarantine the node.
+	refused := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: errors.New("connection refused"),
+	}
+	if !isNodeFailure(refused) {
+		t.Fatal("net.Error (connection refused) should be a node failure")
+	}
 }

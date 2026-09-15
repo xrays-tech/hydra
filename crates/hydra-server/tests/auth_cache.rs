@@ -6,6 +6,7 @@
 //! and by tenant, GC evicts expired entries, and — critically — the api-key
 //! is stored only as a SHA-256 digest (never plaintext).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,44 @@ async fn cache_decision_expired_is_miss_like_pure() {
     );
     assert_eq!(pure, Verdict::Miss);
     assert_eq!(cache.check("t1", "sk-x").await, Verdict::Miss);
+}
+
+/// P2-8 — `check` must evaluate `now()` exactly ONCE per lookup. The old code
+/// called `cache_decision` twice (twice `now()`), so a clock that advances
+/// between the two reads could flip a live entry from Hit to Miss mid-lookup.
+/// A single read keeps the verdict stable.
+#[tokio::test]
+async fn cache_check_reads_now_exactly_once() {
+    let t0 = Instant::now();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+    let clock: Clock = Arc::new(move || {
+        let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+        // The `set` read and the `check`'s single read see `t0`; any further
+        // read (a second `now()` in `check` under the old double-read code)
+        // sees a time far past the entry's expiry.
+        if n < 2 {
+            t0
+        } else {
+            t0 + Duration::from_secs(3600)
+        }
+    });
+    let cache = AuthCache::with_clock(ALLOW_TTL, DENY_TTL, clock);
+    // Entry expires at t0 + 60s (live at t0, expired at t0 + 3600s).
+    cache.set("t1", "sk-x", true, Duration::from_secs(60)).await;
+    // A live entry must read as a stable Hit. Under the old double-read code,
+    // the second `now()` (t0 + 3600s) would see it as expired → Miss.
+    assert_eq!(
+        cache.check("t1", "sk-x").await,
+        Verdict::Hit(true),
+        "a live entry must read as a stable Hit (single now() read)"
+    );
+    // `set` reads once + `check` reads once = 2 total.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "now() must be read exactly once per check (plus the one in set)"
+    );
 }
 
 /// Concurrent writers from many threads all land in the cache (the DashMap

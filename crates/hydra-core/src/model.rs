@@ -62,6 +62,26 @@ pub struct ProviderModel {
 pub struct ProviderKey {
     pub id: String,
     pub provider_id: String,
+    /// Plaintext in memory only (persisted as ciphertext at the DB boundary).
+    /// Never serialized (skip on serialize) so the plaintext cannot leak into
+    /// snapshots or any serialized form; defaults to `""` when absent on
+    /// deserialize. Admin responses re-expose the key only through
+    /// [`ProviderKeyDto`] (always masked).
+    #[serde(default, skip_serializing)]
+    pub api_key: String,
+    pub created_at: String,
+}
+
+/// The admin-API view of a [`ProviderKey`]: the api-key is ALWAYS the masked
+/// form (never plaintext — P1-5). This decouples the response shape from
+/// [`ProviderKey`], whose `api_key` is `skip_serializing` (the plaintext is
+/// never serialized — it is sealed at the DB boundary and only re-exposed
+/// through this masked DTO).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderKeyDto {
+    pub id: String,
+    pub provider_id: String,
+    /// The masked api-key (never plaintext).
     pub api_key: String,
     pub created_at: String,
 }

@@ -776,6 +776,54 @@ async fn error_404_when_model_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn error_400_when_model_field_is_ambiguous() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    // No meaningful upstream mount: an ambiguous model must be rejected (400)
+    // BEFORE any provider is contacted.
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // (1) A duplicated top-level "model" key is ambiguous: the provider may
+    //     read either value, so Hydra must reject (400) rather than authorize a
+    //     guess. Both values are the whitelisted "gpt-4" — the ONLY reason for
+    //     400 is the duplicate itself, not a routing failure.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4","model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 400, "duplicate top-level model key must be 400");
+    let _ = resp.text().await;
+
+    // (2) An escaped top-level key may alias "model" ({"\u006dodel":"a"} decodes
+    //     to {"model":"a"}); it cannot be decoded zero-copy, so fail closed (400).
+    let resp = send_one(&client, &url, r#"{"\u006dodel":"gpt-4","model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 400, "escaped top-level model key must be 400");
+    let _ = resp.text().await;
+
+    // The upstream must never be called for an ambiguous model.
+    let upstream_hits = upstream.received_requests().await.expect("recording on");
+    assert!(
+        upstream_hits.is_empty(),
+        "no upstream call may happen for an ambiguous model field: {}",
+        upstream_hits.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_401_when_auth_denied() {
     let auth_server = MockServer::start().await;
     // Auth upstream denies the request.

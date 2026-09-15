@@ -46,11 +46,15 @@ pub const LEASE_KEY: &str = "hydra:{lease:leader}";
 /// `Err`, the documented fail-open branch cannot fire either (no error, no
 /// metric, no response).
 ///
-/// A command timeout turns that hang into an ordinary error, which the callers
-/// already handle: the limiter fails open per role (`rate_limit.rs`), and the
-/// auth cache degrades to an L1 miss. 500 ms is ~1000x the documented
-/// 0.2-0.5 ms local round trip, so it only trips when Redis is genuinely
-/// unresponsive. Override with `HYDRA_REDIS_COMMAND_TIMEOUT_MS`.
+/// A command timeout turns that hang into an ordinary error, which the
+/// callers already handle by **failing open** (deliberate, documented
+/// behavior): the rate limiter swallows the error per role — `continue` in
+/// `rate_limit.rs` — so a Redis outage (or an unresponsive command) can never
+/// lock every tenant out, and the auth cache degrades to an L1 miss. There
+/// is NO env override for the fail-open direction; it is fixed by design.
+/// 500 ms is ~1000x the documented 0.2-0.5 ms local round trip, so it only
+/// trips when Redis is genuinely unresponsive. Override with
+/// `HYDRA_REDIS_COMMAND_TIMEOUT_MS`.
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 500;
 
 /// Default unresponsive-connection watchdog (ms): a frame left unanswered for

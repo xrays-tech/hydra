@@ -139,8 +139,10 @@ pub struct CertMeta {
     #[serde(default)]
     pub cert_pem: Option<String>,
     /// Private key PEM content, plaintext in memory only. Never persisted as
-    /// plaintext; never serialised to admin responses.
-    #[serde(default)]
+    /// plaintext; never serialised (skip on serialize) — it is only ever
+    /// re-derived at the DB boundary, so it must not leak into any serialized
+    /// form (admin responses, snapshots). Defaults to `None` when absent.
+    #[serde(default, skip_serializing)]
     pub cert_key_pem: Option<String>,
 }
 
@@ -218,11 +220,14 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
     // tenant_models → must be offered by ≥1 online provider.
     for (tenant_id, model_keys) in &cfg.tenant_models {
         for key in model_keys {
-            let offered = match cfg.models_by_key.get(key) {
+            // `missing`: true when the model has NO online provider (empty
+            // candidate list, or the key is unknown at all) — i.e. it must be
+            // flagged.
+            let missing = match cfg.models_by_key.get(key) {
                 Some(v) => v.is_empty(),
                 None => true,
             };
-            if offered {
+            if missing {
                 issues.push(ValidationIssue::warn(format!(
                     "tenant_model '{key}' has no online provider (tenant '{tenant_id}')"
                 )));

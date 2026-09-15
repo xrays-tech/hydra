@@ -154,8 +154,10 @@ pub struct LeaderElection {
     lease_ms: u64,
     clock: Clock,
     state: Mutex<ElectionState>,
-    /// Freshness gate: last control-plane sync succeeded (set by the control
-    /// client / replica). A candidate with `!sync_ok` cannot acquire.
+    /// Freshness gate: `true` only after a control-plane sync has succeeded
+    /// (set by the control client / replica). Starts CLOSED: a fresh node has
+    /// not synced from the active leader yet, so it is not eligible to race
+    /// for the lease with a stale replica (F-4).
     sync_ok: AtomicBool,
     /// Consecutive renew errors seen while `Uncertain` (see
     /// [`UNCERTAIN_ERR_BUDGET`]). Reset whenever leadership is re-established.
@@ -183,7 +185,9 @@ impl LeaderElection {
             lease_ms,
             clock,
             state: Mutex::new(ElectionState::Standby),
-            sync_ok: AtomicBool::new(true),
+            // F-4: starts CLOSED — a fresh node has not synced from the
+            // active leader yet (see the field docs).
+            sync_ok: AtomicBool::new(false),
             uncertain_errs: AtomicU32::new(0),
         }
     }
@@ -197,7 +201,7 @@ impl LeaderElection {
     /// Current state (for `/healthz/leader` and admin write gating).
     #[must_use]
     pub fn state(&self) -> ElectionState {
-        *self.state.lock().expect("election state mutex")
+        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether this node may act as the active leader RIGHT NOW (holds the
@@ -319,7 +323,7 @@ impl LeaderElection {
                 }
             }
         };
-        *self.state.lock().expect("election state mutex") = next;
+        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     }
 }
 
@@ -378,6 +382,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             assert!(!e.is_leader());
+            e.mark_sync_ok(true); // first successful control sync opens the gate
             e.tick().await;
             assert!(e.is_leader(), "standby acquires on tick");
             // Time fence: advance the clock past valid_until → write
@@ -398,6 +403,7 @@ mod tests {
         let e1 = LeaderElection::with_clock(shared.clone(), "n1".into(), 60_000, clock.clone());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            e1.mark_sync_ok(true); // first successful control sync opens the gate
             e1.tick().await;
             assert!(e1.is_leader());
             // Another node forces the issue by taking the store directly:
@@ -426,6 +432,7 @@ mod tests {
         let e2 =
             LeaderElection::with_clock(Arc::new(LoseStore), "n1".into(), 60_000, clock.clone());
         rt.block_on(async {
+            e2.mark_sync_ok(true); // first successful control sync opens the gate
             e2.tick().await; // acquire (try_acquire → true)
             assert!(e2.is_leader());
             e2.tick().await; // renew fails
@@ -434,20 +441,25 @@ mod tests {
         });
     }
 
+    /// A fresh node has not synced from the active leader yet: the
+    /// freshness gate must start CLOSED (a stale replica must not race for
+    /// the lease), and the first successful control sync (cold start
+    /// `UpToDate`, or a materialized snapshot) opens it.
     #[test]
     fn freshness_gate_blocks_acquire() {
         let t0 = Instant::now();
         let clock: Clock = Arc::new(move || t0);
         let e = LeaderElection::with_clock(store(), "n1".into(), 3000, clock.clone());
-        e.mark_sync_ok(false);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             e.tick().await;
             assert_eq!(
                 e.state(),
                 ElectionState::Standby,
-                "sync gate closed → no acquire"
+                "fresh node (no sync yet) → gate starts closed → no acquire"
             );
+            // First successful control sync opens the gate → the node may
+            // compete for the lease.
             e.mark_sync_ok(true);
             e.tick().await;
             assert!(e.is_leader(), "gate open → acquires");
@@ -492,6 +504,7 @@ mod tests {
         let e = LeaderElection::with_clock(store.clone(), "n1".into(), 60_000, clock);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            e.mark_sync_ok(true); // first successful control sync opens the gate
             e.tick().await;
             assert!(e.is_leader(), "standby acquires");
 
@@ -553,6 +566,7 @@ mod tests {
         let e = LeaderElection::with_clock(store.clone(), "n1".into(), 60_000, clock);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            e.mark_sync_ok(true); // first successful control sync opens the gate
             e.tick().await;
             assert!(e.is_leader(), "standby acquires");
 

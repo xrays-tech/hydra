@@ -396,6 +396,11 @@ async fn election_two_nodes_one_leader() {
     let e1 = LeaderElection::new(store.clone(), "n1".into(), 600);
     let e2 = LeaderElection::new(store.clone(), "n2".into(), 600);
 
+    // F-4: the freshness gate starts closed — both nodes sync from the
+    // active leader first (in production the control client does this).
+    e1.mark_sync_ok(true);
+    e2.mark_sync_ok(true);
+
     e1.tick().await;
     assert!(e1.is_leader(), "n1 acquires first");
     e2.tick().await;

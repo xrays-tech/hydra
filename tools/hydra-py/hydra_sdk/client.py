@@ -11,6 +11,7 @@ they become reachable again.
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -19,6 +20,23 @@ from typing import Callable, List, Optional
 __all__ = ["HTTPError", "HydraClient"]
 
 UrlOpen = Callable[..., object]
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """Return True when exc is (or wraps) a timeout/cancellation error.
+
+    A request timeout is not evidence that a node is dead (it may simply be
+    slow), so it must not cause the node to be quarantined. This aligns with
+    the Go SDK, which treats context.DeadlineExceeded/Canceled as non-failures.
+    ``socket.timeout`` is the same class as ``TimeoutError`` on Python 3.10+
+    but a distinct OSError subclass on 3.9, so both are checked.
+    """
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return False
 
 
 class HTTPError(Exception):
@@ -273,6 +291,8 @@ class HydraClient:
     def _is_node_failure(exc: Exception) -> bool:
         if isinstance(exc, HTTPError):
             return exc.status >= 500 or exc.status in (404, 405)
-        if isinstance(exc, (urllib.error.URLError, OSError, TimeoutError)):
-            return True
+        # A request timeout is not a node failure (the node may be healthy but
+        # slow); connection refusals and other network errors are.
+        if _is_timeout_error(exc):
+            return False
         return True

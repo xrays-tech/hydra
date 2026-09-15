@@ -220,3 +220,31 @@ fn endpoint_parse_rejects_what_the_dialler_cannot_use() {
         );
     }
 }
+
+/// P2-4 — host robustness. A host that contains `:` MUST be bracketed (bare
+/// IPv6 is ambiguous against the `host:port` split); the brackets are stripped
+/// and the inner must be a valid IPv6 literal. Any `%` in the host is rejected
+/// (percent-encoding only belongs in the path, never the authority).
+#[test]
+fn endpoint_parse_ipv6_and_percent_robustness() {
+    // Bare (unbracketed) host containing `:` is rejected: without brackets the
+    // host:port split is ambiguous, so it cannot be dialled.
+    assert!(
+        EndpointUrl::parse("http://::1/").is_none(),
+        "bare IPv6 host (no brackets) must be rejected"
+    );
+
+    // Bracketed IPv6 is accepted: brackets stripped, host is the inner literal,
+    // and the explicit port after the bracket is parsed.
+    let ep = EndpointUrl::parse("http://[::1]:8080/x").expect("bracketed IPv6");
+    assert_eq!(ep.host, "::1", "brackets must be stripped from the host");
+    assert_eq!(ep.port, 8080, "explicit port after the bracket is parsed");
+    assert_eq!(ep.path_prefix, "/x");
+
+    // A `%` in the host is rejected: it can only appear percent-encoded in the
+    // path component, never in the authority.
+    assert!(
+        EndpointUrl::parse("http://host%20name/x").is_none(),
+        "percent-encoding in the host must be rejected"
+    );
+}

@@ -129,8 +129,14 @@ impl AuthCache {
     pub async fn check(&self, tenant_id: &str, api_key: &str) -> Verdict {
         let hash = sha256_hex(api_key.as_bytes());
         let entry = self.map.get(&(tenant_id.to_string(), hash));
-        if let Verdict::Hit(_) = cache_decision(entry.as_deref(), (self.now)()) {
-            return cache_decision(entry.as_deref(), (self.now)());
+        // P2-8: evaluate the decision (and its `now()`) exactly ONCE. The old
+        // form called `cache_decision` twice — once for the guard and once for
+        // the return — so a clock that advanced between the two reads could
+        // flip a live entry from Hit to Miss mid-lookup. A single read keeps
+        // the verdict stable.
+        let d = cache_decision(entry.as_deref(), (self.now)());
+        if let Verdict::Hit(_) = d {
+            return d;
         }
         #[cfg(feature = "cluster-redis")]
         if let Some(l2) = &self.l2 {
@@ -179,6 +185,29 @@ impl AuthCache {
             #[cfg(feature = "cluster-redis")]
             if let Some(l2) = &self.l2 {
                 let _ = l2.del(tenant_id, &hex_digest(&hash)).await;
+            }
+        }
+        removed
+    }
+
+    /// Force-invalidate specific api-keys given as their SHA-256 hex digests
+    /// (the v=2 invalidation stream carries digests, never plaintext — F-1).
+    /// Mirrors [`invalidate`] but skips the hashing step: the caller already
+    /// hashed, so the SAME hex addresses the L2 (no re-hash). Returns the
+    /// count removed from L1; missing / malformed digests are ignored.
+    pub async fn invalidate_hashes(&self, tenant_id: &str, keyhashes: &[String]) -> usize {
+        let mut removed = 0;
+        for h in keyhashes {
+            let Some(hash) = hex_to_bytes32(h) else {
+                continue; // malformed digest → skip (defensive, not a real key)
+            };
+            if self.map.remove(&(tenant_id.to_string(), hash)).is_some() {
+                removed += 1;
+            }
+            #[cfg(feature = "cluster-redis")]
+            if let Some(l2) = &self.l2 {
+                // `h` IS the L2 key suffix (`hex_digest`) — do NOT re-hash.
+                let _ = l2.del(tenant_id, h).await;
             }
         }
         removed
@@ -711,6 +740,33 @@ fn hex_digest(hash: &[u8; 32]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// Parse a 64-char hex string into its 32 raw bytes (the inverse of
+/// [`hex_digest`]); `None` when the string is not a valid 32-byte digest.
+/// Not feature-gated: the L1 path of `invalidate_hashes` always needs it.
+fn hex_to_bytes32(s: &str) -> Option<[u8; 32]> {
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_val(b[2 * i])?;
+        let lo = hex_val(b[2 * i + 1])?;
+        out[i] = hi * 16 + lo;
+    }
+    Some(out)
+}
+
+/// The value of a single hex digit (`0-9a-fA-F`), or `None` if not hex.
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Generate a per-request trace id (dependency-free). W4 may instead inject

@@ -51,6 +51,19 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_USAGE_SINK: &str = "sqlite";
 
+/// `HYDRA_BREAKER_QUORUM`: minimum live votes for a provider to be
+/// cluster-dead (default 1 = any live vote). A missing, unparseable or
+/// non-positive value falls back to 1 rather than disabling the breaker
+/// (0 would mean "never cluster-dead").
+#[cfg(feature = "cluster-redis")]
+fn breaker_quorum_from_env() -> usize {
+    std::env::var("HYDRA_BREAKER_QUORUM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|q| *q > 0)
+        .unwrap_or(1)
+}
+
 fn main() {
     // (1) Tracing.
     let _ = tracing_subscriber::fmt::Subscriber::builder()
@@ -237,7 +250,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let redis_backend: Option<hydra_server::redis::RedisBackend> = if role.is_cluster() {
         Some(
             hydra_server::redis::RedisBackend::connect(
-                redis_url.as_deref().expect("checked above"),
+                redis_url
+                    .as_deref()
+                    .ok_or("HYDRA_REDIS_URL must be set in cluster mode (checked above)")?,
                 hydra_server::redis::RedisMode::from_env(),
             )
             .await?,
@@ -324,6 +339,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(feature = "cluster-redis")]
     {
         if let Some(b) = &redis_backend {
+            // F-5: HYDRA_BREAKER_QUORUM is now actually read (it was a ghost
+            // env — referenced in a comment, never parsed). One parse, shared
+            // by the vote and sync handles.
+            let quorum = breaker_quorum_from_env();
             // (i) Vote handle for the trip/revive hooks. `vote_dead` /
             //     `vote_alive` touch only the pool + node id, so its internal
             //     breaker is a throwaway — this instance must NOT be used for
@@ -334,7 +353,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 Arc::new(CircuitBreaker::new(BreakerConfig::new(
                     proxy_cfg.breaker.threshold,
                 ))),
-                1, // quorum: any live vote (HYDRA_BREAKER_QUORUM)
+                quorum,
             ));
             {
                 let shared_trip = vote_shared.clone();
@@ -349,7 +368,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 let bg_handle_trip = bg_handle.clone();
                 let bg_handle_revive = bg_handle.clone();
                 Arc::get_mut(&mut breaker)
-                    .expect("breaker Arc is unique before wiring (no clones taken yet)")
+                    .ok_or(
+                        "breaker Arc must be unique before wiring (no clones taken yet)",
+                    )?
                     .set_cluster_hooks(
                         Some(Arc::new(move |p: &str| {
                             let shared = shared_trip.clone();
@@ -382,7 +403,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 b.pool().clone(),
                 cluster.node_id.clone(),
                 breaker.clone(),
-                1,
+                quorum,
             ));
             hydra_server::redis::breaker::spawn_breaker_sync(
                 sync_shared,
@@ -458,6 +479,15 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             auth.clone(),
             store.clone(),
         );
+        // F-6: keep the invalidation stream bounded. A trim that removes
+        // entries bumps the generation so lagging consumers re-hydrate
+        // (idempotent full clear).
+        hydra_server::cluster::events::spawn_trim_task(
+            stream.clone(),
+            // retain the most recent N invalidation events
+            10_000,
+            std::time::Duration::from_secs(30),
+        );
         info!("invalidation consumer started");
         Some(stream)
     } else {
@@ -470,8 +500,14 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // config snapshots. Last-known-good semantics — the data plane keeps
     // serving whatever snapshot it has when the control plane is unreachable.
     if role == hydra_server::cluster::NodeRole::Edge {
-        let url = cluster.control_url.clone().expect("checked above");
-        let token = cluster.cluster_token.clone().expect("checked above");
+        let url = cluster
+            .control_url
+            .clone()
+            .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
+        let token = cluster
+            .cluster_token
+            .clone()
+            .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
         let client = hydra_server::cluster::control_client::ControlClient::new(
             hydra_server::cluster::control_client::ControlClientConfig {
                 url,
@@ -504,7 +540,8 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = if role
         == hydra_server::cluster::NodeRole::Leader
     {
-        let backend = redis_backend.expect("checked above: cluster mode has a Redis backbone");
+        let backend = redis_backend
+            .ok_or("cluster mode has a Redis backbone (checked above)")?;
         let lease_ms = std::env::var("HYDRA_LEADER_LEASE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -519,42 +556,43 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         ));
 
         // Standby sync: poll the active leader, materialize the local replica
-        // on every applied snapshot, and drive the election freshness gate.
-        let url = cluster.control_url.clone().expect("checked above");
-        let token = cluster.cluster_token.clone().expect("checked above");
+        // on every applied snapshot (out-of-order guarded, F-4), and drive
+        // the election freshness gate from the materialization result.
+        let url = cluster
+            .control_url
+            .clone()
+            .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
+        let token = cluster
+            .cluster_token
+            .clone()
+            .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
         let on_poll = {
             let election = election.clone();
-            let pool = pool.clone().expect("leader mode has a SQLite pool");
+            let pool =
+                pool.clone().ok_or("leader mode has a SQLite pool (checked above)")?;
             let key_provider = key_provider.clone();
+            // F-4: monotonic out-of-order guard — a stale snapshot (version
+            // <= the last claimed) is never materialized, so the replica can
+            // never regress below a version already in flight / committed.
+            let guard = Arc::new(hydra_server::cluster::replica::MaterializationGuard::new());
+            let gate = Arc::new(move |ok: bool| election.mark_sync_ok(ok))
+                as Arc<dyn Fn(bool) + Send + Sync>;
             Some(Arc::new(
                 move |outcome: &hydra_server::cluster::control_client::PollOutcome| match outcome {
-                    hydra_server::cluster::control_client::PollOutcome::Error => {
-                        election.mark_sync_ok(false)
-                    }
-                    hydra_server::cluster::control_client::PollOutcome::UpToDate => {
-                        election.mark_sync_ok(true)
-                    }
+                    hydra_server::cluster::control_client::PollOutcome::Error => gate(false),
+                    hydra_server::cluster::control_client::PollOutcome::UpToDate => gate(true),
                     hydra_server::cluster::control_client::PollOutcome::Applied(wire) => {
-                        election.mark_sync_ok(true);
-                        let wire = wire.clone();
-                        let pool = pool.clone();
-                        let key_provider = key_provider.clone();
-                        let election = election.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = hydra_server::cluster::replica::materialize(
-                                &pool,
-                                key_provider.as_ref(),
-                                &wire,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    "replica materialization failed (lease remains safe)"
-                                );
-                                election.mark_sync_ok(false);
-                            }
-                        });
+                        // The gate opens only when THIS snapshot's
+                        // materialization SUCCEEDS (a failed replica must not
+                        // be eligible to lead); a stale version is skipped
+                        // entirely.
+                        hydra_server::cluster::replica::on_applied(
+                            &guard,
+                            &pool,
+                            key_provider.clone(),
+                            wire,
+                            &gate,
+                        )
                     }
                 },
             )
@@ -796,4 +834,28 @@ fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
         sink.shutdown().await;
         info!("usage sinks flushed");
     });
+}
+
+#[cfg(all(test, feature = "cluster-redis"))]
+mod tests {
+    use super::*;
+
+    /// F-5: `HYDRA_BREAKER_QUORUM` must actually be honored (before the fix
+    /// it was a ghost env — mentioned in a comment and the docs, never read).
+    /// The only test in this binary touches this key, so the process-global
+    /// env is safe to mutate here.
+    #[test]
+    fn breaker_quorum_env_injection() {
+        std::env::set_var("HYDRA_BREAKER_QUORUM", "3");
+        assert_eq!(breaker_quorum_from_env(), 3, "injected quorum is honored");
+
+        std::env::set_var("HYDRA_BREAKER_QUORUM", "bogus");
+        assert_eq!(breaker_quorum_from_env(), 1, "unparseable → default 1");
+
+        std::env::set_var("HYDRA_BREAKER_QUORUM", "0");
+        assert_eq!(breaker_quorum_from_env(), 1, "non-positive → default 1");
+
+        std::env::remove_var("HYDRA_BREAKER_QUORUM");
+        assert_eq!(breaker_quorum_from_env(), 1, "unset → default 1");
+    }
 }

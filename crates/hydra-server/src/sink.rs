@@ -299,7 +299,7 @@ impl UsageSink for SqliteSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let tx = {
-                let guard = self.tx.lock().expect("sink tx mutex");
+                let guard = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match guard.as_ref() {
                     Some(tx) => tx.clone(),
                     None => {
@@ -335,8 +335,8 @@ impl UsageSink for SqliteSink {
 
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let tx = self.tx.lock().expect("sink tx mutex").take();
-            let join = self.join.lock().expect("sink join mutex").take();
+            let tx = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let join = self.join.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             drop(tx); // the bg task observes closure and does its final drain
             if let Some(join) = join {
                 let _ = tokio::time::timeout(MAX_SHUTDOWN_WAIT, join).await;
@@ -350,8 +350,8 @@ impl Drop for SqliteSink {
     fn drop(&mut self) {
         // Take both out BEFORE the blocking wait: the guards must not be held
         // across drain_on_drop's block_in_place/block_on.
-        let tx = self.tx.lock().expect("sink tx mutex").take();
-        let join = self.join.lock().expect("sink join mutex").take();
+        let tx = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let join = self.join.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         drain_on_drop(tx, join);
     }
 }
@@ -567,7 +567,7 @@ impl UsageSink for ClickHouseSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let tx = {
-                let guard = self.tx.lock().expect("sink tx mutex");
+                let guard = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match guard.as_ref() {
                     Some(tx) => tx.clone(),
                     None => {
@@ -595,8 +595,8 @@ impl UsageSink for ClickHouseSink {
 
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let tx = self.tx.lock().expect("sink tx mutex").take();
-            let join = self.join.lock().expect("sink join mutex").take();
+            let tx = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let join = self.join.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             drop(tx); // the bg task observes closure and does its final drain
             if let Some(join) = join {
                 let _ = tokio::time::timeout(MAX_SHUTDOWN_WAIT, join).await;
@@ -608,8 +608,8 @@ impl UsageSink for ClickHouseSink {
 #[cfg(feature = "usage-clickhouse")]
 impl Drop for ClickHouseSink {
     fn drop(&mut self) {
-        let tx = self.tx.lock().expect("sink tx mutex").take();
-        let join = self.join.lock().expect("sink join mutex").take();
+        let tx = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let join = self.join.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         drain_on_drop(tx, join);
     }
 }

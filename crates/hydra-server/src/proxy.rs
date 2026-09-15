@@ -453,18 +453,20 @@ impl ProxyHttp for HydraProxy {
         } else {
             ModelField::Absent
         };
-        // A root `model` whose value is not a string must NOT be treated as
-        // "no model": that fell through to the model-less passthrough, which
-        // never consults the tenant model whitelist. Reject it instead. The
-        // body is still forwarded verbatim, so the upstream would otherwise
-        // read a model Hydra never authorized.
-        if matches!(model_field, ModelField::NotAString) {
-            debug!(tenant = %tenant_id, "root model member is not a string");
+        // A root `model` that is not a string, or whose member is AMBIGUOUS
+        // (a duplicated top-level `model` key, or an escaped top-level key that
+        // may alias `model`), must NOT be treated as "no model": that fell
+        // through to the model-less passthrough, which never consults the tenant
+        // model whitelist. Reject it instead. The body is still forwarded
+        // verbatim, so the upstream would otherwise read a model Hydra never
+        // authorized (or a different one than the one it authorized).
+        if matches!(model_field, ModelField::NotAString | ModelField::Ambiguous) {
+            debug!(tenant = %tenant_id, "root model member is not a string or is ambiguous");
             return short_circuit(session, 400, "invalid_model_field").await;
         }
         let model_opt: Option<String> = match model_field {
             ModelField::Value(b) => Some(String::from_utf8_lossy(b).into_owned()),
-            ModelField::Absent | ModelField::NotAString => None,
+            ModelField::Absent | ModelField::NotAString | ModelField::Ambiguous => None,
         };
 
         // (7) Pre-limit count gate (§6.3 §7 / §10.3). Runs BEFORE routing so a
@@ -1124,7 +1126,7 @@ impl HydraProxy {
 /// in the deterministic order returned by [`router::accessible_models`] (model
 /// asc — the catalog entry order is preserved; only the `id` is exposed to the
 /// tenant, never the internal provider topology, design §2.0).
-fn catalog_json(entries: &[router::CatalogEntry]) -> Bytes {
+fn catalog_json(entries: &[router::CatalogEntry]) -> Result<Bytes, serde_json::Error> {
     let mut body = String::from("{\"object\":\"list\",\"data\":[");
     for (i, e) in entries.iter().enumerate() {
         if i > 0 {
@@ -1133,12 +1135,13 @@ fn catalog_json(entries: &[router::CatalogEntry]) -> Bytes {
         body.push_str("{\"id\":");
         // A String always serialises — yields a fully escaped JSON string
         // literal (quotes included), so model keys with special characters
-        // cannot corrupt the envelope.
-        body.push_str(&serde_json::to_string(&e.model).expect("model key serialises"));
+        // cannot corrupt the envelope. `?` propagates the (in practice
+        // unreachable) serialisation error instead of panicking.
+        body.push_str(&serde_json::to_string(&e.model)?);
         body.push_str(",\"object\":\"model\"}");
     }
     body.push_str("]}");
-    Bytes::from(body)
+    Ok(Bytes::from(body))
 }
 
 /// Write the local `GET /v1/models` 200 response (design-tenant-model-catalog
@@ -1154,7 +1157,8 @@ async fn respond_catalog(
     ctx: &mut RequestContext,
     entries: &[router::CatalogEntry],
 ) -> PingoraResult<bool> {
-    let body = catalog_json(entries);
+    let body = catalog_json(entries)
+        .map_err(|e| pingora_err(format!("catalog JSON serialisation: {e}")))?;
     ctx.status_code = 200;
     session.set_keepalive(None);
     let mut resp_header = ResponseHeader::build(200, Some(3))?;

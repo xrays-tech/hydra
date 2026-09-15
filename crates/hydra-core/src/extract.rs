@@ -47,6 +47,13 @@ pub enum ModelField<'a> {
     /// (number, `null`, bool, array or object). Callers must NOT treat this as
     /// "no model": that equivalence is exactly the bypass described above.
     NotAString,
+    /// The root object's `"model"` member is **ambiguous**: the top level either
+    /// carries a `"model"` key more than once, or a top-level key holds an
+    /// escape sequence the zero-copy scan cannot decode (it may be an alias for
+    /// `"model"`, e.g. `{"\u006dodel":"a"}`). We cannot determine which member
+    /// the provider will read, so callers MUST reject the request instead of
+    /// authorizing on a guess.
+    Ambiguous,
 }
 
 /// Index of the `"` that closes the JSON string whose content starts at
@@ -78,7 +85,29 @@ fn skip_ws(body: &[u8], i: &mut usize) {
 /// Extract the root object's `"model"` member.
 ///
 /// Every index is bounds-checked via `slice::get`, so empty, truncated or
-/// malformed input returns [`ModelField::Absent`] and never panics.
+/// malformed input never panics. A truncated body (the root object was not
+/// closed) returns the first model seen so far, or [`ModelField::Absent`] when
+/// none was seen.
+///
+/// ## Why the scan runs to the END (no first-hit early exit)
+///
+/// The extracted value drives authorization while the body is forwarded
+/// upstream verbatim, so it must be the EXACT member the provider will read.
+/// A top-level `"model"` therefore only resolves unambiguously once the whole
+/// root object has been seen:
+///
+/// - a SECOND top-level `"model"` key is [`ModelField::Ambiguous`] — JSON
+///   parsers disagree on which duplicate wins (first vs last), so the provider
+///   may read a different model than Hydra authorized;
+/// - a top-level key carrying an escape sequence is [`ModelField::Ambiguous`] —
+///   it cannot be decoded zero-copy and may be an alias for `"model"`
+///   (e.g. `{"\u006dodel":"a"}`).
+///
+/// **Cost note:** this means one full linear pass over the body instead of
+/// stopping at the first `"model"`. That is acceptable: the caller bounds the
+/// body by the 413 hard cap (see `proxy.rs`, `max_request_body_hard`) before
+/// calling here, and the pass is zero-copy (no allocation, one `memchr`-free
+/// byte scan with the same O(1) per-byte work as before).
 #[must_use]
 pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
     let n = body.len();
@@ -93,6 +122,14 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
     let mut depth: u32 = 0;
     // True while, at depth 1, the next string token would be a member KEY.
     let mut expect_key = false;
+    // Whether a top-level `"model"` key has already been seen. A second one is
+    // ambiguous (JSON parsers disagree on which duplicate wins), which is why
+    // we scan to the end instead of returning on the first hit.
+    let mut seen_model = false;
+    // The value of the FIRST top-level `"model"` key, captured for the final
+    // result. We keep scanning after capturing it so a later duplicate or an
+    // escaped-key alias anywhere in the root object is still detected.
+    let mut model_result: Option<ModelField<'_>> = None;
 
     while i < n {
         let b = body[i];
@@ -102,7 +139,14 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
                     return ModelField::Absent; // unterminated string
                 };
                 if depth == 1 && expect_key {
-                    let is_model = &body[i + 1..close] == b"model";
+                    let key = &body[i + 1..close];
+                    // A top-level key with an escape sequence cannot be decoded
+                    // zero-copy and may be an alias for "model"
+                    // (e.g. {"\u006dodel":"a"}). Fail closed.
+                    if key.contains(&b'\\') {
+                        return ModelField::Ambiguous;
+                    }
+                    let is_model = key == b"model";
                     let mut j = close + 1;
                     skip_ws(body, &mut j);
                     if body.get(j) != Some(&b':') {
@@ -111,7 +155,7 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
                     j += 1;
                     skip_ws(body, &mut j);
                     if is_model {
-                        return match body.get(j) {
+                        let value = match body.get(j) {
                             Some(&b'"') => match string_close(body, j + 1) {
                                 Some(end) => ModelField::Value(&body[j + 1..end]),
                                 None => ModelField::Absent,
@@ -119,8 +163,16 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
                             Some(_) => ModelField::NotAString,
                             None => ModelField::Absent,
                         };
+                        // A SECOND top-level "model" key: we cannot know which
+                        // one the provider reads → ambiguous.
+                        if seen_model {
+                            return ModelField::Ambiguous;
+                        }
+                        seen_model = true;
+                        model_result = Some(value);
                     }
-                    // A different member: resume scanning at its value.
+                    // Resume scanning at the member's value (whether or not it
+                    // was the model key) so the rest of the body is still seen.
                     expect_key = false;
                     i = j;
                     continue;
@@ -137,7 +189,12 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
             b'}' | b']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return ModelField::Absent; // root closed, no "model" seen
+                    // Root closed: the whole body was scanned, so the captured
+                    // first model (if any) is the definitive answer.
+                    return match model_result {
+                        Some(r) => r,
+                        None => ModelField::Absent,
+                    };
                 }
                 i += 1;
             }
@@ -150,19 +207,25 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
             _ => i += 1,
         }
     }
-    ModelField::Absent
+    // The body ended before the root object closed (truncated — e.g. only a
+    // first chunk was available). Return the model seen so far, else Absent.
+    match model_result {
+        Some(r) => r,
+        None => ModelField::Absent,
+    }
 }
 
 /// Convenience view of [`extract_model_field`] for callers that only want a
 /// well-formed string value.
 ///
-/// This collapses [`ModelField::Absent`] and [`ModelField::NotAString`] into
-/// `None`. Authorization call sites must use [`extract_model_field`] directly,
-/// so that a non-string `"model"` is rejected rather than treated as absent.
+/// This collapses [`ModelField::Absent`], [`ModelField::NotAString`] and
+/// [`ModelField::Ambiguous`] into `None`. Authorization call sites must use
+/// [`extract_model_field`] directly, so that a non-string or ambiguous
+/// `"model"` is rejected rather than treated as absent.
 #[must_use]
 pub fn extract_model(body: &[u8]) -> Option<&[u8]> {
     match extract_model_field(body) {
         ModelField::Value(v) => Some(v),
-        ModelField::Absent | ModelField::NotAString => None,
+        ModelField::Absent | ModelField::NotAString | ModelField::Ambiguous => None,
     }
 }

@@ -196,3 +196,80 @@ fn root_model_found_after_other_members() {
     let body = br#"{"a":1,"b":{"model":"decoy"},"c":[1,2,3],"d":"x","model":"real"}"#;
     assert_eq!(extract_model(body), Some(&b"real"[..]));
 }
+
+// ---------------------------------------------------------------------------
+// Ambiguous: a duplicate top-level "model" key, or an escaped top-level key
+// that a zero-copy scan cannot decode (and may therefore alias "model").
+//
+// The extracted value drives authorization while the body goes upstream
+// verbatim, so when Hydra cannot pin down exactly which top-level member the
+// provider will read, it MUST fail closed (reject) rather than guess.
+// ---------------------------------------------------------------------------
+
+// REGRESSION (F-2) - a SECOND top-level "model" key is ambiguous: JSON parsers
+// disagree on which duplicate wins (first vs last), so the provider may read a
+// different model than Hydra authorized. The scan must run to the end (no
+// first-hit early exit) and report Ambiguous.
+#[test]
+fn duplicate_top_level_model_is_ambiguous() {
+    let body = br#"{"model":"a","model":"b"}"#;
+    assert_eq!(
+        extract_model_field(body),
+        ModelField::Ambiguous,
+        "two top-level model keys must be ambiguous, never the first-hit value"
+    );
+    // The convenience view collapses ambiguity to None (rejection lives at the proxy).
+    assert_eq!(extract_model(body), None);
+
+    // A duplicate is ambiguous regardless of what the values are (even equal).
+    let body = br#"{"model":"gpt-4","model":"gpt-4"}"#;
+    assert_eq!(extract_model_field(body), ModelField::Ambiguous);
+    assert_eq!(extract_model(body), None);
+
+    // A nested decoy in between must not mask the duplicate top-level key.
+    let body = br#"{"model":"a","metadata":{"model":"x"},"model":"b"}"#;
+    assert_eq!(extract_model_field(body), ModelField::Ambiguous);
+    assert_eq!(extract_model(body), None);
+}
+
+// REGRESSION (F-2) - an escaped top-level key is an alias for "model" that a
+// zero-copy scan cannot decode: {"\u006dodel":"a"} decodes to {"model":"a"}.
+// We cannot tell what an escaped key is, so any top-level key containing a
+// backslash is Ambiguous (fail closed), whether or not a raw "model" is also
+// present.
+#[test]
+fn escaped_top_level_key_is_ambiguous() {
+    // "\u006d" decodes to "m", so "\u006dodel" is "model" — an alias, and it
+    // precedes a real "model" key: the provider might read either.
+    let body = br#"{"\u006dodel":"a","model":"b"}"#;
+    assert_eq!(
+        extract_model_field(body),
+        ModelField::Ambiguous,
+        "an escaped top-level key may alias \"model\"; fail closed"
+    );
+    assert_eq!(extract_model(body), None);
+
+    // An escaped key alone (no raw "model") is still ambiguous: we cannot
+    // determine its decoded form without a full JSON unescape.
+    let body = br#"{"\u006dodel":"a"}"#;
+    assert_eq!(extract_model_field(body), ModelField::Ambiguous);
+    assert_eq!(extract_model(body), None);
+}
+
+// Boundary pin: the escape check applies to the top-level KEY bytes only. An
+// escape sequence inside a VALUE (or in a non-model key's value) must not make
+// a clean "model" key ambiguous — that would reject ordinary, valid requests.
+#[test]
+fn escaped_value_does_not_make_model_ambiguous() {
+    // The "model" key is clean; its value holds an escaped quote, and a sibling
+    // value holds a "\u006dodel" escape. None of those are top-level keys.
+    // (The returned slice is the RAW bytes `a\"b` — escapes are not decoded.)
+    let body = br#"{"model":"a\"b","x":"\u006dodel"}"#;
+    assert_eq!(
+        extract_model_field(body),
+        ModelField::Value(b"a\\\"b"),
+        "a clean model key with an escaped value is still a clean Value"
+    );
+    assert_eq!(extract_model(body), Some(&b"a\\\"b"[..]));
+}
+

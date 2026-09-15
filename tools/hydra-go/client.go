@@ -421,6 +421,12 @@ func (c *Client) removeNode(node string) {
 // isNodeFailure reports whether an invalidation error should cause the node to
 // be quarantined. HTTP 4xx errors (other than 401/403 handled by the caller)
 // are treated as node/API incompatibility errors and also cause rotation.
+//
+// A request timeout or caller cancellation is NOT a node failure: the node may
+// be healthy but merely slow, so it must not be quarantined. These are checked
+// before the net.Error check below because context.DeadlineExceeded also
+// satisfies net.Error (it defines a Timeout() method) and would otherwise be
+// misclassified as a network fault.
 func isNodeFailure(err error) bool {
 	if err == nil {
 		return false
@@ -429,11 +435,14 @@ func isNodeFailure(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.Status >= 500 || httpErr.Status == http.StatusNotFound || httpErr.Status == http.StatusMethodNotAllowed
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return true
 	}
-	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+	return true
 }
 
 func contains(list []string, value string) bool {

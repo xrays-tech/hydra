@@ -1182,6 +1182,95 @@ async fn auth_cache_invalidate() {
 }
 
 // ===========================================================================
+// F-3 — empty-body DELETE invalidates the ENTIRE local cache (every tenant),
+// keeps the `invalidated` count truthful, and still publishes a whole-cache
+// stream event `(None, [])`.
+// ===========================================================================
+
+#[cfg(feature = "cluster-redis")]
+#[tokio::test]
+async fn empty_body_delete_invalidates_all_local() {
+    use fred::prelude::*;
+    use hydra_core::config::ConfigData;
+    use hydra_core::model::Tenant;
+    use hydra_server::cluster::events::InvalidationStream;
+    use hydra_server::redis::mock::MockRedis;
+
+    // Shared Redis double: captures the published stream payload.
+    let mock = Arc::new(MockRedis::new());
+    let cfg = Config {
+        mocks: Some(mock),
+        ..Default::default()
+    };
+    let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
+    pool.init().await.expect("init");
+    let reader_pool = pool.clone();
+
+    // Store with exactly 3 known tenants.
+    let kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let mut data = ConfigData::default();
+    for (i, dom) in ["a.com", "b.com", "c.com"].iter().enumerate() {
+        data.tenants_by_domain.insert(
+            dom.to_string(),
+            Tenant {
+                id: format!("t{i}"),
+                name: format!("T{i}"),
+                domain: dom.to_string(),
+                auth_url: format!("https://auth.{dom}/v"),
+                cert_key: None,
+                cert_file: None,
+                enabled: true,
+                created_at: "".into(),
+                updated_at: "".into(),
+            },
+        );
+    }
+    let store = ConfigStore::from_snapshot(data, kp);
+
+    // Auth cache seeded with one entry per tenant.
+    let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
+    cache.set("t0", "sk-0", true, Duration::from_secs(300)).await;
+    cache.set("t1", "sk-1", true, Duration::from_secs(300)).await;
+    cache.set("t2", "sk-2", true, Duration::from_secs(300)).await;
+    assert_eq!(cache.len(), 3);
+    let auth = Arc::new(HttpAuthChecker::new(cache, AuthConfig::default()).expect("checker"));
+
+    let mut state = AdminState::new(
+        None,
+        store,
+        auth.clone(),
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
+        Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
+        Some(TOKEN.to_string()),
+        None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None,
+        None,
+    );
+    // Attach the invalidation stream publisher (cluster P4).
+    state.invalidation = Some(InvalidationStream::new(pool.clone()));
+    let state = Arc::new(state);
+    let port = start_admin(state.clone());
+
+    // Empty-body DELETE ⇒ invalidate everything (all tenants).
+    let r = req(port, reqwest::Method::DELETE, "/api/v1/auth/cache", Some(TOKEN), None).await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(v["invalidated"], 3, "all 3 tenants' entries cleared: {v}");
+    assert_eq!(state.auth.cache().len(), 0, "local L1 fully cleared");
+
+    // The stream payload is still a whole-cache clear: (None, []).
+    let reader = InvalidationStream::new(reader_pool);
+    let events = reader.read_since("0", 10).await.expect("read stream");
+    assert_eq!(events.len(), 1, "one stream event published");
+    let ev = &events[0].1;
+    assert_eq!(ev.tenant_id, None, "whole-cache event (None tenant)");
+    assert!(ev.keyhashes.is_empty(), "whole-cache event (no keyhashes)");
+    assert!(ev.legacy_keys.is_empty(), "whole-cache event (no legacy keys)");
+}
+
+// ===========================================================================
 // §2.4 — breaker inspect / reset
 // ===========================================================================
 

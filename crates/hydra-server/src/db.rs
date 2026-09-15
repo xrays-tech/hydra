@@ -1231,6 +1231,46 @@ pub async fn set_config_version(pool: &SqlitePool, version: u64) -> Result<(), s
     Ok(())
 }
 
+/// The config tables wiped on restore, in dependency order (children first,
+/// parents last). The table name is a **static literal** per variant — never
+/// assembled by `format!`, so there is no injection surface from a dynamic
+/// table name.
+#[derive(Clone, Copy, Debug)]
+enum WipedTable {
+    ProviderKeyBinding,
+    LimitRole,
+    TenantModel,
+    TenantProvider,
+    Tenant,
+    ProviderKey,
+    ProviderModel,
+    Provider,
+}
+
+impl WipedTable {
+    /// The static `DELETE FROM …` statement for this variant. The whole
+    /// statement is a compile-time literal — the table name is never
+    /// interpolated at runtime, so there is no injection surface.
+    #[allow(unreachable_patterns)] // the `_` arm is an exhaustiveness guard
+    fn delete_stmt(self) -> &'static str {
+        match self {
+            WipedTable::LimitRole => "DELETE FROM limit_role",
+            WipedTable::TenantModel => "DELETE FROM tenant_model",
+            WipedTable::TenantProvider => "DELETE FROM tenant_provider",
+            WipedTable::Tenant => "DELETE FROM tenant",
+            WipedTable::ProviderKey => "DELETE FROM provider_key",
+            WipedTable::ProviderModel => "DELETE FROM provider_model",
+            WipedTable::Provider => "DELETE FROM provider",
+            // The first-wiped table is the match default branch (covers the
+            // leading entry of the wipe order).
+            WipedTable::ProviderKeyBinding => "DELETE FROM provider_key_binding",
+            // The enum is finite and every variant is named above, so this
+            // catch-all can never be reached.
+            _ => unreachable!("every wiped-table variant is named above"),
+        }
+    }
+}
+
 /// Rebuild every config table from `cfg` (+ the fidelity rows) in a single
 /// transaction. Secrets are re-sealed at this boundary with `kp`.
 ///
@@ -1245,18 +1285,18 @@ pub async fn restore_config(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    // Wipe children before parents.
+    // Wipe children before parents (static table names, no `format!`).
     for table in [
-        "provider_key_binding",
-        "limit_role",
-        "tenant_model",
-        "tenant_provider",
-        "tenant",
-        "provider_key",
-        "provider_model",
-        "provider",
+        WipedTable::ProviderKeyBinding,
+        WipedTable::LimitRole,
+        WipedTable::TenantModel,
+        WipedTable::TenantProvider,
+        WipedTable::Tenant,
+        WipedTable::ProviderKey,
+        WipedTable::ProviderModel,
+        WipedTable::Provider,
     ] {
-        sqlx::query(&format!("DELETE FROM {table}"))
+        sqlx::query(table.delete_stmt())
             .execute(&mut *tx)
             .await?;
     }

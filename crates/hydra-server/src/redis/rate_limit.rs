@@ -167,7 +167,9 @@ impl RedisRateLimiter {
                 Err(e) => {
                     warn!(error = %e, "redis rate-limit check failed; failing open");
                     crate::admin::metrics::record_control_poll("rate_limit_error");
-                    continue; // fail-open per role (HYDRA_RATE_LIMIT_FAIL_MODE=open default)
+                    // fail-open per role — the error is deliberately swallowed
+                    // (documented in redis/mod.rs; there is NO env override)
+                    continue;
                 }
             };
             if admitted == 0 {

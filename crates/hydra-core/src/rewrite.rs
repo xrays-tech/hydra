@@ -68,11 +68,14 @@ impl EndpointUrl {
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest.get(..authority_end)?;
         // Reject userinfo (credentials belong in provider keys; the dialler
-        // would mis-split `user:pass@host` into host/port anyway) and any
-        // whitespace/control character, which can never be part of a host and
-        // would only fail later at DNS resolution.
+        // would mis-split `user:pass@host` into host/port anyway), any
+        // whitespace/control character (never part of a host — would only fail
+        // later at DNS), and any `%` (percent-encoding belongs in the path
+        // component, never in the authority — its presence here means a
+        // malformed host like `host%20name`).
         if authority.is_empty()
             || authority.contains('@')
+            || authority.contains('%')
             || authority
                 .bytes()
                 .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
@@ -81,15 +84,37 @@ impl EndpointUrl {
         }
         let tail = rest.get(authority_end..).unwrap_or("");
 
-        // Authority = host[:port].
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => {
-                if h.is_empty() {
-                    return None;
-                }
-                (h.to_string(), p.parse::<u16>().ok()?)
+        // Authority = host[:port]. An IPv6 host MUST be bracketed
+        // (`[::1]:8080`); a bare (unbracketed) host containing `:` is ambiguous
+        // against the host:port split and is rejected. A bracketed host must be
+        // a valid IPv6 literal (the brackets are stripped from the result).
+        let (host, port) = if authority.starts_with('[') {
+            let close = authority.find(']')?;
+            let inner = authority.get(1..close)?;
+            // The bracketed content must be a valid IPv6 address.
+            if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                return None;
             }
-            None => (authority.to_string(), default_port(scheme)),
+            let after = &authority[close + 1..];
+            let port = if after.is_empty() {
+                default_port(scheme)
+            } else if let Some(p) = after.strip_prefix(':') {
+                p.parse::<u16>().ok()?
+            } else {
+                return None; // trailing junk after the bracket (not a `:port`)
+            };
+            (inner.to_string(), port)
+        } else {
+            let (h, port) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().ok()?),
+                None => (authority, default_port(scheme)),
+            };
+            // A host that still contains `:` (a bare IPv6 literal, no brackets)
+            // is rejected: without brackets the host:port split is ambiguous.
+            if h.contains(':') {
+                return None;
+            }
+            (h.to_string(), port)
         };
         if host.is_empty() {
             return None;

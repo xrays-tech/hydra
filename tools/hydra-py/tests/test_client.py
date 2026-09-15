@@ -2,6 +2,7 @@ import json
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from hydra_sdk import HydraClient
@@ -62,6 +63,38 @@ def make_server(node):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
+
+
+def make_fake_urlopen(mode):
+    """Build a fake ``urlopen`` for a given invalidation failure mode.
+
+    The leader probe always succeeds so the node is considered alive; the
+    invalidation request then raises a timeout (mode="timeout") or a
+    connection-refused error (mode="refused").
+    """
+
+    class FakeResp:
+        status = 200
+
+        def read(self):
+            return b'{"leader":true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(req, timeout=None):
+        if req.full_url.endswith("/healthz/leader"):
+            return FakeResp()
+        if mode == "timeout":
+            raise TimeoutError("timed out")
+        if mode == "refused":
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+        return FakeResp()
+
+    return urlopen
 
 
 class ClientTest(unittest.TestCase):
@@ -185,6 +218,26 @@ class ClientTest(unittest.TestCase):
         client = self.make_client([f"http://127.0.0.1:{server.server_port}"])
         client.invalidate_tenant_auth_cache_keys("t-acme", ["key1", "key2"])
         self.assertEqual(seen["body"], {"api_keys": ["key1", "key2"]})
+
+    def test_timeout_does_not_remove_node(self):
+        client = self.make_client(
+            ["http://127.0.0.1:1"], urlopen=make_fake_urlopen("timeout")
+        )
+        with self.assertRaises(Exception) as ctx:
+            client.invalidate_tenant_auth_cache("t-acme")
+        self.assertIn("failed", str(ctx.exception))
+        self.assertEqual(client.removed_nodes, [])
+        self.assertEqual(client.nodes, ["http://127.0.0.1:1"])
+
+    def test_connection_refused_removes_node(self):
+        client = self.make_client(
+            ["http://127.0.0.1:1"], urlopen=make_fake_urlopen("refused")
+        )
+        with self.assertRaises(Exception) as ctx:
+            client.invalidate_tenant_auth_cache("t-acme")
+        self.assertIn("failed", str(ctx.exception))
+        self.assertEqual(client.removed_nodes, ["http://127.0.0.1:1"])
+        self.assertEqual(client.nodes, [])
 
 
 if __name__ == "__main__":

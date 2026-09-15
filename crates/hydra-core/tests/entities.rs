@@ -49,10 +49,14 @@ fn entities_derive_roundtrip() {
     };
     roundtrip(&provider_model);
 
+    // P2-10: api_key is skip_serializing + default — it is never serialized and
+    // defaults to "" on absence (asserted in
+    // `secrets_are_never_serialized_and_default_on_absence`), so the generic
+    // roundtrip uses the default (empty) value.
     let provider_key = ProviderKey {
         id: "pk_01".into(),
         provider_id: "p_01".into(),
-        api_key: "sk-secret".into(),
+        api_key: String::new(),
         created_at: "2026-01-01T00:00:00Z".into(),
     };
     roundtrip(&provider_key);
@@ -184,15 +188,16 @@ fn entities_derive_roundtrip() {
     };
     roundtrip(&cert_meta);
 
-    // Content form (migration 0007): PEM content serialises; the private key
-    // round-trips inside the snapshot (it is shipped sealed in the wire form;
-    // here we only assert the plain type is serde-compatible).
+    // Content form (migration 0007): the public cert PEM round-trips. The
+    // private key (cert_key_pem) is skip_serializing + default (P2-10) — never
+    // serialized, so it defaults to None on a round-trip (asserted in
+    // `secrets_are_never_serialized_and_default_on_absence`).
     let cert_meta_content = CertMeta {
         domain: "acme.com".into(),
         cert_file: None,
         cert_key: None,
         cert_pem: Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into()),
-        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".into()),
+        cert_key_pem: None,
     };
     roundtrip(&cert_meta_content);
 
@@ -217,4 +222,60 @@ fn entities_derive_roundtrip() {
         serde_json::to_value(ProviderKind::Anthropic).unwrap(),
         json!("Anthropic")
     );
+}
+
+/// P2-10 — secret fields are NEVER serialized (they live only in memory / are
+/// re-sealed at the DB boundary) and deserialize to their `Default` when absent.
+/// This locks the `skip_serializing` + `default` contract for the provider
+/// api-key (`ProviderKey::api_key`, a non-Option `String`) and the cert
+/// private-key PEM (`CertMeta::cert_key_pem`, an `Option<String>`).
+#[test]
+fn secrets_are_never_serialized_and_default_on_absence() {
+    // ProviderKey.api_key: skip on serialize, default to "" on absence.
+    let provider_key = ProviderKey {
+        id: "pk_01".into(),
+        provider_id: "p_01".into(),
+        api_key: "sk-secret".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let value = serde_json::to_value(&provider_key).unwrap();
+    assert!(
+        value.get("api_key").is_none(),
+        "api_key must never be serialized (got: {value})"
+    );
+    // A payload without the field deserializes with the default (empty string).
+    let de: ProviderKey =
+        serde_json::from_value(json!({
+            "id": "pk_01",
+            "provider_id": "p_01",
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+    assert_eq!(de.api_key, "", "absent api_key defaults to the empty string");
+    assert_eq!(de.id, "pk_01");
+    assert_eq!(de.provider_id, "p_01");
+
+    // CertMeta.cert_key_pem: skip on serialize, default to None on absence.
+    let cert_meta = CertMeta {
+        domain: "acme.com".into(),
+        cert_file: None,
+        cert_key: None,
+        cert_pem: Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into()),
+        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".into()),
+    };
+    let value = serde_json::to_value(&cert_meta).unwrap();
+    assert!(
+        value.get("cert_key_pem").is_none(),
+        "cert_key_pem must never be serialized (got: {value})"
+    );
+    // The public cert PEM is still serialized (only the private key is skipped).
+    assert!(value.get("cert_pem").is_some(), "cert_pem is public and must serialize");
+    // A payload without the field deserializes with the default (None).
+    let de: CertMeta =
+        serde_json::from_value(json!({
+            "domain": "acme.com",
+            "cert_pem": "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
+        }))
+        .unwrap();
+    assert!(de.cert_key_pem.is_none(), "absent cert_key_pem defaults to None");
 }

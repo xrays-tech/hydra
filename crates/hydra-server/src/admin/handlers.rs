@@ -13,8 +13,8 @@ use std::sync::Arc;
 use http::Response;
 use hydra_core::auth::sha256_hex;
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
-    TenantProvider,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderKeyDto, ProviderModel, Tenant,
+    TenantModel, TenantProvider,
 };
 use pingora_core::protocols::http::ServerSession;
 use serde::{Deserialize, Serialize};
@@ -405,11 +405,16 @@ pub(super) async fn provider_key_collection(
     if method == "GET" {
         match crate::db::list_provider_keys(state.db(), state.key_provider.as_ref()).await {
             Ok(rows) => {
-                let out: Vec<ProviderKey> = rows
+                let out: Vec<ProviderKeyDto> = rows
                     .into_iter()
-                    .map(|mut k| {
-                        k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-                        k
+                    .map(|k| {
+                        let masked = hydra_core::rewrite::mask_key(&k.api_key);
+                        ProviderKeyDto {
+                            id: k.id,
+                            provider_id: k.provider_id,
+                            api_key: masked,
+                            created_at: k.created_at,
+                        }
                     })
                     .collect();
                 ok_json(200, &out)
@@ -433,9 +438,15 @@ pub(super) async fn provider_key_collection(
             Err(e) => return db_err_resp(e, trace_id),
         }
         reload_best_effort(state, trace_id).await;
-        // Never echo plaintext back (P1-5).
-        k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-        ok_json(201, &k)
+        // Never echo plaintext back (P1-5) — re-expose only via the masked DTO.
+        let masked = hydra_core::rewrite::mask_key(&k.api_key);
+        let dto = ProviderKeyDto {
+            id: k.id,
+            provider_id: k.provider_id,
+            api_key: masked,
+            created_at: k.created_at,
+        };
+        ok_json(201, &dto)
     } else {
         method_not_allowed(trace_id)
     }
@@ -451,9 +462,15 @@ pub(super) async fn provider_key_item(
     match method {
         "GET" => {
             match crate::db::get_provider_key(state.db(), state.key_provider.as_ref(), id).await {
-                Ok(mut k) => {
-                    k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-                    ok_json(200, &k)
+                Ok(k) => {
+                    let masked = hydra_core::rewrite::mask_key(&k.api_key);
+                    let dto = ProviderKeyDto {
+                        id: k.id,
+                        provider_id: k.provider_id,
+                        api_key: masked,
+                        created_at: k.created_at,
+                    };
+                    ok_json(200, &dto)
                 }
                 Err(e) if is_not_found(&e) => err_json(404, "not_found", "key not found", trace_id),
                 Err(e) => db_err_resp(e, trace_id),
@@ -478,8 +495,14 @@ pub(super) async fn provider_key_item(
                 Err(e) => return db_err_resp(e, trace_id),
             }
             reload_best_effort(state, trace_id).await;
-            k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-            ok_json(200, &k)
+            let masked = hydra_core::rewrite::mask_key(&k.api_key);
+            let dto = ProviderKeyDto {
+                id: k.id,
+                provider_id: k.provider_id,
+                api_key: masked,
+                created_at: k.created_at,
+            };
+            ok_json(200, &dto)
         }
         "DELETE" => match crate::db::delete_provider_key(state.db(), id).await {
             Ok(()) => {
@@ -1418,7 +1441,18 @@ pub(super) async fn auth_cache_invalidate(
             }
             total
         }
-        (None, None) => 0,
+        (None, None) => {
+            // F-3: an empty-body DELETE means "invalidate everything" — clear
+            // the local cache for EVERY known tenant (the remote stream event
+            // is already a whole-cache clear; this keeps the `invalidated`
+            // count truthful instead of always 0).
+            let snap = state.store.snapshot();
+            let mut total = 0usize;
+            for t in snap.tenants_by_domain.values() {
+                total += state.auth.invalidate_tenant(&t.id).await;
+            }
+            total
+        }
     };
     // Broadcast the invalidation cluster-wide (P4): every node drops the
     // affected local cache entries via the stream; the L2 entries they

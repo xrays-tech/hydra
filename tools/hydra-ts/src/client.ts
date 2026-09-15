@@ -57,6 +57,18 @@ interface RawResponse {
 
 type ConstructorArg = HydraClientConfig | string;
 
+/**
+ * Reports whether err is a request timeout / caller-cancellation error. In
+ * this SDK such errors surface as an AbortError raised by the fetch
+ * implementation once the client's AbortController is triggered. A timeout is
+ * not evidence that a node is dead (it may simply be slow), so it must not
+ * cause the node to be quarantined.
+ */
+function isTimeoutError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  return (err as { name?: unknown }).name === 'AbortError';
+}
+
 export class HydraClient {
   private readonly token: string;
   private readonly fetchImpl: typeof fetch;
@@ -98,7 +110,14 @@ export class HydraClient {
     for (const raw of config.nodes) {
       const node = raw.trim().replace(/\/+$/, '');
       if (!node || seen.has(node)) continue;
-      const u = new URL(node);
+      let u: URL;
+      try {
+        u = new URL(node);
+      } catch {
+        // A bare TypeError from new URL() is not user-friendly; surface the
+        // offending node the same way the protocol check below does.
+        throw new Error(`hydra: invalid node URL "${node}"`);
+      }
       if (u.protocol !== 'http:' && u.protocol !== 'https:') {
         throw new Error(`hydra: invalid node URL "${node}"`);
       }
@@ -307,6 +326,10 @@ export class HydraClient {
     if (err instanceof HTTPError) {
       return err.status >= 500 || err.status === 404 || err.status === 405;
     }
+    // A request timeout (or caller cancellation) is not a node failure: the
+    // node may be healthy but merely slow. This aligns with the Go SDK, which
+    // treats context.DeadlineExceeded/Canceled as non-failures.
+    if (isTimeoutError(err)) return false;
     return true;
   }
 }

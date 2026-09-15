@@ -173,4 +173,53 @@ describe('HydraClient', () => {
       client.close();
     }
   });
+
+  it('does not quarantine a node on request timeout', async () => {
+    const node = 'http://127.0.0.1:1';
+    // The leader probe succeeds so the node is considered alive; the
+    // invalidation request then hangs until the client's request timeout
+    // aborts it (producing an AbortError).
+    const fetchImpl = ((url: string, init: RequestInit) => {
+      if (url.endsWith('/healthz/leader')) {
+        return Promise.resolve(new Response('{"leader":true}', { status: 200 }));
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        if (signal) {
+          signal.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }
+      });
+    }) as typeof fetch;
+    const client = makeClient([node], { fetchImpl, requestTimeoutMs: 100 });
+    client.close();
+    await assert.rejects(() => client.invalidateTenantAuthCache('t-acme'), /failed/);
+    assert.deepEqual(client.removedNodes, []);
+    assert.deepEqual(client.nodes, [node]);
+  });
+
+  it('quarantines a node on connection refused', async () => {
+    const node = 'http://127.0.0.1:1';
+    const fetchImpl = ((url: string, _init: RequestInit) => {
+      if (url.endsWith('/healthz/leader')) {
+        return Promise.resolve(new Response('{"leader":true}', { status: 200 }));
+      }
+      const err = new TypeError('fetch failed');
+      (err as { cause?: unknown }).cause = new Error('ECONNREFUSED 127.0.0.1:1');
+      return Promise.reject(err);
+    }) as typeof fetch;
+    const client = makeClient([node], { fetchImpl });
+    client.close();
+    await assert.rejects(() => client.invalidateTenantAuthCache('t-acme'), /failed/);
+    assert.deepEqual(client.removedNodes, [node]);
+    assert.deepEqual(client.nodes, []);
+  });
+
+  it('wraps an unparseable node URL in a friendly hydra error', () => {
+    assert.throws(
+      () => new HydraClient({ token: 'sk-tenant-token', nodes: ['not a url'] }),
+      /hydra: invalid node URL/,
+    );
+  });
 });
