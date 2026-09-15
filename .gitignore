@@ -40,6 +40,10 @@
 # Local 3-node test environment runbook -> contains a real upstream api-key
 /LOCAL_TEST_ENV.md
 
+# Code-review report -> describes issues that are still UNFIXED; this repo is
+# public, so keep it local until the remaining findings are addressed.
+/CODE_REVIEW.md
+
 # Local release script (per-developer convenience wrapper)
 /scripts/local_release.sh
 
