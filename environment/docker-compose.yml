@@ -8,8 +8,12 @@
 #          export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
 #      Provider api-keys are stored AES-256-GCM encrypted; without this key the
 #      container refuses to start. Keep it safe — losing it makes the DB unreadable.
-#   5. Start:  cd environment && docker-compose up -d
-#   6. Init:   python3 environment/init.py
+#   5. Export the admin bearer token (REQUIRED — there is no default). Also put
+#      the same value in secure/config.json as "admin_token" so init.py can
+#      authenticate:
+#          export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"
+#   6. Start:  cd environment && docker-compose up -d
+#   7. Init:   python3 environment/init.py
 #
 version: "3.8"
 
@@ -19,9 +23,18 @@ services:
     container_name: hydra
     ports:
       - "8080:8080"   # proxy (HTTP)
-      - "8081:8081"   # admin REST + UI + /metrics
+      # Admin REST + UI + /metrics — published on LOOPBACK ONLY. This port has no
+      # TLS, and its bearer token is the sole authority over tenants, providers
+      # and every stored upstream api-key. Reach it from the host itself or over
+      # an SSH tunnel; front it with an auth-terminating reverse proxy if it must
+      # be reachable remotely. The container still binds 0.0.0.0 internally
+      # (HYDRA_ADMIN_ADDR below) so this publish works.
+      - "127.0.0.1:8081:8081"
     environment:
-      HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:-hydra-admin}
+      # REQUIRED — deliberately no default. A guessable admin token plus a
+      # reachable admin port is a full gateway takeover. Generate:
+      #   openssl rand -hex 32
+      HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:?set HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)" — required for the admin API}
       HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"

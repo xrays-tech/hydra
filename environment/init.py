@@ -49,7 +49,18 @@ def main():
         cfg = json.load(f)
 
     base = cfg.get("admin_url", "http://localhost:8081") + "/api/v1"
-    token = cfg.get("admin_token", "hydra-admin")
+    # No default: a guessable admin credential is a full gateway takeover
+    # (tenant/provider CRUD + upstream api-key writes). Take the config value or
+    # the environment, and enforce the server's own minimum length.
+    token = (cfg.get("admin_token") or os.environ.get("HYDRA_ADMIN_TOKEN") or "").strip()
+    if len(token) < 16:
+        print(
+            "[init] FAIL: no usable admin token.\n"
+            '       Set "admin_token" in secure/config.json (or export HYDRA_ADMIN_TOKEN)\n'
+            "       to the same value the server was started with; minimum 16 chars.\n"
+            "       Generate one with:  openssl rand -hex 32"
+        )
+        sys.exit(1)
 
     print(f"[init] waiting for Hydra at {base.rsplit('/api/v1',1)[0]} ...")
     if not wait_health(base, token):

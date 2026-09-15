@@ -1,7 +1,7 @@
 {
-  "_comment": "Copy this file to secure/config.json and fill in your real api-keys. secure/ is gitignored.",
+  "_comment": "Copy this file to secure/config.json and fill in your real api-keys. secure/ is gitignored. REQUIRED: set admin_token to the same value you exported as HYDRA_ADMIN_TOKEN (>= 16 chars, generate with: openssl rand -hex 32). There is no default.",
   "admin_url": "http://localhost:8081",
-  "admin_token": "hydra-admin",
+  "admin_token": "",
 
   "providers": [
     {

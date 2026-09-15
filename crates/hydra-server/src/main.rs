@@ -138,6 +138,22 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 .into(),
         );
     }
+    // Admin-token strength (design §13.3). Refuse to BOOT on a short token
+    // rather than warn: the gate has no rate limit or lockout, and the admin
+    // API is the authority over every tenant, provider and stored upstream
+    // api-key — so a guessable token is a full gateway takeover. Shipping a
+    // weak default is exactly the failure mode this prevents.
+    if let Ok(token) = std::env::var("HYDRA_ADMIN_TOKEN") {
+        if !token.is_empty() && token.len() < AdminService::MIN_ADMIN_TOKEN_LEN {
+            return Err(format!(
+                "HYDRA_ADMIN_TOKEN is too short ({} chars, minimum {}); \
+                 generate one with `openssl rand -hex 32`; refusing to start",
+                token.len(),
+                AdminService::MIN_ADMIN_TOKEN_LEN
+            )
+            .into());
+        }
+    }
     if role == hydra_server::cluster::NodeRole::Leader && !cfg!(feature = "cluster-redis") {
         return Err(
             "HYDRA_ROLE=leader requires the 'cluster-redis' cargo feature \

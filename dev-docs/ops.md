@@ -641,10 +641,11 @@ cargo build --release --features server,cluster-redis,usage-clickhouse
 
 ```bash
 cd environment
-export HYDRA_ADMIN_TOKEN=admin-secret
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"         # required, >= 16 chars
+export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"       # required (control channel)
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
 docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
-curl -H "Authorization: Bearer admin-secret" http://localhost:8081/api/v1/tenants
+curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/tenants
 ```
 
 k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.

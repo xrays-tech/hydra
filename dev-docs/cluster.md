@@ -80,10 +80,12 @@
 
 ```bash
 cd environment
-HYDRA_ADMIN_TOKEN=admin-secret HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" \
-  docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"      # 必填，>= 16 字符
+export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"    # 必填（控制通道）
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # 全集群必须一致
+docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
 # 管理面：指向任一 leader 候选（standby 自动转发到 active）
-curl -H "Authorization: Bearer admin-secret" http://localhost:8081/api/v1/tenants
+curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/tenants
 ```
 
 ### 4.2 k3s / k8s（纯容器清单，零 K8s API 依赖）

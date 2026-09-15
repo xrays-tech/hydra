@@ -4,7 +4,8 @@
 #   cargo build --release --features server,cluster-redis  → stage to bin/hydra)
 #
 # Prereqs:
-#   export HYDRA_ADMIN_TOKEN=admin-secret
+#   export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # admin API, >= 16 chars
+#   export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # control channel, REQUIRED
 #   export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
 #   python3 environment/init.py  (point it at the leader admin port)
 #
@@ -36,7 +37,9 @@ services:
       HYDRA_ROLE: leader
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: single
-      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:-cluster-tok}
+      # REQUIRED — no default: this token authenticates the inter-node config
+      # channel (/api/v1/internal/*), which carries the sealed provider keys.
+      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:?set HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)" — required in cluster mode}
       # Control-plane SNAPSHOT URL (standbys/edges poll this for config).
       # It is NOT the admin-mutation forward target: forwarding follows the
       # actual lease holder via the registry, so pointing at this node itself
@@ -53,7 +56,8 @@ services:
       HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY}
       RUST_LOG: info
     ports:
-      - "8081:8081"   # admin (the second leader is on 8082, see below)
+      # Loopback only — the admin port has no TLS (see docker-compose.yml).
+      - "127.0.0.1:8081:8081"   # admin (the second leader is on 8082, see below)
     volumes:
       - control-a-data:/app/data
     depends_on:
@@ -73,7 +77,7 @@ services:
       HYDRA_PUBLIC_URL: "http://hydra-control-b:8081"
       HYDRA_NODE_ID: control-b
     ports:
-      - "8082:8081"
+      - "127.0.0.1:8082:8081"
     volumes:
       - control-b-data:/app/data
     depends_on:
@@ -88,7 +92,9 @@ services:
     environment:
       HYDRA_ROLE: edge
       HYDRA_REDIS_URL: "redis://redis:6379"
-      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:-cluster-tok}
+      # REQUIRED — no default: this token authenticates the inter-node config
+      # channel (/api/v1/internal/*), which carries the sealed provider keys.
+      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:?set HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)" — required in cluster mode}
       HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
       HYDRA_PUBLIC_URL: "http://hydra-edge:8081"
       HYDRA_CONTROL_POLL_MS: "500"

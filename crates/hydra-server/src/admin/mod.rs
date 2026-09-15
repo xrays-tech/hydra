@@ -203,9 +203,14 @@ impl AdminService {
         Self { state }
     }
 
-    /// Read the configured admin token from the environment (used by `main`).
-    /// Returns `None` when unset ⇒ the service denies all requests (fail-closed,
-    /// design §13.3).
+    /// Minimum accepted length for `HYDRA_ADMIN_TOKEN`, enforced at startup.
+    ///
+    /// The token is one shared secret gating the entire admin API (tenant,
+    /// model, provider and `provider-key` CRUD, i.e. every upstream api-key and
+    /// the ability to rotate them) and the gate has no rate limit or lockout, so
+    /// a short or human-chosen token is brute-forceable. `main` refuses to boot
+    /// with one. Generate with `openssl rand -hex 32`.
+    pub const MIN_ADMIN_TOKEN_LEN: usize = 16;
     #[must_use]
     pub fn token_from_env() -> Option<String> {
         std::env::var("HYDRA_ADMIN_TOKEN")

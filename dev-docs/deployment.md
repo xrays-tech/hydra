@@ -59,9 +59,11 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8081/api/v1/health   # 
 ```bash
 cp environment/config.example.json secure/config.json   # 填入真实 provider api-key
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"     # 必填（无默认值，>= 16 字符）
+                                                       # 同时写进 secure/config.json 的 "admin_token"
 cd environment && docker compose up -d
 python3 environment/init.py                            # 播种 provider/tenant/模型
-curl -H "Authorization: Bearer hydra-admin" http://localhost:8081/api/v1/tenants
+curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/tenants
 ```
 
 端口：`8080` 代理（HTTP）、`8081` admin、`9091` mock-tenant、`8123` ClickHouse。
@@ -73,7 +75,8 @@ curl -H "Authorization: Bearer hydra-admin" http://localhost:8081/api/v1/tenants
 拓扑：`redis`（仲裁） + `hydra-control-a/b`（双 leader 候选，独立数据卷） + `hydra-edge`（无状态，可 scale）+ `clickhouse`。
 
 ```bash
-export HYDRA_ADMIN_TOKEN=admin-secret
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # 必填，>= 16 字符
+export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # 必填（控制通道）
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"    # 全集群必须一致
 docker compose -f environment/docker-compose.cluster.yml up -d --scale hydra-edge=2
 ```
