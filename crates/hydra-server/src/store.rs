@@ -235,17 +235,11 @@ fn validate_and_log(cfg: &ConfigData) -> Result<(), StoreError> {
 /// froze and key rotation / revocation silently stopped taking effect (audit
 /// §3.14). Write-side and load-side now share one predicate by construction.
 pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
-    let lower = endpoint.to_ascii_lowercase();
-    let rest = match lower
-        .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"))
-    {
-        Some(r) => r,
-        None => return false,
-    };
-    // Reject empty host (e.g. "https://") and an immediate path (e.g. "https:///x").
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    host_end > 0
+    // The loader, the admin write boundary and the upstream dialler all ask the
+    // SAME question, through the SAME parser: can this endpoint become a peer?
+    // The previous hand-rolled prefix test here was weaker than
+    // `proxy::peer::parse_endpoint`, and the gap was reachable — see §21.
+    hydra_core::rewrite::EndpointUrl::parse(endpoint).is_some()
 }
 
 // ---------------------------------------------------------------------------

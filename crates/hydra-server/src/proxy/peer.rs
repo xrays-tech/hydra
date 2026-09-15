@@ -25,52 +25,11 @@ pub use hydra_core::rewrite::EndpointUrl;
 /// has already rejected unparseable endpoints, so reaching `None` here is a
 /// post-reload data-graph inconsistency the shell logs and routes around.
 pub fn parse_endpoint(endpoint: &str) -> Option<EndpointUrl> {
-    let (scheme, rest) = endpoint
-        .strip_prefix("https://")
-        .map(|r| ("https", r))
-        .or_else(|| endpoint.strip_prefix("http://").map(|r| ("http", r)))?;
-
-    // Split authority from path/query/fragment.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest.get(..authority_end)?;
-    if authority.is_empty() {
-        return None;
-    }
-    let tail = rest.get(authority_end..).unwrap_or("");
-
-    // Authority = host[:port]. IPv6 brackets are not expected for configured
-    // provider endpoints; if present we still split on the last colon.
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => {
-            let port: u16 = p.parse().ok()?;
-            (h.to_string(), port)
-        }
-        _ => (authority.to_string(), default_port(scheme)),
-    };
-
-    // Path prefix: take the path component (drop ?query / #frag), strip the
-    // trailing slash so `rewrite_path` concatenation is clean.
-    let path_prefix = tail
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('/')
-        .to_string();
-
-    Some(EndpointUrl {
-        scheme: scheme.to_string(),
-        host,
-        port,
-        path_prefix,
-    })
-}
-
-/// Scheme-default port (RFC 7230 §2.7).
-fn default_port(scheme: &str) -> u16 {
-    match scheme {
-        "https" => 443,
-        _ => 80,
-    }
+    // ONE parser for the dialler, the config loader and the admin write
+    // boundary ([EndpointUrl::parse]). It used to be duplicated here while the
+    // loader validated with a weaker prefix test, which let the loader accept
+    // endpoints this function cannot parse — see audit §21.
+    EndpointUrl::parse(endpoint)
 }
 
 /// Build a Pingora [`HttpPeer`] from a parsed endpoint (design §6.4).

@@ -167,3 +167,56 @@ fn mask_key_long() {
 fn mask_key_four_chars() {
     assert_eq!(mask_key("1234"), "****");
 }
+
+// ===========================================================================
+// EndpointUrl::parse - the ONE parser shared by the config loader, the admin
+// write boundary and the dialler (audit 21).
+// ===========================================================================
+
+/// Parse rules the loader, the write boundary and the dialler must agree on.
+#[test]
+fn endpoint_parse_accepts_well_formed_urls() {
+    let ep = EndpointUrl::parse("https://api.openai.com").expect("bare https host");
+    assert_eq!(ep.scheme, "https");
+    assert_eq!(ep.host, "api.openai.com");
+    assert_eq!(ep.port, 443);
+    assert_eq!(ep.path_prefix, "");
+
+    let ep = EndpointUrl::parse("http://up:8080/v1/").expect("explicit port + prefix");
+    assert_eq!(
+        (ep.scheme.as_str(), ep.host.as_str(), ep.port),
+        ("http", "up", 8080)
+    );
+    assert_eq!(ep.path_prefix, "/v1", "trailing slash is stripped");
+
+    // Scheme is case-insensitive (RFC 3986 3.1) and normalised for the
+    // dialler; the host keeps its original casing.
+    let ep = EndpointUrl::parse("HTTPS://Api.OpenAI.com").expect("uppercase scheme");
+    assert_eq!(ep.scheme, "https");
+    assert_eq!(ep.host, "Api.OpenAI.com");
+    assert_eq!(ep.port, 443);
+}
+
+/// Everything the dialler cannot use must be rejected HERE. Otherwise the admin
+/// API answers 201, the config reloads happily, the provider looks healthy -
+/// and every request silently skips it (audit 21).
+#[test]
+fn endpoint_parse_rejects_what_the_dialler_cannot_use() {
+    for bad in [
+        "",
+        "api.openai.com",          // no scheme
+        "https://",                // empty host
+        "https:///v1",             // hostless path
+        "ftp://host",              // wrong scheme
+        "https://host:abc",        // non-numeric port
+        "https://host:99999",      // port out of u16 range
+        "https://user:pass@host",  // userinfo (use provider keys instead)
+        "https://host with space", // whitespace can never be part of a host
+        "https://host\ttab",
+    ] {
+        assert!(
+            EndpointUrl::parse(bad).is_none(),
+            "{bad:?} must be rejected by the shared parser"
+        );
+    }
+}

@@ -146,7 +146,7 @@ async fn run_channel_sink<F, Fut>(
                                 dropped_total = retained_drops,
                                 retained = buffer.len(),
                                 cap = MAX_RETAINED,
-                                "usage sink retention cap reached (backend still down);                                  dropping incoming usage records"
+                                "usage sink retention cap reached (backend still down); dropping incoming usage records"
                             );
                         }
                         continue;
@@ -158,8 +158,17 @@ async fn run_channel_sink<F, Fut>(
                 }
                 None => {
                     // Channel closed: best-effort final drain + flush, then exit.
-                    if !buffer.is_empty() {
-                        flush_with_backoff(&mut buffer, &inserter, retry_window).await;
+                    // A FAILED final flush means this batch is genuinely lost, so
+                    // it is counted like every other drop (never silent).
+                    if !buffer.is_empty()
+                        && !flush_with_backoff(&mut buffer, &inserter, retry_window).await
+                    {
+                        note_usage_drop("shutdown_unflushed", buffer.len() as u64);
+                        tracing::error!(
+                            lost = buffer.len(),
+                            "usage sink is shutting down with an un-flushable batch; \
+                             these usage records are LOST"
+                        );
                     }
                     return;
                 }
@@ -293,7 +302,12 @@ impl UsageSink for SqliteSink {
                 let guard = self.tx.lock().expect("sink tx mutex");
                 match guard.as_ref() {
                     Some(tx) => tx.clone(),
-                    None => return,
+                    None => {
+                        // The sink is already shut down: this record cannot be
+                        // delivered. Count it instead of dropping it silently.
+                        note_usage_drop("channel_closed", 1);
+                        return;
+                    }
                 }
             };
             if let Err(err) = tx.try_send(record) {
@@ -556,7 +570,12 @@ impl UsageSink for ClickHouseSink {
                 let guard = self.tx.lock().expect("sink tx mutex");
                 match guard.as_ref() {
                     Some(tx) => tx.clone(),
-                    None => return,
+                    None => {
+                        // The sink is already shut down: this record cannot be
+                        // delivered. Count it instead of dropping it silently.
+                        note_usage_drop("channel_closed", 1);
+                        return;
+                    }
                 }
             };
             if let Err(err) = tx.try_send(record) {

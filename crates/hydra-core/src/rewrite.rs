@@ -22,6 +22,102 @@ pub struct EndpointUrl {
     pub path_prefix: String,
 }
 
+impl EndpointUrl {
+    /// Parse a provider endpoint URL — **the single parser shared by the config
+    /// loader, the admin write boundary and the upstream dialler**.
+    ///
+    /// It used to live only in the proxy shell (`proxy::peer::parse_endpoint`),
+    /// while the config loader validated endpoints with a much weaker
+    /// hand-rolled prefix test (`store::is_usable_endpoint`). The two disagreed,
+    /// and the gap was observable: `HTTPS://host` (scheme case),
+    /// `https://host:abc`, `https://host:99999` and `https://user:pass@host` all
+    /// passed the loader — so the admin API answered 201, the snapshot reloaded
+    /// happily, the provider showed up as healthy — and then **every single
+    /// request skipped that provider** because the dialler could not parse its
+    /// endpoint (audit §21). The loader and the write boundary now call THIS
+    /// function, so "accepted" and "dialable" cannot drift apart again.
+    ///
+    /// Rules:
+    /// - scheme must be `http` or `https`, compared **case-insensitively**
+    ///   (RFC 3986 §3.1) and normalised to lower case in the result;
+    /// - a non-empty host must follow;
+    /// - an explicit `:port` must be a valid `u16`;
+    /// - userinfo (`user:pass@host`) is rejected: credentials belong in
+    ///   provider keys, and the dialler would silently mis-split such an
+    ///   authority into host/port anyway;
+    /// - the path component becomes `path_prefix` with any trailing `/`
+    ///   stripped (query/fragment dropped), matching [`rewrite_path`].
+    ///
+    /// Returns `None` for anything the dialler could not use.
+    #[must_use]
+    pub fn parse(endpoint: &str) -> Option<Self> {
+        // Case-insensitive scheme match (RFC 3986 §3.1) with NO allocation and
+        // no copy of the host: `eq_ignore_ascii_case` on a borrowed prefix.
+        // This function runs per candidate candidate on the request hot path
+        // (proxy -> parse_endpoint), so an allocation here would be paid by
+        // every proxied request.
+        let (scheme, rest) = match endpoint.get(..8) {
+            Some(head) if head.eq_ignore_ascii_case("https://") => ("https", endpoint.get(8..)?),
+            _ => match endpoint.get(..7) {
+                Some(head) if head.eq_ignore_ascii_case("http://") => ("http", endpoint.get(7..)?),
+                _ => return None,
+            },
+        };
+
+        // Split authority from path/query/fragment.
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = rest.get(..authority_end)?;
+        // Reject userinfo (credentials belong in provider keys; the dialler
+        // would mis-split `user:pass@host` into host/port anyway) and any
+        // whitespace/control character, which can never be part of a host and
+        // would only fail later at DNS resolution.
+        if authority.is_empty()
+            || authority.contains('@')
+            || authority
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return None;
+        }
+        let tail = rest.get(authority_end..).unwrap_or("");
+
+        // Authority = host[:port].
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => {
+                if h.is_empty() {
+                    return None;
+                }
+                (h.to_string(), p.parse::<u16>().ok()?)
+            }
+            None => (authority.to_string(), default_port(scheme)),
+        };
+        if host.is_empty() {
+            return None;
+        }
+
+        let path_prefix = tail
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string();
+
+        Some(Self {
+            scheme: scheme.to_string(),
+            host,
+            port,
+            path_prefix,
+        })
+    }
+}
+
+/// Scheme-default port (RFC 7230 §2.7).
+fn default_port(scheme: &str) -> u16 {
+    match scheme {
+        "https" => 443,
+        _ => 80,
+    }
+}
 /// Rewrite a downstream request path onto an upstream endpoint (design §6.5).
 ///
 /// Rules:

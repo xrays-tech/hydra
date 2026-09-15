@@ -1950,9 +1950,20 @@ async fn provider_write_rejects_endpoints_the_loader_would_treat_as_fatal() {
     let state = admin_state().await;
     let port = start_admin(state.clone());
 
-    // Every shape `store::is_usable_endpoint` rejects: no scheme (the audit's
-    // exact typo), empty, hostless, wrong scheme.
-    for endpoint in ["api.openai.com", "", "https://", "ftp://host"] {
+    // Every shape the shared parser (and therefore the dialler) rejects: no
+    // scheme (the audit's exact typo), empty, hostless, wrong scheme, and - the
+    // audit-§21 gap - inputs the OLD loader predicate let through even though
+    // `parse_endpoint` could never turn them into a peer (201 + a healthy
+    // looking provider + every request silently skipping it).
+    for endpoint in [
+        "api.openai.com",
+        "",
+        "https://",
+        "ftp://host",
+        "https://host:abc",
+        "https://host:99999",
+        "https://user:pass@host",
+    ] {
         let body = format!(
             r#"{{"id":"p1","key":"openai","name":"O","endpoint":"{endpoint}","weight":1,"created_at":"","updated_at":""}}"#
         );
