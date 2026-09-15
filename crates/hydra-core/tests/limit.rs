@@ -183,3 +183,25 @@ fn window_token_dimension() {
     assert_eq!(w2.count(), 1);
     assert_eq!(w2.token_used(t0), 100);
 }
+
+/// The GC predicate must be able to reclaim a window whose traffic stopped.
+///
+/// `count()` deliberately does not evict (it is the O(1) read taken under the
+/// limiter's entry guard), so `count() > 0` stayed true forever for an idle
+/// window and the limiter's GC could never drop it.
+#[test]
+fn evict_stale_reclaims_an_expired_window() {
+    let t0 = Instant::now();
+    let mut w = SlidingWindow::new(Duration::from_secs(60));
+    assert!(w.check_and_inc(t0, 10), "first request admitted");
+    w.add(t0, 500);
+
+    // Still inside the window: nothing to reclaim, and the counts survive.
+    assert!(w.evict_stale(t0 + Duration::from_secs(30)));
+    assert_eq!(w.count(), 1);
+
+    // Past the window on both dimensions: reclaimable.
+    assert!(!w.evict_stale(t0 + Duration::from_secs(61)));
+    assert_eq!(w.count(), 0);
+    assert_eq!(w.token_used(t0 + Duration::from_secs(61)), 0);
+}

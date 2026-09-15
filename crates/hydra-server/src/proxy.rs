@@ -490,6 +490,23 @@ impl ProxyHttp for HydraProxy {
             crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
             return short_circuit(session, 429, "rate_limited").await;
         }
+        // (7b) Pre-limit TOKEN gate (§10.3). `limit_token` used to be
+        //      write-only: `add_tokens` recorded the usage in the logging phase
+        //      and nothing ever read it back, so a token quota was advertised,
+        //      configurable, persisted — and enforced on nothing. The window is
+        //      only known after the response, so this is the documented
+        //      next-request semantics: the request that would exceed the quota
+        //      is the one that gets the 429.
+        if let CountVerdict::Denied { role_id } = self
+            .state
+            .limiter
+            .check_tokens(&cfg.limit_roles, &match_ctx, now)
+            .await
+        {
+            debug!(role = %role_id, tenant = %tenant_id, "rate-limited (tokens)");
+            crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "tokens");
+            return short_circuit(session, 429, "rate_limited").await;
+        }
 
         // (8) Route (§6.3 §6 / §7): pure resolve + swrr.order, OR passthrough.
         let (candidates, model_for_route) = match model_opt {

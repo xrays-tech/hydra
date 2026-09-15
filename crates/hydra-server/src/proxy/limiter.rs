@@ -42,6 +42,21 @@ pub trait Limiter: Send + Sync {
         now: Instant,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+    /// Pre-gate TOKEN check: deny when any matched role's live token window has
+    /// already reached `limit_token`.
+    ///
+    /// `limit_token` used to be write-only — `add_tokens` recorded the usage
+    /// and NOTHING ever read it back, so a token quota was documented and
+    /// configurable but never enforced on any request. Unlike the count gate,
+    /// this is advisory-by-one-request (the window is only known after the
+    /// response), which is exactly the design's next-request semantics.
+    fn check_tokens<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = CountVerdict> + Send + 'a>>;
+
     /// Drop empty windows (background GC). Redis-backed windows expire
     /// themselves, so the shared limiter's `gc` is a no-op.
     fn gc(&self);
@@ -120,6 +135,42 @@ impl RateLimiter {
         CountVerdict::Admitted
     }
 
+    /// Pre-gate token check: deny when a matched role's token window already
+    /// holds `limit_token` or more.
+    ///
+    /// Read-only: a role that never recorded tokens must NOT have a window
+    /// created merely by being checked (that would grow the map per request).
+    pub fn check_tokens(
+        &self,
+        roles: &[LimitRole],
+        ctx: &MatchCtx<'_>,
+        now: Instant,
+    ) -> CountVerdict {
+        for role in match_roles(roles, ctx) {
+            let Some(limit) = role.limit_token else {
+                continue;
+            };
+            let limit = u64::try_from(limit.max(0)).unwrap_or(0);
+            let key = LimitKey {
+                role_id: role.id.clone(),
+                bucket: bucket_for(role, ctx),
+            };
+            let used = match self.windows.get_mut(&key) {
+                Some(mut window) => window.token_used(now),
+                None => 0,
+            };
+            // `limit_token == 0` means deny unconditionally, mirroring
+            // `limit_count == 0`.
+            if limit == 0 || used >= limit {
+                debug!(role = %role.id, used, limit, "token quota exhausted");
+                return CountVerdict::Denied {
+                    role_id: role.id.clone(),
+                };
+            }
+        }
+        CountVerdict::Admitted
+    }
+
     /// Record token usage in the `logging` phase (design §10.3: the request is
     /// always counted; overage is flagged for next time).
     pub fn add_tokens(&self, roles: &[LimitRole], ctx: &MatchCtx<'_>, tokens: u64, now: Instant) {
@@ -153,9 +204,15 @@ impl RateLimiter {
     /// Drop empty-window entries whose samples have all aged out (design §10.2
     /// GC). Called by a background sweep task.
     pub fn gc(&self) {
+        // Evicting BEFORE deciding is what makes this reclaim anything:
+        // `count()` deliberately does not evict (it is the O(1) read used under
+        // the entry guard), so a window whose traffic stopped kept its expired
+        // samples — and therefore a non-zero count — forever, and the retain
+        // never dropped it.
+        let now = Instant::now();
         // DashMap retain is sharded; cheap relative to a full scan when the map
-        // is small. Windows with no samples and no tokens are removed.
-        self.windows.retain(|_, w| w.count() > 0);
+        // is small. Windows with no live samples and no live tokens are removed.
+        self.windows.retain(|_, w| w.evict_stale(now));
     }
 }
 
@@ -183,6 +240,15 @@ impl Limiter for RateLimiter {
         now: Instant,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move { RateLimiter::add_tokens(self, roles, ctx, tokens, now) })
+    }
+
+    fn check_tokens<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = CountVerdict> + Send + 'a>> {
+        Box::pin(async move { RateLimiter::check_tokens(self, roles, ctx, now) })
     }
 
     fn gc(&self) {
@@ -341,6 +407,81 @@ mod tests {
         assert_eq!(
             rl.check_count(&roles, &ctx, Instant::now()),
             CountVerdict::Admitted
+        );
+    }
+
+    /// REGRESSION — `limit_token` must actually be enforced.
+    ///
+    /// `add_tokens` recorded usage in the logging phase and NOTHING ever read
+    /// it back: `token_used()` had no production caller anywhere, so a role
+    /// configured with only a token quota was documented, persisted, shown in
+    /// the admin UI — and enforced on nothing. Every request sailed through.
+    #[test]
+    fn token_quota_is_enforced_once_the_window_is_full() {
+        let limiter = RateLimiter::new();
+        let mut r = role("r-tok", None, "m");
+        r.limit_token = Some(100);
+        let roles = vec![r];
+        let ctx = MatchCtx {
+            api_key: None,
+            model: None,
+            tenant: None,
+            provider: None,
+        };
+        let t0 = Instant::now();
+
+        // Nothing recorded yet → admitted.
+        assert_eq!(
+            limiter.check_tokens(&roles, &ctx, t0),
+            CountVerdict::Admitted
+        );
+
+        // 80 of 100 used → still admitted.
+        limiter.add_tokens(&roles, &ctx, 80, t0);
+        assert_eq!(
+            limiter.check_tokens(&roles, &ctx, t0),
+            CountVerdict::Admitted
+        );
+
+        // 80 + 30 = 110 > 100 → the NEXT request is rejected.
+        limiter.add_tokens(&roles, &ctx, 30, t0);
+        assert_eq!(
+            limiter.check_tokens(&roles, &ctx, t0),
+            CountVerdict::Denied {
+                role_id: "r-tok".to_string()
+            },
+            "a token quota must reject once the window is over it"
+        );
+
+        // Once the window has rolled over, the quota frees up again.
+        assert_eq!(
+            limiter.check_tokens(&roles, &ctx, t0 + Duration::from_secs(61)),
+            CountVerdict::Admitted,
+            "the sliding window must release the quota"
+        );
+    }
+
+    /// A role with only a COUNT limit must not be judged by tokens, and a
+    /// role with only a TOKEN limit must not be judged by count (the cluster
+    /// limiter mapped a NULL count to 0, the deny-everything sentinel).
+    #[test]
+    fn count_and_token_dimensions_are_independent() {
+        let limiter = RateLimiter::new();
+        let mut count_only = role("r-count", Some(5), "m");
+        count_only.limit_token = None;
+        let roles = vec![count_only];
+        let ctx = MatchCtx {
+            api_key: None,
+            model: None,
+            tenant: None,
+            provider: None,
+        };
+        let t0 = Instant::now();
+        limiter.add_tokens(&roles, &ctx, 10_000, t0);
+        assert_eq!(
+            limiter.check_tokens(&roles, &ctx, t0),
+            CountVerdict::Admitted,
+            "no limit_token ⇒ the token dimension does not apply"
         );
     }
 }

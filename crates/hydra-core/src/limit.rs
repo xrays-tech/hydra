@@ -162,4 +162,16 @@ impl SlidingWindow {
         self.evict_tokens(now);
         self.token_sum
     }
+
+    /// Evict everything outside the window and report whether anything is left.
+    ///
+    /// Used by the limiter's background GC. Eviction otherwise only happens as
+    /// a side effect of `check_and_inc`/`add`/`token_used`, so a window whose
+    /// traffic stopped kept its expired samples — and a non-zero `count()` —
+    /// forever, and the GC predicate could never drop it.
+    pub fn evict_stale(&mut self, now: Instant) -> bool {
+        self.evict_samples(now);
+        self.evict_tokens(now);
+        !self.samples.is_empty() || !self.token_samples.is_empty()
+    }
 }

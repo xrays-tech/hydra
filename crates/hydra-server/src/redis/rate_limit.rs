@@ -43,17 +43,40 @@ else
 end
 "#;
 
-/// Atomic token accounting: record the usage sample inside the window.
-/// `ARGV`: [now_ms, window_ms, member].
+/// Atomic token accounting: record `tokens` for this request in the window.
+/// `ARGV`: [now_ms, window_ms, member, tokens].
+///
+/// The SCORE is the token count, not the timestamp: the previous version stored
+/// the timestamp and returned ZCARD, so the cluster token window held a REQUEST
+/// COUNT where every consumer expects a token sum — wrong by two to three orders
+/// of magnitude, and it would have under-enforced the moment token limits were
+/// actually checked.
 pub const ADD_TOKENS_SCRIPT: &str = r#"
 local now = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
 local member = ARGV[3]
+local tokens = tonumber(ARGV[4])
 local zk = KEYS[1]
 redis.call('ZREMRANGEBYSCORE', zk, '-inf', now - window_ms)
-redis.call('ZADD', zk, now, member)
+redis.call('ZADD', zk, tokens, member)
 redis.call('PEXPIRE', zk, window_ms)
 return redis.call('ZCARD', zk)
+"#;
+
+/// Atomic token check: prune the window, sum the live token scores.
+/// `ARGV`: [now_ms, window_ms, limit] → 1 admit, 0 deny.
+pub const CHECK_TOKENS_SCRIPT: &str = r#"
+local now = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local zk = KEYS[1]
+redis.call('ZREMRANGEBYSCORE', zk, '-inf', now - window_ms)
+local parts = redis.call('ZRANGE', zk, 0, -1, 'WITHSCORES')
+local sum = 0
+for i = 2, #parts, 2 do
+  sum = sum + tonumber(parts[i])
+end
+if sum >= limit then return 0 else return 1 end
 "#;
 
 fn now_ms() -> i64 {
@@ -88,6 +111,15 @@ impl crate::proxy::limiter::Limiter for RedisRateLimiter {
         now: Instant,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move { self.add_tokens(roles, ctx, tokens, now).await })
+    }
+
+    fn check_tokens<'a>(
+        &'a self,
+        roles: &'a [LimitRole],
+        ctx: &'a MatchCtx<'a>,
+        now: Instant,
+    ) -> Pin<Box<dyn Future<Output = CountVerdict> + Send + 'a>> {
+        Box::pin(async move { self.check_tokens(roles, ctx, now).await })
     }
 
     fn gc(&self) {
@@ -147,13 +179,63 @@ impl RedisRateLimiter {
         CountVerdict::Admitted
     }
 
+    /// Pre-gate token check: for every matched role with a `limit_token`, sum
+    /// its live token window in Redis. Fail-open per role, exactly like the
+    /// count gate (a Redis outage must not lock every tenant out).
+    pub async fn check_tokens(
+        &self,
+        roles: &[LimitRole],
+        ctx: &MatchCtx<'_>,
+        _now: Instant,
+    ) -> CountVerdict {
+        let now = now_ms();
+        for role in match_roles(roles, ctx) {
+            let Some(limit) = role.limit_token else {
+                continue;
+            };
+            // `limit_token == 0` ⇒ the script's `sum >= 0` denies
+            // unconditionally, mirroring `limit_count == 0`.
+            let limit = u64::try_from(limit.max(0)).unwrap_or(0);
+            let key = LimitKey {
+                role_id: role.id.clone(),
+                bucket: bucket_for(role, ctx),
+            };
+            let admitted: i64 = match self
+                .pool
+                .eval(
+                    CHECK_TOKENS_SCRIPT,
+                    vec![tokens_key(&key)],
+                    vec![
+                        now.to_string(),
+                        window_ms(role).to_string(),
+                        limit.to_string(),
+                    ],
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "redis token-limit check failed; failing open");
+                    crate::admin::metrics::record_control_poll("rate_limit_error");
+                    continue;
+                }
+            };
+            if admitted == 0 {
+                return CountVerdict::Denied {
+                    role_id: role.id.clone(),
+                };
+            }
+        }
+        CountVerdict::Admitted
+    }
+
     /// Record token usage in the `logging` phase (fire-and-forget semantics:
     /// the batch insert happens async; here we await since callers are async).
     pub async fn add_tokens(
         &self,
         roles: &[LimitRole],
         ctx: &MatchCtx<'_>,
-        _tokens: u64,
+        tokens: u64,
         _now: Instant,
     ) {
         let now = now_ms();
@@ -170,7 +252,12 @@ impl RedisRateLimiter {
                     .eval(
                         ADD_TOKENS_SCRIPT,
                         vec![tokens_key(&key)],
-                        vec![now.to_string(), window_ms(role).to_string(), member],
+                        vec![
+                            now.to_string(),
+                            window_ms(role).to_string(),
+                            member,
+                            tokens.to_string(),
+                        ],
                     )
                     .await;
             }
@@ -197,6 +284,12 @@ fn windows_to_check<'a>(
 ) -> Vec<(&'a LimitRole, String, u64)> {
     match_roles(roles, ctx)
         .into_iter()
+        // `limit_count == NULL` means no request-count limit (migration 0001:
+        // NULL = unlimited), exactly as the in-memory limiter treats it. Mapping
+        // it to 0 made 0 the deny-unconditionally sentinel, so a legal token-only
+        // role 429'd EVERY matched request cluster-wide while single-node mode
+        // skipped it entirely.
+        .filter(|r| r.limit_count.is_some())
         .map(|r| {
             let limit = u64::try_from(r.limit_count.unwrap_or(0).max(0)).unwrap_or(0);
             let key = count_key(&LimitKey {
@@ -289,16 +382,20 @@ mod tests {
         let checks = windows_to_check(&roles, &ctx());
         assert_eq!(
             checks.len(),
-            3,
-            "all matched roles are returned (limit 0 handled by caller)"
+            2,
+            "only roles WITH a limit_count are checked: a NULL limit_count means              unlimited (migration 0001), and mapping it to 0 made it the              deny-unconditionally sentinel — a token-only role 429'd everything              cluster-wide while single-node mode skipped it"
         );
         assert!(
             checks[0].1.contains("{rl:r-all:t1}:count"),
             "bucket includes the tenant dim"
         );
         assert!(
-            checks[2].1.contains("{rl:r-unlimited:}:count"),
-            "no dims → empty bucket"
+            checks[1].1.contains("{rl:r-zero:}:count"),
+            "the zero-limit role is still checked (0 = deny-all, handled by the caller)"
+        );
+        assert!(
+            !checks.iter().any(|(r, _, _)| r.id == "r-unlimited"),
+            "a NULL limit_count means UNLIMITED and must not be checked at all"
         );
     }
 

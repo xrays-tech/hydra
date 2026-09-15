@@ -20,7 +20,7 @@ use fred::error::{Error, ErrorKind};
 use fred::mocks::{MockCommand, Mocks};
 use fred::types::Value;
 
-use crate::redis::rate_limit::{ADD_TOKENS_SCRIPT, CHECK_AND_INC_SCRIPT};
+use crate::redis::rate_limit::{ADD_TOKENS_SCRIPT, CHECK_AND_INC_SCRIPT, CHECK_TOKENS_SCRIPT};
 use crate::redis::RENEW_SCRIPT;
 
 /// One stored value: a typed payload + an optional TTL.
@@ -486,7 +486,7 @@ impl MockRedis {
             return Ok(Value::Integer(0));
         }
         if script == ADD_TOKENS_SCRIPT {
-            // argv: [now_ms, window_ms, member]
+            // argv: [now_ms, window_ms, member, tokens]
             let now: i64 = argv[0]
                 .parse()
                 .map_err(|e: ParseIntError| bad(e.to_string()))?;
@@ -494,15 +494,40 @@ impl MockRedis {
                 .parse()
                 .map_err(|e: ParseIntError| bad(e.to_string()))?;
             let member = argv[2].clone();
+            // The SCORE is the token count (see ADD_TOKENS_SCRIPT).
+            let tokens: i64 = argv[3]
+                .parse()
+                .map_err(|e: ParseIntError| bad(e.to_string()))?;
             let k = keys[0].as_bytes();
             let e = g.entry(k.to_vec()).or_insert_with(|| (Entry::zset(), None));
             let Entry::ZSet(z) = &mut e.0 else {
                 return Err(bad("wrongtype EVAL add (tokens key)"));
             };
             z.retain(|_, s| *s >= now - window);
-            z.insert(member, now);
+            z.insert(member, tokens);
             e.1 = Some(Instant::now() + Duration::from_millis(window as u64));
             return Ok(Value::Integer(z.len() as i64));
+        }
+        if script == CHECK_TOKENS_SCRIPT {
+            // argv: [now_ms, window_ms, limit] -> 1 admit, 0 deny.
+            let now: i64 = argv[0]
+                .parse()
+                .map_err(|e: ParseIntError| bad(e.to_string()))?;
+            let window: i64 = argv[1]
+                .parse()
+                .map_err(|e: ParseIntError| bad(e.to_string()))?;
+            let limit: i64 = argv[2]
+                .parse()
+                .map_err(|e: ParseIntError| bad(e.to_string()))?;
+            let k = keys[0].as_bytes();
+            let e = g.entry(k.to_vec()).or_insert_with(|| (Entry::zset(), None));
+            let Entry::ZSet(z) = &mut e.0 else {
+                return Err(bad("wrongtype EVAL check (tokens key)"));
+            };
+            z.retain(|_, s| *s >= now - window);
+            // The live token sum is the sum of the scores.
+            let sum: i64 = z.values().sum();
+            return Ok(Value::Integer(if sum >= limit { 0 } else { 1 }));
         }
         Err(bad(format!(
             "mock redis: unhandled EVAL script {:?}",
@@ -638,7 +663,9 @@ mod tests {
             .run_script(
                 ADD_TOKENS_SCRIPT,
                 &[tk],
-                &["1000".into(), "60000".into(), "m9".into()],
+                // argv: [now_ms, window_ms, member, tokens] — the SCORE is
+                // the token count, so the mock must be given it.
+                &["1000".into(), "60000".into(), "m9".into(), "250".into()],
             )
             .unwrap();
         assert_eq!(n, 1);
