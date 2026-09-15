@@ -2123,3 +2123,53 @@ async fn provider_key_put_is_atomic_and_keeps_the_previous_key_on_failure() {
     assert_eq!(item["id"], "k1");
     assert_eq!(item["provider_id"], "p1");
 }
+
+// ===========================================================================
+// Audit §4 "zombie tenant" — a rejected access_token must not leave a
+// committed, enabled tenant behind. The certificate path already pre-validated
+// before the INSERT; the access-token path did not.
+// ===========================================================================
+
+#[tokio::test]
+async fn tenant_create_with_a_too_short_access_token_leaves_no_zombie() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    let bad = r#"{"id":"zombie","name":"Z","domain":"zombie.example","auth_url":"https://auth.example/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"access_token":"short","created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(bad),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "a 5-char access_token must be rejected");
+    let e: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(e["error"]["code"], "invalid_access_token");
+
+    // THE POINT: no row. Before the pre-check the tenant was inserted first,
+    // so the operator saw "create failed" while an enabled tenant was live -
+    // and the retry hit the UNIQUE constraint, which is how the zombie stays.
+    let tenants = repo::list_tenants(state.db()).await.expect("list");
+    assert!(
+        tenants.iter().all(|t| t.id != "zombie"),
+        "the 400 left a committed tenant behind: {:?}",
+        tenants.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+    );
+    assert!(state.store.snapshot().tenants_by_domain.is_empty());
+
+    // Control: a 16-character token is accepted and stored (hashed).
+    let ok = r#"{"id":"real","name":"R","domain":"real.example","auth_url":"https://auth.example/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"access_token":"0123456789abcdef","created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(ok),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let created: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(created["has_access_token"], true);
+}

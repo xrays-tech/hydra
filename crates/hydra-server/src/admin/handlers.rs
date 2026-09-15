@@ -699,9 +699,11 @@ async fn apply_tenant_cert_write(
 /// - `Some("")` → clear the token;
 /// - `None` → keep the current token (no change).
 ///
-/// Runs AFTER the tenant row write (like the cert write) so a 4xx (e.g. a
-/// too-short token) is returned before the row is persisted — see the
-/// no-zombie-create rule in [`apply_tenant_cert_write`].
+/// Runs AFTER the tenant row write. The SHAPE of the token is validated
+/// separately, BEFORE the row write, by [`validate_access_token_shape`] — that
+/// pre-check is what keeps a 4xx from leaving a committed, enabled tenant
+/// behind on CREATE (audit §4 "zombie tenant"). The length rule below stays as
+/// defence in depth.
 #[allow(clippy::result_large_err)]
 async fn apply_tenant_access_token_write(
     state: &AdminState,
@@ -731,6 +733,31 @@ async fn apply_tenant_access_token_write(
     crate::db::set_tenant_access_token_hash(state.db(), tenant_id, Some(&hash))
         .await
         .map_err(|e| db_err_resp(e, trace_id))?;
+    Ok(())
+}
+
+/// Shape-check a tenant access token BEFORE the tenant row is written.
+///
+/// The certificate path already pre-validates for exactly this reason
+/// (`resolve_tenant_cert_write` before `insert_tenant`): a 4xx that arrives
+/// after the INSERT leaves a tenant the UI reported as "create failed" but
+/// which exists and is enabled - and a retry then hits the UNIQUE constraint,
+/// so the operator gives up and keeps the zombie (audit section 4).
+#[allow(clippy::result_large_err)]
+fn validate_access_token_shape(access_token: &Option<String>, trace_id: &str) -> Result<(), Resp> {
+    let Some(raw) = access_token else {
+        return Ok(());
+    };
+    let token = raw.trim();
+    // Empty means "clear the token" (see `apply_tenant_access_token_write`).
+    if !token.is_empty() && token.len() < 16 {
+        return Err(err_json(
+            400,
+            "invalid_access_token",
+            "access_token must be at least 16 characters",
+            trace_id,
+        ));
+    }
     Ok(())
 }
 
@@ -800,6 +827,12 @@ pub(super) async fn tenant_collection(
             Ok(a) => a,
             Err(r) => return r,
         };
+        // Same no-zombie rule for the access token: a too-short token must be
+        // rejected BEFORE the INSERT, otherwise the 400 leaves a committed,
+        // enabled tenant behind (audit §4).
+        if let Err(r) = validate_access_token_shape(&up.access_token, trace_id) {
+            return r;
+        }
         match crate::db::insert_tenant(state.db(), &t).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
@@ -861,6 +894,11 @@ pub(super) async fn tenant_item(
                 Ok(a) => a,
                 Err(r) => return r,
             };
+            // Pre-validate for the same reason as POST: a rejected token must
+            // not leave the tenant half-updated.
+            if let Err(r) = validate_access_token_shape(&up.access_token, trace_id) {
+                return r;
+            }
             match crate::db::update_tenant(state.db(), &t).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),

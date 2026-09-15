@@ -237,7 +237,14 @@ impl AdminService {
         let Some(token) = &self.state.admin_token else {
             return false;
         };
-        Self::bearer_token(session) == Some(token.as_str())
+        // Constant-time, like the cluster-token gate below and the tenant
+        // access-token path in handlers: == on &str stops at the first
+        // differing byte, which is a (weak, remote, no-lockout) timing oracle
+        // over the admin token. Audit section 4.
+        match Self::bearer_token(session) {
+            Some(presented) => handlers::constant_time_eq(presented, token),
+            None => false,
+        }
     }
 
     /// The lightweight router (method + path-segment match, design §13.1).
