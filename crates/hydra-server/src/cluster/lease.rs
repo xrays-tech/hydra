@@ -11,8 +11,13 @@
 //! - `Active`   → renew on every tick; a failed renewal **immediately**
 //!   demotes to `Uncertain` (write permission closes, fail-closed) rather
 //!   than waiting for the TTL;
-//! - `Uncertain`→ try to renew (transient blip) or drop back to `Standby`;
-//!   writes stay blocked.
+//! - `Uncertain`→ try to renew (a transient blip may still leave us holding
+//!   the key, and renewing recovers on the very next tick); writes stay
+//!   blocked. It is NOT terminal: a definitive loss (`renew` reports the key
+//!   is not ours) drops straight back to `Standby`, and repeated renew ERRORS
+//!   (Redis unreachable, leadership unknown) are tolerated for only
+//!   [`UNCERTAIN_ERR_BUDGET`] ticks before doing the same, so a node can never
+//!   be stranded as permanently ineligible to lead.
 //!
 //! Split-brain safety: exactly one holder at a time (the store is atomic), a
 //! time fence (`valid_until` — writes require `now < valid_until`), and the
@@ -21,7 +26,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -129,6 +134,19 @@ pub enum ElectionState {
     Uncertain,
 }
 
+/// How many CONSECUTIVE `renew` errors (Redis unreachable — leadership is
+/// unknown, not lost) are tolerated in `Uncertain` before the node returns to
+/// `Standby` and competes for the lease again.
+///
+/// Without a bound, a node that left `Active` without regaining the lease on
+/// the next tick stayed in `Uncertain` for the rest of the process lifetime:
+/// `renew` is a compare-and-renew (`GET key == node_id`), so once the key is
+/// gone it can never return `true` again, and only the `Standby | Active` arm
+/// can call `try_acquire`. In a two-candidate cluster that silently removes half
+/// the failover capacity per lost lease, and two losses leave no writer at all
+/// until a restart.
+const UNCERTAIN_ERR_BUDGET: u32 = 3;
+
 /// The per-node leader-election machine (cluster P2).
 pub struct LeaderElection {
     store: Arc<dyn LeaseStore>,
@@ -139,6 +157,9 @@ pub struct LeaderElection {
     /// Freshness gate: last control-plane sync succeeded (set by the control
     /// client / replica). A candidate with `!sync_ok` cannot acquire.
     sync_ok: AtomicBool,
+    /// Consecutive renew errors seen while `Uncertain` (see
+    /// [`UNCERTAIN_ERR_BUDGET`]). Reset whenever leadership is re-established.
+    uncertain_errs: AtomicU32,
 }
 
 impl LeaderElection {
@@ -163,6 +184,7 @@ impl LeaderElection {
             clock,
             state: Mutex::new(ElectionState::Standby),
             sync_ok: AtomicBool::new(true),
+            uncertain_errs: AtomicU32::new(0),
         }
     }
 
@@ -205,10 +227,26 @@ impl LeaderElection {
                             valid_until: now + Duration::from_millis(self.lease_ms),
                         }
                     }
-                    Ok(false) | Err(_) => {
+                    // Definitive loss vs an error that leaves leadership
+                    // UNKNOWN. Both demote immediately (fail-closed — never
+                    // wait for the TTL), but only the ERROR starts the
+                    // Uncertain budget, so the budget measures the whole run
+                    // of consecutive errors rather than just the ticks spent
+                    // in Uncertain.
+                    Ok(false) => {
+                        self.uncertain_errs.store(0, Ordering::Release);
                         warn!(
                             node = %self.node_id,
                             "lease renewal failed — immediate demotion (fail-closed)"
+                        );
+                        ElectionState::Uncertain
+                    }
+                    Err(e) => {
+                        self.uncertain_errs.store(1, Ordering::Release);
+                        warn!(
+                            node = %self.node_id,
+                            error = %e,
+                            "lease renewal errored — immediate demotion (fail-closed)"
                         );
                         ElectionState::Uncertain
                     }
@@ -217,12 +255,51 @@ impl LeaderElection {
             ElectionState::Uncertain => {
                 match self.store.renew(&self.node_id, self.lease_ms).await {
                     Ok(true) => {
+                        self.uncertain_errs.store(0, Ordering::Release);
                         info!(node = %self.node_id, "lease regained — active again");
                         ElectionState::Active {
                             valid_until: now + Duration::from_millis(self.lease_ms),
                         }
                     }
-                    _ => ElectionState::Uncertain,
+                    // Definitive: the compare-and-renew answered that the key is
+                    // no longer ours (it expired, or another node took it while
+                    // we were not looking). Staying here is a dead end — renew
+                    // can never succeed again — so return to Standby and
+                    // compete for the lease.
+                    Ok(false) => {
+                        self.uncertain_errs.store(0, Ordering::Release);
+                        warn!(
+                            node = %self.node_id,
+                            "lease lost for good — returning to standby to compete again"
+                        );
+                        ElectionState::Standby
+                    }
+                    // Redis unreachable: leadership is UNKNOWN, not lost. Keep
+                    // failing closed (writes stay blocked) for a bounded number
+                    // of ticks, because a transient blip may still leave us
+                    // holding the key and one successful renew restores us
+                    // without waiting out the TTL.
+                    Err(e) => {
+                        let seen = self.uncertain_errs.fetch_add(1, Ordering::AcqRel) + 1;
+                        if seen >= UNCERTAIN_ERR_BUDGET {
+                            self.uncertain_errs.store(0, Ordering::Release);
+                            warn!(
+                                node = %self.node_id,
+                                failures = seen,
+                                error = %e,
+                                "renew keeps failing and leadership is unknown — back to standby"
+                            );
+                            ElectionState::Standby
+                        } else {
+                            warn!(
+                                node = %self.node_id,
+                                failures = seen,
+                                error = %e,
+                                "lease renew errored — staying uncertain (fail-closed)"
+                            );
+                            ElectionState::Uncertain
+                        }
+                    }
                 }
             }
             ElectionState::Standby | ElectionState::Active { .. } => {
@@ -374,6 +451,132 @@ mod tests {
             e.mark_sync_ok(true);
             e.tick().await;
             assert!(e.is_leader(), "gate open → acquires");
+        });
+    }
+    /// A node that definitively loses the lease must not be stranded.
+    ///
+    /// `Uncertain` used to exit only on `Ok(true)`, and the compare-and-renew
+    /// can never succeed once the key is gone (it requires GET key == node_id),
+    /// so a node that lost a lease stayed ineligible to lead for the rest of
+    /// the process lifetime — a restart was the only recovery. In a
+    /// two-candidate cluster that silently removes half the failover capacity
+    /// per lost lease, and two losses leave no writer at all.
+    #[test]
+    fn uncertain_is_not_a_dead_end_and_can_reacquire() {
+        use std::sync::atomic::AtomicBool as Flag;
+        struct Scripted {
+            renew_ok: Flag,
+        }
+        impl LeaseStore for Scripted {
+            fn try_acquire<'a>(
+                &'a self,
+                _n: &'a str,
+                _m: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
+                Box::pin(async { Ok(true) })
+            }
+            fn renew<'a>(
+                &'a self,
+                _n: &'a str,
+                _m: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
+                let ok = self.renew_ok.load(Ordering::Acquire);
+                Box::pin(async move { Ok(ok) })
+            }
+        }
+        let store = Arc::new(Scripted {
+            renew_ok: Flag::new(true),
+        });
+        let t0 = Instant::now();
+        let clock: Clock = Arc::new(move || t0);
+        let e = LeaderElection::with_clock(store.clone(), "n1".into(), 60_000, clock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            e.tick().await;
+            assert!(e.is_leader(), "standby acquires");
+
+            // Another node took the lease: a definitive loss.
+            store.renew_ok.store(false, Ordering::Release);
+            e.tick().await;
+            assert_eq!(e.state(), ElectionState::Uncertain, "immediate demotion");
+
+            e.tick().await;
+            assert_eq!(
+                e.state(),
+                ElectionState::Standby,
+                "a definitive loss must return to Standby, not strand the node"
+            );
+
+            // …and it must be able to lead again once the lease is free.
+            store.renew_ok.store(true, Ordering::Release);
+            e.tick().await;
+            assert!(e.is_leader(), "re-acquires after the lease frees up");
+        });
+    }
+
+    /// Renew ERRORS (Redis unreachable — leadership unknown, not lost) are
+    /// tolerated for a bounded number of ticks, then the node returns to
+    /// Standby. A transient blip still recovers through `Uncertain` first.
+    #[test]
+    fn uncertain_bounds_renew_errors_then_falls_back_to_standby() {
+        struct FlakyStore {
+            failing: std::sync::atomic::AtomicBool,
+        }
+        impl LeaseStore for FlakyStore {
+            fn try_acquire<'a>(
+                &'a self,
+                _n: &'a str,
+                _m: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
+                Box::pin(async { Ok(true) })
+            }
+            fn renew<'a>(
+                &'a self,
+                _n: &'a str,
+                _m: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
+                let failing = self.failing.load(Ordering::Acquire);
+                Box::pin(async move {
+                    if failing {
+                        Err(LeaseError::Store("redis unreachable".into()))
+                    } else {
+                        Ok(true)
+                    }
+                })
+            }
+        }
+        let store = Arc::new(FlakyStore {
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let t0 = Instant::now();
+        let clock: Clock = Arc::new(move || t0);
+        let e = LeaderElection::with_clock(store.clone(), "n1".into(), 60_000, clock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            e.tick().await;
+            assert!(e.is_leader(), "standby acquires");
+
+            // A single blip recovers through Uncertain on the next renew.
+            store.failing.store(true, Ordering::Release);
+            e.tick().await;
+            assert_eq!(e.state(), ElectionState::Uncertain, "blip demotes");
+            store.failing.store(false, Ordering::Release);
+            e.tick().await;
+            assert!(e.is_leader(), "a transient blip is recovered");
+
+            // A sustained outage is bounded, then the node competes again.
+            store.failing.store(true, Ordering::Release);
+            e.tick().await;
+            assert_eq!(e.state(), ElectionState::Uncertain, "1st error");
+            e.tick().await;
+            assert_eq!(e.state(), ElectionState::Uncertain, "2nd error");
+            e.tick().await;
+            assert_eq!(
+                e.state(),
+                ElectionState::Standby,
+                "the error budget is bounded so the node stays eligible"
+            );
+            assert!(!e.is_leader(), "writes stay blocked throughout");
         });
     }
 }
