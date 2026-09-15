@@ -2756,3 +2756,81 @@ async fn model_decoys_cannot_bypass_the_tenant_model_whitelist() {
         "only the control request may reach the upstream ({posts} did)"
     );
 }
+
+// REGRESSION - a 4xx/429 from the provider must NOT count as a breaker failure.
+// The breaker is shared per-provider across ALL tenants, so counting client
+// errors let any authenticated tenant trip it with a handful of requests the
+// upstream merely rejected (bad schema, too many tokens, content filter), which
+// returned 503 no_available_provider for that provider to every OTHER tenant and
+// could be re-tripped on demand. Only 5xx evidences provider unhealth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_errors_do_not_trip_the_shared_breaker() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    // 429 is the sharpest case: the provider ANSWERED, so it is alive and
+    // throttling, not unhealthy.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+
+    // Threshold 2: a couple of wrongly-counted failures would already trip it.
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
+        .await
+        .unwrap();
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .unwrap(),
+    );
+    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let state = Arc::new(AppState {
+        store,
+        auth,
+        breaker: breaker.clone(),
+        limiter: Arc::new(RateLimiter::new()),
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
+        sink,
+        proxy: ProxyConfig::default(),
+    });
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    for i in 0..5 {
+        let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+        assert_eq!(
+            resp.status(),
+            429,
+            "request {i}: the upstream 429 is surfaced, not masked as 503"
+        );
+    }
+
+    assert_eq!(
+        breaker.fail_count("p1"),
+        0,
+        "a 429 means the provider is alive: it must not count as a health failure"
+    );
+    assert!(
+        !breaker.is_dead("p1"),
+        "the SHARED breaker must stay closed, or one tenant starves every other"
+    );
+}

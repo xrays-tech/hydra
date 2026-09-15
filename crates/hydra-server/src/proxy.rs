@@ -722,10 +722,23 @@ impl ProxyHttp for HydraProxy {
                         }
                         return Ok(true);
                     } else {
-                        // 4xx/5xx from provider — not a connect failure, but
-                        // the provider answered. Record breaker failure +
-                        // retry the next candidate (body still in hand).
-                        self.state.breaker.on_failure(&cand.provider_id);
+                        // Non-2xx from the provider. Failover to the next
+                        // candidate either way (the body is still in hand).
+                        //
+                        // But only a 5xx is evidence that the PROVIDER is
+                        // unhealthy. A 4xx is the caller's error (bad schema,
+                        // too many tokens, content filter, unknown model) and
+                        // a 429 says the provider answered — it is alive and
+                        // throttling. Both used to be recorded as breaker
+                        // failures, and since the breaker is shared
+                        // per-provider across ALL tenants, any authenticated
+                        // tenant could trip it with five requests the upstream
+                        // merely rejected, handing every OTHER tenant 503
+                        // no_available_provider for that provider and
+                        // re-tripping it on demand.
+                        if (500..600).contains(&status_code) {
+                            self.state.breaker.on_failure(&cand.provider_id);
+                        }
                         last_error = Some(format!(
                             "provider {} returned {}",
                             cand.provider_id, status_code
