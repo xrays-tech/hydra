@@ -1,31 +1,51 @@
-//! T5.1-T5.8 - `extract::extract_model_field` top-level, zero-copy extraction.
+//! `extract::extract_model_field` — strict serde-based top-level model extraction.
 //!
 //! The extracted value drives authorization while the request body is forwarded
 //! upstream verbatim, so these tests pin the property that actually matters: the
-//! returned value is the one the UPSTREAM will read, i.e. the ROOT object model
-//! member. A decoy elsewhere in the body must never be used for authorization.
+//! returned value is the one the UPSTREAM will read — the ROOT object's `model`
+//! member, with JSON string escapes DECODED exactly as the provider's parser
+//! decodes them. A decoy elsewhere in the body must never be used for
+//! authorization, and a body the provider cannot parse as one JSON value must
+//! not authorize either (fail closed).
 
-use hydra_core::extract::{extract_model, extract_model_field, ModelField};
+use hydra_core::extract::{extract_model, extract_model_field, ModelField, ModelValue};
+
+/// The decoded content when `body`'s root `model` is a JSON string; panics
+/// otherwise. Lets tests assert both "it is a Value" and "its decoded content"
+/// without constructing a `ModelValue` by hand.
+fn decoded(body: &[u8]) -> String {
+    match extract_model_field(body) {
+        ModelField::Value(v) => v.into_string(),
+        other => panic!(
+            "body {} is not a string model member: {other:?}",
+            String::from_utf8_lossy(body)
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value: the root model, decoded, at any position/schema.
+// ---------------------------------------------------------------------------
 
 // T5.1 - standard form, model is the first field.
 #[test]
 fn extract_model_standard() {
     let body = br#"{"model":"gpt-4o","messages":[]}"#;
-    assert_eq!(extract_model(body), Some(&b"gpt-4o"[..]));
+    assert_eq!(extract_model(body), Some("gpt-4o".to_string()));
 }
 
 // T5.2 - whitespace tolerance around the key, colon and value.
 #[test]
 fn extract_model_whitespace_tolerant() {
     let body = br#"{ "model" : "gpt-4o" }"#;
-    assert_eq!(extract_model(body), Some(&b"gpt-4o"[..]));
+    assert_eq!(extract_model(body), Some("gpt-4o".to_string()));
 }
 
 // T5.3 - model is not the first field.
 #[test]
 fn extract_model_not_first_field() {
     let body = br#"{"a":1,"model":"x","b":2}"#;
-    assert_eq!(extract_model(body), Some(&b"x"[..]));
+    assert_eq!(decoded(body), "x");
 }
 
 // T5.4 - no model member at all is ABSENT (distinct from a malformed one).
@@ -36,12 +56,13 @@ fn extract_model_missing_is_absent() {
     assert_eq!(extract_model(body), None);
 }
 
-// T5.5 - zero allocation: the returned slice must be a sub-range of the input.
+// T5.5 - zero copy: a no-escape model value is a zero-copy borrow of the input
+// buffer (serde's `visit_borrowed_str` fast path), never an allocation.
 #[test]
 fn extract_model_no_allocation() {
     let body = br#"{"model":"gpt-4o"}"#;
-    let Some(ModelField::Value(model)) = Some(extract_model_field(body)) else {
-        panic!("model present");
+    let ModelField::Value(ModelValue::Borrowed(model)) = extract_model_field(body) else {
+        panic!("a no-escape model value must be a zero-copy borrow");
     };
 
     let body_start = body.as_ptr() as usize;
@@ -51,16 +72,16 @@ fn extract_model_no_allocation() {
 
     assert!(
         model_start >= body_start && model_end <= body_end,
-        "returned slice must lie within the input buffer"
+        "a no-escape model value must be a zero-copy borrow of the input buffer"
     );
-    assert_eq!(model, b"gpt-4o");
+    assert_eq!(model, "gpt-4o");
 }
 
 // T5.6 - top-level model wins when it appears first.
 #[test]
 fn extract_model_top_level_preferred_when_first() {
     let body = br#"{"model":"real","messages":[{"model":"x"}]}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 }
 
 // T5.6 (REGRESSION) - a nested decoy that textually precedes the top-level key
@@ -70,10 +91,10 @@ fn extract_model_top_level_preferred_when_first() {
 #[test]
 fn extract_model_nested_decoy_is_ignored() {
     let body = br#"{"messages":[{"model":"x"}],"model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 
     let body = br#"{"metadata":{"model":"allowed-model"},"model":"expensive-model"}"#;
-    assert_eq!(extract_model(body), Some(&b"expensive-model"[..]));
+    assert_eq!(decoded(body), "expensive-model");
 }
 
 // T5.7 - empty / very short input never panics.
@@ -89,16 +110,20 @@ fn extract_model_short_input_no_panic() {
     assert_eq!(extract_model_field(b"{"), ModelField::Absent);
 }
 
-// T5.8 - extraction never reads past the given slice (a first chunk is enough).
+// T5.8 (SEMANTIC CHANGE) - a truncated body (the root object was never closed)
+// is no longer "the first chunk is enough". Strict serde JSON parsing requires
+// the whole value, so a truncated body is malformed and returns Absent (fail
+// closed) rather than the first model seen. The old hand-written scanner
+// returned the first chunk's model here.
 #[test]
-fn extract_model_first_chunk_only() {
-    // A first chunk containing the root model suffices; no full-body scan.
+fn extract_model_truncated_body_is_absent() {
     let first_chunk = br#"{"model":"claude-3-opus""#;
-    assert_eq!(extract_model(first_chunk), Some(&b"claude-3-opus"[..]));
+    assert_eq!(extract_model_field(first_chunk), ModelField::Absent);
+    assert_eq!(extract_model(first_chunk), None);
 
-    // Truncated right after the value comma, still complete enough.
     let chunk = br#"{"model":"qwen","#;
-    assert_eq!(extract_model(chunk), Some(&b"qwen"[..]));
+    assert_eq!(extract_model_field(chunk), ModelField::Absent);
+    assert_eq!(extract_model(chunk), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,45 +149,45 @@ fn non_string_root_model_is_not_a_string_not_absent() {
             "body: {}",
             String::from_utf8_lossy(body)
         );
-        // The convenience view still collapses it to None...
         assert_eq!(extract_model(body), None);
     }
 }
 
 // REGRESSION (live variant A) - a nested non-string decoy must NOT stop the
-// scan from reaching the real root member.
+// parse from reaching the real root member.
 #[test]
 fn nested_non_string_decoy_does_not_hide_the_root_model() {
     let body = br#"{"metadata":{"model":123},"model":"expensive-model"}"#;
-    assert_eq!(extract_model(body), Some(&b"expensive-model"[..]));
+    assert_eq!(decoded(body), "expensive-model");
 }
 
 // ---------------------------------------------------------------------------
-// Structural cases the depth/string tracker has to get right.
+// Structural cases the JSON parser has to get right (decoys, nesting, escapes
+// inside other members).
 // ---------------------------------------------------------------------------
 
 // Escaped quotes inside a preceding string value must not end it early.
 #[test]
 fn escaped_quotes_in_a_preceding_string_are_handled() {
     let body = br#"{"note":"said \"model\":\"x\"","model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 }
 
 // Braces/brackets inside strings must not change the nesting depth.
 #[test]
 fn braces_inside_strings_do_not_confuse_depth() {
     let body = br#"{"a":"}","model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 
     let body = br#"{"a":["]","{",{"model":"decoy"}],"model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 }
 
 // Deeply nested decoys are skipped at any depth.
 #[test]
 fn deeply_nested_decoys_are_skipped() {
     let body = br#"{"a":{"b":{"c":{"model":"decoy"}}},"model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
 }
 
 // A non-object root has no top-level member.
@@ -179,7 +204,7 @@ fn non_object_root_is_absent() {
 // Unterminated strings are Absent, never a panic and never a bogus slice.
 #[test]
 fn unterminated_input_is_absent() {
-    assert_eq!(extract_model_field(br#"{"model":"#,), ModelField::Absent);
+    assert_eq!(extract_model_field(br#"{"model":"#), ModelField::Absent);
     assert_eq!(
         extract_model_field(br#"{"a":"unterminated"#),
         ModelField::Absent
@@ -194,12 +219,18 @@ fn unterminated_input_is_absent() {
 #[test]
 fn root_model_found_after_other_members() {
     let body = br#"{"a":1,"b":{"model":"decoy"},"c":[1,2,3],"d":"x","model":"real"}"#;
-    assert_eq!(extract_model(body), Some(&b"real"[..]));
+    assert_eq!(decoded(body), "real");
+}
+
+// An empty root object has no model.
+#[test]
+fn empty_object_is_absent() {
+    assert_eq!(extract_model_field(br#"{}"#), ModelField::Absent);
+    assert_eq!(extract_model(br#"{}"#), None);
 }
 
 // ---------------------------------------------------------------------------
-// Ambiguous: a duplicate top-level "model" key, or an escaped top-level key
-// that a zero-copy scan cannot decode (and may therefore alias "model").
+// Ambiguous: a duplicated top-level "model" key.
 //
 // The extracted value drives authorization while the body goes upstream
 // verbatim, so when Hydra cannot pin down exactly which top-level member the
@@ -208,8 +239,8 @@ fn root_model_found_after_other_members() {
 
 // REGRESSION (F-2) - a SECOND top-level "model" key is ambiguous: JSON parsers
 // disagree on which duplicate wins (first vs last), so the provider may read a
-// different model than Hydra authorized. The scan must run to the end (no
-// first-hit early exit) and report Ambiguous.
+// different model than Hydra authorized. The whole root is parsed (no
+// first-hit early exit) and Ambiguous is reported.
 #[test]
 fn duplicate_top_level_model_is_ambiguous() {
     let body = br#"{"model":"a","model":"b"}"#;
@@ -218,7 +249,6 @@ fn duplicate_top_level_model_is_ambiguous() {
         ModelField::Ambiguous,
         "two top-level model keys must be ambiguous, never the first-hit value"
     );
-    // The convenience view collapses ambiguity to None (rejection lives at the proxy).
     assert_eq!(extract_model(body), None);
 
     // A duplicate is ambiguous regardless of what the values are (even equal).
@@ -232,44 +262,63 @@ fn duplicate_top_level_model_is_ambiguous() {
     assert_eq!(extract_model(body), None);
 }
 
-// REGRESSION (F-2) - an escaped top-level key is an alias for "model" that a
-// zero-copy scan cannot decode: {"\u006dodel":"a"} decodes to {"model":"a"}.
-// We cannot tell what an escaped key is, so any top-level key containing a
-// backslash is Ambiguous (fail closed), whether or not a raw "model" is also
-// present.
+// (SEMANTIC CHANGE) - a top-level key that DECODES to "model" is now recognized
+// as the model member (the provider's parser decodes the key too):
+// {"\u006dodel":"a"} → model "a". The old zero-copy scanner could not decode a
+// key and treated any escaped top-level key as Ambiguous. Two keys that both
+// decode to "model" (an escaped alias plus a raw one) are still a duplicate →
+// Ambiguous.
 #[test]
-fn escaped_top_level_key_is_ambiguous() {
-    // "\u006d" decodes to "m", so "\u006dodel" is "model" — an alias, and it
-    // precedes a real "model" key: the provider might read either.
+fn escaped_key_that_decodes_to_model() {
+    // "\u006d" decodes to "m", so the key "\u006dodel" decodes to "model".
+    let body = br#"{"\u006dodel":"a"}"#;
+    assert_eq!(decoded(body), "a");
+    assert_eq!(extract_model(body), Some("a".to_string()));
+
+    // Two keys that both decode to "model" (escaped alias + raw) are a duplicate.
     let body = br#"{"\u006dodel":"a","model":"b"}"#;
-    assert_eq!(
-        extract_model_field(body),
-        ModelField::Ambiguous,
-        "an escaped top-level key may alias \"model\"; fail closed"
-    );
+    assert_eq!(extract_model_field(body), ModelField::Ambiguous);
     assert_eq!(extract_model(body), None);
 
-    // An escaped key alone (no raw "model") is still ambiguous: we cannot
-    // determine its decoded form without a full JSON unescape.
-    let body = br#"{"\u006dodel":"a"}"#;
+    // Two escaped aliases that both decode to "model" are also a duplicate.
+    let body = br#"{"\u006dodel":"a","\u006dodel":"b"}"#;
     assert_eq!(extract_model_field(body), ModelField::Ambiguous);
     assert_eq!(extract_model(body), None);
 }
 
-// Boundary pin: the escape check applies to the top-level KEY bytes only. An
-// escape sequence inside a VALUE (or in a non-model key's value) must not make
-// a clean "model" key ambiguous — that would reject ordinary, valid requests.
+// (SEMANTIC CHANGE) - the model VALUE is now decoded, matching the provider's
+// parser. {"model":"a\"b"} authorizes on the decoded `a"b`, not the raw bytes
+// `a\"b`. An escape in a sibling value is irrelevant.
 #[test]
-fn escaped_value_does_not_make_model_ambiguous() {
-    // The "model" key is clean; its value holds an escaped quote, and a sibling
-    // value holds a "\u006dodel" escape. None of those are top-level keys.
-    // (The returned slice is the RAW bytes `a\"b` — escapes are not decoded.)
+fn escaped_model_value_is_decoded() {
     let body = br#"{"model":"a\"b","x":"\u006dodel"}"#;
-    assert_eq!(
-        extract_model_field(body),
-        ModelField::Value(b"a\\\"b"),
-        "a clean model key with an escaped value is still a clean Value"
-    );
-    assert_eq!(extract_model(body), Some(&b"a\\\"b"[..]));
+    assert_eq!(decoded(body), "a\"b");
+    assert_eq!(extract_model(body), Some("a\"b".to_string()));
 }
 
+// "\uXXXX" escapes in the value are decoded to their code points, matching the
+// provider's parser.
+#[test]
+fn escaped_unicode_model_value_is_decoded() {
+    // "\u002d" decodes to "-", so the authorized model is "gpt-4".
+    let body = br#"{"model":"gpt\u002d4"}"#;
+    assert_eq!(decoded(body), "gpt-4");
+
+    // "\u0061\u0062" decodes to "ab".
+    let body = br#"{"model":"\u0061\u0062"}"#;
+    assert_eq!(decoded(body), "ab");
+}
+
+// (STRICT) - trailing content after the root object is malformed JSON → Absent.
+// The old scanner returned the model it had already seen; the strict parser
+// requires the body to be exactly one JSON value. Trailing whitespace, though,
+// is fine.
+#[test]
+fn trailing_garbage_is_absent() {
+    let body = br#"{"model":"a"}garbage"#;
+    assert_eq!(extract_model_field(body), ModelField::Absent);
+    assert_eq!(extract_model(body), None);
+
+    let body = br#"{"model":"a"}   "#;
+    assert_eq!(decoded(body), "a");
+}

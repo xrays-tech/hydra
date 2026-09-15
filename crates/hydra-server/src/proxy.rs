@@ -17,8 +17,9 @@
 //!    `api-key` / `x-goog-api-key` / query param — `hydra_core::apikey`);
 //!    disagreeing transports resolve to the highest-precedence value.
 //! 3. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
-//! 4. `extract_model` over the *full* body (memchr — trivial for any
-//!    position/schema; the stream-through "first-chunk gamble" is gone).
+//! 4. `extract_model` over the *full* body (strict serde JSON parse — finds the
+//!    root `model` at any position/schema, with string escapes decoded; the
+//!    stream-through "first-chunk gamble" is gone).
 //! 5. `router::resolve` + `swrr::order` → ordered candidate list.
 //! 6. Pre-limit count gate.
 //! 7. **Failover loop**: for each candidate, build the upstream request
@@ -278,7 +279,8 @@ impl ProxyHttp for HydraProxy {
     //   (3) mandatory api-key parse for every other request (401 missing_api_key)
     //   (4) external auth (cache-first) + metrics
     //   (5) read the FULL downstream body (loop → Bytes)
-    //   (6) extract_model over the full body (memchr — any position/schema)
+    //   (6) extract_model over the full body (strict serde JSON parse — any
+    //       position/schema, string escapes decoded)
     //   (7) pre-limit count gate (BEFORE routing: 429 even if routing would 503)
     //   (8) router::resolve + swrr::order  (+ passthrough fallback)
     //   (9) failover loop: build → send → stream-back, breaker on success/fail
@@ -443,11 +445,12 @@ impl ProxyHttp for HydraProxy {
         };
 
         // (6) Model extraction over the FULL body (terminate-mode §4.1 ④').
-        //     A single byte pass that tracks JSON depth, so it finds the ROOT
-        //     `model` member at any position/schema (the late-model fix) while
-        //     ignoring decoys nested elsewhere — which matters because this
-        //     value authorizes the request while the body goes upstream
-        //     verbatim. No JSON deserialisation.
+        //     A strict serde JSON stream-parse that finds the ROOT `model`
+        //     member at any position/schema (the late-model fix) while ignoring
+        //     decoys nested elsewhere — which matters because this value
+        //     authorizes the request while the body goes upstream verbatim. The
+        //     value's string escapes are decoded, matching what the provider's
+        //     own parser reads from the same bytes.
         let model_field = if has_body && is_v1_route {
             extract_model_field(body_bytes.as_ref())
         } else {
@@ -464,8 +467,11 @@ impl ProxyHttp for HydraProxy {
             debug!(tenant = %tenant_id, "root model member is not a string or is ambiguous");
             return short_circuit(session, 400, "invalid_model_field").await;
         }
+        // The model value is already a decoded, valid UTF-8 string (serde_json
+        // validates/decodes it); `into_string` yields the owned value the
+        // provider will read, so routing/whitelist match the upstream model.
         let model_opt: Option<String> = match model_field {
-            ModelField::Value(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            ModelField::Value(v) => Some(v.into_string()),
             ModelField::Absent | ModelField::NotAString | ModelField::Ambiguous => None,
         };
 
