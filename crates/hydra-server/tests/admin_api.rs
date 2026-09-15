@@ -1938,3 +1938,177 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
     assert_eq!(models[0]["providers"][0]["provider_id"], "real");
     assert_eq!(models[0]["providers"][0]["online"], true);
 }
+// ===========================================================================
+// §3.14 — an endpoint the LOADER treats as fatal must be rejected at the WRITE
+// boundary. Before this, `POST {"endpoint":"api.openai.com"}` (no scheme)
+// answered 201, and from then on every `reload_all` failed fatal validation:
+// the snapshot froze and key rotation / revocation silently stopped working.
+// ===========================================================================
+
+#[tokio::test]
+async fn provider_write_rejects_endpoints_the_loader_would_treat_as_fatal() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // Every shape `store::is_usable_endpoint` rejects: no scheme (the audit's
+    // exact typo), empty, hostless, wrong scheme.
+    for endpoint in ["api.openai.com", "", "https://", "ftp://host"] {
+        let body = format!(
+            r#"{{"id":"p1","key":"openai","name":"O","endpoint":"{endpoint}","weight":1,"created_at":"","updated_at":""}}"#
+        );
+        let r = req(
+            port,
+            reqwest::Method::POST,
+            "/api/v1/providers",
+            Some(TOKEN),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            400,
+            "endpoint {endpoint:?} must be rejected at write time, not persisted with a 201"
+        );
+        let e: serde_json::Value = r.json().await.expect("json");
+        assert_eq!(e["error"]["code"], "invalid_endpoint");
+    }
+
+    // Nothing was persisted, and the snapshot the data plane serves is intact.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/providers",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let list: serde_json::Value = r.json().await.expect("json");
+    assert!(list.as_array().unwrap().is_empty());
+    assert!(state.store.snapshot().providers.is_empty());
+
+    // Regression guard: a well-formed endpoint is still accepted (201).
+    let ok = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(ok),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+
+    // PUT is guarded too, and must NOT touch the stored row.
+    let bad_upd = r#"{"id":"p1","key":"openai","name":"O","endpoint":"api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/providers/p1",
+        Some(TOKEN),
+        Some(bad_upd),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/providers/p1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let stored: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        stored["endpoint"], "https://api.openai.com",
+        "a rejected PUT must leave the stored endpoint untouched"
+    );
+}
+
+// ===========================================================================
+// §3.15 — PUT /provider-keys/{id} is atomic: a rejected upsert must not leave
+// the provider without the key it had before.
+// ===========================================================================
+
+#[tokio::test]
+async fn provider_key_put_is_atomic_and_keeps_the_previous_key_on_failure() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let p = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let _ = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(p),
+    )
+    .await;
+    let k = r#"{"id":"k1","provider_id":"p1","api_key":"sk-original","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-keys",
+        Some(TOKEN),
+        Some(k),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+
+    // The FK on provider_key.provider_id makes this insert fail — after the
+    // DELETE in the old delete-then-insert code had already destroyed k1.
+    let bad =
+        r#"{"id":"k1","provider_id":"no-such-provider","api_key":"sk-rotated","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        Some(bad),
+    )
+    .await;
+    assert!(
+        r.status().is_client_error(),
+        "an unknown provider_id must fail the upsert: {}",
+        r.status()
+    );
+
+    // The key that was working before the failed PUT must still exist, still
+    // belong to p1 — the gateway must not be left with `NoAvailableKey`.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "the failed PUT deleted the previously working key (audit §3.15)"
+    );
+    let item: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(item["provider_id"], "p1");
+
+    // A valid PUT still upserts normally.
+    let good = r#"{"id":"k1","provider_id":"p1","api_key":"sk-rotated","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        Some(good),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let item: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(item["id"], "k1");
+    assert_eq!(item["provider_id"], "p1");
+}

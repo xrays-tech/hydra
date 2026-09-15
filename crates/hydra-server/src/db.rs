@@ -497,6 +497,47 @@ pub async fn insert_provider_key(
     Ok(())
 }
 
+/// Atomic provider-key upsert, used by `PUT /api/v1/provider-keys/{id}`.
+///
+/// The admin PUT was a bare `DELETE` + `INSERT` with the delete error thrown
+/// away. `provider_key.provider_id` is a `REFERENCES provider(id)` FK, so a
+/// body naming a provider that does not exist made the **insert** fail *after*
+/// the old, working key had already been deleted: the API answered 400/4xx, the
+/// operator believed the update had simply failed, and the provider was left
+/// with no key at all (`NoAvailableKey` 503) until someone noticed (audit
+/// §3.15).
+///
+/// Both statements now run in one transaction: a failing insert rolls the delete
+/// back and the previous key survives intact. Reuses the exact SQL text of
+/// `insert_provider_key` / `delete_provider_key`, so the `.sqlx` offline
+/// cache needs no regeneration.
+pub async fn upsert_provider_key(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    k: &ProviderKey,
+) -> Result<(), sqlx::Error> {
+    let sealed = kp.seal(k.api_key.as_bytes()).map_err(crypto_to_sqlx)?;
+    let nonce: &[u8] = &sealed.nonce;
+    let mut tx = pool.begin().await?;
+    sqlx::query!("DELETE FROM provider_key WHERE id = ?", k.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query!(
+        "INSERT INTO provider_key (id, provider_id, api_key_ciphertext, api_key_nonce, \
+         key_version, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        k.id,
+        k.provider_id,
+        sealed.ciphertext,
+        nonce,
+        sealed.key_version,
+        k.created_at,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn get_provider_key(
     pool: &SqlitePool,
     kp: &dyn KeyProvider,

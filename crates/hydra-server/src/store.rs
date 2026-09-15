@@ -227,7 +227,14 @@ fn validate_and_log(cfg: &ConfigData) -> Result<(), StoreError> {
 /// Minimal endpoint sanity check (no `url` crate available under the `db`
 /// feature): the scheme must be `http`/`https` and a non-empty host must
 /// follow. The full URL→`{scheme,host,port}` parse is a W4 proxy concern.
-fn is_usable_endpoint(endpoint: &str) -> bool {
+///
+/// `pub(crate)` so the **write boundary** (admin provider POST/PUT) can reject
+/// exactly the set the loader treats as fatal. Before that call-site existed, a
+/// typo such as `"api.openai.com"` (missing scheme) was persisted with a 201,
+/// after which *every* later `reload_all` failed fatal validation: the snapshot
+/// froze and key rotation / revocation silently stopped taking effect (audit
+/// §3.14). Write-side and load-side now share one predicate by construction.
+pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
     let lower = endpoint.to_ascii_lowercase();
     let rest = match lower
         .strip_prefix("https://")

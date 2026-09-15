@@ -133,18 +133,48 @@ fn is_not_found(e: &sqlx::Error) -> bool {
 async fn reload_best_effort(state: &AdminState, trace_id: &str) {
     let _guard = state.reload_lock.lock().await;
     if let Err(e) = state.store.reload_all().await {
-        tracing::warn!(
+        // ERROR, not WARN (audit §3.14): the write was committed, but the
+        // runtime is now permanently serving the PREVIOUS snapshot — every later
+        // write (key rotation, revocation, tenant disable) will also fail to
+        // take effect. That must be impossible to miss in logs and alertable
+        // from /metrics.
+        tracing::error!(
             target: "hydra::admin",
             trace_id, error = %e,
-            "post-write reload_all failed; in-memory snapshot kept (design §5.3)"
+            "post-write reload_all FAILED: the in-memory config snapshot is now STALE              (design §5.3 keeps the old snapshot; admin writes will keep returning              2xx while having no runtime effect until a reload succeeds)"
         );
+        metrics::record_config_snapshot_stale(true);
         return;
     }
+    metrics::record_config_snapshot_stale(false);
     // Cert-reload contract (W4b): after a successful reload, re-resolve certs
     // so the next TLS handshake sees new cert paths.
     if let Some(reload_certs) = state.cert_reloader.as_ref() {
         reload_certs();
     }
+}
+
+/// Write-boundary mirror of the loader's **fatal** endpoint check
+/// (`store::is_usable_endpoint`). Without it a typo such as
+/// `{"endpoint":"api.openai.com"}` (missing scheme) was persisted with a 201;
+/// from then on every `reload_all` failed fatal validation, the in-memory
+/// snapshot stayed frozen at the old version and **every later write silently
+/// stopped taking effect** — including key rotation and revocation — while the
+/// API kept answering 201/200 (audit §3.14). `None` means "acceptable".
+fn endpoint_error(p: &Provider, trace_id: &str) -> Option<Resp> {
+    if crate::store::is_usable_endpoint(&p.endpoint) {
+        return None;
+    }
+    Some(err_json(
+        400,
+        "invalid_endpoint",
+        &format!(
+            "provider endpoint {:?} is not a usable URL: it must start with \
+             http:// or https:// and be followed by a host",
+            p.endpoint
+        ),
+        trace_id,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +249,9 @@ pub(super) async fn provider_collection(
         if p.updated_at.is_empty() {
             p.updated_at = ts;
         }
+        if let Some(r) = endpoint_error(&p, trace_id) {
+            return r;
+        }
         match crate::db::insert_provider(state.db(), &p).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
@@ -253,6 +286,9 @@ pub(super) async fn provider_item(
             };
             p.id = id.to_string();
             p.updated_at = now_ts();
+            if let Some(r) = endpoint_error(&p, trace_id) {
+                return r;
+            }
             match crate::db::update_provider(state.db(), &p).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
@@ -424,8 +460,6 @@ pub(super) async fn provider_key_item(
             }
         }
         "PUT" => {
-            // provider_key has no dedicated update fn (W2): upsert via
-            // delete + insert.
             let body = read_body(session).await;
             let mut k: ProviderKey = match parse_body(&body, trace_id) {
                 Ok(k) => k,
@@ -435,8 +469,10 @@ pub(super) async fn provider_key_item(
             if k.created_at.is_empty() {
                 k.created_at = now_ts();
             }
-            let _ = crate::db::delete_provider_key(state.db(), id).await;
-            match crate::db::insert_provider_key(state.db(), state.key_provider.as_ref(), &k).await
+            // Atomic (audit §3.15): delete + insert inside ONE transaction, so a
+            // failing insert (e.g. an unknown provider_id hitting the FK) rolls
+            // the delete back and the previously working key is NOT lost.
+            match crate::db::upsert_provider_key(state.db(), state.key_provider.as_ref(), &k).await
             {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),

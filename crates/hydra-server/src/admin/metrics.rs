@@ -31,6 +31,8 @@
 //! | `hydra_queue_wait_seconds` | histogram | provider | admission module (permit-acquired) |
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
+//! | `hydra_config_snapshot_stale` | gauge | — | `admin::reload_best_effort` (1 = last reload failed, snapshot stale) |
+//! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
@@ -91,6 +93,13 @@ struct Metrics {
     /// Mid-stream errors: a chunk read/write failed AFTER the 200 + first
     /// chunk was already sent to the client (failover impossible).
     mid_stream_errors: IntCounterVec,
+    /// 1 = the last post-write `reload_all` failed and the in-memory
+    /// snapshot is stale (later admin writes may have silently not taken
+    /// effect). Alert on this (audit §3.14).
+    config_snapshot_stale: IntGauge,
+    /// Usage records the sink dropped, by reason. Billing data loss must be
+    /// alertable, not just a WARN in the log (audit §3.9).
+    usage_dropped: IntCounterVec,
     // ── Control plane (cluster P1) ──────────────────────────────────────
     /// Control-channel poll outcomes (result=ok|error).
     control_poll: IntCounterVec,
@@ -241,6 +250,17 @@ fn metrics() -> Option<&'static Metrics> {
                 &["provider"]
             )
             .ok()?,
+            usage_dropped: register_int_counter_vec!(
+                "hydra_usage_records_dropped_total",
+                "Usage records dropped by the sink (reason=channel_full|channel_closed|retention_cap)",
+                &["reason"]
+            )
+            .ok()?,
+            config_snapshot_stale: register_int_gauge!(
+                "hydra_config_snapshot_stale",
+                "1 = the last post-write reload_all failed: the in-memory snapshot is stale"
+            )
+            .ok()?,
             // ── Control plane (cluster P1) ────────────────────────────────
             control_poll: register_int_counter_vec!(
                 "hydra_control_poll_total",
@@ -344,6 +364,30 @@ pub fn record_catalog(tenant: &str) {
 pub fn record_auth_cache_size(n: usize) {
     if let Some(m) = metrics() {
         m.auth_cache_size.set(n as i64);
+    }
+}
+
+/// Count usage records the sink dropped, by `reason` ("channel_full",
+/// "channel_closed", "retention_cap").
+///
+/// Usage records are billing data: the audit (§3.9) found them dropped with only
+/// a WARN, so a silently degrading metering pipeline was invisible to operators.
+pub fn record_usage_drop(reason: &str, n: u64) {
+    if let Some(m) = metrics() {
+        m.usage_dropped.with_label_values(&[reason]).inc_by(n);
+    }
+}
+
+/// Publish whether the in-memory config snapshot is stale because the last
+/// post-write `reload_all` failed (1) or is in sync with the DB (0).
+///
+/// This is the ops-visible signal the audit asked for in §3.14: a write that is
+/// committed to SQLite but cannot be loaded leaves the API answering 200 while
+/// the runtime keeps serving the PREVIOUS config — key rotation and revocation
+/// silently stop taking effect. Alert on `hydra_config_snapshot_stale == 1`.
+pub fn record_config_snapshot_stale(stale: bool) {
+    if let Some(m) = metrics() {
+        m.config_snapshot_stale.set(i64::from(stale));
     }
 }
 

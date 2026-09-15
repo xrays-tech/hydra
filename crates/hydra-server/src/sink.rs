@@ -76,6 +76,34 @@ pub trait UsageSink: Send + Sync {
 /// returning the un-written batch so the caller can retry it.
 type InsertResult = Result<(), (Vec<UsageRecord>, String)>;
 
+/// How long ONE `flush_with_backoff` invocation may keep retrying before it
+/// hands the batch back to the channel loop.
+///
+/// Retrying forever looks safe ("never lose a record") but is not: while the
+/// flush future is awaiting, `rx.recv()` is never polled, so the bounded
+/// channel fills up and `record()` starts dropping usage — silently, at exactly
+/// the moment the sink is already unhealthy (audit §3.9). Returning to the loop
+/// after this window keeps live records flowing into the retained buffer.
+const MAX_FLUSH_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Hard cap on records the flush task retains while the backend is down. Beyond
+/// it incoming records are dropped (counted on
+/// `hydra_usage_records_dropped_total`, never silently) so a long outage cannot
+/// grow the gateway's memory without bound.
+const MAX_RETAINED: usize = 10_000;
+
+/// Count a dropped usage record. The metric is the point: losing billing data
+/// must never be visible only as a log line (audit §3.9).
+fn note_usage_drop(reason: &str, n: u64) {
+    #[cfg(feature = "proxy")]
+    crate::admin::metrics::record_usage_drop(reason, n);
+    #[cfg(not(feature = "proxy"))]
+    {
+        // `admin` (and therefore its metric registry) only exists under `proxy`.
+        let _ = (reason, n);
+    }
+}
+
 /// Drive a background sink loop over `rx`. Flushes when the buffer reaches
 /// `batch_size`, on the `flush_secs` interval (if non-empty), and a final flush
 /// when the channel closes.
@@ -83,6 +111,7 @@ async fn run_channel_sink<F, Fut>(
     mut rx: tokio::sync::mpsc::Receiver<UsageRecord>,
     batch_size: usize,
     flush_secs: u64,
+    retry_window: Duration,
     inserter: F,
 ) where
     F: Fn(Vec<UsageRecord>) -> Fut + Send + 'static,
@@ -98,25 +127,45 @@ async fn run_channel_sink<F, Fut>(
     // after a real `flush_dur` has elapsed, not instantly.
     ticker.tick().await;
 
+    // Retention-cap drop counter, used only to throttle the warning.
+    let mut retained_drops: u64 = 0;
+
     loop {
         tokio::select! {
             recv = rx.recv() => match recv {
                 Some(record) => {
+                    // Retention cap: the backend has been down long enough that
+                    // the buffer hit its ceiling. Keep DRAINING the channel (so
+                    // the bounded channel never fills and never drops behind our
+                    // back) but refuse the excess here, counted and warned.
+                    if buffer.len() >= MAX_RETAINED {
+                        retained_drops += 1;
+                        note_usage_drop("retention_cap", 1);
+                        if retained_drops == 1 || retained_drops % 1000 == 0 {
+                            tracing::warn!(
+                                dropped_total = retained_drops,
+                                retained = buffer.len(),
+                                cap = MAX_RETAINED,
+                                "usage sink retention cap reached (backend still down);                                  dropping incoming usage records"
+                            );
+                        }
+                        continue;
+                    }
                     buffer.push(record);
                     if buffer.len() >= batch_size {
-                        flush_with_backoff(&mut buffer, &inserter).await;
+                        flush_with_backoff(&mut buffer, &inserter, retry_window).await;
                     }
                 }
                 None => {
                     // Channel closed: best-effort final drain + flush, then exit.
                     if !buffer.is_empty() {
-                        flush_with_backoff(&mut buffer, &inserter).await;
+                        flush_with_backoff(&mut buffer, &inserter, retry_window).await;
                     }
                     return;
                 }
             },
             _tick = ticker.tick(), if !buffer.is_empty() => {
-                flush_with_backoff(&mut buffer, &inserter).await;
+                flush_with_backoff(&mut buffer, &inserter, retry_window).await;
             }
         }
     }
@@ -127,7 +176,11 @@ async fn run_channel_sink<F, Fut>(
 /// gives up (usage records are best-effort telemetry, but losing them silently
 /// is worse than bounded retry). Never blocks `record()` callers (runs only in
 /// the background task).
-async fn flush_with_backoff<F, Fut>(buffer: &mut Vec<UsageRecord>, inserter: &F)
+async fn flush_with_backoff<F, Fut>(
+    buffer: &mut Vec<UsageRecord>,
+    inserter: &F,
+    retry_window: Duration,
+) -> bool
 where
     F: Fn(Vec<UsageRecord>) -> Fut,
     Fut: Future<Output = InsertResult>,
@@ -135,14 +188,15 @@ where
     const INITIAL: Duration = Duration::from_millis(50);
     const CAP: Duration = Duration::from_secs(10);
 
+    let started = tokio::time::Instant::now();
     let mut delay = INITIAL;
     loop {
         if buffer.is_empty() {
-            return;
+            return true;
         }
         let batch = std::mem::take(buffer);
         match inserter(batch).await {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err((returned, msg)) => {
                 tracing::warn!(
                     error = %msg,
@@ -150,6 +204,18 @@ where
                     "usage sink batch insert failed; will retry"
                 );
                 buffer.extend(returned);
+                // Give the channel loop a turn once the retry window is spent:
+                // the batch is retained in `buffer` and retried on the next
+                // flush tick, but `rx.recv()` gets polled again in the meantime
+                // so live traffic keeps being accepted (audit §3.9).
+                if started.elapsed() >= retry_window {
+                    tracing::warn!(
+                        retained = buffer.len(),
+                        window_ms = retry_window.as_millis() as u64,
+                        "usage sink still failing after the retry window; returning to the                          channel loop with the batch retained (retried on the next flush)"
+                    );
+                    return false;
+                }
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2).min(CAP);
             }
@@ -205,7 +271,13 @@ impl SqliteSink {
             }
         };
 
-        let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
+        let join = tokio::spawn(run_channel_sink(
+            rx,
+            batch_size,
+            flush_secs,
+            MAX_FLUSH_RETRY_WINDOW,
+            inserter,
+        ));
         Self {
             tx: std::sync::Mutex::new(Some(tx)),
             join: std::sync::Mutex::new(Some(join)),
@@ -232,9 +304,15 @@ impl UsageSink for SqliteSink {
                         r.trace_id.clone()
                     }
                 };
+                let (reason, dropped) = match &err {
+                    mpsc::error::TrySendError::Full(_) => ("channel_full", 1u64),
+                    mpsc::error::TrySendError::Closed(_) => ("channel_closed", 1u64),
+                };
+                note_usage_drop(reason, dropped);
                 tracing::warn!(
                     dropped_trace_id = %dropped_trace,
                     error = %err,
+                    reason,
                     "usage sink channel full/closed; dropping usage record"
                 );
             }
@@ -345,6 +423,33 @@ struct ClickHouseConfig {
     /// `?user=x&password=y`), WITHOUT the leading `?`. Appended to the POST
     /// request's query string; empty when the URL had none.
     query_params: String,
+    /// Deadline for the TCP connect
+    /// (`HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS`, default 3000).
+    connect_timeout: Duration,
+    /// Deadline for EACH of write / flush / response read
+    /// (`HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`, default 15000).
+    ///
+    /// Without these, a ClickHouse that accepts the connection but never answers
+    /// — or a black-holed route — pinned the single flush task forever, the
+    /// bounded channel filled and usage records were dropped (audit §3.9).
+    io_timeout: Duration,
+}
+
+/// Largest response we buffer from ClickHouse. A successful `INSERT` answers
+/// `200` with an empty body; only error text is ever sent, so anything past
+/// this is truncation-safe and keeps a misbehaving server from growing our heap.
+#[cfg(feature = "usage-clickhouse")]
+const MAX_CLICKHOUSE_RESPONSE: usize = 64 * 1024;
+
+/// Read `KEY` as a positive millisecond count, falling back to `default_ms`.
+#[cfg(feature = "usage-clickhouse")]
+fn env_millis(key: &str, default_ms: u64) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(default_ms))
 }
 
 /// Parse a ClickHouse URL into transport + credentials. Accepted forms:
@@ -388,6 +493,8 @@ fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
         host_port: host_port.trim_end_matches('/').to_string(),
         auth,
         query_params: query.unwrap_or("").to_string(),
+        connect_timeout: env_millis("HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS", 3_000),
+        io_timeout: env_millis("HYDRA_CLICKHOUSE_IO_TIMEOUT_MS", 15_000),
     }
 }
 
@@ -427,7 +534,13 @@ impl ClickHouseSink {
             }
         };
 
-        let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
+        let join = tokio::spawn(run_channel_sink(
+            rx,
+            batch_size,
+            flush_secs,
+            MAX_FLUSH_RETRY_WINDOW,
+            inserter,
+        ));
         Self {
             tx: std::sync::Mutex::new(Some(tx)),
             join: std::sync::Mutex::new(Some(join)),
@@ -447,8 +560,14 @@ impl UsageSink for ClickHouseSink {
                 }
             };
             if let Err(err) = tx.try_send(record) {
+                let (reason, dropped) = match &err {
+                    ch_mpsc::error::TrySendError::Full(_) => ("channel_full", 1u64),
+                    ch_mpsc::error::TrySendError::Closed(_) => ("channel_closed", 1u64),
+                };
+                note_usage_drop(reason, dropped);
                 tracing::warn!(
                     error = %err,
+                    reason,
                     "clickhouse usage sink channel full/closed; dropping usage record"
                 );
             }
@@ -557,23 +676,68 @@ async fn insert_batch_clickhouse_http(
     request.push_str("\r\nConnection: close\r\n\r\n");
     request.push_str(&body);
 
-    let mut stream = tokio::net::TcpStream::connect(&cfg.host_port)
+    // Every step is deadline-bound (audit §3.9): this runs on the single sink
+    // flush task, so one blocked await would stop ALL usage metering for the
+    // whole node and silently overflow the channel behind it.
+    let hp = cfg.host_port.clone();
+    let mut stream = tokio::time::timeout(
+        cfg.connect_timeout,
+        tokio::net::TcpStream::connect(&cfg.host_port),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "clickhouse connect {hp}: timed out after {}ms",
+            cfg.connect_timeout.as_millis()
+        )
+    })?
+    .map_err(|e| format!("clickhouse connect {hp}: {e}"))?;
+
+    tokio::time::timeout(cfg.io_timeout, stream.write_all(request.as_bytes()))
         .await
-        .map_err(|e| format!("clickhouse connect {hp}: {e}", hp = cfg.host_port))?;
-    stream
-        .write_all(request.as_bytes())
-        .await
+        .map_err(|_| {
+            format!(
+                "clickhouse write: timed out after {}ms",
+                cfg.io_timeout.as_millis()
+            )
+        })?
         .map_err(|e| format!("clickhouse write: {e}"))?;
-    stream
-        .flush()
+    tokio::time::timeout(cfg.io_timeout, stream.flush())
         .await
+        .map_err(|_| {
+            format!(
+                "clickhouse flush: timed out after {}ms",
+                cfg.io_timeout.as_millis()
+            )
+        })?
         .map_err(|e| format!("clickhouse flush: {e}"))?;
 
+    // Read the response with BOTH a deadline and a size cap. `read_to_end`
+    // alone would wait for EOF: a server that sends a status line and then keeps
+    // the connection open would hang us until the deadline, and a chatty server
+    // could grow `resp` without bound.
     let mut resp = Vec::new();
-    stream
-        .read_to_end(&mut resp)
-        .await
-        .map_err(|e| format!("clickhouse read: {e}"))?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(cfg.io_timeout, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                format!(
+                    "clickhouse read: timed out after {}ms",
+                    cfg.io_timeout.as_millis()
+                )
+            })?
+            .map_err(|e| format!("clickhouse read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let room = MAX_CLICKHOUSE_RESPONSE.saturating_sub(resp.len());
+        if room == 0 {
+            // Enough to classify the status/error; stop waiting for EOF.
+            break;
+        }
+        resp.extend_from_slice(&chunk[..n.min(room)]);
+    }
 
     // ClickHouse returns HTTP 200 + empty body on a successful INSERT; any other
     // status carries the error text in the body.
@@ -823,5 +987,211 @@ mod tests {
     fn parse_url_strips_crlf_from_credentials() {
         let cfg = parse_clickhouse_url("http://u\r\n:pa\r\nss@clickhouse:8123");
         assert_eq!(cfg.auth, Some(("u".into(), "pass".into())));
+    }
+}
+
+// ===========================================================================
+// Audit §3.9 — the batching engine must never stop draining its channel, and
+// the ClickHouse transport must never await an answer without a deadline.
+// ===========================================================================
+#[cfg(test)]
+mod audit_3_9_tests {
+    use super::*;
+
+    fn rec(trace: &str) -> UsageRecord {
+        UsageRecord {
+            tenant_id: "t".into(),
+            provider_id: "p".into(),
+            model_key: "m".into(),
+            client_api_key_masked: None,
+            status_code: 200,
+            tokens_in: Some(1),
+            tokens_out: Some(1),
+            cache_hit_tokens: None,
+            latency_ms: 1,
+            forward_latency_ms: None,
+            ttft_ms: None,
+            upstream_host: None,
+            error: None,
+            trace_id: trace.into(),
+            created_at: "2026-09-15T00:00:00Z".into(),
+        }
+    }
+
+    /// The retry loop must hand control back once its window is spent. Retrying
+    /// a single batch FOREVER looks like "never lose a record", but while the
+    /// flush future waits, `rx.recv()` is never polled: the bounded channel
+    /// fills up and `record()` silently drops usage exactly when the sink is
+    /// already unhealthy. Pre-fix this test timed out (flush never returned).
+    #[tokio::test]
+    async fn flush_gives_up_after_the_retry_window_and_keeps_the_batch() {
+        let mut buffer = vec![rec("a"), rec("b")];
+        let inserter = |batch: Vec<UsageRecord>| async move {
+            Err::<(), _>((batch, "clickhouse down".to_string()))
+        };
+        let gave_up = tokio::time::timeout(
+            Duration::from_secs(5),
+            flush_with_backoff(&mut buffer, &inserter, Duration::from_millis(150)),
+        )
+        .await
+        .expect(
+            "flush_with_backoff must RETURN once the retry window is spent; retrying forever starves the channel-draining select loop"
+        );
+        assert!(!gave_up, "window exhausted => the batch was not flushed");
+        assert_eq!(
+            buffer.len(),
+            2,
+            "the un-flushed batch must be retained for the next flush tick"
+        );
+    }
+
+    /// While the backend is down the loop keeps accepting new records into its
+    /// retained buffer instead of leaving them in the bounded channel to be
+    /// dropped. The sender deliberately uses `send().await` (real backpressure,
+    /// not `try_send`): every record must still be delivered once the backend
+    /// recovers — nothing may be lost across a temporary outage.
+    #[tokio::test]
+    async fn channel_sink_keeps_draining_across_a_temporary_outage() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let delivered: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (delivered_in, attempts_in) = (delivered.clone(), attempts.clone());
+        let inserter = move |batch: Vec<UsageRecord>| {
+            let delivered = delivered_in.clone();
+            let attempts = attempts_in.clone();
+            async move {
+                // Fail the first two attempts, then recover.
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    return Err((batch, "backend down".to_string()));
+                }
+                delivered
+                    .lock()
+                    .expect("delivered mutex")
+                    .extend(batch.iter().map(|r| r.trace_id.clone()));
+                Ok(())
+            }
+        };
+        let handle = tokio::spawn(run_channel_sink(
+            rx,
+            1,
+            1,
+            Duration::from_millis(50),
+            inserter,
+        ));
+        for i in 0..6 {
+            tx.send(rec(&format!("t{i}")))
+                .await
+                .expect("channel must stay open");
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the sink loop must finish after the channel closes")
+            .expect("join");
+        let got = delivered.lock().expect("delivered mutex");
+        assert_eq!(
+            got.len(),
+            6,
+            "every record must survive a temporary backend outage: {got:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ClickHouse transport deadlines
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "usage-clickhouse")]
+    fn cfg_for(addr: std::net::SocketAddr, connect_ms: u64, io_ms: u64) -> ClickHouseConfig {
+        ClickHouseConfig {
+            host_port: addr.to_string(),
+            auth: None,
+            query_params: String::new(),
+            connect_timeout: Duration::from_millis(connect_ms),
+            io_timeout: Duration::from_millis(io_ms),
+        }
+    }
+
+    /// A TCP server that answers every connection with `response` verbatim.
+    #[cfg(feature = "usage-clickhouse")]
+    async fn spawn_responder(response: &'static str) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    /// The bounded reader must still recognise a normal `200` (the pre-fix code
+    /// used `read_to_end`; this pins the replacement loop).
+    #[cfg(feature = "usage-clickhouse")]
+    #[tokio::test]
+    async fn a_minimal_200_response_is_accepted() {
+        let addr =
+            spawn_responder("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        let cfg = cfg_for(addr, 500, 500);
+        insert_batch_clickhouse_http(&cfg, &[rec("a")])
+            .await
+            .expect("a 200 must be a success");
+    }
+
+    /// A non-200 carries ClickHouse's error text and must surface it.
+    #[cfg(feature = "usage-clickhouse")]
+    #[tokio::test]
+    async fn a_5xx_response_surfaces_the_error_body() {
+        let addr = spawn_responder(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 60\r\nConnection: close\r\n\r\nCode: 60. DB::Exception: Table usage_record does not exist",
+        )
+        .await;
+        let cfg = cfg_for(addr, 500, 500);
+        let msg = insert_batch_clickhouse_http(&cfg, &[rec("a")])
+            .await
+            .expect_err("5xx must not be treated as success");
+        assert!(msg.contains("500"), "{msg}");
+        assert!(
+            msg.contains("DB::Exception"),
+            "error body must reach the caller: {msg}"
+        );
+    }
+
+    /// A ClickHouse that accepts the connection and then never answers used to
+    /// pin the SINGLE flush task forever (`read_to_end` has no deadline), which
+    /// silently filled the channel and dropped every subsequent usage record.
+    #[cfg(feature = "usage-clickhouse")]
+    #[tokio::test]
+    async fn a_clickhouse_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                // Hold the connection open and stay silent.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(sock);
+            }
+        });
+        let cfg = cfg_for(addr, 500, 300);
+        let started = tokio::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            insert_batch_clickhouse_http(&cfg, &[rec("a")]),
+        )
+        .await
+        .expect("the insert must give up: one stuck flush pinned ALL usage metering on the node");
+        let msg = out.expect_err("a black-holed ClickHouse must not report success");
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "must fail fast on its own deadline, took {:?}",
+            started.elapsed()
+        );
     }
 }
