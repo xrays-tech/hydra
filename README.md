@@ -79,7 +79,8 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | Env var              | Default                          | Purpose                                              |
 | -------------------- | -------------------------------- | ---------------------------------------------------- |
 | `HYDRA_DB_URL`       | `sqlite:hydra.db?mode=rwc`       | SQLite database location                             |
-| `HYDRA_LISTEN`       | `0.0.0.0:8080`                   | Proxy listen address (use `:443` + certs for TLS)    |
+| `HYDRA_LISTEN`       | `0.0.0.0:8080`                   | Proxy **plaintext** listen address (always bound)    |
+| `HYDRA_TLS_LISTEN`   | *(unset)*                        | Optional proxy **TLS** listen address, e.g. `0.0.0.0:8443`. Setting it (not the tenant certs) is what creates the HTTPS listener; per-tenant certs are selected by SNI. |
 | `HYDRA_ADMIN_ADDR`   | `127.0.0.1:8081`                 | Admin REST + UI + `/metrics` listen address          |
 | `HYDRA_ADMIN_TOKEN`  | —                                | Bearer token gating `/api/v1/*` (**required for admin**) |
 | `HYDRA_ENCRYPTION_KEY` | —                              | Base64 of 32 bytes; encrypts provider api-keys at rest (**required**, fail-closed). Generate: `openssl rand 32 \| base64`. |

@@ -179,8 +179,11 @@ spec:
 # 代理入口（Ingress / LB 指向 edge 的 8080）
 ```
 
-> **edge TLS**：`HYDRA_EDGE_TLS=1` 使 edge 绑定 TLS 监听器（证书随快照分发，
-> 无需共享卷）。默认 plain TCP（本地开发）。
+> **edge TLS**：用 `HYDRA_TLS_LISTEN=0.0.0.0:8443` 让 edge 额外绑定 TLS 监听器
+> （证书随快照分发，无需共享卷；证书写入后由快照交换自动重解析，**无需重启**）。
+> 明文 `HYDRA_LISTEN` 恒定存在——曾有过的 `HYDRA_EDGE_TLS` 开关文档提过、代码从未读取，
+> 已删除；而“有证书就把唯一监听器切成 TLS”的做法已按事故报告修掉
+> （`dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`）。
 
 ### 4.3 裸机 / VM
 

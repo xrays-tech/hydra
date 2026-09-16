@@ -30,13 +30,20 @@ services:
       # be reachable remotely. The container still binds 0.0.0.0 internally
       # (HYDRA_ADMIN_ADDR below) so this publish works.
       - "127.0.0.1:8081:8081"
+      # Optional HTTPS entry — only useful with HYDRA_TLS_LISTEN set below.
+      # - "8443:8443"
     environment:
       # REQUIRED — deliberately no default. A guessable admin token plus a
       # reachable admin port is a full gateway takeover. Generate:
       #   openssl rand -hex 32
       HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:?set HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)" — required for the admin API}
       HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
+      # Plaintext entry — always bound. Adding tenant certs does NOT change it;
+      # only HYDRA_TLS_LISTEN adds an HTTPS listener (per-tenant cert by SNI).
       HYDRA_LISTEN: "0.0.0.0:8080"
+      # Optional HTTPS listener. Uncomment together with the "8443:8443" port
+      # publish above and write tenant certs (Admin API `cert_pem`/`cert_key_pem`):
+      # HYDRA_TLS_LISTEN: "0.0.0.0:8443"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_USAGE_SINK: clickhouse
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"

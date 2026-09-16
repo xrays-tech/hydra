@@ -49,8 +49,11 @@ ENV HYDRA_DB_URL=sqlite:/app/data/hydra.db?mode=rwc \
 
 USER hydra
 
-# Proxy: 443 (TLS/SNI), 80 (plain / localhost). Admin API + /metrics: 8081.
-EXPOSE 443 80 8081
+# Proxy: 8080 (plain, always bound) + 8443 (TLS/SNI, only when HYDRA_TLS_LISTEN is
+# set). Admin API + /metrics: 8081. The old `EXPOSE 443 80` advertised the ports
+# design.md drew while the process actually listened on 8080 — exactly the kind of
+# declared-vs-actual mismatch that hid the 2026-09-16 listener flip.
+EXPOSE 8080 8081 8443
 VOLUME ["/app/data", "/etc/hydra"]
 
 # tini reaps zombies and forwards SIGQUIT (Pingora graceful upgrade: `kill -SIGQUIT 1`).

@@ -1206,8 +1206,9 @@ impl TlsAccept for HydraCertStore {
 
 - `ResolvedCert` 在 `ConfigStore::load` 时由 `tenant.cert_file` / `cert_key`（路径）读取 PEM 解析得到，存入 `ConfigData.certs`（单一来源）；
 - 证书热更新：Admin 修改租户证书 → `reload_all` → `ConfigData.certs` 整体替换 → `HydraCertStore`（同一 Arc 引用）立即生效；
-- 监听器：`TlsSettings::with_callbacks(cert_store)` + `enable_h2()`，绑定 `:443`；
-- 同时监听 `:80`（明文）用于 `localhost` / 开发，由配置开关。
+- 监听器：`TlsSettings::with_callbacks(cert_store)` + `enable_h2()`，绑定 TLS 端口（env `HYDRA_TLS_LISTEN`，如 `0.0.0.0:8443`）；
+- **同时**监听明文端口（env `HYDRA_LISTEN`，默认 `0.0.0.0:8080`）。
+- **修订（审核四，2026-09-16）**：实现曾把这两者塌缩成「一个端口二选一」，协议由**快照里有没有租户证书**决定 ⇒ 配一张证书 = 重启后数据面切 TLS，明文入口全挂（`dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`）。现状与本文一致：**明文恒定绑定；TLS 端口只在 `HYDRA_TLS_LISTEN` 被设置时额外创建**（与证书数量无关），决策由 `hydra_server::listeners::plan` 独占，证书数量只用于告警。
 
 ### 12.2 上游 TLS
 
@@ -1317,8 +1318,10 @@ Admin 端口仅绑内网 + 单一 Admin Token（`Authorization: Bearer <ADMIN_TO
 
 ```toml
 [server]
-proxy_tls_addr = "0.0.0.0:443"
-proxy_http_addr = "0.0.0.0:80"     # 可选，开发/localhost
+proxy_tls_addr = "0.0.0.0:443"     # → env HYDRA_TLS_LISTEN（可选；设置它才启用 HTTPS）
+proxy_http_addr = "0.0.0.0:80"     # → env HYDRA_LISTEN（默认 0.0.0.0:8080，**恒定绑定**）
+# ⚠️ 这两个字段名从未被 loader 读取（同 `non_route_strategy` 的幽灵开关问题）：实际开关是环境变量
+# HYDRA_LISTEN / HYDRA_TLS_LISTEN，由 `hydra_server::listeners::plan` 决定拓扑；见审核四 P2。
 admin_addr     = "127.0.0.1:8081"
 threads        = 0                 # 0 = CPU 核数
 
@@ -1446,6 +1449,8 @@ PRAGMA mmap_size = 134217728;
 | `hydra_limit_rejected_total` | counter | tenant, role, dim(count/token) | 限流拒绝 |
 | `hydra_sni_host_mismatch_total` | counter | — | SNI/Host 不一致（§12.3） |
 | `hydra_route_errors_total` | counter | tenant, reason | 路由失败（ModelNotFound/NotAllowed/NoProvider） |
+| `hydra_listener_bound` | gauge | protocol(plain/tls) | 该监听器在启动自检中确实可连接（1/0）。0 = 配置了却没人听 —— 就是本次事故的形态（进程健康、数据面哑） |
+| `hydra_listener_misconfig_total` | counter | kind(certs_without_tls_port/tls_port_without_certs/tls_bind_failed/tls_settings_failed) | 监听配置需要运维决策（审核四 P4） |
 
 ---
 

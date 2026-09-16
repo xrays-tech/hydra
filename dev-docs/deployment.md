@@ -42,7 +42,8 @@ User=hydra
 Environment=HYDRA_ADMIN_TOKEN=<token>
 Environment=HYDRA_ENCRYPTION_KEY=<base64-32B>   # 必填，fail-closed；丢失则 DB 不可读
 Environment=HYDRA_DB_URL=sqlite:/opt/hydra/data/hydra.db?mode=rwc
-Environment=HYDRA_LISTEN=0.0.0.0:8080           # 代理
+Environment=HYDRA_LISTEN=0.0.0.0:8080           # 代理（明文，恒定）
+# Environment=HYDRA_TLS_LISTEN=0.0.0.0:8443     # 可选：设置它才启用 HTTPS（按 SNI 选租户证书）
 Environment=HYDRA_ADMIN_ADDR=127.0.0.1:8081     # 管理 REST + UI + /metrics
 
 [Install]
@@ -312,7 +313,8 @@ kubectl -n hydra exec deploy/hydra-edge -- sh -c 'wget -qO- http://hydra-control
 | `HYDRA_ENCRYPTION_KEY` | 必填 | 必填，全集群一致 | 主密钥（provider key/证书私钥） |
 | `HYDRA_USAGE_SINK` | `sqlite` 默认 | **必须 `clickhouse`** | fail-closed |
 | `HYDRA_DB_URL` | `sqlite:hydra.db?mode=rwc` | leader 用独立数据卷 | edge 无本地 DB |
-| `HYDRA_LISTEN` / `HYDRA_ADMIN_ADDR` | `0.0.0.0:8080` / `127.0.0.1:8081` | 同左 | 代理 / 管理端口 |
+| `HYDRA_LISTEN` / `HYDRA_ADMIN_ADDR` | `0.0.0.0:8080` / `127.0.0.1:8081` | 同左 | 代理（明文，恒定）/ 管理端口 |
+| `HYDRA_TLS_LISTEN` | *（未设置）* | 同左（如 `0.0.0.0:8443`） | 可选 HTTPS 端口；**设置它**才启用 TLS，与租户是否有证书无关 |
 
 健康端点：`/healthz/leader`（200 active / 503 standby / 404 非候选）、`/readyz`（edge）、
 `/metrics`（Prometheus）、`/api/v1/health`（需 admin token）。

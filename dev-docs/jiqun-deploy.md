@@ -98,7 +98,8 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `HYDRA_DB_URL` | 镜像内 `sqlite:/app/data/hydra.db?mode=rwc`（代码默认 `sqlite:hydra.db?mode=rwc`） | 本地 SQLite：仅 `leader`/`all` 使用，`edge` 忽略（配置来自快照）。leader 数据卷须挂到 `/app/data`，保证 db 落盘 PVC。 |
-| `HYDRA_LISTEN` | `0.0.0.0:8080` | 代理监听地址（有租户证书时自动走 TLS/443 语义）。集群内 Service/Ingress 打到 8080 即可，通常无需显式设。 |
+| `HYDRA_LISTEN` | `0.0.0.0:8080` | 代理**明文**监听地址，**恒定绑定**（即使是 edge、即使配了租户证书也不会变成 TLS）。集群内 Service/Ingress 打到 8080 即可，通常无需显式设。 |
+| `HYDRA_TLS_LISTEN` | *（未设置）* | 可选的代理 **TLS** 监听地址（如 `0.0.0.0:8443`）。**只有设置它才会创建 HTTPS 监听**；edge 也读这一项（证书随快照分发，无需共享卷）。未设而租户有证书 ⇒ 证书不被使用（error 日志 + `hydra_listener_misconfig_total`）。必须与 `HYDRA_LISTEN` 不同端口。 |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | 见 §3——配置中心已给 `0.0.0.0:8081`，Pod 内必须保持 0.0.0.0 以便探针/Service 访问。 |
 | `HYDRA_ENCRYPTION_KEY_FILE` | — | `HYDRA_ENCRYPTION_KEY` 的替代：从裸 32 字节文件读主密钥（K8s 用 secret volumeMount 场景）。二者任一即可，同时给优先 `_FILE`。 |
 
@@ -109,7 +110,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `HYDRA_FAILOVER_GRACE_MS` | 预留，**未接线** | 文档里描述过宽限窗口；实测故障切换 = 租约过期 + 轮换 + 选举 tick，不依赖本项。 |
 | `HYDRA_BREAKER_QUORUM` | 代码内默认 `1` | 熔断投票法定数（任一存活投票即生效），暂未提供 env 覆盖。 |
 | `HYDRA_RATE_LIMIT_FAIL_MODE` | 代码内默认 `open` | Redis 宕机时限流 fail-open（可配 closed），暂未提供 env 覆盖。 |
-| `HYDRA_EDGE_TLS` | 文档提及，代码未见接线 | `cluster.md` §4.2 注记“=1 使 edge 绑定 TLS 监听器（证书随快照分发）”；当前代码未见读取，生产如需 edge TLS 请先核实实现状态再依赖。 |
+| ~~`HYDRA_EDGE_TLS`~~ | **从未实现，已删除** | 这个开关只存在于文档里，代码从未读取过它（`grep HYDRA_EDGE_TLS crates/` 为空）。edge TLS 请用上表的 `HYDRA_TLS_LISTEN`。 |
 
 ---
 

@@ -55,7 +55,8 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
 cargo build --release --features server
 export HYDRA_ADMIN_TOKEN=dev-admin-token
 export HYDRA_DB_URL='sqlite::memory:'     # or a file path for persistence
-# Optional: HYDRA_LISTEN, HYDRA_ADMIN_ADDR, RUST_LOG
+# Optional: HYDRA_LISTEN, HYDRA_TLS_LISTEN (adds an HTTPS listener),
+#           HYDRA_ADMIN_ADDR, RUST_LOG
 ./target/release/hydra &
 
 # 2. Wait for it, then seed one row in each table so the UI has something
