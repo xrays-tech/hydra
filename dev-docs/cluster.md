@@ -38,7 +38,8 @@
 | `HYDRA_CONTROL_POLL_MS` | `1000` | 控制快照轮询间隔（standby 副本同步可收紧至 200） |
 | `HYDRA_LEADER_LEASE_MS` | `15000` | 租约时长（续约每 lease/3） |
 | `HYDRA_FAILOVER_GRACE_MS` | `5000` | **预留，尚未接线**（见 §5.1 实测：故障切换 ≈ 租约过期 + 轮换 + 选举 tick） |
-| `HYDRA_NODE_ID` | 自动生成 | 节点标识（租约持有者/熔断投票者/注册表条目） |
+| `HYDRA_NODE_ID` | 自动生成 | 节点标识（租约持有者/熔断投票者/注册表条目）；回退顺序 `HYDRA_NODE_ID` → `HOSTNAME` → 随机，回退前提见 §3.1 |
+| `HYDRA_REGISTRY_STALE_GRACE_SECS` | 120 | 回收见证键的 TTL（= 宽限窗口）；`<= 0` 视为未设。过小会缩短"仅一时静默"的节点的保护窗口 |
 | `HYDRA_USAGE_SINK` | `sqlite` | **集群必须 `clickhouse`**（fail-closed） |
 | `HYDRA_CLICKHOUSE_URL` | — | sink=clickhouse 时必填 |
 | `HYDRA_ADMIN_TOKEN` | — | **leader 必须**：全集群共享（standby 转发管理变更时沿用） |
@@ -55,7 +56,7 @@
 | 子系统 | Key | 说明 |
 |---|---|---|
 | leader 租约 | `hydra:{lease:leader}` | `SET NX PX` + Lua 原子续约（只续自己的） |
-| 节点注册表 | `hydra:{nodes}` + `hydra:{node:hb}:<id>` | 注册/心跳（TTL 30s）/leader 发现 |
+| 节点注册表 | `hydra:{nodes}` + `hydra:{node:hb}:<id>` + `hydra:{node:seen}:<id>` | 注册/心跳（TTL 30s）/leader 发现；第三个键是**回收见证**（TTL = grace，见 §3.1） |
 | 失效总线 | `hydra:{ctl:events}` + `hydra:{ctl:gen}` | Streams 持久可重放 + generation 兜底 |
 | 共享限流 | `hydra:{rl:role:bucket}:count|tokens` | Lua 滑动窗口（同 `{rl:...}` tag 同槽） |
 | 共享熔断 | `hydra:{br}:dead:{p}` + `hydra:{br}:alldead` | 投票 + 心跳 TTL + 本地 1s 同步 |
@@ -71,6 +72,46 @@
 | 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
 | 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
 | 选举 | 续约失败 → **立即降级停写**（fail-closed）；无切换直至 Redis 恢复 |
+
+### 3.1 注册表：值格式、回收判据与身份前提
+
+本节是注册表契约的权威说明；运维侧的取值要求见 `ops.md` §13.5b/§13.6。
+
+**值格式是冻结的**：`hydra:{nodes}` 的字段值恒为 `role|control_url`（如
+`leader|http://hydra-control-a:8081`）。**不得**往里追加时间戳或版本前缀——
+追加会让时间戳粘进 `control_url`（把对端的转发目标写坏），加 `v2|` 前缀会让
+`role` 变成 `"v2"`，而 `active_leader_url()` 按 `role == "leader"` 判断 ⇒ 返回
+`None` ⇒ **每一次 standby 管理写都 503**。因此"最后可见时间"放在**独立键**里：
+
+| 键 | 语义 |
+|---|---|
+| `hydra:{nodes}` | `node_id → "role|control_url"`（值格式不变） |
+| `hydra:{node:hb}:<id>` | 心跳，TTL 30s；缺失即视为离线 |
+| `hydra:{node:seen}:<id>` | 回收**见证**，TTL = `HYDRA_REGISTRY_STALE_GRACE_SECS`（默认 120） |
+| `hydra:{node:reap}:<id>` | 回收器自己的"一击"标记（无 TTL；见下） |
+
+**续期与注册是同一个入口**（`NodeRegistry::register(ttl, seen_ttl)`，每 20s 调用）：
+它同时**重写行**、续心跳、续见证。历史实现把两者分开（启动注册一次、20s 只续心跳），
+结果是节点启动后 `role`/`control_url` 变化时行值**永远停在启动值**却一直"活着"。
+
+**回收判据（两击）**：一次扫描同时满足"心跳缺失 **且** 见证缺失"时**不立即删除**，
+而是写一个 `hydra:{node:reap}:<id>` 标记并跳过；只有**下一次**扫描仍处于同一状态
+（≥60s 连续静默，即三个心跳周期）才真正删除，任何生命迹象（心跳或见证键）都会
+**清除**该标记。**当前租约持有者永不回收**（`active_leader_url()` 不看心跳，删掉它的行
+会让所有备用节点失去唯一的转发指针）。
+
+> 两击规则不是保守，而是必要：**未升级节点只在启动时写一次行**（其 20s 循环只续心跳），
+> 所以一次 ≥30s 的心跳中断若导致行被删，该节点会**永远**从 `list_nodes`/
+> `leader_control_urls` 消失；若它正持租约，所有 standby 的管理写会**永久 503**
+> （转发是 fail-closed，无静态回退）。历史积压仍会被清理，只晚一个 tick。
+
+**身份前提（控制器要求）**：节点身份取 `HYDRA_NODE_ID` → `HOSTNAME` → 随机。
+`HOSTNAME` 这一层只在 **StatefulSet**（或固定 Pod 名的 Deployment）下稳定；普通
+Deployment 每次重启都换 Pod 名，该层回退**无收益**。**两个节点绝不能共用同一个
+`HOSTNAME`**：它们会共用一行注册，任一方的停机 `unregister()` 会删掉对方的注册；
+更严重的是——**该 id 同时是租约身份**（`GET hydra:lease == 本节点 id` 即续租）——
+两个进程会**同时认为自己是 leader**（脑裂），而两个"leader"会各自接受管理写并
+各自发布快照。生产上用显式 `HYDRA_NODE_ID` 或 StatefulSet 固定名。
 
 ---
 

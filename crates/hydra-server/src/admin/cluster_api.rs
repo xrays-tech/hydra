@@ -299,3 +299,166 @@ pub(super) async fn reload(state: &AdminState, force: bool, trace_id: &str) -> R
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{KeyProvider, StaticKeyProvider};
+    use hydra_core::config::ConfigData;
+    use std::sync::Arc;
+
+    /// Build an `AdminState` for the direct-call tests below.
+    ///
+    /// `internal_control` is `pub(super)`, so these live in the module rather than
+    /// in `tests/` (an integration test cannot see it) — which is exactly why the
+    /// non-candidate branch had NEVER been executed before: over HTTP the router
+    /// answers 404 for an edge before dispatch ever happens.
+    async fn state(edge_mode: bool, is_leader: Option<bool>) -> Arc<AdminState> {
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+        let kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+        let store = crate::store::ConfigStore::load(pool.clone(), kp.clone())
+            .await
+            .expect("ConfigStore::load");
+        // Seed ONE provider and reload: a fresh store has version 0, and with
+        // `since=0 >= current=0` the CHEAP path would answer 200 before any gate
+        // is reached — the assertions below would then be vacuous.
+        crate::db::insert_provider(
+            &pool,
+            &hydra_core::model::Provider {
+                id: "p1".into(),
+                key: "k1".into(),
+                name: "P".into(),
+                endpoint: "http://127.0.0.1:1/".into(),
+                weight: 1,
+                created_at: "2026-01-01 00:00:00".into(),
+                updated_at: "2026-01-01 00:00:00".into(),
+                max_concurrency: None,
+                max_queue_depth: None,
+                queue_wait_timeout_ms: None,
+            },
+        )
+        .await
+        .expect("insert provider");
+        store.reload_all().await.expect("reload");
+        assert!(store.version() > 0, "fixture: the store must have content");
+        let auth = Arc::new(
+            crate::http::HttpAuthChecker::new(
+                crate::http::AuthCache::new(
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(30),
+                ),
+                crate::http::AuthConfig::default(),
+            )
+            .expect("HttpAuthChecker"),
+        );
+        let breaker = Arc::new(crate::proxy::breaker_wrap::CircuitBreaker::new(
+            hydra_core::breaker::BreakerConfig::new(2),
+        ));
+        let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+            is_leader.map(|v| Arc::new(move || v) as Arc<dyn Fn() -> bool + Send + Sync>);
+        Arc::new(AdminState::new(
+            Some(pool),
+            store,
+            auth,
+            breaker,
+            kp,
+            Some("admin-token-16chars".to_string()),
+            crate::proxy::admission::AdmissionControl::new(),
+            edge_mode,
+            Some("cluster-token".to_string()),
+            leader_ready,
+        ))
+    }
+
+    fn body_json(resp: &Resp) -> serde_json::Value {
+        serde_json::from_slice(resp.body()).expect("error body is JSON")
+    }
+
+    /// (T4, defence in depth) A NON-CANDIDATE must be refused by the handler
+    /// itself, not only by the router.
+    ///
+    /// Over HTTP an edge is 404'd before dispatch (`AdminService::response`), so
+    /// this branch exists for a future role that keeps the admin API without being
+    /// a leader candidate. Calling the handler directly is the only way to execute
+    /// it — and it is what makes the 404 in `tests/cluster.rs` verifiably
+    /// "pre-existing router behaviour" rather than a claim.
+    #[tokio::test]
+    async fn a_non_candidate_is_refused_by_the_handler_itself() {
+        // edge_mode ⇒ is_leader_candidate() == false, *and* it claims to hold the
+        // lease: the role gate must still win.
+        let state = state(true, Some(true)).await;
+        let resp = internal_control(&state, Some("since=0"), "t").await;
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "a non-candidate serves nothing"
+        );
+        let body = body_json(&resp);
+        assert_eq!(body["error"]["code"], "not_found", "got {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("leader-candidate")),
+            "the reason must name the eligibility rule: {body}"
+        );
+    }
+
+    /// A candidate WITHOUT the lease is the 503 case (the T4 fix), asserted here
+    /// directly so the mapping is pinned even if the HTTP-level test is refactored.
+    #[tokio::test]
+    async fn a_candidate_without_the_lease_is_503_not_leader() {
+        let state = state(false, Some(false)).await;
+        let resp = internal_control(&state, Some("since=0"), "t").await;
+        assert_eq!(resp.status().as_u16(), 503);
+        let body = body_json(&resp);
+        assert_eq!(body["error"]["code"], "not_leader", "got {body}");
+        assert!(
+            body.get("snapshot").is_none(),
+            "no payload in an error: {body}"
+        );
+    }
+
+    /// ...while the CHEAP path (`since >= current`) stays ungated even for a
+    /// non-holder: gating it would turn every follower's quiet poll into an error
+    /// storm whenever the fleet has no leader.
+    #[tokio::test]
+    async fn the_cheap_path_is_not_gated_by_the_lease() {
+        let state = state(false, Some(false)).await;
+        // Current version is whatever the store was built with; asking with a
+        // `since` at least that high takes the cheap path.
+        let current = state.store.version();
+        let resp = internal_control(&state, Some(&format!("since={current}")), "t").await;
+        assert_eq!(resp.status().as_u16(), 200, "cheap path stays 200");
+        let body = body_json(&resp);
+        assert_eq!(body["snapshot"], serde_json::Value::Null, "got {body}");
+    }
+
+    /// A node with NO replication content yet answers 503 `not_ready` — the guard
+    /// that keeps an empty-fidelity snapshot from ever being published.
+    #[tokio::test]
+    async fn a_node_without_content_is_not_ready() {
+        let state = state(false, Some(true)).await;
+        // An edge-shaped store has no content; simulate it directly.
+        let empty = Arc::new(AdminState::new(
+            None,
+            crate::store::ConfigStore::from_snapshot(ConfigData::default(), {
+                let kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+                kp
+            }),
+            state.auth.clone(),
+            state.breaker.clone(),
+            state.key_provider.clone(),
+            Some("admin-token-16chars".to_string()),
+            crate::proxy::admission::AdmissionControl::new(),
+            false,
+            Some("cluster-token".to_string()),
+            Some(Arc::new(|| true) as Arc<dyn Fn() -> bool + Send + Sync>),
+        ));
+        let resp = internal_control(&empty, Some("since=0"), "t").await;
+        assert_eq!(resp.status().as_u16(), 503);
+        assert_eq!(body_json(&resp)["error"]["code"], "not_ready");
+    }
+}

@@ -3974,3 +3974,23 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 用例 | `t10_2_the_presented_chain_verifies_to_the_root`：服务端用真实 fullchain（leaf + intermediate），客户端**只信任 `root.crt`** 且 **`SslVerifyMode::PEER`**（真校验，不再是 `NONE`）⇒ 握手**成功**；**反证在同一条用例内**：同一客户端打"只发 leaf、不发中间证书"的服务端 ⇒ 握手**必须失败**（断言失败来自 handshake），因此该用例不可能因为"校验太宽松"而通过 |
 | 与旧用例的区别 | 旧 `t6_5` 用 `beta.crt`（另一张自签叶子）冒充中间证书、并且 `SslVerifyMode::NONE` ⇒ 只证明**携带**。新用例证明**链有效**。旧用例保留（它测的是 bundle 解析/携带语义，与新用例互补） |
 | 门禁 | fmt clean；clippy **0 warning**；`--features server` **30 套件 0 failed**（tls 套件 7→**8**） |
+
+### Batch 16 — T10.6 余项（`cluster.md` 注册表章节）+ T4 纵深防御分支的直接单测
+
+| 项 | 内容 |
+|---|---|
+| `dev-docs/cluster.md` 新增 **§3.1 注册表：值格式、回收判据与身份前提** | 这是计划指定的集群设计权威文档，此前本章节**零**提及见证键/回收/身份回退（这些只存在于 `ops.md` §13.6 与代码注释里）。新增内容：**值格式冻结**（`role\|control_url`，并写明两种破坏方式：后缀会污染 `control_url`、`v2\|` 前缀会让 `role!="leader"` ⇒ 每次 standby 管理写 503）；四个键的语义表（含 `hydra:{node:seen}:` 与 `hydra:{node:reap}:`）；**注册与续期同一入口**（并说明历史实现的"只续心跳不重写行"缺陷）；**两击回收判据** + **租约持有者永不回收**；**身份前提**（StatefulSet/固定 Pod 名、共用 `HOSTNAME` 的三重后果——共用注册行、任一方的 `unregister()` 删掉对方的注册、以及因该 id 同时是租约身份而导致的**脑裂**）；§2 环境变量表补 `HYDRA_NODE_ID` 的回退前提与 `HYDRA_REGISTRY_STALE_GRACE_SECS`；§3 共享状态表补第三个键 |
+| `admin/cluster_api.rs` 新增 `#[cfg(test)] mod tests`（**4 例**） | T4 新增的"非候选 ⇒ 404"分支在**生产不可达**（路由先 404），此前只由 HTTP 级用例覆盖 = 实际测的是路由。`internal_control` 是 `pub(super)`，集成测试看不到，因此单测必须放在该模块内：① **非候选（edge）且自称持租约 ⇒ 仍 404**，且文案点明资格规则；② 候选但无租约 ⇒ **503 `not_leader`** 且错误体不含 payload；③ **廉价路径不受租约门控**（非持有者 `since >= current` 仍 200 + `snapshot:null`）；④ `replication()` 为 `None` ⇒ **503 `not_ready`**（"空 fidelity 永不会被当快照发出"的那道守卫）。**这一步真正执行了新分支**，不再只是"由既有代码满足验收" |
+| 开发中修掉的一个自身陷阱（值得记） | 前两条单测第一次**拿不到 404/503**：新库的 `version` 是 **0**，而 `since=0 >= current=0` ⇒ **廉价路径先返回 200**，门根本到不了（断言会"通过"在错误的分支上）。已让 fixture 先种一个 provider 再 `reload_all`，并加 `assert!(store.version() > 0)` 把前提钉住 |
+
+**Phase C/D 统一门禁（计划命令集，逐条）**
+
+| 步骤 | 结果 |
+|---|---|
+| lockfile / fmt / 两种 clippy | ✅ `Locking 0 packages`；fmt clean；两种特性组合 clippy **均 0 warning** |
+| 两种 release build | ✅ Finished（10.43s） |
+| `hydra-core` 测试 + 依赖防火墙 | ✅ 15 套件 0 failed；防火墙 OK（无 tokio/pingora/sqlx/reqwest/hyper） |
+| `--features server` 全量 | ✅ **30 套件 0 failed** |
+| 三特性全量 | ✅ **439 passed / 0 failed** |
+| 脚本门禁 | ✅ `check_i18n` OK（334 keys/4 locales）、`node --test` `# fail 0`、`ask_llm.test.sh` ALL PASSED |
+| Playwright（本 Phase 涉及 UI） | ✅ **14 passed**（真实二进制 + 真实 Chromium；单节点负向 + 桩化 fleet 正向 + T2.2b 两条 `clearsFK` 路径） |
