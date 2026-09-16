@@ -3912,7 +3912,9 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 修法（**保留**探测即释放） | 带数由 `pid % 100` 改为**哈希**（`pid × 2654435761 mod 200`），带宽 200×100，仍取在 Linux 临时端口区（32768+）之下；注释**如实**写明：窗口仍存在、本函数只是让两个进程"极不可能同时探测同一候选"，**并点明残余风险**——`band(pid) == band(pid')` 当且仅当 `pid ≡ pid' (mod 200)`，哈希只是把碰撞换了个位置，**不是**"消除了竞争" |
 | 为什么不持有 socket（计划 O20 已实测） | 调用方把端口交给 **Pingora 去 bind**（12 个测试文件共 38 处调用）。持有监听 socket 会让第二次 bind 直接 `EADDRINUSE`——Pingora 只设 `SO_REUSEADDR`、**没有** `SO_REUSEPORT` ⇒ v1 方案会让**几乎整套集成测试**无法 bind |
 | 用例 | `port_bands_do_not_repeat_for_nearby_pids`：断言 `band(pid) != band(pid+100)`（正是被修掉的那条）与相邻 PID 不相撞，**并正面断言** `band(pid) == band(pid+200)` 以把残余风险钉在测试里（诚实标注而非假装消除）；`ephemeral_ports_are_bindable_and_distinct`：连续两次分配不重复，且两个端口都**真的可 bind**（证明探测确实释放了） |
-| 门禁 | fmt clean；clippy **0 warning**；`--features server` **28 套件 0 failed**；计划要求的并发复核 **`--test-threads=8` 连跑 3 次、每次 0 个 FAILED 套件**（这是原 flake 的症状面） |
+| 用例宿主的选择（开发中修正） | 两个用例最初写在 `tests/common/mod.rs` 的 `#[cfg(test)] mod tests` 里——但 `mod common` 被**每个**测试目标声明，那会让同两条断言在每个 target 各跑一遍（二十多次），既拖慢又在各套件计数里灌水、把真回归埋掉。已改为：把带数计算抽成 `common::port_band(pid)`（连同 `PORT_BANDS`/`PORTS_PER_BAND` 常量），用例放进**独立目标** `tests/test_port_allocation.rs` |
+| 门禁 | fmt clean；clippy **0 warning**；`--features server` **29 套件 0 failed**；三特性 **432 passed / 0 failed**（含新目标 2 例）；计划要求的并发复核 **`--test-threads=8` 连跑 3 次、每次 0 个 FAILED 套件** |
+
 
 ### Batch 11 — T10.6（部分）四处"文档与代码不符"更正
 

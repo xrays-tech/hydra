@@ -68,6 +68,25 @@ pub async fn real_redis_pool(db: u8) -> fred::clients::Pool {
     pool
 }
 
+/// How many 100-port bands the allocator spreads processes across. Below the
+/// Linux ephemeral range (32768+) so Pingora's own outbound connections cannot
+/// collide with the block.
+pub const PORT_BANDS: u64 = 200;
+/// Ports probed inside one band before giving up.
+pub const PORTS_PER_BAND: u32 = 100;
+
+/// The band a process id maps to. Exposed so a test can pin the collision rule
+/// (see `tests/test_port_allocation.rs`) without duplicating the formula.
+///
+/// A HASH, not `pid % N`: with `% 100` two pids 100 apart shared a band, so two
+/// test processes fought over one range of ports. Hashing moves collisions — it
+/// does not remove them: `port_band(pid) == port_band(pid')` exactly when
+/// `pid ≡ pid' (mod PORT_BANDS)`.
+#[must_use]
+pub fn port_band(pid: u64) -> u64 {
+    pid.wrapping_mul(2_654_435_761) % PORT_BANDS
+}
+
 /// A unique TCP port for a test listener.
 ///
 /// HONEST ABOUT THE MECHANISM: the candidate is probed with a real `bind` and the
@@ -96,12 +115,7 @@ pub fn ephemeral_port() -> u16 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
 
-    // 200 bands × 100 ports, drawn below the Linux ephemeral range (32768+) so
-    // Pingora's own outbound connections cannot collide with the block.
-    const BANDS: u64 = 200;
-    const PORTS_PER_BAND: u32 = 100;
-    let band = (std::process::id() as u64).wrapping_mul(2_654_435_761) % BANDS;
-    let base = 12_000u32 + (band as u32) * PORTS_PER_BAND;
+    let base = 12_000u32 + (port_band(u64::from(std::process::id())) as u32) * PORTS_PER_BAND;
     for _ in 0..PORTS_PER_BAND {
         let port = (base + NEXT.fetch_add(1, Ordering::Relaxed) % PORTS_PER_BAND) as u16;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -132,51 +146,5 @@ pub fn hydrated(
             tenant_providers: Vec::new(),
             tenant_models: Vec::new(),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// T10.1 — consecutive and BAND-ADJACENT pids must not share a band.
-    ///
-    /// The previous `pid % 100` handed two pids 100 apart the same 100-port
-    /// block, so two test binaries could fight over one range. The band is a hash
-    /// now; this pins the property that motivated the change, and also records
-    /// the residual collision rule (`pid ≡ pid' (mod 200)`) instead of implying
-    /// it was eliminated.
-    #[test]
-    fn port_bands_do_not_repeat_for_nearby_pids() {
-        const BANDS: u64 = 200;
-        let band = |pid: u64| pid.wrapping_mul(2_654_435_761) % BANDS;
-
-        let base = 123_456u64;
-        assert_ne!(
-            band(base),
-            band(base + 100),
-            "pids 100 apart used to share a band — that is the defect this fixes"
-        );
-        assert_ne!(band(base), band(base + 1), "consecutive pids differ");
-        // HONEST: hashing spreads collisions, it does not remove them.
-        assert_eq!(
-            band(base),
-            band(base + BANDS),
-            "pids 200 apart still share a band (documented residual risk)"
-        );
-    }
-
-    /// A probed port really is bindable and unique within one call sequence.
-    #[test]
-    fn ephemeral_ports_are_bindable_and_distinct() {
-        let a = ephemeral_port();
-        let b = ephemeral_port();
-        assert_ne!(a, b, "the caller must not get the same port twice");
-        for port in [a, b] {
-            assert!(
-                std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-                "port {port} must be bindable (the probe released it on purpose)"
-            );
-        }
     }
 }
