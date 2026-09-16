@@ -23,6 +23,26 @@ pub struct EndpointUrl {
 }
 
 impl EndpointUrl {
+    /// The host as it must appear INSIDE an authority — bracketed when it is an
+    /// IPv6 literal.
+    ///
+    /// `host` itself is stored unbracketed (`[::1]:8080` parses to `::1`), but
+    /// an authority may not contain a bare IPv6 address: `http://::1:8080/…` is
+    /// not a URL, and `::1:8080` is not a socket address. Both the URL rewrite
+    /// and the dialler therefore have to bracket it, and doing it here keeps the
+    /// two from drifting apart — the drift this module's docs promise cannot
+    /// happen (review D1/H-5).
+    #[must_use]
+    pub fn authority_host(&self) -> std::borrow::Cow<'_, str> {
+        if self.host.contains(':') {
+            std::borrow::Cow::Owned(format!("[{}]", self.host))
+        } else {
+            std::borrow::Cow::Borrowed(self.host.as_str())
+        }
+    }
+}
+
+impl EndpointUrl {
     /// Parse a provider endpoint URL — **the single parser shared by the config
     /// loader, the admin write boundary and the upstream dialler**.
     ///
@@ -173,7 +193,7 @@ pub fn rewrite_path(req_path: &str, endpoint: &EndpointUrl) -> String {
     );
     out.push_str(&endpoint.scheme);
     out.push_str("://");
-    out.push_str(&endpoint.host);
+    out.push_str(&endpoint.authority_host());
     // Only render the port when it is not the scheme default.
     let default_port = match endpoint.scheme.as_str() {
         "https" => Some(443),

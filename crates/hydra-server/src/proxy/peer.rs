@@ -39,7 +39,9 @@ pub fn parse_endpoint(endpoint: &str) -> Option<EndpointUrl> {
 /// the path rewrite (handled in `upstream_request_filter` via `rewrite_path`).
 pub fn build_peer(endpoint: &EndpointUrl) -> HttpPeer {
     let tls = endpoint.scheme == "https";
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
+    // `authority_host()` brackets an IPv6 literal, so `::1:8080` cannot be
+    // produced where a socket address is expected (review D1).
+    let addr = format!("{}:{}", endpoint.authority_host(), endpoint.port);
     HttpPeer::new(addr, tls, endpoint.host.clone())
 }
 
@@ -95,5 +97,45 @@ mod tests {
     fn parse_http_default_port_80() {
         let ep = parse_endpoint("http://upstream.local").unwrap();
         assert_eq!(ep.port, 80);
+    }
+}
+
+#[cfg(test)]
+mod dialability_tests {
+    use super::*;
+
+    /// REVIEW D1/H-5 — the second half of the contract: whatever the write
+    /// boundary accepts must survive a REAL URL parser (`reqwest`, i.e. the
+    /// dialler the terminate-mode proxy actually uses). A bracketed IPv6
+    /// endpoint used to compose to `http://::1:8080/…`, which `Url::parse`
+    /// rejects with "empty host" — accepted by the admin API, undialable for
+    /// every request.
+    #[test]
+    fn an_ipv6_endpoint_composes_a_url_reqwest_accepts() {
+        for raw in ["http://[::1]:8080/x", "https://[fd00::1]:8443"] {
+            let ep = parse_endpoint(raw).unwrap_or_else(|| panic!("{raw} must parse"));
+            let url = hydra_core::rewrite::rewrite_path("/v1/chat/completions", &ep);
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("{raw} ⇒ {url} must be a usable URL: {e}"));
+            // `url`'s `host_str()` keeps the brackets for an IPv6 literal, so
+            // compare against the bracketed authority form.
+            assert_eq!(
+                parsed.host_str(),
+                Some(ep.authority_host().as_ref()),
+                "{raw}"
+            );
+            assert_eq!(parsed.port_or_known_default(), Some(ep.port), "{raw}");
+        }
+    }
+
+    /// The peer address must be a socket address for the same reason.
+    #[test]
+    fn an_ipv6_endpoint_yields_a_socket_address() {
+        let ep = parse_endpoint("http://[::1]:8080").expect("bracketed IPv6");
+        let addr = format!("{}:{}", ep.authority_host(), ep.port);
+        assert!(
+            addr.parse::<std::net::SocketAddr>().is_ok(),
+            "peer address {addr:?} must parse"
+        );
     }
 }

@@ -248,3 +248,75 @@ fn endpoint_parse_ipv6_and_percent_robustness() {
         "percent-encoding in the host must be rejected"
     );
 }
+
+/// REVIEW D1/H-5 — the CONTRACT: whatever `EndpointUrl::parse` accepts must be
+/// dialable, i.e. the URL `rewrite_path` builds for it must be a valid URL.
+///
+/// The parse side used to strip the brackets off a bracketed IPv6 host and the
+/// compose side never put them back, so `http://[::1]:8080/x` was accepted by
+/// the admin write boundary (which uses this same parser) and then produced
+/// `http://::1:8080/…` — not a URL at all, so every request to that provider
+/// failed. The old parser kept the brackets by accident and DID work, which made
+/// this a regression, and the old test asserted the stripped form without ever
+/// checking dialability — it locked the bug in.
+#[test]
+fn every_accepted_endpoint_composes_a_dialable_url() {
+    for raw in [
+        "http://[::1]:8080/x",
+        "https://[fd00::1]:8443",
+        "https://[2001:db8::1]/v1",
+        "https://api.openai.com",
+        "https://api.openai.com:8443/v1/",
+        "http://127.0.0.1:9999/base",
+        "http://host.internal:80",
+    ] {
+        let ep = EndpointUrl::parse(raw).unwrap_or_else(|| panic!("{raw} must parse"));
+        let url = rewrite_path("/v1/chat/completions", &ep);
+        // `hydra-core` has a dependency firewall (no reqwest/url), so the shape
+        // is asserted here and the "a real URL parser accepts it" half lives in
+        // `hydra-server` (`proxy::peer::tests`, which has reqwest).
+        let authority = url
+            .strip_prefix(&format!("{}://", ep.scheme))
+            .unwrap_or_else(|| panic!("{raw} ⇒ {url} must start with the scheme"))
+            .split('/')
+            .next()
+            .expect("authority");
+        assert!(
+            !authority.is_empty() && !authority.trim_start().starts_with(':'),
+            "{raw} ⇒ {url}: the authority must not start with a bare colon \
+             (that is the unbracketed-IPv6 bug)"
+        );
+        // The dialler builds `authority_host:port`. For an IP literal that must
+        // be a socket address (an IPv6 literal needs its brackets — the bug);
+        // a DNS name is resolved instead, so only check that no bracket-less
+        // IPv6 (the ambiguous, undialable form) can appear.
+        let dial_addr = format!("{}:{}", ep.authority_host(), ep.port);
+        if ep.host.parse::<std::net::IpAddr>().is_ok() {
+            assert!(
+                dial_addr.parse::<std::net::SocketAddr>().is_ok(),
+                "{raw} ⇒ dial address {dial_addr:?} must be a valid socket address"
+            );
+        }
+        assert!(
+            !dial_addr.contains("::") || dial_addr.starts_with('['),
+            "{raw} ⇒ dial address {dial_addr:?} has a bracket-less IPv6 literal"
+        );
+        assert!(
+            url.ends_with("/v1/chat/completions"),
+            "{raw} ⇒ {url}: the request path must be preserved"
+        );
+    }
+
+    // And the address form the dialler builds must be a real socket address.
+    let ep = EndpointUrl::parse("http://[::1]:8080/x").expect("bracketed IPv6");
+    let addr = format!("{}:{}", ep.authority_host(), ep.port);
+    assert!(
+        addr.parse::<std::net::SocketAddr>().is_ok(),
+        "the dialler address {addr:?} must be a valid socket address"
+    );
+    assert_eq!(ep.host, "::1", "the host itself stays unbracketed");
+
+    // A bare IPv6 host (no brackets) is still rejected: the host:port split
+    // would be ambiguous, so it could not be dialled either.
+    assert!(EndpointUrl::parse("http://::1/").is_none());
+}
