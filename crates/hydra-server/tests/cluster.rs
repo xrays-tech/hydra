@@ -900,6 +900,79 @@ async fn freshness_gate_needs_a_materialized_replica() {
     );
 }
 
+/// (d) A TRANSIENT materialization failure must heal itself: the client never
+/// re-delivers a version its memory watermark already passed, so the gate would
+/// otherwise stay closed until a newer config write or a restart.
+#[tokio::test]
+async fn a_transient_materialization_failure_heals_on_the_next_poll() {
+    let leader_pool = common::setup_pool().await;
+    let kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let leader_store = ConfigStore::load(leader_pool.clone(), kp.clone())
+        .await
+        .expect("ConfigStore::load");
+    seed_and_reload(&leader_pool, &leader_store).await;
+    let version = leader_store.version();
+
+    let wire = SnapshotWire::build(
+        version,
+        ConfigData::clone(&leader_store.snapshot()),
+        &leader_pool,
+        kp.as_ref(),
+    )
+    .await
+    .expect("build wire");
+
+    // The replica's DB cannot commit the version marker yet (a REAL SQLite
+    // trigger, no mock): the rebuild fails, so the replica stays empty.
+    let replica_pool = common::setup_pool().await;
+    sqlx::query(
+        "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
+         BEGIN SELECT RAISE(ABORT, 'oracle: marker write blocked'); END",
+    )
+    .execute(&replica_pool)
+    .await
+    .expect("install trigger");
+
+    let standby_store = ConfigStore::from_snapshot(ConfigData::default(), kp.clone());
+    standby_store.apply_snapshot(ConfigData::default(), version);
+    let (gate, calls) = gate_recorder();
+    let hook = replica::gate_hook(
+        Arc::new(replica::MaterializationGuard::new()),
+        replica_pool.clone(),
+        standby_store,
+        kp.clone(),
+        gate,
+    );
+
+    hook(&hydra_server::cluster::control_client::PollOutcome::Applied(Box::new(wire)));
+    assert_eq!(
+        gate_calls(&calls, 1).await,
+        vec![false],
+        "the blocked marker must keep the gate closed"
+    );
+
+    // The fault clears; the NEXT poll (UpToDate — there is nothing newer to
+    // send) must retry the last snapshot and open the gate.
+    sqlx::query("DROP TRIGGER block_marker")
+        .execute(&replica_pool)
+        .await
+        .expect("drop trigger");
+    hook(&hydra_server::cluster::control_client::PollOutcome::UpToDate);
+    let seen = gate_calls(&calls, 2).await;
+    assert_eq!(
+        seen,
+        vec![false, true],
+        "a transient fault must heal without a new config version or a restart"
+    );
+    assert_eq!(
+        replica::replica_version(&replica_pool)
+            .await
+            .expect("version"),
+        Some(version),
+        "the replica caught up"
+    );
+}
+
 /// (b) A node whose STORE holds config but whose replica DB holds nothing must
 /// not be considered synced (the version watermark alone cannot tell a fresh
 /// node from a node that has content).

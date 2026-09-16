@@ -376,18 +376,21 @@ impl ConfigStore {
         let new_cfg = build_config(pool, self.key_provider.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
         // so the previous snapshot is preserved.
+        //
+        // PERSIST FIRST, THEN PUBLISH (review N3). The marker used to be written
+        // best-effort AFTER the in-memory swap, so one failed write left the
+        // in-memory version ahead of the durable one — and with the
+        // evidence-based freshness gate (`replica::replica_is_current`) that
+        // reads as "this node's replica is behind", disqualifying a node whose
+        // replica is in fact exactly what it serves. Failing the write now fails
+        // the admin mutation, which is recoverable; a silently diverging
+        // watermark is not.
+        let next = self.version.load(std::sync::atomic::Ordering::Acquire) + 1;
+        db::set_config_version(pool, next).await?;
         self.inner.store(Arc::new(new_cfg));
         self.swrr.clear();
-        let next = self
-            .version
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        // Persist so a restart resumes at this version (monotonic watermark;
-        // see `load`). Best-effort — the in-memory value still governs this
-        // process; a failed write only risks a lower watermark after restart.
-        if let Err(e) = db::set_config_version(pool, next).await {
-            tracing::warn!(version = next, error = %e, "failed to persist config version");
-        }
+        self.version
+            .store(next, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -415,6 +418,61 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
             },
+        );
+    }
+
+    /// REVIEW N3 — `reload_all` must persist the version marker BEFORE it
+    /// publishes the new snapshot.
+    ///
+    /// It used to swap the snapshot and advance the counter first, then write
+    /// the marker "best-effort" (warn only). One failed write therefore left the
+    /// in-memory version ahead of the durable one — and the evidence-based
+    /// freshness gate (`replica::replica_is_current`) reads that as "this node's
+    /// replica is behind", disqualifying a node whose replica is exactly what it
+    /// serves. Failing the reload is recoverable; a silently diverging watermark
+    /// is not.
+    ///
+    /// Fault injection is a real SQLite trigger (no mock).
+    #[tokio::test]
+    async fn reload_all_persists_the_marker_before_publishing() {
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+        let before = store.version();
+
+        sqlx::query(
+            "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
+             BEGIN SELECT RAISE(ABORT, 'oracle: marker write blocked'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install trigger");
+
+        assert!(
+            store.reload_all().await.is_err(),
+            "an unpersistable version must fail the reload"
+        );
+        assert_eq!(
+            store.version(),
+            before,
+            "the in-memory watermark must not advance past the durable one"
+        );
+
+        // Dropping the trigger lets the same call succeed and advance both.
+        sqlx::query("DROP TRIGGER block_marker")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        store.reload_all().await.expect("reload now succeeds");
+        assert_eq!(store.version(), before + 1);
+        assert_eq!(
+            crate::db::get_config_version(&pool)
+                .await
+                .expect("read marker"),
+            Some(before + 1),
+            "marker and memory agree"
         );
     }
 

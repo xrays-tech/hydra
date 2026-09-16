@@ -1296,9 +1296,17 @@ impl WipedTable {
 }
 
 /// Rebuild every config table from `cfg` (+ the fidelity rows) in a single
-/// transaction. Secrets are re-sealed at this boundary with `kp`.
+/// transaction, AND write the `config_version` marker in that same transaction.
+/// Secrets are re-sealed at this boundary with `kp`.
 ///
 /// Table order: parents first on insert (FK), children first on delete.
+///
+/// **The marker belongs to the content** (review B4). It used to be written as
+/// a separate statement after this function returned, so a crash (or any error)
+/// in between left the replica holding one version's content and another
+/// version's marker — contradicting the invariant this module documents, and,
+/// since the election freshness gate compares the marker against the store, it
+/// also made a node with perfectly correct content ineligible to lead.
 pub async fn restore_config(
     pool: &SqlitePool,
     kp: &dyn KeyProvider,
@@ -1306,6 +1314,7 @@ pub async fn restore_config(
     provider_models: &[hydra_core::model::ProviderModel],
     tenant_providers: &[hydra_core::model::TenantProvider],
     tenant_models: &[hydra_core::model::TenantModel],
+    version: u64,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -1481,6 +1490,15 @@ pub async fn restore_config(
         .execute(&mut *tx)
         .await?;
     }
+
+    // The version marker commits with the content it describes, or neither does.
+    sqlx::query(
+        "INSERT INTO config_meta (key, value) VALUES ('config_version', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(version.to_string())
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(())

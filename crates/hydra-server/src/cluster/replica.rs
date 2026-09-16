@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::cluster::control_client::PollOutcome;
 use crate::cluster::snapshot::{SnapshotError, SnapshotWire};
@@ -44,6 +44,10 @@ pub async fn materialize(
         }
     }
     let cfg = wire.clone().hydrate(kp)?;
+    // Content and version marker commit together (B4): a marker written
+    // afterwards could be lost on its own, leaving the replica at one version's
+    // content with another version's marker — which the freshness gate reads as
+    // "not synced".
     db::restore_config(
         pool,
         kp,
@@ -51,9 +55,9 @@ pub async fn materialize(
         &wire.provider_models,
         &wire.tenant_providers,
         &wire.tenant_models,
+        wire.version,
     )
     .await?;
-    db::set_config_version(pool, wire.version).await?;
     Ok(())
 }
 
@@ -80,13 +84,31 @@ pub struct MaterializationGuard {
     last_materialized_version: Arc<AtomicU64>,
     /// One rebuild at a time (see the docs above).
     in_flight: Arc<tokio::sync::Mutex<()>>,
+    /// The last snapshot DISPATCHED for materialization, kept so a failed
+    /// rebuild can be retried.
+    ///
+    /// The control client never re-delivers a version whose watermark already
+    /// moved in memory (`poll_once` asks with `since = store.version()`), so
+    /// without this a transient failure (a locked SQLite, a marker write that
+    /// could not commit) left the replica behind — and the node ineligible to
+    /// lead — until a NEWER config write or a process restart. The retry count
+    /// is bounded so a permanently unusable snapshot (wrong master key) cannot
+    /// burn the CPU rebuilding on every poll.
+    last_wire: Arc<std::sync::Mutex<Option<Arc<SnapshotWire>>>>,
+    retries_left: Arc<std::sync::atomic::AtomicU32>,
 }
+
+/// How many times a failed materialization is retried before the node gives up
+/// on that snapshot (a new snapshot resets the budget).
+const MAX_MATERIALIZATION_RETRIES: u32 = 3;
 
 impl Default for MaterializationGuard {
     fn default() -> Self {
         Self {
             last_materialized_version: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(tokio::sync::Mutex::new(())),
+            last_wire: Arc::new(std::sync::Mutex::new(None)),
+            retries_left: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
@@ -123,6 +145,39 @@ impl MaterializationGuard {
     pub fn last(&self) -> u64 {
         self.last_materialized_version.load(Ordering::Acquire)
     }
+
+    /// Remember a snapshot that is being dispatched (and reset the retry budget:
+    /// a newer snapshot deserves its own attempts).
+    fn remember(&self, wire: &SnapshotWire) {
+        *self
+            .last_wire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(wire.clone()));
+        self.retries_left
+            .store(MAX_MATERIALIZATION_RETRIES, Ordering::Release);
+    }
+
+    /// Take one retry of the last dispatched snapshot, if the budget allows and
+    /// there is one to retry. `None` = do not retry.
+    fn take_retry(&self) -> Option<Arc<SnapshotWire>> {
+        loop {
+            let left = self.retries_left.load(Ordering::Acquire);
+            if left == 0 {
+                return None;
+            }
+            if self
+                .retries_left
+                .compare_exchange(left, left - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return self
+                    .last_wire
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+            }
+        }
+    }
 }
 
 /// Handle one `Applied` control outcome for the standby replica (F-4):
@@ -151,6 +206,7 @@ pub fn on_applied(
         );
         return;
     }
+    guard.remember(wire);
     let pool = pool.clone();
     let wire = wire.clone();
     let mark_sync = mark_sync.clone();
@@ -232,15 +288,52 @@ pub fn gate_hook(
             let pool = pool.clone();
             let store = store.clone();
             let gate = gate.clone();
+            let guard = guard.clone();
+            let kp = kp.clone();
             tokio::spawn(async move {
-                let ok = replica_is_current(&pool, store.version()).await;
-                if !ok {
+                if replica_is_current(&pool, store.version()).await {
+                    gate(true);
+                    return;
+                }
+                // Behind: retry the last dispatched snapshot before giving up.
+                // Without this the node stays ineligible until a NEWER config
+                // write or a restart, because the client never re-delivers a
+                // version its memory watermark already passed.
+                let Some(wire) = guard.take_retry() else {
                     warn!(
                         store_version = store.version(),
-                        "replica is behind the store; keeping the leader-eligibility gate closed"
+                        "replica is behind the store and there is nothing left to retry; \
+                         keeping the leader-eligibility gate closed"
                     );
+                    gate(false);
+                    return;
+                };
+                let _serial = guard.in_flight.lock().await;
+                match materialize(&pool, kp.as_ref(), &wire).await {
+                    Ok(()) => {
+                        let ok = replica_is_current(&pool, store.version()).await;
+                        if ok {
+                            info!(
+                                version = wire.version,
+                                "replica materialization retry succeeded"
+                            );
+                        } else {
+                            warn!(
+                                version = wire.version,
+                                "replica materialization retry ran but the marker is still behind"
+                            );
+                        }
+                        gate(ok);
+                    }
+                    Err(e) => {
+                        warn!(
+                            version = wire.version,
+                            error = %e,
+                            "replica materialization retry failed; keeping the gate closed"
+                        );
+                        gate(false);
+                    }
                 }
-                gate(ok);
             });
         }
         PollOutcome::Applied(wire) => on_applied(&guard, &pool, kp.clone(), wire, &gate),
@@ -310,6 +403,78 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("gate not called {want} time(s)");
+    }
+
+    /// REVIEW B4 — content and version marker commit together, or neither does.
+    ///
+    /// The marker used to be a SEPARATE statement after `restore_config`'s
+    /// transaction had committed: a crash or error in between left the replica
+    /// holding one version's content and another version's marker — which the
+    /// freshness gate reads as "not synced", disqualifying a node whose content
+    /// is perfectly correct.
+    ///
+    /// Fault injection is a real SQLite trigger (no mock): abort every write to
+    /// `config_meta`.
+    #[tokio::test]
+    async fn content_and_marker_roll_back_together() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
+             BEGIN SELECT RAISE(ABORT, 'oracle: marker write blocked'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install trigger");
+
+        let kp: Arc<dyn KeyProvider> =
+            Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1));
+        let mut cfg = ConfigData::default();
+        cfg.providers.insert(
+            "p1".into(),
+            hydra_core::model::Provider {
+                id: "p1".into(),
+                key: "openai".into(),
+                name: "O".into(),
+                endpoint: "https://api.openai.com".into(),
+                weight: 1,
+                created_at: "2026-01-01 00:00:00".into(),
+                updated_at: "2026-01-01 00:00:00".into(),
+                max_concurrency: None,
+                max_queue_depth: None,
+                queue_wait_timeout_ms: None,
+            },
+        );
+        let wire = SnapshotWire {
+            version: 7,
+            cfg,
+            sealed_provider_keys: HashMap::new(),
+            sealed_certs: HashMap::new(),
+            provider_models: Vec::new(),
+            tenant_providers: Vec::new(),
+            tenant_models: Vec::new(),
+        };
+
+        let err = materialize(&pool, kp.as_ref(), &wire)
+            .await
+            .expect_err("the marker write must fail");
+        assert!(
+            err.to_string().contains("marker write blocked"),
+            "unexpected error: {err}"
+        );
+
+        // Neither half may survive: the content transaction must have rolled
+        // back WITH the marker instead of committing on its own.
+        assert!(
+            !crate::db::config_content_exists(&pool)
+                .await
+                .expect("content probe"),
+            "content committed without its version marker"
+        );
+        assert_eq!(
+            replica_version(&pool).await.expect("version"),
+            None,
+            "no marker either"
+        );
     }
 
     #[test]
