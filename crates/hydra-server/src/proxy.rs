@@ -17,7 +17,7 @@
 //!    `api-key` / `x-goog-api-key` / query param — `hydra_core::apikey`);
 //!    disagreeing transports resolve to the highest-precedence value.
 //! 3. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
-//! 4. `extract_model` over the *full* body (strict serde JSON parse — finds the
+//! 4. `extract_model_field` over the *full* body (strict serde JSON parse — finds the
 //!    root `model` at any position/schema, with string escapes decoded; the
 //!    stream-through "first-chunk gamble" is gone).
 //! 5. `router::resolve` + `swrr::order` → ordered candidate list.
@@ -279,7 +279,7 @@ impl ProxyHttp for HydraProxy {
     //   (3) mandatory api-key parse for every other request (401 missing_api_key)
     //   (4) external auth (cache-first) + metrics
     //   (5) read the FULL downstream body (loop → Bytes)
-    //   (6) extract_model over the full body (strict serde JSON parse — any
+    //   (6) extract_model_field over the full body (strict serde JSON parse — any
     //       position/schema, string escapes decoded)
     //   (7) pre-limit count gate (BEFORE routing: 429 even if routing would 503)
     //   (8) router::resolve + swrr::order  (+ passthrough fallback)
@@ -456,15 +456,27 @@ impl ProxyHttp for HydraProxy {
         } else {
             ModelField::Absent
         };
-        // A root `model` that is not a string, or whose member is AMBIGUOUS
-        // (a duplicated top-level `model` key, or an escaped top-level key that
-        // may alias `model`), must NOT be treated as "no model": that fell
-        // through to the model-less passthrough, which never consults the tenant
-        // model whitelist. Reject it instead. The body is still forwarded
-        // verbatim, so the upstream would otherwise read a model Hydra never
-        // authorized (or a different one than the one it authorized).
-        if matches!(model_field, ModelField::NotAString | ModelField::Ambiguous) {
-            debug!(tenant = %tenant_id, "root model member is not a string or is ambiguous");
+        // A root `model` that is not a string, whose member is AMBIGUOUS (a
+        // duplicated top-level `model` key, or an escaped top-level key that
+        // may alias `model`), or a body Hydra could not parse as one JSON
+        // object (MALFORMED — trailing content, a rejected escape, a
+        // non-object root, a truncated value) must NOT be treated as "no
+        // model": that fell through to the model-less passthrough, which never
+        // consults the tenant model whitelist. Reject it instead. The body is
+        // still forwarded verbatim, so the upstream would otherwise read a
+        // model Hydra never authorized (or a different one than the one it
+        // authorized).
+        //
+        // `Absent` stays reserved for a well-formed JSON object with no `model`
+        // member — the documented `NonRouteStrategy` case.
+        if matches!(
+            model_field,
+            ModelField::NotAString | ModelField::Ambiguous | ModelField::Malformed
+        ) {
+            debug!(
+                tenant = %tenant_id,
+                "rejecting request: root model is not a string / is ambiguous / the body is not one JSON object"
+            );
             return short_circuit(session, 400, "invalid_model_field").await;
         }
         // The model value is already a decoded, valid UTF-8 string (serde_json
@@ -472,7 +484,10 @@ impl ProxyHttp for HydraProxy {
         // provider will read, so routing/whitelist match the upstream model.
         let model_opt: Option<String> = match model_field {
             ModelField::Value(v) => Some(v.into_string()),
-            ModelField::Absent | ModelField::NotAString | ModelField::Ambiguous => None,
+            ModelField::Absent
+            | ModelField::NotAString
+            | ModelField::Ambiguous
+            | ModelField::Malformed => None,
         };
 
         // (7) Pre-limit count gate (§6.3 §7 / §10.3). Runs BEFORE routing so a

@@ -47,18 +47,24 @@
 //! This is a strict serde-based re-implementation. The observable differences
 //! are all in the direction of failing closed:
 //!
-//! - **Malformed / truncated bodies** (an unclosed root object, trailing
-//!   garbage, or an unterminated string) return [`ModelField::Absent`]: a body
-//!   the provider cannot parse as one JSON value is not a body Hydra can
-//!   authorize on. (The old scanner returned the first model it had seen for a
-//!   truncated body.)
+//! - **Malformed bodies** (an unclosed root object, trailing content after the
+//!   value, a non-object root, or a string whose escapes serde_json rejects)
+//!   return [`ModelField::Malformed`] — a distinct state from [`Absent`], so a
+//!   caller cannot mistake "Hydra could not parse this body" for "the body has
+//!   no `model` member". The two differ in consequence: `Absent` is the
+//!   documented model-less passthrough (no whitelist), `Malformed` must be
+//!   rejected. (The old scanner returned the first model it had seen for a
+//!   truncated body — it never validated the body at all.)
 //! - **Escapes are decoded**: a `"model"` value such as `"gpt\u002d4"` is
 //!   authorized as `gpt-4`, matching the provider. The old scanner returned the
 //!   raw, un-decoded bytes.
 //! - **Escaped top-level keys are decoded**: a key such as `"\u006dodel"` is
 //!   recognized as `"model"` (the provider decodes it too). The old scanner
-//!   could not decode a key and treated any escaped top-level key as
-//!   [`ModelField::Ambiguous`].
+//!   could not decode keys, so such a body was simply not attributed to
+//!   `"model"` at all.
+//!
+//! [`Absent`]: ModelField::Absent
+//! [`Malformed`]: ModelField::Malformed
 
 use std::borrow::Cow;
 use std::fmt;
@@ -104,9 +110,10 @@ impl ModelValue<'_> {
 /// One `"model"` member of the root JSON object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelField<'a> {
-    /// The root object has no `"model"` member at all, **or** the body was not
-    /// a single well-formed JSON object (malformed, truncated, or a non-object
-    /// root). In both cases there is no model Hydra can authorize on.
+    /// The root object is well-formed JSON and has no `"model"` member at all.
+    /// This is the **only** state that means "no model to authorize": it feeds
+    /// the documented model-less passthrough (`NonRouteStrategy`). A body Hydra
+    /// could not parse is [`ModelField::Malformed`], never this.
     Absent,
     /// The root `"model"` is a JSON string. The content is the decoded string
     /// (escape sequences resolved), zero-copy borrowed when it had no escapes.
@@ -121,6 +128,17 @@ pub enum ModelField<'a> {
     /// disagree on which duplicate wins, so the provider may read a different
     /// model than Hydra authorized; callers MUST reject the request.
     Ambiguous,
+    /// The body is not a single well-formed JSON **object**: a parse error, a
+    /// truncated/unterminated value, trailing content after the value, a
+    /// non-object root, or a string escape serde_json rejects.
+    ///
+    /// Callers MUST reject this and must NOT treat it as [`ModelField::Absent`].
+    /// The two are deliberately different states: `Absent` leads to the
+    /// model-less passthrough (which never consults the tenant model
+    /// whitelist), while the body is still forwarded upstream verbatim — so
+    /// conflating them let any body Hydra could not parse skip authorization
+    /// entirely, while the provider parsed its own `"model"` and served it.
+    Malformed,
 }
 
 /// The result of streaming the root object's members. `Deserialize` borrows the
@@ -293,17 +311,20 @@ impl<'de> Visitor<'de> for ModelValueAnyVisitor {
 
 /// Extract the root object's `"model"` member.
 ///
-/// The body is stream-parsed with `serde_json`, borrowing the input. Any serde
-/// error (malformed, truncated, or a non-object root) and any trailing content
-/// after the root object collapse to [`ModelField::Absent`]: a body the provider
-/// cannot parse as one JSON value is not a body Hydra can authorize on.
+/// The body is stream-parsed with `serde_json`, borrowing the input. Anything
+/// that is not one well-formed JSON **object** — a parse error, a truncated or
+/// unterminated value, trailing content after the value, a non-object root, or
+/// a string escape serde_json rejects — returns [`ModelField::Malformed`].
+/// [`ModelField::Absent`] is returned only for a well-formed root object that
+/// simply has no `"model"` member.
 ///
 /// **Cost note:** this is one full linear pass over the body (no first-hit
 /// early exit), because a top-level `"model"` only resolves unambiguously once
 /// the whole root object has been seen (a later duplicate must still be
 /// detected). The caller bounds the body by the 413 hard cap before calling
-/// here, and the pass allocates nothing except any model string (and any
-/// top-level key) that carries escape sequences.
+/// here. A clean (escape-free) `model` value stays a zero-copy borrow; escaped
+/// values/keys and serde_json's own skipped-value scratch are the only
+/// allocations.
 #[must_use]
 pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
     let mut de = serde_json::Deserializer::from_slice(body);
@@ -314,21 +335,31 @@ pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
         Ok(RootParse::Value(v)) => ModelField::Value(v),
         Ok(RootParse::NotAString) => ModelField::NotAString,
         Ok(RootParse::Ambiguous) => ModelField::Ambiguous,
-        Ok(RootParse::Absent) | Err(_) => ModelField::Absent,
+        Ok(RootParse::Absent) => ModelField::Absent,
+        // A non-object root also lands here: `RootParse` deserializes the root
+        // as a map, so serde_json reports an invalid-type error for an array,
+        // string, number, bool or `null` root.
+        Err(_) => ModelField::Malformed,
     }
 }
 
 /// Convenience view of [`extract_model_field`] for callers that only want a
 /// well-formed string value.
 ///
-/// This collapses [`ModelField::Absent`], [`ModelField::NotAString`] and
-/// [`ModelField::Ambiguous`] into `None`. Authorization call sites must use
-/// [`extract_model_field`] directly, so that a non-string or ambiguous
-/// `"model"` is rejected rather than treated as absent.
+/// **Lossy by construction** — it collapses [`ModelField::Absent`],
+/// [`ModelField::NotAString`], [`ModelField::Ambiguous`] and
+/// [`ModelField::Malformed`] into one `None`, which is exactly the equivalence
+/// that must NOT drive authorization. Authorization call sites must use
+/// [`extract_model_field`] directly (see `proxy.rs`), so that a non-string,
+/// ambiguous or unparsable body is rejected instead of treated as absent. The
+/// name carries the warning on purpose.
 #[must_use]
-pub fn extract_model(body: &[u8]) -> Option<String> {
+pub fn extract_model_lossy(body: &[u8]) -> Option<String> {
     match extract_model_field(body) {
         ModelField::Value(v) => Some(v.into_string()),
-        ModelField::Absent | ModelField::NotAString | ModelField::Ambiguous => None,
+        ModelField::Absent
+        | ModelField::NotAString
+        | ModelField::Ambiguous
+        | ModelField::Malformed => None,
     }
 }

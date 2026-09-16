@@ -3026,3 +3026,123 @@ async fn post_send_transport_error_is_not_failed_over_by_default() {
         "the second provider must NOT have been called (that is the double billing)"
     );
 }
+// ===========================================================================
+// REVIEW A1 — a body Hydra cannot parse must NOT be treated as "no model".
+//
+// `extract_model_field` used to collapse every serde_json error into `Absent`,
+// and at the call site `Absent` means "no `model` member" → the model-less
+// PASSTHROUGH, which never consults `tenant_models`. So any body Hydra could
+// not parse (trailing garbage, a raw control character, an extra top-level key
+// with an unpaired-surrogate escape, …) skipped the tenant model whitelist
+// entirely while being forwarded upstream VERBATIM — the provider then parsed
+// its own `model` and served it. Regression vs the pre-30011a8 scanner, which
+// returned the real root `model` for these inputs and answered 403.
+//
+// The tenant here is granted ONLY `gpt-4` (see `seed_one`), so every request
+// below must be rejected AND must never reach the upstream.
+// ===========================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unparsable_body_cannot_bypass_the_tenant_model_whitelist() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "unauthorized-model",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "LEAKED" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // (0) Control: the granted model is served, so a 200 below means a leak.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4","messages":[]}"#).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "control: the granted model must be served"
+    );
+    let _ = resp.text().await;
+
+    // (1) Bodies Hydra cannot parse. Each one is ACCEPTED by at least one
+    //     mainstream provider parser (Python/Node/Go all read `model` from the
+    //     first three; Go's `json.Decoder.Decode` also accepts trailing bytes),
+    //     so an accepted-by-Hydra request would be served upstream.
+    let cases: [(&str, &str); 6] = [
+        (
+            "trailing garbage",
+            r#"{"model":"unauthorized-model","messages":[]} trailing"#,
+        ),
+        (
+            "trailing NUL",
+            "{\"model\":\"unauthorized-model\",\"messages\":[]}\u{0}",
+        ),
+        (
+            "unpaired-surrogate escape in an extra top-level key",
+            r#"{"\ud800":1,"model":"unauthorized-model","messages":[]}"#,
+        ),
+        (
+            "invalid escape in an unrelated member",
+            r#"{"model":"unauthorized-model","messages":[],"x":"\q"}"#,
+        ),
+        ("truncated body", r#"{"model":"unauthorized-model""#),
+        ("non-object root", r#"[{"model":"unauthorized-model"}]"#),
+    ];
+    for (name, body) in cases {
+        let resp = send_one(&client, &url, body).await;
+        assert_eq!(
+            resp.status(),
+            400,
+            "`{name}` must be rejected (400 invalid_model_field), not passed through"
+        );
+        let text = resp.text().await.expect("body");
+        assert!(
+            text.contains("invalid_model_field"),
+            "`{name}` must say why it was rejected; body: {text}"
+        );
+    }
+
+    // (2) A malformed body whose WANTED model IS whitelisted must also be
+    //     rejected: the provider never sees a body Hydra could not authorize.
+    let resp = send_one(&client, &url, r#"{"model":"gpt-4","messages":[]} trailing"#).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "even a granted model must not ride a malformed body"
+    );
+    let _ = resp.text().await;
+
+    // (3) The real leak check: only the control request may have reached the
+    //     upstream, and its body must be the control's body.
+    let hits = upstream.received_requests().await.expect("recording on");
+    let posts: Vec<String> = hits
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the control request may reach the upstream; got {posts:#?}"
+    );
+    assert_eq!(posts[0], r#"{"model":"gpt-4","messages":[]}"#);
+}
