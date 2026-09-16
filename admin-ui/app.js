@@ -1,8 +1,11 @@
 /* Hydra admin UI — vanilla JS, no build step (design §14.2).
  *
  * Embedded via include_dir! at compile time. Talks same-origin to /api/v1/*
- * with `Authorization: Bearer <admin-token>`. The token is held in memory only
- * (never persisted) and cleared on sign-out / tab close.
+ * with `Authorization: Bearer <admin-token>`. The token is kept in
+ * `sessionStorage` for the current browser TAB (see `TOKEN_KEY`): a reload or
+ * an in-tab navigation stays signed in, closing the tab does not. Never
+ * `localStorage` — the admin token is the fleet's root credential and the
+ * admin surface is still plaintext HTTP.
  *
  * Config-driven: each of the 7 CRUD entities is described by a config object
  * (columns + form fields). Generic renderers build the table, the modal form
@@ -76,7 +79,30 @@ function icon(name, size = 17) {
  * State
  * ======================================================================== */
 const API = "/api/v1";
-let TOKEN = null;
+/* Admin token storage: sessionStorage, NOT localStorage.
+ * The admin token is the fleet's root credential and the admin surface is
+ * still plaintext HTTP, so a ticket must not outlive the browser tab.
+ * Survives reload / same-tab navigation; dies with the tab. */
+const TOKEN_KEY = "hydra-admin-token";
+function loadStoredToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY); } catch { return null; }
+}
+function storeToken(value) {
+  try {
+    if (value) sessionStorage.setItem(TOKEN_KEY, value);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch { /* storage disabled (private mode): stay in-memory only */ }
+}
+/** Re-entrant suppression for the global 401 handler. A COUNTER, not a
+ *  boolean: the leader banner poll fires background requests, and a single
+ *  flag would let one of those 401s be swallowed by a concurrent sign-in. */
+const suppress401 = {
+  n: 0,
+  enter() { this.n += 1; },
+  leave() { this.n = Math.max(0, this.n - 1); },
+  get active() { return this.n > 0; },
+};
+let TOKEN = loadStoredToken();
 let CURRENT = "providers";
 const FK = {};          // { providers: {list, map}, tenants: {...} } — lazy
 const COUNTS = {};      // section-key -> row count (for nav badges)
@@ -121,6 +147,9 @@ async function api(method, path, { body, query } = {}) {
     const message = json?.error?.message || (typeof json === "string" ? json : resp.statusText);
     const err = new Error(`${resp.status} ${code}: ${message}`);
     err.status = resp.status; err.code = code; err.body = json;
+    // A rotated/expired ticket used to leave every page half-logged-in: the
+    // requests kept failing with no way back except a manual reload.
+    if (resp.status === 401 && !suppress401.active) onSessionInvalid();
     throw err;
   }
   return json;
@@ -1142,8 +1171,13 @@ function highlightJson(obj) {
 /* ===========================================================================
  * Auth / login
  * ======================================================================== */
-function showLogin() {
-  TOKEN = null;
+/** The login VIEW only. Deliberately does NOT touch TOKEN or storage.
+ *
+ *  Doing so (the first draft did) makes a session restore impossible: `api()`
+ *  refuses to even fetch without a token, so a restore path that cleared the
+ *  token here would never issue the validation request and would always look
+ *  like a failure. */
+function showLoginView({ expired = false } = {}) {
   document.body.dataset.state = "locked";
   $("#login-overlay").classList.remove("hidden");
   $("#app").setAttribute("aria-hidden", "true");
@@ -1152,31 +1186,103 @@ function showLogin() {
   const tEl = ts.querySelector(".t");
   tEl.dataset.i18n = "common.auth.notAuthenticated";
   tEl.textContent = t("common.auth.notAuthenticated");
+  const err = $("#login-error");
+  if (expired) {
+    err.textContent = t("common.auth.sessionExpired");
+    err.classList.remove("hidden");
+  } else {
+    err.textContent = "";
+    err.classList.add("hidden");
+  }
   const inp = $("#login-token"); inp.value = ""; setTimeout(() => inp.focus(), 50);
 }
-async function tryLogin(token) {
-  TOKEN = token;
+
+/** Drop the ticket AND return to the login view. Logout / 401 only. */
+function showLogin({ expired = false } = {}) {
+  TOKEN = null;
+  storeToken(null);
+  showLoginView({ expired });
+}
+
+/** One place that switches from the login view to the app. */
+function enterApp() {
+  document.body.dataset.state = "ready";
+  $("#login-overlay").classList.add("hidden");
+  $("#app").setAttribute("aria-hidden", "false");
+  const ts = $("#token-status");
+  ts.classList.remove("bad"); ts.classList.add("ok");
+  const tEl = ts.querySelector(".t");
+  tEl.dataset.i18n = "common.auth.authenticated";
+  tEl.textContent = t("common.auth.authenticated");
+  renderNav();
+  go(CURRENT);
+  // A later phase installs `refreshLeaderBanner`. GUARDED on purpose: an
+  // unguarded call would throw `ReferenceError` on login — the failure class
+  // this repo has already shipped once ("the write landed and the UI still
+  // reported a failure").
+  if (typeof refreshLeaderBanner === "function") refreshLeaderBanner();
+}
+
+/** The single 401 handler for the whole app: drop the ticket, go back to the
+ *  login view and say so ONCE — instead of leaving every page half-logged-in. */
+function onSessionInvalid() {
+  if (document.body.dataset.state === "locked") return; // already there
+  showLogin({ expired: true });
+  toast(t("common.auth.sessionExpired"), "err");
+}
+
+/** Validate a ticket restored from sessionStorage.
+ *
+ *  ORDER IS LOAD-BEARING: the login view is drawn first, then the CANDIDATE is
+ *  put back in `TOKEN` BEFORE the validation call — `api()` throws without a
+ *  token, so validating first would never issue a request. The ticket is
+ *  cleared only on failure. */
+async function restoreSession() {
+  const candidate = TOKEN;
+  if (!candidate) { showLoginView(); return; }
+  TOKEN = candidate;
+  showLoginView();                       // view only: TOKEN stays set
   const btn = $("#login-btn");
-  setLoading(btn, true, t("common.auth.signingIn"));
+  setLoading(btn, true, t("common.auth.verifying"));
+  suppress401.enter();
   try {
     await api("GET", "/health");
-    document.body.dataset.state = "ready";
-    $("#login-overlay").classList.add("hidden");
-    $("#app").setAttribute("aria-hidden", "false");
-    const ts = $("#token-status");
-    ts.classList.remove("bad"); ts.classList.add("ok");
-    const tEl = ts.querySelector(".t");
-    tEl.dataset.i18n = "common.auth.authenticated";
-    tEl.textContent = t("common.auth.authenticated");
-    renderNav();
-    go(CURRENT);
+    enterApp();
+  } catch (e) {
+    // Fail closed: a ticket the server rejects must not leave a half-logged-in
+    // UI, and must not stay in storage.
+    TOKEN = null;
+    storeToken(null);
+    showLoginView({ expired: e.status === 401 });
+    const err = $("#login-error");
+    err.textContent = e.status === 401
+      ? t("common.auth.sessionExpired")
+      : t("common.auth.failed", { msg: e.message });
+    err.classList.remove("hidden");
+  } finally {
+    suppress401.leave();
+    setLoading(btn, false);
+  }
+}
+
+async function tryLogin(token) {
+  const btn = $("#login-btn");
+  setLoading(btn, true, t("common.auth.signingIn"));
+  suppress401.enter();           // a wrong manual token is not an expired session
+  TOKEN = token;
+  try {
+    await api("GET", "/health");
+    storeToken(token);           // persist only after the server accepted it
+    enterApp();
     toast(t("common.toast.signedIn"), "ok");
   } catch (e) {
-    TOKEN = null;
+    TOKEN = null;                // in-memory only: storage untouched, so a
+                                 // mistyped token cannot nuke a stored session
     const err = $("#login-error");
     err.textContent = t("common.auth.failed", { msg: e.message });
     err.classList.remove("hidden");
   } finally {
+    suppress401.leave();
     setLoading(btn, false);
   }
 }
@@ -1226,5 +1332,7 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   wireEvents();
   applyStaticI18n();
-  showLogin();
+  // A ticket left in this tab's sessionStorage is validated against the server
+  // before the app is shown; only its rejection returns to the login view.
+  restoreSession();
 });

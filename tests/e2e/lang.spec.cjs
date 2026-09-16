@@ -32,12 +32,13 @@ test.describe('Hydra admin UI — i18n', () => {
     await expect(page.locator('#page-title')).toContainText('提供方');
     await expect(page.locator('#token-status')).toContainText('已认证');
 
-    // Persisted across reload (the token is in-memory → sign in again).
+    // Persisted across reload. The session ALSO survives it now (the ticket
+    // lives in sessionStorage for this tab), so a reload must NOT bounce back
+    // to the login overlay — the old assertion here pinned the in-memory-only
+    // behaviour that T5 removes.
     await page.reload();
-    await page.locator('#login-overlay').waitFor({ state: 'visible' });
-    await page.fill('#login-token', TOKEN);
-    await page.click('#login-btn');
-    await expect(page.locator('#login-overlay')).toBeHidden({ timeout: 5000 });
+    await expect(page.locator('#login-overlay')).toBeHidden();
+    await expect(page.locator('#app')).toHaveAttribute('aria-hidden', 'false');
     await expect(page.locator('#nav button.nav-item[data-key="providers"]')).toContainText('提供方');
 
     // Back to English.

@@ -92,6 +92,35 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     await expect(page.locator('#login-error')).toContainText(/401/);
   });
 
+  // T5 (audit G5) — the ticket lives in sessionStorage for THIS tab.
+  test('T2.1c a reload keeps the session (token in sessionStorage)', async ({ page }) => {
+    await signIn(page);
+    const before = await page.evaluate(() => sessionStorage.getItem('hydra-admin-token'));
+    expect(before).toBeTruthy();
+    await page.reload();
+    await page.locator('#login-overlay').waitFor({ state: 'hidden' });
+    await expect(page.locator('body')).toHaveAttribute('data-state', 'ready');
+    await expect(page.locator('#reload-btn')).toBeVisible();
+  });
+
+  test('T2.1d sign-out is not resurrected by a reload, and a stale ticket fails closed', async ({ page }) => {
+    await signIn(page);
+    await page.locator('#logout-btn').click();
+    await page.locator('#login-overlay').waitFor({ state: 'visible' });
+    await page.reload();
+    await page.locator('#login-overlay').waitFor({ state: 'visible' });   // not resurrected
+    const stored = await page.evaluate(() => sessionStorage.getItem('hydra-admin-token'));
+    expect(stored).toBeNull();
+
+    // A ticket the server rejects must fail closed: stay on the login view,
+    // clear the key, and show the expired message.
+    await page.evaluate(() => sessionStorage.setItem('hydra-admin-token', 'definitely-not-valid'));
+    await page.reload();
+    await page.locator('#login-overlay').waitFor({ state: 'visible' });
+    await expect(page.locator('#login-error')).toContainText(/Session expired|会话已失效/i);
+    expect(await page.evaluate(() => sessionStorage.getItem('hydra-admin-token'))).toBeNull();
+  });
+
   test('T2.2 create provider via UI → appears in list → persisted via /api', async ({ page }) => {
     await signIn(page);
 
