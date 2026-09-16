@@ -60,6 +60,15 @@ Redis 是外部系统边界（租约、集群限流、熔断投票、鉴权 L2�
 - **回归测试的形状（重要）**：这类缺陷"永不返回"，因此**不能用 `tokio::time::timeout` 包住被测调用**——阻塞发生在**同一次 poll 内**的同步 futex 等待里，计时器即使触发也没人再 poll 这个任务。正确做法：把被测调用放到**独立线程 + 独立 runtime**，由测试线程用**通道超时**等待；并 `std::mem::forget(rt)` 以免 drop 时等待被挂死的 worker（见 `redis::auth_cache::tests::an_expired_l1_entry_does_not_deadlock_on_l2_backfill`）。
 - **触发条件的隐蔽性**：`DashMap::get` 在 key **不存在**时会立刻释放守卫，所以"L1 冷"（条目不存在）不会触发；真正的触发是"**条目存在但已过期**"（`cache_decision` 判 Miss，却仍持有分片读锁）**且 L2 命中**——这也是它为什么不是一上线就炸。写这类回归测试时必须构造"present-but-expired"，只清空缓存是不够的。
 
+### 监听拓扑与启动约定（2026-09-16 起生效）
+
+来源：`dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md` —— 一个**纯配置动作**（给租户配证书）把唯一的下游监听器从明文静默切成 TLS，于是任何一次重启（升级/驱逐/崩溃恢复）都让该副本的明文入口 100% RST：接口全挂、进程健康、`/healthz` `/readyz` 全绿。
+
+- **规则 1：监听拓扑的唯一来源是部署配置。** "哪个端口用什么协议听"只能由环境变量/配置文件决定；**快照、DB 行、业务数据一律不得影响传输协议**。判断口诀：如果"改一条业务数据 + 重启"能改变某个端口的协议，就是本缺陷。
+- **规则 2：「绑定成功」必须有可验证的证据。** 自己打印的 `listener bound` 日志**不算证据**：`main.rs` 的日志发生在 Pingora 真正 `bind()` 之前，而 `Listeners::build()` 是"整个 service 一起成败"——端口被占用时 Pingora 会重试 30 次（每秒一条 `WARN … is in use`），然后在其 service 任务里 `panic!("Failed to build listeners")`，**进程继续存活、admin 端口照常应答、代理端口没有任何监听**（2026-09-16 实测）。因此：启动后必须做一次真实的连接自检并暴露指标；绑定失败**不得**以"进程活着 + 探针绿"收场。
+- **规则 3：证书存储的重解析必须挂在快照交换的唯一边界上。** `HydraCertStore` 的内容要跟随 `ConfigStore` 的每一次快照替换（`reload_all` / `apply_snapshot`），**禁止在每个写入点分别接线**——edge 节点就是这么漏掉的：控制面下发的新证书进了快照，但 TLS 回调永远看不到，必须重启（`main.rs` 里那句 `on_poll: None, // edge TLS cert re-resolution lands with the edge TLS wiring` 就是这个漏点的化石）。
+- **规则 4：多监听的服务边界。** 一个 Pingora `Service` 可以挂多个监听（`Listeners{stacks}`），但**绑定失败是全 service 级的**：把可用性关键端口（明文入口）和可选端口（HTTPS）放在同一个 service 里，等于让可选端口的配置错误连坐关键端口。落地时要么分 service，要么在 Pingora 启动前预检绑定。
+
 > 设计文档中出现的 `MockAuthChecker` 等字样，在实现阶段一律替换为：纯缓存判定逻辑直接测（无需 mock）+ `HttpAuthChecker` 用 wiremock 测。trait 仍保留用于「生产配置 vs 测试配置」的装配，但测试用真实 double。
 
 ### 铁律 3：终止模式（Terminate-in-Pingora）

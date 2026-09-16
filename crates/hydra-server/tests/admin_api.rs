@@ -55,7 +55,6 @@ async fn admin_state() -> Arc<AdminState> {
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
         None, // no cluster token in tests
@@ -870,7 +869,6 @@ async fn edge_admin_probes_only() {
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         true, // edge_mode
         None, // no cluster token in tests
@@ -1242,7 +1240,6 @@ async fn empty_body_delete_invalidates_all_local() {
         Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
         None,
@@ -1405,7 +1402,6 @@ async fn concurrency_snapshot_reports_live_gates() {
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
-        None,
         admission,
         false,
         None, // no cluster token in tests
@@ -2013,7 +2009,6 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
         None,
@@ -2503,7 +2498,6 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
         Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
         None,

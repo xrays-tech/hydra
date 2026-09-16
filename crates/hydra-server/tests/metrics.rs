@@ -218,7 +218,6 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
-        None,
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
         None, // no cluster token in tests

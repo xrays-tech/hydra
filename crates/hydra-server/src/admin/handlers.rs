@@ -122,14 +122,16 @@ fn is_not_found(e: &sqlx::Error) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Shared reload (write-after consistency + cert resolve, design §13.2/§12.1)
+// Shared reload (write-after consistency, design §13.2/§12.1)
 // ---------------------------------------------------------------------------
 
-/// Reload the in-memory snapshot and (under a TLS backend) re-resolve certs so
-/// downstream TLS picks up new cert paths. Serialised by the per-state mutex so
-/// concurrent writes don't race (design §6 risk note). Best-effort: a fatal
-/// validation failure is logged but does **not** fail an already-committed write
-/// (design §5.3 keeps the old snapshot; the next successful reload recovers).
+/// Reload the in-memory snapshot. Cert re-resolution needs no call here: the
+/// cert store is registered as a `ConfigStore` snapshot-change hook, so the swap
+/// itself re-resolves certs for the next TLS handshake. Serialised by the
+/// per-state mutex so concurrent writes don't race (design §6 risk note).
+/// Best-effort: a fatal validation failure is logged but does **not** fail an
+/// already-committed write (design §5.3 keeps the old snapshot; the next
+/// successful reload recovers).
 async fn reload_best_effort(state: &AdminState, trace_id: &str) {
     let _guard = state.reload_lock.lock().await;
     if let Err(e) = state.store.reload_all().await {
@@ -147,11 +149,6 @@ async fn reload_best_effort(state: &AdminState, trace_id: &str) {
         return;
     }
     metrics::record_config_snapshot_stale(false);
-    // Cert-reload contract (W4b): after a successful reload, re-resolve certs
-    // so the next TLS handshake sees new cert paths.
-    if let Some(reload_certs) = state.cert_reloader.as_ref() {
-        reload_certs();
-    }
 }
 
 /// Write-boundary mirror of the loader's **fatal** endpoint check
@@ -2106,6 +2103,10 @@ struct HealthBody {
     breaker_dead: usize,
     tenants: usize,
     providers: usize,
+    /// What this node is actually serving (审核四 P4). `null` when the process
+    /// did not publish a listener set (e.g. an `AdminService` built directly by
+    /// a test), never "assume plaintext".
+    listeners: Option<&'static crate::listeners::ActiveListeners>,
 }
 
 #[derive(Serialize)]
@@ -2139,6 +2140,7 @@ pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
             breaker_dead: state.breaker.dead_providers().len(),
             tenants: snap.tenants_by_domain.len(),
             providers: providers_count,
+            listeners: crate::listeners::active(),
         },
     )
 }
@@ -2222,9 +2224,9 @@ struct LeaderHealth {
 }
 
 pub(super) async fn reload(state: &AdminState, trace_id: &str) -> Resp {
-    // Explicit reload shares the same best-effort path (reload_all + cert
-    // resolve), but a fatal validation failure is reported as 400 (design
-    // §5.3: the old snapshot is retained).
+    // Explicit reload shares the same best-effort path (reload_all only), but a
+    // fatal validation failure is reported as 400 (design §5.3: the old snapshot
+    // is retained). Certs follow the swap via the `ConfigStore` hook.
     let result = {
         let _guard = state.reload_lock.lock().await;
         state.store.reload_all().await
@@ -2236,10 +2238,6 @@ pub(super) async fn reload(state: &AdminState, trace_id: &str) -> Resp {
             &format!("config reload failed (old snapshot retained): {e}"),
             trace_id,
         );
-    }
-    // Cert-reload contract (W4b).
-    if let Some(reload_certs) = state.cert_reloader.as_ref() {
-        reload_certs();
     }
     let snap = state.store.snapshot();
     ok_json(

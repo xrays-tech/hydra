@@ -9,6 +9,9 @@ use hydra_server::db;
 use sqlx::SqlitePool;
 
 /// A migrated, PRAGMA-configured in-memory pool. One per test.
+// Each test target compiles this module on its own, so a helper used by one
+// target is "dead code" in all the others (same as [`ephemeral_port`]).
+#[allow(dead_code)]
 pub async fn setup_pool() -> SqlitePool {
     let pool = db::init_pool("sqlite::memory:")
         .await

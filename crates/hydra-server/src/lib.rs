@@ -63,6 +63,11 @@ pub mod http;
 pub mod sink;
 
 // --- W4: Pingora proxy shell ----------------------------------------------
+/// Downstream listener topology — the single owner of "which port speaks which
+/// protocol" (design §12.1 / §15.1). The decision is a pure function of
+/// **deployment config**; tenant certs are reported, never consulted.
+#[cfg(feature = "proxy")]
+pub mod listeners;
 /// `ProxyHttp` impl wiring core fns to Pingora hooks.
 #[cfg(feature = "proxy")]
 pub mod proxy;

@@ -267,7 +267,15 @@ pub struct ConfigStore {
     /// endpoint serves `?since=` against it; the control client skips
     /// re-applying unchanged snapshots.
     version: Arc<std::sync::atomic::AtomicU64>,
+    /// Snapshot-change hooks (审核四 P3). Every swap path funnels through
+    /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
+    /// be forgotten by one of the writers.
+    hooks: Arc<std::sync::Mutex<Vec<SnapshotHook>>>,
 }
+
+/// A consumer that follows every snapshot swap (see
+/// [`ConfigStore::on_snapshot_change`]).
+pub type SnapshotHook = Arc<dyn Fn(&ConfigData) + Send + Sync>;
 
 impl ConfigStore {
     /// Build the initial snapshot from the DB and wrap it in `ArcSwap`
@@ -303,6 +311,7 @@ impl ConfigStore {
             swrr: Arc::new(DashMap::new()),
             key_provider,
             version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
+            hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -322,6 +331,7 @@ impl ConfigStore {
             swrr: Arc::new(DashMap::new()),
             key_provider,
             version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -352,6 +362,37 @@ impl ConfigStore {
         self.version.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Register a hook that runs after **every** snapshot swap.
+    ///
+    /// Single owner for "something has to follow the config": the resolved TLS
+    /// cert store is why it exists. Wiring that re-resolution at each writer is
+    /// how the cluster path was missed — an edge node applied a snapshot
+    /// containing new tenant certs and kept serving the old ones until a
+    /// restart (`main.rs` carried the fossil: `on_poll: None, // edge TLS cert
+    /// re-resolution lands with the edge TLS wiring`). Both swap paths
+    /// ([`Self::reload_all`], [`Self::apply_snapshot`]) funnel through
+    /// [`Self::notify`], so a future writer cannot forget.
+    ///
+    /// The hook runs synchronously on the caller's thread, after the swap, with
+    /// no lock of ours held — it must not block or panic (a panicking hook would
+    /// abort a reload that already succeeded).
+    pub fn on_snapshot_change(&self, hook: SnapshotHook) {
+        let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        hooks.push(hook);
+    }
+
+    /// Run every registered hook against the snapshot that was just published.
+    fn notify(&self, cfg: &ConfigData) {
+        // Cloned out of the lock before calling: a hook may (re)register.
+        let hooks: Vec<SnapshotHook> = {
+            let hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+            hooks.clone()
+        };
+        for hook in hooks {
+            hook(cfg);
+        }
+    }
+
     /// Atomically apply a snapshot received from the control plane (edge /
     /// standby, cluster P1). Same COW semantics as [`Self::reload_all`]:
     /// the swap is lock-free for readers and the SWRR map is cleared so stale
@@ -362,6 +403,7 @@ impl ConfigStore {
         self.swrr.clear();
         self.version
             .store(version, std::sync::atomic::Ordering::Release);
+        self.notify(&self.snapshot());
     }
 
     /// Rebuild the snapshot from the DB and atomically swap it in (design §5.3).
@@ -391,6 +433,10 @@ impl ConfigStore {
         self.swrr.clear();
         self.version
             .store(next, std::sync::atomic::Ordering::Release);
+        // Followers of the snapshot (the TLS cert store) re-resolve here, so a
+        // cert written through the admin API is live on the very next
+        // handshake — on every node role, including edge.
+        self.notify(&self.snapshot());
         Ok(())
     }
 }
@@ -421,9 +467,48 @@ mod tests {
         );
     }
 
+    /// Every snapshot swap must notify the registered followers.
+    ///
+    /// This is the invariant that keeps the TLS cert store honest (审核四 P3).
+    /// Re-resolving certs from the admin write path only is how the cluster
+    /// path was missed: an edge applies snapshots through
+    /// [`ConfigStore::apply_snapshot`] and never touches an admin handler, so a
+    /// cert pushed through the control plane stayed invisible to the TLS
+    /// callback until the process restarted. Both paths are asserted here, so a
+    /// future writer that bypasses `notify` fails this test instead of shipping.
+    #[tokio::test]
+    async fn every_snapshot_swap_notifies_followers() {
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+        let store = ConfigStore::load(pool, kp()).await.expect("load");
+
+        let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        store.on_snapshot_change(Arc::new(move |cfg: &ConfigData| {
+            // The hook must observe the NEW snapshot, not the old one.
+            recorded
+                .lock()
+                .expect("hook mutex")
+                .push(cfg.tenants_by_domain.len() as u64);
+        }));
+
+        // Control-plane path (edge / standby): one config version.
+        store.apply_snapshot(ConfigData::default(), 7);
+        // Local rebuild path (admin write, `POST /api/v1/reload`).
+        store.reload_all().await.expect("reload_all");
+
+        let seen = seen.lock().expect("hook mutex").clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "both snapshot swap paths must notify their followers; saw {seen:?}"
+        );
+    }
+
     /// REVIEW N3 — `reload_all` must persist the version marker BEFORE it
     /// publishes the new snapshot.
-    ///
     /// It used to swap the snapshot and advance the counter first, then write
     /// the marker "best-effort" (warn only). One failed write therefore left the
     /// in-memory version ahead of the durable one — and the evidence-based

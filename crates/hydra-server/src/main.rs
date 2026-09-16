@@ -310,6 +310,26 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     };
     info!("config store loaded");
 
+    // (2c'') Resolved-cert store (design §12.1) + its single wiring: follow the
+    //        snapshot. It is created here, not in `run_server`, because the
+    //        control client (spawned below) can apply a snapshot — carrying new
+    //        tenant certs — before Pingora starts, and because the snapshot is
+    //        the only thing this consumer needs to observe. The previous design
+    //        re-resolved certs from two admin handler call sites only, so an
+    //        edge node never saw a cert pushed through the control plane until
+    //        it restarted (审核四 P3 / F-3).
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    let cert_store: Option<Arc<hydra_server::tls::HydraCertStore>> = {
+        let cs = Arc::new(hydra_server::tls::HydraCertStore::new(None));
+        // The wiring itself lives in `tls::follow_snapshot` so the integration
+        // suite drives the production path instead of a copy of it.
+        hydra_server::tls::follow_snapshot(&store, &cs);
+        info!("tenant cert store wired to the config snapshot");
+        Some(cs)
+    };
+    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+    let cert_store: Option<()> = None;
+
     // (2c-redis) Cluster Redis backbone (P4): every cluster node (leader AND
     // edge) shares one Redis for the lease, registry, invalidation bus,
     // shared limits / breaker and the auth-cache L2.
@@ -593,7 +613,12 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             },
             store.clone(),
             key_provider.clone(),
-            None, // edge TLS cert re-resolution lands with the edge TLS wiring
+            // No per-poll hook needed for certs: `ConfigStore::apply_snapshot`
+            // notifies its followers, and the cert store is one of them
+            // (`tls::follow_snapshot`), so a cert arriving in a control-plane
+            // snapshot reaches the SNI callback without a restart (审核四 P3).
+            // This slot is for the leader-eligibility gate on leader nodes.
+            None,
         );
         #[cfg(feature = "cluster-redis")]
         let client = match &registry {
@@ -702,6 +727,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         key_provider,
         state,
         leader_ready,
+        cert_store,
         #[cfg(feature = "cluster-redis")]
         invalidation_stream,
         #[cfg(not(feature = "cluster-redis"))]
@@ -738,6 +764,15 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     cluster_registry: Option<()>,
+    /// Resolved multi-tenant cert store (design §12.1 single source). Built in
+    /// `bootstrap` — not in `run_server` — because it registers itself as a
+    /// follower of the config snapshot, and a snapshot can be applied (by the
+    /// control client) before Pingora ever starts.
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    cert_store: Option<Arc<hydra_server::tls::HydraCertStore>>,
+    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+    #[allow(dead_code)]
+    cert_store: Option<()>,
 }
 
 /// Synchronous Pingora setup: build the proxy + admin services and call
@@ -757,52 +792,117 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     let listen_addr = std::env::var("HYDRA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, app);
 
-    // (3b) Downstream TLS when any tenant has certs (design §12 / W4b); else
-    //      plain TCP for the localhost/dev case. The cfg split keeps the binary
-    //      buildable without a TLS backend (plain `proxy` feature). Under a TLS
-    //      backend the resolved `HydraCertStore` is kept so the admin reload
-    //      endpoint can re-resolve certs (W4b contract).
-    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-    let (tls_enabled, cert_store) = {
-        use hydra_server::tls::HydraCertStore;
+    // (3b) Downstream listener topology (design §12.1 / §15.1; 审核四 P2).
+    //
+    // The decision belongs to `listeners::plan`, a pure function of DEPLOYMENT
+    // CONFIG: plaintext always, HTTPS iff `HYDRA_TLS_LISTEN` is set. The tenant
+    // certs in the snapshot are *reported*, never consulted — writing one used
+    // to flip the single listener to TLS, so the next restart took the plaintext
+    // entry (80 → NodePort → pod :8080) down with RST while the process stayed
+    // healthy and the probes stayed green:
+    // dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md.
+    let cert_count = c.store.snapshot().certs.len();
+    let planned = hydra_server::listeners::plan(
+        &listen_addr,
+        hydra_server::listeners::tls_listen_from_env().as_deref(),
+        hydra_server::listeners::tls_backend_available(),
+        cert_count,
+    )?;
+    for note in &planned.notes {
+        error!(kind = note.kind(), "{}", note.message());
+        hydra_server::admin::metrics::record_listener_misconfig(note.kind());
+    }
+    let plan = planned.plan;
 
-        let snapshot = c.store.snapshot();
-        if snapshot.certs.is_empty() {
-            proxy_service.add_tcp(&listen_addr);
-            (false, None::<HydraCertStore>)
-        } else {
-            // Resolve CertMeta → parsed certs into the shared ArcSwap (§12.1
-            // single source). The box inside TlsSettings shares this same
-            // ArcSwap, so hot-reload only needs another `resolve_and_store`
-            // after `reload_all`.
-            let cert_store = HydraCertStore::new(None);
-            cert_store.resolve_and_store(&snapshot.certs);
-            match cert_store.build_tls_settings() {
-                Ok(settings) => {
-                    proxy_service.add_tls_with_settings(&listen_addr, None, settings);
-                    (true, Some(cert_store))
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to build TLS settings; falling back to plain TCP");
-                    proxy_service.add_tcp(&listen_addr);
-                    (false, None)
+    // Bindability is established BEFORE Pingora: a bind failure inside Pingora's
+    // service task is invisible from outside (its own log line is printed before
+    // the bind, the retry loop only WARNs, and the final state is a process that
+    // is alive with zero data-plane listeners while admin probes answer 200).
+    // The plaintext entry is the availability path — if it cannot bind, refuse
+    // to start instead of pretending to serve.
+    if let Err(e) = hydra_server::listeners::probe_bind(&plan.plain) {
+        return Err(format!(
+            "{}={}: {e}; refusing to start — the data plane would have no listener while the \
+             process still reported healthy",
+            hydra_server::listeners::LISTEN_ENV,
+            plan.plain
+        )
+        .into());
+    }
+    proxy_service.add_tcp(&plan.plain);
+
+    // HTTPS is optional and can never take the plaintext entry with it
+    // (`Listeners::build()` is all-or-nothing per service, which is why a TLS
+    // port that cannot bind used to be fatal for the whole data plane).
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    let tls_bound: Option<String> = match plan.tls.clone() {
+        Some(tls_addr) => match hydra_server::listeners::probe_bind(&tls_addr) {
+            Ok(()) => {
+                let cert_store = c
+                    .cert_store
+                    .clone()
+                    .expect("the cert store is built whenever a TLS listener is configured");
+                match cert_store.build_tls_settings() {
+                    Ok(settings) => {
+                        proxy_service.add_tls_with_settings(&tls_addr, None, settings);
+                        Some(tls_addr)
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            addr = %tls_addr,
+                            "could not build downstream TLS settings; serving plaintext only \
+                             (the TLS listener is NOT available)"
+                        );
+                        hydra_server::admin::metrics::record_listener_misconfig(
+                            "tls_settings_failed",
+                        );
+                        None
+                    }
                 }
             }
-        }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    addr = %tls_addr,
+                    "could not bind the configured TLS listener; serving plaintext only"
+                );
+                hydra_server::admin::metrics::record_listener_misconfig("tls_bind_failed");
+                None
+            }
+        },
+        None => None,
     };
     #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
-    let tls_enabled = {
-        proxy_service.add_tcp(&listen_addr);
-        false
-    };
+    let tls_bound: Option<String> = None;
 
     server.add_service(proxy_service);
 
-    if tls_enabled {
-        info!(listen = %listen_addr, "proxy TLS listener bound (per-tenant SNI cert callback)");
-    } else {
-        info!(listen = %listen_addr, "proxy plain-TCP listener bound (no tenant certs configured)");
-    }
+    // Publish the effective listener set for `/api/v1/health` (the plan is
+    // config-derived; `tls` reflects whether the HTTPS listener really came up).
+    hydra_server::listeners::record_active(hydra_server::listeners::ActiveListeners {
+        plain: plan.plain.clone(),
+        tls: tls_bound.clone(),
+        tls_configured: plan.tls.is_some(),
+        tenant_certs: cert_count,
+    });
+
+    // Startup self-check: verify the entry port really accepts connections and
+    // publish it as `hydra_listener_bound{protocol="plain"}`. It is the external
+    // evidence the log line above cannot provide (see the function docs).
+    spawn_listener_self_check(plan.plain.clone());
+    hydra_server::admin::metrics::record_listener_bound("tls", tls_bound.is_some());
+
+    // Startup banner (bug report §5.5): one line that shows the whole protocol
+    // shape, so every restart makes it obvious what is being served.
+    info!(
+        plain = %plan.plain,
+        tls = tls_bound.as_deref().unwrap_or("disabled"),
+        tenant_certs = cert_count,
+        tls_backend = hydra_server::listeners::tls_backend_available(),
+        "downstream listeners (config-derived): plaintext always, TLS only when {}=<addr> is set",
+        hydra_server::listeners::TLS_LISTEN_ENV
+    );
 
     // (3c) Admin service — a second Pingora `Service` (ServeHttp) on its own
     //      plain-TCP port (design §13.1). Same runtime, admin-token-gated.
@@ -812,20 +912,6 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     let admin_addr =
         std::env::var("HYDRA_ADMIN_ADDR").unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_string());
 
-    // Cert-reload hook for the W4b contract: re-resolve certs from the latest
-    // snapshot after every reload. Only meaningful under a TLS backend.
-    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-    let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = cert_store.as_ref().map(|cs| {
-        let cs = cs.clone();
-        let store = c.store.clone();
-        Arc::new(move || {
-            let snap = store.snapshot();
-            cs.resolve_and_store(&snap.certs);
-        }) as Arc<dyn Fn() + Send + Sync>
-    });
-    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
-    let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = None;
-
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
     let mut admin_state = AdminState::new(
         c.pool,
@@ -834,7 +920,6 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         c.breaker,
         c.key_provider.clone(),
         admin_token.clone(),
-        cert_reloader,
         admission.clone(),
         // Edge data-plane nodes serve only probe endpoints (cluster P0b).
         c.role == hydra_server::cluster::NodeRole::Edge,
@@ -873,8 +958,76 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     server.run_forever();
 }
 
-/// Flush the usage sink when the process is asked to terminate.
+/// Verify — from outside our own logging — that the plaintext entry port
+/// actually accepts connections, and publish the result as
+/// `hydra_listener_bound{protocol="plain"}`.
 ///
+/// ## Why this exists
+///
+/// Our "listener bound" log line is printed *before* Pingora binds, so it is
+/// not evidence. When the bind really fails, Pingora retries once a second for
+/// 30 s and then panics **inside its service task**: the process stays alive and
+/// keeps answering `/healthz` `/readyz` on the admin port while the data plane
+/// has no listener at all (measured 2026-09-16; `dev-docs/dev-plan.md`
+/// 「监听拓扑与启动约定」). A connect attempt is the cheapest honest check.
+///
+/// The plaintext listener is the one probed: both listeners live in the same
+/// Pingora service, whose `Listeners::build()` is all-or-nothing — if the TLS
+/// address fails to bind, the plaintext accept loop never starts either. So a
+/// successful connect to the entry port also proves the TLS listener was
+/// configured successfully; `hydra_listener_bound{protocol="tls"}` is published
+/// separately from the config-time decision.
+fn spawn_listener_self_check(plain: String) {
+    std::thread::spawn(move || {
+        let Ok(addr) = plain.parse::<std::net::SocketAddr>() else {
+            // `listeners::plan` already rejected unparseable addresses.
+            return;
+        };
+        // 0.0.0.0 / :: are bind wildcards, not dialable destinations.
+        let target = if addr.ip().is_unspecified() {
+            match addr {
+                std::net::SocketAddr::V4(_) => {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+                }
+                std::net::SocketAddr::V6(_) => {
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()))
+                }
+            }
+        } else {
+            addr
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_secs(2)) {
+                Ok(_) => {
+                    hydra_server::admin::metrics::record_listener_bound("plain", true);
+                    info!(
+                        address = %plain,
+                        "startup self-check: the plaintext entry port accepts connections"
+                    );
+                    return;
+                }
+                Err(e) if std::time::Instant::now() < deadline => {
+                    tracing::debug!(address = %plain, error = %e, "self-check connect failed; retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(e) => {
+                    hydra_server::admin::metrics::record_listener_bound("plain", false);
+                    error!(
+                        address = %plain,
+                        error = %e,
+                        "startup self-check FAILED: nothing is listening on the plaintext entry port — \
+                         the process looks healthy but serves no traffic (see hydra_listener_bound)"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Flush the usage sink when the process is asked to terminate.
 /// The only chance to persist buffered usage: see the call site.
 fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
     use tokio::signal::unix::{signal, SignalKind};

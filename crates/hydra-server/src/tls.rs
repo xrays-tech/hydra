@@ -290,6 +290,30 @@ impl HydraCertStore {
     }
 }
 
+/// Make `cert_store` follow **every** snapshot swap of `config`.
+///
+/// This is the single wiring point for cert hot-reload, and the reason it is a
+/// function rather than three lines in `main`: it has to be called on *every*
+/// node role, and the paths differ —
+///
+/// - a leader/all node writes through the admin API → `ConfigStore::reload_all`,
+/// - an edge (and a standby) learns config from the control plane →
+///   `ConfigStore::apply_snapshot`.
+///
+/// Re-resolving at the admin write path only (the old `AdminState.cert_reloader`
+/// design) meant an edge kept serving the certs it had at boot until someone
+/// restarted it — visible in `main.rs` as
+/// `on_poll: None, // edge TLS cert re-resolution lands with the edge TLS wiring`
+/// (审核四 P3 / F-3). Registering a snapshot follower is idempotent in effect and
+/// covers both, plus any writer added later.
+pub fn follow_snapshot(config: &crate::store::ConfigStore, cert_store: &Arc<HydraCertStore>) {
+    cert_store.resolve_and_store(&config.snapshot().certs);
+    let follower = cert_store.clone();
+    config.on_snapshot_change(Arc::new(move |cfg: &hydra_core::config::ConfigData| {
+        follower.resolve_and_store(&cfg.certs);
+    }));
+}
+
 #[async_trait]
 impl TlsAccept for HydraCertStore {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {

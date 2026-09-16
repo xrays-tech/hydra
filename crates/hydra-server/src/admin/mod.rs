@@ -15,8 +15,10 @@
 //! - **No internal mocking**: every handler drives the real `db::repo`,
 //!   `ConfigStore`, `AuthChecker`, `CircuitBreaker` and `HydraCertStore`.
 //! - **Write-after consistency**: every successful config write calls
-//!   `ConfigStore::reload_all()` then re-resolves certs (design §13.2 / W4b
-//!   cert-reload contract), serialised by a per-state mutex.
+//!   `ConfigStore::reload_all()` (design §13.2), serialised by a per-state
+//!   mutex. Cert re-resolution is no longer the admin service's job: the cert
+//!   store follows every config snapshot swap through the `ConfigStore`
+//!   snapshot-change hook registered in `main` (design §12.1 / W4b).
 //! - **Standby mutation forwarding (cluster P3)**: a leader candidate that
 //!   does not hold the lease forwards every admin mutation to the ACTUAL
 //!   lease holder, resolved live from the cluster registry — never to a
@@ -72,11 +74,6 @@ pub struct AdminState {
     /// Serialises `reload_all` calls so concurrent writes don't race (design §6
     /// risk note: "最后一次为准").
     pub reload_lock: Mutex<()>,
-    /// Optional cert-reload hook (W4b contract): after `reload_all`, re-resolves
-    /// certs so downstream TLS picks up new cert paths. `None` on plain-TCP
-    /// builds (no TLS listener) or when no cert store is wired. Held as a
-    /// cfg-free closure so `AdminState` has a uniform shape across feature sets.
-    pub cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Shared admission controller (design §3 / §13.2). Cloned from the same
     /// `Arc<DashMap>` backing the proxy's `AppState.admission` — the
     /// `GET /api/v1/concurrency` endpoint reads live gate state from here.
@@ -114,8 +111,9 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    /// Build admin state from the shared components. `cert_reloader` is invoked
-    /// after every successful `reload_all` (and by `POST /api/v1/reload`).
+    /// Build admin state from the shared components. Cert re-resolution is not
+    /// wired here: `ConfigStore`'s snapshot-change hook notifies the cert store
+    /// after every swap (see the module docs).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -125,7 +123,6 @@ impl AdminState {
         breaker: Arc<CircuitBreaker>,
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
-        cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
         admission: AdmissionControl,
         edge_mode: bool,
         cluster_token: Option<String>,
@@ -139,7 +136,6 @@ impl AdminState {
             key_provider,
             admin_token,
             reload_lock: Mutex::new(()),
-            cert_reloader,
             admission,
             edge_mode,
             cluster_token,

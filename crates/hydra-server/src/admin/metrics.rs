@@ -32,6 +32,8 @@
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
 //! | `hydra_config_snapshot_stale` | gauge | — | `admin::reload_best_effort` (1 = last reload failed, snapshot stale) |
+//! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
+//! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
 //!
@@ -105,6 +107,14 @@ struct Metrics {
     control_poll: IntCounterVec,
     /// Last config snapshot version applied (edge/standby).
     control_snapshot_version: IntGauge,
+    // ── Downstream listener topology (审核四 P4) ─────────────────────────
+    /// 1 = the configured listener was verified to accept connections at
+    /// startup (protocol=plain|tls); 0 = configured but NOT accepting — the
+    /// shape of the 2026-09-16 outage (process healthy, data plane deaf).
+    listener_bound: IntGaugeVec,
+    /// Config combinations that leave certificates unserved or a configured
+    /// port unusable, by kind. Non-zero means an operator decision is missing.
+    listener_misconfig: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -273,6 +283,19 @@ fn metrics() -> Option<&'static Metrics> {
                 "Last config snapshot version applied from the control plane"
             )
             .ok()?,
+            // ── Downstream listener topology ──────────────────────────────
+            listener_bound: register_int_gauge_vec!(
+                "hydra_listener_bound",
+                "1 = this configured downstream listener accepts connections (protocol=plain|tls)",
+                &["protocol"]
+            )
+            .ok()?,
+            listener_misconfig: register_int_counter_vec!(
+                "hydra_listener_misconfig_total",
+                "Listener configuration that leaves certs unserved or a port unusable, by kind",
+                &["kind"]
+            )
+            .ok()?,
         })
     })
     .as_ref()
@@ -375,6 +398,30 @@ pub fn record_auth_cache_size(n: usize) {
 pub fn record_usage_drop(reason: &str, n: u64) {
     if let Some(m) = metrics() {
         m.usage_dropped.with_label_values(&[reason]).inc_by(n);
+    }
+}
+
+/// Set `hydra_listener_bound{protocol}`: did the listener we configured
+/// actually end up accepting connections at startup?
+///
+/// Its whole purpose is that our own "listener bound" log line is printed
+/// BEFORE Pingora binds, and a bind failure there dies inside Pingora's service
+/// task — the process keeps running and keeps answering `/healthz` while the
+/// data plane has no listener. Alert on `hydra_listener_bound == 0`.
+pub fn record_listener_bound(protocol: &str, bound: bool) {
+    if let Some(m) = metrics() {
+        m.listener_bound
+            .with_label_values(&[protocol])
+            .set(i64::from(bound));
+    }
+}
+
+/// Count a listener-configuration combination that needs an operator decision
+/// (`kind` = `certs_without_tls_port` / `tls_port_without_certs`). See
+/// [`crate::listeners::PlanNote`].
+pub fn record_listener_misconfig(kind: &str) {
+    if let Some(m) = metrics() {
+        m.listener_misconfig.with_label_values(&[kind]).inc();
     }
 }
 

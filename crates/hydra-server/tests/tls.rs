@@ -590,3 +590,54 @@ fn t6_6_single_cert_pem_has_an_empty_chain() {
     let resolved = loaded.get("acme.com").expect("resolved");
     assert!(resolved.chain.is_empty(), "a single cert has no chain");
 }
+
+/// T6.7 — the cert store follows **every** snapshot swap, including the
+/// control-plane path an edge uses (审核四 P3 / F-3).
+///
+/// Before this, cert re-resolution was wired to two admin handler call sites,
+/// so it only ever ran on the node that received the admin write. An `edge`
+/// node applies config through `ConfigStore::apply_snapshot` (control-plane
+/// poll) and never touches an admin handler: a certificate pushed to the
+/// cluster therefore stayed invisible to the TLS callback — the SNI callback
+/// kept selecting the certs the process had at boot — until someone restarted
+/// the pod. This drives the production wiring (`tls::follow_snapshot`, the same
+/// call `main`'s bootstrap makes) through the edge path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t6_7_cert_store_follows_control_plane_snapshots() {
+    let pool = common::setup_pool().await;
+    let (store, _state) = build_state(pool).await;
+
+    let cert_store = Arc::new(HydraCertStore::new(None));
+    hydra_server::tls::follow_snapshot(&store, &cert_store);
+    assert!(
+        cert_store.resolved().is_empty(),
+        "nothing is configured yet"
+    );
+
+    // A control-plane snapshot arrives carrying acme.com's certificate. This is
+    // the edge path: no admin write, no restart.
+    let mut cfg = hydra_core::config::ConfigData::default();
+    cfg.certs.insert(
+        "acme.com".to_string(),
+        CertMeta {
+            domain: "acme.com".to_string(),
+            cert_file: Some(fixture("acme.crt")),
+            cert_key: Some(fixture("acme.key")),
+            cert_pem: None,
+            cert_key_pem: None,
+        },
+    );
+    store.apply_snapshot(cfg, 42);
+
+    let loaded = cert_store.resolved();
+    assert_eq!(
+        loaded.len(),
+        1,
+        "the TLS callback's cert map must follow a control-plane snapshot \
+         without a restart (this is what an edge node needs)"
+    );
+    assert!(
+        loaded.contains_key("acme.com"),
+        "the new tenant domain must be resolvable by SNI"
+    );
+}
