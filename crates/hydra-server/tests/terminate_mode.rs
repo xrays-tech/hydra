@@ -3026,6 +3026,7 @@ async fn post_send_transport_error_is_not_failed_over_by_default() {
         "the second provider must NOT have been called (that is the double billing)"
     );
 }
+
 // ===========================================================================
 // REVIEW A1 — a body Hydra cannot parse must NOT be treated as "no model".
 //
@@ -3145,4 +3146,91 @@ async fn unparsable_body_cannot_bypass_the_tenant_model_whitelist() {
         "only the control request may reach the upstream; got {posts:#?}"
     );
     assert_eq!(posts[0], r#"{"model":"gpt-4","messages":[]}"#);
+}
+
+// ===========================================================================
+// REVIEW A2 — a bodied request OUTSIDE `/v1/` must not be forwarded.
+//
+// `is_v1_route` gates model extraction, so a POST to any other path produced
+// `Absent` → the model-less PASSTHROUGH, which never consults `tenant_models`.
+// The upstream can still resolve a model — from the body, or from the path
+// itself (`/v1beta/models/<model>:generateContent`) — so a one-line client
+// change (drop the `/v1` prefix) skipped the whitelist, model routing, and the
+// model dimension of the rate limits. Hydra only authorizes and forwards
+// `/v1/…` (design §9.4), so anything else is not routable: fail closed.
+// ===========================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bodied_request_outside_v1_is_rejected() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "unauthorized-model",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "LEAKED" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let client = test_client();
+
+    // (0) Control on the routable path: the granted model is served.
+    let v1_url = format!("{root}/v1/chat/completions");
+    let resp = send_until_ready(&client, &v1_url, r#"{"model":"gpt-4","messages":[]}"#).await;
+    assert_eq!(resp.status(), 200, "control: /v1 must keep working");
+    let _ = resp.text().await;
+
+    // (1) The same body on non-`/v1/` paths: not routable, so it must be
+    //     refused — never forwarded with the whitelist skipped.
+    let paths = [
+        "/chat/completions",
+        "/v1beta/models/unauthorized-model:generateContent",
+        "/openai/deployments/d/chat/completions",
+        "/api/chat",
+    ];
+    for path in paths {
+        let url = format!("{root}{path}");
+        let resp = send_one(
+            &client,
+            &url,
+            r#"{"model":"unauthorized-model","messages":[]}"#,
+        )
+        .await;
+        assert!(
+            resp.status().is_client_error(),
+            "POST {path} must be refused (got {})",
+            resp.status()
+        );
+        let _ = resp.text().await;
+    }
+
+    // (2) The leak check: only the control request reached the upstream.
+    let hits = upstream.received_requests().await.expect("recording on");
+    let posts: Vec<String> = hits
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the control request may reach the upstream; got {posts:#?}"
+    );
 }

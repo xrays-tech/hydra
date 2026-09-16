@@ -451,7 +451,27 @@ impl ProxyHttp for HydraProxy {
         //     authorizes the request while the body goes upstream verbatim. The
         //     value's string escapes are decoded, matching what the provider's
         //     own parser reads from the same bytes.
-        let model_field = if has_body && is_v1_route {
+        //
+        // A BODIED request outside `/v1/` is not routable (design §9.4: Hydra
+        // authorizes and forwards `/v1/…`). It used to fall through to `Absent`
+        // → the model-less passthrough, which never consults the tenant model
+        // whitelist, while the upstream could still resolve a model from the
+        // body or from the path itself (`/v1beta/models/<model>:generateContent`)
+        // — so dropping the `/v1` prefix skipped authorization, model routing
+        // and the model dimension of the rate limits. Fail closed instead.
+        if has_body && !is_v1_route {
+            debug!(
+                tenant = %tenant_id,
+                path = %req_path,
+                "rejecting a bodied request outside /v1/ (not routable)"
+            );
+            return short_circuit(session, 404, "path_not_routable").await;
+        }
+        // Only a bodied `/v1/…` request carries a model to authorize on. A
+        // body-less request (GET/HEAD) keeps `Absent` — that is the documented
+        // model-less path (e.g. the local GET /v1/models catalog is answered
+        // before this point; other GETs pass through).
+        let model_field = if has_body {
             extract_model_field(body_bytes.as_ref())
         } else {
             ModelField::Absent
