@@ -3994,3 +3994,11 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 三特性全量 | ✅ **439 passed / 0 failed** |
 | 脚本门禁 | ✅ `check_i18n` OK（334 keys/4 locales）、`node --test` `# fail 0`、`ask_llm.test.sh` ALL PASSED |
 | Playwright（本 Phase 涉及 UI） | ✅ **14 passed**（真实二进制 + 真实 Chromium；单节点负向 + 桩化 fleet 正向 + T2.2b 两条 `clearsFK` 路径） |
+
+### Batch 17 — 把"被取代"的说法变成事实：stats 自动刷新有了真正的 spec
+
+| 项 | 内容 |
+|---|---|
+| 计划里的一处**不成立**的断言 | T8 写 `stats_autorefresh.cjs` 退役后"其覆盖已由 **T9.5 / T10.4** 的正式用例取代"。**两者都不是**：T9.5 是非 leader 横幅，T10.4 是 provider 编辑/删除的 `clearsFK` 路径。该脚本覆盖的是 **F-7（stats 页自动刷新）**——"初始渲染会请求、勾选 auto 后每 10s 重新请求、离开该页必须停止 interval（否则它会覆盖用户正在看的页面）、返回后重新武装"——**此前没有任何其他测试覆盖它**。我上一轮把这个错误说法抄进了 `tests/e2e/README.md`，本条把它改正 |
+| 处置 | ① 新增 **`tests/e2e/stats_autorefresh.spec.cjs`**：把原脚本的 5 条断言逐条移植为**正常 spec**，用 Playwright 的 clock API（否则每个周期要真等 10s），只拦截 `/api/v1/stats/usage` 计数、其余请求（登录/health/reload）走**真实服务端**；② **删除** `scripts/stats_autorefresh.cjs`（覆盖已真实存在 ⇒ 只保留一个所有者，符合反熵原则）；③ README 更正为"已被正式 spec 取代"，并说明为何**不能**只改名（`*.spec.cjs` 会在**收集阶段**执行它的静态服务器 + Chromium） |
+| 结果 | 真实二进制 + 真实 Chromium 全量 **15 passed**（14 → 15：新增该 spec；其自身 1.4s，因为时钟是假的） |

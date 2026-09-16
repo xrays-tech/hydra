@@ -78,13 +78,16 @@ HYDRA_BASE=http://127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token-2026 \
 - The wrong-token test (T2.1b) intentionally exercises the fail-closed path.
 - If `HYDRA_BASE` is unreachable, the suite fails fast in `beforeAll` with a
   pointer to this README.
-- `stats_autorefresh.cjs` was **retired** from this directory (T8 / audit G8):
-  it is not an `@playwright/test` file — requiring it starts a static HTTP
-  server and Chromium, so it must never be collected by the runner. It now
-  lives at `scripts/stats_autorefresh.cjs` and is run manually
-  (`NODE_PATH=$(npm root -g) node scripts/stats_autorefresh.cjs`). Its coverage
-  is to be superseded by the formal banner / auto-refresh specs (plan T9.5 /
-  T10.4).
+- The old `stats_autorefresh.cjs` harness has been **replaced by a real spec**,
+  `stats_autorefresh.spec.cjs`. It was not an `@playwright/test` file — requiring
+  it started a static HTTP server *and* Chromium, so the runner could never
+  collect it, and merely renaming it would have executed all of that at COLLECTION
+  time. It also could not simply be dropped: at the time it was retired, nothing
+  else covered the stats auto-refresh interval (the plan's note that its coverage
+  was "superseded by T9.5/T10.4" was wrong — those are the leader banner and the
+  provider edit/delete paths). The new spec drives the same five behaviours
+  against the real binary with Playwright's clock API (10s cycles without waiting
+  10s), and the manual script is gone so there is only one owner.
 - The default admin token in these specs is `dev-admin-token-2026`. It must be
   at least 16 chars (`MIN_ADMIN_TOKEN_LEN`): the older `dev-admin-token` was 15
   bytes, and the binary refuses to start with it — every run then failed before
