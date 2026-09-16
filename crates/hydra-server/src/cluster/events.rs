@@ -251,10 +251,26 @@ pub async fn apply_invalidation(
     }
 }
 
+/// How many stream entries one `XREAD` asks for (`XREAD COUNT`).
+const INVALIDATION_READ_BATCH: u64 = 100;
+
+/// How long the consumer idles when a read came back with nothing to do.
+/// Deliberately NOT paid after a full batch — see [`spawn_invalidation_consumer`].
+const INVALIDATION_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Spawn the per-node invalidation consumer (cluster P4): an `XREAD` loop
 /// over the stream; each event is applied to the local auth cache (idempotent
 /// replay — on reconnect it re-reads from the last id); a `generation` bump
 /// (the stream was trimmed past our watermark) clears the local cache.
+///
+/// **Drains before idling** (review B3c). The loop used to read
+/// [`INVALIDATION_READ_BATCH`] entries and then sleep unconditionally, i.e. a
+/// hard ceiling of batch/idle = 200 events/s per node with no back-pressure:
+/// above that sustained rate the stream grows to `maxlen`, every trim then drops
+/// unread entries, every drop bumps the generation, and every node then clears
+/// its whole auth cache — on a schedule set by the trim interval. The sleep is
+/// now only paid when a read returned fewer than a full batch, i.e. when there
+/// is genuinely nothing left to read.
 pub fn spawn_invalidation_consumer(
     stream: InvalidationStream,
     auth: std::sync::Arc<crate::http::HttpAuthChecker>,
@@ -264,8 +280,12 @@ pub fn spawn_invalidation_consumer(
         let mut last_id = "0".to_string();
         let mut gen: i64 = stream.generation().await.unwrap_or(0);
         loop {
-            match stream.read_since(&last_id, 100).await {
+            let mut more_to_read = false;
+            match stream.read_since(&last_id, INVALIDATION_READ_BATCH).await {
                 Ok(events) => {
+                    // A full batch means the stream may hold more: loop again
+                    // immediately instead of sleeping.
+                    more_to_read = events.len() as u64 == INVALIDATION_READ_BATCH;
                     if !events.is_empty() {
                         for (id, inv) in events {
                             let known: Vec<String> = store
@@ -304,7 +324,9 @@ pub fn spawn_invalidation_consumer(
                     tracing::warn!(error = %e, "invalidation read failed; retrying");
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !more_to_read {
+                tokio::time::sleep(INVALIDATION_IDLE_POLL).await;
+            }
         }
     });
 }
@@ -671,6 +693,68 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(!bumped, "nothing dropped ⇒ no bump");
         assert_eq!(s.generation().await.expect("gen"), 1, "unchanged");
+    }
+
+    /// REVIEW B3c — the consumer must DRAIN a backlog instead of reading one
+    /// batch per idle interval.
+    ///
+    /// It read 100 entries and then slept 500 ms unconditionally: a hard
+    /// ceiling of ~200 events/s. Above that the stream grows to `maxlen`, every
+    /// trim drops unread entries, every drop bumps the generation, and every
+    /// node clears its whole auth cache on the trim schedule. Measured before
+    /// the fix: 250 events took 1.006 s (three batches); with the drain loop it
+    /// is a few milliseconds.
+    #[tokio::test]
+    async fn consumer_drains_a_backlog_without_idling() {
+        let pool = pool().await;
+        let stream = InvalidationStream::new(pool.clone());
+        let auth = std::sync::Arc::new(
+            crate::http::HttpAuthChecker::new(
+                AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+                crate::http::AuthConfig::default(),
+            )
+            .expect("checker"),
+        );
+        let store = crate::store::ConfigStore::from_snapshot(
+            hydra_core::config::ConfigData::default(),
+            std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
+        );
+
+        // 250 keys cached, then 250 single-key invalidations to apply.
+        const N: usize = 250;
+        for i in 0..N {
+            auth.cache()
+                .set("t1", &format!("sk-{i}"), true, Duration::from_secs(300))
+                .await;
+        }
+        assert_eq!(auth.cache().len(), N, "seeded");
+        for i in 0..N {
+            stream
+                .publish(Some("t1".to_string()), vec![format!("sk-{i}")])
+                .await
+                .expect("publish");
+        }
+
+        spawn_invalidation_consumer(stream.clone(), auth.clone(), store);
+        let started = std::time::Instant::now();
+        let mut drained = false;
+        for _ in 0..400 {
+            if auth.cache().is_empty() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            drained,
+            "the consumer did not apply all {N} events within 2s"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "draining {N} events took {elapsed:?} — the consumer is idling per batch again \
+             (one batch per 500 ms would be ~1 s, which is what the fix removes)"
+        );
     }
 
     #[tokio::test]

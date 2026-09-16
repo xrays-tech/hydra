@@ -2429,3 +2429,140 @@ async fn provider_key_write_requires_a_non_empty_api_key() {
         "the rotated key must not be empty: {rotated}"
     );
 }
+
+// ===========================================================================
+// REVIEW B3(b) / N4 — the admin service must bound what a request can cost.
+//
+// `read_body` looped to EOF with NO size limit (the proxy path has had a 32 MiB
+// hard cap for ages), and the invalidation endpoints accepted an unbounded
+// `api_keys` list. Every key becomes a 64-char digest inside ONE stream entry
+// and costs TWO Redis commands (DEL + SREM) before that, so a single request
+// carrying only a TENANT token could push a multi-hundred-MB entry onto the
+// backbone that also holds the leader lease and the rate-limit state. Measured
+// by the oracle: 20 000 keys ⇒ one 1 299 999-byte entry and 40 000 commands.
+// ===========================================================================
+
+/// A body over the admin cap is refused with 413, before it is parsed or
+/// forwarded anywhere.
+#[tokio::test]
+async fn oversized_admin_body_is_rejected_with_413() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    let huge = "x".repeat(2 * 1024 * 1024); // 2 MiB > the 1 MiB cap
+    let body = format!(
+        r#"{{"id":"p1","key":"openai","name":"{huge}","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}}"#
+    );
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        413,
+        "an oversized admin body must be refused with 413"
+    );
+    let text = r.text().await.expect("body");
+    assert!(text.contains("request_body_too_large"), "body: {text}");
+
+    // The connection stays usable: a normal request still works afterwards.
+    let ok = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#),
+    )
+    .await;
+    assert_eq!(ok.status(), 201, "the next request must still be served");
+}
+
+/// An invalidation naming more keys than the cap is refused, and NOTHING is
+/// published to the invalidation stream.
+#[cfg(feature = "cluster-redis")]
+#[tokio::test]
+async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
+    use fred::prelude::*;
+    use hydra_core::config::ConfigData;
+    use hydra_server::cluster::events::InvalidationStream;
+
+    // Integration-test database 9 (see tests/common/mod.rs for the partition).
+    let pool = common::real_redis_pool(9).await;
+
+    let mut state = AdminState::new(
+        None,
+        ConfigStore::from_snapshot(
+            ConfigData::default(),
+            Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
+        ),
+        Arc::new(
+            HttpAuthChecker::new(
+                AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+                AuthConfig::default(),
+            )
+            .expect("checker"),
+        ),
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
+        Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
+        Some(TOKEN.to_string()),
+        None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
+        false,
+        None,
+        None,
+    );
+    state.invalidation = Some(InvalidationStream::new(pool.clone()));
+    let port = start_admin(Arc::new(state));
+
+    // One over the cap.
+    let keys: Vec<String> = (0..1001).map(|i| format!("sk-{i}")).collect();
+    let body = serde_json::json!({ "api_keys": keys }).to_string();
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/auth/cache",
+        Some(TOKEN),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "1001 keys must be refused");
+    let text = r.text().await.expect("body");
+    assert!(text.contains("too_many_keys"), "body: {text}");
+
+    // An absurdly long single key is refused too.
+    let body = serde_json::json!({ "api_keys": ["k".repeat(5000)] }).to_string();
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/auth/cache",
+        Some(TOKEN),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "an oversized api_key must be refused");
+    let text = r.text().await.expect("body");
+    assert!(text.contains("invalid_api_key"), "body: {text}");
+
+    // Nothing reached the stream (XLEN, only possible against a real Redis).
+    let len: i64 = pool.xlen("hydra:{ctl:events}").await.expect("xlen");
+    assert_eq!(len, 0, "a refused invalidation must publish nothing");
+
+    // At the cap it IS accepted: exactly one entry, ~65 KB.
+    let keys: Vec<String> = (0..1000).map(|i| format!("sk-{i}")).collect();
+    let body = serde_json::json!({ "api_keys": keys }).to_string();
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/auth/cache",
+        Some(TOKEN),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "1000 keys are within the cap");
+    let len: i64 = pool.xlen("hydra:{ctl:events}").await.expect("xlen");
+    assert_eq!(len, 1, "exactly one stream entry");
+}

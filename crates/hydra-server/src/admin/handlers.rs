@@ -196,12 +196,43 @@ fn gen_id() -> String {
 }
 
 /// Read the full request body into a vec (empty for bodyless requests).
-pub(super) async fn read_body(session: &mut ServerSession) -> Vec<u8> {
+/// Hard cap on an admin request body (review N4).
+///
+/// The proxy path has had one for a long time (`max_request_body_hard`, 413);
+/// the admin service had NONE, so a single request — including one carrying
+/// only a *tenant* token — could make the process buffer an arbitrary amount of
+/// memory before anything was even parsed. 1 MiB is ~1000x the largest
+/// legitimate admin body (a JSON config entity).
+pub(super) const MAX_ADMIN_BODY_BYTES: usize = 1024 * 1024;
+
+/// Read the whole request body, refusing anything over
+/// [`MAX_ADMIN_BODY_BYTES`] with `413 request_body_too_large`.
+///
+/// The remainder of an oversized body is drained first, so the connection
+/// stays usable for the next request instead of desynchronizing the stream.
+///
+/// `Err` carries the ready-made 413 `Resp` (`Resp` is ~336 bytes, same
+/// `result_large_err` allowance as [`parse_body`]); the `Ok` path stays cheap.
+#[allow(clippy::result_large_err)]
+pub(super) async fn read_body(
+    session: &mut ServerSession,
+    trace_id: &str,
+) -> Result<Vec<u8>, Resp> {
     let mut buf = Vec::new();
     while let Ok(Some(chunk)) = session.read_request_body().await {
         buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_ADMIN_BODY_BYTES {
+            session.set_keepalive(None);
+            let _ = session.drain_request_body().await;
+            return Err(err_json(
+                413,
+                "request_body_too_large",
+                &format!("request body exceeds {MAX_ADMIN_BODY_BYTES} bytes"),
+                trace_id,
+            ));
+        }
     }
-    buf
+    Ok(buf)
 }
 
 // `Resp` (http::Response<Vec<u8>>) is ~336 bytes; clippy flags the `Result`
@@ -234,7 +265,10 @@ pub(super) async fn provider_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut p: Provider = match parse_body(&body, trace_id) {
             Ok(p) => p,
             Err(r) => return r,
@@ -279,7 +313,10 @@ pub(super) async fn provider_item(
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let mut p: Provider = match parse_body(&body, trace_id) {
                 Ok(p) => p,
                 Err(r) => return r,
@@ -328,7 +365,10 @@ pub(super) async fn provider_model_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let m: ProviderModel = match parse_body(&body, trace_id) {
             Ok(m) => m,
             Err(r) => return r,
@@ -358,7 +398,10 @@ pub(super) async fn provider_model_item(
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let mut m: ProviderModel = match parse_body(&body, trace_id) {
                 Ok(m) => m,
                 Err(r) => return r,
@@ -422,7 +465,10 @@ pub(super) async fn provider_key_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut k: ProviderKey = match parse_body(&body, trace_id) {
             Ok(k) => k,
             Err(r) => return r,
@@ -488,7 +534,10 @@ pub(super) async fn provider_key_item(
             }
         }
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let mut k: ProviderKey = match parse_body(&body, trace_id) {
                 Ok(k) => k,
                 Err(r) => return r,
@@ -832,7 +881,10 @@ pub(super) async fn tenant_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let up: TenantUpsert = match parse_body(&body, trace_id) {
             Ok(u) => u,
             Err(r) => return r,
@@ -919,7 +971,10 @@ pub(super) async fn tenant_item(
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let up: TenantUpsert = match parse_body(&body, trace_id) {
                 Ok(u) => u,
                 Err(r) => return r,
@@ -994,7 +1049,10 @@ pub(super) async fn tenant_provider_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut tp: TenantProvider = match parse_body(&body, trace_id) {
             Ok(tp) => tp,
             Err(r) => return r,
@@ -1050,7 +1108,10 @@ pub(super) async fn tenant_model_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut tm: TenantModel = match parse_body(&body, trace_id) {
             Ok(tm) => tm,
             Err(r) => return r,
@@ -1246,7 +1307,10 @@ pub(super) async fn limit_role_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut r: LimitRole = match parse_body(&body, trace_id) {
             Ok(r) => r,
             Err(resp) => return resp,
@@ -1282,7 +1346,10 @@ pub(super) async fn limit_role_item(
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let mut r: LimitRole = match parse_body(&body, trace_id) {
                 Ok(r) => r,
                 Err(resp) => return resp,
@@ -1327,7 +1394,10 @@ pub(super) async fn provider_key_binding_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
-        let body = read_body(session).await;
+        let body = match read_body(session, trace_id).await {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
         let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
             Ok(b) => b,
             Err(r) => return r,
@@ -1377,7 +1447,10 @@ pub(super) async fn provider_key_binding_item(
             Err(e) => db_err_resp(e, trace_id),
         },
         "PUT" => {
-            let body = read_body(session).await;
+            let body = match read_body(session, trace_id).await {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
             let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
                 Ok(b) => b,
                 Err(resp) => return resp,
@@ -1431,6 +1504,44 @@ struct InvalidateResponse {
     tenant_id: Option<String>,
 }
 
+/// Cap on how many api-keys ONE invalidation request may name (review N4).
+///
+/// Every key becomes a 64-char digest inside a SINGLE stream entry, so an
+/// uncapped list lets one request (a *tenant* token is enough) write a
+/// multi-hundred-MB entry onto the shared backbone — and, before that, issue
+/// two Redis commands per key (`DEL` + `SREM`). 1000 keys ⇒ ~65 KB per entry.
+pub(super) const MAX_INVALIDATION_KEYS: usize = 1_000;
+
+/// Cap on a single api-key's length. Real keys are short; this only blocks
+/// abuse of the field as arbitrary payload.
+pub(super) const MAX_API_KEY_LEN: usize = 4_096;
+
+/// Reject an invalidation request that names too many keys, or a key that is
+/// absurdly long. `None` = acceptable.
+fn invalidate_shape_error(keys: Option<&[String]>, trace_id: &str) -> Option<Resp> {
+    let keys = keys?;
+    if keys.len() > MAX_INVALIDATION_KEYS {
+        return Some(err_json(
+            400,
+            "too_many_keys",
+            &format!(
+                "at most {MAX_INVALIDATION_KEYS} api_keys per request ({} given)",
+                keys.len()
+            ),
+            trace_id,
+        ));
+    }
+    if let Some(len) = keys.iter().map(String::len).find(|l| *l > MAX_API_KEY_LEN) {
+        return Some(err_json(
+            400,
+            "invalid_api_key",
+            &format!("an api_key is {len} bytes; the limit is {MAX_API_KEY_LEN}"),
+            trace_id,
+        ));
+    }
+    None
+}
+
 pub(super) async fn auth_cache_invalidate(
     state: &AdminState,
     session: &mut ServerSession,
@@ -1438,7 +1549,10 @@ pub(super) async fn auth_cache_invalidate(
 ) -> Resp {
     // An empty body means "invalidate everything" — tolerate it instead of
     // failing the parse (curl -X DELETE with no body must work).
-    let body = read_body(session).await;
+    let body = match read_body(session, trace_id).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let req: InvalidateRequest = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
         InvalidateRequest {
             tenant_id: None,
@@ -1450,6 +1564,9 @@ pub(super) async fn auth_cache_invalidate(
             Err(r) => return r,
         }
     };
+    if let Some(resp) = invalidate_shape_error(req.api_keys.as_deref(), trace_id) {
+        return resp;
+    }
     let count = match (req.tenant_id.as_deref(), req.api_keys.as_deref()) {
         (Some(tid), Some(keys)) => state.auth.invalidate(tid, keys).await,
         (Some(tid), None) => state.auth.invalidate_tenant(tid).await,
@@ -1581,7 +1698,10 @@ pub(super) async fn tenant_auth_cache_invalidate(
     tenant_id: &str,
     trace_id: &str,
 ) -> Resp {
-    let body = read_body(session).await;
+    let body = match read_body(session, trace_id).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let req: TenantCacheInvalidateRequest =
         if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
             TenantCacheInvalidateRequest { api_keys: None }
@@ -1591,6 +1711,9 @@ pub(super) async fn tenant_auth_cache_invalidate(
                 Err(r) => return r,
             }
         };
+    if let Some(resp) = invalidate_shape_error(req.api_keys.as_deref(), trace_id) {
+        return resp;
+    }
     let count = match req.api_keys.as_deref() {
         Some(keys) if !keys.is_empty() => state.auth.invalidate(tenant_id, keys).await,
         _ => state.auth.invalidate_tenant(tenant_id).await,
@@ -1632,7 +1755,10 @@ pub(super) async fn tenant_auth_test(
     session: &mut ServerSession,
     trace_id: &str,
 ) -> Resp {
-    let body = read_body(session).await;
+    let body = match read_body(session, trace_id).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let req: AuthTestRequest = match parse_body(&body, trace_id) {
         Ok(r) => r,
         Err(r) => return r,

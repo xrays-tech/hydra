@@ -450,7 +450,11 @@ impl AdminService {
                 ));
             }
         };
-        let body = handlers::read_body(session).await;
+        let body = match handlers::read_body(session, trace_id).await {
+            Ok(b) => b,
+            // This helper returns Option<Resp>; surface the 413 as-is.
+            Err(r) => return Some(r),
+        };
         match crate::cluster::forward::forward_mutation(
             &target,
             method,
