@@ -198,7 +198,12 @@ const API_DOCS = [
       desc: "auth_url is mandatory (empty ⇒ all requests 401). Certificates are optional: leave cert_pem/cert_key_pem blank for no cert (legacy cert_file/cert_key paths still accepted for compat; empty strings are ignored). cert_pem without cert_key_pem ⇒ 400. The private key is sealed at rest and never echoed back.",
       auth: true, exId: "acme",
       body: { id: "acme", name: "ACME", domain: "acme.example.com", auth_url: "https://auth.acme.example.com/v", cert_file: null, cert_key: null, cert_pem: null, cert_key_pem: null, enabled: true, created_at: "", updated_at: "" },
-      resp: ["201 — the created Tenant (cert content never included)"],
+      resp: ["201 — the created Tenant (cert content never included)",
+             "201 with \"snapshot_stale\": true — the write IS committed but the post-write reload failed, so the runtime config still shows the previous value; re-read before retrying"],
+      // `snapshot_stale` is PROCESS-level and last-writer-wins: it reports whether
+      // the LAST reload succeeded (does the runtime snapshot match the committed
+      // DB?), NOT whether this particular write applied. It appears on reads too.
+
       errors: [
         { status: 400, code: "missing_required_field", desc: "auth_url required; or cert_key_pem required when cert_pem is set" },
         { status: 400, code: "cert_file_unreadable", desc: "legacy cert paths not readable on this node" },

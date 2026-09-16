@@ -471,7 +471,7 @@ name and label that really exists in this codebase (`/metrics`).
 | Registry rows piling up | `hydra_registry_nodes{state="dead"} > 5` | Reaping is failing, or node identities drift |
 | Registry reaping churn | `increase(hydra_registry_reaped_total[1h]) > 20` | Nodes keep being recreated (unstable identity — see §13.6) |
 | Config snapshot stale | `hydra_config_snapshot_stale == 1` | A post-write reload failed; the in-memory snapshot is behind the DB |
-| Upstream first-byte timeouts | `increase(hydra_retries_total{stage="connect"}[10m]) > 0` | The upstream accepted the connection and then stopped answering; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s) instead of burning the 300s exchange timeout |
+| Upstream first-byte timeouts | `increase(hydra_upstream_first_byte_timeout_total[10m]) > 0` | The upstream accepted the connection and then sent no response headers; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s) instead of burning the 300s exchange timeout. **Do not use `hydra_retries_total{stage="connect"}`** — nothing emits that label value (retries are recorded with `stage="terminate_loop"`), so such a rule could never fire |
 | Replication stalled (upgrade window) | `changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0` | Fail-closed mixed-version signal. **Only polling nodes publish these** — scope the rule by role |
 
 The label is `protocol`, never `transport` (`hydra_listener_bound` is registered
@@ -703,6 +703,8 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
 | `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
 | `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
+| `HYDRA_FORWARD_TIMEOUT_SECS` | standby→leader admin-forward timeout (default 5). It bounds the CONNECT phase; the total deadline is that value + 2s so a connect-phase failure is reported as the definite failure it is (see `forward.rs`) |
+| `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected. See the alert row in §9.1 |
 | `HYDRA_SHUTDOWN_DRAIN_SECS` | seconds Pingora drains in-flight requests after SIGTERM (default 20); size `terminationGracePeriodSeconds` from it (see §13.5b) |
 | `HYDRA_REGISTRY_STALE_GRACE_SECS` | TTL of the registry "last seen" witness (default 120). Only `> 0` values are accepted; a small value narrows the grace window in which a merely-silent node is protected from reaping |
 

@@ -25,7 +25,6 @@
 //! of a 5 s timeout recursion — a belt-and-suspenders guard underneath the
 //! registry resolution.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use http::{HeaderMap, Response};
@@ -60,6 +59,21 @@ fn parse_forward_timeout_secs(raw: Option<&str>) -> u64 {
 /// might have).
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
+    /// The leader's response HEADERS arrived but the exchange failed afterwards.
+    ///
+    /// As ambiguous as [`Self::Timeout`]: the leader demonstrably received and
+    /// started answering the request, so the write may already have been applied.
+    /// Classifying this as a definite failure would be the same class of lie the
+    /// timeout/connect split exists to prevent.
+    #[error("the leader answered but the response could not be read: {0}")]
+    AfterResponse(String),
+
+    /// A timeout AFTER the connection was established: the request was written,
+    /// so the leader may already have processed it.
+    ///
+    /// `secs` is the TOTAL deadline that actually elapsed (the configured bound
+    /// plus [`CONNECT_SLACK_SECS`]), i.e. the number the operator really waited —
+    /// not the raw configuration value.
     #[error(
         "leader forward timed out after {secs}s; the write may already have landed on the leader"
     )]
@@ -71,12 +85,18 @@ pub enum ForwardError {
 impl ForwardError {
     /// Classify a transport error.
     ///
-    /// ORDER IS SEMANTIC: `is_connect()` is checked FIRST. reqwest marks the
-    /// connect-phase timeout with the same `TimedOut` flag as a read timeout
-    /// (so "SYN dropped" — a dead pod whose IP lingers, the common case in
-    /// Kubernetes — looks like a timeout), and reporting a request that never
-    /// left this node as "the outcome is unknown" would turn the MOST certain
-    /// failure into the least certain one.
+    /// ORDER IS SEMANTIC: `is_connect()` is checked FIRST.
+    ///
+    /// That order only works because the client sets a CONNECT bound (see
+    /// [`client`]): with the request-level deadline alone, a SYN-dropping address
+    /// (a dead pod whose IP is still routed — the common Kubernetes case)
+    /// produces a bare `TimedOut` with `is_connect() == false`, so a request that
+    /// never left this node would be reported as "the outcome is unknown". This
+    /// was MEASURED, not assumed — the table is in [`client`].
+    ///
+    /// So: a connect failure (refused, unreachable, connect-timeout) is a
+    /// DEFINITE failure, while a timeout after the connection was established is
+    /// genuinely ambiguous, because the leader may already have processed it.
     fn from_transport(e: &reqwest::Error, secs: u64) -> Self {
         if e.is_connect() {
             Self::Other(format!("forward to active failed (connection): {e}"))
@@ -126,15 +146,36 @@ pub async fn forward_target_from_registry(
     }
 }
 
-/// Shared reqwest client (rare admin ops; reuse the connection pool).
-fn client() -> &'static reqwest::Client {
-    static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| {
-        reqwest::Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .build()
-            .expect("forward reqwest build (infallible)")
-    })
+/// How much longer the TOTAL forward deadline is than the CONNECT bound.
+///
+/// The two bounds must differ, with the connect one SHORTER: reqwest's
+/// request-level `.timeout()` is a TOTAL deadline whose expiry error carries no
+/// connect marker, so if both fired together a black-holed leader could still be
+/// misreported as "the outcome is unknown". This margin makes the connect timer
+/// resolve first.
+const CONNECT_SLACK_SECS: u64 = 2;
+
+/// Build the client for ONE forward.
+///
+/// It carries BOTH bounds, and the CONNECT one is load-bearing: a SYN-dropping
+/// address (a dead pod whose IP is still routed — the common Kubernetes case)
+/// must be a DEFINITE failure, because the request provably never left this node.
+/// MEASURED, not assumed — a black-holed address with `secs = 2`:
+///
+/// | client setup | elapsed | `is_connect()` | `is_timeout()` |
+/// |---|---|---|---|
+/// | request `.timeout(2s)` only | 2.00s | **false** | true |
+/// | client `.connect_timeout(2s)` + request `.timeout(4s)` | 2.00s | **true** | true |
+///
+/// A per-call client gives up connection pooling, which is the right trade for a
+/// rare admin mutation: a false "the write may have been applied" costs far more
+/// than one extra handshake.
+fn client_for(secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(secs))
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Forward one admin request to the active leader's admin endpoint,
@@ -179,8 +220,11 @@ async fn forward_mutation_with_timeout(
     trace_id: &str,
     secs: u64,
 ) -> Result<Response<Vec<u8>>, ForwardError> {
+    // `secs` bounds the CONNECT phase; the total deadline is longer so a
+    // connect-phase failure is never masked by it (see `CONNECT_SLACK_SECS`).
+    let total_secs = secs + CONNECT_SLACK_SECS;
     let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
-    let mut req = client()
+    let mut req = client_for(secs)
         .request(
             reqwest::Method::from_bytes(method.as_bytes())
                 .map_err(|e| ForwardError::Other(format!("unsupported method {method}: {e}")))?,
@@ -188,7 +232,7 @@ async fn forward_mutation_with_timeout(
         )
         .header("x-hydra-trace-id", trace_id)
         .header(FORWARD_ONCE_HEADER, "1")
-        .timeout(Duration::from_secs(secs));
+        .timeout(Duration::from_secs(total_secs));
     if let Some(auth) = headers.get("authorization") {
         req = req.header("authorization", auth);
     }
@@ -202,20 +246,20 @@ async fn forward_mutation_with_timeout(
     let resp = req
         .send()
         .await
-        .map_err(|e| ForwardError::from_transport(&e, secs))?;
+        .map_err(|e| ForwardError::from_transport(&e, total_secs))?;
     let status = resp.status();
     let content_type = resp.headers().get("content-type").cloned();
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| ForwardError::Other(format!("forward response read failed: {e}")))?;
+        .map_err(|e| ForwardError::AfterResponse(format!("response read failed: {e}")))?;
 
     let mut out = Response::builder().status(status);
     if let Some(ct) = content_type {
         out = out.header("content-type", ct);
     }
     out.body(bytes.to_vec())
-        .map_err(|e| ForwardError::Other(e.to_string()))
+        .map_err(|e| ForwardError::AfterResponse(e.to_string()))
 }
 
 #[cfg(test)]
@@ -274,7 +318,11 @@ mod tests {
         .await
         .expect_err("no response ⇒ error");
         match err {
-            ForwardError::Timeout { secs } => assert_eq!(secs, 1, "the configured bound is quoted"),
+            // The reported value is the TOTAL deadline that elapsed: the
+            // configured 1s connect bound + CONNECT_SLACK_SECS (2).
+            ForwardError::Timeout { secs } => {
+                assert_eq!(secs, 1 + CONNECT_SLACK_SECS, "the elapsed total is quoted")
+            }
             other => panic!("a silent leader must be `Timeout`, got {other:?}"),
         }
         assert!(
@@ -311,6 +359,41 @@ mod tests {
         assert!(
             !err.to_string().contains("may already have landed"),
             "a refused connection must NOT be reported as an unknown outcome: {err}"
+        );
+    }
+
+    /// The plan MANDATED this case ("先实测确认 `is_connect()` 在连接阶段超时下为
+    /// 真；若实测为假，则不得保留'结果未知'这一确定措辞"), and its absence is why a
+    /// wrong classification shipped: both existing tests covered cases that
+    /// classify correctly, so the SYN-dropped case was invisible.
+    ///
+    /// A black-holed address (SYN dropped, no RST) is the "dead pod whose IP is
+    /// still routed" case. It must be a DEFINITE failure: the request never left
+    /// this node, so answering "the outcome is unknown" would be a lie.
+    #[tokio::test]
+    async fn a_syn_dropping_leader_is_a_definite_failure_not_an_unknown_outcome() {
+        // RFC 5737 TEST-NET-1: unroutable, so the SYN is dropped rather than
+        // answered. (In an environment that rejects it outright the error is
+        // still a connect error, so the assertion holds either way.)
+        let err = forward_mutation_with_timeout(
+            "http://192.0.2.1:81",
+            "POST",
+            "/api/v1/providers",
+            Vec::new(),
+            &HeaderMap::new(),
+            "t",
+            2,
+        )
+        .await
+        .expect_err("a black-holed leader must fail");
+        assert!(
+            matches!(err, ForwardError::Other(_)),
+            "a request that never left this node must NOT be reported as an \
+             unknown outcome, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("may already have landed"),
+            "and the message must not suggest the write may have landed: {err}"
         );
     }
 

@@ -1021,6 +1021,9 @@ pub(super) async fn tenant_item(
                     Ok(v) => v,
                     Err(resp) => return resp,
                 };
+            // Which token state did THIS request write? (`None` = untouched.)
+            // Computed before the struct literal moves `token_hash`.
+            let written_token_state = token_hash.as_ref().map(|h| h.is_some());
             if let Err(e) = crate::db::write_tenant(
                 state.db(),
                 state.key_provider.as_ref(),
@@ -1035,15 +1038,27 @@ pub(super) async fn tenant_item(
             {
                 return db_err_resp(e, trace_id);
             }
+            // The write IS committed at this point, so the answer must not
+            // depend on a second read succeeding: a failed re-read used to be
+            // reported as `404 not found` (and as `has_access_token: false`) for a
+            // tenant that had just been written — "reported as failed but
+            // actually live", one step later than §7-3 fixed it.
+            let has = match written_token_state {
+                // We know what we just wrote, so answer from that.
+                Some(written) => written,
+                None => crate::db::tenant_has_access_token(state.db(), id)
+                    .await
+                    .unwrap_or(true), // read failed ⇒ do not claim "no token"
+            };
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
-                    let has = crate::db::tenant_has_access_token(state.db(), id)
-                        .await
-                        .unwrap_or(false);
                     reload_best_effort(state, trace_id).await;
                     ok_json(200, &TenantView::from_state(state, t, has))
                 }
-                Err(_) => err_json(404, "not_found", "tenant not found", trace_id),
+                Err(e) if is_not_found(&e) => {
+                    err_json(404, "not_found", "tenant not found", trace_id)
+                }
+                Err(e) => db_err_resp(e, trace_id),
             }
         }
         "DELETE" => match crate::db::delete_tenant(state.db(), id).await {

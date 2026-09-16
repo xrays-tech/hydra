@@ -8,7 +8,7 @@
 //!
 //! Manual run (with a real ClickHouse reachable at `CH_URL`):
 //!   CH_URL=http://127.0.0.1:8123 \
-//!     cargo test -p hydra-server --features db,usage-clickhouse \
+//!     cargo test -p hydra-server --features server,usage-clickhouse \
 //!       --test clickhouse_sink -- --ignored
 
 #![cfg(feature = "usage-clickhouse")]

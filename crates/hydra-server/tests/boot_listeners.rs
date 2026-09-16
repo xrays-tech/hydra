@@ -65,7 +65,11 @@ impl Drop for TempDb {
 
 fn base_command(db: &TempDb, plain: u16, admin: u16) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hydra"));
-    cmd.env("HYDRA_DB_URL", db.url())
+    cmd
+        // Required (>= 16 chars): without it the admin API fails closed with 401,
+        // so the `/metrics` fallback in case B could never be read.
+        .env("HYDRA_ADMIN_TOKEN", "boot-listeners-token")
+        .env("HYDRA_DB_URL", db.url())
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{plain}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
@@ -220,7 +224,10 @@ async fn a_taken_tls_port_degrades_to_plaintext() {
     let reported_by_log = log_has(&log, "could not bind the configured TLS listener");
     if !reported_by_log {
         let metrics = format!("http://127.0.0.1:{admin}/metrics");
-        let body = reqwest::get(&metrics)
+        let body = reqwest::Client::new()
+            .get(&metrics)
+            .header("authorization", "Bearer boot-listeners-token")
+            .send()
             .await
             .expect("fetch /metrics")
             .text()

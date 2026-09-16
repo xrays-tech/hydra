@@ -507,6 +507,21 @@ impl AdminService {
             // A TIMEOUT is a dedicated code: the write may or may not have been
             // applied on the leader, and the operator must re-read the resource
             // instead of blindly retrying (a blind retry could double-apply).
+            // The leader ANSWERED: whether it applied the write is unknown, so it
+            // gets the same code as a timeout (the caller must re-read), never the
+            // definite 502 below.
+            Err(crate::cluster::forward::ForwardError::AfterResponse(reason)) => {
+                Some(handlers::err_json(
+                    504,
+                    "forward_result_unknown",
+                    &format!(
+                        "the leader answered but the response could not be read ({reason}); the \
+                         write may or may not have been applied — re-read the resource before \
+                         retrying"
+                    ),
+                    trace_id,
+                ))
+            }
             Err(crate::cluster::forward::ForwardError::Timeout { secs }) => {
                 Some(handlers::err_json(
                     504,
@@ -518,10 +533,11 @@ impl AdminService {
                     trace_id,
                 ))
             }
-            // Everything else (connection refused, DNS, TLS, loop guard) proves
-            // the request never reached the leader, so the message must NOT
-            // claim anything about a write that could not have happened — and it
-            // must not pretend certainty it does not have either.
+            // Everything else here proves the request never reached the leader:
+            // a connect failure (refused / unreachable / connect-timeout), an
+            // unparseable method, or the loop guard. The two ambiguous cases
+            // (timeout, and a failure after the response headers) are handled
+            // above and must NOT land here.
             Err(e) => Some(handlers::err_json(
                 502,
                 "forward_failed",

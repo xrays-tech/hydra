@@ -303,59 +303,76 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------
-    let proxy_port = ephemeral_port();
-    let admin_port = ephemeral_port();
-    let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let admin_addr = format!("127.0.0.1:{admin_port}");
-
-    let proxy_app = HydraProxy::new(proxy_state);
-    let admin_app = AdminService::new(admin_state);
-
-    let mut server = Server::new(Some(Opt::default())).expect("Server::new");
-    server.bootstrap();
-    let mut proxy_svc = pingora_proxy::http_proxy_service(&server.configuration, proxy_app);
-    proxy_svc.add_tcp(&proxy_addr);
-    server.add_service(proxy_svc);
-
-    let mut admin_svc = ListenService::new("admin".to_string(), admin_app);
-    admin_svc.add_tcp(&admin_addr);
-    server.add_service(admin_svc);
-
-    let _handle = std::thread::spawn(move || server.run_forever());
-
-    // --- send one proxied request -------------------------------------------
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("client");
-
-    let proxy_url = format!("http://localhost:{proxy_port}/v1/chat/completions");
     let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+    let proxy_url_for = |port: u16| format!("http://localhost:{port}/v1/chat/completions");
 
-    // Retry until the proxy is ready.
-    let mut last_err = None;
-    for _ in 0..50 {
-        match client
-            .post(&proxy_url)
-            .header("authorization", "Bearer test-client-key")
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(r) => {
-                assert_eq!(r.status(), 200, "proxy should succeed");
-                break;
-            }
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(200)).await;
+    // `ephemeral_port` probes a candidate and then RELEASES it, because Pingora
+    // binds it later and holding the socket here would make that bind fail
+    // (Pingora sets only SO_REUSEADDR). Another process can therefore win the
+    // candidate in that window, which shows up as "proxy never ready" — an
+    // ACQUISITION race, not a product failure, and it was a real intermittent
+    // gate failure. Retry the spawn with FRESH ports instead of failing once.
+    let mut attempts = 0u32;
+    let (_proxy_port, admin_port) = loop {
+        attempts += 1;
+        let proxy_port = ephemeral_port();
+        let admin_port = ephemeral_port();
+        let proxy_addr = format!("127.0.0.1:{proxy_port}");
+        let admin_addr = format!("127.0.0.1:{admin_port}");
+
+        let mut server = Server::new(Some(Opt::default())).expect("Server::new");
+        server.bootstrap();
+        let mut proxy_svc = pingora_proxy::http_proxy_service(
+            &server.configuration,
+            HydraProxy::new(proxy_state.clone()),
+        );
+        proxy_svc.add_tcp(&proxy_addr);
+        server.add_service(proxy_svc);
+        let mut admin_svc =
+            ListenService::new("admin".to_string(), AdminService::new(admin_state.clone()));
+        admin_svc.add_tcp(&admin_addr);
+        server.add_service(admin_svc);
+        // Deliberately leaked on failure so a later attempt cannot be confused by
+        // a half-started server; the process ends with the test anyway.
+        std::thread::spawn(move || server.run_forever());
+
+        let mut last_err = None;
+        let mut ready = false;
+        for _ in 0..25 {
+            match client
+                .post(proxy_url_for(proxy_port))
+                .header("authorization", "Bearer test-client-key")
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    assert_eq!(r.status(), 200, "proxy should succeed");
+                    ready = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
         }
-    }
-    if last_err.is_some() {
-        panic!("proxy never ready: {last_err:?}");
-    }
+        if ready {
+            break (proxy_port, admin_port);
+        }
+        assert!(
+            attempts < 3,
+            "proxy never ready after {attempts} attempts (last error: {last_err:?}) — \
+             this is a port-acquisition race, not a product failure; if it persists \
+             the port band in tests/common/mod.rs is worth re-checking"
+        );
+        eprintln!("attempt {attempts}: proxy never became ready; retrying with fresh ports");
+    };
 
     // --- query /metrics on the admin port -----------------------------------
     let metrics_url = format!("http://127.0.0.1:{admin_port}/metrics");

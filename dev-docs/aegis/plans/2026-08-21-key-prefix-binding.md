@@ -738,7 +738,10 @@ pub async fn delete_provider_key_binding(pool: &SqlitePool, id: &str) -> Result<
 DATABASE_URL=sqlite:///tmp/hydra-prepare.db cargo sqlx db create
 DATABASE_URL=sqlite:///tmp/hydra-prepare.db cargo sqlx migrate run --source crates/hydra-server/migrations
 # 2) 重新生成离线缓存（写入仓库根 .sqlx/）
-DATABASE_URL=sqlite:///tmp/hydra-prepare.db cargo sqlx prepare --workspace --features db
+# （T10.6 更正）`--features db` 已不能单独编译（`store.rs`/`db/restore.rs` 依赖
+# `crate::cluster::*`）；且 sqlx-cli 0.9 需要把 features 放在 `--` 之后，
+# `--workspace --features …` 这种写法会报 "no queries found" 并**清空** .sqlx/ 缓存。
+cd crates/hydra-server && DATABASE_URL=sqlite:///$REPO_ROOT/.prepare.db cargo sqlx prepare -- --features server
 # 3) 离线编译验证（CI 同款）
 SQLX_OFFLINE=true cargo build --workspace --features hydra-server/server
 ```

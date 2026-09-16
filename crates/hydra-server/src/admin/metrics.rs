@@ -39,6 +39,7 @@
 //! | `hydra_registry_nodes` | gauge | state | node registry reaper (alive\|dead rows) |
 //! | `hydra_registry_reaped_total` | counter | — | node registry reaper (stale rows removed) |
 //! | `hydra_listener_tenant_certs` | gauge | — | `tls::follow_snapshot` (certs in the current snapshot) |
+//! | `hydra_upstream_first_byte_timeout_total` | counter | provider | proxy send path (upstream accepted, then sent no headers within the bound) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -118,6 +119,12 @@ struct Metrics {
     /// Config combinations that leave certificates unserved or a configured
     /// port unusable, by kind. Non-zero means an operator decision is missing.
     listener_misconfig: IntCounterVec,
+    /// Upstream attempts that established a connection and then produced no
+    /// response HEADERS within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`.
+    ///
+    /// Without this, the first-byte path returned before any counter was
+    /// incremented, so an alert row written against it could never fire.
+    upstream_first_byte_timeouts: IntCounterVec,
     /// Tenant certificates currently in the config snapshot. Together with
     /// `hydra_listener_bound{protocol="tls"}` this makes "certificates are
     /// configured but no TLS listener is bound" ALERTABLE instead of a log line.
@@ -311,6 +318,12 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_listener_misconfig_total",
                 "Listener configuration that leaves certs unserved or a port unusable, by kind",
                 &["kind"]
+            )
+            .ok()?,
+            upstream_first_byte_timeouts: register_int_counter_vec!(
+                "hydra_upstream_first_byte_timeout_total",
+                "Upstream attempts that connected but sent no response headers within the bound",
+                &["provider"]
             )
             .ok()?,
             listener_tenant_certs: register_int_gauge!(
@@ -545,6 +558,15 @@ pub fn record_control_poll(result: &str) {
 pub fn record_control_snapshot_version(version: u64) {
     if let Some(m) = metrics() {
         m.control_snapshot_version.set(version as i64);
+    }
+}
+
+/// Count an upstream first-byte timeout for `provider`.
+pub fn record_upstream_first_byte_timeout(provider: &str) {
+    if let Some(m) = metrics() {
+        m.upstream_first_byte_timeouts
+            .with_label_values(&[provider])
+            .inc();
     }
 }
 

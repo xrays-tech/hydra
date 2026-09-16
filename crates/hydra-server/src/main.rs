@@ -1143,9 +1143,16 @@ fn registry_stale_grace_secs() -> u64 {
 /// `0` is rejected: Pingora would read `Some(0)` as "no drain at all", silently
 /// defeating the point of configuring it.
 fn shutdown_drain_secs() -> u64 {
-    std::env::var("HYDRA_SHUTDOWN_DRAIN_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    parse_shutdown_drain_secs(std::env::var("HYDRA_SHUTDOWN_DRAIN_SECS").ok().as_deref())
+}
+
+/// Parse half of [`shutdown_drain_secs`], kept PURE so it can be tested without
+/// touching the process environment (like the other config parsers here).
+///
+/// `0` is rejected: Pingora would read `Some(0)` as "no drain at all", silently
+/// defeating the point of configuring it.
+fn parse_shutdown_drain_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(20)
 }
@@ -1174,6 +1181,33 @@ fn spawn_registry_unregister_on_shutdown(reg: hydra_server::cluster::registry::N
             tracing::warn!(error = %e, "node registry: unregister on shutdown failed");
         }
     });
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::parse_shutdown_drain_secs;
+
+    /// T9.4 — the drain window is configurable, `0` is rejected, and the default
+    /// is the documented 20s. Without this, deleting the `grace_period_seconds`
+    /// field from the `ServerConf` would silently restore Pingora's 300s default
+    /// with every gate still green.
+    ///
+    /// Deliberately NOT inside the `cluster-redis` test module: the parser has
+    /// nothing to do with clustering, and that module does not compile under the
+    /// `--features server` gate.
+    #[test]
+    fn shutdown_drain_parsing_is_total() {
+        assert_eq!(parse_shutdown_drain_secs(None), 20, "documented default");
+        assert_eq!(parse_shutdown_drain_secs(Some("45")), 45);
+        assert_eq!(parse_shutdown_drain_secs(Some(" 45 ")), 45, "trimmed");
+        assert_eq!(
+            parse_shutdown_drain_secs(Some("0")),
+            20,
+            "0 ⇒ no drain ⇒ default"
+        );
+        assert_eq!(parse_shutdown_drain_secs(Some("nope")), 20);
+        assert_eq!(parse_shutdown_drain_secs(Some("-1")), 20);
+    }
 }
 
 #[cfg(all(test, feature = "cluster-redis"))]

@@ -1401,6 +1401,13 @@ async fn a_stale_snapshot_is_reported_in_the_response() {
         created["snapshot_stale"], true,
         "the response must say the runtime snapshot is behind the committed DB: {created}"
     );
+    // The gauge and the response flag are set in the SAME branch, so the
+    // acceptance's other half (`hydra_config_snapshot_stale == 1`) is asserted
+    // here too rather than left to inspection.
+    assert!(
+        hydra_server::admin::metrics::render().contains("hydra_config_snapshot_stale 1"),
+        "the alertable gauge must agree with the response flag"
+    );
     // The tenant really is in the DB (that is why the status is 2xx).
     assert!(repo::get_tenant(state.db(), "t-stale").await.is_ok());
 

@@ -164,8 +164,30 @@ queue_wait_timeout_ms # 1000-5000
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,
   open on read) at the `db.rs` boundary, never in `hydra-core`.
-- **SQL changes:** after any migration or query edit, re-run `cargo sqlx prepare --workspace --features db`
-  (with a migrated throwaway DB) and commit the refreshed `.sqlx/`. CI builds with `SQLX_OFFLINE=true`.
+- **SQL changes:** after any migration or query edit, regenerate the offline cache
+  and commit it — CI builds with `SQLX_OFFLINE=true` and reads the cache at the
+  **workspace root**. Measured procedure (sqlx-cli 0.9.x):
+
+  ```bash
+  export CARGO_HOME="$PWD/.cargo-cache/home"; export PATH="$CARGO_HOME/bin:$PATH"
+  export DATABASE_URL="sqlite://$PWD/.prepare.db?mode=rwc"
+  cargo sqlx database create && cargo sqlx migrate run --source crates/hydra-server/migrations
+  ( cd crates/hydra-server && SQLX_OFFLINE=false cargo sqlx prepare -- --features server )
+  mv crates/hydra-server/.sqlx/* .sqlx/ && rmdir crates/hydra-server/.sqlx
+  git status --short .sqlx/     # must show your change before you commit it
+  ```
+
+  **Three traps, all measured:**
+  1. `--features db` no longer compiles on its own — `store.rs` / `db/restore.rs`
+     use `crate::cluster::*`, which the `db` feature does not enable (the `db`
+     feature remains for `hydra-core`-free consumers; recipes that used it must
+     say `--features server`).
+  2. Features go **after `--`** now; `cargo sqlx prepare --workspace --features
+     server` is accepted but reports "no queries found" and **deletes every entry
+     in the root `.sqlx/`**, which then breaks the `SQLX_OFFLINE=true` build.
+  3. `prepare` writes the cache next to the CRATE you run it in, so running it in
+     `crates/hydra-server` creates `crates/hydra-server/.sqlx/` — which CI does not
+     read. Move it to the workspace root (step 5 above).
 - **Verification discipline:** never trust a delegated agent's "compiles/clean" claim — re-run
   `cargo build --features server` + full `cargo test` + targeted runtime checks (encryption grep,
   reveal-mask, fail-closed) yourself.

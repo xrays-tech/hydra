@@ -251,3 +251,24 @@ jobs:
           HYDRA_BASE: http://127.0.0.1:8081
           HYDRA_ADMIN_TOKEN: dev-admin-token-2026
         run: npx playwright test --config=playwright.config.cjs
+
+      # A red ui-e2e job must be diagnosable from its OWN evidence: without the
+      # hydra log and the Playwright report, the only thing CI shows is a failed
+      # assertion with no server-side context.
+      - name: Upload e2e diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-e2e-diagnostics
+          path: |
+            /tmp/hydra-e2e.log
+            test-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stop hydra
+        if: always()
+        run: |
+          if [ -f /tmp/hydra-e2e.pid ]; then
+            kill "$(cat /tmp/hydra-e2e.pid)" 2>/dev/null || true
+          fi

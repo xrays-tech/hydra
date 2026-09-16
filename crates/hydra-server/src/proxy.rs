@@ -898,7 +898,16 @@ impl ProxyHttp for HydraProxy {
                     // failure (and NOT be silently upgraded to "never reached").
                     let never_reached_upstream = match &e {
                         crate::proxy::provider_client::SendError::Transport(re) => re.is_connect(),
-                        crate::proxy::provider_client::SendError::FirstByteTimeout { .. } => false,
+                        crate::proxy::provider_client::SendError::FirstByteTimeout { .. } => {
+                            // Recorded HERE and now: this path can return early
+                            // (see the 502 branch below), which used to mean a
+                            // first-byte timeout incremented NOTHING — so an
+                            // alert on it could never fire.
+                            crate::admin::metrics::record_upstream_first_byte_timeout(
+                                &cand.provider_id,
+                            );
+                            false
+                        }
                     };
                     if !never_reached_upstream && !self.state.proxy.failover.retry_after_connect {
                         warn!(

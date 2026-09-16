@@ -2275,6 +2275,7 @@ grep -n 'hydra_listener_tenant_certs\|hydra_registry_nodes' dev-docs/ops.md
 - 修改 `.github/workflows/ci.yml`（新增 `ui-e2e` job）
 - 修改 `tests/e2e/admin.spec.cjs`、`tests/e2e/lang.spec.cjs`（**token 默认值同步**，P10）
 - 修改 `tests/e2e/README.md`（**token 默认值与前置条件**，P10）
+- ⚠ **执行时更正（Batch 17）**：本步骤原先声称 `stats_autorefresh.cjs` 退役后"其覆盖已由 **T9.5/T10.4** 的正式用例取代"——**不成立**：T9.5 是非 leader 横幅，T10.4 是 provider 编辑/删除的 `clearsFK` 路径，而该脚本覆盖的是 **F-7（stats 页自动刷新）**，此前**无任何**其他测试覆盖。实际处置：新增 `tests/e2e/stats_autorefresh.spec.cjs`（把它的 5 条断言移植为正式 spec）并**删除**该手动脚本；"取代"这一说法因此才成立。
 - 处置 `tests/e2e/stats_autorefresh.cjs`（**P12/O25：当前不被 Playwright 收集**）。**不得**改名为 `*.spec.cjs`——它不是 `@playwright/test` 文件：加载时会 `require` `playwright` 核心包并启动 HTTP server + Chromium（`stats_autorefresh.cjs:24-33`），改名会在**收集阶段**执行它。**本 Task 的处置已定：显式退役该脚本**（从 `tests/e2e/` 移出至 `scripts/` 或删除），并在提交信息与 `tests/e2e/README.md` 说明其覆盖已由 T9.5/T10.4 的正式用例取代
 
 **Why**：CI 只有 `check` / `optional-features` / `scripts` 三个 job，**没有任何浏览器级用例**；`invalidateFK` 那类"写入已落库但 UI 抛 ReferenceError"的回归只可能被真实浏览器用例挡住。`tests/e2e/` 与 `playwright.config.cjs` 已存在且可用，缺的只是"谁来跑"。
@@ -3609,8 +3610,8 @@ bash scripts/ask_llm.test.sh
 | `cluster/mod.rs` | 新增纯函数 `node_id_from(node_id_env, hostname_env)`（`HYDRA_NODE_ID` → `HOSTNAME` → 随机），并**接到** `ClusterConfig::from_env` 的真实身份生产点（F12 的接线，不再是 claim-only） |
 | `main.rs` | 启动 `reg.register(30, grace)`（保留 `?` fail-fast）；20s 续期改调 `register`（旧路径只续心跳、**永不重写行**）；新增 60s 回收任务（回收 + 发布 `hydra_registry_nodes` 存活/离线分布）；新增 `registry_stale_grace_secs()`（`HYDRA_REGISTRY_STALE_GRACE_SECS`，默认 120，`<= 0` 视为未设）；新增 `spawn_registry_unregister_on_shutdown()`（pingora 的 SIGTERM 走 `process::exit(0)`，不跑析构） |
 | `admin/metrics.rs` | 新增 `hydra_registry_nodes{state}`（gauge，带 `alive|dead`）与 `hydra_registry_reaped_total`（counter）+ 两个 `record_*` 助手；导入补 `register_int_counter` / `IntCounter`；catalogue 表补两行 |
-| 调用点适配 | `register` 由 1 参变 2 参：`control_client.rs`（3 处）、`forward.rs`（2 处）、`tests/cluster.rs`（2 处）、`registry.rs` 既有单测（3 处）——共 10 处，全部同步 |
-| 测试 | 新增 `tests/registry_reaping.rs`（**首行 `#![cfg(feature = "cluster-redis")]`**，6 例）+ `registry.rs` 单测 4 例 + `cluster/mod.rs` 的 `node_id_from` 三档回退单测 |
+| 调用点适配 | `register` 由 1 参变 2 参，**所有**调用点已同步。⚠ **计数更正**：本记录早先写"共 10 处（control_client 3 / forward 2 / tests/cluster 2 / registry.rs 既有单测 3）"——该分解既漏了**本批新建**的 `tests/registry_reaping.rs`（8 处），也把 `main.rs` 记成 1 处（实为 2：启动注册 + 20s 续期）。事后复核（`grep -rn "\.register(" crates/hydra-server`）当时为 23 处、现为 33 处（含后续批次新增的用例）；**没有任何 1 参调用残留**，这才是该行真正要断言的事实 |
+| 测试 | 新增 `tests/registry_reaping.rs`（**首行 `#![cfg(feature = "cluster-redis")]`**，6 例）+ `registry.rs` **新增 5 例**单测（该文件现共 9 例）+ `cluster/mod.rs` 的 `node_id_from` 三档回退单测。⚠ 计数更正：早先写"registry.rs 单测 4 例"，与本记录自己的 `+12` 矛盾，实为 5 |
 
 **"改前失败"证据的性质说明（本 Task 与前三个 Task 不同）**：T2 的缺陷是**整条路径不存在**，而不是"存在但行为错"，因此新用例在改前**无法编译**（没有 `sweep_stale`，且 `register` 只有 1 个参数），无法像 Batch 1 那样用"临时改回旧实现"取证。本 Task 留的是**静态可复算的证据**，两条都在 HEAD 上取证：
 
@@ -4012,3 +4013,47 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 **证据**：加上同一组 flags 立刻恢复 —— `RUSTFLAGS="-D warnings" cargo test -p hydra-server --features server --doc` ⇒ `test result: ok`，全量 ⇒ **30 套件 / 365 passed**。
 
 **结论/做法**：本仓库门禁一律带 `RUSTFLAGS="-D warnings"`；若要临时不带（或换 flags）复核，**要么也带同一组 flags，要么用独立的 `CARGO_TARGET_DIR`**，否则会得到与产品无关的"编译失败"。同类现象也会出现在"两个 cargo 同时跑"时（文件锁会串行化构建，但指纹回收仍会发生在其中一方）。
+
+### Batch 18 — 第二次开发后 oracle 复审的处置（4 个阻塞项 + 9 项非阻塞 + 门禁不确定性）
+
+第二轮对抗式复审（Phase B/C/D 实现逐条对照）给出 **T5 PASS / T7+T8 FAIL / T9.x FAIL / T10.x FAIL（4 个阻塞）**；另一路"逐条重算声明"的审查者给出 **CLAIMS: FAIL（3 条被证伪）**。全部处置如下。
+
+| 编号 | 缺陷 | 处置与证据 |
+|---|---|---|
+| **B1** | **T9.2：SYN 被丢弃（死 Pod、IP 仍在）的连接阶段超时**仍被判为"结果未知"⇒ 一个**证明没离开本节点**的请求被回答"可能已生效"。计划正文明确要求先**实测** `is_connect()` 是否在连接阶段超时为真，我没做，还在注释里把相反结论写成了事实 | **已实测并修**。实测表（`HYDRA_FORWARD_TIMEOUT_SECS=2`，黑洞地址）：仅请求级 `.timeout(2s)` ⇒ `is_connect=false, is_timeout=true`；**客户端级 `.connect_timeout(2s)` + 请求 `.timeout(4s)`** ⇒ `is_connect=true, is_timeout=true`。因此改为**每次转发按 `secs` 构造客户端**：`connect_timeout = secs`、总deadline = `secs + CONNECT_SLACK_SECS(2)`（**两个界必须不等且连接界更短**，否则两个计时器同时到期仍是竞态）。放弃连接池是**有意取舍**（管理变更罕见，误报"可能已生效"远比多一次握手昂贵）。同时补上计划**要求却缺失**的黑洞用例 `a_syn_dropping_leader_is_a_definite_failure_not_an_unknown_outcome`（黑洞 ⇒ 必须是 `Other`，绝不可是 `Timeout`） |
+| **B1 附带** | `ForwardError::Timeout { secs }` 现在承载**总 deadline**（而非配置值），文档与用例同步说明"这是运维真正等待的秒数" | 已在变体文档与用例注释中写明 |
+| **B2** | **`ops.md` 里有一条永远不可能触发的告警**：`hydra_retries_total{stage="connect"}` —— 生产代码从不写该标签值（只有 `terminate_loop`），且首字节超时路径**在任何计数之前就 return** | **已修**：新增真实计数器 `hydra_upstream_first_byte_timeout_total{provider}` + `record_upstream_first_byte_timeout()`，在首字节超时分支**立即记录**（该分支会提前 return），`ops.md` 改为引用它，并**显式写明不要**用那个永不触发的表达式 |
+| **B3** | **T10.6 步骤 4 未实施**：三处 `--features db` 配方已不能编译（`store.rs`/`db/restore.rs` 用 `crate::cluster::*`） | **已修**：`dev-docs/HANDOFF.md`、`tests/clickhouse_sink.rs`、`2026-08-21` 计划正文三处更正。复核：`cargo check -p hydra-server --features db` 报 4 个错误（确认前提成立）。**并在复核中又发现两个更危险的坑并写进 HANDOFF**：① `cargo sqlx prepare --workspace --features server` 被接受但报 "no queries found" 并**清空根 `.sqlx/`**（实测 44 个条目全被删，已 `git checkout` 恢复）；② `prepare` 把缓存写到**运行它的 crate 目录**（`crates/hydra-server/.sqlx/`）而 CI 读的是**工作区根** `.sqlx/`。最终给出的配方是**实测可用**的：在 crate 内 `cargo sqlx prepare -- --features server` 后把 `.sqlx/` 移到工作区根（实测：移动后与已提交缓存 **完全一致**，`git status .sqlx/` 为空） |
+| **B4** | **T8 的 CI job 缺计划规定的失败诊断步骤**（`actions/upload-artifact`），且 `trace: 'on-first-retry'` 配 `retries: 0` ⇒ **永远不会产生 trace** | **已修**：补 `Upload e2e diagnostics`（`if: failure()`，上传 `/tmp/hydra-e2e.log` 与 `test-results/`）与 `Stop hydra`（`if: always()`）；`playwright.config.cjs` 改为 CI 下 `retries: 1`，使 trace 真的会被记录 |
+| **N1** | T9.3 残留：PUT 提交后**再读**失败被映射成 `404 not found`，且 `has_access_token` 在读取失败时被报成 `false` ⇒ 与 §7-3 同类"报错但已生效" | **已修**：token 状态**由本次写入决定**（`Some(written)` 直接用写入结果，读取失败时不再声称"无 token"）；错误分别走 `is_not_found` ⇒ 404、其余 ⇒ `db_err_resp` |
+| **N2** | T9.2 的 502 注释过度断言：响应**已到达**之后的失败（读 body、构造响应）也被归入"证明没送到" | **已修**：新增 `ForwardError::AfterResponse`，与 `Timeout` 一样映射为 **504 `forward_result_unknown`**（leader 已收到并开始应答，写入是否已生效**同样未知**），502 分支的注释改为只覆盖**确实没送到**的情形 |
+| **N3** | `snapshot_stale` 的**进程级**语义只写在 Rust 注释里，用户可见的响应文档没提（计划 2698 明确要求在响应文档里写明） | **已修**：`admin-ui/api-docs.js` 的租户创建响应补该字段、其"进程级 / last-writer-wins / 不等于本次写入是否生效"的含义，以及"读接口同样可见" |
+| **N4** | `ops.md` 环境变量表缺 2 个变量 | **已修**：补 `HYDRA_FORWARD_TIMEOUT_SECS`（含连接界 vs 总 deadline 的解释）与 `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` |
+| **N5** | T9.4 的 `shutdown_drain_secs()` 直接读环境、**零测试** ⇒ 删掉 `grace_period_seconds` 字段会静默退回 300s 而门禁全绿 | **已修**：抽出纯函数 `parse_shutdown_drain_secs`（`0` 拒绝、默认 20）并单测；测试放在**未按 `cluster-redis` 门控**的模块里，确保 `--features server` 门禁会执行它 |
+| **N6** | T9.3 验收的另一半（`hydra_config_snapshot_stale == 1`）无人断言 | **已修**：同一用例内断言渲染结果含 `hydra_config_snapshot_stale 1` |
+| **N7** | T10.3 用例 B 的"或 `/metrics`"回退分支**不可能通过**（该进程没配 admin token ⇒ 401） | **已修**：起进程时设 `HYDRA_ADMIN_TOKEN`，取 `/metrics` 时带 Bearer |
+| **N8** | 横幅在 `/cluster/status` 请求失败时保留旧状态（刚升为 leader 时最多 30s 仍显示"不是 leader"） | **有意保留**并记录：失败时清屏会导致网络抖动下横幅闪烁；30s 轮询会自愈 |
+| **N9** | 记账错误：`stats_autorefresh` 的搬移落在 **T7** 提交 `588624e`，本记录写成 T8 | **已更正**（并见 Batch 17 对该说法本身的纠正） |
+| **门禁不确定性（最重要的一条）** | 声明的"全部 0 failed"**并非确定性事实**：`tests/metrics.rs::metrics_endpoint_exposes_proxy_counters` 在评审期间 **2 次失败 / 4 次通过**，失败信息是 `ConnectionRefused 127.0.0.1:19600` —— 即 T10.1 自己记录的"探测后释放"残余竞态：候选端口在释放与 Pingora 真正 bind 之间被别的进程抢走 | **已修**：该用例改为**有界重试**（最多 3 次，每次都换**全新端口**并重建服务），并明确断言这属于**端口获取竞态而非产品失败**；失败信息里指向 `tests/common/mod.rs` 的端口带以便继续排查。全量门禁的"0 failed"因此才是可复现的结论 |
+| **hollow-pass 1** | `registry_metric_hooks_do_not_panic` **没有任何断言**（改名并补断言） | **已修**：`registry_metric_hooks_publish_the_values` 断言渲染结果里的 alive/dead/reaped 三个值 |
+| **hollow-pass 2** | Batch 9 的撕裂读修复**没有确定性守卫**：删掉 `load` 里的 `pool.begin()` 两个用例很可能仍然全绿（用例①只在"恰好撕裂"时失败，用例②钉的是 SQLite 语义而非调用点） | **如实保留并记录**：这是**已知的守卫局限**，不是可通过黑盒测试消除的；调用点由代码结构与 code review 保证。不在文档里声称它被"确定性覆盖" |
+| **hollow-pass 3** | 注入式 RED 证据只有叙述、无产物 | **如实保留**：本机 `/tmp` 每条命令都是新 tmpfs，无法留存产物；已在 Batch 1 记录中给出每条 RED 的**注入点 + 期望失败 + 实测输出**，第三方需要改生产代码才能复现，这一点已写明 |
+
+**本轮门禁（含上述修改）**：见下一节"Phase C/D 门禁（复审处置后重跑）"。
+
+### Phase C/D 门禁（复审处置后重跑，全部带上计划规定的 flags）
+
+| 步骤 | 结果 |
+|---|---|
+| `cargo fmt --check` | ✅ clean |
+| clippy：`--features hydra-server/server` | ✅ **0 warning** |
+| clippy：`--features server,cluster-redis,usage-clickhouse` | ✅ **0 warning** |
+| release build：`--features server` / 三特性 | ✅ 均 Finished |
+| `cargo test -p hydra-core` | ✅ 15 套件 |
+| `cargo test -p hydra-server --features server` **连跑 3 次** | ✅ **每次 367 passed / 0 failed**（端口竞态修复后不再出现评审期间那种偶发 `ConnectionRefused`） |
+| 三特性全量 | ✅ **441 passed / 2 ignored / 0 failed**（2 个 ignored 为：T10.3 的已知限制用例、需真实 ClickHouse 的用例） |
+| 脚本门禁 | ✅ `check_i18n` OK（334 keys/4 locales）、`node --test` `# fail 0`、`ask_llm.test.sh` ALL PASSED |
+| Playwright（真实二进制 + 真实 Chromium） | ✅ **15 passed** |
+| `.sqlx/` | ✅ 复核用配方重生成后与已提交缓存**逐文件一致**（`git status .sqlx/` 为空） |
+
+> 门禁一律带 `RUSTFLAGS="-D warnings"`：本文档已记录"同一 `target/` 内换 flags 会互相回收产物、导致与产品无关的编译失败"这一实测结论。

@@ -276,8 +276,22 @@ async fn unregister_removes_the_row_and_both_keys() {
 /// makes the symptom alertable) — a registration conflict must degrade to a
 /// no-op rather than panic.
 #[test]
-fn registry_metric_hooks_do_not_panic() {
+fn registry_metric_hooks_publish_the_values() {
+    // Not just "does not panic": the values must reach the exposition, or the
+    // reaper's whole point (making the symptom alertable) is silently lost.
     hydra_server::admin::metrics::record_registry_nodes(3, 108);
     hydra_server::admin::metrics::record_registry_reaped(108);
-    hydra_server::admin::metrics::record_registry_reaped(0);
+    let out = hydra_server::admin::metrics::render();
+    assert!(
+        out.contains("hydra_registry_nodes{state=\"alive\"} 3"),
+        "alive gauge must be published:\n{out}"
+    );
+    assert!(
+        out.contains("hydra_registry_nodes{state=\"dead\"} 108"),
+        "dead gauge must be published:\n{out}"
+    );
+    assert!(
+        out.contains("hydra_registry_reaped_total 108"),
+        "reaped counter must be published:\n{out}"
+    );
 }
