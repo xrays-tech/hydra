@@ -169,24 +169,48 @@ impl AuthCache {
     /// pure [`cache_decision`]. The api-key is SHA-256 hashed before lookup.
     /// On an L1 miss, consults the Redis L2 (cluster P4) and hydrates L1 from
     /// it, avoiding an upstream `auth_url` round trip on a cold node.
+    /// The L1 verdict for one key, with the shard guard released before this
+    /// function returns.
+    ///
+    /// **Synchronous on purpose.** `DashMap::get` hands back a `Ref`, which is a
+    /// *shard read lock* held by a value with a `Drop` impl — so it lives until
+    /// the end of its enclosing scope, NOT until its last use. A `Ref` that
+    /// survives into an `.await` will deadlock the task the moment it (or
+    /// anything else) writes the same shard, and `clippy::await_holding_lock`
+    /// cannot see DashMap's guard. Reading the shard inside one non-async
+    /// function makes the guard's lifetime impossible to extend by accident
+    /// (bug-2026-09-16-auth-cache-guard-deadlock).
+    fn l1_decision(&self, key: &(String, [u8; 32])) -> Verdict {
+        let entry = self.map.get(key);
+        // P2-8: evaluate the decision (and its `now()`) exactly ONCE. Calling
+        // `cache_decision` twice — once for the guard and once for the return —
+        // let a clock that advanced between the two reads flip a live entry from
+        // Hit to Miss mid-lookup.
+        cache_decision(entry.as_deref(), (self.now)())
+    }
+
     pub async fn check(&self, tenant_id: &str, api_key: &str) -> Verdict {
         let hash = sha256_hex(api_key.as_bytes());
-        let entry = self.map.get(&(tenant_id.to_string(), hash));
-        // P2-8: evaluate the decision (and its `now()`) exactly ONCE. The old
-        // form called `cache_decision` twice — once for the guard and once for
-        // the return — so a clock that advanced between the two reads could
-        // flip a live entry from Hit to Miss mid-lookup. A single read keeps
-        // the verdict stable.
-        let d = cache_decision(entry.as_deref(), (self.now)());
-        if let Verdict::Hit(_) = d {
-            return d;
+        let key = (tenant_id.to_string(), hash);
+
+        // (1) L1 only. The shard guard is gone by the time this returns: an
+        //     entry that is present-but-EXPIRED is a Miss here while still
+        //     occupying the map, and it was exactly that case which held a read
+        //     guard across the L2 await below.
+        if let Verdict::Hit(allowed) = self.l1_decision(&key) {
+            return Verdict::Hit(allowed);
         }
+
+        // (2) L2 back-fill. NO shard guard may be held across these awaits —
+        //     the `insert` takes the same shard's WRITE lock, so holding a read
+        //     guard on this task is a self-deadlock (not a race: it can never
+        //     resolve).
         #[cfg(feature = "cluster-redis")]
         if let Some(l2) = &self.l2 {
             if let Ok(Some((allowed, ttl))) = l2.get(tenant_id, &hex_digest(&hash)).await {
                 let expires_at = (self.now)() + ttl;
                 self.map.insert(
-                    (tenant_id.to_string(), hash),
+                    key,
                     AuthEntry {
                         allowed,
                         expires_at,

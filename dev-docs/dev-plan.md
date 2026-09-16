@@ -47,6 +47,19 @@ Redis 是外部系统边界（租约、集群限流、熔断投票、鉴权 L2�
 - **为什么这件事要紧（不是洁癖）**：in-process double 会掩盖真实 Redis 的语义与失败模式，直接导致测试假绿。已知三例：`MockRedis` 的 `INCR` 永不失败（于是"trim 成功但 bump 失败"这条路径**无法被测到**）、没有 `XLEN`、`XTRIM` 是自己重写的（不校验 MAXLEN/MINID 语义）；另有 `SET ... NX PX 0` 在真 Redis 上会报错、在 double 上却成功。这些差异正是集群侧最重要的失败路径。
 - **对当前任务的影响**：`B3(a)`（裁剪与代际自增的原子性）**必须用真实 Redis 验证**——它需要的正是真实 `INCR` 失败/命令时序与 `XLEN`，因此不再给 mock 加"故障注入接缝"。
 
+### 并发约定（2026-09-16 起生效）：`DashMap` 守卫不得跨越 `.await`
+
+来源：`dev-docs/bug-2026-09-16-auth-cache-guard-deadlock.md` —— 生产上一个边缘副本的**唯一** Pingora worker 线程被自死锁挂死，8080 数据面完全停 accept，而 8081 的 `/healthz` 仍 200，k8s 因此继续把流量路由给它（约一半请求静默超时，且**不会自愈**）。
+
+- **根因形状**：`DashMap::get()` 返回的 `Ref` 是**分片读锁**，它是有 `Drop` 的类型 ⇒ **活到作用域结束，而不是最后一次使用**。带着它 `.await`，再对**同一个 key**（⇒ 同一分片）`insert()`，就等于"自己持读锁、又等自己放读锁" ⇒ 永久自死锁。
+- **为什么 lint 帮不上忙**：`clippy::await_holding_lock` 只覆盖 std / parking_lot 的锁，**覆盖不到 DashMap 的 `Ref`/`RefMut`**。
+- **规则**：
+  1. 任何 `DashMap` 的 `get` / `entry` 结果**必须在同一个同步函数或同一个语句内释放**，绝不允许越过 `.await`；
+  2. 需要"读一下再决定是否走异步路径"时，把这个读抽成一个**同步**函数（返回 `Copy` 的判定值），例如 `AuthCache::l1_decision(&key) -> Verdict`——守卫在它返回前就已释放，从 **API 形状上**杜绝守卫逃逸；
+  3. 新增/审查任何 async 函数时，先看它是否持有 `DashMap` 守卫、`std::sync::MutexGuard` 或任何带 `Drop` 的锁值再 await。
+- **回归测试的形状（重要）**：这类缺陷"永不返回"，因此**不能用 `tokio::time::timeout` 包住被测调用**——阻塞发生在**同一次 poll 内**的同步 futex 等待里，计时器即使触发也没人再 poll 这个任务。正确做法：把被测调用放到**独立线程 + 独立 runtime**，由测试线程用**通道超时**等待；并 `std::mem::forget(rt)` 以免 drop 时等待被挂死的 worker（见 `redis::auth_cache::tests::an_expired_l1_entry_does_not_deadlock_on_l2_backfill`）。
+- **触发条件的隐蔽性**：`DashMap::get` 在 key **不存在**时会立刻释放守卫，所以"L1 冷"（条目不存在）不会触发；真正的触发是"**条目存在但已过期**"（`cache_decision` 判 Miss，却仍持有分片读锁）**且 L2 命中**——这也是它为什么不是一上线就炸。写这类回归测试时必须构造"present-but-expired"，只清空缓存是不够的。
+
 > 设计文档中出现的 `MockAuthChecker` 等字样，在实现阶段一律替换为：纯缓存判定逻辑直接测（无需 mock）+ `HttpAuthChecker` 用 wiremock 测。trait 仍保留用于「生产配置 vs 测试配置」的装配，但测试用真实 double。
 
 ### 铁律 3：终止模式（Terminate-in-Pingora）

@@ -250,6 +250,99 @@ mod tests {
         );
     }
 
+    /// REGRESSION (bug-2026-09-16-auth-cache-guard-deadlock) — an L2 hit must
+    /// not self-deadlock while back-filling the L1.
+    ///
+    /// `AuthCache::check` bound the DashMap shard read guard (`Ref`) to a named
+    /// local and then `.await`ed the Redis L2 with it still alive. On an L2 hit
+    /// it called `self.map.insert(...)` for the SAME key — the same shard — so
+    /// the task waited for a write lock it was itself holding: a permanent
+    /// self-deadlock. Pingora runs one worker thread per service, so the whole
+    /// data plane of that replica stopped accepting while the admin port (a
+    /// different thread) kept answering `/healthz` 200 and k8s kept the pod in
+    /// the Service — half the traffic silently timed out (production: 5/10
+    /// requests hung for 6 s, no self-healing).
+    ///
+    /// The trigger is precise: the L1 entry must be PRESENT BUT EXPIRED (a Miss
+    /// that still yields a shard guard). `DashMap::get` releases the guard
+    /// immediately when the key is ABSENT — which is why the plain "cold L1"
+    /// test above (`auth_cache_l1_miss_hydrates_from_l2`) never caught this.
+    ///
+    /// Shape of the test: `check` runs on its OWN thread with its own runtime,
+    /// and this thread waits on a channel with a timeout. It has to be that way
+    /// — the failure is a synchronous futex wait inside a single `poll`, so a
+    /// `tokio::time::timeout` around `check` never fires and a plain test would
+    /// hang the suite instead of failing. The runtime is deliberately leaked on
+    /// the worker thread for the same reason: dropping it would wait for the
+    /// parked worker.
+    #[test]
+    fn an_expired_l1_entry_does_not_deadlock_on_l2_backfill() {
+        for allowed in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                rt.block_on(async move {
+                    let l2 = std::sync::Arc::new(l2().await);
+                    let t0 = std::time::Instant::now();
+                    let now = std::sync::Arc::new(std::sync::Mutex::new(t0));
+                    let clock: crate::http::Clock = {
+                        let now = now.clone();
+                        std::sync::Arc::new(move || *now.lock().expect("test clock"))
+                    };
+                    let cache = crate::http::AuthCache::with_clock(
+                        Duration::from_secs(300),
+                        Duration::from_secs(30),
+                        clock,
+                    )
+                    .with_l2(l2.clone());
+
+                    // (1) L1 gets a 1 s entry; the L2 gets a live verdict for the
+                    //     same key (i.e. "L1 cold, L2 warm").
+                    cache
+                        .set("t1", "sk-a", allowed, Duration::from_secs(1))
+                        .await;
+                    assert_eq!(cache.len(), 1, "seeded L1");
+
+                    // (2) Time moves past the L1 TTL. The entry stays IN the map
+                    //     (no GC sweep ran) while the decision becomes Miss —
+                    //     the deadlock's precondition.
+                    *now.lock().expect("test clock") = t0 + Duration::from_secs(2);
+                    let hex = hydra_core::auth::sha256_hex_string(b"sk-a");
+                    l2.set("t1", &hex, allowed, Duration::from_secs(300))
+                        .await
+                        .expect("seed l2");
+
+                    // (3) This is the call that used to block forever on the
+                    //     shard write lock it was itself holding.
+                    let verdict = cache.check("t1", "sk-a").await;
+                    assert_eq!(cache.len(), 1, "the L1 was back-filled from the L2");
+                    let _ = tx.send(format!("{verdict:?}"));
+                });
+                // A pre-fix deadlock parks a worker thread inside a futex wait;
+                // dropping the runtime would wait for it, so leak it and let the
+                // process exit clean up.
+                std::mem::forget(rt);
+            });
+
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(verdict) => assert_eq!(
+                    verdict,
+                    format!("{:?}", hydra_core::auth::Verdict::Hit(allowed)),
+                    "allowed={allowed}"
+                ),
+                Err(_) => panic!(
+                    "check() self-deadlocked (allowed={allowed}): a DashMap shard read guard \
+                     was held across the Redis L2 await, so the back-filling insert could never \
+                     take the write lock"
+                ),
+            }
+        }
+    }
+
     /// REVIEW N2 — the index is written BEFORE the value, so a value can never
     /// exist without index membership (which would make it survive
     /// `del_tenant`).
