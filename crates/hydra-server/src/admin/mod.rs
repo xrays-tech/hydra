@@ -82,6 +82,17 @@ pub struct AdminState {
     /// Edge data-plane mode (cluster P0b): the admin service serves only
     /// `/metrics` `/healthz` `/readyz`; everything else is 404 (no CRUD, no UI).
     pub edge_mode: bool,
+    /// `true` when the LAST post-write `reload_all` failed, i.e. the in-memory
+    /// snapshot no longer matches the committed config (same condition as the
+    /// `hydra_config_snapshot_stale` gauge).
+    ///
+    /// PROCESS-level and last-writer-wins: it is set/cleared by the reload path
+    /// and read by every admin response, so a given response may report ANOTHER
+    /// request's reload failure. It answers "is the runtime consistent with the
+    /// DB right now?", not "did MY write apply?" — the response field is
+    /// documented that way on purpose.
+    pub snapshot_stale: Arc<std::sync::atomic::AtomicBool>,
+
     /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`): gates the internal
     /// `/api/v1/internal/*` endpoints (cluster P1). `None` ⇒ internal
     /// endpoints are denied (fail-closed).
@@ -137,6 +148,7 @@ impl AdminState {
             key_provider,
             admin_token,
             reload_lock: Mutex::new(()),
+            snapshot_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission,
             edge_mode,
             cluster_token,

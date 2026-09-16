@@ -688,6 +688,119 @@ pub async fn update_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Er
     Ok(())
 }
 
+/// Everything a tenant write must persist, in ONE transaction.
+pub struct TenantWrite<'a> {
+    pub tenant: &'a Tenant,
+    /// `true` = INSERT (create), `false` = UPDATE (edit).
+    pub is_create: bool,
+    /// `Some(None)` = clear the token; `Some(Some(hash))` = set/rotate it;
+    /// `None` = leave it alone.
+    pub token_hash: Option<Option<String>>,
+    /// `Some((None, None))` = clear the certificate; `Some((Some(pem), Some(key)))`
+    /// = replace it; `None` = leave it alone.
+    pub cert: Option<(Option<String>, Option<String>)>,
+}
+
+/// Upsert a tenant TOGETHER WITH its secret material, atomically.
+///
+/// Everything commits at once or not at all. Splitting these steps is the
+/// "reported as failed but actually live" defect: the tenant row committed, then
+/// the certificate or token write failed, and the API answered 500/400 while the
+/// change was already in effect — the operator's natural retry then hits a
+/// duplicate or re-applies a credential they were told had failed.
+///
+/// The post-write `reload` is deliberately NOT part of the transaction: it is
+/// recoverable (the next successful reload fixes it) and is reported separately
+/// through the response's `snapshot_stale` flag.
+///
+/// The SQL statements and their parameter types are byte-identical to the
+/// single-purpose helpers they replace, so the committed `.sqlx` cache stays
+/// valid for offline builds.
+pub async fn write_tenant(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    w: TenantWrite<'_>,
+) -> Result<(), sqlx::Error> {
+    let t = w.tenant;
+    let cert_key = non_empty_path(t.cert_key.as_deref());
+    let cert_file = non_empty_path(t.cert_file.as_deref());
+    let mut tx = pool.begin().await?;
+
+    if w.is_create {
+        sqlx::query!(
+            "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            t.id,
+            t.name,
+            t.domain,
+            t.auth_url,
+            cert_key,
+            cert_file,
+            t.enabled,
+            t.created_at,
+            t.updated_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query!(
+            "UPDATE tenant SET name = ?, domain = ?, auth_url = ?, cert_key = ?, cert_file = ?, \
+             enabled = ?, updated_at = ? WHERE id = ?",
+            t.name,
+            t.domain,
+            t.auth_url,
+            cert_key,
+            cert_file,
+            t.enabled,
+            t.updated_at,
+            t.id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some(hash) = &w.token_hash {
+        // Bind first: `hash.as_deref()` would create a temporary that the query
+        // borrows past the end of the statement.
+        let hash: Option<&str> = hash.as_deref();
+        sqlx::query!(
+            "UPDATE tenant SET access_token_hash = ? WHERE id = ?",
+            hash,
+            t.id
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    if let Some((cert_pem, cert_key_pem)) = &w.cert {
+        let (ct, nonce, version) = match cert_key_pem {
+            Some(pem) => {
+                let sealed = kp.seal(pem.as_bytes()).map_err(crypto_to_sqlx)?;
+                (
+                    Some(sealed.ciphertext),
+                    Some(sealed.nonce.to_vec()),
+                    Some(sealed.key_version as i64),
+                )
+            }
+            None => (None, None, None),
+        };
+        sqlx::query!(
+            "UPDATE tenant SET cert_pem = ?, cert_key_ciphertext = ?, cert_key_nonce = ?, \
+             cert_key_version = ? WHERE id = ?",
+            cert_pem,
+            ct,
+            nonce,
+            version,
+            t.id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn delete_tenant(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query!("DELETE FROM tenant WHERE id = ?", id)
         .execute(pool)

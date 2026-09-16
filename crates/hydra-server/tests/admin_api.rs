@@ -1268,6 +1268,198 @@ async fn reload_fatal_validation_is_400_reload_failed() {
     assert_eq!(r.status(), 400, "force does not bypass validation");
 }
 
+/// T9.3 — a tenant write is ONE transaction: the row, its certificate and its
+/// access-token hash either all commit or none do.
+///
+/// Before this, the row committed FIRST and the certificate/token writes ran as
+/// separate statements: a failure there answered 500/400 while the tenant was
+/// already live ("reported as failed but actually created"), and the operator's
+/// retry then hit a duplicate.
+#[tokio::test]
+async fn a_failed_secret_write_rolls_back_the_whole_tenant() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // Fault injection: any attempt to store certificate content aborts. The
+    // tenant INSERT is in the same transaction, so it must be undone with it.
+    sqlx::query(
+        "CREATE TRIGGER block_cert BEFORE UPDATE OF cert_pem ON tenant \
+         BEGIN SELECT RAISE(ABORT, 'oracle: certificate write blocked'); END",
+    )
+    .execute(state.db())
+    .await
+    .expect("install trigger");
+
+    let body = serde_json::json!({
+        "id": "t-atomic",
+        "name": "atomic",
+        "domain": "atomic.example",
+        "auth_url": "https://auth.example/v",
+        "cert_file": "",
+        "cert_key": "",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+        "cert_key_pem": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
+        "enabled": true,
+        "access_token": "0123456789abcdef",
+        "created_at": "",
+        "updated_at": ""
+    });
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(&body.to_string()),
+    )
+    .await;
+    assert!(
+        r.status().is_server_error() || r.status().is_client_error(),
+        "the write must report failure, got {}",
+        r.status()
+    );
+
+    // THE ASSERTION THAT MATTERS: no half-written tenant exists. Before T9.3 the
+    // row was committed before the certificate write failed.
+    assert!(
+        repo::get_tenant(state.db(), "t-atomic").await.is_err(),
+        "a failed secret write must roll the tenant row back — the API reported \
+         failure, so nothing about this tenant may be live"
+    );
+    assert!(
+        !repo::list_tenants(state.db())
+            .await
+            .expect("list")
+            .iter()
+            .any(|t| t.id == "t-atomic"),
+        "no tenant row may survive the rolled-back transaction"
+    );
+    assert!(
+        !repo::tenant_has_access_token(state.db(), "t-atomic")
+            .await
+            .expect("has token"),
+        "no token hash may survive a rolled-back tenant write"
+    );
+}
+
+/// T9.3 — a write that COMMITS but whose post-write reload fails is reported as
+/// `snapshot_stale: true` (2xx, because the write really did happen) instead of
+/// leaving the operator to guess whether the change took effect.
+#[tokio::test]
+async fn a_stale_snapshot_is_reported_in_the_response() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // A provider with an unusable endpoint makes every subsequent reload fail
+    // FATAL validation (the same fixture `tests/config_store.rs` uses).
+    repo::insert_provider(
+        state.db(),
+        &hydra_core::model::Provider {
+            id: "pbad".into(),
+            key: "bad".into(),
+            name: "bad".into(),
+            endpoint: "not-a-url".into(),
+            weight: 1,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("insert the bad provider");
+
+    let body = serde_json::json!({
+        "id": "t-stale",
+        "name": "stale",
+        "domain": "stale.example",
+        "auth_url": "https://auth.example/v",
+        "cert_file": "",
+        "cert_key": "",
+        "cert_pem": null,
+        "cert_key_pem": null,
+        "enabled": true,
+        "access_token": null,
+        "created_at": "",
+        "updated_at": ""
+    });
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(r.status(), 201, "the write itself succeeded");
+    let created: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        created["has_access_token"], false,
+        "the pre-existing field is still there: {created}"
+    );
+    assert_eq!(
+        created["snapshot_stale"], true,
+        "the response must say the runtime snapshot is behind the committed DB: {created}"
+    );
+    // The tenant really is in the DB (that is why the status is 2xx).
+    assert!(repo::get_tenant(state.db(), "t-stale").await.is_ok());
+
+    // A read reports it too: the flag is process-level, not per-request.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/tenants/t-stale",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let item: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        item["snapshot_stale"], true,
+        "the flag is process-level by design and visible on reads too: {item}"
+    );
+}
+
+/// T9.3 — the normal case: a successful write reports `snapshot_stale: false`,
+/// and the secret material committed WITH the row in one transaction.
+#[tokio::test]
+async fn a_normal_write_reports_a_fresh_snapshot() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    let body = serde_json::json!({
+        "id": "t-fresh",
+        "name": "fresh",
+        "domain": "fresh.example",
+        "auth_url": "https://auth.example/v",
+        "cert_file": "",
+        "cert_key": "",
+        "cert_pem": null,
+        "cert_key_pem": null,
+        "enabled": true,
+        "access_token": "0123456789abcdef",
+        "created_at": "",
+        "updated_at": ""
+    });
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/tenants",
+        Some(TOKEN),
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let created: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(created["snapshot_stale"], false, "got {created}");
+    assert_eq!(created["has_access_token"], true, "got {created}");
+    assert!(
+        repo::tenant_has_access_token(state.db(), "t-fresh")
+            .await
+            .expect("has token"),
+        "the token hash committed with the row"
+    );
+}
+
 // ===========================================================================
 // §2.3 — auth cache invalidation (by keys, by tenant, unknown)
 // ===========================================================================

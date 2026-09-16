@@ -3876,3 +3876,17 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 计划前提的两处修正（第八轮已写明，实测确认） | 真实枚举是 `ElectionState::{Standby, Active, Uncertain}`（**没有** `Leader` 变体），公开谓词是 `is_leader()`；且**新鲜度门初始关闭**（`sync_ok = false`）⇒ 无快照产端时必须显式 `mark_sync_ok(true)`，否则三个节点全部停在 `Standby`（那正是 fail-closed 的正确行为，但不是本用例要测的东西）。用例里用 **3s** 租约使 2×lease 的新鲜度窗口覆盖整个选举过程 |
 | 开发中发现并修掉的一个自伤 | 我最初写了一条"缺 `HYDRA_TEST_REDIS_URL` 必须响亮失败"的用例，它用 `std::env::remove_var` **改动进程级环境**，而同一二进制内的用例**并行执行** ⇒ 它把另外三条用例的 env 一并抹掉，导致它们全部 panic。已**删除**该用例：响亮失败的契约由 `common::real_redis_pool` 自身保证（未设即 panic 并打印启动命令），不需要、也不应该靠改全局环境来"测" |
 | 门禁 | fmt clean；三种 clippy 组合（server / server+cluster-redis / 三特性）均 **0 warning**；真实 Redis 下 `redis_real` **3 passed**；`--features server` 下该 target 0 测试且不报错 |
+
+### Batch 8 — T9.3 租户写后置步骤事务化 + `snapshot_stale`
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `db.rs`（新增 `TenantWrite` + `write_tenant`）、`admin/handlers.rs`（改为单次事务写入；`TenantView` 加 `snapshot_stale`；纯解析器 `resolved_secret_writes`；**删除**已成为死代码的 `apply_tenant_cert_write` / `apply_tenant_access_token_write`）、`admin/mod.rs`（`AdminState` 加 `snapshot_stale: Arc<AtomicBool>`，**在 `new()` 内初始化**，因此 18 处既有构造点无需改动） |
+| 原子性 | 行 + 证书列 + `access_token_hash` 落在**同一个事务**；写后 `reload` **刻意不在事务内**（它是可恢复的，且通过响应字段单独上报） |
+| 纯校验前移 | `resolved_secret_writes(action, access_token, trace_id)` 是**纯函数**：证书动作映射与 token 的 SHA-256 摘要都在开事务**之前**算好，短 token 仍返回 400 而**绝不落库**（保住既有"无僵尸租户"不变量） |
+| 响应字段 | `TenantView` **追加** `snapshot_stale`（既有 `has_access_token` 与 `#[serde(flatten)] tenant` 原样保留；4 个构造点统一走 `from_state`，从进程级标志读取）；标志与既有 `hydra_config_snapshot_stale` gauge **同源同分支**设置/清除 |
+| 语义边界（必须写明） | `snapshot_stale` 是**进程级、last-writer-wins** 标志：某次响应可能报告**另一个**请求的 reload 失败。它回答"运行时当前是否与已提交的 DB 一致"，**不是**"本次写入是否生效"——该措辞已写进代码注释与用例注释 |
+| 用例 | ① `a_failed_secret_write_rolls_back_the_whole_tenant`：在 `tenant.cert_pem` 上装 **`RAISE(ABORT)` 触发器**（照 `store.rs` 既有故障注入范式）⇒ 写入报错，且**租户行、列表、token 哈希三者皆不存在**；② `a_stale_snapshot_is_reported_in_the_response`：致命校验 provider ⇒ 201 + `has_access_token:false` + **`snapshot_stale:true`**，读接口同样可见；③ `a_normal_write_reports_a_fresh_snapshot` ⇒ 201 + `snapshot_stale:false` + token 与行同事务落库 |
+| RED 证据（已实测） | 在 `write_tenant` 中注入"**先提交行、再开新事务写 secret**"（即改前的分步语义）⇒ 用例① **FAILED**："a failed secret write must roll the tenant row back" ⇒ 恢复后全绿 |
+| `.sqlx/` 的实际结论（**偏离计划纸面**） | 计划断言 T9.3"**必然**产生新 SQL 文本 ⇒ `cargo sqlx prepare` 是强制步骤"。实测**不需要**：我把三段 SQL（行 INSERT/UPDATE、`access_token_hash`、证书四列）以**逐字相同**的语句与参数类型搬进 `write_tenant`，`SQLX_OFFLINE=true` 全量构建通过、`git status --short .sqlx/` **为空** ⇒ 缓存仍然命中。计划该处的前提只对"新写一条合成 SQL"成立；复用既有语句是更好的做法（零缓存 churn、零 CI 风险） |
+| 门禁 | fmt clean；两种 clippy **0 warning**（唯一一次告警 `type_complexity`，已用 `type SecretWrites` 别名消除）；`--features server` **28 套件 0 failed**（admin_api 34→**37**）；三特性 **428 passed / 0 failed** |
