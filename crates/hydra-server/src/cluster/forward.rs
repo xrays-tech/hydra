@@ -184,20 +184,11 @@ mod registry_tests {
     use super::*;
     use crate::cluster::registry::NodeRegistry;
     use crate::cluster::NodeRole;
-    use crate::redis::mock::MockRedis;
     use fred::prelude::*;
-    use std::sync::Arc;
 
-    /// Fresh MockRedis-backed pool (in-process command-level test double).
+    /// A REAL Redis on its own database (dev-plan 铁律 2: no in-process mock).
     async fn pool() -> Pool {
-        let mock = Arc::new(MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-        pool.init().await.expect("init");
-        pool
+        crate::redis::test_redis::isolated_pool().await
     }
 
     fn registry(pool: &Pool, node_id: &str, url: &str) -> NodeRegistry {

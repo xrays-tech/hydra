@@ -18,18 +18,25 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 2s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v5
+
+      # dev-plan 铁律 2: Redis-dependent tests need a REAL Redis (an in-process
+      # double is forbidden). Started here rather than as a service container so
+      # it can run with 64 databases — the harness gives every test its own
+      # database, and the default 16 wrap around under a parallel test run.
+      - name: Start a real Redis for tests
+        run: |
+          set -euo pipefail
+          docker run -d --name hydra-test-redis -p 6379:6379 \
+            redis:7-alpine redis-server --save "" --appendonly no --databases 64
+          for _ in $(seq 1 30); do
+            if docker exec hydra-test-redis redis-cli ping >/dev/null 2>&1; then
+              echo "redis is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the test Redis did not become reachable"; exit 1
 
       # Pin the toolchain explicitly (dtolnay/rust-toolchain sets
       # RUSTUP_TOOLCHAIN, overriding rust-toolchain.toml): a latest-stable
@@ -101,18 +108,25 @@ jobs:
   # from exactly this feature set, so a break here ships a broken binary.
   optional-features:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 2s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v5
+
+      # dev-plan 铁律 2: Redis-dependent tests need a REAL Redis (an in-process
+      # double is forbidden). Started here rather than as a service container so
+      # it can run with 64 databases — the harness gives every test its own
+      # database, and the default 16 wrap around under a parallel test run.
+      - name: Start a real Redis for tests
+        run: |
+          set -euo pipefail
+          docker run -d --name hydra-test-redis -p 6379:6379 \
+            redis:7-alpine redis-server --save "" --appendonly no --databases 64
+          for _ in $(seq 1 30); do
+            if docker exec hydra-test-redis redis-cli ping >/dev/null 2>&1; then
+              echo "redis is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the test Redis did not become reachable"; exit 1
 
       - name: Install Rust toolchain (pinned 1.98.0)
         uses: dtolnay/rust-toolchain@v1

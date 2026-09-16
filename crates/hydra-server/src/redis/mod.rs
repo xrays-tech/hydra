@@ -24,7 +24,6 @@
 
 pub mod auth_cache;
 pub mod breaker;
-pub mod mock;
 pub mod rate_limit;
 
 /// Real-Redis harness for tests (dev-plan 铁律 2: Redis is an external system
@@ -45,7 +44,17 @@ pub mod test_redis {
     /// Hand out a distinct Redis DATABASE per test: the key names are shared
     /// constants (`hydra:{ctl:events}`, `hydra:{lease:leader}`, …), so tests on
     /// one instance would otherwise observe each other's state.
-    static NEXT_DB: AtomicU8 = AtomicU8::new(1);
+    ///
+    /// The range is deliberately wide (lib tests own 1..=40, hand-assigned
+    /// integration tests 41..=63) because the allocator wraps: with only the
+    /// default 16 databases, a big enough test binary would hand two concurrent
+    /// tests the same one, and each flushes it. The test instance therefore runs
+    /// with `--databases 64` (docker-compose.local.yml / CI).
+    static NEXT_DB: AtomicU8 = AtomicU8::new(0);
+
+    /// Databases this harness may use (unit tests). Integration tests start at
+    /// [`INTEGRATION_DB_FIRST`].
+    const UNIT_DB_COUNT: u8 = 40;
 
     /// A pool on its own flushed database, against a REAL Redis.
     ///
@@ -61,7 +70,7 @@ pub mod test_redis {
                  then:      export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380"
             )
         });
-        let db = NEXT_DB.fetch_add(1, Ordering::Relaxed) % 15 + 1; // 1..=15
+        let db = NEXT_DB.fetch_add(1, Ordering::Relaxed) % UNIT_DB_COUNT + 1; // 1..=40
         let url = format!("{}/{}", base.trim_end_matches('/'), db);
         let config = Config::from_url(&url).expect("HYDRA_TEST_REDIS_URL must parse");
         let pool = Pool::new(

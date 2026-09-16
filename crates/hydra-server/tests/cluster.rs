@@ -551,18 +551,11 @@ async fn standby_forwards_mutations_to_active() {
     use fred::prelude::*;
     use hydra_server::cluster::registry::NodeRegistry;
     use hydra_server::cluster::NodeRole;
-    use hydra_server::redis::mock::MockRedis;
     use hydra_server::redis::LEASE_KEY;
 
-    // Shared Redis double: the lease + the registry entries the forward
-    // target is resolved from (MockRedis — no external Redis needed).
-    let mock = Arc::new(MockRedis::new());
-    let cfg = Config {
-        mocks: Some(mock),
-        ..Default::default()
-    };
-    let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-    pool.init().await.expect("init");
+    // A REAL Redis (dev-plan 铁律 2): holds the lease + the registry entries the
+    // forward target is resolved from. Integration database 42.
+    let pool = common::real_redis_pool(42).await;
 
     let active_pool = common::setup_pool().await;
     let kp_arc: Arc<dyn KeyProvider> = Arc::new(kp());

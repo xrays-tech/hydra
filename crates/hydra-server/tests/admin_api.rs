@@ -1190,20 +1190,13 @@ async fn auth_cache_invalidate() {
 #[cfg(feature = "cluster-redis")]
 #[tokio::test]
 async fn empty_body_delete_invalidates_all_local() {
-    use fred::prelude::*;
     use hydra_core::config::ConfigData;
     use hydra_core::model::Tenant;
     use hydra_server::cluster::events::InvalidationStream;
-    use hydra_server::redis::mock::MockRedis;
 
-    // Shared Redis double: captures the published stream payload.
-    let mock = Arc::new(MockRedis::new());
-    let cfg = Config {
-        mocks: Some(mock),
-        ..Default::default()
-    };
-    let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-    pool.init().await.expect("init");
+    // A REAL Redis (dev-plan 铁律 2): captures the published stream payload.
+    // Integration database 43.
+    let pool = common::real_redis_pool(43).await;
     let reader_pool = pool.clone();
 
     // Store with exactly 3 known tenants.
@@ -2490,8 +2483,8 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
     use hydra_core::config::ConfigData;
     use hydra_server::cluster::events::InvalidationStream;
 
-    // Integration-test database 9 (see tests/common/mod.rs for the partition).
-    let pool = common::real_redis_pool(9).await;
+    // Integration-test database 41 (see tests/common/mod.rs for the partition).
+    let pool = common::real_redis_pool(41).await;
 
     let mut state = AdminState::new(
         None,

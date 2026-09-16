@@ -135,7 +135,10 @@ aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # --- Cluster Redis backbone (v8 plan, feature `cluster-redis`) --------------
-fred = { version = "10", features = ["mocks", "i-scripts"], optional = true }
+# `i-scripts` = Lua `EVAL` (the lease renew, the rate-limit windows, the
+# trim+bump). The former `mocks` feature went away with `redis/mock.rs`: Redis
+# tests run against a REAL instance (dev-plan 铁律 2).
+fred = { version = "10", features = ["i-scripts"], optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,

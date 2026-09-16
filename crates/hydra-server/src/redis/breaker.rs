@@ -131,23 +131,16 @@ pub fn spawn_breaker_sync(shared: Arc<SharedBreaker>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redis::mock::MockRedis;
     use hydra_core::breaker::BreakerConfig;
 
-    async fn pool_with_mock() -> Pool {
-        let mock = std::sync::Arc::new(MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let p = Pool::new(cfg, None, None, None, 1).expect("pool");
-        p.init().await.expect("init");
-        p
+    /// A REAL Redis on its own database (dev-plan 铁律 2: no in-process mock).
+    async fn pool() -> Pool {
+        crate::redis::test_redis::isolated_pool().await
     }
 
     #[tokio::test]
     async fn vote_propagates_via_sync() {
-        let pool = pool_with_mock().await;
+        let pool = pool().await;
         // Node A trips locally and votes; node B (separate breaker, SAME
         // Redis) converges on the shared dead-set via sync.
         let breaker_a = Arc::new(CircuitBreaker::new(BreakerConfig::new(1)));
@@ -174,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_requires_enough_votes() {
-        let pool = pool_with_mock().await;
+        let pool = pool().await;
         let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(1)));
         let b = SharedBreaker::new(pool.clone(), "b".into(), breaker.clone(), 2);
 

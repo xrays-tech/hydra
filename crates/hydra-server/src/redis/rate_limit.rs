@@ -345,7 +345,6 @@ fn bucket_for(role: &LimitRole, ctx: &MatchCtx<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redis::mock::MockRedis;
 
     fn role(id: &str, count: Option<i64>, window: &str) -> LimitRole {
         LimitRole {
@@ -410,22 +409,106 @@ mod tests {
         assert!(count_key(&k).contains("{rl:r1:b}") && tokens_key(&k).contains("{rl:r1:b}"));
     }
 
-    #[test]
-    fn script_semantics_via_double() {
-        // The Lua scripts' sliding-window semantics, executed by the in-process
-        // double (fred's mock layer cannot round-trip EVAL; live Redis
-        // integration lands with deployment acceptance).
-        let m = MockRedis::new();
+    /// The sliding-window semantics of the REAL Lua script, evaluated by a REAL
+    /// Redis (dev-plan 铁律 2). The previous version ran the script through the
+    /// in-process double's own interpreter — which could agree with a broken
+    /// script, since both were written from the same reading of the semantics.
+    #[tokio::test]
+    async fn script_semantics_on_real_redis() {
+        use fred::prelude::*;
+        let pool = crate::redis::test_redis::isolated_pool().await;
         let ck = "hydra:{rl:r1:b}:count".to_string();
         for (i, expect) in [1i64, 1, 0].iter().enumerate() {
-            let got = m
-                .run_script(
+            let got: i64 = pool
+                .eval(
                     CHECK_AND_INC_SCRIPT,
-                    std::slice::from_ref(&ck),
-                    &["1000".into(), "60000".into(), "2".into(), format!("m{i}")],
+                    vec![ck.clone()],
+                    vec![
+                        "1000".to_string(),
+                        "60000".to_string(),
+                        "2".to_string(),
+                        format!("m{i}"),
+                    ],
                 )
-                .unwrap();
+                .await
+                .expect("EVAL");
             assert_eq!(got, *expect, "call {i}: admit, admit, then deny");
         }
+
+        // The window expires: an old member falls out and admission resumes.
+        let later: i64 = pool
+            .eval(
+                CHECK_AND_INC_SCRIPT,
+                vec![ck.clone()],
+                vec![
+                    (1000 + 61_000).to_string(),
+                    "60000".to_string(),
+                    "2".to_string(),
+                    "m-later".to_string(),
+                ],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(later, 1, "the window rolled over ⇒ admit again");
+    }
+
+    /// Token accounting on the real script: the SCORE is the token count, not a
+    /// timestamp (a previous version stored the timestamp and summed counts).
+    #[tokio::test]
+    async fn token_accounting_on_real_redis() {
+        use fred::prelude::*;
+        let pool = crate::redis::test_redis::isolated_pool().await;
+        let tk = "hydra:{rl:r1:b}:tokens".to_string();
+        for tokens in ["10", "20", "30"] {
+            let _: i64 = pool
+                .eval(
+                    ADD_TOKENS_SCRIPT,
+                    vec![tk.clone()],
+                    vec![
+                        "1000".to_string(),
+                        "60000".to_string(),
+                        format!("m-{tokens}"),
+                        tokens.to_string(),
+                    ],
+                )
+                .await
+                .expect("EVAL");
+        }
+        // The verdict script sums the live SCORES (60 = 10+20+30 tokens, not 3
+        // requests) and compares against the limit: 1 = admit, 0 = deny.
+        let admit: i64 = pool
+            .eval(
+                CHECK_TOKENS_SCRIPT,
+                vec![tk.clone()],
+                vec!["2000".to_string(), "60000".to_string(), "100".to_string()],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(admit, 1, "60 tokens is under a 100-token limit");
+
+        let deny: i64 = pool
+            .eval(
+                CHECK_TOKENS_SCRIPT,
+                vec![tk.clone()],
+                vec!["2000".to_string(), "60000".to_string(), "50".to_string()],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(
+            deny, 0,
+            "60 tokens (three requests' worth, not three requests) exceeds a 50-token limit"
+        );
+
+        // A request count would have been 3 here and passed BOTH limits — which
+        // is exactly the mis-accounting the score-based version fixes.
+        let count_like_deny: i64 = pool
+            .eval(
+                CHECK_TOKENS_SCRIPT,
+                vec![tk.clone()],
+                vec!["2000".to_string(), "60000".to_string(), "4".to_string()],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(count_like_deny, 0, "still denied at limit 4");
     }
 }

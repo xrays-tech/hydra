@@ -221,29 +221,22 @@ fn heartbeat_key(node_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redis::mock::MockRedis;
 
-    async fn pool_with_mock() -> Pool {
-        let mock = std::sync::Arc::new(MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let p = Pool::new(cfg, None, None, None, 1).expect("pool");
-        p.init().await.expect("init");
-        p
+    /// A REAL Redis on its own database (dev-plan 铁律 2: no in-process mock).
+    async fn pool() -> Pool {
+        crate::redis::test_redis::isolated_pool().await
     }
 
     #[tokio::test]
     async fn register_discover_unregister() {
         let a = NodeRegistry::new(
-            pool_with_mock().await,
+            pool().await,
             "node-a".into(),
             NodeRole::Leader,
             "http://a:8081".into(),
         );
         let b = NodeRegistry::new(
-            pool_with_mock().await,
+            pool().await,
             "node-b".into(),
             NodeRole::Edge,
             "http://b:8081".into(),
@@ -265,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn expired_heartbeat_hides_node() {
         let a = NodeRegistry::new(
-            pool_with_mock().await,
+            pool().await,
             "node-a".into(),
             NodeRole::Leader,
             "http://a:8081".into(),
@@ -279,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_nodes_reports_liveness_and_lease_holder() {
-        let pool = pool_with_mock().await;
+        let pool = pool().await;
         let a = NodeRegistry::new(
             pool.clone(),
             "node-a".into(),

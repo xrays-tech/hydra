@@ -171,7 +171,11 @@ services:
   redis-test:
     image: redis:7-alpine
     container_name: hydra-local-redis-test
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # 64 databases: the test harness isolates each test on its own database
+    # (the key names are shared production constants), and the default 16 are
+    # not enough for the lib suite + integration binaries running in parallel.
+    command:
+      ["redis-server", "--save", "", "--appendonly", "no", "--databases", "64"]
     ports:
       - "127.0.0.1:6380:6379"   # loopback only
     healthcheck:

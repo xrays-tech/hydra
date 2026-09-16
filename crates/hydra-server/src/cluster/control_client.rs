@@ -301,13 +301,7 @@ mod tests {
     async fn rotate_from_registry_follows_leader() {
         // A live leader registered in the (mock) registry; the client's poll
         // target rotates to it.
-        let mock = std::sync::Arc::new(crate::redis::mock::MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-        pool.init().await.expect("init");
+        let pool = crate::redis::test_redis::isolated_pool().await;
         let reg = std::sync::Arc::new(crate::cluster::registry::NodeRegistry::new(
             pool.clone(),
             "edge".into(),
@@ -351,13 +345,7 @@ mod tests {
         // Two LIVE leaders; the current poll target is the first (sorted)
         // one — the dead active. Rotation must move to the OTHER leader,
         // not stay pinned to the failing URL.
-        let mock = std::sync::Arc::new(crate::redis::mock::MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-        pool.init().await.expect("init");
+        let pool = crate::redis::test_redis::isolated_pool().await;
         let reg = std::sync::Arc::new(crate::cluster::registry::NodeRegistry::new(
             pool.clone(),
             "edge".into(),
@@ -413,13 +401,7 @@ mod tests {
         // client's poll target is a different (reachable!) node — e.g. a
         // rejoining standby pointing at itself. Lease-aware rotation must
         // move the target to the actual holder.
-        let mock = std::sync::Arc::new(crate::redis::mock::MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let pool = Pool::new(cfg, None, None, None, 1).expect("pool");
-        pool.init().await.expect("init");
+        let pool = crate::redis::test_redis::isolated_pool().await;
         let reg = std::sync::Arc::new(crate::cluster::registry::NodeRegistry::new(
             pool.clone(),
             "standby".into(),

@@ -140,17 +140,10 @@ impl RedisAuthL2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::redis::mock::MockRedis;
 
+    /// A REAL Redis on its own database (dev-plan 铁律 2: no in-process mock).
     async fn l2() -> RedisAuthL2 {
-        let mock = std::sync::Arc::new(MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let p = Pool::new(cfg, None, None, None, 1).expect("pool");
-        p.init().await.expect("init");
-        RedisAuthL2::new(p)
+        RedisAuthL2::new(crate::redis::test_redis::isolated_pool().await)
     }
 
     #[tokio::test]

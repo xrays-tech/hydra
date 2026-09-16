@@ -27,8 +27,8 @@ pub async fn setup_pool() -> SqlitePool {
 /// fallback to a mock.
 ///
 /// Databases are partitioned so parallel test BINARIES cannot collide: lib unit
-/// tests use 1..=8 (`redis::test_redis::isolated_pool`), integration tests
-/// hand-assign 9..=15 here. Each call flushes its database.
+/// tests own 1..=40 (`redis::test_redis::isolated_pool`), integration tests
+/// hand-assign 41..=63 here. Each call flushes its database.
 // Each test target compiles this module on its own, so a helper used by one
 // target is "dead code" in all the others.
 #[allow(dead_code)]
@@ -36,8 +36,8 @@ pub async fn setup_pool() -> SqlitePool {
 pub async fn real_redis_pool(db: u8) -> fred::clients::Pool {
     use fred::prelude::*;
     assert!(
-        (9..=15).contains(&db),
-        "integration tests use Redis database 9..=15 (lib tests own 1..=8)"
+        (41..=63).contains(&db),
+        "integration tests use Redis database 41..=63 (lib unit tests own 1..=40)"
     );
     let base = std::env::var("HYDRA_TEST_REDIS_URL").unwrap_or_else(|_| {
         panic!(

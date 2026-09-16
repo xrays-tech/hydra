@@ -42,7 +42,7 @@ Redis 是外部系统边界（租约、集群限流、熔断投票、鉴权 L2�
 
 - **新写的 Redis 相关测试一律连真实 Redis**，端点由环境变量 `HYDRA_TEST_REDIS_URL` 指定（如 `redis://127.0.0.1:6379`）。
 - **未设置该变量时必须明确失败**，并在信息里给出启动指引（本机 compose / CI service）；**不得**静默回退到 mock，也不得静默跳过——否则"用真实实例"这条规则会悄悄失效。
-- **现有 `MockRedis` 用例按模块迁移**，迁完删除 `redis/mock.rs`，并从 `redis/mod.rs` 摘掉 `pub mod mock;`（注意：它当前**没有** `#[cfg(test)]` 门控，即 673 行测试替身会被编进生产二进制，本身也与"本体零 mock"冲突）。
+- **`MockRedis` 已全量迁移并删除**（2026-09）：`redis/mock.rs`（673 行）与 `redis/mod.rs` 的 `pub mod mock;` 都已移除，`fred` 的 `mocks` feature 也一并摘掉。注意它此前**没有** `#[cfg(test)]` 门控，即那 673 行测试替身是被编进生产二进制的。
 - **本机端点（已核实）**：Docker 容器 `hydra-local-redis`（`redis:7-alpine`，属三节点本地环境）在 docker 网络 `environment_default` 内为 `172.22.0.4:6379`，**宿主机可达**；但 `environment/docker-compose.local.yml` 与 `docker-compose.cluster.yml` 只声明了容器内地址 `redis://redis:6379`，**未把 6379 发布到宿主**，所以宿主上跑 `cargo test` 目前拿不到稳定端点。要落地本规则，需要：① 在 compose 的 `redis` 服务上加 `127.0.0.1:6379:6379`（一行）；② CI 侧给作业加 `redis:7-alpine` service 容器（Actions 的 service 会映射到 localhost）并设置 `HYDRA_TEST_REDIS_URL`；③ 本地 `export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6379`。
 - **为什么这件事要紧（不是洁癖）**：in-process double 会掩盖真实 Redis 的语义与失败模式，直接导致测试假绿。已知三例：`MockRedis` 的 `INCR` 永不失败（于是"trim 成功但 bump 失败"这条路径**无法被测到**）、没有 `XLEN`、`XTRIM` 是自己重写的（不校验 MAXLEN/MINID 语义）；另有 `SET ... NX PX 0` 在真 Redis 上会报错、在 double 上却成功。这些差异正是集群侧最重要的失败路径。
 - **对当前任务的影响**：`B3(a)`（裁剪与代际自增的原子性）**必须用真实 Redis 验证**——它需要的正是真实 `INCR` 失败/命令时序与 `XLEN`，因此不再给 mock 加"故障注入接缝"。
