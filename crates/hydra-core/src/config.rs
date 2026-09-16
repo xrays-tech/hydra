@@ -33,7 +33,7 @@ use crate::model::{LimitRole, Provider, ProviderKeyBinding, Tenant};
 
 /// In-memory configuration snapshot. All indexes are built once at load time
 /// and read lock-free thereafter (the server holds it inside `ArcSwap`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigData {
     /// `domain` (lowercase) → tenant (incl. the `localhost` special case).
     pub tenants_by_domain: HashMap<String, Tenant>,

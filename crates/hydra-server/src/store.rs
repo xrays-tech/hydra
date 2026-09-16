@@ -23,6 +23,8 @@ use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity
 use hydra_core::model::{LimitRole, ProviderKeyBinding};
 use hydra_core::swrr::SwrrState;
 
+use crate::cluster::content::ReplicationContent;
+use crate::cluster::snapshot::HydratedWire;
 use crate::crypto::KeyProvider;
 use crate::db;
 
@@ -262,11 +264,16 @@ pub struct ConfigStore {
     pool: Option<SqlitePool>,
     swrr: Arc<DashMap<(String, String), SwrrState>>,
     key_provider: Arc<dyn KeyProvider>,
-    /// Monotonic config version (cluster P1): bumped on every local reload
-    /// and set to the control-plane version on `apply_snapshot`. The control
-    /// endpoint serves `?since=` against it; the control client skips
-    /// re-applying unchanged snapshots.
-    version: Arc<std::sync::atomic::AtomicU64>,
+    /// The replicated bytes, version included (cluster P1/P2). The generation
+    /// predicate is defined HERE, so "the version advanced" and "the replicated
+    /// content changed" are one statement, and [`Self::version`] DERIVES from it
+    /// (a second `AtomicU64` would be a second owner — review C16).
+    ///
+    /// `Arc<ArcSwapOption<..>>`: the outer `Arc` is required because
+    /// `ArcSwapAny` is not `Clone` and `ConfigStore` is `#[derive(Clone)]`; the
+    /// `Option` is required because an edge store built by [`Self::from_snapshot`]
+    /// has no fidelity rows until its first [`Self::apply_snapshot`].
+    replication: Arc<arc_swap::ArcSwapOption<ReplicationContent>>,
     /// Snapshot-change hooks (审核四 P3). Every swap path funnels through
     /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
     /// be forgotten by one of the writers.
@@ -305,12 +312,17 @@ impl ConfigStore {
             None if db::config_content_exists(&pool).await.unwrap_or(false) => 1,
             None => 0,
         };
+        // The replication content is built at construction (not lazily): a
+        // leader that served a wire with EMPTY fidelity rows would instruct
+        // every replica to wipe its fidelity tables and insert nothing.
+        let content =
+            ReplicationContent::load(&pool, key_provider.as_ref(), cfg.clone(), version).await?;
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
             pool: Some(pool),
             swrr: Arc::new(DashMap::new()),
             key_provider,
-            version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
+            replication: Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(content)))),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
@@ -330,9 +342,20 @@ impl ConfigStore {
             pool: None,
             swrr: Arc::new(DashMap::new()),
             key_provider,
-            version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // No pool on an edge ⇒ no fidelity rows yet. Left `None` on purpose:
+            // only the first `apply_snapshot` (from a verified wire) fills it.
+            replication: Arc::new(arc_swap::ArcSwapOption::empty()),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// The current replication content, version included (one atomic load).
+    ///
+    /// `None` until a node has content: on an edge that means "before the first
+    /// `apply_snapshot`".
+    #[must_use]
+    pub fn replication(&self) -> Guard<Option<Arc<ReplicationContent>>> {
+        self.replication.load()
     }
 
     /// Lock-free hot-path read. Returns a [`Guard`] that derefs to
@@ -359,7 +382,7 @@ impl ConfigStore {
     /// control channel and the local last-applied version on edges.
     #[must_use]
     pub fn version(&self) -> u64 {
-        self.version.load(std::sync::atomic::Ordering::Acquire)
+        self.replication.load().as_deref().map_or(0, |c| c.version)
     }
 
     /// Register a hook that runs after **every** snapshot swap.
@@ -398,11 +421,15 @@ impl ConfigStore {
     /// the swap is lock-free for readers and the SWRR map is cleared so stale
     /// per-`(tenant, model)` weights never survive a config change. The store
     /// adopts the control-plane `version` (monotonic across the cluster).
-    pub fn apply_snapshot(&self, cfg: ConfigData, version: u64) {
-        self.inner.store(Arc::new(cfg));
+    pub fn apply_snapshot(&self, hydrated: HydratedWire) {
+        let content = ReplicationContent::from_hydrated(
+            hydrated.version,
+            Arc::new(hydrated.cfg.clone()),
+            hydrated.fidelity,
+        );
+        self.inner.store(Arc::new(hydrated.cfg));
+        self.replication.store(Some(Arc::new(content)));
         self.swrr.clear();
-        self.version
-            .store(version, std::sync::atomic::Ordering::Release);
         self.notify(&self.snapshot());
     }
 
@@ -413,31 +440,52 @@ impl ConfigStore {
     /// (version bumped) and the SWRR map is cleared so per-`(tenant, model)`
     /// weights are rebuilt lazily on the next request. Snapshot-fed stores
     /// (edge) have no DB to reload from and return [`StoreError::NoDatabase`].
-    pub async fn reload_all(&self) -> Result<(), StoreError> {
-        let pool = self.pool.as_ref().ok_or(StoreError::NoDatabase)?;
-        let new_cfg = build_config(pool, self.key_provider.as_ref()).await?;
+    /// Returns whether the REPLICATION CONTENT actually changed (plan T6).
+    pub async fn reload_all(&self) -> Result<bool, StoreError> {
+        self.reload_all_with(false).await
+    }
+
+    /// Reload from the DB and publish, advancing the generation **only when the
+    /// replication content changed**.
+    ///
+    /// An unconditional bump made an idempotent `POST /reload` (and any write
+    /// that touched no replicated column) rebuild every replica for nothing.
+    /// `force` restores the operator's "push this out anyway".
+    pub async fn reload_all_with(&self, force: bool) -> Result<bool, StoreError> {
+        let pool = self.pool.clone().ok_or(StoreError::NoDatabase)?;
+        let kp = self.key_provider.clone();
+        let new_cfg = build_config(&pool, kp.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
         // so the previous snapshot is preserved.
         //
-        // PERSIST FIRST, THEN PUBLISH (review N3). The marker used to be written
-        // best-effort AFTER the in-memory swap, so one failed write left the
-        // in-memory version ahead of the durable one — and with the
-        // evidence-based freshness gate (`replica::replica_is_current`) that
-        // reads as "this node's replica is behind", disqualifying a node whose
-        // replica is in fact exactly what it serves. Failing the write now fails
-        // the admin mutation, which is recoverable; a silently diverging
-        // watermark is not.
-        let next = self.version.load(std::sync::atomic::Ordering::Acquire) + 1;
-        db::set_config_version(pool, next).await?;
-        self.inner.store(Arc::new(new_cfg));
+        // ORDER IS LOAD-BEARING: `ReplicationContent` derives `PartialEq`
+        // INCLUDING `version`, so the candidate is loaded at the CURRENT version
+        // and compared before the new version is applied. Loading it at
+        // `prev + 1` would make the comparison unequal always ⇒ the generation
+        // would still advance on every reload (the defect this predicate
+        // exists to remove).
+        let prev_version = self.version();
+        let candidate = ReplicationContent::load(&pool, kp.as_ref(), new_cfg, prev_version).await?;
+        let changed = force || self.replication.load().as_deref() != Some(&candidate);
+
+        if !changed {
+            tracing::debug!(version = prev_version, "reload: no replicated change");
+            return Ok(false);
+        }
+
+        let mut new_content = candidate;
+        new_content.version = prev_version + 1;
+        // PERSIST FIRST, THEN PUBLISH (review N3): a durable watermark that lags
+        // the in-memory one reads as "this node is behind".
+        db::set_config_version(&pool, new_content.version).await?;
+        self.inner.store(new_content.cfg.clone());
+        self.replication.store(Some(Arc::new(new_content)));
         self.swrr.clear();
-        self.version
-            .store(next, std::sync::atomic::Ordering::Release);
         // Followers of the snapshot (the TLS cert store) re-resolve here, so a
         // cert written through the admin API is live on the very next
         // handshake — on every node role, including edge.
         self.notify(&self.snapshot());
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -448,6 +496,49 @@ mod tests {
 
     fn kp() -> std::sync::Arc<dyn KeyProvider> {
         std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1))
+    }
+
+    /// A hydrated wire with NO fidelity rows, for tests that only exercise the
+    /// config swap. Production never builds one this way: the leader uses
+    /// `ReplicationContent::load` and a replica uses `hydrate` on a real wire.
+    fn hydrated(version: u64, cfg: ConfigData) -> HydratedWire {
+        HydratedWire {
+            version,
+            cfg,
+            fidelity: crate::cluster::content::FidelityRows {
+                limit_roles: Vec::new(),
+                key_prefix_bindings: Vec::new(),
+                provider_keys: Vec::new(),
+                tenant_token_hashes: Vec::new(),
+                provider_models: Vec::new(),
+                tenant_providers: Vec::new(),
+                tenant_models: Vec::new(),
+            },
+        }
+    }
+
+    /// Insert one provider row so the next `reload_all` sees a REAL change.
+    ///
+    /// The generation now advances only when the replication content changes
+    /// (plan T6), so a test that wants a notify/marker write must first make one.
+    async fn seed_change(pool: &sqlx::SqlitePool, id: &str) {
+        crate::db::insert_provider(
+            pool,
+            &hydra_core::model::Provider {
+                id: id.to_string(),
+                key: format!("k-{id}"),
+                name: id.to_string(),
+                endpoint: "http://127.0.0.1:1/".to_string(),
+                weight: 1,
+                created_at: String::new(),
+                updated_at: String::new(),
+                max_concurrency: None,
+                max_queue_depth: None,
+                queue_wait_timeout_ms: None,
+            },
+        )
+        .await
+        .expect("seed provider");
     }
 
     fn cfg_with_tenant(cfg: &mut ConfigData) {
@@ -482,7 +573,7 @@ mod tests {
             .await
             .expect("init_pool");
         crate::db::run_migrate(&pool).await.expect("migrate");
-        let store = ConfigStore::load(pool, kp()).await.expect("load");
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
 
         let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
@@ -495,9 +586,15 @@ mod tests {
         }));
 
         // Control-plane path (edge / standby): one config version.
-        store.apply_snapshot(ConfigData::default(), 7);
-        // Local rebuild path (admin write, `POST /api/v1/reload`).
-        store.reload_all().await.expect("reload_all");
+        store.apply_snapshot(hydrated(7, ConfigData::default()));
+        // Local rebuild path (admin write, `POST /api/v1/reload`). The content
+        // must ACTUALLY change: the generation now advances — and followers are
+        // notified — only when the replicated bytes differ (plan T6).
+        seed_change(&pool, "p-notify").await;
+        assert!(
+            store.reload_all().await.expect("reload_all"),
+            "a real DB change must advance the replication content"
+        );
 
         let seen = seen.lock().expect("hook mutex").clone();
         assert_eq!(
@@ -526,6 +623,10 @@ mod tests {
         crate::db::run_migrate(&pool).await.expect("migrate");
         let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
         let before = store.version();
+        // Make a REAL change first: an unchanged store skips the marker write
+        // entirely under the new predicate, which would make the fault
+        // injection below vacuous (plan T6 step 7).
+        seed_change(&pool, "p-marker").await;
 
         sqlx::query(
             "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
@@ -583,7 +684,7 @@ mod tests {
         assert!(!store.swrr().is_empty());
 
         let c2 = ConfigData::default();
-        store.apply_snapshot(c2, 42);
+        store.apply_snapshot(hydrated(42, c2));
         assert!(
             store.snapshot().tenants_by_domain.is_empty(),
             "apply_snapshot replaced the config"

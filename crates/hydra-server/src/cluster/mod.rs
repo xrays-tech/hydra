@@ -18,6 +18,7 @@
 use std::fmt;
 use std::time::Duration;
 
+pub mod content;
 pub mod control_client;
 #[cfg(feature = "cluster-redis")]
 pub mod events;

@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 
 use super::AdminState;
 use crate::admin::metrics;
-use crate::cluster::snapshot::SnapshotWire;
 use crate::http::AuthChecker;
 
 /// A fully-built HTTP response (the `ServeHttp` return type).
@@ -1944,99 +1943,6 @@ pub(super) async fn tenant_auth_test(
 }
 
 // ===========================================================================
-// Cluster status (cluster P4) — whole-fleet view for the Admin UI Health page
-// ===========================================================================
-
-/// One fleet node as rendered by `GET /api/v1/cluster/status`.
-#[derive(Serialize)]
-struct ClusterNodeDto {
-    node_id: String,
-    role: String,
-    control_url: String,
-    alive: bool,
-    is_lease_holder: bool,
-    is_self: bool,
-}
-
-/// Whole-cluster status. `cluster=false` on the single-node build / default
-/// mode — the UI then renders just the local Health panel.
-#[derive(Serialize)]
-struct ClusterStatusDto {
-    cluster: bool,
-    mode: String,
-    node_id: String,
-    this_node_leader: bool,
-    lease_holder: Option<String>,
-    nodes: Vec<ClusterNodeDto>,
-}
-
-/// `GET /api/v1/cluster/status` (admin-token gated): fleet nodes from the
-/// registry (role + control URL + heartbeat liveness) plus the current
-/// leader-lease holder. Single-node mode reports `cluster=false`.
-#[allow(unused_variables)] // params are unused on the single-node build
-pub(super) async fn cluster_status(state: &AdminState, trace_id: &str) -> Resp {
-    #[cfg(feature = "cluster-redis")]
-    {
-        let Some(registry) = &state.cluster_registry else {
-            return ok_json(200, &single_node_status());
-        };
-        let (nodes, holder) = match (registry.list_nodes().await, registry.lease_holder().await) {
-            (Ok(nodes), Ok(holder)) => (nodes, holder),
-            _ => {
-                return err_json(
-                    502,
-                    "cluster_unavailable",
-                    "cannot read the cluster registry (Redis unreachable?)",
-                    trace_id,
-                );
-            }
-        };
-        let self_id = registry.node_id().to_string();
-        let mode = match registry.role() {
-            crate::cluster::NodeRole::Leader => "leader",
-            crate::cluster::NodeRole::Edge => "edge",
-            crate::cluster::NodeRole::All => "all",
-        }
-        .to_string();
-        let dto = ClusterStatusDto {
-            cluster: true,
-            mode,
-            this_node_leader: holder.as_deref() == Some(registry.node_id()),
-            node_id: self_id.clone(),
-            lease_holder: holder.clone(),
-            nodes: nodes
-                .into_iter()
-                .map(|n| ClusterNodeDto {
-                    is_lease_holder: holder.as_deref() == Some(n.node_id.as_str()),
-                    is_self: n.node_id == self_id,
-                    node_id: n.node_id,
-                    role: n.role,
-                    control_url: n.control_url,
-                    alive: n.alive,
-                })
-                .collect(),
-        };
-        ok_json(200, &dto)
-    }
-    #[cfg(not(feature = "cluster-redis"))]
-    {
-        ok_json(200, &single_node_status())
-    }
-}
-
-/// The single-node status payload (shared by both cfg branches).
-fn single_node_status() -> ClusterStatusDto {
-    ClusterStatusDto {
-        cluster: false,
-        mode: "single".to_string(),
-        node_id: String::new(),
-        this_node_leader: false,
-        lease_holder: None,
-        nodes: Vec::new(),
-    }
-}
-
-// ===========================================================================
 // Breaker inspect / reset (design §8.4 / §13.2)
 // ===========================================================================
 
@@ -2109,16 +2015,6 @@ struct HealthBody {
     listeners: Option<&'static crate::listeners::ActiveListeners>,
 }
 
-#[derive(Serialize)]
-struct ReloadBody {
-    status: &'static str,
-    tenants: usize,
-    providers: usize,
-    models: usize,
-    keys: usize,
-    certs: usize,
-}
-
 pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
     let snap = state.store.snapshot();
     // Edge nodes have no local DB (cluster P0b) — skip the DB probe.
@@ -2141,114 +2037,6 @@ pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
             tenants: snap.tenants_by_domain.len(),
             providers: providers_count,
             listeners: crate::listeners::active(),
-        },
-    )
-}
-
-// ===========================================================================
-// Internal control plane (cluster P1) — snapshot distribution
-// ===========================================================================
-
-/// Control-channel response: `snapshot` is present only when the caller's
-/// `since` is older than the current version.
-#[derive(Serialize)]
-struct InternalControlResponse {
-    version: u64,
-    snapshot: Option<SnapshotWire>,
-}
-
-/// `GET /api/v1/internal/control?since=N` (cluster-token gated): serve the
-/// current config snapshot (secrets sealed, versioned) to edge/standby
-/// nodes. `snapshot` is `null` when the caller is already current.
-pub(super) async fn internal_control(
-    state: &AdminState,
-    query: Option<&str>,
-    trace_id: &str,
-) -> Resp {
-    let since: u64 = query
-        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("since=")))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let current = state.store.version();
-    if since >= current {
-        return ok_json(
-            200,
-            &InternalControlResponse {
-                version: current,
-                snapshot: None,
-            },
-        );
-    }
-    let cfg: hydra_core::config::ConfigData =
-        hydra_core::config::ConfigData::clone(&state.store.snapshot());
-    match SnapshotWire::build(current, cfg, state.db(), state.key_provider.as_ref()).await {
-        Ok(snapshot) => ok_json(
-            200,
-            &InternalControlResponse {
-                version: current,
-                snapshot: Some(snapshot),
-            },
-        ),
-        Err(e) => err_json(
-            500,
-            "snapshot_build_failed",
-            &format!("control snapshot build failed: {e}"),
-            trace_id,
-        ),
-    }
-}
-
-/// `GET /healthz/leader` (cluster P2): 200 while this node holds the leader
-/// lease, 503 on standby, 404 on non-candidate nodes (`all` / edge).
-pub(super) fn leader_health(state: &AdminState, trace_id: &str) -> Resp {
-    match &state.leader_ready {
-        Some(f) if f() => ok_json(200, &LeaderHealth { leader: true }),
-        Some(_) => err_json(
-            503,
-            "not_leader",
-            "this node is not the active leader",
-            trace_id,
-        ),
-        None => err_json(
-            404,
-            "not_found",
-            "leader health is only available on leader-candidate nodes",
-            trace_id,
-        ),
-    }
-}
-
-#[derive(Serialize)]
-struct LeaderHealth {
-    leader: bool,
-}
-
-pub(super) async fn reload(state: &AdminState, trace_id: &str) -> Resp {
-    // Explicit reload shares the same best-effort path (reload_all only), but a
-    // fatal validation failure is reported as 400 (design §5.3: the old snapshot
-    // is retained). Certs follow the swap via the `ConfigStore` hook.
-    let result = {
-        let _guard = state.reload_lock.lock().await;
-        state.store.reload_all().await
-    };
-    if let Err(e) = result {
-        return err_json(
-            400,
-            "reload_failed",
-            &format!("config reload failed (old snapshot retained): {e}"),
-            trace_id,
-        );
-    }
-    let snap = state.store.snapshot();
-    ok_json(
-        200,
-        &ReloadBody {
-            status: "reloaded",
-            tenants: snap.tenants_by_domain.len(),
-            providers: snap.providers.len(),
-            models: snap.models_by_key.len(),
-            keys: snap.provider_keys.len(),
-            certs: snap.certs.len(),
         },
     )
 }

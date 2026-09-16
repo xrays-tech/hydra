@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id as \"id!\", provider_id, created_at, api_key_ciphertext, api_key_nonce,\n                  key_version\n           FROM provider_key ORDER BY provider_id, created_at",
+  "query": "SELECT id as \"id!\", provider_id, created_at, api_key_ciphertext, api_key_nonce,\n                  key_version\n           FROM provider_key ORDER BY provider_id, created_at, id",
   "describe": {
     "columns": [
       {
@@ -46,5 +46,5 @@
       false
     ]
   },
-  "hash": "4cd04be8e37caea7c0032da8d6af96a259c4bc9998932ba814de363ea1503dec"
+  "hash": "72f44d10890a42eb2e27f491f8ce89d5f95181758e8711834d9f665faa59cfbb"
 }

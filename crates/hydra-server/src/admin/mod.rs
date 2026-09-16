@@ -42,6 +42,7 @@ use crate::proxy::admission::AdmissionControl;
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::store::ConfigStore;
 
+pub mod cluster_api;
 pub mod handlers;
 pub mod metrics;
 mod static_files;
@@ -268,7 +269,18 @@ impl AdminService {
             return handlers::health(&self.state, trace_id).await;
         }
         if parts == ["reload"] && method == "POST" {
-            return handlers::reload(&self.state, trace_id).await;
+            // `?force=1` is a SAFETY-RELEVANT ops override, so it is PARSED as a
+            // parameter, never substring-matched: `q.contains("force=1")` would
+            // also fire on `?x=force=1` and on `?noforce=1`.
+            let force = query
+                .map(|q| {
+                    q.split('&').any(|kv| {
+                        let mut it = kv.splitn(2, '=');
+                        matches!((it.next(), it.next()), (Some("force"), Some("1")))
+                    })
+                })
+                .unwrap_or(false);
+            return cluster_api::reload(&self.state, force, trace_id).await;
         }
         // Auth cache invalidation.
         if parts == ["auth", "cache"] && method == "DELETE" {
@@ -292,11 +304,11 @@ impl AdminService {
         }
         // Internal control plane (cluster P1): snapshot distribution.
         if parts == ["internal", "control"] && method == "GET" {
-            return handlers::internal_control(&self.state, query, trace_id).await;
+            return cluster_api::internal_control(&self.state, query, trace_id).await;
         }
         // Cluster status (cluster P4): whole-fleet view for the Health page.
         if parts == ["cluster", "status"] && method == "GET" {
-            return handlers::cluster_status(&self.state, trace_id).await;
+            return cluster_api::cluster_status(&self.state, trace_id).await;
         }
         // Tenant auth-url probe (Admin UI "Test" button on the Tenants form):
         // POSTs a simulated auth request to the given auth_url and reports
@@ -497,7 +509,7 @@ impl ServeHttp for AdminService {
         // lease, 503 on standby, 404 on non-candidate nodes. Token-free so
         // LBs / orchestrators can route to the active leader.
         if path == "/healthz/leader" {
-            return handlers::leader_health(&self.state, &trace_id);
+            return cluster_api::leader_health(&self.state, &trace_id);
         }
 
         // Internal control-plane endpoints (cluster P1): gated by the SHARED

@@ -1096,11 +1096,105 @@ async fn reload_endpoint_triggers_reload_all() {
     let body: serde_json::Value = r.json().await.expect("json");
     assert_eq!(body["status"], "reloaded");
     assert_eq!(body["providers"], 1);
+    // T6 (additive): the body also reports whether the generation advanced and
+    // what it advanced TO. A real change ⇒ `changed: true` and version ≥ 1.
+    assert_eq!(body["changed"], true, "a real change must report changed");
+    assert!(
+        body["version"].as_u64().expect("version") >= 1,
+        "version is reported after the reload: {body}"
+    );
+    assert_eq!(body["version"].as_u64(), Some(state.store.version()));
     // Snapshot now reflects the reloaded row.
     assert_eq!(
         state.store.snapshot().providers.get("px").unwrap().weight,
         3
     );
+}
+
+/// Plan T6 — `POST /reload` is IDEMPOTENT by default and forceable with
+/// `?force=1`.
+///
+/// Before T6 every reload advanced the generation unconditionally, so an
+/// unchanged config rebuilt every replica on the fleet for nothing. The ops
+/// escape hatch is preserved as an explicitly PARSED parameter — not a substring
+/// match, which is why the near-miss query strings below are asserted too.
+#[tokio::test]
+async fn reload_is_idempotent_and_forceable() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    let post = |path: &'static str| {
+        let state = state.clone();
+        async move {
+            let _ = state;
+            let r = req(port, reqwest::Method::POST, path, Some(TOKEN), Some("{}")).await;
+            let status = r.status().as_u16();
+            let body: serde_json::Value = r.json().await.expect("json");
+            (status, body)
+        }
+    };
+
+    // 1) First reload: whatever it finds is "new" relative to the content the
+    //    store was constructed with, so the generation advances.
+    let (status, first) = post("/api/v1/reload").await;
+    assert_eq!(status, 200, "got {first}");
+    assert_eq!(first["status"], "reloaded");
+    let v1 = first["version"].as_u64().expect("version");
+
+    // 2) Second reload with NO write in between: a no-op.
+    let (status, second) = post("/api/v1/reload").await;
+    assert_eq!(status, 200, "got {second}");
+    assert_eq!(second["status"], "reloaded", "the old field is preserved");
+    assert_eq!(
+        second["changed"], false,
+        "an unchanged config must not advance the generation: {second}"
+    );
+    assert_eq!(
+        second["version"].as_u64(),
+        Some(v1),
+        "and the version must not move"
+    );
+    // The counters are still reported (the Admin UI renders them).
+    for key in ["providers", "tenants", "models", "keys", "certs"] {
+        assert!(
+            second.get(key).and_then(|v| v.as_u64()).is_some(),
+            "the additive change must not drop `{key}`: {second}"
+        );
+    }
+
+    // 3) Near-miss query strings must NOT force: `force` is parsed as a
+    //    parameter, not matched as a substring.
+    for path in [
+        "/api/v1/reload?x=force=1",
+        "/api/v1/reload?noforce=1",
+        "/api/v1/reload?force=0",
+    ] {
+        let (status, body) = post(path).await;
+        assert_eq!(status, 200, "{path} got {body}");
+        assert_eq!(
+            body["changed"], false,
+            "{path} must NOT be treated as force=1: {body}"
+        );
+        assert_eq!(body["version"].as_u64(), Some(v1), "{path} must not bump");
+    }
+
+    // 4) The real override: `?force=1` advances the generation unconditionally.
+    let (status, forced) = post("/api/v1/reload?force=1").await;
+    assert_eq!(status, 200, "got {forced}");
+    assert_eq!(forced["changed"], true, "force must advance: {forced}");
+    assert_eq!(
+        forced["version"].as_u64(),
+        Some(v1 + 1),
+        "exactly one generation: {forced}"
+    );
+
+    // 5) ...and it is order-independent within the query string.
+    let (status, forced2) = post("/api/v1/reload?foo=bar&force=1").await;
+    assert_eq!(status, 200, "got {forced2}");
+    assert_eq!(
+        forced2["changed"], true,
+        "`force=1` after another param: {forced2}"
+    );
+    assert_eq!(forced2["version"].as_u64(), Some(v1 + 2));
 }
 
 // ===========================================================================

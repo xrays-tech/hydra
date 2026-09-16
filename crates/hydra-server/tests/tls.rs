@@ -627,7 +627,7 @@ async fn t6_7_cert_store_follows_control_plane_snapshots() {
             cert_key_pem: None,
         },
     );
-    store.apply_snapshot(cfg, 42);
+    store.apply_snapshot(common::hydrated(42, cfg));
 
     let loaded = cert_store.resolved();
     assert_eq!(

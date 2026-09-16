@@ -22,8 +22,50 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use hydra_core::config::{CertMeta, ConfigData};
+use hydra_core::model::{
+    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, TenantModel, TenantProvider,
+};
 
+use crate::cluster::content::{FidelityRows, ReplicationContent};
 use crate::crypto::{KeyProvider, Sealed};
+
+/// Snapshot wire format version.
+///
+/// Fail-closed in BOTH directions, deliberately:
+/// - a NEW reader rejects an OLD wire (missing `wire_version` / `fidelity`);
+/// - an OLD reader rejects a NEW wire: the three row-sets it REQUIRES
+///   (`provider_models` / `tenant_providers` / `tenant_models`) moved INSIDE
+///   [`FidelityWireRows`], so it fails with `missing field provider_models`
+///   **regardless of payload**. Relying only on the `sealed_provider_keys`
+///   value-type change was not enough: an old reader ignores unknown fields, and
+///   when the leader had no provider keys (`{}`) it would parse the new wire
+///   happily and then execute the wipe this version exists to prevent.
+///
+/// There is deliberately NO emit switch: governing only emission would leave
+/// new nodes unable to materialize the old shape (it carries no fidelity rows),
+/// and governing acceptance too would let a new replica rebuild from v1 — i.e.
+/// perform the very wipe fail-closed exists to stop. Upgrade/rollback are an
+/// ORDER plus an accepted stall window (see `dev-docs/ops.md`).
+pub const WIRE_VERSION: u32 = 2;
+
+/// One sealed provider key WITH its row identity, so the replica keeps the
+/// leader's primary key instead of minting a new one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedProviderKeyDto {
+    pub id: String,
+    pub created_at: String,
+    pub sealed: SealedDto,
+}
+
+/// `tenant_id` → SEALED access-token hash (never the token, and sealed like every
+/// other secret on this channel: the control plane is plaintext HTTP).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantTokenHashDto {
+    pub tenant_id: String,
+    pub hash: SealedDto,
+}
 
 /// One sealed secret on the wire: AES-256-GCM ciphertext + nonce + key
 /// version (mirrors [`Sealed`], but serde-ready with a `Vec<u8>` nonce).
@@ -45,28 +87,60 @@ pub struct SealedCertDto {
     pub key: Option<SealedDto>,
 }
 
+/// The fidelity rows ON THE WIRE.
+///
+/// This is a WIRE DTO, deliberately distinct from [`FidelityRows`]: it carries
+/// no `provider_keys` (a [`ProviderKey`] cannot round-trip — its `api_key` is
+/// `#[serde(skip_serializing)]`; the sealed keys WITH identity travel via
+/// [`SnapshotWire::sealed_provider_keys`]), and its token hashes are sealed.
+///
+/// **The nesting is the mechanism**: `provider_models` / `tenant_providers` /
+/// `tenant_models` were top-level fields that every pre-v2 reader requires.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FidelityWireRows {
+    /// FULL `limit_role` rows, disabled ones included.
+    pub limit_roles: Vec<LimitRole>,
+    /// FULL `provider_key_binding` rows, disabled ones included.
+    pub key_prefix_bindings: Vec<ProviderKeyBinding>,
+    /// `tenant_id` → sealed access-token hash.
+    pub tenant_token_hashes: Vec<TenantTokenHashDto>,
+    /// Full `provider_model` rows — INCLUDING offline models (`status != 1`),
+    /// which the derived `cfg.models_by_key` drops.
+    pub provider_models: Vec<ProviderModel>,
+    /// Full `tenant_provider` rows (join ids preserved).
+    pub tenant_providers: Vec<TenantProvider>,
+    /// Full `tenant_model` rows (join ids preserved).
+    pub tenant_models: Vec<TenantModel>,
+}
+
 /// The control-channel snapshot: version + config (secrets stripped) + the
 /// sealed secret material to rehydrate it + the fidelity rows needed to
 /// rebuild a byte-faithful local DB (standby replica, P2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotWire {
+    /// Must equal [`WIRE_VERSION`]. NEVER add `#[serde(default)]` here: that
+    /// would re-open the "new reader accepts an old wire" direction.
+    pub wire_version: u32,
     /// Monotonic config version on the leader (the `since` watermark).
     pub version: u64,
     /// Config with `provider_keys` emptied and `cert_key_pem` stripped.
     pub cfg: ConfigData,
-    /// Sealed provider api-keys: `provider_id` → sealed blobs (one per key).
-    pub sealed_provider_keys: HashMap<String, Vec<SealedDto>>,
+    /// Sealed provider api-keys WITH row identity: `provider_id` → rows.
+    pub sealed_provider_keys: HashMap<String, Vec<SealedProviderKeyDto>>,
     /// Sealed cert private keys, keyed by (lowercased) domain.
     pub sealed_certs: HashMap<String, SealedCertDto>,
-    // ── Fidelity rows (P2 replica materialization) ────────────────────────
-    /// Full `provider_model` rows — INCLUDING offline models (`status != 1`),
-    /// which the derived `cfg.models_by_key` drops. Without these, a promoted
-    /// replica would silently lose manually-disabled models.
-    pub provider_models: Vec<hydra_core::model::ProviderModel>,
-    /// Full `tenant_provider` rows (join ids preserved).
-    pub tenant_providers: Vec<hydra_core::model::TenantProvider>,
-    /// Full `tenant_model` rows (join ids preserved).
-    pub tenant_models: Vec<hydra_core::model::TenantModel>,
+    /// The rebuild source — nested on purpose (see [`FidelityWireRows`]).
+    pub fidelity: FidelityWireRows,
+}
+
+/// What a replica gets after unsealing: the runtime config plus the fidelity
+/// rows, so "unsealing" and "what to rebuild" are one decision.
+pub struct HydratedWire {
+    pub version: u64,
+    pub cfg: ConfigData,
+    pub fidelity: FidelityRows,
 }
 
 /// Errors building or hydrating a [`SnapshotWire`].
@@ -80,6 +154,11 @@ pub enum SnapshotError {
     NotUtf8,
     #[error("malformed sealed payload (bad nonce length)")]
     MalformedNonce,
+    #[error(
+        "snapshot wire version {found} is not supported (this binary speaks {expected}); \
+         upgrade every node before the leader emits the new format"
+    )]
+    WireVersion { found: u32, expected: u32 },
 }
 
 impl From<&Sealed> for SealedDto {
@@ -110,29 +189,37 @@ impl TryFrom<SealedDto> for Sealed {
 }
 
 impl SnapshotWire {
-    /// Leader side: strip the secrets from an in-memory snapshot and seal
-    /// them under the fleet-wide master key. Freshly re-sealing the plaintext
-    /// (rather than reading DB ciphertext) keeps the wire consistent with the
-    /// snapshot being served. The fidelity rows (full `provider_model` /
-    /// join rows) are fetched from the DB so a promoted replica rebuilds a
-    /// byte-faithful local store.
+    /// Leader side: encode the replication content for the control channel.
+    ///
+    /// Takes the content WHOLE — the version comes from `content.version` (not
+    /// from a separate argument), so "what we serve" and "what we versioned"
+    /// cannot drift. Emits [`WIRE_VERSION`]; there is no emit knob.
+    ///
+    /// Secrets are freshly re-sealed from the in-memory plaintext rather than
+    /// read back from the DB, so the wire is consistent with the snapshot being
+    /// served.
     pub async fn build(
-        version: u64,
-        cfg: ConfigData,
-        pool: &sqlx::SqlitePool,
+        content: &ReplicationContent,
         kp: &dyn KeyProvider,
     ) -> Result<Self, SnapshotError> {
-        let mut sealed_provider_keys: HashMap<String, Vec<SealedDto>> = HashMap::new();
-        for (provider_id, keys) in &cfg.provider_keys {
-            let mut sealed = Vec::with_capacity(keys.len());
-            for k in keys {
-                sealed.push(SealedDto::from(&kp.seal(k.as_bytes())?));
-            }
-            sealed_provider_keys.insert(provider_id.clone(), sealed);
+        let f = content.fidelity();
+
+        // Sealed provider keys WITH row identity.
+        let mut sealed_provider_keys: HashMap<String, Vec<SealedProviderKeyDto>> = HashMap::new();
+        for k in &f.provider_keys {
+            sealed_provider_keys
+                .entry(k.provider_id.clone())
+                .or_default()
+                .push(SealedProviderKeyDto {
+                    id: k.id.clone(),
+                    created_at: k.created_at.clone(),
+                    sealed: SealedDto::from(&kp.seal(k.api_key.as_bytes())?),
+                });
         }
 
+        // Sealed cert private keys (public PEM stays readable).
         let mut sealed_certs: HashMap<String, SealedCertDto> = HashMap::new();
-        for (domain, meta) in &cfg.certs {
+        for (domain, meta) in &content.cfg.certs {
             let key = match &meta.cert_key_pem {
                 Some(pem) => Some(SealedDto::from(&kp.seal(pem.as_bytes())?)),
                 None => None,
@@ -147,45 +234,72 @@ impl SnapshotWire {
             );
         }
 
-        // Fidelity rows (P2): full provider_model set incl. offline models,
-        // and the raw join rows.
-        let provider_models = crate::db::list_provider_models(pool).await?;
-        let tenant_providers = crate::db::list_tenant_providers(pool).await?;
-        let tenant_models = crate::db::list_tenant_models(pool).await?;
+        // Sealed access-token hashes.
+        let mut tenant_token_hashes = Vec::with_capacity(f.tenant_token_hashes.len());
+        for (tenant_id, hash) in &f.tenant_token_hashes {
+            tenant_token_hashes.push(TenantTokenHashDto {
+                tenant_id: tenant_id.clone(),
+                hash: SealedDto::from(&kp.seal(hash.as_bytes())?),
+            });
+        }
 
-        // Strip secrets from the serialized copy.
-        let mut cfg = cfg;
+        // Strip secrets from the serialized config copy.
+        let mut cfg = (*content.cfg).clone();
         cfg.provider_keys = HashMap::new();
         for meta in cfg.certs.values_mut() {
             meta.cert_key_pem = None;
         }
 
         Ok(Self {
-            version,
+            wire_version: WIRE_VERSION,
+            version: content.version,
             cfg,
             sealed_provider_keys,
             sealed_certs,
-            provider_models,
-            tenant_providers,
-            tenant_models,
+            fidelity: FidelityWireRows {
+                limit_roles: f.limit_roles.clone(),
+                key_prefix_bindings: f.key_prefix_bindings.clone(),
+                tenant_token_hashes,
+                provider_models: f.provider_models.clone(),
+                tenant_providers: f.tenant_providers.clone(),
+                tenant_models: f.tenant_models.clone(),
+            },
         })
     }
 
-    /// Receiver side (edge / standby): decrypt the sealed material with the
-    /// local master key and rebuild a full [`ConfigData`]. **Fail-closed**: a
-    /// single decryption failure (wrong master key, tampered payload) rejects
-    /// the whole snapshot — the caller keeps its previous snapshot.
-    pub fn hydrate(self, kp: &dyn KeyProvider) -> Result<ConfigData, SnapshotError> {
+    /// Receiver side (edge / standby): verify the format version, decrypt the
+    /// sealed material with the local master key and rebuild the replication
+    /// content. **Fail-closed**: a version mismatch or a single decryption
+    /// failure (wrong master key, tampered payload) rejects the whole snapshot —
+    /// the caller keeps its previous last-known-good config.
+    pub fn hydrate(self, kp: &dyn KeyProvider) -> Result<HydratedWire, SnapshotError> {
+        if self.wire_version != WIRE_VERSION {
+            return Err(SnapshotError::WireVersion {
+                found: self.wire_version,
+                expected: WIRE_VERSION,
+            });
+        }
+
         let mut cfg = self.cfg;
 
-        for (provider_id, sealed_keys) in self.sealed_provider_keys {
-            let mut keys = Vec::with_capacity(sealed_keys.len());
-            for s in sealed_keys {
-                let plaintext = kp.open(&Sealed::try_from(s)?)?;
-                let key = String::from_utf8(plaintext).map_err(|_| SnapshotError::NotUtf8)?;
-                keys.push(key);
+        // Provider keys: unseal, keep the wire's identity, and re-project
+        // `cfg.provider_keys` so the hot path sees the same keys.
+        let mut provider_keys: Vec<ProviderKey> = Vec::new();
+        for (provider_id, rows) in self.sealed_provider_keys {
+            for row in rows {
+                let plaintext = kp.open(&Sealed::try_from(row.sealed)?)?;
+                let api_key = String::from_utf8(plaintext).map_err(|_| SnapshotError::NotUtf8)?;
+                cfg.provider_keys
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .push(api_key.clone());
+                provider_keys.push(ProviderKey {
+                    id: row.id,
+                    provider_id: provider_id.clone(),
+                    api_key,
+                    created_at: row.created_at,
+                });
             }
-            cfg.provider_keys.insert(provider_id, keys);
         }
 
         for (domain, sc) in self.sealed_certs {
@@ -208,7 +322,26 @@ impl SnapshotWire {
             );
         }
 
-        Ok(cfg)
+        let mut tenant_token_hashes = Vec::with_capacity(self.fidelity.tenant_token_hashes.len());
+        for dto in self.fidelity.tenant_token_hashes {
+            let plaintext = kp.open(&Sealed::try_from(dto.hash)?)?;
+            let hash = String::from_utf8(plaintext).map_err(|_| SnapshotError::NotUtf8)?;
+            tenant_token_hashes.push((dto.tenant_id, hash));
+        }
+
+        Ok(HydratedWire {
+            version: self.version,
+            cfg,
+            fidelity: FidelityRows {
+                limit_roles: self.fidelity.limit_roles,
+                key_prefix_bindings: self.fidelity.key_prefix_bindings,
+                provider_keys,
+                tenant_token_hashes,
+                provider_models: self.fidelity.provider_models,
+                tenant_providers: self.fidelity.tenant_providers,
+                tenant_models: self.fidelity.tenant_models,
+            },
+        })
     }
 }
 
@@ -220,15 +353,6 @@ mod tests {
 
     fn kp() -> crate::crypto::StaticKeyProvider {
         crate::crypto::StaticKeyProvider::new([7u8; 32], 1)
-    }
-
-    /// A migrated in-memory pool for `build` (which now reads fidelity rows).
-    async fn pool() -> sqlx::SqlitePool {
-        let p = crate::db::init_pool("sqlite::memory:")
-            .await
-            .expect("init_pool");
-        crate::db::run_migrate(&p).await.expect("migrate");
-        p
     }
 
     fn cfg_with_secrets() -> ConfigData {
@@ -281,15 +405,51 @@ mod tests {
         cfg
     }
 
+    /// A replication content with NO fidelity rows, for tests that only care
+    /// about the secret round-trip. Production never constructs one this way:
+    /// `ReplicationContent::load` (leader) and `hydrate` (replica) are the only
+    /// paths, and both supply real rows.
+    fn content(version: u64, cfg: ConfigData) -> ReplicationContent {
+        // Mirror the production invariant EXACTLY: `ReplicationContent::load`
+        // derives `cfg.provider_keys` FROM the fidelity rows, and `build` seals
+        // the keys from those same rows. A content whose cfg carried keys but
+        // whose fidelity did not would be a state production cannot produce.
+        let mut provider_keys = Vec::new();
+        for (provider_id, keys) in &cfg.provider_keys {
+            for (n, api_key) in keys.iter().enumerate() {
+                provider_keys.push(ProviderKey {
+                    id: format!("{provider_id}-k{n}"),
+                    provider_id: provider_id.clone(),
+                    api_key: api_key.clone(),
+                    created_at: String::new(),
+                });
+            }
+        }
+        ReplicationContent::from_hydrated(
+            version,
+            std::sync::Arc::new(cfg),
+            FidelityRows {
+                limit_roles: Vec::new(),
+                key_prefix_bindings: Vec::new(),
+                provider_keys,
+                tenant_token_hashes: Vec::new(),
+                provider_models: Vec::new(),
+                tenant_providers: Vec::new(),
+                tenant_models: Vec::new(),
+            },
+        )
+    }
+
     #[tokio::test]
     async fn build_strips_secrets_and_hydrate_restores() {
         let kp = kp();
         let original = cfg_with_secrets();
-        let p = pool().await;
 
-        let wire = SnapshotWire::build(7, original.clone(), &p, &kp)
+        let wire = SnapshotWire::build(&content(7, original.clone()), &kp)
             .await
             .expect("build");
+        assert_eq!(wire.wire_version, WIRE_VERSION, "emits the current version");
+        assert_eq!(wire.version, 7);
 
         // The serialized config must not carry plaintext secrets.
         assert!(wire.cfg.provider_keys.is_empty(), "provider_keys stripped");
@@ -308,17 +468,22 @@ mod tests {
         let wire2: SnapshotWire = serde_json::from_slice(&json).expect("deserialize");
 
         let restored = wire2.hydrate(&kp).expect("hydrate");
-        assert_eq!(restored.provider_keys["p1"], original.provider_keys["p1"]);
-        assert_eq!(restored.certs["acme.com"], original.certs["acme.com"]);
-        assert_eq!(restored.tenants_by_domain, original.tenants_by_domain);
-        assert_eq!(restored.providers, original.providers);
+        assert_eq!(restored.version, 7);
+        assert_eq!(
+            restored.cfg.provider_keys["p1"],
+            original.provider_keys["p1"]
+        );
+        assert_eq!(restored.cfg.certs["acme.com"], original.certs["acme.com"]);
+        assert_eq!(restored.cfg.tenants_by_domain, original.tenants_by_domain);
+        assert_eq!(restored.cfg.providers, original.providers);
+        // The wire's fidelity block round-trips (empty here — see `content`).
+        assert!(restored.fidelity.limit_roles.is_empty());
     }
 
     #[tokio::test]
     async fn hydrate_fails_closed_on_wrong_key() {
         let kp = kp();
-        let p = pool().await;
-        let wire = SnapshotWire::build(1, cfg_with_secrets(), &p, &kp)
+        let wire = SnapshotWire::build(&content(1, cfg_with_secrets()), &kp)
             .await
             .expect("build");
 
@@ -332,7 +497,6 @@ mod tests {
     #[tokio::test]
     async fn cert_without_key_roundtrips() {
         let kp = kp();
-        let p = pool().await;
         let mut cfg = ConfigData::default();
         cfg.certs.insert(
             "plain.com".into(),
@@ -344,11 +508,11 @@ mod tests {
                 cert_key_pem: None,
             },
         );
-        let wire = SnapshotWire::build(1, cfg.clone(), &p, &kp)
+        let wire = SnapshotWire::build(&content(1, cfg.clone()), &kp)
             .await
             .expect("build");
         assert!(wire.sealed_certs["plain.com"].key.is_none());
         let restored = wire.hydrate(&kp).expect("hydrate");
-        assert_eq!(restored.certs, cfg.certs);
+        assert_eq!(restored.cfg.certs, cfg.certs);
     }
 }

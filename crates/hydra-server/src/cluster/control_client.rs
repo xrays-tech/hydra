@@ -18,8 +18,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use hydra_core::config::ConfigData;
-
 use crate::admin::metrics;
 use crate::cluster::snapshot::SnapshotWire;
 use crate::crypto::KeyProvider;
@@ -276,11 +274,11 @@ impl ControlClient {
             }
             return Ok(()); // defensive: never apply a non-newer version
         }
-        let cfg: ConfigData = match wire.clone().hydrate(self.key_provider.as_ref()) {
-            Ok(c) => c,
+        let hydrated = match wire.clone().hydrate(self.key_provider.as_ref()) {
+            Ok(h) => h,
             Err(e) => return err(format!("snapshot hydrate failed (wrong master key?): {e}")),
         };
-        self.store.apply_snapshot(cfg, body.version);
+        self.store.apply_snapshot(hydrated);
         if let Some(hook) = &self.on_poll {
             hook(&PollOutcome::Applied(Box::new(wire.clone())));
         }

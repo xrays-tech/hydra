@@ -17,10 +17,10 @@ use hydra_core::model::{
     Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
 };
 use hydra_server::admin::{AdminService, AdminState};
-use hydra_server::cluster::control_client::{ControlClient, ControlClientConfig};
+use hydra_server::cluster::control_client::{ControlClient, ControlClientConfig, ControlResponse};
 use hydra_server::cluster::lease::{LeaderElection, MemoryLeaseStore};
 use hydra_server::cluster::replica;
-use hydra_server::cluster::snapshot::SnapshotWire;
+use hydra_server::cluster::snapshot::{SnapshotError, SnapshotWire, WIRE_VERSION};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
@@ -330,6 +330,296 @@ async fn edge_keeps_last_known_good_on_decrypt_failure() {
 }
 
 // ===========================================================================
+// T1 — the wire contract is FAIL-CLOSED IN BOTH DIRECTIONS (plan O1/O3/O4).
+//
+// The v2 wire moved the three fidelity row-sets the v1 reader REQUIRED
+// (`provider_models` / `tenant_providers` / `tenant_models`) INSIDE a nested
+// `fidelity` object, added `wire_version`, and changed the `sealed_provider_keys`
+// value shape. Two mixed-version windows must therefore be safe:
+//   * a NEW reader must reject an OLD wire (and keep last-known-good), and
+//   * an OLD reader must reject a NEW wire UNCONDITIONALLY — if it did not, the
+//     old reader would ignore the new fields and silently execute the G1 data
+//     destruction (wipe the fidelity tables and rebuild them from the
+//     ENABLED-only `cfg`).
+//
+// The unconditional part is what these tests pin: v1 of the plan claimed the
+// change to `sealed_provider_keys`' value type was the guard, but that fails
+// only when the map is NON-EMPTY. The empty-payload case is covered below.
+// ===========================================================================
+
+/// A v1-shaped reader: exactly the pre-T1 `SnapshotWire`, WITHOUT
+/// `deny_unknown_fields` (v1 had none — that is what makes the old reader
+/// silently tolerant of the new fields).
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct LegacyReaderWire {
+    version: u64,
+    cfg: ConfigData,
+    sealed_provider_keys: std::collections::HashMap<String, Vec<LegacySealedDto>>,
+    sealed_certs: std::collections::HashMap<String, serde_json::Value>,
+    provider_models: Vec<serde_json::Value>,
+    tenant_providers: Vec<serde_json::Value>,
+    tenant_models: Vec<serde_json::Value>,
+}
+
+/// v1's per-key payload: `{ciphertext, nonce, key_version}` — no identity.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct LegacySealedDto {
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    key_version: u32,
+}
+
+/// Serve ONE fixed JSON body for every request, over a raw socket.
+///
+/// `ControlClient` is only constructible with a URL, and the point of this test
+/// is the PARSER — so the peer is a stub that emits v1 bytes, not a v2 leader.
+fn start_json_stub(json: String) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let port = listener.local_addr().expect("stub local_addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Drain the request head so the client sees a complete exchange.
+            let mut buf = [0u8; 8192];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            let _ = std::io::Write::flush(&mut stream);
+        }
+    });
+    port
+}
+
+/// The v1 wire as JSON: fidelity rows at the TOP LEVEL, no `wire_version`, and
+/// the old `sealed_provider_keys` value shape (identity-less blobs).
+fn legacy_wire_json(version: u64) -> String {
+    serde_json::json!({
+        "version": version,
+        "snapshot": {
+            "version": version,
+            "cfg": ConfigData::default(),
+            "sealed_provider_keys": {},
+            "sealed_certs": {},
+            "provider_models": [],
+            "tenant_providers": [],
+            "tenant_models": [],
+        }
+    })
+    .to_string()
+}
+
+/// (1) An OLD wire must not be accepted by the NEW reader: `ControlResponse`
+/// fails to deserialize (missing `wire_version` / `fidelity`), the poll surfaces
+/// an error, and the edge keeps its last-known-good snapshot untouched.
+#[tokio::test]
+async fn old_wire_is_rejected_and_last_known_good_is_kept() {
+    // A genuinely non-empty last-known-good: the edge already holds the
+    // leader's config (as if it had synced before the leader was upgraded).
+    let (leader_pool, leader_store, _port) = leader().await;
+    seed_and_reload(&leader_pool, &leader_store).await;
+    let kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let good: ConfigData = leader_store.snapshot().as_ref().clone();
+    assert!(!good.providers.is_empty(), "the fixture is non-empty");
+
+    let legacy = legacy_wire_json(leader_store.version() + 1);
+    assert!(
+        serde_json::from_str::<ControlResponse>(&legacy).is_err(),
+        "the new reader must reject the v1 wire shape outright"
+    );
+
+    let edge_store = ConfigStore::from_snapshot(good.clone(), kp.clone());
+    let outcomes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = outcomes.clone();
+    let hook: hydra_server::cluster::control_client::PollHook =
+        Arc::new(move |o| sink.lock().expect("hook mutex").push(format!("{o:?}")));
+
+    let port = start_json_stub(legacy);
+    let client = ControlClient::new(
+        ControlClientConfig {
+            url: format!("http://127.0.0.1:{port}"),
+            token: CLUSTER_TOKEN.to_string(),
+            poll_interval: Duration::from_millis(50),
+        },
+        edge_store.clone(),
+        kp.clone(),
+        Some(hook),
+    );
+
+    let res = client.poll_once().await;
+    assert!(res.is_err(), "a v1 wire must fail the poll: {res:?}");
+    assert!(
+        outcomes.lock().expect("hook mutex")[0].contains("Error"),
+        "the poll hook must report `PollOutcome::Error`, got {:?}",
+        outcomes.lock().expect("hook mutex")
+    );
+    assert_eq!(
+        edge_store.snapshot().as_ref(),
+        &good,
+        "the edge keeps its last-known-good config"
+    );
+    assert_eq!(
+        edge_store.version(),
+        0,
+        "and its watermark never advanced from a rejected payload"
+    );
+}
+
+/// (2) A newer/unknown `wire_version` is rejected by the version check, and that
+/// check is the ONLY reachable path to `SnapshotError::WireVersion` (a v1 wire
+/// cannot even deserialize into `SnapshotWire`).
+#[tokio::test]
+async fn unknown_wire_version_is_rejected() {
+    let pool = common::setup_pool().await;
+    let kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let store = ConfigStore::load(pool.clone(), kp.clone())
+        .await
+        .expect("load");
+    let content = store.replication().as_deref().cloned().expect("content");
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build");
+
+    let mut json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&wire).expect("ser")).expect("json");
+    assert_eq!(json["wire_version"], WIRE_VERSION, "the wire is stamped");
+    json["wire_version"] = serde_json::json!(3);
+
+    let future: SnapshotWire =
+        serde_json::from_value(json.clone()).expect("a same-shape wire still deserializes");
+    match future.hydrate(kp.as_ref()) {
+        Ok(_) => panic!("hydrate must reject an unknown wire_version"),
+        Err(SnapshotError::WireVersion { found, expected }) => {
+            assert_eq!(found, 3, "the reader reports what it FOUND");
+            assert_eq!(expected, WIRE_VERSION, "and what it supports");
+        }
+        Err(other) => panic!("expected SnapshotError::WireVersion, got {other:?}"),
+    }
+
+    // The version field must stay REQUIRED: `#[serde(default)]` would make a
+    // missing version look like a valid one and re-open the "new reader accepts
+    // an old wire" direction — i.e. put the G1 data loss back.
+    let mut missing = json;
+    missing
+        .as_object_mut()
+        .expect("object")
+        .remove("wire_version");
+    assert!(
+        serde_json::from_value::<SnapshotWire>(missing).is_err(),
+        "`wire_version` must NOT have a serde default"
+    );
+}
+
+/// (3) An OLD reader must reject a NEW wire UNCONDITIONALLY — including the
+/// empty-payload case that v1's acceptance text used to miss. The failure is
+/// `missing field provider_models`: the field the old reader required is now
+/// nested inside `fidelity`, so no payload shape can satisfy both readers.
+#[tokio::test]
+async fn old_reader_rejects_the_new_wire_unconditionally() {
+    let kp: Arc<dyn KeyProvider> = Arc::new(kp());
+
+    // (a) EMPTY payload — the loophole v1 relied on: with the old
+    // `sealed_provider_keys` shape match skipped, only the moved fields can
+    // fail, so this asserts they DO.
+    let empty_pool = common::setup_pool().await;
+    let empty_store = ConfigStore::load(empty_pool.clone(), kp.clone())
+        .await
+        .expect("load");
+    let empty_content = empty_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("content");
+    let empty_wire = SnapshotWire::build(&empty_content, kp.as_ref())
+        .await
+        .expect("build");
+    assert!(
+        empty_wire.sealed_provider_keys.is_empty(),
+        "fixture: no sealed provider keys"
+    );
+    let empty_json = serde_json::to_string(&empty_wire).expect("ser");
+    let err = serde_json::from_str::<LegacyReaderWire>(&empty_json)
+        .expect_err("an old reader must NOT accept an empty-payload v2 wire");
+    assert!(
+        err.to_string().contains("provider_models"),
+        "the old reader must fail on the MOVED field, got: {err}"
+    );
+
+    // (b) POPULATED config with an EMPTY key map — the exact input v1's
+    // acceptance text failed to cover, and the dangerous one: the old reader
+    // would otherwise proceed to wipe the replica's fidelity tables and rebuild
+    // them from the ENABLED-only `cfg` (G1). Providers/tenants/models are
+    // present, so `fidelity` carries real rows while `sealed_provider_keys`
+    // stays `{}`.
+    let (leader_pool, leader_store, _port) = leader().await;
+    seed_and_reload(&leader_pool, &leader_store).await;
+    repo::delete_provider_key(&leader_pool, "k1")
+        .await
+        .expect("drop the only provider key");
+    leader_store.reload_all().await.expect("reload");
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("content");
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build");
+    assert!(
+        wire.sealed_provider_keys.is_empty(),
+        "fixture: the key map is empty on purpose"
+    );
+    assert!(
+        !wire.fidelity.provider_models.is_empty(),
+        "fixture: ...while the moved fidelity rows are NOT"
+    );
+    let json = serde_json::to_string(&wire).expect("ser");
+    assert!(
+        json.contains("fidelity"),
+        "fixture: the rows really are nested under `fidelity`"
+    );
+    let err = serde_json::from_str::<LegacyReaderWire>(&json)
+        .expect_err("an old reader must NOT accept an empty-key v2 wire");
+    assert!(
+        err.to_string().contains("provider_models"),
+        "the old reader must fail on the MOVED field, got: {err}"
+    );
+
+    // (c) WITH provider keys the old reader is rejected even earlier, by the
+    // changed per-key shape (`LegacySealedDto` wants `ciphertext`, the v2 shape
+    // nests it under `sealed`). Two independent guards, either one is fatal —
+    // asserted so a future refactor cannot quietly remove both.
+    let (key_pool, key_store, _port) = leader().await;
+    seed_and_reload(&key_pool, &key_store).await;
+    let key_content = key_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("content");
+    let key_wire = SnapshotWire::build(&key_content, kp.as_ref())
+        .await
+        .expect("build");
+    assert!(
+        !key_wire.sealed_provider_keys.is_empty(),
+        "fixture: sealed provider keys present"
+    );
+    let key_json = serde_json::to_string(&key_wire).expect("ser");
+    let err = serde_json::from_str::<LegacyReaderWire>(&key_json)
+        .expect_err("an old reader must NOT accept a populated v2 wire");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("provider_models") || msg.contains("ciphertext"),
+        "the rejection must come from one of the two structural changes, got: {msg}"
+    );
+}
+
+// ===========================================================================
 // P2 — leader election & standby replica
 // ===========================================================================
 
@@ -342,14 +632,38 @@ async fn standby_materializes_replica() {
     seed_and_reload(&leader_pool, &leader_store).await;
 
     let kp: Arc<dyn KeyProvider> = Arc::new(kp());
-    let wire = SnapshotWire::build(
-        leader_store.version(),
-        hydra_core::config::ConfigData::clone(&leader_store.snapshot()),
-        &leader_pool,
-        kp.as_ref(),
-    )
-    .await
-    .expect("build wire");
+    // A tenant access-token HASH. It lives in no `ConfigData` field, and before
+    // T1 the wire carried no token hashes at all — a promoted replica answered
+    // `has_access_token: false` and 401'd every `/auth/cache/invalidate`. Set it
+    // BEFORE the wire is built.
+    let token_hash = "5f4dcc3b5aa765d61d8327deb882cf99";
+    repo::set_tenant_access_token_hash(&leader_pool, "t1", Some(token_hash))
+        .await
+        .expect("set token hash");
+    leader_store.reload_all().await.expect("reload");
+
+    // The wire is built from the leader's own replication content: version and
+    // payload come from ONE atomic read, so they cannot drift.
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("the leader has replication content");
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build wire");
+    assert_eq!(
+        content.fidelity().tenant_token_hashes,
+        vec![("t1".to_string(), token_hash.to_string())],
+        "the leader's replication content carries the token hash"
+    );
+    // Sealed on the wire (plan O25): the hash must not appear as plaintext JSON,
+    // or the control channel would leak a bearer-equivalent secret.
+    let wire_json = serde_json::to_string(&wire).expect("serialize wire");
+    assert!(
+        !wire_json.contains(token_hash),
+        "the access-token hash must be SEALED on the wire, not plaintext"
+    );
 
     let replica_pool = common::setup_pool().await;
     replica::materialize(&replica_pool, kp.as_ref(), &wire)
@@ -388,6 +702,23 @@ async fn standby_materializes_replica() {
             .expect("version"),
         Some(leader_store.version()),
         "promoted replica continues the version sequence"
+    );
+
+    // §7-7: the replica can answer `has_access_token` (and serve token-cache
+    // invalidation) without a 401 — the hash is rebuilt, not re-hashed from a
+    // token the replica never sees.
+    assert!(
+        repo::tenant_has_access_token(&replica_pool, "t1")
+            .await
+            .expect("has access token"),
+        "the replica must carry the tenant's access-token hash"
+    );
+    assert_eq!(
+        repo::list_tenant_access_token_hashes(&replica_pool)
+            .await
+            .expect("hashes"),
+        vec![("t1".to_string(), token_hash.to_string())],
+        "byte-identical hash, not a re-derived one"
     );
 }
 
@@ -801,14 +1132,14 @@ async fn freshness_gate_needs_a_materialized_replica() {
     let version = leader_store.version();
     assert!(version >= 1, "the leader must have a real config version");
 
-    let wire = SnapshotWire::build(
-        version,
-        ConfigData::clone(&leader_store.snapshot()),
-        &leader_pool,
-        sealing_kp.as_ref(),
-    )
-    .await
-    .expect("build wire");
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("the leader has replication content");
+    let wire = SnapshotWire::build(&content, sealing_kp.as_ref())
+        .await
+        .expect("build wire");
 
     // --- (a) the standby CANNOT open the sealed snapshot (wrong master key):
     //         materialization fails, so the replica stays empty.
@@ -820,7 +1151,10 @@ async fn freshness_gate_needs_a_materialized_replica() {
     let wrong_kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([9u8; 32], 1));
     let replica_pool = common::setup_pool().await;
     let standby_store = ConfigStore::from_snapshot(ConfigData::default(), wrong_kp.clone());
-    standby_store.apply_snapshot(ConfigData::default(), version);
+    // The store adopts the leader's version WITHOUT the content being usable
+    // (the sealed snapshot cannot be opened with this key) — exactly the state
+    // that must not open the gate.
+    standby_store.apply_snapshot(common::hydrated(version, ConfigData::default()));
     let (gate, calls) = gate_recorder();
     let hook = replica::gate_hook(
         Arc::new(replica::MaterializationGuard::new()),
@@ -858,7 +1192,11 @@ async fn freshness_gate_needs_a_materialized_replica() {
     //         gate opens; the following UpToDate poll keeps it open.
     let replica_pool2 = common::setup_pool().await;
     let standby_store2 = ConfigStore::from_snapshot(ConfigData::default(), sealing_kp.clone());
-    standby_store2.apply_snapshot(ConfigData::default(), version);
+    standby_store2.apply_snapshot(
+        wire.clone()
+            .hydrate(sealing_kp.as_ref())
+            .expect("hydrate with the right key"),
+    );
     let (gate2, calls2) = gate_recorder();
     let hook2 = replica::gate_hook(
         Arc::new(replica::MaterializationGuard::new()),
@@ -901,14 +1239,14 @@ async fn a_transient_materialization_failure_heals_on_the_next_poll() {
     seed_and_reload(&leader_pool, &leader_store).await;
     let version = leader_store.version();
 
-    let wire = SnapshotWire::build(
-        version,
-        ConfigData::clone(&leader_store.snapshot()),
-        &leader_pool,
-        kp.as_ref(),
-    )
-    .await
-    .expect("build wire");
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("the leader has replication content");
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build wire");
 
     // The replica's DB cannot commit the version marker yet (a REAL SQLite
     // trigger, no mock): the rebuild fails, so the replica stays empty.
@@ -922,7 +1260,7 @@ async fn a_transient_materialization_failure_heals_on_the_next_poll() {
     .expect("install trigger");
 
     let standby_store = ConfigStore::from_snapshot(ConfigData::default(), kp.clone());
-    standby_store.apply_snapshot(ConfigData::default(), version);
+    standby_store.apply_snapshot(wire.clone().hydrate(kp.as_ref()).expect("hydrate the wire"));
     let (gate, calls) = gate_recorder();
     let hook = replica::gate_hook(
         Arc::new(replica::MaterializationGuard::new()),

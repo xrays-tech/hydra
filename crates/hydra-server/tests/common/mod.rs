@@ -97,3 +97,27 @@ pub fn ephemeral_port() -> u16 {
     }
     panic!("no free test port in the allocated block");
 }
+
+/// A hydrated wire with NO fidelity rows, for tests that only exercise the
+/// config swap / version adoption. Production never builds one this way: the
+/// leader uses `ReplicationContent::load` and a replica uses `hydrate` on a real
+/// wire (which supplies both).
+#[allow(dead_code)]
+pub fn hydrated(
+    version: u64,
+    cfg: hydra_core::config::ConfigData,
+) -> hydra_server::cluster::snapshot::HydratedWire {
+    hydra_server::cluster::snapshot::HydratedWire {
+        version,
+        cfg,
+        fidelity: hydra_server::cluster::content::FidelityRows {
+            limit_roles: Vec::new(),
+            key_prefix_bindings: Vec::new(),
+            provider_keys: Vec::new(),
+            tenant_token_hashes: Vec::new(),
+            provider_models: Vec::new(),
+            tenant_providers: Vec::new(),
+            tenant_models: Vec::new(),
+        },
+    }
+}

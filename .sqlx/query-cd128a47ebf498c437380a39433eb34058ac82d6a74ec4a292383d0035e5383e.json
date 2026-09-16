@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id as \"id!\", name, matching_key, matching_model, matching_tenant,\n                  matching_provider, limit_count, limit_token, window, enabled, created_at\n           FROM limit_role ORDER BY created_at",
+  "query": "SELECT id as \"id!\", name, matching_key, matching_model, matching_tenant,\n                  matching_provider, limit_count, limit_token, window, enabled, created_at\n           FROM limit_role ORDER BY created_at, id",
   "describe": {
     "columns": [
       {
@@ -76,5 +76,5 @@
       false
     ]
   },
-  "hash": "59c02e25cc0579715fdcbaefe353cb00e318cd9662ee87e192921d589d944eb8"
+  "hash": "cd128a47ebf498c437380a39433eb34058ac82d6a74ec4a292383d0035e5383e"
 }

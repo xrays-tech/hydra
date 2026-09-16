@@ -43,7 +43,9 @@ pub async fn materialize(
             return Ok(());
         }
     }
-    let cfg = wire.clone().hydrate(kp)?;
+    // `hydrate` verifies the wire version and unseals BOTH the config and the
+    // fidelity rows, so "unsealing" and "what to rebuild" are one decision.
+    let hydrated = wire.clone().hydrate(kp)?;
     // Content and version marker commit together (B4): a marker written
     // afterwards could be lost on its own, leaving the replica at one version's
     // content with another version's marker — which the freshness gate reads as
@@ -51,11 +53,9 @@ pub async fn materialize(
     db::restore_config(
         pool,
         kp,
-        &cfg,
-        &wire.provider_models,
-        &wire.tenant_providers,
-        &wire.tenant_models,
-        wire.version,
+        &hydrated.cfg,
+        &hydrated.fidelity,
+        hydrated.version,
     )
     .await?;
     Ok(())
@@ -354,7 +354,7 @@ mod tests {
 
     use hydra_core::config::ConfigData;
 
-    use crate::cluster::snapshot::SealedDto;
+    use crate::cluster::snapshot::{SealedDto, SealedProviderKeyDto};
 
     async fn pool() -> sqlx::SqlitePool {
         let p = crate::db::init_pool("sqlite::memory:")
@@ -367,13 +367,19 @@ mod tests {
     /// A minimal snapshot wire (no secrets / no fidelity rows) at `version`.
     fn wire(version: u64) -> SnapshotWire {
         SnapshotWire {
+            wire_version: crate::cluster::snapshot::WIRE_VERSION,
             version,
             cfg: ConfigData::default(),
             sealed_provider_keys: HashMap::new(),
             sealed_certs: HashMap::new(),
-            provider_models: Vec::new(),
-            tenant_providers: Vec::new(),
-            tenant_models: Vec::new(),
+            fidelity: crate::cluster::snapshot::FidelityWireRows {
+                limit_roles: Vec::new(),
+                key_prefix_bindings: Vec::new(),
+                tenant_token_hashes: Vec::new(),
+                provider_models: Vec::new(),
+                tenant_providers: Vec::new(),
+                tenant_models: Vec::new(),
+            },
         }
     }
 
@@ -445,13 +451,19 @@ mod tests {
             },
         );
         let wire = SnapshotWire {
+            wire_version: crate::cluster::snapshot::WIRE_VERSION,
             version: 7,
             cfg,
             sealed_provider_keys: HashMap::new(),
             sealed_certs: HashMap::new(),
-            provider_models: Vec::new(),
-            tenant_providers: Vec::new(),
-            tenant_models: Vec::new(),
+            fidelity: crate::cluster::snapshot::FidelityWireRows {
+                limit_roles: Vec::new(),
+                key_prefix_bindings: Vec::new(),
+                tenant_token_hashes: Vec::new(),
+                provider_models: Vec::new(),
+                tenant_providers: Vec::new(),
+                tenant_models: Vec::new(),
+            },
         };
 
         let err = materialize(&pool, kp.as_ref(), &wire)
@@ -577,7 +589,11 @@ mod tests {
 
         // A snapshot sealed under one master key; the replica holds another
         // → hydrate fails (fail-closed) → materialize errors.
-        let sealed = SealedDto::from(&sealer.seal(b"sk-test").expect("seal"));
+        let sealed = SealedProviderKeyDto {
+            id: "k1".into(),
+            created_at: String::new(),
+            sealed: SealedDto::from(&sealer.seal(b"sk-test").expect("seal")),
+        };
         let mut w = wire(3);
         w.sealed_provider_keys.insert("p1".into(), vec![sealed]);
 

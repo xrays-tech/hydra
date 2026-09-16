@@ -118,7 +118,7 @@ async fn store_reload_clears_swrr() {
     let pool = common::setup_pool().await;
     seed_basic(&pool).await;
 
-    let store = ConfigStore::load(pool, kp()).await.expect("load");
+    let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
 
     // Inject SWRR state as if requests had been served.
     store.swrr().insert(
@@ -132,10 +132,22 @@ async fn store_reload_clears_swrr() {
         .insert(("t1".into(), "other".into()), SwrrState::default());
     assert_eq!(store.swrr().len(), 2, "precondition: two swrr entries");
 
-    store.reload_all().await.expect("reload");
+    // Make a REAL change before reloading. `swrr.clear()` is part of the
+    // "content changed" branch: an unchanged reload keeps the routing cache
+    // (there is nothing to invalidate). Without this the test would assert that
+    // a no-op reload clears SWRR — the opposite of the new contract (plan T6
+    // step 7: make a real change, do NOT move `swrr.clear()` out of the branch).
+    repo::insert_provider(&pool, &provider("p-extra", "extra"))
+        .await
+        .expect("seed a second provider");
+
+    assert!(
+        store.reload_all().await.expect("reload"),
+        "a real DB change must advance the replication content"
+    );
     assert!(
         store.swrr().is_empty(),
-        "swrr must be cleared on successful reload"
+        "swrr must be cleared when the reload actually changed the content"
     );
 }
 
