@@ -57,6 +57,13 @@ pub fn system_clock() -> Clock {
 /// resident in memory (design §16.4).
 pub struct AuthCache {
     map: DashMap<(String, [u8; 32]), AuthEntry>,
+    /// Invalidation counter (N1). Every invalidation bumps it, and
+    /// [`Self::set_if_unchanged`] refuses to store a verdict whose epoch moved
+    /// while it was being resolved — otherwise an auth response that was
+    /// already in flight when the key was revoked would write the
+    /// pre-revocation verdict back into the L1/L2 and silently undo the
+    /// revocation for the whole TTL.
+    epoch: std::sync::atomic::AtomicU64,
     allow_ttl: Duration,
     deny_ttl: Duration,
     now: Clock,
@@ -82,6 +89,7 @@ impl AuthCache {
     pub fn with_clock(allow_ttl: Duration, deny_ttl: Duration, now: Clock) -> Self {
         Self {
             map: DashMap::new(),
+            epoch: std::sync::atomic::AtomicU64::new(0),
             allow_ttl,
             deny_ttl,
             now,
@@ -96,6 +104,41 @@ impl AuthCache {
     pub fn with_l2(mut self, l2: Arc<crate::redis::auth_cache::RedisAuthL2>) -> Self {
         self.l2 = Some(l2);
         self
+    }
+
+    /// The current invalidation epoch (N1): sample it before resolving a
+    /// verdict upstream, then hand it to [`Self::set_if_unchanged`].
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Store a verdict obtained from the tenant auth service, but ONLY if no
+    /// invalidation landed since `epoch_before` was sampled (N1).
+    ///
+    /// An invalidation that arrives while the upstream call is in flight has
+    /// already dropped the L1/L2 entry; writing this pre-invalidation verdict
+    /// afterwards would resurrect it. The caller still returns the verdict for
+    /// THIS request (it was resolved legitimately); it is simply not cached, so
+    /// the next request re-resolves against the tenant auth service. Returns
+    /// whether the verdict was cached.
+    pub async fn set_if_unchanged(
+        &self,
+        epoch_before: u64,
+        tenant_id: &str,
+        api_key: &str,
+        allowed: bool,
+        ttl: Duration,
+    ) -> bool {
+        if self.epoch() != epoch_before {
+            debug!(
+                tenant = %tenant_id,
+                "verdict not cached: the cache was invalidated while it was being resolved"
+            );
+            return false;
+        }
+        self.set(tenant_id, api_key, allowed, ttl).await;
+        true
     }
 
     /// Default allow TTL (design §11.5; default 5 min).
@@ -176,6 +219,7 @@ impl AuthCache {
     /// Force-invalidate specific api-keys for a tenant (design §11.7).
     /// Returns the count actually removed; missing keys are ignored.
     pub async fn invalidate(&self, tenant_id: &str, api_keys: &[String]) -> usize {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let mut removed = 0;
         for key in api_keys {
             let hash = sha256_hex(key.as_bytes());
@@ -196,6 +240,7 @@ impl AuthCache {
     /// hashed, so the SAME hex addresses the L2 (no re-hash). Returns the
     /// count removed from L1; missing / malformed digests are ignored.
     pub async fn invalidate_hashes(&self, tenant_id: &str, keyhashes: &[String]) -> usize {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let mut removed = 0;
         for h in keyhashes {
             let Some(hash) = hex_to_bytes32(h) else {
@@ -216,6 +261,7 @@ impl AuthCache {
     /// Force-invalidate ALL entries for a tenant (design §11.7). Returns the
     /// count removed.
     pub async fn invalidate_tenant(&self, tenant_id: &str) -> usize {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let before = self.map.len();
         self.map.retain(|(tid, _), _| tid != tenant_id);
         #[cfg(feature = "cluster-redis")]
@@ -236,6 +282,7 @@ impl AuthCache {
     /// the tenant's effective allow TTL, which a tenant auth service can raise
     /// well beyond the 300 s default via `expires_in` (review B2).
     pub async fn clear_all(&self) -> usize {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let cleared = self.map.len();
         self.map.clear();
         #[cfg(feature = "cluster-redis")]
@@ -445,6 +492,13 @@ impl AuthChecker for HttpAuthChecker {
             }
 
             // (3) upstream POST (design §11.3) with the configured timeout.
+            //
+            // N1: sample the invalidation epoch BEFORE the round trip. An
+            // invalidation that lands while this request is being authorized
+            // (a slow tenant auth service is exactly what this cache exists to
+            // absorb) must not be undone by the verdict this request is about
+            // to receive — it is returned for THIS request but not cached.
+            let epoch_before = cache.epoch();
             let trace_id = generate_trace_id();
             let body = auth_request_body(&api_key_owned, &tenant_id);
             let send = client
@@ -512,7 +566,15 @@ impl AuthChecker for HttpAuthChecker {
                                 source: CacheSource::Miss,
                             };
                         }
-                        cache.set(&tenant_id, &api_key_owned, false, deny_ttl).await;
+                        cache
+                            .set_if_unchanged(
+                                epoch_before,
+                                &tenant_id,
+                                &api_key_owned,
+                                false,
+                                deny_ttl,
+                            )
+                            .await;
                         return AuthVerdict::Denied {
                             status: 401,
                             reason: "denied",
@@ -547,7 +609,13 @@ impl AuthChecker for HttpAuthChecker {
                         .map(Duration::from_secs)
                         .unwrap_or(ttl);
                     cache
-                        .set(&tenant_id, &api_key_owned, true, effective_ttl)
+                        .set_if_unchanged(
+                            epoch_before,
+                            &tenant_id,
+                            &api_key_owned,
+                            true,
+                            effective_ttl,
+                        )
                         .await;
                     decide(Verdict::Miss, 401, "denied") // → Allowed{Miss}
                 }
@@ -556,7 +624,9 @@ impl AuthChecker for HttpAuthChecker {
                     ttl,
                 } => {
                     // 401/403: cache the denial with the deny TTL (design §11.2).
-                    cache.set(&tenant_id, &api_key_owned, false, ttl).await;
+                    cache
+                        .set_if_unchanged(epoch_before, &tenant_id, &api_key_owned, false, ttl)
+                        .await;
                     AuthVerdict::Denied {
                         status: 401,
                         reason: "denied",

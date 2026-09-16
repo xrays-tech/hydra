@@ -997,3 +997,106 @@ async fn auth_upstream_2xx_nested_status_is_not_a_verdict() {
     );
     assert_eq!(checker.cache().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// REVIEW N1 (oracle) — an in-flight auth response must not undo an
+// invalidation.
+//
+// `check` calls `cache.set(...)` unconditionally after the upstream round trip,
+// with no record of what was invalidated meanwhile. A revocation that lands
+// while a request is being authorized (a slow tenant auth service — the exact
+// shape this cache exists to absorb) is therefore silently undone: the
+// pre-revocation verdict is written back into the L1 (and the Redis L2), and
+// the key keeps working for the whole TTL — which `expires_in` can raise far
+// beyond the 300 s default.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn an_inflight_allow_does_not_undo_a_revocation() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    // A SLOW allow: 300 ms is enough for an invalidation to land mid-flight.
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let checker = Arc::new(checker);
+
+    // Request 1 goes upstream and is still in flight…
+    let inflight = {
+        let tenant = tenant.clone();
+        let c = checker.clone();
+        tokio::spawn(async move { c.check(&tenant, "sk-revoked").await })
+    };
+
+    // …the tenant is revoked (欠费/封禁) while it is still in flight. Wait until
+    // the request has actually REACHED the auth server before invalidating —
+    // a fixed sleep would race the spawned task's first poll under load, and
+    // the invalidation would then land before the epoch was sampled.
+    for _ in 0..400 {
+        if !server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let dropped = checker
+        .cache()
+        .invalidate("t1", &["sk-revoked".to_string()])
+        .await;
+    assert_eq!(
+        dropped, 0,
+        "nothing was cached yet — the request is still in flight"
+    );
+
+    let verdict = inflight.await.expect("join");
+    assert_eq!(
+        verdict,
+        AuthVerdict::Allowed {
+            source: CacheSource::Miss
+        },
+        "the in-flight request still gets its verdict (it was resolved upstream)"
+    );
+
+    // The verdict must NOT have been cached: the next lookup has to re-resolve
+    // against the tenant auth service rather than reusing the pre-revocation
+    // answer.
+    assert_eq!(
+        checker.cache().check("t1", "sk-revoked").await,
+        hydra_core::auth::Verdict::Miss,
+        "an in-flight allow re-cached a verdict that was invalidated mid-flight"
+    );
+
+    // Control: with no invalidation, the same flow DOES cache (so the guard
+    // above is not just disabling the cache).
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(10))
+                .set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&server)
+        .await;
+    let v = checker.check(&tenant, "sk-fresh").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Allowed {
+            source: CacheSource::Miss
+        }
+    );
+    assert_eq!(
+        checker.cache().check("t1", "sk-fresh").await,
+        hydra_core::auth::Verdict::Hit(true),
+        "an uncontested verdict is still cached"
+    );
+}
