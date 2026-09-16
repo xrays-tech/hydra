@@ -3711,3 +3711,16 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 6 | `.sqlx/` | ✅ 本 Phase 唯一需要重生成的批次是 Batch 1（3 条 `ORDER BY`），其变更已在 Batch 1 提交内；Batch 2–4 新增代码只用运行时 `sqlx::query`，**无新增宏 SQL** ⇒ `git status --short .sqlx/` 为空 |
 
 **Phase A 门禁判据逐条**：① 以上全部 0 error / 0 failed ✅；② **T1、T6、T2、T3、T4 的新增用例"改前失败"留证** ✅（T1/T6 用"临时改回旧实现"实测 RED→GREEN；T2/T3 的缺陷是"路径不存在"故留静态可复算证据；T4 用"临时删掉租约门"实测 RED，失败输出里能看到备用节点真的吐出了含 `sealed_provider_keys` 的完整快照）；③ `.sqlx/` 变更已提交 ✅。
+
+### Phase B 前置核查（只读侦察，尚未改动任何 Phase B 文件）
+
+计划把 Phase B 的落地顺序定为 **T5 → T8 → T7**。开工前先核实计划正文里几处"纸面断言"是否与当前仓库一致（结果：全部一致，其中 P10 得到确认）：
+
+| 计划断言 | 实测 | 结论 |
+|---|---|---|
+| P10：`dev-admin-token` 只有 15 字节 < `MIN_ADMIN_TOKEN_LEN = 16` ⇒ 二进制**拒绝启动** | `tests/e2e/admin.spec.cjs:25`、`tests/e2e/lang.spec.cjs:13`、`tests/e2e/README.md:56/64/68` 均为 `dev-admin-token`；`admin/mod.rs:228` = `MIN_ADMIN_TOKEN_LEN: usize = 16` | ✅ 确认。T8 前**必须**先改成 `dev-admin-token-2026`（三处代码 + 文档全部），否则 `ui-e2e` job 永远起不来 |
+| e2e 资产已存在、缺的只是"谁来跑" | `tests/e2e/{admin.spec.cjs,lang.spec.cjs,seed-data.json,seed.sh,README.md,stats_autorefresh.cjs}` + `playwright.config.cjs`（`testDir: ./tests/e2e`、`workers: 1`、无 `webServer`，靠外部启动实例） | ✅ 确认，T8 只加 job 与两个 spec 的默认值同步 |
+| `tests/e2e/stats_autorefresh.cjs` 不被收集且**不得**改名 | 文件存在，且不在 `*.spec.cjs` 通配内；文件内 `require('playwright')` + 启动 HTTP server/Chromium | ✅ 确认 T8 的处置为**显式退役** |
+| T5 的 token 存储位置 | `admin-ui/app.js` 为无构建步骤的 plain JS（`include_dir!` 内嵌进二进制） | ✅ 改动无需构建，但**需要重启进程**才能看到（非 HMR） |
+
+> 另记录一条 Phase A 的独立复核（不属于任何 Task 的验收项，但决定 §7-7 的修复是否**真的**生效）：租户自助令牌的鉴权路径 `admin/handlers.rs::tenant_id_for_token` 是**每请求直接查库**（`list_tenant_access_token_hashes(pool)` 后常量时间比较），**没有**进程内缓存层 ⇒ `restore_config` 把哈希写回副本 DB 之后，提升的副本立即就能鉴权，不存在"要等 reload 才生效"的窗口。这一条是"哈希已落地"之外的第二个必要条件，此前只在验收里断言了前者。
