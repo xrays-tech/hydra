@@ -201,7 +201,10 @@ impl LeaderElection {
     /// Current state (for `/healthz/leader` and admin write gating).
     #[must_use]
     pub fn state(&self) -> ElectionState {
-        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether this node may act as the active leader RIGHT NOW (holds the
@@ -323,7 +326,10 @@ impl LeaderElection {
                 }
             }
         };
-        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     }
 }
 

@@ -805,13 +805,21 @@ async fn error_400_when_model_field_is_ambiguous() {
     //     guess. Both values are the whitelisted "gpt-4" — the ONLY reason for
     //     400 is the duplicate itself, not a routing failure.
     let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4","model":"gpt-4"}"#).await;
-    assert_eq!(resp.status(), 400, "duplicate top-level model key must be 400");
+    assert_eq!(
+        resp.status(),
+        400,
+        "duplicate top-level model key must be 400"
+    );
     let _ = resp.text().await;
 
     // (2) An escaped top-level key may alias "model" ({"\u006dodel":"a"} decodes
     //     to {"model":"a"}); it cannot be decoded zero-copy, so fail closed (400).
     let resp = send_one(&client, &url, r#"{"\u006dodel":"gpt-4","model":"gpt-4"}"#).await;
-    assert_eq!(resp.status(), 400, "escaped top-level model key must be 400");
+    assert_eq!(
+        resp.status(),
+        400,
+        "escaped top-level model key must be 400"
+    );
     let _ = resp.text().await;
 
     // The upstream must never be called for an ambiguous model.

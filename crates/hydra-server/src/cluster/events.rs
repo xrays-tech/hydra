@@ -122,9 +122,7 @@ impl InvalidationStream {
                     match k.as_str() {
                         "tenant" => tenant_id = Some(v),
                         // v=2: SHA-256 hex digests.
-                        "keyhashes" => {
-                            keyhashes = v.split(',').map(str::to_string).collect()
-                        }
+                        "keyhashes" => keyhashes = v.split(',').map(str::to_string).collect(),
                         // v=1 legacy: plaintext keys (replayed, hashed at apply).
                         "keys" => legacy_keys = v.split(',').map(str::to_string).collect(),
                         _ => {}
@@ -201,10 +199,7 @@ pub async fn apply_invalidation(
     let keyhashes: Vec<String> = if !inv.keyhashes.is_empty() {
         inv.keyhashes.clone()
     } else {
-        inv.legacy_keys
-            .iter()
-            .map(|k| sha256_hex_str(k))
-            .collect()
+        inv.legacy_keys.iter().map(|k| sha256_hex_str(k)).collect()
     };
     match (&inv.tenant_id, keyhashes.is_empty()) {
         (Some(tid), true) => cache.invalidate_tenant(tid).await,
@@ -288,11 +283,7 @@ pub fn spawn_invalidation_consumer(
 /// (via [`InvalidationStream::trim_and_maybe_bump`]) so every node re-hydrates
 /// its auth cache — a removed event may not have reached a lagging consumer,
 /// and a full local clear is the safe, idempotent response.
-pub fn spawn_trim_task(
-    stream: InvalidationStream,
-    maxlen: u64,
-    interval: std::time::Duration,
-) {
+pub fn spawn_trim_task(stream: InvalidationStream, maxlen: u64, interval: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // The first `tick()` completes immediately; drop it so the first trim
@@ -430,7 +421,10 @@ mod tests {
     async fn publish_carries_hashes_not_plaintext() {
         let s = InvalidationStream::new(pool_with_mock().await);
         let _id = s
-            .publish(Some("t1".into()), vec!["sk-secret-key".into(), "sk-b".into()])
+            .publish(
+                Some("t1".into()),
+                vec!["sk-secret-key".into(), "sk-b".into()],
+            )
             .await
             .expect("publish");
         let events = s.read_since("0", 10).await.expect("read");
@@ -478,7 +472,10 @@ mod tests {
         );
         let n = apply_invalidation(&cache, inv, &["t1".into()]).await;
         assert_eq!(n, 1, "the comma key was invalidated by its hash");
-        assert_eq!(cache.check("t1", "a,b").await, hydra_core::auth::Verdict::Miss);
+        assert_eq!(
+            cache.check("t1", "a,b").await,
+            hydra_core::auth::Verdict::Miss
+        );
     }
 
     #[tokio::test]
@@ -516,21 +513,31 @@ mod tests {
 
         // Equivalence: applying EITHER event clears the SAME cache entry.
         let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-        cache.set("t1", "sk-a", true, Duration::from_secs(300)).await;
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
         assert_eq!(
             apply_invalidation(&cache, inv_v2, &["t1".into()]).await,
             1,
             "v2 event invalidated the entry"
         );
-        assert_eq!(cache.check("t1", "sk-a").await, hydra_core::auth::Verdict::Miss);
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            hydra_core::auth::Verdict::Miss
+        );
         // Re-seed, apply the legacy event → the SAME entry is cleared (replay).
-        cache.set("t1", "sk-a", true, Duration::from_secs(300)).await;
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
         assert_eq!(
             apply_invalidation(&cache, inv_legacy, &["t1".into()]).await,
             1,
             "legacy event invalidated the SAME entry (stream replay)"
         );
-        assert_eq!(cache.check("t1", "sk-a").await, hydra_core::auth::Verdict::Miss);
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            hydra_core::auth::Verdict::Miss
+        );
     }
 
     #[test]
@@ -542,16 +549,20 @@ mod tests {
             c1.set("t1", "sk-a", true, Duration::from_secs(300)).await;
             let c2 = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
             c2.set("t1", "sk-a", true, Duration::from_secs(300)).await;
-            let via_hashes = c1
-                .invalidate_hashes("t1", &[sha256_hex_str("sk-a")])
-                .await;
+            let via_hashes = c1.invalidate_hashes("t1", &[sha256_hex_str("sk-a")]).await;
             let via_plain = c2.invalidate("t1", &["sk-a".to_string()]).await;
             assert_eq!(via_hashes, via_plain, "both remove exactly one entry");
             assert_eq!(via_plain, 1);
             assert_eq!(c1.len(), 0);
             assert_eq!(c2.len(), 0);
-            assert_eq!(c1.check("t1", "sk-a").await, hydra_core::auth::Verdict::Miss);
-            assert_eq!(c2.check("t1", "sk-a").await, hydra_core::auth::Verdict::Miss);
+            assert_eq!(
+                c1.check("t1", "sk-a").await,
+                hydra_core::auth::Verdict::Miss
+            );
+            assert_eq!(
+                c2.check("t1", "sk-a").await,
+                hydra_core::auth::Verdict::Miss
+            );
 
             // A foreign / unparseable digest is ignored (no panic, no false
             // removal).
@@ -602,7 +613,9 @@ mod tests {
             )
             .expect("checker"),
         );
-        auth.cache().set("t1", "sk-a", true, Duration::from_secs(300)).await;
+        auth.cache()
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
         assert_eq!(auth.cache().len(), 1, "seeded verdict before trim");
 
         // An empty store is fine: the (None, []) events are no-ops, so the
@@ -623,7 +636,7 @@ mod tests {
         // Wait for the consumer to observe the bump and clear the cache.
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if auth.cache().len() == 0 {
+                if auth.cache().is_empty() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -631,7 +644,11 @@ mod tests {
         })
         .await
         .expect("consumer did not clear the cache within 3s (bump not observed)");
-        assert_eq!(auth.cache().len(), 0, "consumer cleared the local cache on bump");
+        assert_eq!(
+            auth.cache().len(),
+            0,
+            "consumer cleared the local cache on bump"
+        );
         assert_eq!(
             stream.generation().await.expect("gen"),
             1,

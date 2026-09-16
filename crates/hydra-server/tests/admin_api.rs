@@ -1229,9 +1229,15 @@ async fn empty_body_delete_invalidates_all_local() {
 
     // Auth cache seeded with one entry per tenant.
     let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-    cache.set("t0", "sk-0", true, Duration::from_secs(300)).await;
-    cache.set("t1", "sk-1", true, Duration::from_secs(300)).await;
-    cache.set("t2", "sk-2", true, Duration::from_secs(300)).await;
+    cache
+        .set("t0", "sk-0", true, Duration::from_secs(300))
+        .await;
+    cache
+        .set("t1", "sk-1", true, Duration::from_secs(300))
+        .await;
+    cache
+        .set("t2", "sk-2", true, Duration::from_secs(300))
+        .await;
     assert_eq!(cache.len(), 3);
     let auth = Arc::new(HttpAuthChecker::new(cache, AuthConfig::default()).expect("checker"));
 
@@ -1254,7 +1260,14 @@ async fn empty_body_delete_invalidates_all_local() {
     let port = start_admin(state.clone());
 
     // Empty-body DELETE ⇒ invalidate everything (all tenants).
-    let r = req(port, reqwest::Method::DELETE, "/api/v1/auth/cache", Some(TOKEN), None).await;
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/auth/cache",
+        Some(TOKEN),
+        None,
+    )
+    .await;
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await.expect("json");
     assert_eq!(v["invalidated"], 3, "all 3 tenants' entries cleared: {v}");
@@ -1267,7 +1280,10 @@ async fn empty_body_delete_invalidates_all_local() {
     let ev = &events[0].1;
     assert_eq!(ev.tenant_id, None, "whole-cache event (None tenant)");
     assert!(ev.keyhashes.is_empty(), "whole-cache event (no keyhashes)");
-    assert!(ev.legacy_keys.is_empty(), "whole-cache event (no legacy keys)");
+    assert!(
+        ev.legacy_keys.is_empty(),
+        "whole-cache event (no legacy keys)"
+    );
 }
 
 // ===========================================================================

@@ -244,14 +244,16 @@ fn secrets_are_never_serialized_and_default_on_absence() {
         "api_key must never be serialized (got: {value})"
     );
     // A payload without the field deserializes with the default (empty string).
-    let de: ProviderKey =
-        serde_json::from_value(json!({
-            "id": "pk_01",
-            "provider_id": "p_01",
-            "created_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap();
-    assert_eq!(de.api_key, "", "absent api_key defaults to the empty string");
+    let de: ProviderKey = serde_json::from_value(json!({
+        "id": "pk_01",
+        "provider_id": "p_01",
+        "created_at": "2026-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    assert_eq!(
+        de.api_key, "",
+        "absent api_key defaults to the empty string"
+    );
     assert_eq!(de.id, "pk_01");
     assert_eq!(de.provider_id, "p_01");
 
@@ -269,13 +271,18 @@ fn secrets_are_never_serialized_and_default_on_absence() {
         "cert_key_pem must never be serialized (got: {value})"
     );
     // The public cert PEM is still serialized (only the private key is skipped).
-    assert!(value.get("cert_pem").is_some(), "cert_pem is public and must serialize");
+    assert!(
+        value.get("cert_pem").is_some(),
+        "cert_pem is public and must serialize"
+    );
     // A payload without the field deserializes with the default (None).
-    let de: CertMeta =
-        serde_json::from_value(json!({
-            "domain": "acme.com",
-            "cert_pem": "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
-        }))
-        .unwrap();
-    assert!(de.cert_key_pem.is_none(), "absent cert_key_pem defaults to None");
+    let de: CertMeta = serde_json::from_value(json!({
+        "domain": "acme.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
+    }))
+    .unwrap();
+    assert!(
+        de.cert_key_pem.is_none(),
+        "absent cert_key_pem defaults to None"
+    );
 }

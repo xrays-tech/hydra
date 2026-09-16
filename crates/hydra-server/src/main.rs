@@ -540,8 +540,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = if role
         == hydra_server::cluster::NodeRole::Leader
     {
-        let backend = redis_backend
-            .ok_or("cluster mode has a Redis backbone (checked above)")?;
+        let backend = redis_backend.ok_or("cluster mode has a Redis backbone (checked above)")?;
         let lease_ms = std::env::var("HYDRA_LEADER_LEASE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -568,8 +567,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
         let on_poll = {
             let election = election.clone();
-            let pool =
-                pool.clone().ok_or("leader mode has a SQLite pool (checked above)")?;
+            let pool = pool
+                .clone()
+                .ok_or("leader mode has a SQLite pool (checked above)")?;
             let key_provider = key_provider.clone();
             // F-4: monotonic out-of-order guard — a stale snapshot (version
             // <= the last claimed) is never materialized, so the replica can

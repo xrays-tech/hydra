@@ -96,12 +96,13 @@ impl EndpointUrl {
                 return None;
             }
             let after = &authority[close + 1..];
+            // `after` is either empty (default port) or `:port` — anything else
+            // is trailing junk the dialler could not use.
             let port = if after.is_empty() {
                 default_port(scheme)
-            } else if let Some(p) = after.strip_prefix(':') {
-                p.parse::<u16>().ok()?
             } else {
-                return None; // trailing junk after the bracket (not a `:port`)
+                let p = after.strip_prefix(':')?;
+                p.parse::<u16>().ok()?
             };
             (inner.to_string(), port)
         } else {

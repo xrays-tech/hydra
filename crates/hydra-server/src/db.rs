@@ -1296,9 +1296,7 @@ pub async fn restore_config(
         WipedTable::ProviderModel,
         WipedTable::Provider,
     ] {
-        sqlx::query(table.delete_stmt())
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(table.delete_stmt()).execute(&mut *tx).await?;
     }
 
     // Providers.

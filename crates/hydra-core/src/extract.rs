@@ -283,7 +283,10 @@ impl<'de> Visitor<'de> for ModelValueAnyVisitor {
         Ok(ModelValueAny::NotAString)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        while map.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+        while map
+            .next_entry::<de::IgnoredAny, de::IgnoredAny>()?
+            .is_some()
+        {}
         Ok(ModelValueAny::NotAString)
     }
 }
