@@ -3799,3 +3799,25 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 ### 顺序偏差（如实记录）
 
 计划写"Phase A 未过门禁，不得进入 Phase B"。实际执行中，Phase A 的**统一门禁命令块**已全绿后，我**并行**启动了 oracle 复审与 Phase B 的 T5 前端实现（文件完全不相交：T5 只动 `admin-ui/*`、`tests/e2e/*`）。审查者③在报告中据实标记了该偏差（工作树在其审查期间变脏）。T5 的验证（真实二进制 + 真实 Chromium，11 passed）与 Phase A 的复审因此**互不污染**，但这确实是对计划文字的顺序偏离，特此记录；后续 Phase B/C/D 将遵守"前一阶段门禁先过"。
+
+### Batch 5 记录（T5 会话持久化 / T8 CI 浏览器门禁 / T7 指标）
+
+| Task | 落地 | 证据 |
+|---|---|---|
+| **T5**（G5） | `sessionStorage["hydra-admin-token"]`（**故意不用 localStorage**：根凭证 + 明文 HTTP 的管理面）；视图/状态拆分（`showLoginView` 只画界面、`showLogin` 才清令牌 —— 这是"restore 之所以可能"的前提，v1 的实现在登录视图里清 token，而 `api()` 无 token 时不发请求 ⇒ 永远走失败分支）；`restoreSession()` 先置回候选令牌再校验 `/health`，被拒则 fail-closed（清键 + 保留登录视图 + 明确提示）；`onSessionInvalid()` 作为**唯一** 401 处理点，用**计数器** `suppress401` 而非布尔；手动输错**不**清除已存会话；i18n 补 2 键 ×4 语并改写"仅内存"帮助文案；文件头第 4 行同步 | e2e `T2.1c`/`T2.1d`；`lang.spec.cjs` 的旧断言（reload ⇒ 必须重现登录框）改为"reload 后仍在已登录态"；`check_i18n.js` = OK（332 en keys，4 语一致） |
+| **T8**（G8） | `.github/workflows/ci.yml` 新增 `ui-e2e` job（构建 → 起实例 → **带 Bearer 的就绪等待** → seed → Playwright/chromium）；P10：三处默认令牌改为 `dev-admin-token-2026`（旧的 15 字节 < `MIN_ADMIN_TOKEN_LEN = 16` ⇒ 二进制拒绝启动，job 永远到不了浏览器）；`stats_autorefresh.cjs` **显式退役**至 `scripts/`（它是"require 即启动 HTTP server + Chromium"的脚本，**不得**改名进采集目录），README 说明其覆盖将由 T9.5/T10.4 的正式用例取代 | 本地按 job 逐步复现：release build → 起实例 → 鉴权就绪 → seed → `npx playwright test` ⇒ **11 passed**（不设 `HYDRA_ADMIN_TOKEN` 以验证新默认值） |
+| **T7**（G7） | 新增 `hydra_listener_tenant_certs`（gauge）+ `record_listener_tenant_certs`；**在证书解析的同一处发布**（`tls::follow_snapshot` ⇒ 启动与每次快照变更都覆盖，避免"启动时发布"在热加载后永久失真）；`ops.md` 新增 §9.1 告警映射（**本仓库只提供指标，告警规则文件属运维仓库**），标签用真实的 `protocol`（不是 `transport`，否则运维会照错标签写出一条永不触发的告警）；不新增 `hydra_proxy_*` 别名（`hydra_listener_bound` 已是权威信号，同义指标会制造第二个所有者） | `tests/metrics.rs::tenant_cert_gauge_tracks_snapshot_changes`：驱动真实 follower → 写入证书 → reload → 断言渲染文本从 `hydra_listener_tenant_certs 0` 变为 `... 1`，并断言该序列以 `gauge` 类型注册（防"断言命中偶然子串"）；计划规定的三条 grep（≥3 处注册/使用点、无 `transport="tls"`、ops.md 正面命中）全部满足 |
+| 附带修好的一处真实脆弱点 | `tests/e2e/seed.sh` 此前用**调用者 CWD** 相对路径找 `seed-data.json` ⇒ 从scratch 目录运行的门禁会以"seed file not found"失败（本次实测踩到）。改为相对**脚本自身**目录解析（`$1` 覆盖仍然可用） | 门禁脚本从 scratch 目录运行 seed 现在成功 |
+
+**Phase B 统一门禁执行结果：`fail=0`**
+
+| 步骤 | 结果 |
+|---|---|
+| 1. lockfile / fmt / clippy(server) | ✅ dry-run "Locking 0 packages"；fmt clean；clippy **0 warning** |
+| 2. release build(server) + `hydra-core` 测试与依赖防火墙 | ✅ Finished；`hydra-core` 15 个 `test result: ok`；防火墙 CLEAN |
+| 3. server 测试 + 三特性 clippy/build/test | ✅ **27 套件 0 failed**；三特性 clippy 0 warning、release Finished、**累计 412 passed / 0 failed** |
+| 4. 脚本门禁 | ✅ `check_i18n.js` OK（332 keys / 4 locales）、`node --test` `# fail 0`、`ask_llm.test.sh` ALL PASSED |
+| 5. **真实浏览器腿** | ✅ 用**当前代码新构建**的二进制（脚本内先按 pid 杀旧实例并按 B5 断言新 PID 存活，避免"就绪循环被旧进程满足"）+ 真实 Chromium ⇒ **11 passed**（=`admin.spec.cjs` 10 + `lang.spec.cjs` 1，正是计划 §"Playwright 采集数"中 **Phase B 期望 11**） |
+
+**Phase B 门禁判据逐条**：全部 0 error / 0 failed ✅；Playwright **11 passed** ✅；T5 反证可见（`T2.1c` 证明刷新不再掉登录、`T2.1d` 证明登出不被刷新复活且陈旧票据 fail-closed）✅。
+> 门禁脚本按环境做了三处**仅本机**的重定向（CARGO_HOME、npm 缓存、Playwright 浏览器缓存），并把 npm 依赖装在 `.acceptance/e2e/` + `NODE_PATH` 指向它——**仓库不新增根 `package.json`**（UI 无构建步骤；CI 自己内联创建清单），`.acceptance/` 已在 `.gitignore` 内。

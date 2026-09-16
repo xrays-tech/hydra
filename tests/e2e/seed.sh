@@ -6,7 +6,12 @@ set -euo pipefail
 
 ADMIN="${HYDRA_ADMIN_ADDR:-127.0.0.1:8081}"
 TOKEN="${HYDRA_ADMIN_TOKEN:?HYDRA_ADMIN_TOKEN must be set}"
-SEED="${1:-tests/e2e/seed-data.json}"
+# Resolve the default data file NEXT TO THIS SCRIPT, not against the caller's
+# CWD: the suite and the CI job run it from the repo root, but a gate that has
+# `cd`-ed into a scratch directory (to keep its logs and SQLite file together)
+# used to fail with "seed file not found" for no visible reason.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEED="${1:-$HERE/seed-data.json}"
 
 [ -f "$SEED" ] || { echo "seed file not found: $SEED" >&2; exit 1; }
 
