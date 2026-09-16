@@ -3953,3 +3953,14 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | **开发中撞到的两个真实工具陷阱（已修 + 已记录）** | ① **`include_dir!` 不触发重建**：只改 `admin-ui/*` 后 `cargo build --release` 不重新编译，二进制里仍是**旧 UI** ⇒ 我的第一次反证因此跑在旧 UI 上、"验证了错的产物"。已新增 `crates/hydra-server/build.rs` 声明 `cargo:rerun-if-changed=../../admin-ui`，并实测"只改一个 CSS 注释也会触发重新编译"。② **旧实例仍占端口**：新进程 bind 失败退出，而就绪探测被**旧进程**满足 ⇒ 同样是在验证旧产物（与计划 B5 的警告同类）。两条都写进 `tests/e2e/README.md`，并给出"验证服务的 bundle 就是你构建的那个"的检查方法 |
 | 另一个自身缺陷（已修） | `hasText` 是**子串**匹配，而我把改名写成 `原name + "-renamed"` ⇒ 旧名字断言永远会命中新行。已改用互不包含的两个名字，并把这条坑写进 README |
 | 门禁 | `node --check` 通过；release 重建（含 build.rs 后的**正确**重建）后真实 Chromium 全量 **14 passed**（12 计划值 + T9.5b + T2.2b；**Phase D 门禁期望值应为 14**） |
+
+### Batch 14 — T10.3 进程级启动装配用例
+
+| 项 | 内容 |
+|---|---|
+| 新增 | `crates/hydra-server/tests/boot_listeners.rs`（**首行 `#![cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]`**，与 `tests/listener_topology.rs` 既有约定一致）；`listeners.rs` 模块文档补"同端口不同绑定地址不被静态检测"的已知限制 |
+| 用例 A | `HYDRA_LISTEN` 与 `HYDRA_TLS_LISTEN` **同址** ⇒ 进程**退出码非 0**，且合并输出含 `HYDRA_LISTEN and HYDRA_TLS_LISTEN both point at`。**stdout+stderr 合并缓冲**（O38）：`tracing` subscriber 未设 `.with_writer` ⇒ 默认写 **stdout**，只断言 stderr 会永远超时；照 `listener_topology.rs` 的 `spawn_capturing` 取合并缓冲 |
+| 用例 B | `HYDRA_TLS_LISTEN` 指向**已被外部占用**的端口（用一个仍在持有的 `TcpListener` 制造，而不是 bind 后释放） ⇒ 进程**仍在运行**、**明文入口照常服务**（真的发一个 HTTP 请求读回响应），且失败**可观测**：合并输出含真实日志文案 `could not bind the configured TLS listener`，**或** `/metrics` 含 `hydra_listener_misconfig_total{kind="tls_bind_failed"}`。**不**断言日志里出现 `tls_bind_failed`——那只是普罗米修斯标签名 |
+| 用例 C | `HYDRA_LISTEN=0.0.0.0:8080` + `HYDRA_TLS_LISTEN=127.0.0.1:8080` ⇒ 当前**不**被静态拒绝（纯字符串比较）。按要求写成**显式 `#[ignore]`** 的用例（断言"进程仍在运行"），并在 `listeners.rs` 文档说明：该配置在某些主机上其实是合法的，故不做更严的静态检查；由 `probe_bind` 与 Pingora 的 all-or-nothing 服务构建在**运行时**兜底 |
+| 性质说明（不夸大） | 这两条**验证的是既有行为**、不是新修的行为：`listeners.rs` 早有纯函数单测，而"进程真的 exit 1 / 真的降级"此前零覆盖（计划的 Why 亦如此表述）。因此本项**没有可注入的 RED**（没有改动生产行为），RED 判据不适用 |
+| 门禁 | fmt clean；clippy **0 warning**；`--features server` **30 套件 0 failed**（新增目标 2 passed + 1 ignored）；三特性同（下一步统一门禁复核） |

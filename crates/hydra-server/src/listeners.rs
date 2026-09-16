@@ -12,6 +12,19 @@
 //! healthy and `/healthz` `/readyz` stayed green.
 //! See `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`.
 //!
+//! ## KNOWN LIMITATION — same port, different bind addresses
+//!
+//! [`plan`] compares normalized address STRINGS, so `HYDRA_LISTEN=0.0.0.0:8080`
+//! together with `HYDRA_TLS_LISTEN=127.0.0.1:8080` is **not** rejected
+//! statically: the two spellings differ even though they overlap on
+//! `127.0.0.1:8080`. This is deliberate — the same port on different interfaces
+//! is a legitimate deployment on some hosts, so a stricter check would reject
+//! working configurations — and it is covered at runtime instead: [`probe_bind`]
+//! notices an unbindable address, and Pingora builds its services all-or-nothing,
+//! so a genuine conflict surfaces as a startup failure or as the documented
+//! TLS-bind degradation rather than as a half-configured process.
+//! Recorded (and asserted) in `tests/boot_listeners.rs`.
+//!
 //! ## Contract (dev-plan 「监听拓扑与启动约定」)
 //!
 //! 1. The topology is a **pure function of deployment config** — never of the
