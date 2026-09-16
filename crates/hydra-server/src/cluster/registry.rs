@@ -32,6 +32,12 @@ pub const HEARTBEAT_PREFIX: &str = "hydra:{node:hb}:";
 /// "Last seen" witness key prefix (suffix = node id). See the module docs for
 /// why this is not encoded in the hash value.
 pub const SEEN_PREFIX: &str = "hydra:{node:seen}:";
+/// Reaper "strike" key prefix (suffix = node id): a row already observed once in
+/// the `no heartbeat AND no witness` state. PERSISTENT on purpose — see
+/// [`NodeRegistry::sweep_stale`]: a TTL would silently re-arm the first-strike
+/// state, and the key is deleted as soon as the node shows any sign of life (or
+/// when the row is actually reaped).
+pub const STRIKE_PREFIX: &str = "hydra:{node:reap}:";
 
 /// A registered node's record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +103,7 @@ impl NodeRegistry {
     ///
     /// One entry point so a node whose `role` or `control_url` changed after
     /// boot cannot keep advertising the boot-time value while looking healthy:
-    /// the previous split (`register` once at startup, `refresh_heartbeat`
+    /// the previous split (register once at startup, heartbeat-only refresh
     /// every 20s) renewed only the heartbeat, so the hash row was written
     /// exactly once per process lifetime.
     ///
@@ -138,6 +144,7 @@ impl NodeRegistry {
         let _: i64 = self.pool.hdel(NODES_KEY, &self.node_id).await?;
         let _: i64 = self.pool.del(heartbeat_key(&self.node_id)).await?;
         let _: i64 = self.pool.del(seen_key(&self.node_id)).await?;
+        let _: i64 = self.pool.del(strike_key(&self.node_id)).await?;
         Ok(())
     }
 
@@ -154,10 +161,19 @@ impl NodeRegistry {
     /// row would remove the only forward pointer a standby has to the active
     /// writer (every admin write would then 503).
     ///
-    /// Rows written by a not-yet-upgraded node carry no witness key, so for
-    /// them the predicate reduces to "heartbeat absent" — the same condition
-    /// `leader_control_urls()` already uses to skip a node. That is what lets
-    /// the pre-existing backlog actually be cleaned after an upgrade.
+    /// A row with NO witness key — one written by a not-yet-upgraded node —
+    /// gets a STRIKE instead of being reaped outright. Such a node writes its
+    /// hash row exactly ONCE, at boot (its 20s loop only renewed the
+    /// heartbeat), so a row deleted while that process is alive can never come
+    /// back: the node stays invisible to `list_nodes`/`leader_control_urls`
+    /// forever, and if it holds the lease every standby admin write answers 503
+    /// permanently (forwarding is fail-closed with no static fallback). A single
+    /// heartbeat gap of ≥30s — a Redis blip, a paused host — would be enough.
+    /// The first sweep that sees "no heartbeat, no witness" therefore only
+    /// records a strike; the row is reaped only if the state is IDENTICAL on a
+    /// later sweep (≥60s of continuous silence, i.e. three heartbeat intervals),
+    /// and any evidence of life clears the strike. That still cleans the
+    /// historical backlog, one tick later.
     ///
     /// Returns the number of rows removed.
     pub async fn sweep_stale(&self) -> Result<usize, RedisError> {
@@ -169,22 +185,38 @@ impl NodeRegistry {
             if Some(node_id.as_str()) == holder.as_deref() {
                 continue; // the current lease holder is never reaped
             }
-            if self.node_alive(&node_id).await? {
-                continue; // live — never reap
+            // Evidence of life: a live heartbeat, or a witness key the node
+            // refreshed within the grace window. Either one clears any strike.
+            if self.node_alive(&node_id).await?
+                || self.pool.exists::<i64, _>(seen_key(&node_id)).await? > 0
+            {
+                let _: i64 = self.pool.del(strike_key(&node_id)).await?;
+                continue;
             }
-            let seen: i64 = self.pool.exists(seen_key(&node_id)).await?;
-            if seen == 0 {
-                doomed.push(node_id);
+            // No heartbeat and no witness. Strike once, reap on a repeat.
+            let struck: i64 = self.pool.exists(strike_key(&node_id)).await?;
+            if struck == 0 {
+                let _: Option<String> = self
+                    .pool
+                    .set(strike_key(&node_id), "1", None, None, false)
+                    .await?;
+                continue;
             }
+            doomed.push(node_id);
         }
 
         if doomed.is_empty() {
             return Ok(0);
         }
+        let removed = doomed.len();
         let refs: Vec<&str> = doomed.iter().map(String::as_str).collect();
         // One HDEL round trip for the whole batch.
         let _: i64 = self.pool.hdel(NODES_KEY, refs).await?;
-        Ok(doomed.len())
+        // The strikes go with the rows: a future registration starts clean.
+        let strikes: Vec<String> = doomed.iter().map(|id| strike_key(id)).collect();
+        let _: i64 = self.pool.del(strikes).await?;
+        // Report what was actually removed, not what we intended to remove.
+        Ok(removed)
     }
 
     /// The control URLs of LIVE nodes with `role == "leader"` (the poll
@@ -281,6 +313,11 @@ fn heartbeat_key(node_id: &str) -> String {
 /// The "last seen" witness key for a node id. Its TTL is the grace window.
 fn seen_key(node_id: &str) -> String {
     format!("{SEEN_PREFIX}{node_id}")
+}
+
+/// The reaper's strike key for a node id (see [`NodeRegistry::sweep_stale`]).
+fn strike_key(node_id: &str) -> String {
+    format!("{STRIKE_PREFIX}{node_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -475,10 +512,18 @@ mod tests {
             let _: i64 = pool.del(seen_key(id)).await.expect("del seen");
         }
 
+        // FIRST sweep only records a strike (see `sweep_stale`): a row with no
+        // witness key may belong to a live, not-yet-upgraded node whose
+        // heartbeat merely lapsed, and such a node can never rewrite it.
         assert_eq!(
-            reaper.sweep_stale().await.expect("sweep"),
+            reaper.sweep_stale().await.expect("first sweep"),
+            0,
+            "the first sweep only strikes — nothing is deleted yet"
+        );
+        assert_eq!(
+            reaper.sweep_stale().await.expect("second sweep"),
             1,
-            "exactly the dead non-holder row is reaped"
+            "the SECOND sweep reaps exactly the dead non-holder row"
         );
         let ids: Vec<String> = reaper
             .list_nodes()
@@ -501,10 +546,115 @@ mod tests {
         );
     }
 
+    /// (4b) THE B2 REGRESSION — a LIVE legacy node must survive a heartbeat blip.
+    ///
+    /// A not-yet-upgraded node writes its hash row exactly ONCE, at boot (its
+    /// 20s loop only renewed the heartbeat). So if the reaper deleted that row
+    /// while the process was alive — which one heartbeat gap of >=30s used to be
+    /// enough for — the node would stay invisible forever, and a lease-holding
+    /// node in that state makes EVERY standby admin write 503 permanently
+    /// (forwarding is fail-closed with no static fallback). The strike rule
+    /// exists for exactly this: silence must be observed twice, with no
+    /// heartbeat in between, before anything is deleted.
+    #[tokio::test]
+    async fn a_live_legacy_node_survives_a_heartbeat_blip() {
+        let pool = pool().await;
+        let reaper = NodeRegistry::new(
+            pool.clone(),
+            "node-self".into(),
+            NodeRole::Leader,
+            "http://self:8081".into(),
+        );
+        reaper.register(60, 120).await.expect("register self");
+
+        // A legacy row: hand-written, with a heartbeat but NO witness key.
+        let _: i64 = pool
+            .hset(NODES_KEY, ("node-legacy", "leader|http://legacy:8081"))
+            .await
+            .expect("hset");
+        let _: Option<String> = pool
+            .set(
+                heartbeat_key("node-legacy"),
+                "1",
+                Some(fred::types::Expiration::EX(60)),
+                None,
+                false,
+            )
+            .await
+            .expect("hb");
+
+        // The blip: its heartbeat is gone at sweep time (Redis was unreachable
+        // for >30s). One sweep must NOT delete it...
+        let _: i64 = pool
+            .del(heartbeat_key("node-legacy"))
+            .await
+            .expect("del hb");
+        assert_eq!(
+            reaper.sweep_stale().await.expect("sweep 1"),
+            0,
+            "a single observation of silence must never delete a row"
+        );
+        assert!(
+            reaper
+                .list_nodes()
+                .await
+                .expect("list")
+                .iter()
+                .any(|n| n.node_id == "node-legacy"),
+            "the legacy node is still registered after the blip"
+        );
+
+        // ...then it recovers: the heartbeat comes back and the strike is cleared.
+        let _: Option<String> = pool
+            .set(
+                heartbeat_key("node-legacy"),
+                "1",
+                Some(fred::types::Expiration::EX(60)),
+                None,
+                false,
+            )
+            .await
+            .expect("hb again");
+        assert_eq!(reaper.sweep_stale().await.expect("sweep 2"), 0);
+        let strike: i64 = pool
+            .exists(strike_key("node-legacy"))
+            .await
+            .expect("strike");
+        assert_eq!(strike, 0, "evidence of life clears the strike");
+
+        // A node that is really gone is still reaped — two consecutive silent
+        // sweeps: strike, then reap.
+        let _: i64 = pool
+            .del(heartbeat_key("node-legacy"))
+            .await
+            .expect("del hb");
+        assert_eq!(reaper.sweep_stale().await.expect("sweep 3"), 0);
+        assert_eq!(
+            reaper.sweep_stale().await.expect("sweep 4"),
+            1,
+            "continuous silence across two sweeps does get cleaned up"
+        );
+        assert!(
+            !reaper
+                .list_nodes()
+                .await
+                .expect("list2")
+                .iter()
+                .any(|n| n.node_id == "node-legacy"),
+            "the dead legacy row is gone"
+        );
+        // The strike key is cleaned up with the row.
+        let strike: i64 = pool
+            .exists(strike_key("node-legacy"))
+            .await
+            .expect("strike");
+        assert_eq!(strike, 0, "no strike key is left behind");
+    }
+
     /// (5) `register` RENEWS the row, not just the heartbeat: a node whose
     /// role/control_url changed after boot must stop advertising the boot-time
-    /// value. The retired `refresh_heartbeat` could not do this — the row was
-    /// written exactly once per process lifetime.
+    /// value. The retired heartbeat-only refresh path could not do this — the
+    /// row was written exactly once per process lifetime.
     #[tokio::test]
     async fn register_rewrites_the_row_on_every_renewal() {
         let pool = pool().await;

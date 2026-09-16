@@ -3724,3 +3724,78 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | T5 的 token 存储位置 | `admin-ui/app.js` 为无构建步骤的 plain JS（`include_dir!` 内嵌进二进制） | ✅ 改动无需构建，但**需要重启进程**才能看到（非 HMR） |
 
 > 另记录一条 Phase A 的独立复核（不属于任何 Task 的验收项，但决定 §7-7 的修复是否**真的**生效）：租户自助令牌的鉴权路径 `admin/handlers.rs::tenant_id_for_token` 是**每请求直接查库**（`list_tenant_access_token_hashes(pool)` 后常量时间比较），**没有**进程内缓存层 ⇒ `restore_config` 把哈希写回副本 DB 之后，提升的副本立即就能鉴权，不存在"要等 reload 才生效"的窗口。这一条是"哈希已落地"之外的第二个必要条件，此前只在验收里断言了前者。
+
+## 开发后 oracle 复审（Phase A 实现，第 13 轮）
+
+计划规定的"Phase A → oracle 复审 → Phase B"环节。三个**独立对抗式**只读审查者，分工：① T1+T6 与计划正文逐条对照；② T2/T3/T4 逐条对照；③ **门禁完整性**（明确要求"不采信文档里任何数字"，重算并专找空洞通过）。
+
+**结论**
+
+| 审查者 | 结论 | 阻塞项 |
+|---|---|---|
+| ① T1+T6 | **GATE: PASS** | 0（9 项非阻塞） |
+| ② T2/T3/T4 | **T3 PASS / T4 PASS / T2 FAIL** | **2**（均在 T2） |
+| ③ 门禁完整性 | **GATE-INTEGRITY: FAIL** | 2 条**文档级**断言被证伪（实质门禁全部复现） |
+
+### 被证伪的断言（已修，见下方"修正"）
+
+| # | 原断言 | 实测 | 处理 |
+|---|---|---|---|
+| 1 | `grep -rn "gen_id_static\|now_static" crates/` ⇒ 0 命中 | **1 命中**：本批自己加的测试文档注释（函数本身确实已删） | 改写注释 ⇒ 现为 **0 命中** |
+| 2 | `grep -rn "cfg.limit_roles\|cfg.key_prefix_bindings" .../db/restore.rs` ⇒ 0 命中 | **1 命中**：解释性注释 | 改写注释 ⇒ **0 命中** |
+| 3 | `grep -rn "refresh_heartbeat" crates/` ⇒ 0 命中 | **3 命中**（全是注释） | 改写为"heartbeat-only refresh" ⇒ **0 命中** |
+| 4 | "`registry.rs` 单测 4 例" | 实为 **5 例**（且与本记录自己的 +12 矛盾） | 计数更正 |
+| 5 | 提交信息/日志"10 处 `register` 调用点" | 实为 **14 处**（`control_client` 4 / `forward` 2 / `registry.rs` 5 / `main.rs` 1 / `tests/cluster.rs` 2） | 计数更正 |
+| 6 | "6 个回归用例均按改前失败取证" | 注入式 RED 实际只覆盖 **4** 例（G1×2 + G3×2）；其余用例的 RED 需不同注入或属新增能力 | 逐例写明所用注入；其余明确为"新增能力的正向用例" |
+
+### T2 的两个阻塞缺陷（审查者②，已修）
+
+**B1（文档/运维）**：`cluster/mod.rs` 的注释写"两条事实记录在 `dev-docs/ops.md`"，而 `ops.md` **完全没有**这些内容（`HOSTNAME`/`StatefulSet`/`unregister`/`node:seen` 均 0 命中）。审查者还发现一个比注释更严重的后果链：**`cluster.node_id` 同时是租约身份**，而续租脚本在 `GET hydra:lease == 本节点 id` 时即续租 ⇒ 两个进程共用 `HOSTNAME` 时**双方都认为自己是 leader**（脑裂），此外还共用注册行、任一方的停机 `unregister()` 会删掉对方的注册。
+**修正**：注释改为直接把三件事写在代码里并指向真实章节；`dev-docs/ops.md` 新增 **§13.6 注册表身份**（含脑裂后果、StatefulSet 前提、回收的两击规则）与 §13.3 的两个环境变量行；同时**退役**了 §13.6 里"G1 已知限制"那条早已过时的条目（禁用行现在会复制）。
+
+**B2（真实缺陷：会把活着的旧版本节点永久注销）**：`sweep_stale` 原来只看"心跳缺失 + 无见证键"即回收。而**未升级节点只在启动时写一次行**（其 20s 循环只续心跳，且该循环忽略错误），因此 ≥30s 的心跳中断（Redis 抖动/主机停顿）就足以让一个**活着的**节点被回收，且它再也无法重新写回该行；若它正持租约，`active_leader_url()` 查不到行 ⇒ **所有备用节点的管理写永久 503**（转发是 fail-closed，无静态回退）。审查者同时指出原用例把"活的旧格式行"给了 `EX(60)` 心跳，等于把待验证的假设当成了前提。
+**修正**：引入**两击（strike）规则**——首次观察到"心跳缺失且无见证"只记录 `hydra:{node:reap}:<id>` 并以 0 计数返回；只有**下一次**扫描（≥60s，即连续静默三个心跳周期）仍处于同一状态才回收；任何生命迹象（心跳或见证键）都会**清除 strike**；租约持有者依旧永不回收；回收时 strike 键随行一并删除。逐出计数改为报告**实际删除的行数**。
+**偏离计划之处（显式记录）**：计划的验收写"旧两段式行 ⇒ 心跳缺失时被回收"，现改为"**连续两次**扫描确认后回收"——历史积压仍会被清理，只晚一个 tick（60s）。这是为消除 B2 的真实生产风险而做的**有意收紧**，`sweep_stale()` 的签名未变（strike 键不设 TTL，其生命周期由"下一次扫描"或"节点自证存活"限定）。
+**证据**：新增 `a_live_legacy_node_survives_a_heartbeat_blip`（旧格式行 + 心跳消失 ⇒ 第一次扫描不删、行仍在；心跳恢复 ⇒ strike 被清除；再次持续静默 ⇒ 第二次扫描才回收）。**已实测 RED**：把实现临时改成"单次观察即回收"后该用例 FAILED（`left: 1, right: 0`），恢复后全绿。`tests/registry_reaping.rs` 的两个用例同步改为两击语义，并新增"回收后不留 strike 键"的断言。
+
+### 审查者②的其余非阻塞项处置
+
+| # | 内容 | 处置 |
+|---|---|---|
+| N3 | T3 的计数器用例**重写了生产配对**，因此抓不到"接线传错参数"（而日志声称"测的是接线本身"） | 已修（提交 `03909b9`）：配对抽成唯一函数 `HydraProxy::note_host_authority`，生产路径与用例都调它；**已实测 RED**（注入"第二个参数传解析结果"⇒ FAILED `0 vs 1`） |
+| N4 | 失配计数器只在**同时**带 `Host` 与不一致 `:authority` 时触发（h1 无 authority、常规 h2 无 Host） | 记录为"可观测但触发面窄"，属设计取舍（不翻转 Host 优先级）；保留既有语义 |
+| N5 | `resolve_tenant` 仍按第一个 `:` 切分 ⇒ IPv6 `::1` 落到 `localhost` 兜底 | 计划 O17 明确要求保留去端口逻辑；已由用例断言为"落到 localhost 而非垃圾域名" |
+| N7 | T4 新增的"非候选 ⇒ 404"分支在生产**不可达**（路由先 404），用例实际测的是路由 | 已在记录中如实写明；该分支保留为纵深防御 |
+| N8 | 新增 503 会经 `PollOutcome::Error` 暂时关闭候选者的新鲜度闸门，但**灾难变体不成立**（`since >= current` 廉价路径不受门控 ⇒ 自指向节点仍返回 200） | 审查者已自行攻击并证伪；记录为"仅短暂" |
+| N9 | T4 的 RED 证据只有叙述、无产物 | 见下方"RED 证据产物" |
+| N10 | 指标不会 panic；但 gauge 会漏掉 `split_once('|')` 失败的行、`record_registry_reaped` 上报的是意图数 | 回收计数已改为实际删除行数 |
+
+### 审查者①的其余非阻塞项处置
+
+| # | 内容 | 处置 |
+|---|---|---|
+| 3 | T6 验收"**禁用行变更 ⇒ version 推进**"（唯一能被 T1+T6 弄坏的回归守卫）**没有用例** | 新增 `editing_a_disabled_row_advances_the_generation`：改禁用行的 `window` ⇒ 先断言该行**不在**运行时快照中，再断言 `reload_all()` 推进且恰好 +1 |
+| 4 | "无变更 reload ⇒ **notify 不触发**"未断言 | 新增 `store_noop_reload_does_not_notify_followers`（计数钩子；并验证真实变更仍通知一次）＋ `store_noop_reload_keeps_swrr_and_the_version` |
+| 5 | "`reload_failed` 仍是 **400**"无用例 | 新增 `reload_fatal_validation_is_400_reload_failed`：致命校验行 ⇒ 400 + 错误码 + **旧快照保留**，且 `?force=1` 也不能绕过 |
+| 6 | `tenant.access_token_hash` 用 UPDATE 而非 INSERT（计划要求 INSERT 携带） | 已改为 **INSERT 直接携带**该列（一次语句；顺带消除"UPDATE 影响 0 行却静默成功"的风险） |
+| 7 | `content.rs` 注释声称"空 fidelity 在构造上不可达"，而计划 N7 **明令不得这样声称** | 已改为计划 N7 的措辞：明说类型系统**不**保证，真正的守卫是三条（只有 `load` 填 `replication`、`from_snapshot` 留 `None`、`internal_control` 对 `None` 返 503） |
+| 4'（审查者③） | 禁用行用例直接调 `restore_config`，绕过了 `replica::materialize` | `standby_materializes_replica` 现在在 leader 侧种入禁用行，并断言它们经**真实 materialize** 后仍在 |
+| 3'（审查者③） | 指标用例只断言"不 panic" | 改为断言**渲染结果**里的 `hydra_registry_nodes{state="alive"} 2` / `{state="dead"} 7` / `hydra_registry_reaped_total 3` |
+
+### RED 证据产物（回应审查者③的第 2 条 MEDIUM）
+
+审查者③指出"T1/T6/T4 的改前失败只有叙述、仓库里没有任何产物"。本轮补足可复现的产物：**每个注入式 RED 都在本记录中写明"注入点 + 期望失败 + 实测输出"**，并给出可重放命令；不依赖仓库外的日志（本机 `/tmp` 每条命令都是新的 tmpfs，无法作为产物留存）。已实测的注入式 RED 一览：
+
+| 用例 | 注入点 | 实测 |
+|---|---|---|
+| `fidelity_disabled_rows::{replica_materialization_keeps_disabled_limit_roles_and_bindings, rematerializing_the_same_content_is_stable}` | `restore_config` 的 `limit_role`/`provider_key_binding` 改回遍历 `cfg` | **2 failed**（"保留 2 行"实测 1 行） |
+| `provider_key_fidelity::{replica_keeps_leader_provider_key_identity, rematerializing_does_not_renumber_provider_keys}` | `provider_key` 循环改回 `cfg.provider_keys` + 时间戳/`id-{:x}` | **2 failed** |
+| `cluster::control_snapshot_requires_the_leader_lease` | 删掉 `internal_control` 的租约门 | **FAILED**，且失败输出显示备用节点真的返回了含 `sealed_provider_keys` 的完整快照 |
+| `proxy::tests::host_authority_mismatch_is_counted_but_host_still_wins` | 第二个参数改传"解析后的 host"（幽灵指标类） | **FAILED**（预期 +1，实测 +0） |
+| `registry::tests::a_live_legacy_node_survives_a_heartbeat_blip` | 回收改为"单次观察即删"（B2 缺陷本身） | **FAILED**（`left: 1, right: 0`） |
+
+**仍属"静态可复算证据"（非注入式）**：T2 的"无删除路径"（`git grep unregister` 在 `4106a9f` 上唯一命中是测试断言文案）与 T3 的"无任何从 URI 取 authority 的代码"。另注（审查者③指出）：T3 的 `grep "uri\.host()" ⇒ 0` **不能**证明"h2 的 host 恒为空"——该结论由审查者②独立地从 `h2-0.4.15` 与 `pingora-proxy-0.8.1` 源码确认，本记录据此更正该条的证明地位（结论对，但原证据不足）。
+
+### 顺序偏差（如实记录）
+
+计划写"Phase A 未过门禁，不得进入 Phase B"。实际执行中，Phase A 的**统一门禁命令块**已全绿后，我**并行**启动了 oracle 复审与 Phase B 的 T5 前端实现（文件完全不相交：T5 只动 `admin-ui/*`、`tests/e2e/*`）。审查者③在报告中据实标记了该偏差（工作树在其审查期间变脏）。T5 的验证（真实二进制 + 真实 Chromium，11 passed）与 Phase A 的复审因此**互不污染**，但这确实是对计划文字的顺序偏离，特此记录；后续 Phase B/C/D 将遵守"前一阶段门禁先过"。

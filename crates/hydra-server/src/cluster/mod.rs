@@ -130,9 +130,15 @@ impl ClusterConfig {
 /// registry row (and thereby a fresh "offline node" in the admin view). It
 /// requires STABLE pod names, i.e. a StatefulSet (or a Deployment with a pinned
 /// name): under a plain Deployment `HOSTNAME` changes on every restart and this
-/// tier buys nothing. Two nodes sharing one `HOSTNAME` would share ONE registry
-/// row — and the shutdown `unregister()` of either would then delete the
-/// peer's registration. Both facts are recorded in `dev-docs/ops.md`.
+/// tier buys nothing.
+///
+/// Two nodes sharing one `HOSTNAME` is a MISCONFIGURATION with three effects,
+/// and the last one is the dangerous one: they share a registry row, the
+/// shutdown `unregister()` of either deletes that shared row (including the
+/// peer's registration), and — because this same id is the LEASE identity
+/// (`LeaderElection` renews whenever `GET hydra:lease == our node_id`) — BOTH
+/// processes would consider themselves the lease holder, i.e. split brain.
+/// Runbook: `dev-docs/ops.md` §13.6.
 ///
 /// A pure function on purpose: the module's tests are parallel-safe and never
 /// mutate the process environment.

@@ -663,6 +663,8 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
 | `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
+| `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
+| `HYDRA_REGISTRY_STALE_GRACE_SECS` | TTL of the registry "last seen" witness (default 120). Only `> 0` values are accepted; a small value narrows the grace window in which a merely-silent node is protected from reaping |
 
 ### 13.4 Failover drill
 
@@ -686,11 +688,41 @@ Data plane keeps serving (last-known-good snapshot + local caches). Election is
 **fail-closed**: a leader that cannot renew demotes immediately (writes stop)
 until Redis recovers. See `dev-docs/cluster.md` §3 for the full matrix.
 
-### 13.6 Known limitations (as of the 2025-08 acceptance)
+### 13.6 Registry identity: `HYDRA_NODE_ID`, `HOSTNAME`, and why they matter
 
-- Disabled `limit_role` / `provider_key_binding` rows are not carried in config
-  snapshots (`build_config` keeps enabled rows only) — after a failover they are
-  lost from replicas and must be re-created.
+Node identity is resolved as **`HYDRA_NODE_ID` → `HOSTNAME` → random**, and it is
+used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
+(the lease value is the bare node id). Three consequences, all operator-visible:
+
+1. **Pods need STABLE names.** The `HOSTNAME` fallback only helps under a
+   StatefulSet (or a Deployment with a pinned name). Under a plain Deployment
+   `HOSTNAME` changes on every restart, so each restart registers a new row and
+   the fallback buys nothing — set `HYDRA_NODE_ID` explicitly instead.
+2. **Two nodes must never share one `HOSTNAME`.** They would share a registry
+   row, and — worse — BOTH would satisfy the lease-renew check (`GET
+   hydra:lease == <our node_id>`), i.e. **two nodes would each believe they hold
+   the lease** (split brain). The shutdown `unregister()` of either process also
+   deletes the shared row, including the peer's registration.
+3. **Reaping is two-strike, deliberately.** `hydra_registry_reaped_total` /
+   `hydra_registry_nodes{state}` show the reaper at work. A registry row is
+   deleted only when its 30s heartbeat AND its grace witness
+   (`hydra:{node:seen}:<id>`, TTL = `HYDRA_REGISTRY_STALE_GRACE_SECS`, default
+   120) are both absent **on two consecutive sweeps** (the reaper ticks every
+   60s). The first observation only records a strike. That extra tick exists
+   because a node running a binary that predates the witness key writes its row
+   exactly ONCE, at boot: deleting such a row while the process is alive would
+   make it invisible to the fleet forever — and if it held the lease, every
+   standby admin write would answer 503 permanently (forwarding is fail-closed
+   with no static fallback). Any sign of life (a heartbeat, or a refreshed
+   witness) clears the strike. The current lease holder is never reaped at all.
+
+### 13.7 Known limitations (as of this revision)
+
+- ~~Disabled `limit_role` / `provider_key_binding` rows are not carried in
+  config snapshots — after a failover they are lost from replicas.~~ **FIXED**:
+  the snapshot contract carries the full fidelity rows (including disabled ones,
+  `provider_key` identity and tenant access-token hashes), so a promoted replica
+  is byte-faithful. See `dev-docs/cluster.md` and the snapshot wire v2 notes.
 - `HYDRA_FAILOVER_GRACE_MS` is documented but not wired; `HYDRA_BREAKER_QUORUM`
   and `HYDRA_RATE_LIMIT_FAIL_MODE` use in-code defaults.
 - Redis sentinel/cluster deployment modes fail fast (single mode wired).

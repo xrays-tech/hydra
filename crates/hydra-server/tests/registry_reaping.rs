@@ -18,7 +18,9 @@
 mod common;
 
 use fred::prelude::*;
-use hydra_server::cluster::registry::{NodeRegistry, HEARTBEAT_PREFIX, NODES_KEY, SEEN_PREFIX};
+use hydra_server::cluster::registry::{
+    NodeRegistry, HEARTBEAT_PREFIX, NODES_KEY, SEEN_PREFIX, STRIKE_PREFIX,
+};
 use hydra_server::cluster::NodeRole;
 use hydra_server::redis::LEASE_KEY;
 
@@ -100,10 +102,21 @@ async fn sweep_clears_the_legacy_backlog() {
     let reaper = reg(&pool, "node-self", NodeRole::Leader, "http://self:8081");
     reaper.register(60, 120).await.expect("register self");
 
+    // TWO sweeps: a witness-less row is only STRIKED on the first observation,
+    // because it may belong to a live not-yet-upgraded node that writes its row
+    // exactly once (at boot) and can never rewrite it. Reaping it while that
+    // process lives would make it invisible forever — and a lease-holding node
+    // in that state makes every standby admin write 503 permanently. One extra
+    // 60s tick is the price of that safety.
     assert_eq!(
-        reaper.sweep_stale().await.expect("sweep"),
+        reaper.sweep_stale().await.expect("first sweep"),
+        0,
+        "the first sweep only strikes"
+    );
+    assert_eq!(
+        reaper.sweep_stale().await.expect("second sweep"),
         10,
-        "the ten heartbeat-less legacy rows are reaped in one batch"
+        "the second sweep reaps the ten heartbeat-less legacy rows in one batch"
     );
     let ids: Vec<String> = reaper
         .list_nodes()
@@ -116,8 +129,28 @@ async fn sweep_clears_the_legacy_backlog() {
     assert!(ids.contains(&"legacy-3".to_string()) && ids.contains(&"legacy-7".to_string()));
     assert!(ids.contains(&"node-self".to_string()));
 
-    // Idempotent: nothing left to reap.
-    assert_eq!(reaper.sweep_stale().await.expect("sweep2"), 0);
+    // Idempotent: nothing left to reap, and no strike keys linger.
+    assert_eq!(reaper.sweep_stale().await.expect("sweep3"), 0);
+    for id in [
+        "legacy-0",
+        "legacy-1",
+        "legacy-2",
+        "legacy-3",
+        "legacy-4",
+        "legacy-5",
+        "legacy-6",
+        "legacy-7",
+        "legacy-8",
+        "legacy-9",
+        "legacy-10",
+        "legacy-11",
+    ] {
+        let strike: i64 = pool
+            .exists(format!("{STRIKE_PREFIX}{id}"))
+            .await
+            .expect("exists strike");
+        assert_eq!(strike, 0, "no strike key is left behind for {id}");
+    }
 }
 
 /// A node that dies after registering (both keys expire) is reaped; the CURRENT
@@ -159,7 +192,9 @@ async fn sweep_spares_the_lease_holder_but_reaps_the_dead() {
     let reaper = reg(&pool, "node-self", NodeRole::Leader, "http://self:8081");
     reaper.register(60, 120).await.expect("register self");
 
-    assert_eq!(reaper.sweep_stale().await.expect("sweep"), 1);
+    // Strike, then reap (see the backlog test for why).
+    assert_eq!(reaper.sweep_stale().await.expect("first sweep"), 0);
+    assert_eq!(reaper.sweep_stale().await.expect("second sweep"), 1);
     let ids: Vec<String> = reaper
         .list_nodes()
         .await
@@ -183,8 +218,8 @@ async fn sweep_spares_the_lease_holder_but_reaps_the_dead() {
 }
 
 /// Renewal rewrites the row and pushes both TTLs forward — the retired
-/// `refresh_heartbeat` renewed ONLY the heartbeat, so a node whose role or
-/// control_url changed after boot kept advertising the boot-time value.
+/// the heartbeat-only refresh renewed ONLY the heartbeat, so a node whose role
+/// or control_url changed after boot kept advertising the boot-time value.
 #[tokio::test]
 async fn renewal_rewrites_the_row_and_extends_both_ttls() {
     let pool = common::real_redis_pool(47).await;
