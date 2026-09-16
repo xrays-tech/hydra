@@ -159,6 +159,13 @@ pub struct LeaderElection {
     /// not synced from the active leader yet, so it is not eligible to race
     /// for the lease with a stale replica (F-4).
     sync_ok: AtomicBool,
+    /// When the last SUCCESSFUL control sync happened (N1/B5b). `sync_ok` alone
+    /// is a latch with no age: a node stalled past its lease (SIGSTOP, a long
+    /// GC pause, a scheduler stall) kept `sync_ok = true` and could re-acquire
+    /// the lease with a pre-stall snapshot. The module docs describe the
+    /// recovery rule ("has not synced from the active leader recently"); this
+    /// field is what makes it enforceable.
+    sync_ok_at: Mutex<Option<Instant>>,
     /// Consecutive renew errors seen while `Uncertain` (see
     /// [`UNCERTAIN_ERR_BUDGET`]). Reset whenever leadership is re-established.
     uncertain_errs: AtomicU32,
@@ -188,14 +195,51 @@ impl LeaderElection {
             // F-4: starts CLOSED — a fresh node has not synced from the
             // active leader yet (see the field docs).
             sync_ok: AtomicBool::new(false),
+            sync_ok_at: Mutex::new(None),
             uncertain_errs: AtomicU32::new(0),
         }
     }
 
     /// Mark the freshness gate: `true` after a successful control sync,
-    /// `false` when syncing has failed.
+    /// `false` when syncing has failed. A `true` also stamps the sync time —
+    /// see [`Self::sync_is_fresh`].
     pub fn mark_sync_ok(&self, ok: bool) {
+        *self
+            .sync_ok_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            if ok { Some((self.clock)()) } else { None };
         self.sync_ok.store(ok, Ordering::Release);
+    }
+
+    /// How long a successful sync stays valid for leader eligibility.
+    ///
+    /// `2 × lease_ms` — comfortably longer than the control poll interval (1 s
+    /// by default) so normal operation keeps the gate open, and short enough
+    /// that a node which stalled past its own lease must re-sync before it may
+    /// lead again.
+    #[must_use]
+    fn sync_freshness_window(&self) -> Duration {
+        Duration::from_millis(self.lease_ms.saturating_mul(2))
+    }
+
+    /// Whether the freshness gate is open RIGHT NOW: a successful sync that is
+    /// still within [`Self::sync_freshness_window`].
+    #[must_use]
+    pub fn sync_is_fresh(&self) -> bool {
+        if !self.sync_ok.load(Ordering::Acquire) {
+            return false;
+        }
+        let at = *self
+            .sync_ok_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match at {
+            Some(at) => {
+                (self.clock)().saturating_duration_since(at) <= self.sync_freshness_window()
+            }
+            None => false,
+        }
     }
 
     /// Current state (for `/healthz/leader` and admin write gating).
@@ -310,8 +354,11 @@ impl LeaderElection {
                 }
             }
             ElectionState::Standby | ElectionState::Active { .. } => {
-                if !self.sync_ok.load(Ordering::Acquire) {
-                    debug!(node = %self.node_id, "election: sync gate closed; not eligible");
+                if !self.sync_is_fresh() {
+                    debug!(
+                        node = %self.node_id,
+                        "election: sync gate closed or stale; not eligible"
+                    );
                     ElectionState::Standby
                 } else {
                     match self.store.try_acquire(&self.node_id, self.lease_ms).await {
@@ -374,6 +421,66 @@ mod tests {
                 "expired → b acquires"
             );
         });
+    }
+
+    /// REVIEW B5b — a node stalled past its lease must re-sync before it may
+    /// lead again. `sync_ok` used to be an age-less latch, so a node that was
+    /// frozen (SIGSTOP, long GC pause, scheduler stall) came back with
+    /// `sync_ok = true` and could re-acquire the lease with a pre-stall
+    /// snapshot — the recovery rule the module docs describe existed only in
+    /// prose.
+    #[test]
+    fn a_stalled_node_must_resync_before_it_may_lead() {
+        let t0 = Instant::now();
+        let now = Arc::new(Mutex::new(t0));
+        let clock: Clock = {
+            let now = now.clone();
+            Arc::new(move || *now.lock().expect("test clock"))
+        };
+        let e = LeaderElection::with_clock(store(), "n1".into(), 3000, clock);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            e.mark_sync_ok(true);
+            e.tick().await;
+            assert!(e.is_leader(), "a freshly synced node leads");
+
+            // The node stalls: 10 s pass with no tick and no successful sync
+            // (its 3 s lease fence has expired by then).
+            *now.lock().expect("test clock") = t0 + Duration::from_millis(10_000);
+            assert!(
+                !e.sync_is_fresh(),
+                "a 10 s old sync is stale for a 3 s lease (window is 2x lease)"
+            );
+            e.tick().await;
+            assert!(
+                !e.is_leader(),
+                "a stalled node must not re-acquire with a pre-stall snapshot"
+            );
+
+            // After a FRESH sync the gate opens again, and an eligible node on a
+            // free lease acquires (fresh store: nobody holds it).
+            let t1 = Instant::now();
+            let clock2: Clock = Arc::new(move || t1);
+            let e2 = LeaderElection::with_clock(store(), "n2".into(), 3000, clock2);
+            e2.mark_sync_ok(true);
+            assert!(e2.sync_is_fresh(), "a just-synced node is fresh");
+            e2.tick().await;
+            assert!(e2.is_leader(), "a re-synced node may lead again");
+        });
+    }
+
+    /// The window must exceed one poll interval but stay proportional to the
+    /// lease, so a normal node (syncing every second) is never gated out.
+    #[test]
+    fn sync_freshness_window_is_twice_the_lease() {
+        let t0 = Instant::now();
+        let clock: Clock = Arc::new(move || t0);
+        let e = LeaderElection::with_clock(store(), "n1".into(), 600, clock);
+        assert_eq!(e.sync_freshness_window(), Duration::from_millis(1200));
+        e.mark_sync_ok(true);
+        assert!(e.sync_is_fresh(), "just synced");
+        e.mark_sync_ok(false);
+        assert!(!e.sync_is_fresh(), "a failed sync closes the gate");
     }
 
     #[test]

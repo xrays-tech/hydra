@@ -64,6 +64,43 @@ fn breaker_quorum_from_env() -> usize {
         .unwrap_or(1)
 }
 
+/// Bounds for `HYDRA_LEADER_LEASE_MS`.
+///
+/// Below the minimum, leadership becomes meaningless: `valid_until = now + 0`
+/// makes `is_leader()` permanently false while the election loop spins at
+/// `(lease_ms/3).max(1)` = 1 ms, i.e. ~1000 `SET NX` per second per node with
+/// no leader ever elected (and no startup error to say so). A value like `15`
+/// (someone meaning seconds) gives a 5 ms tick and a lease that any 15 ms stall
+/// loses — the active writer flaps. Above the maximum, `Expiration::PX` would
+/// overflow into a negative TTL.
+#[cfg(feature = "cluster-redis")]
+const MIN_LEADER_LEASE_MS: u64 = 1_000;
+#[cfg(feature = "cluster-redis")]
+const MAX_LEADER_LEASE_MS: u64 = 600_000;
+#[cfg(feature = "cluster-redis")]
+const DEFAULT_LEADER_LEASE_MS: u64 = 15_000;
+
+/// `HYDRA_LEADER_LEASE_MS` (cluster mode), validated: unset → the default,
+/// out-of-range or unparseable → an error that fails startup. Deliberately NOT
+/// a silent fallback: this is a safety-relevant value whose wrong setting is
+/// invisible at runtime (see [`MIN_LEADER_LEASE_MS`]).
+#[cfg(feature = "cluster-redis")]
+fn leader_lease_ms_from_env() -> Result<u64, String> {
+    let Ok(raw) = std::env::var("HYDRA_LEADER_LEASE_MS") else {
+        return Ok(DEFAULT_LEADER_LEASE_MS);
+    };
+    let ms: u64 = raw
+        .parse()
+        .map_err(|e| format!("HYDRA_LEADER_LEASE_MS={raw:?} is not a millisecond count: {e}"))?;
+    if !(MIN_LEADER_LEASE_MS..=MAX_LEADER_LEASE_MS).contains(&ms) {
+        return Err(format!(
+            "HYDRA_LEADER_LEASE_MS={ms} is outside {MIN_LEADER_LEASE_MS}..={MAX_LEADER_LEASE_MS} ms \
+             (0 or a tiny value makes this node permanently ineligible while the election loop spins)"
+        ));
+    }
+    Ok(ms)
+}
+
 fn main() {
     // (1) Tracing.
     let _ = tracing_subscriber::fmt::Subscriber::builder()
@@ -541,10 +578,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         == hydra_server::cluster::NodeRole::Leader
     {
         let backend = redis_backend.ok_or("cluster mode has a Redis backbone (checked above)")?;
-        let lease_ms = std::env::var("HYDRA_LEADER_LEASE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15_000);
+        let lease_ms = leader_lease_ms_from_env()?;
         let lease_store: Arc<dyn hydra_server::cluster::lease::LeaseStore> = Arc::new(
             hydra_server::redis::RedisLeaseStore::new(backend.pool().clone()),
         );
@@ -844,5 +878,32 @@ mod tests {
 
         std::env::remove_var("HYDRA_BREAKER_QUORUM");
         assert_eq!(breaker_quorum_from_env(), 1, "unset → default 1");
+    }
+
+    /// B5a: `HYDRA_LEADER_LEASE_MS` must be validated, not silently defaulted.
+    /// `0` used to be accepted — the node then never became leader (its fence
+    /// expired instantly) while the election loop spun at ~1 kHz, with no error
+    /// anywhere. The same test binary owns this env key.
+    #[test]
+    fn leader_lease_ms_env_is_validated() {
+        std::env::remove_var("HYDRA_LEADER_LEASE_MS");
+        assert_eq!(
+            leader_lease_ms_from_env(),
+            Ok(15_000),
+            "unset → the documented default"
+        );
+
+        std::env::set_var("HYDRA_LEADER_LEASE_MS", "2000");
+        assert_eq!(leader_lease_ms_from_env(), Ok(2000), "in range is honored");
+
+        for bad in ["0", "15", "999", "600001", "99999999", "bogus", ""] {
+            std::env::set_var("HYDRA_LEADER_LEASE_MS", bad);
+            assert!(
+                leader_lease_ms_from_env().is_err(),
+                "HYDRA_LEADER_LEASE_MS={bad:?} must fail startup, not silently default"
+            );
+        }
+
+        std::env::remove_var("HYDRA_LEADER_LEASE_MS");
     }
 }
