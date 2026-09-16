@@ -3928,3 +3928,16 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 > **T10.6 仍未完成的部分**：`dev-docs/cluster.md` 的注册表章节（值格式不变、`hydra:{node:seen}:` 见证键、两击回收规则、`HOSTNAME` 身份的 StatefulSet 前提与脑裂后果）——这些内容目前已写在 `ops.md` §13.6/§13.3 与代码注释里，**cluster.md 尚未同步**（该文档在计划里被定为集群设计的权威参考）。
 
 **门禁**：fmt clean；clippy **0 warning**；`--features server` **28 套件 0 failed**。
+
+### Batch 12 — T9.5 非 leader 横幅（§7-5）
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `admin-ui/app.js`（`refreshLeaderBanner()`；`enterApp()` 末尾调用；`wireEvents()` 注册 30s 轮询；`window.__onLangChanged` 追加一次重渲染）、`admin-ui/i18n.js`（**2 键 × 4 语**，无死键）、`admin-ui/style.css`（`#leader-banner` 最小样式）、`tests/e2e/admin.spec.cjs`（+2 例） |
+| 不做 redirect（计划 §7-5 的裁定） | 外部 NodePort **只**把流量送到 Ready(=leader) 节点，能打开非 leader 的管理面说明运维是经 port-forward / 集群内访问进来的——**这正是 leader 不可达时他们会在那里的原因**，所以只提示、不跳转 |
+| 插到 `.main` 而不是 `#app`（O15） | `.app` 是 flex **行**容器（侧栏 + 内容），把横幅 prepend 进 `#app` 会渲染成被挤压的**第三列**；`.banner` 类也不存在（只有 `.pill.warn`），故新增 `#leader-banner` 样式 |
+| 语言切换必须重渲染（B7） | 横幅文案**含变量**（`{node}`），而 `applyStaticI18n` **没有**插值机制 ⇒ 横幅**不使用** `data-i18n`，改由 `refreshLeaderBanner()` 用 `t(..., {node})` 生成，并在 `__onLangChanged` 里重建（否则切语言后文案不更新、或被静态 i18n 用带 `{node}` 的原文覆盖） |
+| 轮询安全性 | 30s 轮询仅在 `TOKEN` 存在时发起；`api()` 的 401 处理走上一批的 `suppress401` 计数器，因此后台 401 不会被"手动登录中"窗口吞掉，也不会把操作者踢出 |
+| e2e 覆盖（**两个方向**） | ① `T9.5`（单节点）**负向**：横幅**不出现**，并额外断言 `/api/v1/cluster/status` 真的返回 `cluster:false`（证明断言针对的是横幅，而不是端点失败）；② `T9.5b`（**正向**，用 `page.route` 造一个真实形态的 fleet payload）：显示横幅、含本节点 id、链接 href 指向 lease holder 的 control_url、**切中文后文案随之更新**、且当本节点**就是** leader 时横幅**消失** |
+| 采集数与计划的差异（如实记录） | 计划预计 T9.5 后 Playwright = **12**；实测 **13**：计划只安排了一个"单节点不出现横幅"的用例，只覆盖**负向**，而 T9.5 的验收明确要求"非 leader 且能解析到 leader URL ⇒ 显示横幅 + 可点击链接"——单节点实例产生不了这个状态，故我补了一个 `page.route` 桩化的**正向**用例（端点自身契约由 Rust 套件覆盖）。因此 **Phase C 门禁的 Playwright 期望值应为 13，不是 12** |
+| 门禁 | `node --check` 通过；`check_i18n.js` **OK（334 en keys，4 语一致，无死键）**；`node --test` `# fail 0`；release 二进制重新构建（UI 经 `include_dir!` 内嵌）后跑真实 Chromium：**13 passed** |

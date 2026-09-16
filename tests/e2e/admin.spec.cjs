@@ -121,6 +121,98 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     expect(await page.evaluate(() => sessionStorage.getItem('hydra-admin-token'))).toBeNull();
   });
 
+  // T9.5 (§7-5) — the leader banner. This suite runs against a SINGLE node
+  // (`cluster: null`), so the honest assertion here is the NEGATIVE one: no
+  // banner on a non-cluster instance, i.e. the feature cannot misfire and tell an
+  // operator they are on a standby when they are not. The positive path needs a
+  // multi-node fleet and is covered by the cluster tests.
+  test('T9.5 no leader banner on a single-node instance', async ({ page }) => {
+    await signIn(page);
+    await expect(page.locator('#leader-banner')).toHaveCount(0);
+    // Give the 30s poll a chance to (wrongly) appear, then re-assert: the banner
+    // is created asynchronously after login, so checking once is not enough.
+    await page.waitForTimeout(1500);
+    await expect(page.locator('#leader-banner')).toHaveCount(0);
+    // And `/cluster/status` really does report a single node, so the assertion
+    // above is about the banner and not about a failing endpoint.
+    const status = await page.evaluate(async () => {
+      const r = await fetch('/api/v1/cluster/status', {
+        headers: {
+          Authorization: 'Bearer ' + sessionStorage.getItem('hydra-admin-token'),
+        },
+      });
+      return { code: r.status, body: await r.json() };
+    });
+    expect(status.code).toBe(200);
+    expect(status.body.cluster).toBe(false);
+  });
+
+  // T9.5 (§7-5) — the POSITIVE path: on a non-leader the banner must actually
+  // appear, name this node and link to the active leader. A single-node instance
+  // cannot produce that state (it has no registry, so `/cluster/status` answers
+  // `cluster: false`), so the endpoint is stubbed here with a realistic payload.
+  // The endpoint's own contract is covered by the Rust suite; what is under test
+  // here is the banner.
+  test('T9.5b a non-leader shows the banner with a jump link, and the leader hides it', async ({ page }) => {
+    const fleet = (nodeId, holder) => ({
+      cluster: true,
+      mode: 'leader',
+      node_id: nodeId,
+      this_node_leader: nodeId === holder,
+      lease_holder: holder,
+      nodes: [
+        {
+          node_id: 'node-a',
+          role: 'leader',
+          control_url: 'http://leader.example:8081',
+          alive: true,
+          is_lease_holder: holder === 'node-a',
+          is_self: nodeId === 'node-a',
+        },
+        {
+          node_id: 'node-b',
+          role: 'leader',
+          control_url: 'http://standby.example:8082',
+          alive: true,
+          is_lease_holder: holder === 'node-b',
+          is_self: nodeId === 'node-b',
+        },
+      ],
+    });
+    let payload = fleet('node-b', 'node-a'); // this node is a STANDBY
+    await page.route('**/api/v1/cluster/status', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(payload),
+      });
+    });
+
+    await signIn(page);
+    const banner = page.locator('#leader-banner');
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText('node-b'); // which node is not the leader
+    await expect(banner.locator('a')).toHaveAttribute(
+      'href',
+      'http://leader.example:8081', // ...and where the leader is
+    );
+
+    // A language switch must re-render it: the text interpolates the node id, so
+    // the banner deliberately does NOT use `data-i18n` (there is no variable
+    // interpolation in `applyStaticI18n`).
+    await page.selectOption('#lang-select', 'zh');
+    await expect(banner).toContainText('node-b');
+    await expect(banner).toContainText('不是 leader');
+    await page.selectOption('#lang-select', 'en');
+
+    // On the leader ITSELF there must be no banner. Reloading re-runs login and
+    // the banner refresh (the ticket is in sessionStorage for this tab).
+    payload = fleet('node-a', 'node-a');
+    await page.reload();
+    await page.locator('#login-overlay').waitFor({ state: 'hidden' });
+    await expect(page.locator('#leader-banner')).toHaveCount(0);
+  });
+
   test('T2.2 create provider via UI → appears in list → persisted via /api', async ({ page }) => {
     await signIn(page);
 

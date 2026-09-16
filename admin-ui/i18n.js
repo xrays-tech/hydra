@@ -27,6 +27,8 @@ const LANG_STORAGE_KEY = "hydra-admin-lang";
 const I18N = {
   en: {
     "common.brand.sub": "admin console",
+    "common.leaderBanner.notLeader": "This node ({node}) is not the leader — writes are forwarded.",
+    "common.leaderBanner.jump": "Open the leader",
     "common.auth.help": "Enter the admin token (<code>HYDRA_ADMIN_TOKEN</code>). It is kept <strong>for this browser tab only</strong> (a reload stays signed in; closing the tab signs out) and sent as <code>Authorization: Bearer</code>.",
     "common.auth.tokenLabel": "Admin token",
     "common.auth.tokenPlaceholder": "paste token…",
@@ -361,6 +363,8 @@ const I18N = {
   },
   zh: {
     "common.brand.sub": "管理控制台",
+    "common.leaderBanner.notLeader": "本节点（{node}）不是 leader —— 写入会被转发。",
+    "common.leaderBanner.jump": "打开 leader",
     "common.auth.help": "输入管理员令牌（<code>HYDRA_ADMIN_TOKEN</code>）。令牌仅在<strong>当前标签页内</strong>保留（刷新仍保持登录，关闭标签页即退出），并以 <code>Authorization: Bearer</code> 方式发送。",
     "common.auth.tokenLabel": "管理员令牌",
     "common.auth.tokenPlaceholder": "粘贴令牌…",
@@ -695,6 +699,8 @@ const I18N = {
   },
   fr: {
     "common.brand.sub": "console d'administration",
+    "common.leaderBanner.notLeader": "Ce nœud ({node}) n'est pas le leader — les écritures sont relayées.",
+    "common.leaderBanner.jump": "Ouvrir le leader",
     "common.auth.help": "Saisissez le jeton d'administration (<code>HYDRA_ADMIN_TOKEN</code>). Il est conservé <strong>pour cet onglet uniquement</strong> (un rechargement reste connecté, la fermeture de l'onglet déconnecte) et envoyé sous forme <code>Authorization: Bearer</code>.",
     "common.auth.tokenLabel": "Jeton d'administration",
     "common.auth.tokenPlaceholder": "collez le jeton…",
@@ -1029,6 +1035,8 @@ const I18N = {
   },
   de: {
     "common.brand.sub": "Admin-Konsole",
+    "common.leaderBanner.notLeader": "Dieser Knoten ({node}) ist nicht der Leader — Schreibvorgänge werden weitergeleitet.",
+    "common.leaderBanner.jump": "Leader öffnen",
     "common.auth.help": "Admin-Token eingeben (<code>HYDRA_ADMIN_TOKEN</code>). Er wird <strong>nur für diesen Tab</strong> gespeichert (Neuladen bleibt angemeldet, Schließen des Tabs meldet ab) und als <code>Authorization: Bearer</code> gesendet.",
     "common.auth.tokenLabel": "Admin-Token",
     "common.auth.tokenPlaceholder": "Token einfügen…",

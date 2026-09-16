@@ -557,3 +557,16 @@ pre.json .b { color: #56d4dd; }
   .chart-row { grid-template-columns: minmax(64px, 1fr) minmax(80px, 2fr) 48px; gap: 7px; }
 }
 
+
+/* Read-only banner shown on a non-leader admin UI (T9.5 / §7-5). Inserted at the
+ * top of `.main` (the content column), never into `#app` — `#app` is a flex ROW
+ * of sidebar + main, so a banner there would render as a squeezed third column. */
+#leader-banner {
+  display: flex; align-items: center; gap: .75rem;
+  padding: .5rem .75rem; margin-bottom: .75rem;
+  border: 1px solid rgba(210, 153, 34, .4);
+  border-radius: 6px;
+  background: rgba(210, 153, 34, .1);
+  color: var(--warn);
+  font-size: .875rem;
+}

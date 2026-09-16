@@ -1169,6 +1169,58 @@ function highlightJson(obj) {
 }
 
 /* ===========================================================================
+ * Leader banner (T9.5 / §7-5)
+ * ======================================================================== */
+/** Show a banner when this admin UI is NOT on the leader.
+ *
+ *  A standby UI gives no other hint: the external NodePort only routes to Ready
+ *  (= leader) nodes, so anyone reaching a standby got there via port-forward or
+ *  in-cluster access, and every write from this page is FORWARDED to the active
+ *  leader. We deliberately do not redirect (§7-5) — the operator may be here
+ *  precisely because the leader is unreachable.
+ *
+ *  Re-entrant: it is called on login, every 30s, and after a language change, so
+ *  it reuses the existing element instead of stacking banners. */
+async function refreshLeaderBanner() {
+  let cluster = null;
+  try {
+    cluster = await api("GET", "/cluster/status");
+  } catch {
+    return; // not cluster-enabled, or the probe failed: no banner either way
+  }
+  const existing = document.getElementById("leader-banner");
+  if (
+    !cluster ||
+    !cluster.cluster ||
+    !cluster.lease_holder ||
+    cluster.node_id === cluster.lease_holder
+  ) {
+    if (existing) existing.remove();
+    return;
+  }
+  const leader = (cluster.nodes || []).find(
+    (n) => n.node_id === cluster.lease_holder,
+  );
+  const banner = existing || el("div", { id: "leader-banner" });
+  clear(banner);
+  banner.appendChild(
+    el("span", {
+      text: t("common.leaderBanner.notLeader", { node: cluster.node_id }),
+    }),
+  );
+  if (leader && leader.control_url) {
+    // `HYDRA_PUBLIC_URL` must be BROWSER-reachable for this link to work; that
+    // is an ops prerequisite, recorded in dev-docs/ops.md.
+    banner.appendChild(
+      el("a", { href: leader.control_url, text: t("common.leaderBanner.jump") }),
+    );
+  }
+  // Insert into `.main` (the content column), NOT `#app`: `#app` is a flex ROW
+  // of sidebar + main, so prepending there renders a squeezed third column.
+  if (!existing) $(".main").prepend(banner);
+}
+
+/* ===========================================================================
  * Auth / login
  * ======================================================================== */
 /** The login VIEW only. Deliberately does NOT touch TOKEN or storage.
@@ -1216,8 +1268,8 @@ function enterApp() {
   tEl.textContent = t("common.auth.authenticated");
   renderNav();
   go(CURRENT);
-  // A later phase installs `refreshLeaderBanner`. GUARDED on purpose: an
-  // unguarded call would throw `ReferenceError` on login — the failure class
+  // T9.5: the banner is installed now; the guard stays so a scrollback to a
+  // build without it cannot throw `ReferenceError` on login — the failure class
   // this repo has already shipped once ("the write landed and the UI still
   // reported a failure").
   if (typeof refreshLeaderBanner === "function") refreshLeaderBanner();
@@ -1316,6 +1368,12 @@ function wireEvents() {
     langSel.value = currentLang();
     langSel.addEventListener("change", (e) => setLang(e.target.value));
   }
+  // The lease can move under us (failover) while this page stays open: keep the
+  // banner honest without a reload. The request is suppressed-aware for 401s,
+  // like every other background call.
+  setInterval(() => {
+    if (TOKEN) refreshLeaderBanner().catch(() => {});
+  }, 30000);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1329,6 +1387,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (sel) sel.value = code;
     renderNav();
     go(CURRENT);
+    // The banner's text interpolates the node id, so it cannot use `data-i18n`
+    // (there is no variable interpolation in `applyStaticI18n`) — it has to be
+    // rebuilt for the new language.
+    refreshLeaderBanner();
   };
   wireEvents();
   applyStaticI18n();
