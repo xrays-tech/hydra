@@ -122,8 +122,15 @@ impl ControlClient {
     /// with several live candidates the lexicographically-first URL may be
     /// the dead active, which would pin us to it until its heartbeat expires
     /// (30 s) — inflating failover from ~lease expiry to ~lease + heartbeat.
-    /// Rotating to ANY live candidate is safe: the lease machine arbitrates
-    /// who actually writes, and a standby's replica is last-known-good.
+    /// Rotating to ANY live candidate is SAFE BUT NOT FREE: the lease machine
+    /// still arbitrates who writes, and a standby's replica is last-known-good,
+    /// but since the control endpoint gained its lease gate a candidate that is
+    /// not the holder answers `503 not_leader` instead of a snapshot. A caller
+    /// that is BEHIND therefore gets an error (not that peer's newer content)
+    /// until rotation reaches the real holder — a transient gap of about two
+    /// polls plus backoff. The `since >= current` cheap path stays ungated, so a
+    /// current caller still gets its quiet 200 and the freshness gate is not
+    /// wedged.
     #[cfg(feature = "cluster-redis")]
     pub async fn rotate_from_registry(&self) -> bool {
         let Some(reg) = &self.discovery else {

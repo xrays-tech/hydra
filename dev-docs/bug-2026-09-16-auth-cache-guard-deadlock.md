@@ -1,7 +1,7 @@
 # BUG：`AuthCache::check` 持 DashMap 读守卫跨 `await` ⇒ 分片写锁自死锁，单副本静默僵死
 
 > 记录时间：2026-09-16（UTC）
-> 状态：**未修复 —— 仓库 HEAD（`110774c`）仍然存在该缺陷**
+> 状态：**已修复**（本仓库已落地：`AuthCache::check` 不再持 DashMap 守卫跨 `await`，并接入 L1 清扫；见提交 `fa52356` / `0fde660` 与 `http.rs` 的守卫纪律注释）。**本文档记录的是事故当时的分析，状态行已过期故更正。**
 > 影响版本：至少 `gpu/dogress2@sha256:4bbcc923…`（线上旧镜像，2026-09-16 03:01 之前）
 > 发现环境：dogress 生产 k3s 集群（172.16.39.182 / .171 / .185，ns `hydra`）
 > 代码定位：`crates/hydra-server/src/http.rs:170-191`（`AuthCache::check`）

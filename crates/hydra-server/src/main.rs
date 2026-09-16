@@ -1,9 +1,13 @@
 //! `hydra` — Pingora-based LLM gateway binary (design §6.1 / §15.1).
 //!
 //! Boots a [`pingora_core::server::Server`] hosting one `http_proxy_service`
-//! running [`HydraProxy`]. The listener is downstream TLS (per-tenant SNI cert
-//! callback, design §12 / W4b) whenever any tenant has certs configured; a
-//! plain `add_tcp` listener is used for the localhost/dev case (no certs).
+//! running [`HydraProxy`]. The listener topology comes from CONFIGURATION ONLY:
+//! the plaintext listener (`HYDRA_LISTEN`) is always bound, and setting
+//! `HYDRA_TLS_LISTEN` adds a downstream-TLS listener that selects a per-tenant
+//! certificate by SNI (design §12 / W4b). Whether tenants HAVE certificates never
+//! decides which listeners exist — deriving the protocol from the data is the
+//! bug that took the plaintext entry port down (`dev-docs/bug-2026-09-16-tenant-
+//! cert-flips-listener-to-tls.md`).
 //!
 //! ## Startup sequence
 //!

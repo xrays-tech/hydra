@@ -4,7 +4,7 @@
 > 现象环境：dogress 生产 k3s（172.16.39.182 / .171 / .185，ns `hydra`）
 > 代码定位：`crates/hydra-server/src/main.rs:755-805`（`run_server` 的 (3b) 段）
 > 设计对照：`dev-docs/design.md` 架构图（ProxyService 应为 `:443 (TLS, SNI)` + `:80 (HTTP, dev)` **两个监听**）
-> 状态：**未修复**（2026-09-16 的 `84f7fc75` 镜像仍为单监听；本次事故以"清空租户证书"临时止血）
+> 状态：**已修复**（监听器拓扑改为**只由配置决定**：明文 `HYDRA_LISTEN` 恒定绑定、`HYDRA_TLS_LISTEN` 才新增 TLS 监听；见提交 `a3eb73b` 与 `dev-docs/ops.md` §9.1 的 `hydra_listener_*` 指标。**本文档记录的是事故当时的分析，状态行已过期故更正。**）
 
 ---
 

@@ -3913,3 +3913,16 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 为什么不持有 socket（计划 O20 已实测） | 调用方把端口交给 **Pingora 去 bind**（12 个测试文件共 38 处调用）。持有监听 socket 会让第二次 bind 直接 `EADDRINUSE`——Pingora 只设 `SO_REUSEADDR`、**没有** `SO_REUSEPORT` ⇒ v1 方案会让**几乎整套集成测试**无法 bind |
 | 用例 | `port_bands_do_not_repeat_for_nearby_pids`：断言 `band(pid) != band(pid+100)`（正是被修掉的那条）与相邻 PID 不相撞，**并正面断言** `band(pid) == band(pid+200)` 以把残余风险钉在测试里（诚实标注而非假装消除）；`ephemeral_ports_are_bindable_and_distinct`：连续两次分配不重复，且两个端口都**真的可 bind**（证明探测确实释放了） |
 | 门禁 | fmt clean；clippy **0 warning**；`--features server` **28 套件 0 failed**；计划要求的并发复核 **`--test-threads=8` 连跑 3 次、每次 0 个 FAILED 套件**（这是原 flake 的症状面） |
+
+### Batch 11 — T10.6（部分）四处"文档与代码不符"更正
+
+| 位置 | 原文（不实/过期） | 更正后 |
+|---|---|---|
+| `main.rs` 头部 | "有租户证书时监听器就是 downstream TLS；无证书时用 plain `add_tcp`" | 监听器拓扑**只由配置决定**：`HYDRA_LISTEN` 恒定绑定、`HYDRA_TLS_LISTEN` 才新增 TLS 监听；**证书的有无从不决定监听器**（这正是把明文入口打挂的那个 bug），并指向对应 bug 文档 |
+| `control_client.rs` 的旋转注释 | "Rotating to ANY live candidate is safe"（T4 之后不再完全准确） | 改为"safe **but not free**"：非持有者现在答 `503 not_leader`，落后的调用方会先拿到错误而非对端更新内容，直到旋转到真正的持有者（约两次轮询 + 退避的**短暂**缺口）；同时说明 `since >= current` 廉价路径**不受门控**，因此新鲜度闸门不会被卡死 |
+| `dev-docs/bug-2026-09-16-auth-cache-guard-deadlock.md` 状态头 | "**未修复** —— HEAD 仍存在该缺陷" | **已修复**（附提交与守卫纪律注释的位置），并注明"状态行已过期故更正" |
+| `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md` 状态头 | "**未修复**（仍为单监听）" | **已修复**（附提交与 `ops.md` §9.1 的 `hydra_listener_*` 指标），同样注明更正原因 |
+
+> **T10.6 仍未完成的部分**：`dev-docs/cluster.md` 的注册表章节（值格式不变、`hydra:{node:seen}:` 见证键、两击回收规则、`HOSTNAME` 身份的 StatefulSet 前提与脑裂后果）——这些内容目前已写在 `ops.md` §13.6/§13.3 与代码注释里，**cluster.md 尚未同步**（该文档在计划里被定为集群设计的权威参考）。
+
+**门禁**：fmt clean；clippy **0 warning**；`--features server` **28 套件 0 failed**。
