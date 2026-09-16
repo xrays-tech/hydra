@@ -67,6 +67,19 @@ pub enum AuthVerdict {
 /// Used to key the auth cache so plaintext api-keys are never resident.
 ///
 /// This is a real, pure computation (sha2) — not a stub.
+/// Lower-case hex of [`sha256_hex`]: the ONE place that turns a digest into the
+/// string form used as a cache key / stream payload (audit L-1: the cluster
+/// invalidation stream and the auth-cache L1/L2 keys each carried their own
+/// copy, so a change to either could silently stop the L2 from matching).
+#[must_use]
+pub fn sha256_hex_string(input: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in sha256_hex(input) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 pub fn sha256_hex(input: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(input);

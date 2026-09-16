@@ -251,8 +251,12 @@ impl AuthCache {
             }
             #[cfg(feature = "cluster-redis")]
             if let Some(l2) = &self.l2 {
-                // `h` IS the L2 key suffix (`hex_digest`) — do NOT re-hash.
-                let _ = l2.del(tenant_id, h).await;
+                // `h` IS the L2 key suffix (`hex_digest`) — do NOT re-hash, but
+                // DO normalise: `hex_to_bytes32` accepts upper case while the L2
+                // key is lower case, so a foreign publisher writing `ABCD…`
+                // would delete the L1 entry and leave the L2 one to re-hydrate
+                // it (audit L-4).
+                let _ = l2.del(tenant_id, &h.to_ascii_lowercase()).await;
             }
         }
         removed
@@ -825,11 +829,29 @@ pub(crate) fn json_string_field<'a>(body: &'a str, field: &str) -> Option<&'a st
 /// Hex-encode a SHA-256 digest for the L2 key (no base64 dep needed).
 #[cfg(feature = "cluster-redis")]
 fn hex_digest(hash: &[u8; 32]) -> String {
+    // One owner for the digest -> hex-string form (audit L-1): the same string
+    // must address the L1 key, the L2 key and the invalidation stream payload.
     let mut out = String::with_capacity(64);
     for b in hash {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// The digest → hex-string form is `cluster-redis`-only in production code
+/// (`hex_digest` above), so this equivalence test is too.
+#[cfg(all(test, feature = "cluster-redis"))]
+mod hex_digest_tests {
+    /// The L2 key suffix and the stream digest are built by different call
+    /// paths; they must stay byte-identical.
+    #[test]
+    fn hex_digest_matches_the_shared_helper() {
+        let hash = hydra_core::auth::sha256_hex(b"sk-test");
+        assert_eq!(
+            super::hex_digest(&hash),
+            hydra_core::auth::sha256_hex_string(b"sk-test")
+        );
+    }
 }
 
 /// Parse a 64-char hex string into its 32 raw bytes (the inverse of

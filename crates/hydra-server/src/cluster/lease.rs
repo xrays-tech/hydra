@@ -82,7 +82,10 @@ impl LeaseStore for MemoryLeaseStore {
         lease_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().expect("lease mutex");
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = std::time::SystemTime::now();
             let expired = g.as_ref().map(|(_, expiry)| now >= *expiry).unwrap_or(true);
             if expired {
@@ -100,7 +103,10 @@ impl LeaseStore for MemoryLeaseStore {
         lease_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, LeaseError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().expect("lease mutex");
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = std::time::SystemTime::now();
             let ours = g
                 .as_ref()

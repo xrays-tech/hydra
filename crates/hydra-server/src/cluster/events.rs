@@ -51,11 +51,7 @@ pub struct InvalidationStream {
 /// level so both `publish` (hash at the boundary) and `apply_invalidation`
 /// (hash legacy `keys` on the spot for replay) share one implementation.
 fn sha256_hex_str(s: &str) -> String {
-    let mut out = String::with_capacity(64);
-    for b in hydra_core::auth::sha256_hex(s.as_bytes()) {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    hydra_core::auth::sha256_hex_string(s.as_bytes())
 }
 
 impl InvalidationStream {
@@ -122,9 +118,26 @@ impl InvalidationStream {
                     match k.as_str() {
                         "tenant" => tenant_id = Some(v),
                         // v=2: SHA-256 hex digests.
-                        "keyhashes" => keyhashes = v.split(',').map(str::to_string).collect(),
+                        // v=2: SHA-256 hex digests. An EMPTY field means "no
+                        // keys" (a whole-tenant clear), never one empty digest:
+                        // `"".split(',')` yields `[""]`, which made
+                        // `apply_invalidation` take the per-key branch and
+                        // invalidate nothing at all — silently (audit L-3).
+                        "keyhashes" => {
+                            keyhashes = v
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                        }
                         // v=1 legacy: plaintext keys (replayed, hashed at apply).
-                        "keys" => legacy_keys = v.split(',').map(str::to_string).collect(),
+                        "keys" => {
+                            legacy_keys = v
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                        }
                         _ => {}
                     }
                 }
@@ -495,6 +508,47 @@ mod tests {
         );
         assert_eq!(inv.keyhashes[0], sha256_hex_str("sk-secret-key"));
         assert!(inv.legacy_keys.is_empty(), "v=2 carries no legacy keys");
+    }
+
+    /// REVIEW L-3 — an empty `keyhashes` field must mean "no keys" (a
+    /// whole-tenant clear), not "one empty digest". `"".split(',')` yields
+    /// `[""]`, which used to take the per-key branch and invalidate NOTHING,
+    /// silently.
+    #[tokio::test]
+    async fn an_empty_keyhashes_field_is_a_whole_tenant_clear() {
+        let pool = pool().await;
+        let s = InvalidationStream::new(pool.clone());
+        // Hand-written XADD with an EMPTY keyhashes field (a foreign publisher,
+        // or a future one): the field is present but carries no digests.
+        let _: String = pool
+            .xadd(
+                EVENTS_KEY,
+                false,
+                None,
+                "*",
+                vec![("v", "2"), ("tenant", "t1"), ("keyhashes", "")],
+            )
+            .await
+            .expect("xadd");
+
+        let events = s.read_since("0", 10).await.expect("read");
+        assert_eq!(events.len(), 1);
+        let inv = &events[0].1;
+        assert!(
+            inv.keyhashes.is_empty(),
+            "an empty field must parse to NO digests, got {:?}",
+            inv.keyhashes
+        );
+
+        // And it clears the tenant's cached verdicts.
+        let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
+        assert_eq!(cache.len(), 1);
+        let cleared = apply_invalidation(&cache, inv, &["t1".to_string()]).await;
+        assert_eq!(cleared, 1, "a whole-tenant clear must drop the entry");
+        assert_eq!(cache.len(), 0);
     }
 
     #[tokio::test]

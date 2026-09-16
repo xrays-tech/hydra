@@ -318,13 +318,18 @@ impl<'de> Visitor<'de> for ModelValueAnyVisitor {
 /// [`ModelField::Absent`] is returned only for a well-formed root object that
 /// simply has no `"model"` member.
 ///
-/// **Cost note:** this is one full linear pass over the body (no first-hit
-/// early exit), because a top-level `"model"` only resolves unambiguously once
-/// the whole root object has been seen (a later duplicate must still be
-/// detected). The caller bounds the body by the 413 hard cap before calling
-/// here. A clean (escape-free) `model` value stays a zero-copy borrow; escaped
-/// values/keys and serde_json's own skipped-value scratch are the only
-/// allocations.
+/// **Cost note (measured):** this is one full linear pass over the body, with
+/// NO first-hit early exit, because a top-level `"model"` only resolves
+/// unambiguously once the whole root object has been seen (a later duplicate
+/// must still be detected). Cost scales with the body, not with where `model`
+/// sits: measured in release, ~0.09 ms/MB for a body whose payload is one large
+/// string and up to ~1.3 ms/MB for deeply nested or wide objects (the old
+/// hand-written scanner returned at the `model` member, i.e. tens of
+/// nanoseconds, so this is a real change in cost structure — for a typical
+/// 3-50 KB request it is a few microseconds). The caller bounds the body by the
+/// 413 hard cap (32 MiB) before calling here. A clean (escape-free) `model`
+/// value stays a zero-copy borrow; escaped values/keys and serde_json's own
+/// skipped-value scratch are the only allocations.
 #[must_use]
 pub fn extract_model_field(body: &[u8]) -> ModelField<'_> {
     let mut de = serde_json::Deserializer::from_slice(body);

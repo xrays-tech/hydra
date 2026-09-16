@@ -16,7 +16,7 @@
 |---|---|---|
 | ⚡ | **11,056 RPS** peak throughput | c=25, p99 = 4.39 ms |
 | 🪶 | **65 MiB** RSS under full load | 18.6 → 65.4 MiB; < 0.4% of a 16 GB box |
-| ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency |
+| ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency; the model-extraction pass is O(body) (~0.09-1.3 ms/MB), so multi-MB bodies add milliseconds |
 | 🛡️ | **0** production `unwrap`/`panic`/`unsafe` | both crates `#![forbid(unsafe_code)]` |
 | 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
 | 🧪 | **core 114 + server 173** tests, `clippy -D warnings` clean | CI hard gate |

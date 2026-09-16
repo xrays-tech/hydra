@@ -1502,6 +1502,11 @@ struct InvalidateRequest {
 struct InvalidateResponse {
     invalidated: usize,
     tenant_id: Option<String>,
+    /// L-6: whether the cluster-wide broadcast reached the invalidation stream.
+    /// `false` means remote nodes keep their cached verdict until it expires —
+    /// the LOCAL cache was still invalidated. A failed publish used to be a log
+    /// line plus a 200, so the caller could not tell the fleet was not told.
+    published: bool,
 }
 
 /// Cap on how many api-keys ONE invalidation request may name (review N4).
@@ -1593,6 +1598,8 @@ pub(super) async fn auth_cache_invalidate(
             total
         }
     };
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
+    let mut published = true;
     // Broadcast the invalidation cluster-wide (P4): every node drops the
     // affected local cache entries via the stream; the L2 entries they
     // re-hydrate from are gone too (they were deleted below on this node).
@@ -1606,6 +1613,7 @@ pub(super) async fn auth_cache_invalidate(
             .await
         {
             tracing::warn!(error = %e, "invalidation publish failed");
+            published = false;
         }
     }
     // Refresh the cache-size gauge after mutation.
@@ -1615,6 +1623,7 @@ pub(super) async fn auth_cache_invalidate(
         &InvalidateResponse {
             invalidated: count,
             tenant_id: req.tenant_id,
+            published,
         },
     )
 }
@@ -1692,6 +1701,10 @@ struct TenantCacheInvalidateRequest {
 /// authenticated tenant's own cached auth decisions — 欠费停机 / 付费恢复等
 /// 场景。The tenant id is NOT client-chosen here: the router resolved it from
 /// the access token and already verified it matches the URL's tenant_id.
+/// Whether the cluster-wide broadcast went out (L-6). `false` means remote
+/// nodes keep their cached verdict until it expires — the local cache was still
+/// invalidated.
+#[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut, unused_variables))]
 pub(super) async fn tenant_auth_cache_invalidate(
     state: &AdminState,
     session: &mut ServerSession,
@@ -1718,6 +1731,8 @@ pub(super) async fn tenant_auth_cache_invalidate(
         Some(keys) if !keys.is_empty() => state.auth.invalidate(tenant_id, keys).await,
         _ => state.auth.invalidate_tenant(tenant_id).await,
     };
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
+    let mut published = true;
     // Broadcast the invalidation cluster-wide (P4), mirroring the admin
     // auth-cache endpoint: every node drops the affected local cache entries.
     #[cfg(feature = "cluster-redis")]
@@ -1729,7 +1744,11 @@ pub(super) async fn tenant_auth_cache_invalidate(
             )
             .await
         {
+            // L-6: a failed broadcast used to be a log line and a 200 — the
+            // caller could not tell that remote nodes keep their stale verdict
+            // until the TTL expires. It is reported in the response now.
             tracing::warn!(error = %e, "invalidation publish failed");
+            published = false;
         }
     }
     metrics::record_auth_cache_size(state.auth.cache().len());
@@ -1738,6 +1757,7 @@ pub(super) async fn tenant_auth_cache_invalidate(
         &InvalidateResponse {
             invalidated: count,
             tenant_id: Some(tenant_id.to_string()),
+            published,
         },
     )
 }

@@ -1275,7 +1275,11 @@ impl WipedTable {
     /// The static `DELETE FROM …` statement for this variant. The whole
     /// statement is a compile-time literal — the table name is never
     /// interpolated at runtime, so there is no injection surface.
-    #[allow(unreachable_patterns)] // the `_` arm is an exhaustiveness guard
+    ///
+    /// Every variant is named: a future config table added to this enum must be
+    /// given a statement, and the compiler says so. (The previous `_ =>
+    /// unreachable!()` catch-all turned that compile error into a runtime panic
+    /// on the replica-restore path — audit L-2.)
     fn delete_stmt(self) -> &'static str {
         match self {
             WipedTable::LimitRole => "DELETE FROM limit_role",
@@ -1288,9 +1292,6 @@ impl WipedTable {
             // The first-wiped table is the match default branch (covers the
             // leading entry of the wipe order).
             WipedTable::ProviderKeyBinding => "DELETE FROM provider_key_binding",
-            // The enum is finite and every variant is named above, so this
-            // catch-all can never be reached.
-            _ => unreachable!("every wiped-table variant is named above"),
         }
     }
 }
