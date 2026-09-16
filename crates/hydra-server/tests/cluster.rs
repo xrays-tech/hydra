@@ -620,6 +620,168 @@ async fn old_reader_rejects_the_new_wire_unconditionally() {
 }
 
 // ===========================================================================
+// T4 / audit G9 — the snapshot PRODUCER must hold the lease.
+//
+// `internal_control` used to be protected by the cluster token ALONE: any node
+// holding that token could mint a snapshot, including one that had just lost
+// the lease while its heartbeat was still fresh. Edges following that node would
+// rebuild their replica from a stale producer. The lease gate (`503
+// not_leader`) simply did not exist.
+// ===========================================================================
+
+/// An admin state over a REAL DB-backed store (so `replication()` is `Some`),
+/// with the lease answer under the test's control.
+async fn control_state(
+    pool: &sqlx::SqlitePool,
+    store: &ConfigStore,
+    edge_mode: bool,
+    is_leader: Option<bool>,
+) -> Arc<AdminState> {
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(kp());
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+        is_leader.map(|v| Arc::new(move || v) as Arc<dyn Fn() -> bool + Send + Sync>);
+    Arc::new(AdminState::new(
+        Some(pool.clone()),
+        store.clone(),
+        auth,
+        breaker,
+        key_provider,
+        Some(ADMIN_TOKEN.to_string()),
+        AdmissionControl::new(),
+        edge_mode,
+        Some(CLUSTER_TOKEN.to_string()),
+        leader_ready,
+    ))
+}
+
+/// `GET /api/v1/internal/control?since=N` → (status, body).
+async fn control_get(port: u16, since: u64) -> (u16, serde_json::Value) {
+    let url = format!("http://127.0.0.1:{port}/api/v1/internal/control?since={since}");
+    let client = reqwest::Client::new();
+    for _ in 0..50 {
+        match client
+            .get(&url)
+            .header("authorization", format!("Bearer {CLUSTER_TOKEN}"))
+            .send()
+            .await
+        {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let body = r.json().await.unwrap_or(serde_json::Value::Null);
+                return (status, body);
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    panic!("admin server did not come up");
+}
+
+/// A candidate that lost (or never held) the lease must NOT hand out a snapshot
+/// — but the cheap "you are already current" answer stays available, because
+/// gating that would break the poll rhythm of every follower.
+#[tokio::test]
+async fn control_snapshot_requires_the_leader_lease() {
+    let leader_pool = common::setup_pool().await;
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(kp());
+    let store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
+        .await
+        .expect("load");
+    seed_and_reload(&leader_pool, &store).await;
+    let current = store.version();
+    assert!(current > 0, "fixture: the store has content");
+
+    // (a) Candidate WITHOUT the lease ⇒ 503 `not_leader`.
+    let standby = control_state(&leader_pool, &store, false, Some(false)).await;
+    let port = start_admin(standby);
+    let (status, body) = control_get(port, 0).await;
+    assert_eq!(status, 503, "a standby must not produce snapshots: {body}");
+    assert_eq!(body["error"]["code"], "not_leader", "got {body}");
+    assert!(
+        body.get("snapshot").is_none(),
+        "no snapshot may leak in an error body: {body}"
+    );
+
+    // (b) ...but `since >= current` is answered normally (cheap path, no lease
+    //     gate): this is what keeps a follower's poll a no-op instead of an
+    //     error storm while the fleet has no leader.
+    let (status, body) = control_get(port, current).await;
+    assert_eq!(status, 200, "got {body}");
+    assert_eq!(body["version"].as_u64(), Some(current));
+    assert_eq!(body["snapshot"], serde_json::Value::Null, "no payload sent");
+    let (status, body) = control_get(port, current + 10).await;
+    assert_eq!(status, 200, "a follower AHEAD of us is still fine: {body}");
+    assert_eq!(body["snapshot"], serde_json::Value::Null);
+
+    // (c) Candidate HOLDING the lease ⇒ a real snapshot, versioned from the SAME
+    //     atomic read as the cheap path.
+    let holder = control_state(&leader_pool, &store, false, Some(true)).await;
+    let port = start_admin(holder);
+    let (status, body) = control_get(port, 0).await;
+    assert_eq!(status, 200, "the lease holder serves the snapshot: {body}");
+    assert_eq!(body["version"].as_u64(), Some(current));
+    assert!(
+        body["snapshot"].is_object(),
+        "the payload is present for a behind follower: {body}"
+    );
+    assert_eq!(
+        body["snapshot"]["version"].as_u64(),
+        Some(current),
+        "the wire version equals the version we advertised"
+    );
+
+    // (d) Candidate with NO election wired (`leader_ready: None`, the
+    //     single-node/`all` shape) keeps serving — pre-existing behaviour.
+    let all = control_state(&leader_pool, &store, false, None).await;
+    let port = start_admin(all);
+    let (status, body) = control_get(port, 0).await;
+    assert_eq!(status, 200, "no election ⇒ no lease gate: {body}");
+    assert!(body["snapshot"].is_object(), "got {body}");
+}
+
+/// A non-candidate (edge) gets the PRE-EXISTING 404 "edge node: no admin API"
+/// from the router, before dispatch — and crucially it does not panic (the
+/// endpoint must never reach a `.expect` on a missing pool).
+#[tokio::test]
+async fn control_snapshot_on_an_edge_is_404_and_does_not_panic() {
+    let leader_pool = common::setup_pool().await;
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(kp());
+    let store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
+        .await
+        .expect("load");
+    seed_and_reload(&leader_pool, &store).await;
+
+    // edge_mode + `leader_ready: Some(true)`: even a node that THINKS it holds
+    // the lease is not a candidate when it is an edge.
+    let edge = control_state(&leader_pool, &store, true, Some(true)).await;
+    let port = start_admin(edge);
+    let (status, body) = control_get(port, 0).await;
+    assert_eq!(status, 404, "edge has no admin API: {body}");
+    assert_eq!(body["error"]["code"], "not_found", "got {body}");
+    assert_eq!(
+        body["error"]["message"], "edge node: no admin API",
+        "the pre-existing edge response, unchanged: {body}"
+    );
+
+    // The service is still alive (a panic would have killed the connection and
+    // the second call would fail): the probe endpoint answers.
+    let client = reqwest::Client::new();
+    let r = client
+        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .send()
+        .await
+        .expect("edge stays up");
+    assert_eq!(r.status().as_u16(), 200);
+}
+
+// ===========================================================================
 // P2 — leader election & standby replica
 // ===========================================================================
 

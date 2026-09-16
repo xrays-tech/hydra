@@ -177,6 +177,38 @@ pub(super) async fn internal_control(
             },
         );
     }
+
+    // Only a node that HOLDS THE LEASE may speak for the cluster. A non-leader
+    // (or one whose lease just lapsed while its heartbeat is still fresh) must
+    // not hand out a snapshot: edges would follow a stale producer and rebuild
+    // their replica from it.
+    //
+    // `is_leader_candidate()` is the role/eligibility gate (`!edge_mode`): an
+    // edge gets the pre-existing 404 "edge node: no admin API" from
+    // `AdminService::response` BEFORE dispatch, so this branch is defence in
+    // depth — it exists so a future role that keeps the admin API without being
+    // a leader candidate cannot serve snapshots by omission.
+    if !state.is_leader_candidate() {
+        return err_json(
+            404,
+            "not_found",
+            "the control snapshot endpoint is only served by leader-candidate nodes",
+            trace_id,
+        );
+    }
+    // `leader_ready` is `Some` only on leader candidates. This is the gate that
+    // did not exist at all before T4.
+    if let Some(is_leader) = state.leader_ready.as_ref() {
+        if !is_leader() {
+            return err_json(
+                503,
+                "not_leader",
+                "this node does not hold the leader lease; retry against the active leader",
+                trace_id,
+            );
+        }
+    }
+
     match SnapshotWire::build(content, state.key_provider.as_ref()).await {
         Ok(snapshot) => ok_json(
             200,

@@ -162,6 +162,24 @@ impl AdminState {
             .expect("admin SQLite pool (leader mode only)")
     }
 
+    /// Whether this node may act as a cluster LEADER CANDIDATE.
+    ///
+    /// Defined as `!edge_mode` on purpose. `AdminState` carries no role field,
+    /// and under `--features server` (no `cluster-redis`) the cluster registry
+    /// is an `Option<()>` that cannot be read for a role at all. `edge_mode` is
+    /// present in every build and means exactly "data-plane node: no admin
+    /// CRUD", i.e. not a candidate.
+    ///
+    /// The single-node `all` role is NOT an edge, so it remains a candidate and
+    /// keeps serving control snapshots — the pre-existing behaviour.
+    ///
+    /// NOTE: this is the role/eligibility half only. Whether the node currently
+    /// HOLDS the lease is a separate question answered by `leader_ready`.
+    #[must_use]
+    pub fn is_leader_candidate(&self) -> bool {
+        !self.edge_mode
+    }
+
     /// Resolve the URL admin mutations should be forwarded to: the ACTUAL
     /// lease holder from the cluster registry (cluster P3/P4). The target is
     /// resolved LIVE at forward time — never from a static
