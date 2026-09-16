@@ -627,7 +627,7 @@ pub struct SelectedRoute {
 
 - **路径前缀非 `/v1/`**（如健康检查、webhook 回调）或 body 无 `model` 字段：
   - 默认策略 **`passthrough`**：不走路由算法，**按域名→租户→该租户任一可用 provider 直连**（首选权重最高且非 dead），仅做认证与限流；
-  - 由配置 `[proxy] non_route_strategy = "passthrough" | "reject"` 控制；`reject` → 400；
+  - 由环境变量 **`HYDRA_NON_ROUTE_STRATEGY=passthrough|reject`**（大小写不敏感，未设置 = `passthrough`）控制；`reject` → `400 no_model_field`。**已接线**：`main.rs::non_route_strategy_from_env()` 读取并写入 `ProxyConfig`；取值非法会**启动失败**（而不是静默回落到 passthrough——否则运维会以为安全开关已生效）。注意 `[proxy] non_route_strategy` 这个**配置段写法从未被读取过**（历史遗留的幽灵开关，见审核二 M-8 / C3），不要再照抄；
   - 用例：OpenAI 兼容客户端的 `/health` 等无需 model 路由的请求。
   - **例外（新，design-tenant-model-catalog §2.2 + dev-docs/aegis/plans/2026-09-08-public-models-catalog.md）**：`GET /v1/models` 不再直通——**无条件公开**在本地聚合应答**该租户可调用模型目录**（跨授权 provider 并集 × 租户模型白名单 × 在线 provider 过滤，OpenAI 兼容形状；带不带 api-key 均可读——2026-09-09 起出示的 key 不再走外部鉴权，仅按前缀绑定收窄目录；聊天等调用仍须 api-key）；管理面另提供只读配置全集 `GET /api/v1/tenants/{tenant_id}/models`。
 
@@ -1326,6 +1326,8 @@ threads        = 0                 # 0 = CPU 核数
 max_request_body       = "8MiB"    # 软上限：超此停止 Vec<Bytes> 重放累积 → 禁用该请求故障转移（body 仍零拷贝转发）
 max_request_body_hard  = "32MiB"   # 硬上限：超此直接 413
 non_route_strategy     = "passthrough"  # passthrough | reject
+# ⚠️ 上面这行是历史遗留的「幽灵开关」：loader 从未读取它。实际开关是环境变量
+# HYDRA_NON_ROUTE_STRATEGY（已接线，取值非法则启动失败）；见审核二 C3。
 
 [failover]
 retry_after_connect = false        # 默认 false（安全）；true 接受重复计费风险

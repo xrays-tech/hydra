@@ -101,6 +101,36 @@ fn leader_lease_ms_from_env() -> Result<u64, String> {
     Ok(ms)
 }
 
+/// `HYDRA_NON_ROUTE_STRATEGY` = `passthrough` | `reject` (case-insensitive).
+///
+/// What happens to a request that carries no `model` at all (a well-formed JSON
+/// object with no such member — a request Hydra could NOT parse is rejected
+/// outright, see `ModelField::Malformed`). `passthrough` forwards it to the
+/// tenant's first live provider; `reject` answers `400 no_model_field`, which is
+/// the only operator-facing backstop against a request reaching a provider
+/// without the tenant model whitelist having been consulted.
+///
+/// Until now the documented `[proxy] non_route_strategy` was a ghost switch:
+/// `main.rs` built `ProxyConfig::default()` and nothing ever read it, so
+/// `Reject` was unreachable in the shipped binary (review M-8 / C3).
+///
+/// Unset → `passthrough` (the historical default). Anything else, including an
+/// unknown word, FAILS STARTUP: an operator who typed `reject` and got a silent
+/// fallback to `passthrough` would believe a safety control was on.
+fn non_route_strategy_from_env() -> Result<hydra_server::proxy::config::NonRouteStrategy, String> {
+    use hydra_server::proxy::config::NonRouteStrategy;
+    match std::env::var("HYDRA_NON_ROUTE_STRATEGY") {
+        Err(_) => Ok(NonRouteStrategy::Passthrough),
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "passthrough" => Ok(NonRouteStrategy::Passthrough),
+            "reject" => Ok(NonRouteStrategy::Reject),
+            other => Err(format!(
+                "HYDRA_NON_ROUTE_STRATEGY={other:?} is not a known strategy (expected \"passthrough\" or \"reject\")"
+            )),
+        },
+    }
+}
+
 fn main() {
     // (1) Tracing.
     let _ = tracing_subscriber::fmt::Subscriber::builder()
@@ -368,7 +398,13 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // (2e) Build shared app state. In cluster mode the breaker announces its
     // local trips to the cluster (shared votes) and converges on the
     // cluster-wide dead-set via the sync task (P4).
-    let proxy_cfg = ProxyConfig::default();
+    // C3: the documented non-route strategy is now actually read (it was a
+    // ghost switch, so `Reject` could not be configured at all).
+    let proxy_cfg = ProxyConfig {
+        non_route_strategy: non_route_strategy_from_env()
+            .map_err(Box::<dyn std::error::Error>::from)?,
+        ..ProxyConfig::default()
+    };
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
     let mut breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(
         proxy_cfg.breaker.threshold,
@@ -905,5 +941,57 @@ mod tests {
         }
 
         std::env::remove_var("HYDRA_LEADER_LEASE_MS");
+    }
+}
+
+/// C3: the non-route strategy parser. NOT gated on `cluster-redis` — the proxy
+/// config exists in every build, and this switch is the backstop that keeps a
+/// model-less request away from a provider.
+#[cfg(test)]
+mod non_route_strategy_tests {
+    use super::non_route_strategy_from_env;
+    use hydra_server::proxy::config::NonRouteStrategy;
+
+    #[test]
+    fn non_route_strategy_env_is_validated() {
+        std::env::remove_var("HYDRA_NON_ROUTE_STRATEGY");
+        assert_eq!(
+            non_route_strategy_from_env(),
+            Ok(NonRouteStrategy::Passthrough),
+            "unset keeps the historical default"
+        );
+
+        std::env::set_var("HYDRA_NON_ROUTE_STRATEGY", "reject");
+        assert_eq!(non_route_strategy_from_env(), Ok(NonRouteStrategy::Reject));
+
+        std::env::set_var("HYDRA_NON_ROUTE_STRATEGY", "REJECT");
+        assert_eq!(
+            non_route_strategy_from_env(),
+            Ok(NonRouteStrategy::Reject),
+            "case-insensitive"
+        );
+
+        std::env::set_var("HYDRA_NON_ROUTE_STRATEGY", " reject ");
+        assert_eq!(
+            non_route_strategy_from_env(),
+            Ok(NonRouteStrategy::Reject),
+            "surrounding whitespace is tolerated"
+        );
+
+        std::env::set_var("HYDRA_NON_ROUTE_STRATEGY", "passthrough");
+        assert_eq!(
+            non_route_strategy_from_env(),
+            Ok(NonRouteStrategy::Passthrough)
+        );
+
+        for bad in ["rejct", "deny", "false", "1", ""] {
+            std::env::set_var("HYDRA_NON_ROUTE_STRATEGY", bad);
+            assert!(
+                non_route_strategy_from_env().is_err(),
+                "HYDRA_NON_ROUTE_STRATEGY={bad:?} must fail startup, not silently pass through"
+            );
+        }
+
+        std::env::remove_var("HYDRA_NON_ROUTE_STRATEGY");
     }
 }

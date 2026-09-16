@@ -197,6 +197,15 @@ fn ephemeral_port() -> u16 {
 
 /// Build the full AppState from a seeded pool + auth URL.
 async fn build_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
+    build_state_with_proxy_config(pool, ProxyConfig::default()).await
+}
+
+/// Same, with an explicit proxy runtime config (review C3: drive
+/// `non_route_strategy` the way the env parser now does).
+async fn build_state_with_proxy_config(
+    pool: &sqlx::SqlitePool,
+    proxy: ProxyConfig,
+) -> Arc<AppState> {
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
@@ -218,7 +227,7 @@ async fn build_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
         limiter,
         admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
+        proxy,
     })
 }
 
@@ -3233,4 +3242,83 @@ async fn bodied_request_outside_v1_is_rejected() {
         1,
         "only the control request may reach the upstream; got {posts:#?}"
     );
+}
+
+// ===========================================================================
+// REVIEW C3 — `non_route_strategy` is now configurable, and `Reject` works.
+//
+// The documented `[proxy] non_route_strategy` was a ghost switch: `main.rs`
+// built `ProxyConfig::default()` and nothing read it, so the only operator-side
+// backstop against a model-less request reaching a provider (bypassing the
+// tenant model whitelist) could not be enabled at all. This test drives the
+// strategy the env parser now produces (see `non_route_strategy_tests` for the
+// parsing itself).
+// ===========================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_route_strategy_reject_refuses_a_model_less_body() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "whatever",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+
+    // (1) Reject: a well-formed body with NO model member is refused, and the
+    //     upstream is never called.
+    let reject_cfg = ProxyConfig {
+        non_route_strategy: hydra_server::proxy::config::NonRouteStrategy::Reject,
+        ..ProxyConfig::default()
+    };
+    let state = build_state_with_proxy_config(&pool, reject_cfg).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(&client, &url, r#"{"messages":[]}"#).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "HYDRA_NON_ROUTE_STRATEGY=reject must refuse a model-less body"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("no_model_field"), "body: {body}");
+    let hits = upstream.received_requests().await.expect("recording on");
+    assert!(
+        hits.iter().all(|r| r.method.as_str() != "POST"),
+        "a rejected model-less request must not reach the upstream"
+    );
+
+    // (2) The default (passthrough) still forwards it — the switch adds an
+    //     option, it does not change the historical default.
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let resp = send_until_ready(&client, &url, r#"{"messages":[]}"#).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the default Passthrough must keep working"
+    );
+    let _ = resp.text().await;
 }
