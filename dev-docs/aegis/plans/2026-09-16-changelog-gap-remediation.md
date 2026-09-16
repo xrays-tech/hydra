@@ -3599,3 +3599,49 @@ bash scripts/ask_llm.test.sh
 
 **本次未做（不属 Batch 1）**：`.sqlx/` 无需再次重生成（新增代码只用运行时 `sqlx::query`，未新增宏 SQL）；未触碰 T2/T3/T4 的任何文件；Phase 0 的纯搬移与 Batch 1 落在**同一次提交**（Phase 0 的逐字搬移证据已在上面记录，且 `restore_config`/`cluster_api` 两个新文件随后被 Batch 1 修改，无法再切成一个可编译的纯搬移提交）。
 
+### Batch 2 记录（T2 — 节点注册表陈旧行回收，G2）
+
+**实现（完全按 v2 规范正文：值格式不变 + 独立见证键）**
+
+| 文件 | 改动 |
+|---|---|
+| `cluster/registry.rs` | 新增 `SEEN_PREFIX = "hydra:{node:seen}:"` + 私有 `seen_key()`；`register(ttl_secs, seen_ttl_secs)`（**注册与续期唯一入口**，写行 + 心跳 + 见证键）；**删除** `refresh_heartbeat`；新增 `sweep_stale()`（判据 = 心跳缺失 **且** 见证键缺失，**永不回收当前 lease holder**，一次 `HDEL` 批删）；`unregister()` 同时删除见证键 |
+| `cluster/mod.rs` | 新增纯函数 `node_id_from(node_id_env, hostname_env)`（`HYDRA_NODE_ID` → `HOSTNAME` → 随机），并**接到** `ClusterConfig::from_env` 的真实身份生产点（F12 的接线，不再是 claim-only） |
+| `main.rs` | 启动 `reg.register(30, grace)`（保留 `?` fail-fast）；20s 续期改调 `register`（旧路径只续心跳、**永不重写行**）；新增 60s 回收任务（回收 + 发布 `hydra_registry_nodes` 存活/离线分布）；新增 `registry_stale_grace_secs()`（`HYDRA_REGISTRY_STALE_GRACE_SECS`，默认 120，`<= 0` 视为未设）；新增 `spawn_registry_unregister_on_shutdown()`（pingora 的 SIGTERM 走 `process::exit(0)`，不跑析构） |
+| `admin/metrics.rs` | 新增 `hydra_registry_nodes{state}`（gauge，带 `alive|dead`）与 `hydra_registry_reaped_total`（counter）+ 两个 `record_*` 助手；导入补 `register_int_counter` / `IntCounter`；catalogue 表补两行 |
+| 调用点适配 | `register` 由 1 参变 2 参：`control_client.rs`（3 处）、`forward.rs`（2 处）、`tests/cluster.rs`（2 处）、`registry.rs` 既有单测（3 处）——共 10 处，全部同步 |
+| 测试 | 新增 `tests/registry_reaping.rs`（**首行 `#![cfg(feature = "cluster-redis")]`**，6 例）+ `registry.rs` 单测 4 例 + `cluster/mod.rs` 的 `node_id_from` 三档回退单测 |
+
+**"改前失败"证据的性质说明（本 Task 与前三个 Task 不同）**：T2 的缺陷是**整条路径不存在**，而不是"存在但行为错"，因此新用例在改前**无法编译**（没有 `sweep_stale`，且 `register` 只有 1 个参数），无法像 Batch 1 那样用"临时改回旧实现"取证。本 Task 留的是**静态可复算的证据**，两条都在 HEAD 上取证：
+
+```bash
+git grep -n "unregister" HEAD -- crates/ | grep -v "src/cluster/registry.rs"
+# ⇒ 唯一命中是 forward.rs:251 的一句测试断言文案 —— 生产代码里**没有任何调用点**
+#   （审核原文："`unregister()` 无生产调用点"）⇒ 不存在删除路径 ⇒ 症状必然复现。
+git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
+# ⇒ `refresh_heartbeat` 只 SET 心跳键，**不碰 hash 行**；而 `register` 只在启动调一次
+#   ⇒ 行值永久停在启动时的 role/control_url（续期不重写行，文档所述设计下不可能发生）。
+```
+改动后的行为由 `register_rewrites_the_row_on_every_renewal`（注册后再以新 role/url 续期 ⇒ 行被重写、发现集随之改变）与 `sweep_*` 五例覆盖。
+
+**验收逐条对照**
+
+| 验收项 | 用例 |
+|---|---|
+| 心跳存在 ⇒ 永不回收 | `sweep_never_reaps_a_live_node` |
+| 心跳缺失但见证键存在 ⇒ 不回收 | `sweep_spares_a_node_within_the_grace_window` |
+| 两者都缺失 ⇒ 回收 | `sweep_reaps_the_dead_but_never_the_lease_holder` |
+| 当前 lease holder **永不**回收（即使心跳缺失） | 同上 + `sweep_spares_the_lease_holder_but_reaps_the_dead`（并断言 `active_leader_url()` 正是靠这行仍能解析） |
+| 旧两段式行（无见证键）⇒ 心跳缺失时被回收（清理历史积压） | `sweep_clears_the_legacy_backlog`（12 行旧格式，10 行心跳缺失 ⇒ 一次回收 10，存活 2 + self 保留，再扫为 0） |
+| 值格式**未变**，三个读者在旧格式下行为一致 | `the_registry_value_format_is_frozen`（直接断言 Redis 里就是 `leader\|http://a:8081` 字节）+ `legacy_rows_still_parse_for_every_reader`（手写旧格式行：`leader_control_urls` / `active_leader_url` / `list_nodes` 全部照常工作） |
+| `node_id_from` 三档回退各有单测 + `from_env` 确实调用它 | `cluster::tests::node_id_prefers_explicit_then_hostname_then_random`（含空串视为未设、随机 id 不重复）；接线的唯一性由 `from_env` 内那一行调用保证（不新增 `NodeRole::parse` —— 值格式未变，role 仍是字符串比较） |
+| `refresh_heartbeat` 已无引用 | `grep -rn "refresh_heartbeat" crates/` ⇒ 命中仅剩 3 处**文档注释**（说明退役原因），**无代码引用** |
+
+> ⚠️ 开发中发现的测试环境事实（已写入 `tests/registry_reaping.rs` 头注释）：`common::real_redis_pool(db)` 会 flush 它给的库，而**同一测试二进制内的用例是并行执行的** ⇒ 同一文件里各用例必须各用一个库索引（本文件用 44–48；41/42/43 已被 `admin_api.rs`/`cluster.rs` 占用），否则会互相 flush 掉对方的数据。第一版正是这样失败的（`renewal_*` 里出现了别的用例写的 `http://a:8081`）。
+
+**门禁证据（Batch 2 完结时）**
+
+- `cargo fmt --all --check` ⇒ **clean**
+- 两种 clippy 均 **0 warning**：`--features hydra-server/server` 与 `--features hydra-server/server,hydra-server/cluster-redis`
+- `SQLX_OFFLINE=true cargo test -p hydra-server --features server` ⇒ **27 个套件 0 failed**（库 96 + `node_id_from` 单测）
+- `HYDRA_TEST_REDIS_URL=…:6380 SQLX_OFFLINE=true cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse` ⇒ **累计 398 passed、0 failed**（Batch 1 时为 386，本批 +12）

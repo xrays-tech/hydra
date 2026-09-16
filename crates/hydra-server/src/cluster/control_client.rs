@@ -313,7 +313,7 @@ mod tests {
             crate::cluster::NodeRole::Leader,
             "http://leader-a:8081".into(),
         );
-        leader.register(60).await.expect("register leader");
+        leader.register(60, 120).await.expect("register leader");
 
         let client = ControlClient::new(
             ControlClientConfig {
@@ -363,8 +363,8 @@ mod tests {
             crate::cluster::NodeRole::Leader,
             "http://b:8081".into(),
         );
-        a.register(60).await.expect("register a");
-        b.register(60).await.expect("register b");
+        a.register(60, 120).await.expect("register a");
+        b.register(60, 120).await.expect("register b");
 
         let client = ControlClient::new(
             ControlClientConfig {
@@ -412,7 +412,7 @@ mod tests {
             crate::cluster::NodeRole::Leader,
             "http://leader-a:8081".into(),
         );
-        leader.register(60).await.expect("register leader");
+        leader.register(60, 120).await.expect("register leader");
         // leader-a holds the leader lease.
         let _: Option<String> = pool
             .set(crate::redis::LEASE_KEY, "leader-a", None, None, false)

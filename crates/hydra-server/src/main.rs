@@ -371,14 +371,52 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 role,
                 public_url.clone().unwrap_or_default(),
             ));
-            reg.register(30).await?;
+            // Best-effort de-registration on shutdown, so a clean restart does
+            // not leave a row behind for the reaper to clean up later.
+            spawn_registry_unregister_on_shutdown((*reg).clone());
+            // Register once and FAIL FAST: a node that cannot register must not
+            // look healthy to the cluster (audit §3). The renewal loop below
+            // must not re-register before its first interval elapses —
+            // `tokio::time::interval` fires immediately, hence the leading
+            // `tick.tick().await`.
+            let grace = registry_stale_grace_secs();
+            reg.register(30, grace).await?;
             let reg2 = reg.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let _ = reg2.refresh_heartbeat(30).await;
+                    // `register`, NOT a heartbeat-only refresh: renewal must
+                    // rewrite the row too, or a node whose role/control_url
+                    // changed after boot advertises the boot-time value forever.
+                    if let Err(e) = reg2.register(30, grace).await {
+                        tracing::warn!(error = %e, "node registry: renew failed");
+                    }
+                }
+            });
+            // The reaper: without it nothing ever deletes a registry row (the
+            // 113-rows/108-offline symptom — there was no delete path at all).
+            let reaper = reg.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    match reaper.sweep_stale().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            hydra_server::admin::metrics::record_registry_reaped(n as u64);
+                            info!(reaped = n, "node registry: reaped stale rows");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "node registry: sweep failed"),
+                    }
+                    if let Ok(nodes) = reaper.list_nodes().await {
+                        let alive = nodes.iter().filter(|n| n.alive).count();
+                        hydra_server::admin::metrics::record_registry_nodes(
+                            alive as i64,
+                            (nodes.len() - alive) as i64,
+                        );
+                    }
                 }
             });
             info!(node_id = %cluster.node_id, "node registered in the cluster registry");
@@ -1047,6 +1085,48 @@ fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
         }
         sink.shutdown().await;
         info!("usage sinks flushed");
+    });
+}
+
+/// How long a node may go without re-registering before its row becomes
+/// reapable (`HYDRA_REGISTRY_STALE_GRACE_SECS`, default 120).
+///
+/// This value is used ONLY here, at registration time: it is the TTL of the
+/// witness key that `register` writes. The reaper itself does no time
+/// arithmetic — Redis expiry is what makes a row reapable, so there is no
+/// timestamp comparison and no clock-skew handling anywhere.
+#[cfg(feature = "cluster-redis")]
+fn registry_stale_grace_secs() -> u64 {
+    std::env::var("HYDRA_REGISTRY_STALE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0) // 0 would make every row instantly reapable
+        .unwrap_or(120)
+}
+
+/// Best-effort registry de-registration on shutdown. Mirrors
+/// [`spawn_sink_flush_on_shutdown`]: pingora's SIGTERM path ends in
+/// `process::exit(0)`, which runs no destructors, so this is the only chance to
+/// remove our row (otherwise a clean restart leaves a row for the reaper).
+#[cfg(feature = "cluster-redis")]
+fn spawn_registry_unregister_on_shutdown(reg: hydra_server::cluster::registry::NodeRegistry) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let (Ok(mut term), Ok(mut interrupt)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            tracing::warn!("cannot listen for shutdown signals; the registry row stays behind");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        if let Err(e) = reg.unregister().await {
+            tracing::warn!(error = %e, "node registry: unregister on shutdown failed");
+        }
     });
 }
 

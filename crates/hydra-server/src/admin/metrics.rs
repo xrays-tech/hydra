@@ -36,6 +36,8 @@
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
+//! | `hydra_registry_nodes` | gauge | state | node registry reaper (alive\|dead rows) |
+//! | `hydra_registry_reaped_total` | counter | — | node registry reaper (stale rows removed) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -47,8 +49,8 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
-    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 use serde::Serialize;
 
@@ -115,6 +117,12 @@ struct Metrics {
     /// Config combinations that leave certificates unserved or a configured
     /// port unusable, by kind. Non-zero means an operator decision is missing.
     listener_misconfig: IntCounterVec,
+    // ── Node registry (cluster P4 → 审核 G2) ────────────────────────────
+    /// Registry rows by liveness (`state="alive"|"dead"`). A growing `dead`
+    /// series is the "113 rows, 108 offline" symptom in a queryable form.
+    registry_nodes: IntGaugeVec,
+    /// Total registry rows reaped as stale (no heartbeat AND no seen marker).
+    registry_reaped_total: IntCounter,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -294,6 +302,17 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_listener_misconfig_total",
                 "Listener configuration that leaves certs unserved or a port unusable, by kind",
                 &["kind"]
+            )
+            .ok()?,
+            registry_nodes: register_int_gauge_vec!(
+                "hydra_registry_nodes",
+                "Nodes in the registry, by liveness state (alive|dead)",
+                &["state"]
+            )
+            .ok()?,
+            registry_reaped_total: register_int_counter!(
+                "hydra_registry_reaped_total",
+                "Registry rows reaped as stale (no heartbeat and no seen marker)"
             )
             .ok()?,
         })
@@ -512,6 +531,21 @@ pub fn record_control_poll(result: &str) {
 pub fn record_control_snapshot_version(version: u64) {
     if let Some(m) = metrics() {
         m.control_snapshot_version.set(version as i64);
+    }
+}
+
+/// Publish the registry liveness split (called by the reaper each tick).
+pub fn record_registry_nodes(alive: i64, dead: i64) {
+    if let Some(m) = metrics() {
+        m.registry_nodes.with_label_values(&["alive"]).set(alive);
+        m.registry_nodes.with_label_values(&["dead"]).set(dead);
+    }
+}
+
+/// Count registry rows reaped as stale.
+pub fn record_registry_reaped(n: u64) {
+    if let Some(m) = metrics() {
+        m.registry_reaped_total.inc_by(n);
     }
 }
 

@@ -6,8 +6,18 @@
 //! for special cases).
 //!
 //! **Keys** (single-key operations, topology-safe): `hydra:{nodes}` (hash
-//! `node_id → "role|control_url"`) and `hydra:{node:hb}:<id>` (heartbeat with
-//! TTL; a node whose heartbeat expired is considered gone).
+//! `node_id → "role|control_url"`), `hydra:{node:hb}:<id>` (heartbeat with TTL;
+//! a node whose heartbeat expired is considered gone) and `hydra:{node:seen}:<id>`
+//! (the "last seen" witness whose TTL **is** the reaping grace window).
+//!
+//! **The registry hash VALUE FORMAT IS FROZEN** (`role|control_url`). It is the
+//! one shape a not-yet-upgraded node parses: appending anything to the value
+//! would glue it onto `control_url` (breaking that peer's forward target), and
+//! prefixing a version tag would make `role == "v2"`, which `active_leader_url`
+//! resolves to `None` ⇒ **every standby admin write answers 503**. Liveness
+//! evidence therefore lives in a SEPARATE key, and reaping is decided by key
+//! existence alone (Redis expires the witness; no timestamp arithmetic, no
+//! clock-skew handling).
 
 use fred::clients::Pool;
 use fred::prelude::*;
@@ -19,6 +29,9 @@ use crate::redis::RedisError;
 pub const NODES_KEY: &str = "hydra:{nodes}";
 /// Heartbeat key prefix (suffix = node id).
 pub const HEARTBEAT_PREFIX: &str = "hydra:{node:hb}:";
+/// "Last seen" witness key prefix (suffix = node id). See the module docs for
+/// why this is not encoded in the hash value.
+pub const SEEN_PREFIX: &str = "hydra:{node:seen}:";
 
 /// A registered node's record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,9 +93,18 @@ impl NodeRegistry {
         }
     }
 
-    /// Register this node + write a heartbeat (`ttl_secs`; the caller
-    /// refreshes periodically).
-    pub async fn register(&self, ttl_secs: u64) -> Result<(), RedisError> {
+    /// Register this node AND renew it — the ONLY entry point for both.
+    ///
+    /// One entry point so a node whose `role` or `control_url` changed after
+    /// boot cannot keep advertising the boot-time value while looking healthy:
+    /// the previous split (`register` once at startup, `refresh_heartbeat`
+    /// every 20s) renewed only the heartbeat, so the hash row was written
+    /// exactly once per process lifetime.
+    ///
+    /// Writes three things: the row (value format unchanged — see module docs),
+    /// the 30s heartbeat (liveness), and the `seen_ttl_secs` witness marker
+    /// (the reaping grace window).
+    pub async fn register(&self, ttl_secs: u64, seen_ttl_secs: u64) -> Result<(), RedisError> {
         let value = format!("{}|{}", self.role, self.control_url);
         let _: i64 = self
             .pool
@@ -98,6 +120,16 @@ impl NodeRegistry {
                 false,
             )
             .await?;
+        let _: Option<String> = self
+            .pool
+            .set(
+                seen_key(&self.node_id),
+                "1",
+                Some(fred::types::Expiration::EX(seen_ttl_secs as i64)),
+                None,
+                false,
+            )
+            .await?;
         Ok(())
     }
 
@@ -105,22 +137,54 @@ impl NodeRegistry {
     pub async fn unregister(&self) -> Result<(), RedisError> {
         let _: i64 = self.pool.hdel(NODES_KEY, &self.node_id).await?;
         let _: i64 = self.pool.del(heartbeat_key(&self.node_id)).await?;
+        let _: i64 = self.pool.del(seen_key(&self.node_id)).await?;
         Ok(())
     }
 
-    /// Refresh this node's heartbeat.
-    pub async fn refresh_heartbeat(&self, ttl_secs: u64) -> Result<(), RedisError> {
-        let _: Option<String> = self
-            .pool
-            .set(
-                heartbeat_key(&self.node_id),
-                "1",
-                Some(fred::types::Expiration::EX(ttl_secs as i64)),
-                None,
-                false,
-            )
-            .await?;
-        Ok(())
+    /// Reap registry rows that are PROVABLY dead.
+    ///
+    /// A row is reaped only when the 30s heartbeat is GONE **and** the
+    /// grace-TTL witness is GONE — i.e. this node has not registered for longer
+    /// than the grace window. Both conditions are key-existence checks in
+    /// Redis, so the grace window is enforced by Redis expiry rather than by
+    /// clock arithmetic here.
+    ///
+    /// The current lease holder is NEVER reaped, even with a missing heartbeat:
+    /// `active_leader_url()` does not consult the heartbeat, so deleting that
+    /// row would remove the only forward pointer a standby has to the active
+    /// writer (every admin write would then 503).
+    ///
+    /// Rows written by a not-yet-upgraded node carry no witness key, so for
+    /// them the predicate reduces to "heartbeat absent" — the same condition
+    /// `leader_control_urls()` already uses to skip a node. That is what lets
+    /// the pre-existing backlog actually be cleaned after an upgrade.
+    ///
+    /// Returns the number of rows removed.
+    pub async fn sweep_stale(&self) -> Result<usize, RedisError> {
+        let holder = self.lease_holder().await?;
+        let all: Vec<(String, String)> = self.pool.hgetall(NODES_KEY).await?;
+        let mut doomed: Vec<String> = Vec::new();
+
+        for (node_id, _raw) in all {
+            if Some(node_id.as_str()) == holder.as_deref() {
+                continue; // the current lease holder is never reaped
+            }
+            if self.node_alive(&node_id).await? {
+                continue; // live — never reap
+            }
+            let seen: i64 = self.pool.exists(seen_key(&node_id)).await?;
+            if seen == 0 {
+                doomed.push(node_id);
+            }
+        }
+
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let refs: Vec<&str> = doomed.iter().map(String::as_str).collect();
+        // One HDEL round trip for the whole batch.
+        let _: i64 = self.pool.hdel(NODES_KEY, refs).await?;
+        Ok(doomed.len())
     }
 
     /// The control URLs of LIVE nodes with `role == "leader"` (the poll
@@ -214,6 +278,11 @@ fn heartbeat_key(node_id: &str) -> String {
     format!("{HEARTBEAT_PREFIX}{node_id}")
 }
 
+/// The "last seen" witness key for a node id. Its TTL is the grace window.
+fn seen_key(node_id: &str) -> String {
+    format!("{SEEN_PREFIX}{node_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Tests against the in-process Redis double
 // ---------------------------------------------------------------------------
@@ -242,8 +311,8 @@ mod tests {
             "http://b:8081".into(),
         );
 
-        a.register(60).await.expect("register a");
-        b.register(60).await.expect("register b");
+        a.register(60, 120).await.expect("register a");
+        b.register(60, 120).await.expect("register b");
 
         // Only LIVE leaders are discovered (b is an edge).
         let urls = a.leader_control_urls().await.expect("discover");
@@ -264,7 +333,7 @@ mod tests {
             "http://a:8081".into(),
         );
         // 1-second TTL → expires before the check below (mock uses real time).
-        a.register(1).await.expect("register");
+        a.register(1, 120).await.expect("register");
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let urls = a.leader_control_urls().await.expect("discover");
         assert!(urls.is_empty(), "expired heartbeat ⇒ node considered gone");
@@ -285,8 +354,8 @@ mod tests {
             NodeRole::Edge,
             "http://b:8081".into(),
         );
-        a.register(60).await.expect("register a");
-        b.register(60).await.expect("register b");
+        a.register(60, 120).await.expect("register a");
+        b.register(60, 120).await.expect("register b");
         // node-a holds the leader lease (value = holder node id).
         let _: Option<String> = pool
             .set(crate::redis::LEASE_KEY, "node-a", None, None, false)
@@ -311,5 +380,214 @@ mod tests {
             .find(|n| n.node_id == "node-b")
             .expect("b listed");
         assert!(!b_entry.alive, "expired heartbeat ⇒ down but still visible");
+    }
+
+    // -----------------------------------------------------------------------
+    // G2 — stale-row reaping. Before this feature there was NO delete path at
+    // all (`unregister` had no production caller), so every restart added a row
+    // that stayed forever: the "113 rows, 108 offline" symptom.
+    // -----------------------------------------------------------------------
+
+    /// (1) A LIVE node is never reaped, even though its witness key is present
+    /// (it is present precisely because it re-registers).
+    #[tokio::test]
+    async fn sweep_never_reaps_a_live_node() {
+        let a = NodeRegistry::new(
+            pool().await,
+            "node-live".into(),
+            NodeRole::Leader,
+            "http://a:8081".into(),
+        );
+        a.register(60, 120).await.expect("register");
+        assert_eq!(a.sweep_stale().await.expect("sweep"), 0, "live ⇒ spared");
+        assert_eq!(a.list_nodes().await.expect("list").len(), 1);
+    }
+
+    /// (2) Heartbeat gone but the witness key still present ⇒ NOT reaped: the
+    /// grace window has not elapsed, so this node may simply be between
+    /// renewals (or briefly unreachable). This is the case that keeps a rolling
+    /// restart from churning the fleet view.
+    #[tokio::test]
+    async fn sweep_spares_a_node_within_the_grace_window() {
+        let pool = pool().await;
+        let a = NodeRegistry::new(
+            pool.clone(),
+            "node-grace".into(),
+            NodeRole::Edge,
+            "http://b:8081".into(),
+        );
+        // Short heartbeat, long witness: exactly the window under test.
+        a.register(1, 120).await.expect("register");
+        let _: i64 = pool
+            .del(heartbeat_key("node-grace"))
+            .await
+            .expect("del heartbeat");
+        let seen: i64 = pool.exists(seen_key("node-grace")).await.expect("seen");
+        assert!(seen > 0, "fixture: the witness key is still there");
+        assert_eq!(
+            a.sweep_stale().await.expect("sweep"),
+            0,
+            "no heartbeat but a live witness ⇒ inside the grace window ⇒ spared"
+        );
+    }
+
+    /// (3) Both keys gone ⇒ reaped. (4) The current lease holder is NEVER
+    /// reaped, even with both keys gone — `active_leader_url()` does not check
+    /// the heartbeat, so removing that row would strand every standby's forward
+    /// path (every admin write would 503).
+    #[tokio::test]
+    async fn sweep_reaps_the_dead_but_never_the_lease_holder() {
+        let pool = pool().await;
+        let reaper = NodeRegistry::new(
+            pool.clone(),
+            "node-self".into(),
+            NodeRole::Leader,
+            "http://self:8081".into(),
+        );
+        let dead = NodeRegistry::new(
+            pool.clone(),
+            "node-dead".into(),
+            NodeRole::Edge,
+            "http://dead:8081".into(),
+        );
+        let holder = NodeRegistry::new(
+            pool.clone(),
+            "node-holder".into(),
+            NodeRole::Leader,
+            "http://holder:8081".into(),
+        );
+        reaper.register(60, 120).await.expect("register self");
+        dead.register(60, 120).await.expect("register dead");
+        holder.register(60, 120).await.expect("register holder");
+
+        // The lease: node-holder is the active writer.
+        let _: Option<String> = pool
+            .set(crate::redis::LEASE_KEY, "node-holder", None, None, false)
+            .await
+            .expect("set lease");
+
+        // Kill BOTH keys for both candidates — the strongest form of "provably
+        // dead" (an un-upgraded node writes no witness key, so its row looks
+        // exactly like this; this is also how the historical backlog is
+        // cleaned).
+        for id in ["node-dead", "node-holder"] {
+            let _: i64 = pool.del(heartbeat_key(id)).await.expect("del hb");
+            let _: i64 = pool.del(seen_key(id)).await.expect("del seen");
+        }
+
+        assert_eq!(
+            reaper.sweep_stale().await.expect("sweep"),
+            1,
+            "exactly the dead non-holder row is reaped"
+        );
+        let ids: Vec<String> = reaper
+            .list_nodes()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|n| n.node_id)
+            .collect();
+        assert!(
+            !ids.contains(&"node-dead".to_string()),
+            "the dead row is gone: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"node-holder".to_string()),
+            "the lease holder survives reaping even with no heartbeat: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"node-self".to_string()),
+            "the live reaper node survives: {ids:?}"
+        );
+    }
+
+    /// (5) `register` RENEWS the row, not just the heartbeat: a node whose
+    /// role/control_url changed after boot must stop advertising the boot-time
+    /// value. The retired `refresh_heartbeat` could not do this — the row was
+    /// written exactly once per process lifetime.
+    #[tokio::test]
+    async fn register_rewrites_the_row_on_every_renewal() {
+        let pool = pool().await;
+        let boot = NodeRegistry::new(
+            pool.clone(),
+            "node-x".into(),
+            NodeRole::Edge,
+            "http://old:8081".into(),
+        );
+        boot.register(60, 120).await.expect("register");
+
+        // Same identity, promoted role + new control URL (what a lease
+        // takeover looks like).
+        let promoted = NodeRegistry::new(
+            pool.clone(),
+            "node-x".into(),
+            NodeRole::Leader,
+            "http://new:8081".into(),
+        );
+        promoted.register(60, 120).await.expect("re-register");
+
+        let nodes = boot.list_nodes().await.expect("list");
+        assert_eq!(nodes.len(), 1, "same node id ⇒ one row");
+        assert_eq!(nodes[0].role, "leader", "the row was REWRITTEN");
+        assert_eq!(nodes[0].control_url, "http://new:8081");
+        // The discovery set follows the rewritten row.
+        assert_eq!(
+            boot.leader_control_urls().await.expect("discover"),
+            vec!["http://new:8081".to_string()]
+        );
+    }
+
+    /// (6) The value format is FROZEN. A not-yet-upgraded node's row (hand
+    /// written here, exactly as the old binary wrote it: no witness key, plain
+    /// `role|control_url`) must keep working for every reader — that is what
+    /// makes the rolling upgrade safe: an old `active_leader_url` must not see
+    /// `role == "v2"` and start 503-ing every admin write.
+    #[tokio::test]
+    async fn legacy_rows_still_parse_for_every_reader() {
+        let pool = pool().await;
+        let reg = NodeRegistry::new(
+            pool.clone(),
+            "node-new".into(),
+            NodeRole::Edge,
+            "http://new:8081".into(),
+        );
+        // Hand-written OLD-FORMAT rows (no witness key at all).
+        let _: i64 = pool
+            .hset(NODES_KEY, ("node-old", "leader|http://old:8081"))
+            .await
+            .expect("hset old");
+        let _: Option<String> = pool
+            .set(
+                heartbeat_key("node-old"),
+                "1",
+                Some(fred::types::Expiration::EX(60)),
+                None,
+                false,
+            )
+            .await
+            .expect("hb old");
+        let _: Option<String> = pool
+            .set(crate::redis::LEASE_KEY, "node-old", None, None, false)
+            .await
+            .expect("lease");
+
+        assert_eq!(
+            reg.leader_control_urls().await.expect("discover"),
+            vec!["http://old:8081".to_string()],
+            "an old-format leader row is still discoverable"
+        );
+        assert_eq!(
+            reg.active_leader_url().await.expect("active"),
+            Some("http://old:8081".to_string()),
+            "and the forward target still resolves (the value format did not change)"
+        );
+        let nodes = reg.list_nodes().await.expect("list");
+        let old = nodes
+            .iter()
+            .find(|n| n.node_id == "node-old")
+            .expect("old node listed");
+        assert_eq!(old.role, "leader", "role parses as a plain string");
+        assert_eq!(old.control_url, "http://old:8081");
+        assert!(old.alive, "its heartbeat is fresh");
     }
 }

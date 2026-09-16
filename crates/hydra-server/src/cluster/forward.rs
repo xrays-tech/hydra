@@ -205,7 +205,7 @@ mod registry_tests {
         let pool = pool().await;
         let standby = registry(&pool, "control-a", "http://control-a:8081");
         let leader = registry(&pool, "control-b", "http://control-b:8081");
-        leader.register(60).await.expect("register leader");
+        leader.register(60, 120).await.expect("register leader");
         let _: Option<String> = pool
             .set(crate::redis::LEASE_KEY, "control-b", None, None, false)
             .await
@@ -259,7 +259,10 @@ mod registry_tests {
         let pool = pool().await;
         let standby = registry(&pool, "control-a", "http://shared:8081");
         let misregistered = registry(&pool, "control-b", "http://shared:8081"); // same URL as ours
-        misregistered.register(60).await.expect("register leader");
+        misregistered
+            .register(60, 120)
+            .await
+            .expect("register leader");
         let _: Option<String> = pool
             .set(crate::redis::LEASE_KEY, "control-b", None, None, false)
             .await

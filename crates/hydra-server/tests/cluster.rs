@@ -912,7 +912,10 @@ async fn standby_forwards_mutations_to_active() {
         NodeRole::Leader,
         format!("http://127.0.0.1:{active_port}"),
     );
-    active_registry.register(60).await.expect("register active");
+    active_registry
+        .register(60, 120)
+        .await
+        .expect("register active");
     let _: Option<String> = pool
         .set(LEASE_KEY, "active", None, None, false)
         .await
@@ -1045,7 +1048,7 @@ async fn standby_forwards_mutations_to_active() {
         format!("http://127.0.0.1:{dead_port}"),
     );
     dead_active
-        .register(60)
+        .register(60, 120)
         .await
         .expect("register dead active");
     let _: Option<String> = pool

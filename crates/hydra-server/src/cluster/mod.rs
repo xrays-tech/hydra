@@ -116,12 +116,35 @@ impl ClusterConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_millis(1000)),
-            node_id: std::env::var("HYDRA_NODE_ID")
-                .ok()
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("node-{:x}", rand::random::<u64>())),
+            node_id: node_id_from(
+                std::env::var("HYDRA_NODE_ID").ok().as_deref(),
+                std::env::var("HOSTNAME").ok().as_deref(),
+            ),
         }
     }
+}
+
+/// This node's registry identity: `HYDRA_NODE_ID` → `HOSTNAME` → random.
+///
+/// The middle tier is what stops every restart from creating a brand-new
+/// registry row (and thereby a fresh "offline node" in the admin view). It
+/// requires STABLE pod names, i.e. a StatefulSet (or a Deployment with a pinned
+/// name): under a plain Deployment `HOSTNAME` changes on every restart and this
+/// tier buys nothing. Two nodes sharing one `HOSTNAME` would share ONE registry
+/// row — and the shutdown `unregister()` of either would then delete the
+/// peer's registration. Both facts are recorded in `dev-docs/ops.md`.
+///
+/// A pure function on purpose: the module's tests are parallel-safe and never
+/// mutate the process environment.
+#[must_use]
+pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> String {
+    node_id_env
+        .filter(|n| !n.is_empty())
+        .or_else(|| hostname_env.filter(|n| !n.is_empty()))
+        .map_or_else(
+            || format!("node-{:x}", rand::random::<u64>()),
+            ToString::to_string,
+        )
 }
 
 #[cfg(test)]
@@ -148,6 +171,32 @@ mod tests {
             "case-sensitive, unknown → all"
         );
         assert_eq!(parse(Some("typo")), NodeRole::All);
+    }
+
+    /// The identity fallback chain (G2). Each tier is asserted separately
+    /// because a regression here is SILENT: it only shows up as a growing pile
+    /// of offline rows in the admin view after every restart.
+    #[test]
+    fn node_id_prefers_explicit_then_hostname_then_random() {
+        // 1) An explicit id always wins (the pinned-pod-name case).
+        assert_eq!(node_id_from(Some("pinned"), Some("host")), "pinned");
+        // 2) `HOSTNAME` is the tier that stops restarts from minting new rows.
+        assert_eq!(
+            node_id_from(None, Some("k3s-hydra-edge-1")),
+            "k3s-hydra-edge-1"
+        );
+        // An EMPTY value is treated as unset (a bare `HYDRA_NODE_ID=` must not
+        // register a node under the empty string).
+        assert_eq!(node_id_from(Some(""), Some("host")), "host");
+        // 3) Both unset (or empty) ⇒ a fresh random id, still recognisable. The
+        // empty-string case must land here too, so a bare `HYDRA_NODE_ID=`
+        // cannot register a node under "".
+        for random in [node_id_from(Some(""), Some("")), node_id_from(None, None)] {
+            assert!(random.starts_with("node-"), "got {random}");
+            assert!(random.len() > "node-".len(), "got {random}");
+        }
+        // Distinct random ids (never a shared row for two unconfigured nodes).
+        assert_ne!(node_id_from(None, None), node_id_from(None, None));
     }
 
     #[test]
