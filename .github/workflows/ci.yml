@@ -144,3 +144,25 @@ jobs:
 
       - name: Test hydra-server (optional features)
         run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse
+
+  # The admin UI, its i18n and the shell entry points have their own checks and
+  # tests, and NOTHING ran them: `check_i18n.js` had already found two real
+  # issues when it was written, and it would not have found a third (review C2).
+  # No build step is involved — the UI is plain ES2017 loaded from disk.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: i18n consistency (code↔en, dead keys, all locales)
+        run: node scripts/check_i18n.js
+
+      - name: i18n checker tests
+        run: node --test scripts/check_i18n.test.cjs
+
+      - name: "Shell checks: LLM_API_KEY required, no request when unset (ask_llm)"
+        run: bash scripts/ask_llm.test.sh
