@@ -328,15 +328,42 @@ impl AuthCache {
     }
 
     /// Evict all entries whose TTL has elapsed (`now >= expires_at`). Returns
-    /// the count evicted. This is the sweep a background GC task calls
-    /// (task spawn is W4/server-main; the method itself is pure eviction over
-    /// the live map).
+    /// the count evicted. Swept by [`spawn_gc_task`]; the method itself is pure
+    /// eviction over the live map.
     pub fn gc(&self) -> usize {
         let now = (self.now)();
         let before = self.map.len();
         self.map.retain(|_, e| now < e.expires_at);
         before - self.map.len()
     }
+}
+
+/// Spawn a background sweep that drops expired L1 entries every `interval`.
+///
+/// `AuthCache::gc` existed with this exact doc comment ("the sweep a background
+/// GC task calls") and **no caller at all**: expired entries were only ever
+/// removed by being overwritten or invalidated, so any `(tenant, key)` pair the
+/// process had seen stayed in the map for the lifetime of the process. Two
+/// consequences, both real:
+///
+/// - **unbounded memory**: a denial is cached too (deny TTL), so a caller that
+///   keeps presenting different keys grows the map without limit;
+/// - **the self-deadlock window became permanent** (see the guard fix in
+///   `check`): because expired entries were never swept, the "entry is present
+///   but expired" precondition of that deadlock was always available for a key
+///   whose L1 TTL had lapsed while its L2 verdict was still live.
+pub fn spawn_gc_task(auth: std::sync::Arc<HttpAuthChecker>, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            let evicted = auth.cache().gc();
+            if evicted > 0 {
+                crate::admin::metrics::record_auth_cache_size(auth.cache().len());
+            }
+        }
+    });
 }
 
 impl fmt::Debug for AuthCache {

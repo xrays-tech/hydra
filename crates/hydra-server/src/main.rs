@@ -541,6 +541,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         proxy_cfg.breaker.probe_interval,
     );
     spawn_gc_task(limiter.clone(), std::time::Duration::from_secs(30));
+    // Auth-cache L1 sweep: `AuthCache::gc` had no caller, so expired verdicts
+    // were never evicted (unbounded memory for rotating keys, and — before the
+    // guard fix in `check` — a permanently available deadlock precondition).
+    hydra_server::http::spawn_gc_task(auth.clone(), std::time::Duration::from_secs(60));
 
     // (2f-redis) Invalidation consumer (P4): every node consumes the
     // invalidation stream so auth-cache invalidations propagate cluster-wide.

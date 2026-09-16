@@ -343,6 +343,64 @@ mod tests {
         }
     }
 
+    /// REGRESSION (found while fixing bug-2026-09-16) — the L1 sweep must
+    /// actually run.
+    ///
+    /// `AuthCache::gc` carried the doc comment "the sweep a background GC task
+    /// calls" and had NO caller anywhere in the binary: expired entries were
+    /// only removed by being overwritten or invalidated. That left two real
+    /// problems — the map grew for the life of the process (denials are cached
+    /// too, so rotating keys grow it without bound), and the expired-but-present
+    /// entries that fed the `check` self-deadlock were never cleaned up.
+    #[tokio::test]
+    async fn the_gc_task_evicts_expired_entries() {
+        let t0 = std::time::Instant::now();
+        let now = std::sync::Arc::new(std::sync::Mutex::new(t0));
+        let clock: crate::http::Clock = {
+            let now = now.clone();
+            std::sync::Arc::new(move || *now.lock().expect("test clock"))
+        };
+        let cache = crate::http::AuthCache::with_clock(
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            clock,
+        );
+        cache.set("t1", "sk-a", true, Duration::from_secs(1)).await;
+        cache
+            .set("t1", "sk-b", true, Duration::from_secs(300))
+            .await;
+        assert_eq!(cache.len(), 2);
+
+        let auth = std::sync::Arc::new(
+            crate::http::HttpAuthChecker::new(cache, crate::http::AuthConfig::default())
+                .expect("checker"),
+        );
+        crate::http::spawn_gc_task(auth.clone(), Duration::from_millis(20));
+
+        // Nothing is due yet (the clock has not moved).
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(auth.cache().len(), 2, "live entries must survive a sweep");
+
+        // Expire ONE of them; the sweep must drop exactly that one.
+        *now.lock().expect("test clock") = t0 + Duration::from_secs(2);
+        for _ in 0..100 {
+            if auth.cache().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            auth.cache().len(),
+            1,
+            "the sweep must evict the expired entry (and only it)"
+        );
+        assert_eq!(
+            auth.cache().check("t1", "sk-b").await,
+            hydra_core::auth::Verdict::Hit(true),
+            "the live entry is still served"
+        );
+    }
+
     /// REVIEW N2 — the index is written BEFORE the value, so a value can never
     /// exist without index membership (which would make it survive
     /// `del_tenant`).
