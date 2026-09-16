@@ -577,28 +577,15 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             let guard = Arc::new(hydra_server::cluster::replica::MaterializationGuard::new());
             let gate = Arc::new(move |ok: bool| election.mark_sync_ok(ok))
                 as Arc<dyn Fn(bool) + Send + Sync>;
-            Some(Arc::new(
-                move |outcome: &hydra_server::cluster::control_client::PollOutcome| match outcome {
-                    hydra_server::cluster::control_client::PollOutcome::Error => gate(false),
-                    hydra_server::cluster::control_client::PollOutcome::UpToDate => gate(true),
-                    hydra_server::cluster::control_client::PollOutcome::Applied(wire) => {
-                        // The gate opens only when THIS snapshot's
-                        // materialization SUCCEEDS (a failed replica must not
-                        // be eligible to lead); a stale version is skipped
-                        // entirely.
-                        hydra_server::cluster::replica::on_applied(
-                            &guard,
-                            &pool,
-                            key_provider.clone(),
-                            wire,
-                            &gate,
-                        )
-                    }
-                },
-            )
-                as Arc<
-                    dyn Fn(&hydra_server::cluster::control_client::PollOutcome) + Send + Sync,
-                >)
+            // The gate decision itself lives in `replica::gate_hook`, so tests
+            // can drive the real wiring instead of a copy of it.
+            Some(hydra_server::cluster::replica::gate_hook(
+                guard,
+                pool,
+                store.clone(),
+                key_provider,
+                gate,
+            ))
         };
         let client = hydra_server::cluster::control_client::ControlClient::new(
             hydra_server::cluster::control_client::ControlClientConfig {

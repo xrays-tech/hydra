@@ -284,7 +284,19 @@ impl ConfigStore {
         // the config). Monotonicity across restarts is what makes the
         // control channel's `?since=` watermark meaningful.
         let persisted = db::get_config_version(&pool).await.ok().flatten();
-        let version = persisted.unwrap_or(1).max(1);
+        // A missing marker means one of two very different things, and the
+        // freshness gate depends on telling them apart:
+        // - a brand-new DB (no config at all) → version 0: this node holds
+        //   NOTHING, so an `UpToDate` poll must not count as "synced" (a node
+        //   with an empty replica must not be eligible to lead — F-4);
+        // - a DB with config but no marker (predates migration 0008, or was
+        //   imported) → version 1: the cluster really does have config, so
+        //   peers polling with `since = 0` are sent a full snapshot.
+        let version = match persisted {
+            Some(v) => v,
+            None if db::config_content_exists(&pool).await.unwrap_or(false) => 1,
+            None => 0,
+        };
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
             pool: Some(pool),
@@ -297,6 +309,11 @@ impl ConfigStore {
     /// Build a store without a local DB (edge mode, cluster P0b): starts from
     /// a shipped snapshot (initially empty; the control client replaces it via
     /// [`Self::apply_snapshot`] once wired).
+    ///
+    /// Version 0 = "this node holds nothing yet", so the first poll asks with
+    /// `?since=0` and is always sent a full snapshot. Starting at 1 would let a
+    /// node that has never synced claim to be current with a leader whose own
+    /// first version is 1 (see [`Self::load`]).
     #[must_use]
     pub fn from_snapshot(cfg: ConfigData, key_provider: Arc<dyn KeyProvider>) -> Self {
         Self {
@@ -304,7 +321,7 @@ impl ConfigStore {
             pool: None,
             swrr: Arc::new(DashMap::new()),
             key_provider,
-            version: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -407,7 +424,9 @@ mod tests {
         cfg_with_tenant(&mut c1);
         let store = ConfigStore::from_snapshot(c1, kp());
         assert!(store.pool().is_none(), "snapshot-fed store has no DB");
-        assert_eq!(store.version(), 1);
+        // A snapshot-fed store starts at version 0: it holds nothing yet, so its
+        // first control poll asks with `?since=0` and is sent a full snapshot.
+        assert_eq!(store.version(), 0);
 
         // Initial snapshot is served.
         assert!(store.snapshot().tenants_by_domain.contains_key("acme.com"));

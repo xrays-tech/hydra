@@ -15,9 +15,11 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 use tracing::{debug, warn};
 
+use crate::cluster::control_client::PollOutcome;
 use crate::cluster::snapshot::{SnapshotError, SnapshotWire};
 use crate::crypto::KeyProvider;
 use crate::db;
+use crate::store::ConfigStore;
 
 /// Materialize a received control snapshot into the local replica DB:
 /// hydrate (decrypt secrets) → full-table rebuild → persist the version.
@@ -170,6 +172,79 @@ pub fn on_applied(
             }
         }
     });
+}
+
+/// Whether the local replica DB is materialized AT (or ahead of)
+/// `store_version`.
+///
+/// This is the **evidence** the election freshness gate must be driven by: "the
+/// replica holds what the control plane told me" is a fact about this node's
+/// disk, not about the poll that carried the snapshot.
+///
+/// A missing version marker counts as current only when there is nothing to be
+/// current about (`store_version == 0`, i.e. the cluster has no config yet) —
+/// that is what lets a genuinely cold cluster elect its first leader while a
+/// node whose replica was never written stays ineligible.
+pub async fn replica_is_current(pool: &SqlitePool, store_version: u64) -> bool {
+    match db::get_config_version(pool).await {
+        Ok(Some(v)) => v >= store_version,
+        Ok(None) => store_version == 0,
+        Err(e) => {
+            warn!(error = %e, "could not read the replica version; keeping the gate closed");
+            false
+        }
+    }
+}
+
+/// Build the control-client poll hook that drives the election freshness gate
+/// (F-4).
+///
+/// This function is the single owner of the decision "may this node be eligible
+/// to lead?", so it can be exercised directly by tests instead of being
+/// re-implemented (the bug it exists to prevent lived precisely in the wiring,
+/// not in a helper):
+///
+/// - `Error` → closed: the control plane is unreachable, the replica's
+///   freshness cannot be established.
+/// - `UpToDate` → decided by [`replica_is_current`], NOT opened blindly. An
+///   `UpToDate` poll only proves the control plane had nothing newer to send
+///   (the client asks with `since = store.version()`, and it advances that
+///   watermark BEFORE the replica rebuild is dispatched) — it says nothing
+///   about this node's replica, which may be empty or stale after a failed or
+///   still-running materialization. Opening the gate here let such a node win
+///   the lease and then rebuild the cluster's config from its stale DB
+///   (`ConfigStore::reload_all` reads the local DB).
+/// - `Applied` → materialize the snapshot, then open only on SUCCESS.
+pub fn gate_hook(
+    guard: Arc<MaterializationGuard>,
+    pool: SqlitePool,
+    store: ConfigStore,
+    kp: Arc<dyn KeyProvider>,
+    gate: Arc<dyn Fn(bool) + Send + Sync>,
+) -> Arc<dyn Fn(&PollOutcome) + Send + Sync> {
+    Arc::new(move |outcome: &PollOutcome| match outcome {
+        PollOutcome::Error => gate(false),
+        PollOutcome::UpToDate => {
+            // Nothing newer to apply — but that is a statement about the CONTROL
+            // plane, not about this node's replica. Verify the evidence before
+            // opening the gate (async, so the check is spawned like the
+            // materialization itself).
+            let pool = pool.clone();
+            let store = store.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let ok = replica_is_current(&pool, store.version()).await;
+                if !ok {
+                    warn!(
+                        store_version = store.version(),
+                        "replica is behind the store; keeping the leader-eligibility gate closed"
+                    );
+                }
+                gate(ok);
+            });
+        }
+        PollOutcome::Applied(wire) => on_applied(&guard, &pool, kp.clone(), wire, &gate),
+    })
 }
 
 /// The last-applied config version stored in the replica (`None` = fresh DB).

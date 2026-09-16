@@ -1219,6 +1219,30 @@ pub async fn get_config_version(pool: &SqlitePool) -> Result<Option<u64>, sqlx::
     Ok(row.and_then(|(v,)| v.parse().ok()))
 }
 
+/// Whether the config tables hold ANY row.
+///
+/// Used only to tell two indistinguishable-by-version states apart at boot:
+/// a brand-new DB (nothing configured yet ⇒ version 0, a node that holds
+/// nothing and must sync before it may lead) versus a DB that predates
+/// migration 0008 or was imported (content but no `config_version` marker ⇒
+/// version 1, a cluster that really does have config). Table names are static
+/// literals — nothing is interpolated at runtime.
+pub async fn config_content_exists(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM tenant LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM provider LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM provider_model LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM tenant_model LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM tenant_provider LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM provider_key LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM limit_role LIMIT 1) \
+           OR EXISTS(SELECT 1 FROM provider_key_binding LIMIT 1)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 != 0)
+}
+
 /// Persist the last-applied config version (upsert).
 pub async fn set_config_version(pool: &SqlitePool, version: u64) -> Result<(), sqlx::Error> {
     sqlx::query(

@@ -322,7 +322,11 @@ async fn edge_keeps_last_known_good_on_decrypt_failure() {
         edge_store.snapshot().tenants_by_domain.is_empty(),
         "the edge keeps its last-known-good (empty) snapshot"
     );
-    assert_eq!(edge_store.version(), 1, "version unchanged on failure");
+    assert_eq!(
+        edge_store.version(),
+        0,
+        "version unchanged on failure (an edge that never synced holds nothing: version 0)"
+    );
 }
 
 // ===========================================================================
@@ -746,5 +750,208 @@ async fn standby_forwards_mutations_to_active() {
     assert!(
         repo::list_providers(&dead_pool).await.unwrap().is_empty(),
         "standby never self-promotes via the forwarding path"
+    );
+}
+
+// ===========================================================================
+// REVIEW B1 — the election freshness gate must be driven by EVIDENCE (this
+// node's replica DB), not by the poll signal.
+//
+// `UpToDate` means "the control plane had nothing newer to send" — the client
+// asks with `since = store.version()` and advances that watermark BEFORE the
+// replica rebuild is dispatched (`control_client`: `apply_snapshot` then the
+// hook). So a node whose materialization FAILED (wrong master key, disk full,
+// `restore_config` error) or is still running looks "up to date" on the very
+// next poll. Opening the gate there made that node eligible to lead with a
+// stale/empty replica, and a promoted node whose replica is stale then rebuilds
+// the cluster's config FROM that replica (`ConfigStore::reload_all` reads the
+// local DB) and republishes it at a higher version.
+//
+// These tests drive the REAL hook (`replica::gate_hook`), so the wiring itself
+// is what is under test — not a copy of it.
+// ===========================================================================
+
+/// Every gate decision the hook made, in order.
+type GateCalls = Arc<std::sync::Mutex<Vec<bool>>>;
+/// The closure the gate driver calls with each decision.
+type GateFn = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Collect every gate decision the hook makes, in order.
+fn gate_recorder() -> (GateFn, GateCalls) {
+    let calls: GateCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = calls.clone();
+    let gate = Arc::new(move |ok: bool| {
+        sink.lock().expect("gate mutex").push(ok);
+    }) as GateFn;
+    (gate, calls)
+}
+
+/// Wait until the (spawned) hook has recorded `n` decisions.
+async fn gate_calls(calls: &GateCalls, n: usize) -> Vec<bool> {
+    for _ in 0..200 {
+        {
+            let seen = calls.lock().expect("gate mutex");
+            if seen.len() >= n {
+                return seen.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    calls.lock().expect("gate mutex").clone()
+}
+
+/// (a) + (c): a FAILED materialization must keep the gate closed even when the
+/// next poll says `UpToDate`; a SUCCESSFUL one opens it.
+#[tokio::test]
+async fn freshness_gate_needs_a_materialized_replica() {
+    let leader_pool = common::setup_pool().await;
+    let sealing_kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let leader_store = ConfigStore::load(leader_pool.clone(), sealing_kp.clone())
+        .await
+        .expect("ConfigStore::load");
+    seed_and_reload(&leader_pool, &leader_store).await;
+    let version = leader_store.version();
+    assert!(version >= 1, "the leader must have a real config version");
+
+    let wire = SnapshotWire::build(
+        version,
+        ConfigData::clone(&leader_store.snapshot()),
+        &leader_pool,
+        sealing_kp.as_ref(),
+    )
+    .await
+    .expect("build wire");
+
+    // --- (a) the standby CANNOT open the sealed snapshot (wrong master key):
+    //         materialization fails, so the replica stays empty.
+    //
+    //         The standby's STORE is at the leader's version: the control client
+    //         applies the snapshot to memory (`apply_snapshot`) BEFORE the
+    //         replica rebuild is dispatched, which is exactly why the next poll
+    //         answers `UpToDate` and why that signal must not open the gate.
+    let wrong_kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([9u8; 32], 1));
+    let replica_pool = common::setup_pool().await;
+    let standby_store = ConfigStore::from_snapshot(ConfigData::default(), wrong_kp.clone());
+    standby_store.apply_snapshot(ConfigData::default(), version);
+    let (gate, calls) = gate_recorder();
+    let hook = replica::gate_hook(
+        Arc::new(replica::MaterializationGuard::new()),
+        replica_pool.clone(),
+        standby_store.clone(),
+        wrong_kp.clone(),
+        gate,
+    );
+
+    hook(&hydra_server::cluster::control_client::PollOutcome::Applied(Box::new(wire.clone())));
+    assert_eq!(
+        gate_calls(&calls, 1).await,
+        vec![false],
+        "a failed materialization must close the gate"
+    );
+    assert_eq!(
+        replica::replica_version(&replica_pool)
+            .await
+            .expect("version"),
+        None,
+        "the replica really is empty in this arm"
+    );
+
+    // The next poll has nothing newer to apply (the store watermark already
+    // moved) — that must NOT be read as "synced".
+    hook(&hydra_server::cluster::control_client::PollOutcome::UpToDate);
+    let seen = gate_calls(&calls, 2).await;
+    assert_eq!(
+        seen,
+        vec![false, false],
+        "an UpToDate poll must not open the gate while the replica is empty"
+    );
+
+    // --- (c) with the RIGHT master key the materialization succeeds and the
+    //         gate opens; the following UpToDate poll keeps it open.
+    let replica_pool2 = common::setup_pool().await;
+    let standby_store2 = ConfigStore::from_snapshot(ConfigData::default(), sealing_kp.clone());
+    standby_store2.apply_snapshot(ConfigData::default(), version);
+    let (gate2, calls2) = gate_recorder();
+    let hook2 = replica::gate_hook(
+        Arc::new(replica::MaterializationGuard::new()),
+        replica_pool2.clone(),
+        standby_store2,
+        sealing_kp.clone(),
+        gate2,
+    );
+    hook2(&hydra_server::cluster::control_client::PollOutcome::Applied(Box::new(wire)));
+    assert_eq!(
+        gate_calls(&calls2, 1).await,
+        vec![true],
+        "a successful materialization opens the gate"
+    );
+    assert_eq!(
+        replica::replica_version(&replica_pool2)
+            .await
+            .expect("version"),
+        Some(version),
+        "the replica now holds the store's version"
+    );
+    hook2(&hydra_server::cluster::control_client::PollOutcome::UpToDate);
+    assert_eq!(
+        gate_calls(&calls2, 2).await,
+        vec![true, true],
+        "with the replica current, UpToDate keeps the gate open"
+    );
+}
+
+/// (b) A node whose STORE holds config but whose replica DB holds nothing must
+/// not be considered synced (the version watermark alone cannot tell a fresh
+/// node from a node that has content).
+#[tokio::test]
+async fn an_empty_replica_is_not_synced_with_a_non_empty_store() {
+    let leader_pool = common::setup_pool().await;
+    let sealing_kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let leader_store = ConfigStore::load(leader_pool.clone(), sealing_kp.clone())
+        .await
+        .expect("ConfigStore::load");
+    seed_and_reload(&leader_pool, &leader_store).await;
+
+    // A standby that has never materialized anything.
+    let replica_pool = common::setup_pool().await;
+    assert_eq!(
+        replica::replica_version(&replica_pool)
+            .await
+            .expect("version"),
+        None,
+        "fresh replica: no version marker"
+    );
+
+    let (gate, calls) = gate_recorder();
+    let hook = replica::gate_hook(
+        Arc::new(replica::MaterializationGuard::new()),
+        replica_pool.clone(),
+        leader_store.clone(),
+        sealing_kp,
+        gate,
+    );
+    hook(&hydra_server::cluster::control_client::PollOutcome::UpToDate);
+    assert_eq!(
+        gate_calls(&calls, 1).await,
+        vec![false],
+        "an empty replica must not be 'up to date' with a store at version {}",
+        leader_store.version()
+    );
+
+    // Control: a store with NO config at all (a genuinely cold cluster) accepts
+    // an empty replica — otherwise the first node could never take the lease.
+    let cold_pool = common::setup_pool().await;
+    let cold_kp: Arc<dyn KeyProvider> = Arc::new(kp());
+    let cold_store = ConfigStore::load(cold_pool.clone(), cold_kp.clone())
+        .await
+        .expect("ConfigStore::load");
+    assert_eq!(
+        cold_store.version(),
+        0,
+        "a DB with no config and no marker is version 0, not 1"
+    );
+    assert!(
+        replica::replica_is_current(&cold_pool, cold_store.version()).await,
+        "nothing to sync ⇒ a cold cluster may still elect its first leader"
     );
 }
