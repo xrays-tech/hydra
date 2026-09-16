@@ -831,6 +831,29 @@ mod tests {
         );
     }
 
+    /// The registry metrics must actually be PUBLISHED, not merely
+    /// panic-free: the reaper's whole point is to make the "113 rows, 108
+    /// offline" symptom alertable, so a no-op `record_*` stub would silently
+    /// remove the signal (the exporter is the only consumer).
+    #[test]
+    fn registry_metrics_reach_the_exposition() {
+        record_registry_nodes(2, 7);
+        record_registry_reaped(3);
+        let out = render();
+        assert!(
+            out.contains("hydra_registry_nodes{state=\"alive\"} 2"),
+            "the alive count must be exposed with its label:\n{out}"
+        );
+        assert!(
+            out.contains("hydra_registry_nodes{state=\"dead\"} 7"),
+            "the dead count must be exposed:\n{out}"
+        );
+        assert!(
+            out.contains("hydra_registry_reaped_total 3"),
+            "the reaped counter must be exposed:\n{out}"
+        );
+    }
+
     #[test]
     fn record_helpers_are_idempotent() {
         // Calling twice must not panic even if registered already.

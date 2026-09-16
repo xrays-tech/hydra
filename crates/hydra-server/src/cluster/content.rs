@@ -67,10 +67,16 @@ pub struct ReplicationContent {
     pub cfg: Arc<ConfigData>,
     /// PRIVATE on purpose: the only production constructors are [`Self::load`]
     /// (leader/standby, from the DB) and [`Self::from_hydrated`] (replica, from
-    /// a wire that already passed the version check). An EMPTY `FidelityRows`
-    /// would instruct a replica to wipe its fidelity tables and insert nothing —
-    /// cluster-wide silent data loss — so "no empty fidelity" is enforced by
-    /// construction rather than by convention.
+    /// a wire that already passed the version check).
+    ///
+    /// An EMPTY `FidelityRows` would instruct a replica to wipe its fidelity
+    /// tables and insert nothing — cluster-wide silent data loss. Do NOT claim
+    /// the type system rules that out: `FidelityRows` has `pub` fields and
+    /// `from_hydrated` accepts any value, so an empty set IS constructible. The
+    /// real guards are three, and all three are required: (1) only `load`
+    /// populates `replication`, (2) `ConfigStore::from_snapshot` (edge, no pool)
+    /// leaves it `None`, and (3) `internal_control` answers 503 `not_ready` for
+    /// `None` — so a default/empty content can never be SERVED as a snapshot.
     fidelity: FidelityRows,
 }
 

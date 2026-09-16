@@ -147,11 +147,23 @@ pub async fn restore_config(
         .await?;
     }
 
-    // Tenants (+ cert content columns).
+    // Tenants (+ cert content columns + the access-token HASH).
+    //
+    // The hash is part of the row, not a follow-up step: `ConfigData` has no
+    // field for it, so it rides the wire as a sealed fidelity row and is written
+    // HERE (a separate UPDATE could silently affect zero rows if the tenant set
+    // ever diverged, and a promoted replica would then answer 401 to every
+    // request until an operator re-entered the token — §7-7). It arrives as a
+    // hash and is reproduced VERBATIM: nothing is re-hashed at this boundary.
+    let token_hashes: std::collections::HashMap<&str, &str> = fidelity
+        .tenant_token_hashes
+        .iter()
+        .map(|(tenant_id, hash)| (tenant_id.as_str(), hash.as_str()))
+        .collect();
     for t in cfg.tenants_by_domain.values() {
         sqlx::query(
             "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             created_at, updated_at, access_token_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&t.id)
         .bind(&t.name)
@@ -162,6 +174,7 @@ pub async fn restore_config(
         .bind(t.enabled)
         .bind(&t.created_at)
         .bind(&t.updated_at)
+        .bind(token_hashes.get(t.id.as_str()).copied())
         .execute(&mut *tx)
         .await?;
         // Cert content (migration 0007): sealed key, plaintext cert PEM.
@@ -194,20 +207,6 @@ pub async fn restore_config(
         }
     }
 
-    // Tenant access-token HASHES (§7-7). `ConfigData` has no field for these, so
-    // they ride the wire as sealed fidelity rows — and they must be written
-    // here, or a promoted replica answers `has_access_token: false` and 401s
-    // every request until an operator re-enters the token. They arrive as
-    // hashes (never the token itself), so no re-hashing happens at this
-    // boundary: the bytes are reproduced verbatim.
-    for (tenant_id, hash) in &fidelity.tenant_token_hashes {
-        sqlx::query("UPDATE tenant SET access_token_hash = ? WHERE id = ?")
-            .bind(hash)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-
     // Tenant provider / model grants (fidelity rows — ids preserved).
     for tp in &fidelity.tenant_providers {
         sqlx::query("INSERT INTO tenant_provider (id, tenant_id, provider_id) VALUES (?, ?, ?)")
@@ -226,9 +225,9 @@ pub async fn restore_config(
             .await?;
     }
 
-    // Limit roles — from `fidelity`, NOT `cfg`: `cfg.limit_roles` holds only the
-    // ENABLED rows the hot path matches on, so rebuilding from it would delete
-    // every disabled role on the replica (audit G1).
+    // Limit roles — from `fidelity`, NOT from the runtime config: that view
+    // holds only the ENABLED rows the hot path matches on, so rebuilding from it
+    // would delete every disabled role on the replica (audit G1).
     for r in &fidelity.limit_roles {
         sqlx::query(
             "INSERT INTO limit_role (id, name, matching_key, matching_model, matching_tenant, \
@@ -250,7 +249,8 @@ pub async fn restore_config(
         .await?;
     }
 
-    // api-key prefix bindings — from `fidelity` for the same reason (G1).
+    // api-key prefix bindings — from `fidelity` for the same reason (G1); the
+    // runtime config carries only the enabled ones.
     for b in &fidelity.key_prefix_bindings {
         sqlx::query(
             "INSERT INTO provider_key_binding (id, key_prefix, provider_id, enabled, created_at, \

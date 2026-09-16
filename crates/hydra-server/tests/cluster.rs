@@ -845,6 +845,72 @@ async fn standby_materializes_replica() {
     assert_eq!(replica_cfg.tenant_providers, leader_cfg.tenant_providers);
     assert_eq!(replica_cfg.tenant_models, leader_cfg.tenant_models);
 
+    // G1 THROUGH THE REAL PLUMBING: the disabled rows must survive
+    // `replica::materialize` (hydrate → restore_config), not just a direct
+    // `restore_config` call — a regression inside `materialize` that handed the
+    // rebuild the ENABLED-only `cfg` instead of the fidelity rows would pass a
+    // direct-call test and destroy the replica's disabled rows in production.
+    repo::insert_limit_role(
+        &leader_pool,
+        &hydra_core::model::LimitRole {
+            id: "r-off".into(),
+            name: "disabled role".into(),
+            matching_key: None,
+            matching_model: None,
+            matching_tenant: None,
+            matching_provider: None,
+            limit_count: Some(5),
+            limit_token: None,
+            window: "m".into(),
+            enabled: false,
+            created_at: now().into(),
+        },
+    )
+    .await
+    .expect("insert disabled role");
+    repo::insert_provider_key_binding(
+        &leader_pool,
+        &hydra_core::model::ProviderKeyBinding {
+            id: "b-off".into(),
+            key_prefix: "sk-off-".into(),
+            provider_id: "p1".into(),
+            enabled: false,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("insert disabled binding");
+    leader_store.reload_all().await.expect("reload");
+
+    // Rebuild the wire from the (now larger) content and re-materialize.
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("content");
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build wire");
+    replica::materialize(&replica_pool, kp.as_ref(), &wire)
+        .await
+        .expect("materialize");
+
+    let replica_roles = repo::list_limit_roles(&replica_pool).await.expect("roles");
+    assert!(
+        replica_roles.iter().any(|r| r.id == "r-off" && !r.enabled),
+        "the DISABLED limit role must survive the real materialize path: {replica_roles:?}"
+    );
+    let replica_bindings = repo::list_provider_key_bindings(&replica_pool)
+        .await
+        .expect("bindings");
+    assert!(
+        replica_bindings
+            .iter()
+            .any(|b| b.id == "b-off" && !b.enabled),
+        "the DISABLED binding must survive the real materialize path: {replica_bindings:?}"
+    );
+
     // Fidelity: the OFFLINE model survives the round-trip (it is absent from
     // the derived `models_by_key` but must not be dropped from the DB).
     let models = repo::list_provider_models(&replica_pool)

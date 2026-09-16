@@ -215,6 +215,54 @@ async fn rematerializing_the_same_content_is_stable() {
     assert_eq!(bindings.len(), 2, "no duplication and no loss on re-apply");
 }
 
+/// T6 acceptance — an edit to a DISABLED row must ADVANCE the generation.
+///
+/// This is the property that only the T1+T6 pair could break: `ConfigData`
+/// cannot see disabled rows, so a generation predicate defined on the RUNTIME
+/// config would treat "someone disabled a limit role" (or changed a disabled
+/// role's window) as no change at all — the edit would then never replicate.
+/// The predicate is defined on `ReplicationContent`, whose `PartialEq` includes
+/// the full fidelity rows, so the edit must bump the version.
+#[tokio::test]
+async fn editing_a_disabled_row_advances_the_generation() {
+    let pool = common::setup_pool().await;
+    seed_leader(&pool).await;
+    let key_provider = kp();
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("load");
+    // Settle the baseline so the next reload is a strict comparison.
+    store.reload_all().await.expect("baseline reload");
+    let before = store.version();
+
+    // A no-op reload first: unchanged ⇒ no advance (the control for this test).
+    assert!(!store.reload_all().await.expect("no-op reload"));
+    assert_eq!(store.version(), before);
+
+    // Now change ONLY a disabled row: flip its `window` while it stays disabled.
+    // This column is invisible to `ConfigData` (the row is filtered out of the
+    // runtime view entirely), so a `ConfigData`-based predicate would miss it.
+    let mut role = role("r-off", false);
+    role.window = "h".into();
+    repo::update_limit_role(&pool, &role)
+        .await
+        .expect("update the disabled role");
+    assert!(
+        !store.snapshot().limit_roles.iter().any(|r| r.id == "r-off"),
+        "precondition: the disabled row is absent from the RUNTIME snapshot"
+    );
+
+    assert!(
+        store.reload_all().await.expect("reload after the edit"),
+        "a disabled-row edit IS a replicated change and must advance the generation"
+    );
+    assert_eq!(
+        store.version(),
+        before + 1,
+        "exactly one generation for one edit"
+    );
+}
+
 /// Byte-fidelity of the fidelity rows themselves: two loads of an UNCHANGED
 /// database must be equal, or the generation predicate would bump on every
 /// reload (the O10 idempotency property, asserted from the outside).

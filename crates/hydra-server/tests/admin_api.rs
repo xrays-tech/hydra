@@ -1197,6 +1197,77 @@ async fn reload_is_idempotent_and_forceable() {
     assert_eq!(forced2["version"].as_u64(), Some(v1 + 2));
 }
 
+/// T6 acceptance — a fatal validation failure is still a **400
+/// `reload_failed`**, not a 500.
+///
+/// The error code is a documented contract (`admin-ui/api-docs.js` documents
+/// 400 `reload_failed`, and the Admin UI surfaces it), and the old snapshot must
+/// survive: a reload that cannot build a valid snapshot must not take the data
+/// plane down with it.
+#[tokio::test]
+async fn reload_fatal_validation_is_400_reload_failed() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    // Control: the endpoint answers 200 while the config is valid, so the 400
+    // below is caused by the bad row and not by the endpoint being broken.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/reload",
+        Some(TOKEN),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "control: a valid reload succeeds");
+
+    // A provider with an unusable endpoint ⇒ FATAL validation (the same fixture
+    // `tests/config_store.rs::store_reload_validate_fail_keeps_old` uses).
+    repo::insert_provider(
+        state.db(),
+        &hydra_core::model::Provider {
+            id: "pbad".into(),
+            key: "bad".into(),
+            name: "bad".into(),
+            endpoint: "not-a-url".into(),
+            weight: 1,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("insert the bad provider");
+
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/reload",
+        Some(TOKEN),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "a fatal reload is a 400, never a 500");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "reload_failed", "got {body}");
+    // Fail-closed: the OLD snapshot is retained, so the data plane keeps serving.
+    assert!(
+        !state.store.snapshot().providers.contains_key("pbad"),
+        "the invalid config must not be published: {body}"
+    );
+    // `?force=1` must not turn a fatal failure into a success either.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/reload?force=1",
+        Some(TOKEN),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "force does not bypass validation");
+}
+
 // ===========================================================================
 // §2.3 — auth cache invalidation (by keys, by tenant, unknown)
 // ===========================================================================

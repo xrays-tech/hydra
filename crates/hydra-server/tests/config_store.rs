@@ -151,6 +151,93 @@ async fn store_reload_clears_swrr() {
     );
 }
 
+/// T6 (the OTHER direction) — a no-op `reload_all()` must leave BOTH the
+/// routing cache and the generation alone.
+///
+/// `store_reload_clears_swrr` above proves the changed branch clears SWRR; on
+/// its own that would also pass if the "changed" check were inverted (always
+/// true), so the no-op direction has to be pinned as well: an unchanged reload
+/// keeps the SWRR state (nothing to invalidate) and does not advance the
+/// version.
+#[tokio::test]
+async fn store_noop_reload_keeps_swrr_and_the_version() {
+    let pool = common::setup_pool().await;
+    seed_basic(&pool).await;
+
+    let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+    // Settle the baseline: the first reload publishes the content the store was
+    // constructed from (its version label may differ), so everything after this
+    // must be a strict no-op.
+    store.reload_all().await.expect("baseline reload");
+    let version = store.version();
+
+    store.swrr().insert(
+        ("t1".into(), "gpt-4".into()),
+        SwrrState {
+            current_weights: [("p1".to_string(), 3)].into(),
+        },
+    );
+    assert_eq!(store.swrr().len(), 1, "precondition: one swrr entry");
+
+    // No DB write in between ⇒ the replicated bytes are identical.
+    assert!(
+        !store.reload_all().await.expect("no-op reload"),
+        "an unchanged reload must report `changed == false`"
+    );
+    assert_eq!(store.version(), version, "and must not advance the version");
+    assert_eq!(
+        store.swrr().len(),
+        1,
+        "an unchanged reload keeps the routing cache — there is nothing to \
+         invalidate, and clearing it would reset every tenant's smooth-weighted \
+         rotation for no reason"
+    );
+}
+
+/// T6 — a no-op reload must NOT notify snapshot followers.
+///
+/// `store::tests::every_snapshot_swap_notifies_followers` covers the changed
+/// direction (a real change notifies); the plan's acceptance also requires the
+/// negative half, because notifying on an unchanged reload is what made every
+/// replica rebuild for nothing.
+#[tokio::test]
+async fn store_noop_reload_does_not_notify_followers() {
+    let pool = common::setup_pool().await;
+    seed_basic(&pool).await;
+    let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = calls.clone();
+    store.on_snapshot_change(std::sync::Arc::new(move |_cfg| {
+        sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    // Settle: publish the content the store was built from.
+    store.reload_all().await.expect("baseline reload");
+    let after_baseline = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    // No DB write ⇒ identical content ⇒ no notify.
+    assert!(!store.reload_all().await.expect("no-op reload"));
+    assert!(!store.reload_all().await.expect("no-op reload again"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        after_baseline,
+        "an unchanged reload must not notify: every follower would rebuild its \
+         replica for nothing"
+    );
+
+    // ...and a REAL change still notifies (the hook is not simply broken).
+    repo::insert_provider(&pool, &provider("p-notify", "notify"))
+        .await
+        .expect("seed a provider");
+    assert!(store.reload_all().await.expect("changed reload"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        after_baseline + 1,
+        "a changed reload notifies exactly once"
+    );
+}
+
 /// T6.5 — a fatal validation issue makes `reload_all()` return `Err` and the
 /// previous snapshot is kept (design §5.3).
 #[tokio::test]

@@ -3,8 +3,10 @@
 //!
 //! THE DEFECT THIS GUARDS. `restore_config` used to rebuild `provider_key` from
 //! `cfg.provider_keys` (the plaintext map, which carries no identity) and mint a
-//! FRESH `id` / `created_at` per row on every materialization (`gen_id_static()`
-//! was a bare nanosecond counter, with no monotonic component and no salt).
+//! FRESH `id` / `created_at` per row on every materialization — the id came from
+//! a bare nanosecond counter with no monotonic component and no salt (both
+//! minting helpers are now DELETED; the plan's T1 step-6 retirement criterion is
+//! `grep -rn` over `crates/` returning nothing).
 //! Consequences: the replica was not byte-faithful, `DELETE
 //! /provider-keys/{id}` returned 404 on a promoted replica (the id the admin UI
 //! held no longer existed), and multiple keys of one provider could collide on

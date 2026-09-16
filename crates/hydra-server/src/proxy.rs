@@ -182,6 +182,20 @@ impl HydraProxy {
             .to_string()
     }
 
+    /// Observe a `Host` / `:authority` disagreement — the ONE place that pairs
+    /// the two extractors, so a test can drive exactly what the request path
+    /// runs (a test that re-implemented the pairing could not catch a wiring bug
+    /// such as handing this the RESOLVED host instead of the raw header).
+    fn note_host_authority(req_header: &pingora_http::RequestHeader) {
+        #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+        crate::tls::note_host_authority_mismatch(
+            &Self::host_header(req_header),
+            &Self::authority_host(req_header),
+        );
+        #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+        let _ = req_header;
+    }
+
     /// The HTTP/2 `:authority` host, normalised: the port is dropped by
     /// `Authority::host()` and the IPv6 brackets are trimmed so the value can be
     /// compared with a `Host` header and used as a domain key.
@@ -359,11 +373,7 @@ impl ProxyHttp for HydraProxy {
         // authoritative here (flipping the precedence would change existing h1
         // behaviour, which is a separate decision), but a disagreement between
         // the two is now observable instead of silent.
-        #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-        crate::tls::note_host_authority_mismatch(
-            &Self::host_header(session.req_header()),
-            &Self::authority_host(session.req_header()),
-        );
+        Self::note_host_authority(session.req_header());
         let Some(tenant) = Self::resolve_tenant(cfg, &host) else {
             return short_circuit(session, 404, "unknown_domain").await;
         };
@@ -1505,17 +1515,18 @@ mod tests {
         assert_eq!(resolved_host(None, Some("http://acme.com")), "acme.com");
     }
 
-    /// Drive the REAL extraction pair (`host_header` / `authority_host`) — the
-    /// same two values `request_filter` hands to the counter, so the wiring
-    /// itself is under test, not a copy of it.
+    /// Drive the PRODUCTION wiring function (`note_host_authority`) — the exact
+    /// one `request_filter` calls. Re-implementing the pairing here would hide a
+    /// wiring regression: if the first argument were switched to the RESOLVED
+    /// host (`request_host`, which returns `Host` whenever it is present), the
+    /// counter would never increment and a copy-based test would still pass.
     fn note_for(host: Option<&str>, uri: Option<&str>) {
-        let h = header(host, uri);
-        crate::tls::note_host_authority_mismatch(
-            &HydraProxy::host_header(&h),
-            &HydraProxy::authority_host(&h),
-        );
+        HydraProxy::note_host_authority(&header(host, uri));
     }
 
+    // The wiring is `#[cfg]`-gated on a TLS backend (the counter lives in
+    // `tls.rs`), so the increment assertions below only hold in those builds.
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
     #[test]
     fn host_authority_mismatch_is_counted_but_host_still_wins() {
         // Both present and different: Host wins (the existing priority is
