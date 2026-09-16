@@ -427,6 +427,17 @@ pub(super) async fn provider_key_collection(
             Ok(k) => k,
             Err(r) => return r,
         };
+        // A provider key must carry a real credential: an empty value would be
+        // stored as an authoritative-but-useless key, so every request routed to
+        // that provider would fail upstream with an empty credential (review A3).
+        if k.api_key.trim().is_empty() {
+            return err_json(
+                400,
+                "invalid_api_key",
+                "api_key must not be empty",
+                trace_id,
+            );
+        }
         if k.id.is_empty() {
             k.id = gen_id();
         }
@@ -482,6 +493,17 @@ pub(super) async fn provider_key_item(
                 Ok(k) => k,
                 Err(r) => return r,
             };
+            // PUT is an OVERWRITE (upsert), so an empty credential must never be
+            // accepted: it would silently destroy the working key that was there
+            // before (review A3). Rotation means supplying a new non-empty key.
+            if k.api_key.trim().is_empty() {
+                return err_json(
+                    400,
+                    "invalid_api_key",
+                    "api_key must not be empty",
+                    trace_id,
+                );
+            }
             k.id = id.to_string();
             if k.created_at.is_empty() {
                 k.created_at = now_ts();

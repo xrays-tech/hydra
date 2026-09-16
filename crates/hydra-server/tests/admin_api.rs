@@ -2278,3 +2278,154 @@ async fn tenant_create_with_a_too_short_access_token_leaves_no_zombie() {
     let created: serde_json::Value = r.json().await.expect("json");
     assert_eq!(created["has_access_token"], true);
 }
+
+// ===========================================================================
+// REVIEW A3 — a provider-key write must carry a NON-EMPTY `api_key`.
+//
+// `ProviderKey::api_key` gained `#[serde(default)]` (alongside the intended
+// `skip_serializing`), so a body that OMITS the field deserialized to `""`
+// instead of being rejected. `PUT /provider-keys/{id}` is an upsert (overwrite)
+// and neither POST nor PUT validated the value, so a metadata-only PUT silently
+// replaced a working provider credential with an empty string and answered 200
+// — after which every request to that provider carried an empty credential.
+// ===========================================================================
+#[tokio::test]
+async fn provider_key_write_requires_a_non_empty_api_key() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    let p = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let _ = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(p),
+    )
+    .await;
+
+    // A valid create, so there is a stored key to (not) destroy.
+    let k = r#"{"id":"k1","provider_id":"p1","api_key":"sk-original-secret","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-keys",
+        Some(TOKEN),
+        Some(k),
+    )
+    .await;
+    assert_eq!(r.status(), 201, "a valid create must still work");
+    let _ = r.text().await;
+
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let before: serde_json::Value = r.json().await.expect("json");
+    let before_key = before["api_key"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !before_key.is_empty(),
+        "control: the stored key must be masked, not empty: {before}"
+    );
+
+    // (1) A metadata-only PUT (no `api_key` field) must NOT wipe the key.
+    let no_key = r#"{"id":"k1","provider_id":"p1","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        Some(no_key),
+    )
+    .await;
+    assert!(
+        r.status().is_client_error(),
+        "PUT without api_key must be refused, not silently accepted (got {})",
+        r.status()
+    );
+    let _ = r.text().await;
+
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let after: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        after["api_key"].as_str().unwrap_or_default(),
+        before_key,
+        "the stored key must survive the rejected PUT: {after}"
+    );
+
+    // (2) An explicitly empty key is refused too (both verbs).
+    let empty_put = r#"{"id":"k1","provider_id":"p1","api_key":"","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        Some(empty_put),
+    )
+    .await;
+    assert!(
+        r.status().is_client_error(),
+        "PUT with an empty api_key must be refused (got {})",
+        r.status()
+    );
+    let _ = r.text().await;
+
+    let no_key_post = r#"{"id":"k2","provider_id":"p1","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-keys",
+        Some(TOKEN),
+        Some(no_key_post),
+    )
+    .await;
+    assert!(
+        r.status().is_client_error(),
+        "POST without api_key must be refused (got {})",
+        r.status()
+    );
+    let _ = r.text().await;
+
+    // (3) A valid update still rotates the key.
+    let good = r#"{"id":"k1","provider_id":"p1","api_key":"sk-rotated-secret","created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        Some(good),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "a valid PUT must still rotate the key");
+    let _ = r.text().await;
+
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let rotated: serde_json::Value = r.json().await.expect("json");
+    assert_ne!(
+        rotated["api_key"].as_str().unwrap_or_default(),
+        before_key,
+        "the valid PUT must have rotated the stored key: {rotated}"
+    );
+    assert!(
+        !rotated["api_key"].as_str().unwrap_or_default().is_empty(),
+        "the rotated key must not be empty: {rotated}"
+    );
+}

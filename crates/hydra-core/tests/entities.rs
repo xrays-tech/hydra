@@ -49,17 +49,32 @@ fn entities_derive_roundtrip() {
     };
     roundtrip(&provider_model);
 
-    // P2-10: api_key is skip_serializing + default — it is never serialized and
-    // defaults to "" on absence (asserted in
-    // `secrets_are_never_serialized_and_default_on_absence`), so the generic
-    // roundtrip uses the default (empty) value.
+    // P2-10 / review A3: `api_key` is `skip_serializing` and REQUIRED on
+    // deserialize, so `ProviderKey` is deliberately NOT serde-round-trippable —
+    // the secret never leaves the process, and a body that omits it is a loud
+    // error rather than a silently-defaulted empty credential. Both properties
+    // are asserted in `secrets_are_never_serialized_and_required_on_absence`;
+    // here we pin the wire shape only (no `api_key` in the serialized form).
     let provider_key = ProviderKey {
         id: "pk_01".into(),
         provider_id: "p_01".into(),
-        api_key: String::new(),
+        api_key: "sk-must-not-appear".into(),
         created_at: "2026-01-01T00:00:00Z".into(),
     };
-    roundtrip(&provider_key);
+    let ser = serde_json::to_value(&provider_key).expect("serialize");
+    assert_eq!(
+        ser,
+        json!({
+            "id": "pk_01",
+            "provider_id": "p_01",
+            "created_at": "2026-01-01T00:00:00Z"
+        }),
+        "the serialized ProviderKey must never carry the plaintext api_key"
+    );
+    assert!(
+        serde_json::from_value::<ProviderKey>(ser).is_err(),
+        "the serialized form omits api_key on purpose, so it must not deserialize back"
+    );
 
     let tenant = Tenant {
         id: "t_01".into(),
@@ -230,8 +245,8 @@ fn entities_derive_roundtrip() {
 /// api-key (`ProviderKey::api_key`, a non-Option `String`) and the cert
 /// private-key PEM (`CertMeta::cert_key_pem`, an `Option<String>`).
 #[test]
-fn secrets_are_never_serialized_and_default_on_absence() {
-    // ProviderKey.api_key: skip on serialize, default to "" on absence.
+fn secrets_are_never_serialized_and_required_on_absence() {
+    // ProviderKey.api_key: skip on serialize, REQUIRED on deserialize.
     let provider_key = ProviderKey {
         id: "pk_01".into(),
         provider_id: "p_01".into(),
@@ -243,17 +258,28 @@ fn secrets_are_never_serialized_and_default_on_absence() {
         value.get("api_key").is_none(),
         "api_key must never be serialized (got: {value})"
     );
-    // A payload without the field deserializes with the default (empty string).
-    let de: ProviderKey = serde_json::from_value(json!({
+    // A payload that OMITS the field must be rejected, NOT defaulted to "":
+    // `PUT /provider-keys/{id}` overwrites, so an empty default silently destroys
+    // a working credential (review A3).
+    let missing = serde_json::from_value::<ProviderKey>(json!({
         "id": "pk_01",
         "provider_id": "p_01",
         "created_at": "2026-01-01T00:00:00Z"
+    }));
+    assert!(
+        missing.is_err(),
+        "a payload without api_key must fail to deserialize, not default to an empty key"
+    );
+    // A payload that carries it still round-trips (explicit empty included — the
+    // write boundary is what rejects empty values).
+    let de: ProviderKey = serde_json::from_value(json!({
+        "id": "pk_01",
+        "provider_id": "p_01",
+        "api_key": "sk-secret",
+        "created_at": "2026-01-01T00:00:00Z"
     }))
     .unwrap();
-    assert_eq!(
-        de.api_key, "",
-        "absent api_key defaults to the empty string"
-    );
+    assert_eq!(de.api_key, "sk-secret");
     assert_eq!(de.id, "pk_01");
     assert_eq!(de.provider_id, "p_01");
 

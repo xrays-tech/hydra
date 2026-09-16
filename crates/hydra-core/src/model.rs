@@ -63,11 +63,18 @@ pub struct ProviderKey {
     pub id: String,
     pub provider_id: String,
     /// Plaintext in memory only (persisted as ciphertext at the DB boundary).
-    /// Never serialized (skip on serialize) so the plaintext cannot leak into
-    /// snapshots or any serialized form; defaults to `""` when absent on
-    /// deserialize. Admin responses re-expose the key only through
-    /// [`ProviderKeyDto`] (always masked).
-    #[serde(default, skip_serializing)]
+    /// Never serialized (`skip_serializing`) so the plaintext cannot leak into
+    /// snapshots or any serialized form.
+    ///
+    /// **Required on deserialize** — deliberately NOT `serde(default)`: a body
+    /// that omits this field must be rejected by the admin write boundary, never
+    /// silently defaulted to `""`. `PUT /provider-keys/{id}` is an upsert, so a
+    /// defaulted empty value would destroy a working provider credential and
+    /// still answer 200.
+    ///
+    /// Admin responses re-expose the key only through [`ProviderKeyDto`]
+    /// (always masked).
+    #[serde(skip_serializing)]
     pub api_key: String,
     pub created_at: String,
 }
