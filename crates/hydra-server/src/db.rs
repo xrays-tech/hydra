@@ -431,12 +431,22 @@ pub async fn get_provider_model(pool: &SqlitePool, id: &str) -> Result<ProviderM
 }
 
 pub async fn list_provider_models(pool: &SqlitePool) -> Result<Vec<ProviderModel>, sqlx::Error> {
+    list_provider_models_on(pool).await
+}
+
+/// [`list_provider_models`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_provider_models_on<'e, E>(
+    exec: E,
+) -> Result<Vec<ProviderModel>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         ProviderModelRow,
         r#"SELECT id as "id!", key, name, provider_id, status
            FROM provider_model ORDER BY key, provider_id"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -560,13 +570,24 @@ pub async fn list_provider_keys(
     pool: &SqlitePool,
     kp: &dyn KeyProvider,
 ) -> Result<Vec<ProviderKey>, sqlx::Error> {
+    list_provider_keys_on(pool, kp).await
+}
+
+/// [`list_provider_keys`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_provider_keys_on<'e, E>(
+    exec: E,
+    kp: &dyn KeyProvider,
+) -> Result<Vec<ProviderKey>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         ProviderKeyRow,
         r#"SELECT id as "id!", provider_id, created_at, api_key_ciphertext, api_key_nonce,
                   key_version
            FROM provider_key ORDER BY provider_id, created_at, id"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     rows.iter()
         .map(|r| r.to_model(kp).map_err(crypto_to_sqlx))
@@ -972,11 +993,22 @@ pub async fn set_tenant_access_token_hash(
 pub async fn list_tenant_access_token_hashes(
     pool: &SqlitePool,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
+    list_tenant_access_token_hashes_on(pool).await
+}
+
+/// [`list_tenant_access_token_hashes`] on an arbitrary executor
+/// (one-transaction read).
+pub(crate) async fn list_tenant_access_token_hashes_on<'e, E>(
+    exec: E,
+) -> Result<Vec<(String, String)>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query!(
         "SELECT id, access_token_hash FROM tenant WHERE access_token_hash IS NOT NULL \
            ORDER BY id"
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows
         .into_iter()
@@ -1091,12 +1123,22 @@ pub async fn get_tenant_provider(
 }
 
 pub async fn list_tenant_providers(pool: &SqlitePool) -> Result<Vec<TenantProvider>, sqlx::Error> {
+    list_tenant_providers_on(pool).await
+}
+
+/// [`list_tenant_providers`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_tenant_providers_on<'e, E>(
+    exec: E,
+) -> Result<Vec<TenantProvider>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         TenantProviderRow,
         r#"SELECT id as "id!", tenant_id, provider_id
            FROM tenant_provider ORDER BY tenant_id, provider_id"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -1137,12 +1179,20 @@ pub async fn get_tenant_model(pool: &SqlitePool, id: &str) -> Result<TenantModel
 }
 
 pub async fn list_tenant_models(pool: &SqlitePool) -> Result<Vec<TenantModel>, sqlx::Error> {
+    list_tenant_models_on(pool).await
+}
+
+/// [`list_tenant_models`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_tenant_models_on<'e, E>(exec: E) -> Result<Vec<TenantModel>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         TenantModelRow,
         r#"SELECT id as "id!", tenant_id, model_key
            FROM tenant_model ORDER BY tenant_id, model_key"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -1194,13 +1244,22 @@ pub async fn get_limit_role(pool: &SqlitePool, id: &str) -> Result<LimitRole, sq
 }
 
 pub async fn list_limit_roles(pool: &SqlitePool) -> Result<Vec<LimitRole>, sqlx::Error> {
+    list_limit_roles_on(pool).await
+}
+
+/// [`list_limit_roles`] on an arbitrary executor, so the replication content can
+/// read it inside ONE transaction (see `cluster::content::ReplicationContent::load`).
+pub(crate) async fn list_limit_roles_on<'e, E>(exec: E) -> Result<Vec<LimitRole>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         LimitRoleRow,
         r#"SELECT id as "id!", name, matching_key, matching_model, matching_tenant,
                   matching_provider, limit_count, limit_token, window, enabled, created_at
            FROM limit_role ORDER BY created_at, id"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -1277,12 +1336,22 @@ pub async fn get_provider_key_binding(
 pub async fn list_provider_key_bindings(
     pool: &SqlitePool,
 ) -> Result<Vec<ProviderKeyBinding>, sqlx::Error> {
+    list_provider_key_bindings_on(pool).await
+}
+
+/// [`list_provider_key_bindings`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_provider_key_bindings_on<'e, E>(
+    exec: E,
+) -> Result<Vec<ProviderKeyBinding>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         ProviderKeyBindingRow,
         r#"SELECT id as "id!", key_prefix, provider_id, enabled, created_at, updated_at
            FROM provider_key_binding ORDER BY key_prefix"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }

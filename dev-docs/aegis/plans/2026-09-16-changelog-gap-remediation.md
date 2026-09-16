@@ -3890,3 +3890,16 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | RED 证据（已实测） | 在 `write_tenant` 中注入"**先提交行、再开新事务写 secret**"（即改前的分步语义）⇒ 用例① **FAILED**："a failed secret write must roll the tenant row back" ⇒ 恢复后全绿 |
 | `.sqlx/` 的实际结论（**偏离计划纸面**） | 计划断言 T9.3"**必然**产生新 SQL 文本 ⇒ `cargo sqlx prepare` 是强制步骤"。实测**不需要**：我把三段 SQL（行 INSERT/UPDATE、`access_token_hash`、证书四列）以**逐字相同**的语句与参数类型搬进 `write_tenant`，`SQLX_OFFLINE=true` 全量构建通过、`git status --short .sqlx/` **为空** ⇒ 缓存仍然命中。计划该处的前提只对"新写一条合成 SQL"成立；复用既有语句是更好的做法（零缓存 churn、零 CI 风险） |
 | 门禁 | fmt clean；两种 clippy **0 warning**（唯一一次告警 `type_complexity`，已用 `type SecretWrites` 别名消除）；`--features server` **28 套件 0 failed**（admin_api 34→**37**）；三特性 **428 passed / 0 failed** |
+
+### Batch 9 — C-3 复制内容读取放进单一事务（消除撕裂读）
+
+> 本条不在计划正文内，是**后实现 oracle 复审**（审查者①第 8 条）指出的既有暴露面：`ReplicationContent::load` 依次发 **7 条独立查询**，并发管理写若在两条查询之间提交，会得到一个**混合了不同版本**的集合。
+
+| 项 | 内容 |
+|---|---|
+| 影响 | 最尖锐的一种：`provider_key` 行已读出、而它所属的 provider 随后被删除 ⇒ `restore_config` 撞外键 ⇒ 该副本**本次物化失败**，直到内容再次变化才恢复（**保持原子 + last-known-good，无数据丢失**，但副本会静默变旧——正是本模块存在的意义所要消除的失败模式） |
+| 修法 | `ReplicationContent::load` 内改用**一个读事务**：`pool.begin()` → 7 条查询全部走 `&mut *tx` → `commit()` 释放快照。SQLite(Wal) 在一个事务内为所有读提供**同一快照**，因此七组行必然描述同一版本 |
+| 支撑改动 | `db.rs` 把 7 个 loader 各拆成"池版包装 + `_on(exec)` 泛型版"（`pub(crate)`），SQL 文本与参数类型**逐字不变** ⇒ `.sqlx/` 零改动、`SQLX_OFFLINE=true` 仍全量通过；`host`/`migrate` 等既有调用点不受影响 |
+| 用例 | ① `a_load_is_internally_consistent`：断言一次 load 的每组行**互相一致**（没有 `provider_key` / binding / tenant_provider 指向本次未见的 provider）——撕裂读一旦发生就会被抓住；② `a_read_transaction_is_not_torn_by_a_concurrent_writer`：用**文件池+第二个连接**实测引擎语义——事务内先读到的 key 集合，在另一连接 commit 删除后**仍不变**，而事务结束后删除**立即可见**（防"其实写没生效"的空洞通过） |
+| 诚实边界（不夸大） | 用例② 钉的是**引擎快照语义**（该修法所依赖的性质），不是"load 内部一定有事务"这一调用点本身；调用点由代码可见的结构保证，用例① 则在真的发生撕裂时失败。计划正文与门禁均未覆盖本条，属开发后复审的追加项 |
+| 门禁 | fmt clean；两种 clippy **0 warning**；`--features server` **28 套件 0 failed**（content 单测 1→**3**）；三特性 **430 passed / 0 failed**；`.sqlx/` **无改动** |
