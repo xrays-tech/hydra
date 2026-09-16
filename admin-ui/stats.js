@@ -15,6 +15,16 @@
 let _statsTimer = null;
 let _statsAuto = false; // persistent auto-refresh switch (survives re-renders)
 
+/** Stop the auto-refresh interval, if any.
+ *
+ * Called by `go()` when the user navigates AWAY from this page. `_statsAuto` is
+ * a persistent switch, so the interval used to survive navigation and re-render
+ * the stats page over whatever page the user had moved to — every 10 s, forever
+ * (review D3/M-9). The switch itself is kept: coming back re-arms the timer. */
+function teardownStats() {
+  if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
+}
+
 function renderStats() {
   if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
 

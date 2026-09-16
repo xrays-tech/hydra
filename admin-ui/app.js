@@ -451,6 +451,8 @@ const CUSTOM = {
     title: "custom.stats.title", nav: "custom.stats.nav", icon: "chart",
     desc: "custom.stats.desc",
     render: renderStats,
+    // A custom page may own timers; `go()` calls this when leaving the page.
+    teardown: teardownStats,
   },
 };
 
@@ -495,6 +497,12 @@ function setNavBadge(key, n) {
  * Content rendering
  * ======================================================================== */
 function go(key) {
+  // Tear down the page we are LEAVING before switching: the stats page owns a
+  // persistent auto-refresh interval, and without this it kept firing and
+  // re-rendering itself over the page the user had navigated to (review
+  // D3/M-9). Pages that own no timer simply omit `teardown`.
+  const leaving = CUSTOM[CURRENT];
+  if (leaving && typeof leaving.teardown === "function") leaving.teardown();
   CURRENT = key;
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.key === key));
   closeSidebar();

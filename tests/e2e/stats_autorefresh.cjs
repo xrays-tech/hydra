@@ -10,6 +10,11 @@
  *   - uncheck "auto" → advance the clock → request count stays unchanged.
  *
  * Run:  node tests/e2e/stats_autorefresh.cjs
+ *
+ * Playwright is not a dependency of this repo (no root node_modules), so point
+ * NODE_PATH at an installation whose browser build is present, e.g.
+ *   NODE_PATH=$(npm root -g) node tests/e2e/stats_autorefresh.cjs
+ *   NODE_PATH=/path/to/node_modules node tests/e2e/stats_autorefresh.cjs
  */
 "use strict";
 const http = require("http");
@@ -70,7 +75,10 @@ const settle = (ms = 25) => new Promise((r) => setTimeout(r, ms));
   };
 
   try {
-    const ctx = await browser.newContext();
+    // Pin the language: the UI is fully i18n'd and picks its locale from
+    // `navigator.language`, so an assertion on English text would otherwise
+    // depend on the machine running the test.
+    const ctx = await browser.newContext({ locale: "en-US" });
     const page = await ctx.newPage();
     page.on("pageerror", (e) => console.error("PAGE ERROR:", e.message));
 
@@ -118,6 +126,46 @@ const settle = (ms = 25) => new Promise((r) => setTimeout(r, ms));
     const afterAuto = usageCount;
     assert("auto-refresh fired >= 2 requests over 2 cycles", afterAuto >= atCheck + 2,
       "afterAuto=" + afterAuto + " atCheck=" + atCheck);
+
+    // --- REVIEW D3/M-9: leaving the page must stop the interval -------------
+    // Re-arm auto-refresh, navigate to another page, then advance the clock:
+    // the stats page must not re-render itself over the page the user is on,
+    // and no further /stats/usage request may fire.
+    await page.locator("#stats-autorefresh").check();
+    await settle();
+    await page.locator('#nav button.nav-item[data-key="providers"]').click();
+    await page.locator("#page-title").waitFor({ state: "visible", timeout: 5000 });
+    await settle();
+    const afterNav = usageCount;
+    await page.clock.runFor(30000); // three stats cycles
+    await settle();
+    assert(
+      "leaving the stats page stops its auto-refresh requests",
+      usageCount === afterNav,
+      "usageCount=" + usageCount + " afterNav=" + afterNav
+    );
+    const title = (await page.locator("#page-title").textContent()) || "";
+    assert(
+      "the stats page does not re-render over the page we navigated to",
+      !(await page.locator("#stats-totals").isVisible()),
+      "page-title=" + title.trim()
+    );
+
+    // Coming back re-arms the persistent switch (it is a user preference, not
+    // a per-visit one) — so the timer must be running again.
+    await page.locator('#nav button.nav-item[data-key="stats"]').click();
+    await page.locator("#stats-totals").waitFor({ state: "visible", timeout: 5000 });
+    await settle();
+    const atReturn = usageCount;
+    await page.clock.runFor(10000);
+    await settle();
+    assert(
+      "returning to the page resumes auto-refresh",
+      usageCount > atReturn,
+      "usageCount=" + usageCount + " atReturn=" + atReturn
+    );
+    await page.locator("#stats-autorefresh").uncheck();
+    await settle();
 
     // Uncheck auto-refresh — the interval is cleared, no more re-fetches.
     await page.locator("#stats-autorefresh").uncheck();
