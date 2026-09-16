@@ -172,20 +172,49 @@ impl InvalidationStream {
         Ok(g.unwrap_or(0))
     }
 
-    /// One trim pass (F-6): trim to `maxlen`, and if entries were removed,
-    /// bump the generation so lagging consumers re-hydrate. Returns
+    /// One trim pass (F-6): trim to `maxlen`, and if entries were removed, bump
+    /// the generation so lagging consumers re-hydrate. Returns
     /// `(removed, bumped)`.
+    ///
+    /// **One atomic script** (review B3a). The trim and its compensating bump
+    /// used to be two commands: `XTRIM` first, then `INCR`, so anything that
+    /// failed in between (a dropped connection, a command timeout) left the
+    /// entries deleted with NO compensation — and the only backstop against
+    /// dropping an invalidation nobody had read is that generation bump.
+    /// Redis runs a script as a single command, so the two effects cannot be
+    /// separated by a network failure any more.
+    ///
+    /// The bump is computed from `GET`/`SET` rather than `INCR` on purpose: a
+    /// corrupt counter value would make `INCR` raise *after* the trim had
+    /// already been applied (a Lua error does not roll back earlier writes in
+    /// the same script), which is the very loss this fix removes.
     pub async fn trim_and_maybe_bump(&self, maxlen: u64) -> Result<(i64, bool), RedisError> {
-        let removed = self.trim(maxlen).await?;
-        let bumped = if removed > 0 {
-            self.bump_generation().await?;
-            true
-        } else {
-            false
-        };
-        Ok((removed, bumped))
+        let removed: i64 = self
+            .pool
+            .eval(
+                TRIM_AND_MAYBE_BUMP_SCRIPT,
+                vec![EVENTS_KEY, GENERATION_KEY],
+                vec![maxlen.to_string()],
+            )
+            .await?;
+        Ok((removed, removed > 0))
     }
 }
+
+/// Trim the invalidation stream and bump the generation in ONE atomic step.
+///
+/// `KEYS[1]` = stream, `KEYS[2]` = generation counter, `ARGV[1]` = maxlen.
+/// Exact `MAXLEN` (matching the previous `XCapTrim::Exact`), and the counter is
+/// only touched when something was actually removed — a spurious bump would
+/// clear every node's auth cache for nothing.
+pub const TRIM_AND_MAYBE_BUMP_SCRIPT: &str = r#"
+local removed = redis.call('XTRIM', KEYS[1], 'MAXLEN', ARGV[1])
+if removed > 0 then
+  local current = tonumber(redis.call('GET', KEYS[2])) or 0
+  redis.call('SET', KEYS[2], current + 1)
+end
+return removed
+"#;
 
 /// Apply one invalidation to a local auth cache (idempotent).
 pub async fn apply_invalidation(
@@ -317,23 +346,19 @@ pub fn spawn_trim_task(stream: InvalidationStream, maxlen: u64, interval: std::t
 mod tests {
     use super::*;
     use crate::http::AuthCache;
-    use crate::redis::mock::MockRedis;
     use std::time::Duration;
 
-    async fn pool_with_mock() -> Pool {
-        let mock = std::sync::Arc::new(MockRedis::new());
-        let cfg = Config {
-            mocks: Some(mock),
-            ..Default::default()
-        };
-        let p = Pool::new(cfg, None, None, None, 1).expect("pool");
-        p.init().await.expect("init");
-        p
+    /// A REAL Redis, on its own database (dev-plan 铁律 2: the invalidation bus
+    /// is the one place where a double's missing semantics hid a real failure
+    /// path — its `INCR` could not fail, so "trimmed but not compensated" was
+    /// untestable). Fails loudly when `HYDRA_TEST_REDIS_URL` is unset.
+    async fn pool() -> Pool {
+        crate::redis::test_redis::isolated_pool().await
     }
 
     #[tokio::test]
     async fn publish_read_roundtrip() {
-        let s = InvalidationStream::new(pool_with_mock().await);
+        let s = InvalidationStream::new(pool().await);
         let id = s
             .publish(Some("t1".into()), vec!["sk-a".into(), "sk-b".into()])
             .await
@@ -356,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn trim_and_generation() {
-        let s = InvalidationStream::new(pool_with_mock().await);
+        let s = InvalidationStream::new(pool().await);
         for _ in 0..5 {
             s.publish(None, vec![]).await.expect("publish");
         }
@@ -421,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_carries_hashes_not_plaintext() {
-        let s = InvalidationStream::new(pool_with_mock().await);
+        let s = InvalidationStream::new(pool().await);
         let _id = s
             .publish(
                 Some("t1".into()),
@@ -454,7 +479,7 @@ mod tests {
     async fn comma_key_invalidated_by_hash() {
         // A key containing a comma is hashed WHOLE before the comma-join, so
         // the stream carries ONE digest (never an ambiguous split).
-        let s = InvalidationStream::new(pool_with_mock().await);
+        let s = InvalidationStream::new(pool().await);
         let _id = s
             .publish(Some("t1".into()), vec!["a,b".into()])
             .await
@@ -482,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_keys_replay_equivalent_to_keyhashes() {
-        let pool = pool_with_mock().await;
+        let pool = pool().await;
         let s = InvalidationStream::new(pool.clone());
         // v=2 event for "sk-a".
         let _ = s
@@ -583,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn trim_and_maybe_bump() {
-        let s = InvalidationStream::new(pool_with_mock().await);
+        let s = InvalidationStream::new(pool().await);
         for _ in 0..5 {
             s.publish(None, vec![]).await.expect("publish");
         }
@@ -600,12 +625,60 @@ mod tests {
         assert_eq!(s.generation().await.expect("gen post"), 1);
     }
 
+    /// REVIEW B3a — the trim and its compensating bump are ONE atomic step.
+    ///
+    /// They used to be two commands (`XTRIM`, then `INCR`), so anything failing
+    /// in between left the entries deleted with no compensation — and that bump
+    /// is the only backstop against dropping an invalidation no consumer had
+    /// read yet. Fault injection needs no mock here: a real Redis makes `INCR`
+    /// fail on a non-integer counter value, and a Lua error does NOT roll back
+    /// the writes the script already performed.
+    #[tokio::test]
+    async fn trim_and_bump_are_one_atomic_step() {
+        let pool = pool().await;
+        let s = InvalidationStream::new(pool.clone());
+        for i in 0..5 {
+            s.publish(Some("t1".into()), vec![format!("k{i}")])
+                .await
+                .expect("publish");
+        }
+
+        // A corrupt counter: `INCR` raises on it, and (in the old two-command
+        // form) that error arrived AFTER the trim had already been applied.
+        let _: () = pool
+            .set(GENERATION_KEY, "not-a-number", None, None, false)
+            .await
+            .expect("seed corrupt counter");
+
+        let (removed, bumped) = s
+            .trim_and_maybe_bump(2)
+            .await
+            .expect("trim + bump must be one step, not a partial failure");
+        assert_eq!(removed, 3, "three entries were dropped");
+        assert!(
+            bumped,
+            "dropping entries MUST bump, whatever the counter held"
+        );
+        assert_eq!(
+            s.generation().await.expect("gen"),
+            1,
+            "the bump is applied on top of the unparseable value (treated as 0)"
+        );
+
+        // A trim that removes nothing must NOT bump: a spurious bump clears
+        // every node's auth cache for nothing.
+        let (removed, bumped) = s.trim_and_maybe_bump(2).await.expect("second pass");
+        assert_eq!(removed, 0);
+        assert!(!bumped, "nothing dropped ⇒ no bump");
+        assert_eq!(s.generation().await.expect("gen"), 1, "unchanged");
+    }
+
     #[tokio::test]
     async fn trim_bump_clears_consumer_cache() {
         // End-to-end: publish past maxlen → the trim task removes entries →
         // bumps the generation → the consumer observes the bump and clears its
         // local cache.
-        let pool = pool_with_mock().await;
+        let pool = pool().await;
         let stream = InvalidationStream::new(pool.clone());
 
         let auth = std::sync::Arc::new(

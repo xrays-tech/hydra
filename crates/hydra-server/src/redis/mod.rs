@@ -27,6 +27,75 @@ pub mod breaker;
 pub mod mock;
 pub mod rate_limit;
 
+/// Real-Redis harness for tests (dev-plan 铁律 2: Redis is an external system
+/// boundary and a REAL instance is available locally and in CI, so the
+/// in-process double is no longer the default for new tests).
+///
+/// The endpoint comes from `HYDRA_TEST_REDIS_URL` (e.g.
+/// `redis://127.0.0.1:6380`). A test that needs Redis **fails loudly** when it
+/// is unset: silently falling back to a mock — or skipping — is exactly how
+/// "use the real thing" rots into "we never notice".
+#[cfg(test)]
+pub mod test_redis {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use fred::clients::Pool;
+    use fred::prelude::*;
+
+    /// Hand out a distinct Redis DATABASE per test: the key names are shared
+    /// constants (`hydra:{ctl:events}`, `hydra:{lease:leader}`, …), so tests on
+    /// one instance would otherwise observe each other's state.
+    static NEXT_DB: AtomicU8 = AtomicU8::new(1);
+
+    /// A pool on its own flushed database, against a REAL Redis.
+    ///
+    /// # Panics
+    /// When `HYDRA_TEST_REDIS_URL` is unset or the instance is unreachable —
+    /// with the exact commands needed to start one.
+    pub async fn isolated_pool() -> Pool {
+        let base = std::env::var("HYDRA_TEST_REDIS_URL").unwrap_or_else(|_| {
+            panic!(
+                "HYDRA_TEST_REDIS_URL is not set, and Redis-dependent tests must run against a REAL \
+                 Redis (dev-plan 铁律 2: no in-process Redis mock).\n  \
+                 start one: docker compose -f environment/docker-compose.local.yml up -d redis-test\n  \
+                 then:      export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380"
+            )
+        });
+        let db = NEXT_DB.fetch_add(1, Ordering::Relaxed) % 15 + 1; // 1..=15
+        let url = format!("{}/{}", base.trim_end_matches('/'), db);
+        let config = Config::from_url(&url).expect("HYDRA_TEST_REDIS_URL must parse");
+        let pool = Pool::new(
+            config,
+            Some(super::performance_config()),
+            Some(super::connection_config()),
+            None,
+            2,
+        )
+        .expect("test pool builds");
+        pool.init()
+            .await
+            .unwrap_or_else(|e| panic!("cannot reach the test Redis at {url}: {e}"));
+        // Clear only THIS test's database. `FLUSHALL` would wipe the other
+        // databases that parallel tests are using, and fred 10 exposes no
+        // `FLUSHDB` helper, so it goes through the raw command interface.
+        let _: fred::types::Value = pool
+            .custom(
+                fred::types::CustomCommand::new_static("FLUSHDB", None, false),
+                Vec::<String>::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("cannot flush test db {db}: {e}"));
+        pool
+    }
+
+    /// `true` when a test Redis is configured. Prefer [`isolated_pool`], which
+    /// fails loudly instead of silently skipping.
+    #[must_use]
+    pub fn configured() -> bool {
+        std::env::var("HYDRA_TEST_REDIS_URL").is_ok()
+    }
+}
+
 use fred::prelude::*;
 use fred::types::config::{ConnectionConfig, PerformanceConfig, UnresponsiveConfig};
 use fred::types::{Expiration, SetOptions};

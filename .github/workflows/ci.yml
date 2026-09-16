@@ -9,10 +9,25 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   SQLX_OFFLINE: "true"
+  # dev-plan 铁律 2: Redis-dependent tests must talk to a REAL Redis — the
+  # in-process double is forbidden. The service container below publishes
+  # 6379 on localhost; a test that needs Redis FAILS LOUDLY when this is unset
+  # rather than silently falling back to a mock.
+  HYDRA_TEST_REDIS_URL: "redis://127.0.0.1:6379"
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 2s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
 
@@ -86,6 +101,16 @@ jobs:
   # from exactly this feature set, so a break here ships a broken binary.
   optional-features:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 2s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
 
