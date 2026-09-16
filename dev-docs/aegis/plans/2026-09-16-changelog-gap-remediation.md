@@ -3645,3 +3645,48 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 - 两种 clippy 均 **0 warning**：`--features hydra-server/server` 与 `--features hydra-server/server,hydra-server/cluster-redis`
 - `SQLX_OFFLINE=true cargo test -p hydra-server --features server` ⇒ **27 个套件 0 failed**（库 96 + `node_id_from` 单测）
 - `HYDRA_TEST_REDIS_URL=…:6380 SQLX_OFFLINE=true cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse` ⇒ **累计 398 passed、0 failed**（Batch 1 时为 386，本批 +12）
+### Batch 3 记录（T3 — HTTP/2 authority 参与租户解析，G4）
+
+| 文件 | 改动 |
+|---|---|
+| `proxy.rs` | 新增 `request_host(req_header)`（`Host` **逐字优先**，缺失/空则回退 URI authority）、`host_header()`、`authority_host()`（端口由 `Authority::host()` 丢弃、IPv6 方括号 trim、小写）；`request_filter` 改用 `let host = Self::request_host(session.req_header());`，两处调用点（`observe_sni_host_mismatch`、`resolve_tenant`）均传 `&host`；`resolve_tenant` 的**去端口逻辑保留未动**（O17） |
+| `tls.rs` | 新增 `hydra_host_authority_mismatch_total`（与 `hydra_sni_host_mismatch_total` 同族：模块内 `OnceLock<Option<IntCounter>>`、注册失败降级为无操作）+ `note_host_authority_mismatch(host, authority)` + 私有 `normalise_host()`；`#[cfg(test)]` 的 `host_authority_mismatch_count()` 供 `proxy.rs` 单测观测 |
+| 测试位置 | 按 O28 **放在 `proxy.rs` 内新增的 `#[cfg(test)] mod tests`**（两个函数都是私有的，集成测试无法调用）——**未**新增 `tests/h2_authority.rs` |
+
+**实现中发现的两个真实坑（都在写测试时被抓住并修好）**
+
+1. **门控写反会让计数器变成幽灵指标**：第一版把 `note_host_authority_mismatch(<Host 头>, &host)` 的第二个参数传成"解析结果"。但 `request_host` 在 `Host` 存在时**就是**返回 `Host`，两者恒等 ⇒ `hydra_host_authority_mismatch_total` **永远不会递增**（而计划明确要求它是"Host 与 authority 同时存在且不一致"的可观测信号）。改为**同时**引入 `host_header()` / `authority_host()` 两个提取器，调用点传"原始 Host 头 vs 规范化 authority"，并让单测直接驱动这一对提取器（测的是接线本身，不是它的副本）。
+2. **比较必须两边都规范化**：authority 侧经 `Authority::host()` 后是**无方括号**的 `::1`，而 `Host` 侧可能是 `[::1]:8080`；若只对 authority 做 trim、再用 `host.split(':').next()` 比，`::1` 会被截成空串 ⇒ 幻影失配。`normalise_host()` 因此对无括号且冒号 ≥2 的值整体返回（IPv6 字面量），并新增断言锁定 `[::1]:8080` vs `::1` 不算失配。
+
+**验收逐条对照**
+
+| 验收项 | 用例 |
+|---|---|
+| 有 `Host: acme.com` ⇒ `acme.com`（h1 不变） | `host_header_wins_and_is_kept_verbatim` |
+| **有 `Host: acme.com:8443`**（O17 回归守卫） | 同上（`request_host` 逐字保留 + `resolve_tenant` 去端口 ⇒ 仍命中 `acme.com`） |
+| 无 `Host`、URI `https://acme.com/v1/chat/completions` ⇒ `acme.com`（**改前为空**） | `falls_back_to_the_uri_authority_without_a_host_header` |
+| 无 `Host`、URI `http://acme.com:8443/v1/x` ⇒ `acme.com` | 同上 |
+| 无 `Host`、URI `http://[::1]:8080/v1/x` ⇒ `::1`（**不得**得 `[`），且落到 `localhost` 兜底 | `ipv6_authority_is_unbracketed_and_falls_back_to_localhost` |
+| 两者都缺 ⇒ 空串（沿用 `localhost` 兜底语义） | `neither_host_nor_authority_yields_the_empty_domain` |
+| 两者同时存在且不同 ⇒ 取 `Host` 且计数器递增 | `host_authority_mismatch_is_counted_but_host_still_wins`（另有"仅大小写差异/一侧缺失/端口差异/IPv6 括号差异均不计"的负向断言） |
+
+**"改前失败"证据**：`request_host` 在改前**不存在**（取值处直接读 `Host` 头），因此该用例无法在改前编译——与 T2 同类。可复算的静态证据即审核 §G4 的 `grep -rn "uri\.host()" crates/` ⇒ 0 命中（无任何从 URI 取 authority 的代码），"h2 请求解析出的 host 恒为空"由此成立。
+
+### Batch 4 记录（T4 — 快照产端租约校验，G9）
+
+| 文件 | 改动 |
+|---|---|
+| `admin/mod.rs` | 新增 `AdminState::is_leader_candidate()`（判据 `!edge_mode`，含 B7 的理由注释：`AdminState` 无 role 字段、`--features server` 下 registry 是 `Option<()>`） |
+| `admin/cluster_api.rs` | `internal_control` 在**廉价路径之后**加两道门：非候选 ⇒ 404 `not_found`（防御性；edge 实际由路由在分发前 404）、候选但未持租约 ⇒ **503 `not_leader`**；wire 仍从同一次 `replication()` 读取的 `content` 构建 |
+
+**验收逐条对照**（全部经真实 HTTP 端点驱动，`tests/cluster.rs`）
+
+| 验收项 | 结果 |
+|---|---|
+| 候选且持租约 ⇒ 正常快照，且 `snapshot.version == 公布的 version` | ✅ `control_snapshot_requires_the_leader_lease`(c) |
+| 候选但非 leader ⇒ 503 `not_leader`，且**错误体里不含任何 payload** | ✅ (a)（断言 `error.code` 与 `snapshot` 不存在） |
+| 非候选（edge）⇒ 404 `not_found` 且**不 panic** | ✅ `control_snapshot_on_an_edge_is_404_and_does_not_panic`（断言是既有文案 `edge node: no admin API`，并在其后再次请求 `/healthz` 证明服务未崩） |
+| `since >= current` ⇒ 恒 200 + `snapshot: null`（**不受租约门控**，含 `since > current`） | ✅ (b) |
+| 无选举（`leader_ready: None`）⇒ 行为不变（既有夹具不回退） | ✅ (d) |
+
+**"改前失败"证据（已实测，非静态推理）**：临时删掉刚加的租约门后重跑，`control_snapshot_requires_the_leader_lease` **FAILED**，且失败输出显示备用节点**真的吐出了完整快照**——含 `sealed_provider_keys`（`{"p1":[{"id":"k1","sealed":{...}}]}`）与 `fidelity` 段，即"任何持 cluster token 的非 leader 都能产出快照"的实证；恢复门后全绿。
