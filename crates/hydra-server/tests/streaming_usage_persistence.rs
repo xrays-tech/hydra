@@ -152,9 +152,10 @@ async fn seed_routed(
     .expect("insert limit_role");
 }
 
+/// See `common::ephemeral_port`: no bind-then-release race (the previous
+/// local copy could hand two concurrent tests the same port).
 fn ephemeral_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local_addr").port()
+    common::ephemeral_port()
 }
 
 fn start_proxy(state: std::sync::Arc<AppState>) -> String {

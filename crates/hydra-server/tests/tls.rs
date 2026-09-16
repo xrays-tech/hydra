@@ -63,9 +63,10 @@ fn fixture_cert_der(crt: &str) -> Vec<u8> {
 
 /// Bind an ephemeral port, return it, then release the socket so Pingora can
 /// rebind. (Same TOCTOU-tolerant pattern as the W4 spike test.)
+/// See `common::ephemeral_port`: no bind-then-release race (the previous
+/// local copy could hand two concurrent tests the same port).
 fn ephemeral_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("local_addr").port()
+    common::ephemeral_port()
 }
 
 /// Blocking TLS client: connect to `addr` presenting SNI=`sni`, return the DER

@@ -64,3 +64,33 @@ pub async fn real_redis_pool(db: u8) -> fred::clients::Pool {
         .unwrap_or_else(|e| panic!("cannot flush test db {db}: {e}"));
     pool
 }
+
+/// A unique TCP port for a test listener, allocated WITHOUT the
+/// bind-then-release race.
+///
+/// `TcpListener::bind("127.0.0.1:0")` returns a port and then closes it; the
+/// kernel is free to hand the same port to another test before Pingora actually
+/// binds it. Two tests in one binary could then end up sharing a listener: the
+/// older test's requests were answered by the younger test's proxy, whose config
+/// differs — observed as a mystery 404 from a test that asserts pass-through
+/// (`catalog_get_v1_models_id_still_passes_through_upstream`, ~1 run in 7).
+///
+/// Ports now come from a per-process base plus a counter that never repeats
+/// inside the process, and the candidate is probed with a real bind so an
+/// unrelated process holding it is skipped.
+#[allow(dead_code)]
+pub fn ephemeral_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
+    // 100 ports per process, drawn below the Linux ephemeral range (32768+) so
+    // Pingora's own outbound connections cannot collide with the block.
+    let base = 12_000u32 + (std::process::id() % 100) * 100;
+    for _ in 0..100 {
+        let port = (base + u32::from(NEXT.fetch_add(1, Ordering::Relaxed) % 100)) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free test port in the allocated block");
+}

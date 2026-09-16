@@ -24,9 +24,10 @@ use pingora_core::services::listening::Service;
 
 const TOKEN: &str = "test-admin-token";
 
+/// See `common::ephemeral_port`: no bind-then-release race (the previous
+/// local copy could hand two concurrent tests the same port).
 fn ephemeral_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
+    common::ephemeral_port()
 }
 
 async fn admin_state() -> Arc<AdminState> {
