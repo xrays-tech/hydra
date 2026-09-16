@@ -3865,3 +3865,14 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 诊断复现 | 改前：黑洞上游会一直等到客户端级 300s（`provider_client.rs` 只有 `.timeout(300s)`，`proxy.rs` 的 `send` 无首字节界）；改后：在 `first_byte_secs` 量级失败 |
 
 **本轮门禁**：`cargo fmt --check` clean；两种 clippy **0 warning**；release build Finished；`--features server` ⇒ **27 套件 0 failed**；三特性 ⇒ **累计 422 passed / 0 failed**（Batch 6 前半为 417，本批 +5）。
+
+### Batch 7 — T10.5 真实 Redis 冷启动选主不变量
+
+| 项 | 内容 |
+|---|---|
+| 新增 | `crates/hydra-server/tests/redis_real.rs`（**首行 `#![cfg(feature = "cluster-redis")]`**；已实测 `--features server` 构建下该 target 编译为 0 测试，不破坏既有门禁） |
+| 为什么另开文件 | `tests/cluster.rs` 的选举用例跑在 **`MemoryLeaseStore`**（进程内替身）上，**无法**触及真正仲裁租约的 Lua compare-and-set；本文件用**真实 Redis**（dev-plan 铁律 2：外部系统不 mock） |
+| 三条不变量 | ① **冷启动恰好 1 个 leader**（断言"不是 0 个"也断言"不是 2 个"，并断言两个失败者停在 `Standby`）；② **持有者死后恰好 1 个继任者**（另一轮 tick 后仍然恰好 1）；③ **租约键的值就是持有者 node id**（standby 的转发目标正是从这个值解析出来的，属契约而非实现细节） |
+| 计划前提的两处修正（第八轮已写明，实测确认） | 真实枚举是 `ElectionState::{Standby, Active, Uncertain}`（**没有** `Leader` 变体），公开谓词是 `is_leader()`；且**新鲜度门初始关闭**（`sync_ok = false`）⇒ 无快照产端时必须显式 `mark_sync_ok(true)`，否则三个节点全部停在 `Standby`（那正是 fail-closed 的正确行为，但不是本用例要测的东西）。用例里用 **3s** 租约使 2×lease 的新鲜度窗口覆盖整个选举过程 |
+| 开发中发现并修掉的一个自伤 | 我最初写了一条"缺 `HYDRA_TEST_REDIS_URL` 必须响亮失败"的用例，它用 `std::env::remove_var` **改动进程级环境**，而同一二进制内的用例**并行执行** ⇒ 它把另外三条用例的 env 一并抹掉，导致它们全部 panic。已**删除**该用例：响亮失败的契约由 `common::real_redis_pool` 自身保证（未设即 panic 并打印启动命令），不需要、也不应该靠改全局环境来"测" |
+| 门禁 | fmt clean；三种 clippy 组合（server / server+cluster-redis / 三特性）均 **0 warning**；真实 Redis 下 `redis_real` **3 passed**；`--features server` 下该 target 0 测试且不报错 |
