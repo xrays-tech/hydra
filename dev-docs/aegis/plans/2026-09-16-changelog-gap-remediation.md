@@ -4002,3 +4002,13 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 计划里的一处**不成立**的断言 | T8 写 `stats_autorefresh.cjs` 退役后"其覆盖已由 **T9.5 / T10.4** 的正式用例取代"。**两者都不是**：T9.5 是非 leader 横幅，T10.4 是 provider 编辑/删除的 `clearsFK` 路径。该脚本覆盖的是 **F-7（stats 页自动刷新）**——"初始渲染会请求、勾选 auto 后每 10s 重新请求、离开该页必须停止 interval（否则它会覆盖用户正在看的页面）、返回后重新武装"——**此前没有任何其他测试覆盖它**。我上一轮把这个错误说法抄进了 `tests/e2e/README.md`，本条把它改正 |
 | 处置 | ① 新增 **`tests/e2e/stats_autorefresh.spec.cjs`**：把原脚本的 5 条断言逐条移植为**正常 spec**，用 Playwright 的 clock API（否则每个周期要真等 10s），只拦截 `/api/v1/stats/usage` 计数、其余请求（登录/health/reload）走**真实服务端**；② **删除** `scripts/stats_autorefresh.cjs`（覆盖已真实存在 ⇒ 只保留一个所有者，符合反熵原则）；③ README 更正为"已被正式 spec 取代"，并说明为何**不能**只改名（`*.spec.cjs` 会在**收集阶段**执行它的静态服务器 + Chromium） |
 | 结果 | 真实二进制 + 真实 Chromium 全量 **15 passed**（14 → 15：新增该 spec；其自身 1.4s，因为时钟是假的） |
+
+### 一条环境事实（会浪费一小时，值得记）：同一 `target/` 里两种 `RUSTFLAGS` 会互相回收产物
+
+复核门禁数字时出现过一次**看似真实**的失败：`cargo test -p hydra-server --features server` 的 **doctest 目标**报 9 个 `error[E0463]: can't find crate for hydra_core/tracing/pingora_core/…`。
+
+原因**不是**代码：计划的门禁（以及当时并发运行的两个审查者）都设 `RUSTFLAGS="-D warnings"`，而我的复核命令没设 ⇒ cargo 把它们视为**两个不同的指纹**，用不同 hash 的 rlib；后跑的一方会把另一方**刚被旧命令引用**的产物回收掉，于是 rustdoc 拿着一个已被删除的 `.rlib` 路径失败。
+
+**证据**：加上同一组 flags 立刻恢复 —— `RUSTFLAGS="-D warnings" cargo test -p hydra-server --features server --doc` ⇒ `test result: ok`，全量 ⇒ **30 套件 / 365 passed**。
+
+**结论/做法**：本仓库门禁一律带 `RUSTFLAGS="-D warnings"`；若要临时不带（或换 flags）复核，**要么也带同一组 flags，要么用独立的 `CARGO_TARGET_DIR`**，否则会得到与产品无关的"编译失败"。同类现象也会出现在"两个 cargo 同时跑"时（文件锁会串行化构建，但指纹回收仍会发生在其中一方）。
