@@ -35,6 +35,8 @@ use hydra_server::store::ConfigStore;
 use hydra_server::tls::{HydraCertStore, ResolvedCert};
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
+use std::io::Write;
+
 use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use pingora_core::tls::x509::X509;
 
@@ -567,6 +569,119 @@ async fn t6_5_fullchain_pem_presents_the_intermediates() {
         chain[1],
         fixture_cert_der("beta.crt"),
         "the intermediate must be presented too"
+    );
+}
+
+/// T10.2 — the chain must actually VERIFY, not merely be carried.
+///
+/// `t6_5` proves the bundle reaches the handshake with `SslVerifyMode::NONE` and
+/// an unrelated self-signed cert standing in for the intermediate: it would pass
+/// even if the server presented a chain no client could build a path from. This
+/// test uses a REAL three-level chain (root → intermediate → leaf, generated with
+/// the commands recorded in `tests/fixtures/chain/README.md`) and a client that
+/// trusts only `root.crt` with verification ENABLED.
+///
+/// The counter-proof is the second half: the same client, against a server that
+/// presents the leaf WITHOUT the intermediate, must FAIL — so the test cannot
+/// pass merely because verification is lenient.
+fn verify_chain_blocking(addr: &str, ca_file: &str, sni: &str) -> Result<(), String> {
+    let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector builder");
+    builder
+        .set_ca_file(ca_file)
+        .map_err(|e| format!("load CA file: {e}"))?;
+    let connector = builder.build();
+    let mut cfg = connector.configure().expect("configure");
+    // VERIFY for real: the root is the ONLY trust anchor.
+    cfg.set_verify(SslVerifyMode::PEER);
+    cfg.set_use_server_name_indication(true);
+
+    let mut connected = None;
+    let mut last_err = None;
+    for _ in 0..100 {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    let stream = connected.ok_or_else(|| format!("connect failed: {last_err:?}"))?;
+    let mut stream = connector
+        .connect(sni, stream)
+        .map_err(|e| format!("handshake failed: {e}"))?;
+    // A completed handshake is the assertion; drain nothing, just close politely.
+    let _ = stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: acme.com\r\n\r\n");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t10_2_the_presented_chain_verifies_to_the_root() {
+    let chain_dir = format!("{}/tests/fixtures/chain", env!("CARGO_MANIFEST_DIR"));
+    let leaf = std::fs::read(format!("{chain_dir}/leaf.crt")).expect("leaf");
+    let intermediate =
+        std::fs::read(format!("{chain_dir}/intermediate.crt")).expect("intermediate");
+    let key_pem = std::fs::read_to_string(format!("{chain_dir}/leaf.key")).expect("leaf key");
+
+    // FULLCHAIN: leaf + intermediate.
+    let mut bundle = leaf.clone();
+    bundle.extend_from_slice(&intermediate);
+    let mut certs = std::collections::HashMap::new();
+    certs.insert(
+        "acme.com".to_string(),
+        CertMeta {
+            domain: "acme.com".to_string(),
+            cert_file: None,
+            cert_key: None,
+            cert_pem: Some(String::from_utf8(bundle).expect("utf8 bundle")),
+            cert_key_pem: Some(key_pem.clone()),
+        },
+    );
+
+    let cert_store = HydraCertStore::new(None);
+    cert_store.resolve_and_store(&certs);
+    {
+        let loaded = cert_store.resolved();
+        let resolved = loaded.get("acme.com").expect("acme resolved");
+        assert_eq!(resolved.chain.len(), 1, "the intermediate is the chain");
+    }
+
+    let pool = common::setup_pool().await;
+    let (_store, state) = build_state(pool).await;
+    let port = start_tls_server(state, &cert_store);
+    let addr = format!("127.0.0.1:{port}");
+    let ca = format!("{chain_dir}/root.crt");
+
+    verify_chain_blocking(&addr, &ca, "acme.com")
+        .expect("a client trusting ONLY the root must verify leaf+intermediate");
+
+    // COUNTER-PROOF: present the leaf alone (no intermediate) ⇒ verification fails,
+    // which is what makes the assertion above meaningful.
+    let mut leaf_only = std::collections::HashMap::new();
+    leaf_only.insert(
+        "acme.com".to_string(),
+        CertMeta {
+            domain: "acme.com".to_string(),
+            cert_file: None,
+            cert_key: None,
+            cert_pem: Some(String::from_utf8(leaf).expect("utf8 leaf")),
+            cert_key_pem: Some(key_pem),
+        },
+    );
+    let leaf_store = HydraCertStore::new(None);
+    leaf_store.resolve_and_store(&leaf_only);
+    let pool2 = common::setup_pool().await;
+    let (_store2, state2) = build_state(pool2).await;
+    let port2 = start_tls_server(state2, &leaf_store);
+
+    let err = verify_chain_blocking(&format!("127.0.0.1:{port2}"), &ca, "acme.com")
+        .expect_err("without the intermediate the chain must NOT verify");
+    assert!(
+        err.contains("handshake failed"),
+        "the failure must come from the handshake, got: {err}"
     );
 }
 

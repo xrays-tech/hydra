@@ -3964,3 +3964,13 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 用例 C | `HYDRA_LISTEN=0.0.0.0:8080` + `HYDRA_TLS_LISTEN=127.0.0.1:8080` ⇒ 当前**不**被静态拒绝（纯字符串比较）。按要求写成**显式 `#[ignore]`** 的用例（断言"进程仍在运行"），并在 `listeners.rs` 文档说明：该配置在某些主机上其实是合法的，故不做更严的静态检查；由 `probe_bind` 与 Pingora 的 all-or-nothing 服务构建在**运行时**兜底 |
 | 性质说明（不夸大） | 这两条**验证的是既有行为**、不是新修的行为：`listeners.rs` 早有纯函数单测，而"进程真的 exit 1 / 真的降级"此前零覆盖（计划的 Why 亦如此表述）。因此本项**没有可注入的 RED**（没有改动生产行为），RED 判据不适用 |
 | 门禁 | fmt clean；clippy **0 warning**；`--features server` **30 套件 0 failed**（新增目标 2 passed + 1 ignored）；三特性同（下一步统一门禁复核） |
+
+### Batch 15 — T10.2 真实证书链 fixture + "验到根"（PEER 校验）
+
+| 项 | 内容 |
+|---|---|
+| 新增 fixture | `crates/hydra-server/tests/fixtures/chain/{root,intermediate,leaf}.{crt,key}`（真三级链，openssl 生成）+ **`chain/README.md`** 记录**逐条生成命令**与校验命令（含"先切到该目录"这一步——计划第 10 轮指出早期草稿会把产物写进调用者 CWD） |
+| 生成的链本身已独立校验 | `openssl verify -CAfile root.crt -untrusted intermediate.crt leaf.crt` ⇒ **OK**；去掉中间证书 ⇒ **error 20 unable to get local issuer certificate**（这正是用例要断言的两半） |
+| 用例 | `t10_2_the_presented_chain_verifies_to_the_root`：服务端用真实 fullchain（leaf + intermediate），客户端**只信任 `root.crt`** 且 **`SslVerifyMode::PEER`**（真校验，不再是 `NONE`）⇒ 握手**成功**；**反证在同一条用例内**：同一客户端打"只发 leaf、不发中间证书"的服务端 ⇒ 握手**必须失败**（断言失败来自 handshake），因此该用例不可能因为"校验太宽松"而通过 |
+| 与旧用例的区别 | 旧 `t6_5` 用 `beta.crt`（另一张自签叶子）冒充中间证书、并且 `SslVerifyMode::NONE` ⇒ 只证明**携带**。新用例证明**链有效**。旧用例保留（它测的是 bundle 解析/携带语义，与新用例互补） |
+| 门禁 | fmt clean；clippy **0 warning**；`--features server` **30 套件 0 failed**（tls 套件 7→**8**） |
