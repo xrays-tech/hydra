@@ -448,6 +448,93 @@ pub fn observe_sni_host_mismatch(session: &pingora_proxy::Session, host: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP/2 `:authority` vs `Host` observation (T3 / audit G4)
+// ---------------------------------------------------------------------------
+
+/// Metric name for a `Host` / `:authority` disagreement.
+const HOST_AUTHORITY_METRIC: &str = "hydra_host_authority_mismatch_total";
+const HOST_AUTHORITY_HELP: &str =
+    "Downstream request carried both Host and HTTP/2 :authority and they disagreed";
+
+/// Process-wide counter for [`note_host_authority_mismatch`]. Lives here (next
+/// to the SNI counter it mirrors) rather than in `admin/metrics.rs`, and is an
+/// `Option` for the same reason: a registry conflict hides the metric, it never
+/// panics.
+fn host_authority_counter() -> Option<&'static IntCounter> {
+    use std::sync::OnceLock;
+    static COUNTER: OnceLock<Option<IntCounter>> = OnceLock::new();
+    COUNTER
+        .get_or_init(|| {
+            prometheus::register_int_counter!(HOST_AUTHORITY_METRIC, HOST_AUTHORITY_HELP).ok()
+        })
+        .as_ref()
+}
+
+/// Note a disagreement between the `Host` header and the HTTP/2 `:authority`.
+///
+/// RFC 9113 §8.3.1 makes `:authority` normative for h2, but this proxy keeps
+/// `Host` authoritative (flipping that priority would change existing HTTP/1.1
+/// behaviour — a separate decision). What must not happen is that a
+/// disagreement stays INVISIBLE, so it is counted and logged.
+///
+/// `host` is the raw `Host` header (possibly with a port) and `authority` the
+/// normalised `:authority` host. Both must be PRESENT for a disagreement to
+/// exist: an h1 request has no authority and an h2 request typically has no
+/// `Host`, and neither is a mismatch. Plain strings, not a `Session`, so this is
+/// directly testable and the caller passes values it already extracted.
+pub fn note_host_authority_mismatch(host: &str, authority: &str) {
+    if host.is_empty() || authority.is_empty() {
+        return;
+    }
+    // Compare the DOMAIN parts only: `Host: acme.com:8443` and
+    // `:authority: acme.com` name the same domain, so they do NOT disagree.
+    if normalise_host(host) == normalise_host(authority) {
+        return;
+    }
+    if let Some(counter) = host_authority_counter() {
+        counter.inc();
+    }
+    tracing::warn!(
+        target: "hydra::tls",
+        host = %host,
+        authority = %authority,
+        "Host/:authority mismatch: both present and different — Host wins (not blocked)"
+    );
+}
+
+/// The domain part of a `Host`-style value: lowercase, port dropped, IPv6
+/// brackets trimmed. Used only for COMPARING the two sources — tenant lookup
+/// keeps its own (pre-existing) port-stripping in `proxy::resolve_tenant`.
+fn normalise_host(value: &str) -> String {
+    // An IPv6 literal carries optional brackets and the port OUTSIDE them
+    // (`[::1]:8080`), so it cannot be split at the first `:`.
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some((inner, _)) = rest.split_once(']') {
+            return inner.to_ascii_lowercase();
+        }
+    }
+    // An UNBRACKETED value with two or more colons is an IPv6 literal with no
+    // port (`::1`) — `split(':')` would truncate it to the empty string. (The
+    // authority side arrives unbracketed precisely because `Authority::host()`
+    // is normalised by the caller, so this branch is load-bearing.)
+    if value.matches(':').count() >= 2 {
+        return value.to_ascii_lowercase();
+    }
+    value.split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// Current value of the Host/:authority mismatch counter (`0` when the metric
+/// could not be registered).
+///
+/// Test-only on purpose: production only ever increments it (the value is read
+/// by Prometheus).
+#[cfg(test)]
+#[must_use]
+pub fn host_authority_mismatch_count() -> u64 {
+    host_authority_counter().map_or(0, |c| c.get())
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure helpers only (the integration TLS suite is in tests/tls.rs).
 // ---------------------------------------------------------------------------
 

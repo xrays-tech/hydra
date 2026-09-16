@@ -148,6 +148,56 @@ impl HydraProxy {
         }
     }
 
+    /// The domain used for tenant resolution.
+    ///
+    /// HTTP/1.1 carries it in `Host`; HTTP/2 carries it in `:authority`, which
+    /// pingora keeps in the request URI and does NOT mirror into a `Host`
+    /// header for downstream requests (it only synthesizes `Host` when talking
+    /// to an h1 upstream). Reading only `Host` therefore resolved EVERY h2
+    /// request to the empty domain — i.e. to the `localhost` tenant, or to a
+    /// 404 `unknown_domain`. Fall back to the URI authority.
+    ///
+    /// The `Host` value is returned VERBATIM (it may carry a port);
+    /// [`Self::resolve_tenant`] is what strips the port. The authority branch is
+    /// already normalised here: `Authority::host()` drops the port, and the
+    /// IPv6 brackets are trimmed so the domain key matches the config's
+    /// spelling.
+    fn request_host(req_header: &pingora_http::RequestHeader) -> String {
+        let host = Self::host_header(req_header);
+        if host.is_empty() {
+            Self::authority_host(req_header)
+        } else {
+            host
+        }
+    }
+
+    /// The raw `Host` header, empty when absent/blank. Returned VERBATIM: it may
+    /// carry a port, and stripping is [`Self::resolve_tenant`]'s job.
+    fn host_header(req_header: &pingora_http::RequestHeader) -> String {
+        req_header
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The HTTP/2 `:authority` host, normalised: the port is dropped by
+    /// `Authority::host()` and the IPv6 brackets are trimmed so the value can be
+    /// compared with a `Host` header and used as a domain key.
+    fn authority_host(req_header: &pingora_http::RequestHeader) -> String {
+        req_header
+            .uri
+            .authority()
+            .map(|a| {
+                a.host()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default()
+    }
+
     /// Resolve the tenant from the downstream `Host` header (design §6.3 §1).
     /// `localhost` / missing Host maps to the `localhost` tenant.
     fn resolve_tenant(cfg: &ConfigData, host: &str) -> Option<hydra_core::model::Tenant> {
@@ -299,18 +349,22 @@ impl ProxyHttp for HydraProxy {
         let cfg: &ConfigData = &cfg_guard;
 
         // (1) Domain → tenant (§6.3 §1). Missing/localhost → "localhost".
-        let host = session
-            .req_header()
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let host = Self::request_host(session.req_header());
         // §12.3 SNI/Host mismatch observation (never blocks): the cert was
         // selected by TLS SNI; compare it against the Host-derived domain and
         // bump `hydra_sni_host_mismatch_total` on mismatch. Additive only.
         #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-        crate::tls::observe_sni_host_mismatch(session, host);
-        let Some(tenant) = Self::resolve_tenant(cfg, host) else {
+        crate::tls::observe_sni_host_mismatch(session, &host);
+        // RFC 9113 §8.3.1 makes `:authority` normative for HTTP/2. `Host` stays
+        // authoritative here (flipping the precedence would change existing h1
+        // behaviour, which is a separate decision), but a disagreement between
+        // the two is now observable instead of silent.
+        #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+        crate::tls::note_host_authority_mismatch(
+            &Self::host_header(session.req_header()),
+            &Self::authority_host(session.req_header()),
+        );
+        let Some(tenant) = Self::resolve_tenant(cfg, &host) else {
             return short_circuit(session, 404, "unknown_domain").await;
         };
 
@@ -1310,4 +1364,209 @@ fn now_iso8601() -> String {
 #[allow(dead_code)]
 fn _unused_cache_source_marker() -> CacheSource {
     CacheSource::Local
+}
+
+// ---------------------------------------------------------------------------
+// T3 / audit G4 — the downstream domain for tenant resolution.
+//
+// `request_host` and `resolve_tenant` are PRIVATE, so these tests live here:
+// an integration test links `hydra_server` as an external crate and could not
+// call them (that is why the plan drops the earlier `tests/h2_authority.rs`).
+// `RequestHeader::build`/`set_uri` are public API, so no live h2 connection is
+// needed.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hydra_core::model::Tenant;
+
+    fn tenant(domain: &str) -> Tenant {
+        Tenant {
+            id: domain.to_string(),
+            name: domain.to_string(),
+            domain: domain.to_string(),
+            auth_url: "https://auth.example/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn cfg_with(domains: &[&str]) -> ConfigData {
+        let mut cfg = ConfigData::default();
+        for d in domains {
+            cfg.tenants_by_domain.insert((*d).to_string(), tenant(d));
+        }
+        cfg
+    }
+
+    /// A request header with an optional `Host` and an optional URI.
+    fn header(host: Option<&str>, uri: Option<&str>) -> pingora_http::RequestHeader {
+        let mut h = pingora_http::RequestHeader::build("GET", b"/v1/chat/completions", None)
+            .expect("build request header");
+        if let Some(host) = host {
+            h.insert_header("host", host).expect("insert host");
+        }
+        if let Some(uri) = uri.filter(|u| !u.is_empty()) {
+            h.set_uri(uri.parse().expect("parse uri"));
+        }
+        h
+    }
+
+    /// The domain actually used for resolution (what `request_filter` computes).
+    fn resolved_host(host: Option<&str>, uri: Option<&str>) -> String {
+        HydraProxy::request_host(&header(host, uri))
+    }
+
+    #[test]
+    fn host_header_wins_and_is_kept_verbatim() {
+        // h1 behaviour must not change: the raw header value is used, port
+        // included (stripping is `resolve_tenant`'s job).
+        assert_eq!(
+            resolved_host(Some("acme.com"), Some("http://other.com/v1/x")),
+            "acme.com"
+        );
+        // O17 regression guard: the port must survive `request_host` (and be
+        // stripped downstream) — simplifying this to "use the value as-is" in
+        // `resolve_tenant` would 404 a `Host: acme.com:8443` request.
+        assert_eq!(resolved_host(Some("acme.com:8443"), None), "acme.com:8443");
+        assert_eq!(
+            HydraProxy::resolve_tenant(&cfg_with(&["acme.com"]), "acme.com:8443").map(|t| t.id),
+            Some("acme.com".to_string()),
+            "the port is stripped before the config lookup"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_uri_authority_without_a_host_header() {
+        // THE DIAGNOSTIC REPRODUCTION: an h2 request has no `Host` and the
+        // domain only in `:authority` (which pingora stores in the URI). Before
+        // T3 this resolved to "" ⇒ localhost tenant or 404 unknown_domain.
+        assert_eq!(
+            resolved_host(None, Some("https://acme.com/v1/chat/completions")),
+            "acme.com"
+        );
+        assert_eq!(
+            HydraProxy::resolve_tenant(
+                &cfg_with(&["acme.com"]),
+                &resolved_host(None, Some("https://acme.com/v1/chat/completions"))
+            )
+            .map(|t| t.id),
+            Some("acme.com".to_string()),
+            "the h2 request now reaches its tenant"
+        );
+        // A port in the authority is dropped by `Authority::host()`.
+        assert_eq!(
+            resolved_host(None, Some("http://acme.com:8443/v1/x")),
+            "acme.com"
+        );
+        // Case is normalised (config keys are lowercase).
+        assert_eq!(
+            resolved_host(None, Some("https://ACME.com/v1/x")),
+            "acme.com"
+        );
+    }
+
+    #[test]
+    fn ipv6_authority_is_unbracketed_and_falls_back_to_localhost() {
+        let host = resolved_host(None, Some("http://[::1]:8080/v1/x"));
+        assert_eq!(host, "::1", "brackets must be trimmed, got {host:?}");
+        assert!(!host.contains('['), "no bracket may leak into the lookup");
+
+        // `::1` is not a configured domain: it reaches the documented
+        // `localhost` fallback rather than producing a garbage domain key. (The
+        // port-strip inside `resolve_tenant` splits at the first `:`, which for
+        // an IPv6 literal is the empty leading label — the same "no host" path
+        // a missing `Host` takes. `localhost` is designed to be permissive, so
+        // the fallback is the correct outcome here.)
+        assert_eq!(
+            HydraProxy::resolve_tenant(&cfg_with(&["localhost"]), &host).map(|t| t.id),
+            Some("localhost".to_string()),
+            "an IPv6 literal lands on the documented `localhost` fallback"
+        );
+        assert!(
+            HydraProxy::resolve_tenant(&cfg_with(&["::1"]), &host).is_none(),
+            "...and it is never matched against a configured domain as-is"
+        );
+    }
+
+    #[test]
+    fn neither_host_nor_authority_yields_the_empty_domain() {
+        assert_eq!(resolved_host(None, None), "", "empty ⇒ localhost fallback");
+        assert_eq!(
+            resolved_host(Some(""), Some("")),
+            "",
+            "an empty Host is treated as absent"
+        );
+        // An origin-form URI (h1 request line `/v1/x`) carries no authority.
+        assert_eq!(resolved_host(None, Some("http://acme.com")), "acme.com");
+    }
+
+    /// Drive the REAL extraction pair (`host_header` / `authority_host`) — the
+    /// same two values `request_filter` hands to the counter, so the wiring
+    /// itself is under test, not a copy of it.
+    fn note_for(host: Option<&str>, uri: Option<&str>) {
+        let h = header(host, uri);
+        crate::tls::note_host_authority_mismatch(
+            &HydraProxy::host_header(&h),
+            &HydraProxy::authority_host(&h),
+        );
+    }
+
+    #[test]
+    fn host_authority_mismatch_is_counted_but_host_still_wins() {
+        // Both present and different: Host wins (the existing priority is
+        // preserved)...
+        let host = resolved_host(Some("a.com"), Some("http://b.com/v1/x"));
+        assert_eq!(host, "a.com", "Host stays authoritative");
+
+        // ...and the disagreement is observable. Read the counter before/after
+        // because lib tests share one process-wide registry.
+        let before = crate::tls::host_authority_mismatch_count();
+        note_for(Some("a.com"), Some("http://a.com/v1/x"));
+        assert_eq!(
+            crate::tls::host_authority_mismatch_count(),
+            before,
+            "Host and :authority naming the same domain is NOT a mismatch"
+        );
+        note_for(Some("a.com"), None);
+        assert_eq!(
+            crate::tls::host_authority_mismatch_count(),
+            before,
+            "h1 (no :authority) is not a mismatch"
+        );
+        note_for(None, Some("http://b.com/v1/x"));
+        assert_eq!(
+            crate::tls::host_authority_mismatch_count(),
+            before,
+            "an h2 request without `Host` is not a mismatch either"
+        );
+        note_for(Some("a.com"), Some("http://b.com/v1/x"));
+        assert_eq!(
+            crate::tls::host_authority_mismatch_count(),
+            before + 1,
+            "a real two-source disagreement increments \
+             hydra_host_authority_mismatch_total"
+        );
+        // Case-only differences are not disagreements…
+        note_for(Some("acme.com"), Some("http://ACME.com/v1/x"));
+        assert_eq!(crate::tls::host_authority_mismatch_count(), before + 1);
+        // …and neither is a port on the Host side (the authority never has one,
+        // `Authority::host()` drops it): the domain is what must agree.
+        note_for(Some("acme.com:8443"), Some("http://acme.com/v1/x"));
+        assert_eq!(
+            crate::tls::host_authority_mismatch_count(),
+            before + 1,
+            "`acme.com:8443` vs `acme.com` name the same domain"
+        );
+        // An IPv6 Host literal vs its (unbracketed) authority is the same host:
+        // the authority side arrives as `::1`, and splitting THAT at the first
+        // `:` would truncate it to the empty string and count a phantom
+        // mismatch.
+        note_for(Some("[::1]:8080"), Some("http://[::1]:8080/v1/x"));
+        assert_eq!(crate::tls::host_authority_mismatch_count(), before + 1);
+    }
 }
