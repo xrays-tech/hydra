@@ -3821,3 +3821,33 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 
 **Phase B 门禁判据逐条**：全部 0 error / 0 failed ✅；Playwright **11 passed** ✅；T5 反证可见（`T2.1c` 证明刷新不再掉登录、`T2.1d` 证明登出不被刷新复活且陈旧票据 fail-closed）✅。
 > 门禁脚本按环境做了三处**仅本机**的重定向（CARGO_HOME、npm 缓存、Playwright 浏览器缓存），并把 npm 依赖装在 `.acceptance/e2e/` + `NODE_PATH` 指向它——**仓库不新增根 `package.json`**（UI 无构建步骤；CI 自己内联创建清单），`.acceptance/` 已在 `.gitignore` 内。
+
+## Phase C 部分落地（T9.2 / T9.4 / T9.6 / T9.7）
+
+> 说明：Phase A、Phase B 的**全部**任务与门禁已完成；本节的 Phase C 任务是计划剩余的 §7 待决策项。本轮先落地两个**小且自包含**的任务（各自可独立验证），其余（T9.1 上游首字节超时、T9.3 租户写后置步骤事务化、T9.5 非 leader 横幅）仍按计划待实施，未动。
+
+### Batch 6（部分）— T9.2 转发超时语义 + `504 forward_result_unknown`
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `cluster/forward.rs`（类型化错误 + 可配置超时 + 分类）、`admin/mod.rs`（错误码映射） |
+| 改动 | `FORWARD_TIMEOUT` 常量**退场**，改为 `DEFAULT_FORWARD_TIMEOUT_SECS = 5` + `forward_timeout_secs()`（读 `HYDRA_FORWARD_TIMEOUT_SECS`，`0`/垃圾值回落默认）；新增 `ForwardError::{Timeout{secs}, Other}`；**分类顺序有语义**——先判 `is_connect()` 再判 `is_timeout()`（连接阶段超时与读超时带同一个 `TimedOut` 标记，而"死 Pod / SYN 被丢"正是连接阶段超时；若只判 `is_timeout()`，一次**根本没送到**的请求会被说成"结果未知"）；超时 ⇒ **504 `forward_result_unknown`**，连接类错误 ⇒ **502 `forward_failed`**，且消息**不再谎称 "no local write"** |
+| 可测性缝隙 | `forward_mutation` 委托给 `forward_mutation_with_timeout(…, secs)`，生产入口仍从环境派生；**没有**任何 "are we testing" 分支。解析逻辑另抽纯函数 `parse_forward_timeout_secs`，因此测试**不需要**改进程环境（并行安全） |
+| 用例 | 单测：解析全量（默认/trim/`0`/垃圾/负数）；**黑洞 leader**（accept 后永不回包）⇒ `Timeout{secs:1}` 且消息含"may already have landed"；**端口关闭** ⇒ `Other` 且消息**不含**该措辞。集成（真实 Redis + 真实 HTTP）：黑洞 leader ⇒ standby 返回 **504 + `forward_result_unknown` + "may or may not have been applied"** 且**不含** "no local write"、standby 自身不写库；死端口 leader ⇒ **502 + `forward_failed`** 且**不含** `forward_result_unknown` |
+| RED 证据 | 把映射还原成旧的"一律 502"后 `a_silent_leader_produces_504_forward_result_unknown` **FAILED**（`left: 502, right: 504`），恢复后全绿 |
+
+### Batch 6（部分）— T9.4 排空期显式配置
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `main.rs`、`dev-docs/ops.md` |
+| 改动 | `Server::new(...)` ⇒ `Server::new_with_opt_and_conf(...)`，**显式**设置 `grace_period_seconds: Some(shutdown_drain_secs())`（新 env `HYDRA_SHUTDOWN_DRAIN_SECS`，默认 20，`0` 被拒）与 `graceful_shutdown_timeout_seconds: Some(5)`；`ops.md` 新增 §13.5b 与 env 表行 |
+| 为什么是这两个字段 | 计划第八轮已修正前提：Pingora 的 `grace_period_seconds` 默认是 **300s**（这才是"排空 300s"，且远超典型 k8s 宽限期 ⇒ 进程被 SIGKILL 截断，usage sink flush 与 `unregister()` 一起丢），而 `graceful_shutdown_timeout_seconds` 默认 5s 只是**最后一步**的界。因此要显式设置的是前者 |
+| 部署侧公式（属运维仓库的 manifest） | `terminationGracePeriodSeconds ≥ HYDRA_SHUTDOWN_DRAIN_SECS(20) + graceful_shutdown_timeout_seconds(5) + 余量(10)` ⇒ 默认 **≥ 35** |
+
+### T9.6 / T9.7 — 记录为"已决策/已交付"
+
+- **T9.7（§7-7 快照纳入 access-token 哈希）**：**由 T1 交付**（哈希随 wire 密封传输、`restore_config` 在租户 INSERT 中逐字写回、副本 `has_access_token` 与租户自助鉴权均生效）。本 Phase 无需额外改动。
+- **T9.6（§7-6 localStorage "记住我" / 服务端会话）**：**显式非目标**，理由已在 T5 落地时写明——admin token 是全舰队根凭证而管理面当前是**明文 HTTP**，因此票据只活在标签页内（`sessionStorage`），"关标签页也保持登录"会实质扩大暴露面。该升级须先落 HTTPS / 仅内网暴露。
+
+**本轮门禁（已实现部分的复核）**：`cargo fmt --check` clean；两种 clippy **0 warning**（`--features server` 与三特性）；`cargo test -p hydra-server --features server` ⇒ **27 套件 0 failed**；三特性 ⇒ **累计 417 passed / 0 failed**（Phase B 时为 412，本批 +5：2 个转发单测 + 3 个解析/端到端断言组）。

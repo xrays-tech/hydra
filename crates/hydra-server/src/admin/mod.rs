@@ -492,10 +492,28 @@ impl AdminService {
         .await
         {
             Ok(resp) => Some(resp),
+            // A TIMEOUT is a dedicated code: the write may or may not have been
+            // applied on the leader, and the operator must re-read the resource
+            // instead of blindly retrying (a blind retry could double-apply).
+            Err(crate::cluster::forward::ForwardError::Timeout { secs }) => {
+                Some(handlers::err_json(
+                    504,
+                    "forward_result_unknown",
+                    &format!(
+                        "the leader did not answer within {secs}s; the write {}",
+                        "may or may not have been applied — re-read the resource before retrying"
+                    ),
+                    trace_id,
+                ))
+            }
+            // Everything else (connection refused, DNS, TLS, loop guard) proves
+            // the request never reached the leader, so the message must NOT
+            // claim anything about a write that could not have happened — and it
+            // must not pretend certainty it does not have either.
             Err(e) => Some(handlers::err_json(
                 502,
                 "forward_failed",
-                &format!("{e}; the active leader is unreachable (no local write)"),
+                &format!("{e}"),
                 trace_id,
             )),
         }

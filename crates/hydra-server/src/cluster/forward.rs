@@ -30,8 +30,63 @@ use std::time::Duration;
 
 use http::{HeaderMap, Response};
 
-/// Forward timeout for admin mutations (generous; admin ops are rare).
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default forward timeout for admin mutations (generous; admin ops are rare).
+const DEFAULT_FORWARD_TIMEOUT_SECS: u64 = 5;
+
+/// The forward timeout in SECONDS (`HYDRA_FORWARD_TIMEOUT_SECS`, default 5).
+///
+/// Seconds rather than a `Duration` because the value is quoted back to the
+/// caller in the `504 forward_result_unknown` message.
+fn forward_timeout_secs() -> u64 {
+    parse_forward_timeout_secs(std::env::var("HYDRA_FORWARD_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// The parse half of [`forward_timeout_secs`], kept PURE so the tests do not
+/// mutate the process environment (parallel-safe, like the rest of this crate's
+/// config helpers). `0`, garbage and a missing value all mean "use the default":
+/// a zero-second forward timeout would fail every forward for no reason.
+fn parse_forward_timeout_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_FORWARD_TIMEOUT_SECS)
+}
+
+/// Why a forward attempt failed.
+///
+/// The distinction is LOAD-BEARING: a timeout cannot tell whether the leader
+/// already committed the write, while a connect error proves the request never
+/// left this node. Reporting both as "failed, nothing was written" was the
+/// defect (a standby told the operator the write did not happen when it
+/// might have).
+#[derive(Debug, thiserror::Error)]
+pub enum ForwardError {
+    #[error(
+        "leader forward timed out after {secs}s; the write may already have landed on the leader"
+    )]
+    Timeout { secs: u64 },
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ForwardError {
+    /// Classify a transport error.
+    ///
+    /// ORDER IS SEMANTIC: `is_connect()` is checked FIRST. reqwest marks the
+    /// connect-phase timeout with the same `TimedOut` flag as a read timeout
+    /// (so "SYN dropped" — a dead pod whose IP lingers, the common case in
+    /// Kubernetes — looks like a timeout), and reporting a request that never
+    /// left this node as "the outcome is unknown" would turn the MOST certain
+    /// failure into the least certain one.
+    fn from_transport(e: &reqwest::Error, secs: u64) -> Self {
+        if e.is_connect() {
+            Self::Other(format!("forward to active failed (connection): {e}"))
+        } else if e.is_timeout() {
+            Self::Timeout { secs }
+        } else {
+            Self::Other(format!("forward to active failed: {e}"))
+        }
+    }
+}
 
 /// Forward-once marker: set on every forwarded admin mutation so the
 /// receiving node can tell a mutation that already travelled through a
@@ -97,17 +152,43 @@ pub async fn forward_mutation(
     body: Vec<u8>,
     headers: &HeaderMap,
     trace_id: &str,
-) -> Result<Response<Vec<u8>>, String> {
+) -> Result<Response<Vec<u8>>, ForwardError> {
+    forward_mutation_with_timeout(
+        base_url,
+        method,
+        path_and_query,
+        body,
+        headers,
+        trace_id,
+        forward_timeout_secs(),
+    )
+    .await
+}
+
+/// [`forward_mutation`] with an explicit timeout — the seam that lets the
+/// timeout path be exercised in ~1s instead of the 5s production default. The
+/// production entry point always derives the value from the environment; there
+/// is no "are we testing" branch anywhere.
+#[allow(clippy::too_many_arguments)]
+async fn forward_mutation_with_timeout(
+    base_url: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Vec<u8>,
+    headers: &HeaderMap,
+    trace_id: &str,
+    secs: u64,
+) -> Result<Response<Vec<u8>>, ForwardError> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
     let mut req = client()
         .request(
             reqwest::Method::from_bytes(method.as_bytes())
-                .map_err(|e| format!("unsupported method {method}: {e}"))?,
+                .map_err(|e| ForwardError::Other(format!("unsupported method {method}: {e}")))?,
             &url,
         )
         .header("x-hydra-trace-id", trace_id)
         .header(FORWARD_ONCE_HEADER, "1")
-        .timeout(FORWARD_TIMEOUT);
+        .timeout(Duration::from_secs(secs));
     if let Some(auth) = headers.get("authorization") {
         req = req.header("authorization", auth);
     }
@@ -121,19 +202,20 @@ pub async fn forward_mutation(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("forward to active failed: {e}"))?;
+        .map_err(|e| ForwardError::from_transport(&e, secs))?;
     let status = resp.status();
     let content_type = resp.headers().get("content-type").cloned();
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("forward response read failed: {e}"))?;
+        .map_err(|e| ForwardError::Other(format!("forward response read failed: {e}")))?;
 
     let mut out = Response::builder().status(status);
     if let Some(ct) = content_type {
         out = out.header("content-type", ct);
     }
-    out.body(bytes.to_vec()).map_err(|e| e.to_string())
+    out.body(bytes.to_vec())
+        .map_err(|e| ForwardError::Other(e.to_string()))
 }
 
 #[cfg(test)]
@@ -142,6 +224,95 @@ mod tests {
     use http::header::HeaderValue;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn forward_timeout_parsing_is_total() {
+        assert_eq!(parse_forward_timeout_secs(None), 5, "default");
+        assert_eq!(parse_forward_timeout_secs(Some("12")), 12);
+        assert_eq!(parse_forward_timeout_secs(Some(" 12 ")), 12, "trimmed");
+        assert_eq!(parse_forward_timeout_secs(Some("0")), 5, "0 ⇒ default");
+        assert_eq!(
+            parse_forward_timeout_secs(Some("nope")),
+            5,
+            "garbage ⇒ default"
+        );
+        assert_eq!(
+            parse_forward_timeout_secs(Some("-3")),
+            5,
+            "negative ⇒ default"
+        );
+    }
+
+    /// A leader that ACCEPTS the connection and then never answers: the request
+    /// WAS written, so the outcome is genuinely unknown — `Timeout`, not a
+    /// definite failure.
+    #[tokio::test]
+    async fn a_silent_leader_times_out_as_result_unknown() {
+        // A black hole: the socket is accepted and never written to.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black hole");
+        let addr = listener.local_addr().expect("addr");
+        let held: Vec<std::net::TcpStream> = Vec::new();
+        let keep = std::sync::Arc::new(std::sync::Mutex::new(held));
+        let keep2 = keep.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(s) = stream else { break };
+                // Hold the connection open and stay silent.
+                keep2.lock().expect("lock").push(s);
+            }
+        });
+
+        let err = forward_mutation_with_timeout(
+            &format!("http://{addr}"),
+            "POST",
+            "/api/v1/providers",
+            Vec::new(),
+            &HeaderMap::new(),
+            "t",
+            1,
+        )
+        .await
+        .expect_err("no response ⇒ error");
+        match err {
+            ForwardError::Timeout { secs } => assert_eq!(secs, 1, "the configured bound is quoted"),
+            other => panic!("a silent leader must be `Timeout`, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("may already have landed"),
+            "the message must not claim certainty about a request that was sent: {err}"
+        );
+    }
+
+    /// A leader whose port is CLOSED: the request never left this node, so this
+    /// must NOT be reported as "the outcome is unknown" — otherwise the most
+    /// certain failure would look like the least certain one.
+    #[tokio::test]
+    async fn a_refused_connection_is_a_definite_failure() {
+        // Bind then drop to get a port nobody is listening on.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let err = forward_mutation_with_timeout(
+            &format!("http://127.0.0.1:{port}"),
+            "POST",
+            "/api/v1/providers",
+            Vec::new(),
+            &HeaderMap::new(),
+            "t",
+            1,
+        )
+        .await
+        .expect_err("refused ⇒ error");
+        assert!(
+            matches!(err, ForwardError::Other(_)),
+            "connection refusal proves nothing was written, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("may already have landed"),
+            "a refused connection must NOT be reported as an unknown outcome: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn forwarded_mutation_carries_forward_once_marker() {

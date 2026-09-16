@@ -818,8 +818,23 @@ struct BootstrapComponents {
 /// runtime) so Pingora can build its own.
 fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> {
     // (3a) Pingora server.
-    let mut server =
-        Server::new(Some(Opt::default())).map_err(|e| format!("pingora server init: {e:?}"))?;
+    //
+    // The drain window is set EXPLICITLY. Pingora's default `grace_period_seconds`
+    // is `None` ⇒ `EXIT_TIMEOUT` = 300s, which is far longer than a typical
+    // Kubernetes `terminationGracePeriodSeconds` (30s): the pod would be
+    // SIGKILLed mid-drain, losing the usage-sink flush AND the registry
+    // `unregister()`. `graceful_shutdown_timeout_seconds` (Pingora's 5s default)
+    // is only the bound on the FINAL runtime-shutdown step, so it is not the
+    // knob that governs in-flight requests.
+    let conf = pingora_core::server::configuration::ServerConf {
+        grace_period_seconds: Some(shutdown_drain_secs()),
+        graceful_shutdown_timeout_seconds: Some(5),
+        ..Default::default()
+    };
+    // `new_with_opt_and_conf` returns a `Server` (not a `Result`), so there is
+    // nothing to map here; the only thing it does not do that `Server::new` did
+    // is derive the unused `version` field from `Opt`.
+    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
 
     // Clone the admission controller out of AppState BEFORE c.state is moved
@@ -1102,6 +1117,25 @@ fn registry_stale_grace_secs() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0) // 0 would make every row instantly reapable
         .unwrap_or(120)
+}
+
+/// Seconds Pingora may spend draining in-flight requests after SIGTERM
+/// (`HYDRA_SHUTDOWN_DRAIN_SECS`, default 20).
+///
+/// This maps to Pingora's `grace_period_seconds`. The deployment's
+/// `terminationGracePeriodSeconds` MUST exceed this value plus the final
+/// runtime-shutdown step (5s) plus slack, or the process is SIGKILLed mid-drain
+/// and both the usage-sink flush and the registry de-registration are lost. The
+/// value is deployment-visible, so it is recorded in `dev-docs/ops.md`.
+///
+/// `0` is rejected: Pingora would read `Some(0)` as "no drain at all", silently
+/// defeating the point of configuring it.
+fn shutdown_drain_secs() -> u64 {
+    std::env::var("HYDRA_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(20)
 }
 
 /// Best-effort registry de-registration on shutdown. Mirrors

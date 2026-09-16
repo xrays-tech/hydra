@@ -688,6 +688,7 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
 | `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
 | `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
+| `HYDRA_SHUTDOWN_DRAIN_SECS` | seconds Pingora drains in-flight requests after SIGTERM (default 20); size `terminationGracePeriodSeconds` from it (see §13.5b) |
 | `HYDRA_REGISTRY_STALE_GRACE_SECS` | TTL of the registry "last seen" witness (default 120). Only `> 0` values are accepted; a small value narrows the grace window in which a merely-silent node is protected from reaping |
 
 ### 13.4 Failover drill
@@ -711,6 +712,27 @@ can point the admin UI at ANY leader candidate, including one whose
 Data plane keeps serving (last-known-good snapshot + local caches). Election is
 **fail-closed**: a leader that cannot renew demotes immediately (writes stop)
 until Redis recovers. See `dev-docs/cluster.md` §3 for the full matrix.
+
+### 13.5b Shutdown drain vs `terminationGracePeriodSeconds`
+
+`HYDRA_SHUTDOWN_DRAIN_SECS` (default **20**) is how long Pingora may spend
+draining in-flight requests after `SIGTERM`. It maps to Pingora's
+`grace_period_seconds`. Set your pod's grace period from it:
+
+```
+terminationGracePeriodSeconds  >=  HYDRA_SHUTDOWN_DRAIN_SECS (20)
+                                 +  graceful_shutdown_timeout_seconds (5, the
+                                    final runtime-shutdown step — not the
+                                    in-flight window)
+                                 +  slack (10)
+                                 =  35  (default)
+```
+
+**Why this must be set explicitly:** Pingora's DEFAULT `grace_period_seconds` is
+`None` ⇒ 300s, far beyond a typical 30s Kubernetes grace period. The pod would be
+`SIGKILL`ed while still draining, losing both the usage-sink flush and the
+registry de-registration. The deployment manifests are owned by the operations
+repository; this repository only reads the environment variable.
 
 ### 13.6 Registry identity: `HYDRA_NODE_ID`, `HOSTNAME`, and why they matter
 

@@ -1096,6 +1096,190 @@ async fn admin_components(
     (store, auth, breaker)
 }
 
+/// T9.2 — a forward that TIMES OUT must be reported as an UNKNOWN outcome.
+///
+/// The old mapping answered 502 `forward_failed` with "…(no local write)" for
+/// every failure, including a timeout — i.e. it told the operator the write had
+/// not happened when the request had in fact been sent and may well have been
+/// applied. A blind retry could then double-apply it. Timeouts now get their own
+/// code (`504 forward_result_unknown`) and the message tells the caller to
+/// re-read the resource first; connection failures keep the definite 502.
+#[cfg(feature = "cluster-redis")]
+#[tokio::test]
+async fn a_silent_leader_produces_504_forward_result_unknown() {
+    use fred::prelude::*;
+    use hydra_server::cluster::registry::NodeRegistry;
+    use hydra_server::cluster::NodeRole;
+    use hydra_server::redis::LEASE_KEY;
+
+    // A black hole: accepts the TCP connection and never answers, which is what
+    // a wedged leader looks like from here.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black hole");
+    let black_hole = listener.local_addr().expect("addr");
+    let keep: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep2 = keep.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(s) = stream else { break };
+            keep2.lock().expect("lock").push(s); // hold it open, say nothing
+        }
+    });
+
+    let pool = common::real_redis_pool(49).await;
+    let kp_arc: Arc<dyn KeyProvider> = Arc::new(kp());
+
+    // The "leader" is the black hole, and it holds the lease: that is exactly
+    // the forward target a standby resolves.
+    let silent_registry = NodeRegistry::new(
+        pool.clone(),
+        "silent".into(),
+        NodeRole::Leader,
+        format!("http://{black_hole}"),
+    );
+    silent_registry.register(60, 120).await.expect("register");
+    let _: Option<String> = pool
+        .set(LEASE_KEY, "silent", None, None, false)
+        .await
+        .expect("set lease");
+
+    let standby_pool = common::setup_pool().await;
+    let (standby_store, auth2, breaker2) =
+        admin_components(standby_pool.clone(), kp_arc.clone()).await;
+    let mut standby_state = AdminState::new(
+        Some(standby_pool.clone()),
+        standby_store,
+        auth2,
+        breaker2,
+        kp_arc,
+        Some(ADMIN_TOKEN.to_string()),
+        AdmissionControl::new(),
+        false,
+        None,
+        Some(Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>),
+    );
+    standby_state.cluster_registry = Some(Arc::new(NodeRegistry::new(
+        pool.clone(),
+        "standby".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{}", ephemeral_port()),
+    )));
+    let standby_port = start_admin(Arc::new(standby_state));
+
+    let body = serde_json::json!({
+        "id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com",
+        "weight":1,"created_at":"","updated_at":""
+    });
+    let r = http(
+        standby_port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        r.status().as_u16(),
+        504,
+        "a timed-out forward is not a definite failure"
+    );
+    let text = r.text().await.expect("body");
+    assert!(
+        text.contains("forward_result_unknown"),
+        "the dedicated code must be reported: {text}"
+    );
+    assert!(
+        text.contains("may or may not have been applied"),
+        "and the message must state the uncertainty: {text}"
+    );
+    assert!(
+        !text.contains("no local write"),
+        "the response must NOT claim the write did not happen: {text}"
+    );
+    // The standby itself still wrote nothing (its DB is empty).
+    assert!(
+        repo::list_providers(&standby_pool)
+            .await
+            .expect("list")
+            .is_empty(),
+        "a standby never writes locally"
+    );
+}
+
+/// T9.2 — the complementary case: a leader that REFUSES the connection proves
+/// nothing was sent, so it must stay a definite 502 (never "unknown"). This is
+/// the classification that keeps a dead pod (IP present, process gone — the
+/// normal Kubernetes case) from being mislabelled as possibly-applied.
+#[cfg(feature = "cluster-redis")]
+#[tokio::test]
+async fn a_refused_leader_produces_502_forward_failed() {
+    use fred::prelude::*;
+    use hydra_server::cluster::registry::NodeRegistry;
+    use hydra_server::cluster::NodeRole;
+    use hydra_server::redis::LEASE_KEY;
+
+    let pool = common::real_redis_pool(50).await;
+    let kp_arc: Arc<dyn KeyProvider> = Arc::new(kp());
+
+    // A port nobody listens on: bound, then released.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let dead_registry = NodeRegistry::new(
+        pool.clone(),
+        "dead".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{dead_port}"),
+    );
+    dead_registry.register(60, 120).await.expect("register");
+    let _: Option<String> = pool
+        .set(LEASE_KEY, "dead", None, None, false)
+        .await
+        .expect("set lease");
+
+    let standby_pool = common::setup_pool().await;
+    let (standby_store, auth2, breaker2) =
+        admin_components(standby_pool.clone(), kp_arc.clone()).await;
+    let mut standby_state = AdminState::new(
+        Some(standby_pool.clone()),
+        standby_store,
+        auth2,
+        breaker2,
+        kp_arc,
+        Some(ADMIN_TOKEN.to_string()),
+        AdmissionControl::new(),
+        false,
+        None,
+        Some(Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>),
+    );
+    standby_state.cluster_registry = Some(Arc::new(NodeRegistry::new(
+        pool.clone(),
+        "standby".into(),
+        NodeRole::Leader,
+        format!("http://127.0.0.1:{}", ephemeral_port()),
+    )));
+    let standby_port = start_admin(Arc::new(standby_state));
+
+    let body = serde_json::json!({
+        "id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com",
+        "weight":1,"created_at":"","updated_at":""
+    });
+    let r = http(
+        standby_port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(body),
+    )
+    .await;
+    assert_eq!(r.status().as_u16(), 502, "a refusal is definite");
+    let text = r.text().await.expect("body");
+    assert!(text.contains("forward_failed"), "got {text}");
+    assert!(
+        !text.contains("forward_result_unknown"),
+        "a refused connection must not be labelled an unknown outcome: {text}"
+    );
+}
+
 /// T-CL-7 — a standby FORWARDS admin mutations to the ACTUAL lease holder
 /// (resolved live from the cluster registry — the target is never a static
 /// `HYDRA_CONTROL_URL`, which for a primary candidate points at the node
