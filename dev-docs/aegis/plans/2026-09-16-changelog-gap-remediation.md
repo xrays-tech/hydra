@@ -3903,3 +3903,13 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 用例 | ① `a_load_is_internally_consistent`：断言一次 load 的每组行**互相一致**（没有 `provider_key` / binding / tenant_provider 指向本次未见的 provider）——撕裂读一旦发生就会被抓住；② `a_read_transaction_is_not_torn_by_a_concurrent_writer`：用**文件池+第二个连接**实测引擎语义——事务内先读到的 key 集合，在另一连接 commit 删除后**仍不变**，而事务结束后删除**立即可见**（防"其实写没生效"的空洞通过） |
 | 诚实边界（不夸大） | 用例② 钉的是**引擎快照语义**（该修法所依赖的性质），不是"load 内部一定有事务"这一调用点本身；调用点由代码可见的结构保证，用例① 则在真的发生撕裂时失败。计划正文与门禁均未覆盖本条，属开发后复审的追加项 |
 | 门禁 | fmt clean；两种 clippy **0 warning**；`--features server` **28 套件 0 failed**（content 单测 1→**3**）；三特性 **430 passed / 0 failed**；`.sqlx/` **无改动** |
+
+### Batch 10 — T10.1 测试端口分配：注释诚实 + 消除 PID 撞带
+
+| 项 | 内容 |
+|---|---|
+| 真实缺陷（两处） | ① 注释声称"allocated WITHOUT the bind-then-release race"，而实现**就是** `bind` 探一下随即释放（`Pingora` 自己再 bind）；② `pid % 100` 让**相隔 100 的 PID 共用同一端口带** ⇒ 两个测试进程抢同一段端口，正是"请求被另一个测试的 proxy 应答、表现为莫名其妙的 404"那条 flake 的成因 |
+| 修法（**保留**探测即释放） | 带数由 `pid % 100` 改为**哈希**（`pid × 2654435761 mod 200`），带宽 200×100，仍取在 Linux 临时端口区（32768+）之下；注释**如实**写明：窗口仍存在、本函数只是让两个进程"极不可能同时探测同一候选"，**并点明残余风险**——`band(pid) == band(pid')` 当且仅当 `pid ≡ pid' (mod 200)`，哈希只是把碰撞换了个位置，**不是**"消除了竞争" |
+| 为什么不持有 socket（计划 O20 已实测） | 调用方把端口交给 **Pingora 去 bind**（12 个测试文件共 38 处调用）。持有监听 socket 会让第二次 bind 直接 `EADDRINUSE`——Pingora 只设 `SO_REUSEADDR`、**没有** `SO_REUSEPORT` ⇒ v1 方案会让**几乎整套集成测试**无法 bind |
+| 用例 | `port_bands_do_not_repeat_for_nearby_pids`：断言 `band(pid) != band(pid+100)`（正是被修掉的那条）与相邻 PID 不相撞，**并正面断言** `band(pid) == band(pid+200)` 以把残余风险钉在测试里（诚实标注而非假装消除）；`ephemeral_ports_are_bindable_and_distinct`：连续两次分配不重复，且两个端口都**真的可 bind**（证明探测确实释放了） |
+| 门禁 | fmt clean；clippy **0 warning**；`--features server` **28 套件 0 failed**；计划要求的并发复核 **`--test-threads=8` 连跑 3 次、每次 0 个 FAILED 套件**（这是原 flake 的症状面） |

@@ -68,31 +68,44 @@ pub async fn real_redis_pool(db: u8) -> fred::clients::Pool {
     pool
 }
 
-/// A unique TCP port for a test listener, allocated WITHOUT the
-/// bind-then-release race.
+/// A unique TCP port for a test listener.
 ///
-/// `TcpListener::bind("127.0.0.1:0")` returns a port and then closes it; the
-/// kernel is free to hand the same port to another test before Pingora actually
-/// binds it. Two tests in one binary could then end up sharing a listener: the
-/// older test's requests were answered by the younger test's proxy, whose config
-/// differs — observed as a mystery 404 from a test that asserts pass-through
+/// HONEST ABOUT THE MECHANISM: the candidate is probed with a real `bind` and the
+/// probe socket is then RELEASED, because the caller hands this port to Pingora,
+/// which binds it itself. Holding the socket here would make that second bind
+/// fail with `EADDRINUSE` (Pingora sets only `SO_REUSEADDR`, never
+/// `SO_REUSEPORT`), i.e. it would break nearly every integration test rather than
+/// fix anything. So the probe-to-bind window still exists; what this function
+/// does is make two PROCESSES very unlikely to probe the same candidate at the
+/// same moment, not reserve a port.
+///
+/// The per-process band is derived by HASHING the pid instead of `pid % N`. With
+/// `% 100`, two pids 100 apart were handed the SAME band, so two test binaries
+/// (or a test run and a leftover process) fought over one block of ports — which
+/// is how a test's requests ended up answered by another test's proxy,
+/// observed as a mystery 404 from a pass-through assertion
 /// (`catalog_get_v1_models_id_still_passes_through_upstream`, ~1 run in 7).
 ///
-/// Ports now come from a per-process base plus a counter that never repeats
-/// inside the process, and the candidate is probed with a real bind so an
-/// unrelated process holding it is skipped.
+/// RESIDUAL RISK, stated rather than papered over: hashing changes which pids
+/// collide, it does not eliminate collisions — `band(pid) == band(pid')` exactly
+/// when `pid ≡ pid' (mod 200)`. Two processes whose pids differ by a multiple of
+/// 200 still share a band (and a single process that runs out of its 100 probed
+/// ports still panics).
 #[allow(dead_code)]
 pub fn ephemeral_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
 
-    // 100 ports per process, drawn below the Linux ephemeral range (32768+) so
+    // 200 bands × 100 ports, drawn below the Linux ephemeral range (32768+) so
     // Pingora's own outbound connections cannot collide with the block.
-    let base = 12_000u32 + (std::process::id() % 100) * 100;
-    for _ in 0..100 {
-        let port = (base + u32::from(NEXT.fetch_add(1, Ordering::Relaxed) % 100)) as u16;
+    const BANDS: u64 = 200;
+    const PORTS_PER_BAND: u32 = 100;
+    let band = (std::process::id() as u64).wrapping_mul(2_654_435_761) % BANDS;
+    let base = 12_000u32 + (band as u32) * PORTS_PER_BAND;
+    for _ in 0..PORTS_PER_BAND {
+        let port = (base + NEXT.fetch_add(1, Ordering::Relaxed) % PORTS_PER_BAND) as u16;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+            return port; // probe socket dropped here, on purpose (see above)
         }
     }
     panic!("no free test port in the allocated block");
@@ -119,5 +132,51 @@ pub fn hydrated(
             tenant_providers: Vec::new(),
             tenant_models: Vec::new(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T10.1 — consecutive and BAND-ADJACENT pids must not share a band.
+    ///
+    /// The previous `pid % 100` handed two pids 100 apart the same 100-port
+    /// block, so two test binaries could fight over one range. The band is a hash
+    /// now; this pins the property that motivated the change, and also records
+    /// the residual collision rule (`pid ≡ pid' (mod 200)`) instead of implying
+    /// it was eliminated.
+    #[test]
+    fn port_bands_do_not_repeat_for_nearby_pids() {
+        const BANDS: u64 = 200;
+        let band = |pid: u64| pid.wrapping_mul(2_654_435_761) % BANDS;
+
+        let base = 123_456u64;
+        assert_ne!(
+            band(base),
+            band(base + 100),
+            "pids 100 apart used to share a band — that is the defect this fixes"
+        );
+        assert_ne!(band(base), band(base + 1), "consecutive pids differ");
+        // HONEST: hashing spreads collisions, it does not remove them.
+        assert_eq!(
+            band(base),
+            band(base + BANDS),
+            "pids 200 apart still share a band (documented residual risk)"
+        );
+    }
+
+    /// A probed port really is bindable and unique within one call sequence.
+    #[test]
+    fn ephemeral_ports_are_bindable_and_distinct() {
+        let a = ephemeral_port();
+        let b = ephemeral_port();
+        assert_ne!(a, b, "the caller must not get the same port twice");
+        for port in [a, b] {
+            assert!(
+                std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+                "port {port} must be bindable (the probe released it on purpose)"
+            );
+        }
     }
 }
