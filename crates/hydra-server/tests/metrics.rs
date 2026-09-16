@@ -154,6 +154,84 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
     .unwrap();
 }
 
+/// T7 — the certificate gauge must track HOT-RELOADED certs.
+///
+/// `hydra_listener_tenant_certs` exists to make "certs are configured but no TLS
+/// listener is bound" alertable. A boot-time-only gauge would be stale in
+/// exactly that scenario (an operator adds a cert to a running node), so this
+/// drives the real follower: a snapshot change must move the gauge.
+#[tokio::test]
+async fn tenant_cert_gauge_tracks_snapshot_changes() {
+    let pool = common::setup_pool().await;
+    seed(&pool, "http://127.0.0.1:1/auth", "http://127.0.0.1:2").await;
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("ConfigStore::load");
+
+    let cert_store = Arc::new(hydra_server::tls::HydraCertStore::new(None));
+    // Subscribing is what installs the follower (and publishes the initial count).
+    hydra_server::tls::follow_snapshot(&store, &cert_store);
+
+    // The follower runs synchronously on the snapshot swap, so the gauge is
+    // already set; assert through the real exposition text.
+    let before = hydra_server::admin::metrics::render();
+    assert!(
+        before.contains("hydra_listener_tenant_certs 0"),
+        "the gauge starts at zero on a cert-less config:\n{before}"
+    );
+
+    // Write a cert directly (as the admin API does) and reload: the snapshot
+    // change must republish the count.
+    let domain = "cert-gauge.example";
+    repo::insert_tenant(
+        &pool,
+        &Tenant {
+            id: "t-cert".into(),
+            name: "cert".into(),
+            domain: domain.into(),
+            auth_url: "https://auth.example/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        },
+    )
+    .await
+    .expect("insert tenant");
+    repo::update_tenant_cert(
+        &pool,
+        key_provider.as_ref(),
+        &repo::TenantCert {
+            tenant_id: "t-cert".into(),
+            cert_pem: Some("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----".into()),
+            cert_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----".into(),
+            ),
+        },
+    )
+    .await
+    .expect("update cert");
+
+    assert!(
+        store.reload_all().await.expect("reload"),
+        "cert is a change"
+    );
+
+    let after = hydra_server::admin::metrics::render();
+    assert!(
+        after.contains("hydra_listener_tenant_certs 1"),
+        "a written certificate must move the gauge to 1 (hot reload):\n{after}"
+    );
+    // Sanity: the exposition really is being read (the metric name exists with a
+    // HELP/TYPE pair), so the assertions above cannot pass on a stray substring.
+    assert!(
+        after.contains("# TYPE hydra_listener_tenant_certs gauge"),
+        "the gauge must be registered as a gauge:\n{after}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_exposes_proxy_counters() {
     // --- wiremock upstreams -------------------------------------------------

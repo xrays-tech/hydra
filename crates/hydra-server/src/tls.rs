@@ -308,9 +308,17 @@ impl HydraCertStore {
 /// covers both, plus any writer added later.
 pub fn follow_snapshot(config: &crate::store::ConfigStore, cert_store: &Arc<HydraCertStore>) {
     cert_store.resolve_and_store(&config.snapshot().certs);
+    // The cert COUNT is published here rather than at boot: this function runs
+    // once at startup and then on every snapshot change, which is exactly the
+    // lifecycle of the certificates themselves (a boot-time-only gauge would be
+    // stale the moment an operator adds a cert, i.e. in the very scenario the
+    // `hydra_listener_tenant_certs > 0 and hydra_listener_bound{protocol="tls"}
+    // == 0` alert exists for).
+    crate::admin::metrics::record_listener_tenant_certs(config.snapshot().certs.len());
     let follower = cert_store.clone();
     config.on_snapshot_change(Arc::new(move |cfg: &hydra_core::config::ConfigData| {
         follower.resolve_and_store(&cfg.certs);
+        crate::admin::metrics::record_listener_tenant_certs(cfg.certs.len());
     }));
 }
 

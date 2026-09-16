@@ -38,6 +38,7 @@
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
 //! | `hydra_registry_nodes` | gauge | state | node registry reaper (alive\|dead rows) |
 //! | `hydra_registry_reaped_total` | counter | — | node registry reaper (stale rows removed) |
+//! | `hydra_listener_tenant_certs` | gauge | — | `tls::follow_snapshot` (certs in the current snapshot) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -117,6 +118,14 @@ struct Metrics {
     /// Config combinations that leave certificates unserved or a configured
     /// port unusable, by kind. Non-zero means an operator decision is missing.
     listener_misconfig: IntCounterVec,
+    /// Tenant certificates currently in the config snapshot. Together with
+    /// `hydra_listener_bound{protocol="tls"}` this makes "certificates are
+    /// configured but no TLS listener is bound" ALERTABLE instead of a log line.
+    ///
+    /// Published from the snapshot FOLLOWER, not at boot: tenant certs are
+    /// hot-reloaded at runtime, so a boot-time-only gauge would be permanently
+    /// stale in exactly the scenario this alert targets.
+    listener_tenant_certs: IntGauge,
     // ── Node registry (cluster P4 → 审核 G2) ────────────────────────────
     /// Registry rows by liveness (`state="alive"|"dead"`). A growing `dead`
     /// series is the "113 rows, 108 offline" symptom in a queryable form.
@@ -302,6 +311,11 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_listener_misconfig_total",
                 "Listener configuration that leaves certs unserved or a port unusable, by kind",
                 &["kind"]
+            )
+            .ok()?,
+            listener_tenant_certs: register_int_gauge!(
+                "hydra_listener_tenant_certs",
+                "Tenant certificates present in the config snapshot"
             )
             .ok()?,
             registry_nodes: register_int_gauge_vec!(
@@ -531,6 +545,16 @@ pub fn record_control_poll(result: &str) {
 pub fn record_control_snapshot_version(version: u64) {
     if let Some(m) = metrics() {
         m.control_snapshot_version.set(version as i64);
+    }
+}
+
+/// Publish how many tenant certificates the current snapshot holds.
+///
+/// Called by the certificate follower on every snapshot change (and once at
+/// startup), so the value tracks hot-reloaded certs.
+pub fn record_listener_tenant_certs(n: usize) {
+    if let Some(m) = metrics() {
+        m.listener_tenant_certs.set(n as i64);
     }
 }
 

@@ -450,9 +450,33 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
   `hydra_route_errors_total`, `hydra_mid_stream_errors_total`.
 - **Tracing**: structured logs via `tracing` (`RUST_LOG`). Every request carries
   an `X-Hydra-Trace-Id` echoed to the client and logged end-to-end.
-- **Admin UI**: `http://<admin_addr>/admin/` — same-origin, in-memory token
-  prompt. Useful for incident inspection (breaker dead-set, health, manual
-  reload, key reveal with audit log).
+- **Admin UI**: `http://<admin_addr>/admin/` — same-origin (the token is kept
+  in `sessionStorage` for the current tab, so a reload stays signed in while
+  closing the tab signs out). Useful for incident inspection (breaker dead-set,
+  health, manual reload, key reveal with audit log).
+
+### 9.1 Alerting: which metric means what
+
+**This repository ships the METRICS, not the alert rules.** The alert-rule files
+(Prometheus rules / Alertmanager routes) belong to the OPERATIONS repository —
+adding them here would create a second owner for the same policy. The table below
+is the contract those rules are written against: every expression uses a metric
+name and label that really exists in this codebase (`/metrics`).
+
+| Alert | Expression | Meaning |
+|---|---|---|
+| Certs configured, no TLS listener bound | `hydra_listener_tenant_certs > 0 and hydra_listener_bound{protocol="tls"} == 0` | Tenant SNI is silently not served (the 2026-09-16 outage shape) |
+| TLS listener configured, no certs | `hydra_listener_bound{protocol="tls"} == 1 and hydra_listener_tenant_certs == 0` | Handshakes will fail until a certificate is written |
+| Invalid listener configuration | `increase(hydra_listener_misconfig_total[10m]) > 0` | Startup-time configuration problem (certs without a port / port without certs) |
+| Registry rows piling up | `hydra_registry_nodes{state="dead"} > 5` | Reaping is failing, or node identities drift |
+| Registry reaping churn | `increase(hydra_registry_reaped_total[1h]) > 20` | Nodes keep being recreated (unstable identity — see §13.6) |
+| Config snapshot stale | `hydra_config_snapshot_stale == 1` | A post-write reload failed; the in-memory snapshot is behind the DB |
+| Replication stalled (upgrade window) | `changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0` | Fail-closed mixed-version signal. **Only polling nodes publish these** — scope the rule by role |
+
+The label is `protocol`, never `transport` (`hydra_listener_bound` is registered
+with `&["protocol"]`). Note the metric-name family: listener signals live under
+`hydra_listener_*`; there is deliberately **no** `hydra_proxy_listener_*` alias —
+two names for one signal would mean two owners.
 
 > **Mid-stream failures are not retried.** Streaming responses that fail AFTER
 > the `200` + first byte are sent cannot be retried (sent bytes cannot be
