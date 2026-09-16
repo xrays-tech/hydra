@@ -461,6 +461,14 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let proxy_cfg = ProxyConfig {
         non_route_strategy: non_route_strategy_from_env()
             .map_err(Box::<dyn std::error::Error>::from)?,
+        // Read HERE (the single construction site) or the env var is a ghost:
+        // the value would never reach the request path.
+        upstream_first_byte_timeout_secs:
+            hydra_server::proxy::config::parse_upstream_first_byte_timeout_secs(
+                std::env::var("HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS")
+                    .ok()
+                    .as_deref(),
+            ),
         ..ProxyConfig::default()
     };
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]

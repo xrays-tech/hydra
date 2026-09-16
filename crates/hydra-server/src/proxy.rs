@@ -799,7 +799,10 @@ impl ProxyHttp for HydraProxy {
                 ctx.forward_latency_ms = Some(ctx.started_at.elapsed().as_millis() as u64);
             }
             ctx.upstream_started_at = Some(Instant::now());
-            let send_result = self.provider_client.send(req).await;
+            let send_result = self
+                .provider_client
+                .send(req, self.state.proxy.upstream_first_byte_timeout_secs)
+                .await;
 
             match send_result {
                 Ok(resp) => {
@@ -888,7 +891,15 @@ impl ProxyHttp for HydraProxy {
                     // written) requires the documented opt-in
                     // (`FailoverConfig::retry_after_connect`, which was declared
                     // and documented but read by nothing).
-                    let never_reached_upstream = e.is_connect();
+                    // A connect error is the ONLY proof the upstream never saw
+                    // the request. A FIRST-BYTE timeout is the opposite: the
+                    // request was written, so replaying it may double-bill — it
+                    // must therefore take the same path as any other post-send
+                    // failure (and NOT be silently upgraded to "never reached").
+                    let never_reached_upstream = match &e {
+                        crate::proxy::provider_client::SendError::Transport(re) => re.is_connect(),
+                        crate::proxy::provider_client::SendError::FirstByteTimeout { .. } => false,
+                    };
                     if !never_reached_upstream && !self.state.proxy.failover.retry_after_connect {
                         warn!(
                             trace_id = %ctx.trace_id,

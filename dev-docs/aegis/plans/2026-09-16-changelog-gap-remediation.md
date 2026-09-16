@@ -3851,3 +3851,17 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 - **T9.6（§7-6 localStorage "记住我" / 服务端会话）**：**显式非目标**，理由已在 T5 落地时写明——admin token 是全舰队根凭证而管理面当前是**明文 HTTP**，因此票据只活在标签页内（`sessionStorage`），"关标签页也保持登录"会实质扩大暴露面。该升级须先落 HTTPS / 仅内网暴露。
 
 **本轮门禁（已实现部分的复核）**：`cargo fmt --check` clean；两种 clippy **0 warning**（`--features server` 与三特性）；`cargo test -p hydra-server --features server` ⇒ **27 套件 0 failed**；三特性 ⇒ **累计 417 passed / 0 failed**（Phase B 时为 412，本批 +5：2 个转发单测 + 3 个解析/端到端断言组）。
+
+### Batch 6（部分）— T9.1 上游首字节超时（§7-1 的"收口"那一半）
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `proxy/provider_client.rs`（`SendError` + 有界 `send`）、`proxy.rs`（取值 + `never_reached_upstream` 判定）、`proxy/config.rs`（新配置项 + 默认值 + 纯解析器 + 单测）、`main.rs`（**唯一**构造点读 env，否则是 ghost env）、`dev-docs/ops.md` |
+| 改动 | `send()` 由"裸 `req.send()`"改为**两把时钟**：`first_byte_secs` 只包住 `send()`（`send()` 在**响应头**到达时返回 ⇒ 这是真正的 TTFB 界），客户端级 300s 仍覆盖整个交换（含 body 读取）。**刻意不用 `RequestBuilder::timeout`**——那会把流式 body 一起卡住，截断长 SSE 响应 |
+| 配置 | `upstream_first_byte_timeout_secs`，默认 **30**，env `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`；解析抽成**纯函数** `parse_upstream_first_byte_timeout_secs`（`0`/垃圾值回落默认；`0` 会被解释成"立即超时"）；`Default` impl 已同步补字段 |
+| 双计费语义**保住** | `SendError::FirstByteTimeout` 明确归入"**可能已到达上游**"：`never_reached_upstream` 只在 `SendError::Transport(re)` 且 `re.is_connect()` 时为真；首字节超时时为 **false** ⇒ 除非显式开启 `retry_after_connect`，否则直接 502，**不会**把可能已计费的请求重放到别的 provider |
+| §7-1 的另一半**不谎称已收口** | 探针语义（`<500` 即复活、探针打非推理路径）**保持原样**，并在 `ops.md` 明确记录其**已知盲区**：加两个默认值不变的开关等于把盲区留下却对外宣布修好。该问题需真实凭据与产品语义决定，**留作独立决策** |
+| 用例 | `a_silent_upstream_fails_within_the_first_byte_bound`（黑洞上游：`FirstByteTimeout{secs:1}`、耗时远小于 300s、消息含 "already sent"）；`a_refused_upstream_is_a_transport_error`（拒绝连接仍是 `Transport`，即"可安全故障转移"的那一类）；`a_slow_body_is_not_truncated_by_the_first_byte_bound`（**自制原始流式服务端**：响应头立刻到、body 在 1.5s 后才发完 ⇒ 1s 的 TTFB 界**不得**截断 body，断言收到完整 SSE 文本）；`upstream_first_byte_timeout_parse_is_total` + 默认值锁定 |
+| 诊断复现 | 改前：黑洞上游会一直等到客户端级 300s（`provider_client.rs` 只有 `.timeout(300s)`，`proxy.rs` 的 `send` 无首字节界）；改后：在 `first_byte_secs` 量级失败 |
+
+**本轮门禁**：`cargo fmt --check` clean；两种 clippy **0 warning**；release build Finished；`--features server` ⇒ **27 套件 0 failed**；三特性 ⇒ **累计 422 passed / 0 failed**（Batch 6 前半为 417，本批 +5）。

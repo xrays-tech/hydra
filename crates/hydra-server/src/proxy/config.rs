@@ -86,6 +86,14 @@ pub struct ProxyConfig {
     /// zeros: `max_concurrency == 0` ⇒ `Permit::Passthrough` (no gating, no
     /// behaviour change for unconfigured providers — risk #1).
     pub default_concurrency_policy: ConcurrencyPolicy,
+    /// Time-to-first-byte bound for one upstream attempt, in seconds
+    /// (`HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`, default 30).
+    ///
+    /// It bounds `send()` only — i.e. how long the upstream may take to produce
+    /// response HEADERS — and deliberately does NOT bound the streaming body
+    /// (the client-level 300s timeout covers the whole exchange). `0` is
+    /// rejected at parse time: it would mean "time out immediately".
+    pub upstream_first_byte_timeout_secs: u64,
 }
 
 impl Default for ProxyConfig {
@@ -105,6 +113,55 @@ impl Default for ProxyConfig {
                 max_queue_depth: 0,
                 queue_wait_timeout_ms: 0,
             },
+            // 30s: long enough for a slow provider to start answering (TTFT for
+            // a large model is routinely several seconds), short enough that a
+            // wedged upstream fails over instead of burning the 300s exchange
+            // timeout.
+            upstream_first_byte_timeout_secs: 30,
         }
+    }
+}
+
+/// The configured first-byte bound: `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`,
+/// defaulting to [`ProxyConfig::default`]'s value. Kept PURE so the tests do not
+/// mutate the process environment.
+#[must_use]
+pub fn parse_upstream_first_byte_timeout_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        // 0 would mean "time out immediately" — ignore it and fall back.
+        .filter(|v| *v > 0)
+        .unwrap_or(ProxyConfig::default().upstream_first_byte_timeout_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T9.1 — the first-byte bound parse is TOTAL: garbage and `0` fall back to
+    /// the default, because `0` would mean "time out immediately" and every
+    /// request would fail with a first-byte timeout.
+    #[test]
+    fn upstream_first_byte_timeout_parse_is_total() {
+        assert_eq!(parse_upstream_first_byte_timeout_secs(None), 30, "default");
+        assert_eq!(parse_upstream_first_byte_timeout_secs(Some("45")), 45);
+        assert_eq!(
+            parse_upstream_first_byte_timeout_secs(Some(" 45 ")),
+            45,
+            "trimmed"
+        );
+        assert_eq!(
+            parse_upstream_first_byte_timeout_secs(Some("0")),
+            30,
+            "0 means 'time out immediately' and must be rejected"
+        );
+        assert_eq!(parse_upstream_first_byte_timeout_secs(Some("nope")), 30);
+        assert_eq!(parse_upstream_first_byte_timeout_secs(Some("-1")), 30);
+    }
+
+    /// The default is the value the docs quote; drift here would make the
+    /// documented timeout a lie.
+    #[test]
+    fn the_default_first_byte_timeout_is_thirty_seconds() {
+        assert_eq!(ProxyConfig::default().upstream_first_byte_timeout_secs, 30);
     }
 }

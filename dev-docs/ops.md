@@ -471,12 +471,27 @@ name and label that really exists in this codebase (`/metrics`).
 | Registry rows piling up | `hydra_registry_nodes{state="dead"} > 5` | Reaping is failing, or node identities drift |
 | Registry reaping churn | `increase(hydra_registry_reaped_total[1h]) > 20` | Nodes keep being recreated (unstable identity — see §13.6) |
 | Config snapshot stale | `hydra_config_snapshot_stale == 1` | A post-write reload failed; the in-memory snapshot is behind the DB |
+| Upstream first-byte timeouts | `increase(hydra_retries_total{stage="connect"}[10m]) > 0` | The upstream accepted the connection and then stopped answering; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s) instead of burning the 300s exchange timeout |
 | Replication stalled (upgrade window) | `changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0` | Fail-closed mixed-version signal. **Only polling nodes publish these** — scope the rule by role |
 
 The label is `protocol`, never `transport` (`hydra_listener_bound` is registered
 with `&["protocol"]`). Note the metric-name family: listener signals live under
 `hydra_listener_*`; there is deliberately **no** `hydra_proxy_listener_*` alias —
 two names for one signal would mean two owners.
+
+> **Known blind spot in the breaker PROBE (audit §7-1, deliberately NOT fixed).**
+> A revived-by-probe decision treats any response status `< 500` as "healthy", and
+> the probe hits a path that a real inference request never uses — so an upstream
+> that accepts connections and returns e.g. 404 to the probe (or that is merely
+> slow to answer) can be revived while genuine traffic still fails. Whether 4xx
+> should count as healthy, and whether the probe should exercise the real
+> inference path with a real credential, is a PRODUCT decision that needs real
+> credentials to validate; it is recorded here rather than silently "fixed" by
+> adding switches whose defaults preserve the blind spot.
+>
+> What IS fixed: the per-attempt **first-byte bound** (`HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`,
+> default 30s). Without it a "connected but silent" upstream consumed the full
+> 300s exchange timeout on every attempt and every failover hop.
 
 > **Mid-stream failures are not retried.** Streaming responses that fail AFTER
 > the `200` + first byte are sent cannot be retried (sent bytes cannot be
