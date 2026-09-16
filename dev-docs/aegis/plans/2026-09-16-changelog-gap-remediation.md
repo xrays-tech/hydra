@@ -3690,3 +3690,24 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | 无选举（`leader_ready: None`）⇒ 行为不变（既有夹具不回退） | ✅ (d) |
 
 **"改前失败"证据（已实测，非静态推理）**：临时删掉刚加的租约门后重跑，`control_snapshot_requires_the_leader_lease` **FAILED**，且失败输出显示备用节点**真的吐出了完整快照**——含 `sealed_provider_keys`（`{"p1":[{"id":"k1","sealed":{...}}]}`）与 `fidelity` 段，即"任何持 cluster token 的非 leader 都能产出快照"的实证；恢复门后全绿。
+
+### Phase A 门禁执行结果（统一门禁命令，逐条）
+
+按计划 §"Phase A 门禁"的**统一命令块**执行（同一套命令，未另写）。结果：**全部 0 error / 0 failed，`fail=0`**。
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| 1 | `cargo update --workspace --locked --dry-run` | ✅ `Locking 0 packages to latest compatible versions`（lockfile 同步） |
+| 2 | `cargo fmt --check` | ✅ clean |
+| 2 | `cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings` | ✅ 0 warning |
+| 2 | `cargo build --release --workspace --features hydra-server/server` | ✅ Finished（57.99s） |
+| 3 | `cargo test -p hydra-core` | ✅ 全部 `0 failed` |
+| 3 | `cargo test -p hydra-server --features server` | ✅ **27 个套件 0 failed** |
+| 3 | hydra-core 依赖防火墙（`cargo tree` + grep） | ✅ 仅 `bytes` / `memchr` 等，无 tokio/pingora/sqlx/reqwest/hyper |
+| 4 | 三特性 clippy / release build / test | ✅ 0 warning、Finished（19.99s）、**累计 405 passed、0 failed** |
+| 5 | `node scripts/check_i18n.js` | ✅ `OK (330 en keys, 4 locales, code↔en consistent)` |
+| 5 | `node --test scripts/check_i18n.test.cjs` | ✅ `# fail 0`（0 cancelled / 0 skipped / 0 todo） |
+| 5 | `bash scripts/ask_llm.test.sh` | ✅ `E3 (ask_llm + dead-code): ALL PASSED` |
+| 6 | `.sqlx/` | ✅ 本 Phase 唯一需要重生成的批次是 Batch 1（3 条 `ORDER BY`），其变更已在 Batch 1 提交内；Batch 2–4 新增代码只用运行时 `sqlx::query`，**无新增宏 SQL** ⇒ `git status --short .sqlx/` 为空 |
+
+**Phase A 门禁判据逐条**：① 以上全部 0 error / 0 failed ✅；② **T1、T6、T2、T3、T4 的新增用例"改前失败"留证** ✅（T1/T6 用"临时改回旧实现"实测 RED→GREEN；T2/T3 的缺陷是"路径不存在"故留静态可复算证据；T4 用"临时删掉租约门"实测 RED，失败输出里能看到备用节点真的吐出了含 `sealed_provider_keys` 的完整快照）；③ `.sqlx/` 变更已提交 ✅。
