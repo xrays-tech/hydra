@@ -166,3 +166,88 @@ jobs:
 
       - name: "Shell checks: LLM_API_KEY required, no request when unset (ask_llm)"
         run: bash scripts/ask_llm.test.sh
+
+  # Real-browser UI gate. The Rust suites cannot see the admin UI: the
+  # `invalidateFK` regression ("the write landed and the UI still reported a
+  # failure") was invisible to every existing job. This builds the binary,
+  # starts a real instance against a real SQLite file, seeds it over the admin
+  # REST API and drives the embedded UI with Chromium.
+  ui-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hydra
+        run: cargo build --release --workspace --features hydra-server/server
+
+      # The repo ships no root package.json on purpose (the UI has zero build
+      # step); the harness's own package.json is created here, in CI only.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Playwright + Chromium
+        run: |
+          set -euo pipefail
+          npm init -y >/dev/null 2>&1
+          # PINNED: an unpinned install in CI is silent drift — this gate must
+          # fail because the PRODUCT changed, not the test runner.
+          npm install --save-dev @playwright/test@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Verify prerequisites
+        run: |
+          set -euo pipefail
+          # tests/e2e/seed.sh calls jq 8x; assert rather than assume.
+          command -v jq >/dev/null || { echo "::error::jq is required by tests/e2e/seed.sh"; exit 1; }
+          command -v curl >/dev/null || { echo "::error::curl is required"; exit 1; }
+
+      - name: Start hydra
+        env:
+          # >= MIN_ADMIN_TOKEN_LEN (16): a 15-byte token makes bootstrap exit(1),
+          # which would make this whole job unreachable.
+          HYDRA_ADMIN_TOKEN: dev-admin-token-2026
+          HYDRA_ADMIN_ADDR: 127.0.0.1:8081
+          HYDRA_DB_URL: sqlite://${{ github.workspace }}/e2e-ci.db?mode=rwc
+          # Required, fail-closed: provider api-keys are encrypted at rest.
+          HYDRA_ENCRYPTION_KEY: ${{ secrets.HYDRA_E2E_ENCRYPTION_KEY || 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          # `nohup` so the runner does not reap the process when this step's
+          # shell exits.
+          nohup ./target/release/hydra >/tmp/hydra-e2e.log 2>&1 &
+          echo $! >/tmp/hydra-e2e.pid
+          for _ in $(seq 1 60); do
+            kill -0 "$(cat /tmp/hydra-e2e.pid)" 2>/dev/null \
+              || { echo "::error::hydra exited"; tail -50 /tmp/hydra-e2e.log; exit 1; }
+            # `/healthz` is token-FREE only in edge_mode; with the default role
+            # `all` it sits behind the admin-token gate, so an unauthenticated
+            # probe gets 401 and `curl -f` exits 22 forever. This is exactly
+            # what the repo's own leader healthcheck does.
+            if curl -fsS -H "Authorization: Bearer dev-admin-token-2026" \
+                 http://127.0.0.1:8081/api/v1/health >/dev/null 2>&1; then
+              echo "hydra is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::hydra did not become ready"; tail -50 /tmp/hydra-e2e.log; exit 1
+
+      - name: Seed fixtures
+        env:
+          HYDRA_ADMIN_ADDR: 127.0.0.1:8081
+          HYDRA_ADMIN_TOKEN: dev-admin-token-2026
+        run: ./tests/e2e/seed.sh
+
+      - name: Playwright (chromium)
+        env:
+          HYDRA_BASE: http://127.0.0.1:8081
+          HYDRA_ADMIN_TOKEN: dev-admin-token-2026
+        run: npx playwright test --config=playwright.config.cjs

@@ -22,7 +22,7 @@
 const { test, expect } = require('@playwright/test');
 
 const BASE = process.env.HYDRA_BASE || 'http://127.0.0.1:8081';
-const TOKEN = process.env.HYDRA_ADMIN_TOKEN || 'dev-admin-token';
+const TOKEN = process.env.HYDRA_ADMIN_TOKEN || 'dev-admin-token-2026';
 // Distinct prefix so parallel/repeated runs don't collide with seed data or
 // each other.
 const RUN_ID = 'pw-' + Date.now().toString(36);

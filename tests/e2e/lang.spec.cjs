@@ -10,7 +10,7 @@
 const { test, expect } = require('@playwright/test');
 
 const BASE = process.env.HYDRA_BASE || 'http://127.0.0.1:8081';
-const TOKEN = process.env.HYDRA_ADMIN_TOKEN || 'dev-admin-token';
+const TOKEN = process.env.HYDRA_ADMIN_TOKEN || 'dev-admin-token-2026';
 
 async function signIn(page) {
   await page.goto(`${BASE}/admin/`);

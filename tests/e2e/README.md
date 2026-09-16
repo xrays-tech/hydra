@@ -53,7 +53,7 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
 ```bash
 # 1. Build + start hydra (in one terminal or under your supervisor):
 cargo build --release --features server
-export HYDRA_ADMIN_TOKEN=dev-admin-token
+export HYDRA_ADMIN_TOKEN=dev-admin-token-2026
 export HYDRA_DB_URL='sqlite::memory:'     # or a file path for persistence
 # Optional: HYDRA_LISTEN, HYDRA_TLS_LISTEN (adds an HTTPS listener),
 #           HYDRA_ADMIN_ADDR, RUST_LOG
@@ -61,11 +61,11 @@ export HYDRA_DB_URL='sqlite::memory:'     # or a file path for persistence
 
 # 2. Wait for it, then seed one row in each table so the UI has something
 #    to show on first load:
-HYDRA_ADMIN_ADDR=127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token \
+HYDRA_ADMIN_ADDR=127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token-2026 \
   ./tests/e2e/seed.sh
 
 # 3. Run Playwright:
-HYDRA_BASE=http://127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token \
+HYDRA_BASE=http://127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token-2026 \
   npx playwright test --config=playwright.config.cjs
 ```
 
@@ -78,6 +78,17 @@ HYDRA_BASE=http://127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token \
 - The wrong-token test (T2.1b) intentionally exercises the fail-closed path.
 - If `HYDRA_BASE` is unreachable, the suite fails fast in `beforeAll` with a
   pointer to this README.
+- `stats_autorefresh.cjs` was **retired** from this directory (T8 / audit G8):
+  it is not an `@playwright/test` file — requiring it starts a static HTTP
+  server and Chromium, so it must never be collected by the runner. It now
+  lives at `scripts/stats_autorefresh.cjs` and is run manually
+  (`NODE_PATH=$(npm root -g) node scripts/stats_autorefresh.cjs`). Its coverage
+  is to be superseded by the formal banner / auto-refresh specs (plan T9.5 /
+  T10.4).
+- The default admin token in these specs is `dev-admin-token-2026`. It must be
+  at least 16 chars (`MIN_ADMIN_TOKEN_LEN`): the older `dev-admin-token` was 15
+  bytes, and the binary refuses to start with it — every run then failed before
+  the first browser ever launched.
 - The `admin-ui/` directory has **no `package.json`** and no build step (T1.4).
   The `package.json` you create for Playwright is for the test harness only,
   not for the UI; CI can flag any `package.json` under `admin-ui/` as a

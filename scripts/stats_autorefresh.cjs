@@ -1,6 +1,16 @@
 /**
  * Stats auto-refresh (F-7) — Playwright verification with the fake-clock API.
  *
+ * ⚠ RETIRED FROM THE TEST SUITE (T8 / audit G8). This script used to live in
+ * `tests/e2e/`. It is NOT an `@playwright/test` file: requiring it starts a
+ * static HTTP server AND a Chromium instance, so merely COLLECTING it would run
+ * it (which also means Playwright never collected it — the pattern
+ * `*.spec.cjs` never matched it). It is therefore kept here as a runnable
+ * manual script, out of the collected directory, instead of being renamed into
+ * the suite. Its coverage is to be superseded by the formal banner/auto-refresh
+ * specs (plan T9.5 / T10.4); until those land, run it by hand with the command
+ * below.
+ *
  * Self-contained: it serves admin-ui/ over a local static HTTP server and mocks
  * /api/v1/* via page.route (no hydra binary needed), then drives the real
  * stats.js through the clock API:
@@ -9,7 +19,7 @@
  *     fires at least twice (auto-refresh reschedules itself);
  *   - uncheck "auto" → advance the clock → request count stays unchanged.
  *
- * Run:  node tests/e2e/stats_autorefresh.cjs
+ * Run:  node scripts/stats_autorefresh.cjs
  *
  * Playwright is not a dependency of this repo (no root node_modules), so point
  * NODE_PATH at an installation whose browser build is present, e.g.
