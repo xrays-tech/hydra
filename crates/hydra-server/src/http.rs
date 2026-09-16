@@ -225,11 +225,31 @@ impl AuthCache {
         before - self.map.len()
     }
 
-    /// Clear the LOCAL cache entirely (cluster P4 generation bump: the
-    /// invalidation stream was trimmed past our watermark, so the safe action
-    /// is re-auth everything; L2 entries expire by TTL).
-    pub fn clear_all(&self) {
+    /// Clear the whole cache — L1 **and** the L2 of every tenant (cluster P4
+    /// generation bump: the invalidation stream was trimmed past our watermark,
+    /// so the safe action is re-auth everything). Returns the L1 entries
+    /// dropped.
+    ///
+    /// Clearing only the L1 was NOT a clear: `check` re-hydrates an L1 miss from
+    /// the L2 (`l2.get`), so a key whose invalidation event the trim dropped was
+    /// served the stale verdict again for the rest of its TTL — and that TTL is
+    /// the tenant's effective allow TTL, which a tenant auth service can raise
+    /// well beyond the 300 s default via `expires_in` (review B2).
+    pub async fn clear_all(&self) -> usize {
+        let cleared = self.map.len();
         self.map.clear();
+        #[cfg(feature = "cluster-redis")]
+        if let Some(l2) = &self.l2 {
+            if let Err(e) = l2.del_all_tenants().await {
+                // Best effort, but loud: the L1 is already gone, and whatever
+                // the L2 still holds can be resurrected by the next L1 miss.
+                warn!(
+                    error = %e,
+                    "L2 clear failed after a whole-cache invalidation; stale verdicts may be re-served"
+                );
+            }
+        }
+        cleared
     }
 
     /// Evict all entries whose TTL has elapsed (`now >= expires_at`). Returns

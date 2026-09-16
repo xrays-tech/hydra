@@ -205,12 +205,11 @@ pub async fn apply_invalidation(
         (Some(tid), true) => cache.invalidate_tenant(tid).await,
         (Some(tid), false) => cache.invalidate_hashes(tid, &keyhashes).await,
         (None, true) => {
-            // Clear every tenant's cache.
-            let mut n = 0;
-            for t in known_tenants {
-                n += cache.invalidate_tenant(t).await;
-            }
-            n
+            // Whole-cache clear (a `tenant: None` event with no keys): clear
+            // L1 AND the L2 fleet-wide. Iterating `known_tenants` instead would
+            // skip both the L1 entries of a tenant this node's snapshot does not
+            // know and (until B2) the L2 entirely.
+            cache.clear_all().await
         }
         (None, false) => {
             // Keys across all tenants.
@@ -261,9 +260,12 @@ pub fn spawn_invalidation_consumer(
                             gen = g;
                             tracing::info!(
                                 generation = g,
-                                "invalidation generation bumped; clearing local auth cache"
+                                "invalidation generation bumped; clearing local auth cache (L1 + L2)"
                             );
-                            auth.cache().clear_all();
+                            // L1 **and** L2 (B2): clearing only the L1 let the
+                            // next `check` re-hydrate the very verdict this
+                            // clear exists to drop, for the rest of its TTL.
+                            auth.cache().clear_all().await;
                             crate::admin::metrics::record_auth_cache_size(0);
                         }
                         _ => {}
@@ -618,8 +620,11 @@ mod tests {
             .await;
         assert_eq!(auth.cache().len(), 1, "seeded verdict before trim");
 
-        // An empty store is fine: the (None, []) events are no-ops, so the
-        // only thing that clears the seeded verdict is the generation bump.
+        // An empty store is fine: the published events target ANOTHER tenant, so
+        // they cannot clear the seeded `t1` verdict — only the generation bump
+        // can. (A `(None, [])` event is itself a whole-cache clear and would
+        // clear it directly; that path is covered by
+        // `apply_invalidation_to_local_cache`.)
         let store = crate::store::ConfigStore::from_snapshot(
             hydra_core::config::ConfigData::default(),
             std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
@@ -629,8 +634,11 @@ mod tests {
         spawn_trim_task(stream.clone(), 2, Duration::from_millis(20));
 
         // Publish past maxlen (2) → the trim task removes 3 → bumps.
-        for _ in 0..5 {
-            stream.publish(None, vec![]).await.expect("publish");
+        for i in 0..5 {
+            stream
+                .publish(Some("t9".to_string()), vec![format!("sk-{i}")])
+                .await
+                .expect("publish");
         }
 
         // Wait for the consumer to observe the bump and clear the cache.

@@ -25,6 +25,15 @@ fn idx_key(tenant_id: &str) -> String {
     format!("hydra:{{auth:idx}}:{tenant_id}")
 }
 
+/// Fleet-wide tenant index: `hydra:{auth:idx}` → set of tenant ids that hold at
+/// least one L2 verdict.
+///
+/// Needed because a WHOLE-cache clear cannot enumerate tenants otherwise (the
+/// namespace rules allow single-key ops only — no `SCAN`), and clearing only the
+/// L1 is not a clear at all: `AuthCache::check` re-hydrates an L1 miss from the
+/// L2. Bounded by the number of tenants, never by the number of keys.
+pub const GLOBAL_IDX_KEY: &str = "hydra:{auth:idx}";
+
 /// Redis-backed auth-verdict L2 cache.
 #[derive(Clone)]
 pub struct RedisAuthL2 {
@@ -58,7 +67,14 @@ impl RedisAuthL2 {
         Ok(Some((allowed, ttl)))
     }
 
-    /// Store a verdict with its TTL and add the key hash to the tenant index.
+    /// Store a verdict with its TTL and record the key hash in the tenant index
+    /// (and the tenant in the fleet-wide index).
+    ///
+    /// **Index first, value second** (N2): `del_tenant` enumerates the index, so
+    /// a value written without index membership would survive a tenant-wide
+    /// invalidation (suspension / 欠费停机) for its whole TTL. A dangling index
+    /// member is harmless — it only makes a later `del` of a key that is not
+    /// there — which is why this is the safe order of the two writes.
     pub async fn set(
         &self,
         tenant_id: &str,
@@ -66,6 +82,8 @@ impl RedisAuthL2 {
         allowed: bool,
         ttl: Duration,
     ) -> Result<(), RedisError> {
+        let _: i64 = self.pool.sadd(idx_key(tenant_id), key_hash_hex).await?;
+        let _: i64 = self.pool.sadd(GLOBAL_IDX_KEY, tenant_id).await?;
         let key = l2_key(tenant_id, key_hash_hex);
         let _: Option<String> = self
             .pool
@@ -77,7 +95,6 @@ impl RedisAuthL2 {
                 false,
             )
             .await?;
-        let _: i64 = self.pool.sadd(idx_key(tenant_id), key_hash_hex).await?;
         Ok(())
     }
 
@@ -97,6 +114,22 @@ impl RedisAuthL2 {
         }
         let _: i64 = self.pool.del(&idx).await?;
         Ok(())
+    }
+
+    /// Remove every verdict of EVERY tenant (fleet-wide clear; index-driven, no
+    /// SCAN). Returns the number of tenants cleared.
+    ///
+    /// This is what makes a cluster-wide "re-auth everything" (the generation
+    /// bump that compensates for a trimmed invalidation) actually effective:
+    /// with the L2 left in place, the next L1 miss re-hydrates the very verdict
+    /// the clear was supposed to drop.
+    pub async fn del_all_tenants(&self) -> Result<usize, RedisError> {
+        let tenants: Vec<String> = self.pool.smembers(GLOBAL_IDX_KEY).await?;
+        for t in &tenants {
+            self.del_tenant(t).await?;
+        }
+        let _: i64 = self.pool.del(GLOBAL_IDX_KEY).await?;
+        Ok(tenants.len())
     }
 }
 
@@ -176,5 +209,89 @@ mod tests {
             l2.get("t2", "k3").await.expect("c").is_some(),
             "other tenant untouched"
         );
+    }
+
+    /// REVIEW B2 — the whole-cache clear (cluster generation bump) must clear
+    /// the L2 as well, for EVERY tenant.
+    ///
+    /// `AuthCache::clear_all` used to clear only the L1 map, and `check`
+    /// re-hydrates an L1 miss from the L2. So when the invalidation stream was
+    /// trimmed past a node's watermark, the compensating full clear dropped the
+    /// L1 but the very next request for an affected key was served the STALE
+    /// verdict from the L2 — for the rest of that verdict's TTL, which
+    /// `expires_in` can raise far beyond the 300 s default (`http.rs`).
+    #[tokio::test]
+    async fn clear_all_clears_the_l2_of_every_tenant() {
+        let l2 = std::sync::Arc::new(l2().await);
+        let cache = crate::http::AuthCache::new(Duration::from_secs(300), Duration::from_secs(30))
+            .with_l2(l2.clone());
+
+        // Two tenants, each with a cached ALLOW in both L1 and L2.
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
+        cache
+            .set("t2", "sk-b", true, Duration::from_secs(300))
+            .await;
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            hydra_core::auth::Verdict::Hit(true)
+        );
+        assert_eq!(
+            cache.check("t2", "sk-b").await,
+            hydra_core::auth::Verdict::Hit(true)
+        );
+
+        cache.clear_all().await;
+
+        assert_eq!(cache.len(), 0, "L1 cleared");
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            hydra_core::auth::Verdict::Miss,
+            "the L2 must not resurrect an invalidated verdict"
+        );
+        assert_eq!(
+            cache.check("t2", "sk-b").await,
+            hydra_core::auth::Verdict::Miss,
+            "EVERY tenant must be cleared, not just the last one written"
+        );
+    }
+
+    /// REVIEW N2 — the index is written BEFORE the value, so a value can never
+    /// exist without index membership (which would make it survive
+    /// `del_tenant`).
+    #[tokio::test]
+    async fn index_is_written_before_the_value() {
+        let l2 = l2().await;
+        l2.set("t1", "k1", true, Duration::from_secs(60))
+            .await
+            .expect("set");
+        // The index names the key hash, and the fleet-wide index names the
+        // tenant — both must be in place alongside the value.
+        let members: Vec<String> = l2.pool.smembers(idx_key("t1")).await.expect("tenant index");
+        assert_eq!(members, vec!["k1".to_string()]);
+        let tenants: Vec<String> = l2
+            .pool
+            .smembers(GLOBAL_IDX_KEY)
+            .await
+            .expect("global index");
+        assert!(tenants.contains(&"t1".to_string()));
+    }
+
+    /// A fleet-wide clear removes every tenant's verdicts (B2's mechanism), so
+    /// `del_all_tenants` is exercised independently of `AuthCache`.
+    #[tokio::test]
+    async fn del_all_tenants_clears_the_fleet() {
+        let l2 = l2().await;
+        l2.set("t1", "k1", true, Duration::from_secs(60))
+            .await
+            .expect("k1");
+        l2.set("t2", "k2", true, Duration::from_secs(60))
+            .await
+            .expect("k2");
+        let cleared = l2.del_all_tenants().await.expect("clear fleet");
+        assert_eq!(cleared, 2, "two tenants cleared");
+        assert!(l2.get("t1", "k1").await.expect("a").is_none());
+        assert!(l2.get("t2", "k2").await.expect("b").is_none());
     }
 }
