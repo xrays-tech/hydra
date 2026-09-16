@@ -66,6 +66,40 @@ async function signIn(page) {
   await expect(page.locator('#token-status')).toContainText('authenticated');
 }
 
+/** Create a provider through the UI and return what was filled in.
+ *
+ *  Selectors follow the conventions this suite already relies on
+ *  (`#modal-root`, `[data-field=…]`, `.modal-foot button.btn.primary`) — NOT the
+ *  invented ones (`tr[data-id]`, `button[data-action]`, `#modal`, `#confirm-ok`)
+ *  that do not exist in `admin-ui/`.
+ *
+ *  EVERY field T2.2 fills is parameterizable: T2.2 asserts the exact id, key,
+ *  endpoint and weight afterwards, so hard-coding them here would break four of
+ *  its assertions.
+ */
+async function createProviderViaUi(
+  page,
+  {
+    id = null, // empty ⇒ the server generates one
+    name = `pw-${Date.now()}`,
+    key = `prov-${Date.now()}`,
+    endpoint = 'http://127.0.0.1:9/',
+    weight = null, // null ⇒ leave the form default
+  } = {},
+) {
+  await newButton(page, 'New provider').click();
+  if (id) await page.fill('#modal-root [data-field="id"]', id);
+  await page.fill('#modal-root [data-field="key"]', key);
+  await page.fill('#modal-root [data-field="name"]', name);
+  await page.fill('#modal-root [data-field="endpoint"]', endpoint);
+  if (weight !== null) {
+    await page.fill('#modal-root [data-field="weight"]', String(weight));
+  }
+  await page.locator('#modal-root .modal-foot button.btn.primary').click();
+  await expect(page.locator('#modal-root .modal-overlay')).toBeHidden({ timeout: 5000 });
+  return { id, name, key, endpoint, weight };
+}
+
 test.describe('Hydra admin UI — CRUD E2E', () => {
   test.beforeAll(async () => {
     // Liveness guard: fail fast with a clear message if the server isn't up.
@@ -218,14 +252,15 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
 
     // Open the Providers section and the New form.
     await navItem(page, 'providers').click();
-    await newButton(page, 'New provider').click();
     const id = `${RUN_ID}-prov`;
-    await page.fill('[data-field="id"]', id);
-    await page.fill('[data-field="key"]', `${RUN_ID}-key`);
-    await page.fill('[data-field="name"]', 'Playwright Provider');
-    await page.fill('[data-field="endpoint"]', 'https://pw-upstream.example.com');
-    await page.fill('[data-field="weight"]', '2');
-    await page.locator('.modal-foot button.btn.primary').click();
+    // Shared helper (T10.4); every value T2.2 asserts on is passed explicitly.
+    await createProviderViaUi(page, {
+      id,
+      key: `${RUN_ID}-key`,
+      name: 'Playwright Provider',
+      endpoint: 'https://pw-upstream.example.com',
+      weight: 2,
+    });
 
     // The modal hides on success and a toast appears.
     await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
@@ -241,6 +276,82 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     expect(json.key).toBe(`${RUN_ID}-key`);
     expect(json.endpoint).toBe('https://pw-upstream.example.com');
     expect(json.weight).toBe(2);
+  });
+
+  // T10.4 — the two `clearsFK` call sites in the providers section.
+  //
+  // `clearsFK: ["providers"]` means a provider create/edit/delete must DROP the
+  // foreign-key cache, because that cache is what the FK `<select>`s are built
+  // from (`ensureFK('providers')` → `FK.providers`). The observable consequence
+  // is therefore NOT "the modal closed" and NOT "the row list refreshed" (that
+  // list is re-fetched from the API regardless) — it is that the DEPENDENT
+  // DROPDOWN shows the new name instead of the stale one. The option text is
+  // `${r.name || r.id} · ${r.id}`.
+  test('T2.2b edit and delete a provider through the UI (both clearsFK paths)', async ({ page }) => {
+    // No `beforeEach` in this suite (only a `beforeAll` liveness probe) and a
+    // fresh context starts on the login overlay: sessionStorage deliberately does
+    // NOT carry over between tests (that is T5's design).
+    await signIn(page);
+    // The two names must NOT be substrings of one another: Playwright's
+    // `hasText` is a SUBSTRING match, so `x` and `x-renamed` would both match the
+    // renamed row and the assertion below could never distinguish them.
+    const stamp = Date.now();
+    const name = `pw-fk-orig-${stamp}`;
+    const renamed = `pw-fk-renamed-${stamp}`;
+
+    // 1) Populate the FK cache: the bindings section's provider dropdown is
+    //    sourced from it.
+    await navItem(page, 'provider-key-bindings').click();
+    await newButton(page, 'New binding').click();
+    const select = page.locator('#modal-root [data-field="provider_id"]');
+    await expect(select).toBeVisible();
+    // Close without submitting: the CACHE is what we wanted warm.
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#modal-root .modal-overlay')).toBeHidden({ timeout: 5000 });
+
+    // 2) Create a provider and EDIT its name.
+    await navItem(page, 'providers').click();
+    await createProviderViaUi(page, { name });
+    const row = page.locator('#content table tbody tr', { hasText: name });
+    await expect(row).toHaveCount(1);
+
+    await row.locator('button[title="Edit"]').click();
+    await page.fill('#modal-root [data-field="name"]', renamed);
+    await page.locator('#modal-root .modal-foot button.btn.primary').click();
+    // The modal must CLOSE (a submit path that throws leaves it open — the
+    // historical failure this suite exists to catch).
+    await expect(page.locator('#modal-root .modal-overlay')).toBeHidden({ timeout: 5000 });
+    // ...and the list reflects the edit without a manual reload.
+    await expect(page.locator('#content table tbody tr', { hasText: renamed })).toHaveCount(1);
+
+    // 3) THE clearsFK ASSERTION: the dependent dropdown must show the NEW name.
+    //    With a stale FK cache it still offers the old one.
+    await navItem(page, 'provider-key-bindings').click();
+    await newButton(page, 'New binding').click();
+    const options = page.locator('#modal-root [data-field="provider_id"] option');
+    await expect(options.filter({ hasText: renamed })).toHaveCount(1);
+    await expect(options.filter({ hasText: name })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#modal-root .modal-overlay')).toBeHidden({ timeout: 5000 });
+
+    // 4) DELETE — the second `clearsFK` call site.
+    await navItem(page, 'providers').click();
+    await page
+      .locator('#content table tbody tr', { hasText: renamed })
+      .locator('button[title="Delete"]')
+      .click();
+    // The confirm dialog's danger button (real markup: `btn danger solid`).
+    await page.locator('#modal-root .modal-overlay button.btn.danger.solid').click();
+    await expect(page.locator('#content table tbody tr', { hasText: renamed })).toHaveCount(0);
+
+    // ...and the dropdown cache was dropped again: the deleted provider is gone
+    // from the dependent select.
+    await navItem(page, 'provider-key-bindings').click();
+    await newButton(page, 'New binding').click();
+    await expect(
+      page.locator('#modal-root [data-field="provider_id"] option').filter({ hasText: renamed }),
+    ).toHaveCount(0);
+    await page.keyboard.press('Escape');
   });
 
   test('T2.3 tenant with auth_url + associate provider/model', async ({ page }) => {

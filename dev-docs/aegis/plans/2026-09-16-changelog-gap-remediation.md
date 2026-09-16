@@ -3941,3 +3941,15 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | e2e 覆盖（**两个方向**） | ① `T9.5`（单节点）**负向**：横幅**不出现**，并额外断言 `/api/v1/cluster/status` 真的返回 `cluster:false`（证明断言针对的是横幅，而不是端点失败）；② `T9.5b`（**正向**，用 `page.route` 造一个真实形态的 fleet payload）：显示横幅、含本节点 id、链接 href 指向 lease holder 的 control_url、**切中文后文案随之更新**、且当本节点**就是** leader 时横幅**消失** |
 | 采集数与计划的差异（如实记录） | 计划预计 T9.5 后 Playwright = **12**；实测 **13**：计划只安排了一个"单节点不出现横幅"的用例，只覆盖**负向**，而 T9.5 的验收明确要求"非 leader 且能解析到 leader URL ⇒ 显示横幅 + 可点击链接"——单节点实例产生不了这个状态，故我补了一个 `page.route` 桩化的**正向**用例（端点自身契约由 Rust 套件覆盖）。因此 **Phase C 门禁的 Playwright 期望值应为 13，不是 12** |
 | 门禁 | `node --check` 通过；`check_i18n.js` **OK（334 en keys，4 语一致，无死键）**；`node --test` `# fail 0`；release 二进制重新构建（UI 经 `include_dir!` 内嵌）后跑真实 Chromium：**13 passed** |
+
+### Batch 13 — T10.4 e2e `T2.2b`（两条 `clearsFK` 路径）
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `tests/e2e/admin.spec.cjs`（新增可复用 `createProviderViaUi(page, opts)`；T2.2 改为复用它并传入自己的字面量）、`crates/hydra-server/build.rs`（**新增**，见下）、`tests/e2e/README.md` |
+| 选择器**逐个核实**（计划要求，O39） | 计划点名要核对：`#modal-root` **存在**（`index.html:110`）、字段是 `[data-field=…]`、主按钮 `.modal-foot button.btn.primary`、行内按钮由 `iconBtn()` 生成 ⇒ `button[title="Edit"]` / `button[title="Delete"]`（取 i18n 的 `common.action.edit/delete`）、确认框是 `.btn.danger.solid`（`confirmDialog`，`app.js:253`）。计划里提到的 `tr[data-id]`/`button[data-action]`/`#modal`/`#confirm-ok` **确实不存在**，已按真实实现书写 |
+| **`clearsFK` 的语义被真正测到** | 计划给的示例断言的是"modal 关闭 + 行列表刷新"，但两者都**不依赖** `invalidateFK`：行列表每次从 API 重取。`clearsFK` 真正管的是 **FK 下拉缓存**（`ensureFK('providers')` → `FK.providers`，下拉选项文案是 `${r.name \|\| r.id} · ${r.id}`）。用例因此重写为：先打开绑定表单**把缓存焐热** → 编辑 provider 名 → 回到绑定表单**断言下拉里出现了新名字、且旧名字消失** → 删除 provider → 再断言下拉里没有它 |
+| **反证（计划要求，已实测）** | 把 `invalidateFK` 改成 no-op（保留函数、只去掉 `delete FK[kind]`）并重建 ⇒ **T2.2b FAILED，失败点正是 FK 下拉断言**（`unexpected value "1"`，旧名字仍在下拉里）。恢复后全绿。注意：计划设想的"删掉函数定义 ⇒ modal 仍可见"是**另一类**（ReferenceError）失败，比语义失败弱；本用例现在抓的是语义 |
+| **开发中撞到的两个真实工具陷阱（已修 + 已记录）** | ① **`include_dir!` 不触发重建**：只改 `admin-ui/*` 后 `cargo build --release` 不重新编译，二进制里仍是**旧 UI** ⇒ 我的第一次反证因此跑在旧 UI 上、"验证了错的产物"。已新增 `crates/hydra-server/build.rs` 声明 `cargo:rerun-if-changed=../../admin-ui`，并实测"只改一个 CSS 注释也会触发重新编译"。② **旧实例仍占端口**：新进程 bind 失败退出，而就绪探测被**旧进程**满足 ⇒ 同样是在验证旧产物（与计划 B5 的警告同类）。两条都写进 `tests/e2e/README.md`，并给出"验证服务的 bundle 就是你构建的那个"的检查方法 |
+| 另一个自身缺陷（已修） | `hasText` 是**子串**匹配，而我把改名写成 `原name + "-renamed"` ⇒ 旧名字断言永远会命中新行。已改用互不包含的两个名字，并把这条坑写进 README |
+| 门禁 | `node --check` 通过；release 重建（含 build.rs 后的**正确**重建）后真实 Chromium 全量 **14 passed**（12 计划值 + T9.5b + T2.2b；**Phase D 门禁期望值应为 14**） |

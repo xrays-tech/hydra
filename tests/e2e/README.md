@@ -94,6 +94,28 @@ HYDRA_BASE=http://127.0.0.1:8081 HYDRA_ADMIN_TOKEN=dev-admin-token-2026 \
   not for the UI; CI can flag any `package.json` under `admin-ui/` as a
   regression.
 
+## ⚠ Rebuilding after a UI-only edit
+
+The admin UI is embedded with `include_dir!`, and cargo does **not** track the
+contents of a directory a proc macro reads. `crates/hydra-server/build.rs` now
+declares `cargo:rerun-if-changed=../../admin-ui`, so an edit under `admin-ui/`
+rebuilds the crate — without it, `cargo build --release` would happily re-link a
+binary carrying the PREVIOUS UI and these tests would exercise the old app and
+pass. (This is not hypothetical: it silently invalidated a counter-proof run.)
+
+Two more traps that cost real time here, both worth knowing before debugging a
+"mystery" e2e failure:
+
+- **A previous instance still holds the port.** The new process exits with a bind
+  error while the readiness probe is answered by the OLD one, so the suite runs
+  against a stale binary. Kill by pid before starting, and assert the served
+  bundle is the one you built — `curl -H "Authorization: Bearer $TOKEN"
+  $HYDRA_BASE/admin/app.js | grep <your-marker>`.
+- **`hasText` is a SUBSTRING match.** Two labels where one contains the other
+  (`pw-orig-123` vs `pw-orig-123-renamed`) both match, so an assertion meant to
+  prove "the stale name is gone" silently proves nothing. Use non-overlapping
+  values in tests that compare before/after strings.
+
 ## Why no `webServer` in `playwright.config.cjs`
 
 Pingora's listener + SQLite + env-var secrets are environment-specific. Letting
