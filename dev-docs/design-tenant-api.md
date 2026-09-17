@@ -20,7 +20,7 @@
    - **两个高危威胁整体消失**——不再有"租户可写域名"（Host→租户映射被不可信方控制 → 客户端原始 api-key 被截获）与"租户可写 `auth_url`"（网关出站目标被不可信方指定 → SSRF）。§5 从 5 个威胁缩到 3 个。
    - **不再有任何 DB 写路径** → 不需要窄写 DB 函数、不需要 `key_provider`、不需要 `reload_all` 与跨服务共享的 `reload_lock`/`snapshot_stale`、不存在域名唯一性冲突、不存在"停用租户还能改数据面行为"的闸门不对称。
    - **不再需要 leader 转发** → 不需要 `cluster_registry`/`leader_ready`/`forward_mutation`、不需要在管理口挂第二个执行点、不引入任何新信任边界、不碰 `HYDRA_PUBLIC_URL` 的语义。**租户 API 变成"只读 + 一次幂等的缓存删除"**。
-7. **E2 的语义是"在全部数据面节点上清除"，而且调用方能知道是否真的做到了**（§4.2）。今天做不到这一点：远端节点的 L1 命中项**不会**因为发布方删了 L2 而消失（L1 命中根本不查 L2），而消费者的已读位置 `last_id` 只存在于那个 loop 的局部变量里（`events.rs:291`），**从不对外发布**——所以 `published: true` 只表示"进了流"，与"已生效"无关。设计补上三层：**L1 扇出**（既有失效流+消费者）+ **L2 权威**（发布方同步 `DEL` 共享 Redis）+ **L3 收敛屏障**（每节点把"已应用到的事件 ID"写进一个 Redis HASH，发布方等待**注册表里全部存活节点**确认）。返回码因此是 **200 = 已全量生效 / 202 = 已接受未收敛（带 `lagging` 列表）/ 503 = 集群成员但失效通道不可用**（今天这种情况会静默报 `true`）。
+7. **E2 的语义是"在全部数据面节点上清除"，而且调用方能知道是否真的做到了**（§4.2）。今天做不到这一点：远端节点的 L1 命中项**不会**因为发布方删了 L2 而消失（L1 命中根本不查 L2），而消费者的已读位置 `last_id` 只存在于 `spawn_invalidation_consumer` 的循环局部变量里（`events.rs:293` 声明 / `:311` 推进），**从不对外发布**——所以 `published: true` 只表示"进了流"，与"已生效"无关。设计补上三层：**L1 扇出**（既有失效流+消费者）+ **L2 权威**（发布方同步 `DEL` 共享 Redis）+ **L3 收敛屏障**（每节点把"已应用到的事件 ID"写进一个 Redis HASH，发布方等待**注册表里全部存活节点**确认）。返回码因此是 **200 = 已全量生效 / 202 = 已接受未收敛（带 `lagging` 列表）/ 503 = 集群成员但失效通道不可用**（今天这种情况会静默报 `true`）。
 8. **必须给残余窗口一个"不由租户决定"的硬上界**（§4.2.5）。活着但不消费失效事件的节点（消费者挂掉、与 Redis 分区、未注册）只能靠 L1 的 allow TTL 兜底——而**今天的 allow TTL 可以被租户用 `expires_in` 抬到任意长**（`http.rs:661-674`；`clear_all` 的注释自己承认 "can raise well beyond the 300 s default"，`http.rs:309-311`）。也就是说：今天"某节点上封禁何时生效"部分取决于**被停用的那个租户**。新增 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（默认 300 = 现有默认值，**对不设 `expires_in` 的租户零变化**）把该窗口封顶。
 9. **`AppState` 只增 2 个字段**：`invalidation: Option<InvalidationStream>`（E2 广播）与 `usage: Arc<dyn UsageQuery>`（E3 的读能力，按 sink kind 在启动时注入唯一实现）。DB 池**不新增字段**——直接用 `ConfigStore::pool()`（`store.rs:374-379`，同一个 store 实例的公开访问器，避免第二个"本节点有没有本地库"的 owner）。
 10. **两个后端都在 v1，集群首次可用**（需求确定：生产必跑集群，用量首发可用）。集群强制 `HYDRA_USAGE_SINK=clickhouse`（`main.rs:263-269`），而 CH 侧今天只有 INSERT、没有读路径 → 本设计**新增 CH 读通道**。关键事实全部对仓库自带的活实例**实测**得到（ClickHouse 24.3，§4.3.3）：**64 位整数默认被序列化成 JSON 字符串**（`{"n":"12345"}`）、无匹配行时 `MAX(created_at)` 返回 `""` 而不是 null、`{name:String}` + `param_*` 参数绑定实测可安全承载 `x' OR 1=1 --`、主键 `ORDER BY (created_at, …)` 对范围和等值谓词**确实裁剪**（`Granules: 1/2`）。**CH 侧最危险的陷阱是"整数被引号包裹"**：解析器若只接受 JSON number，就会静默返回 0 用量——正是那个"语法正确、语义错误的 200"（§4.3.3 CH-A）。
@@ -61,7 +61,7 @@
 | D3 | `published` 字段会**说谎** | 初值 `true`，仅当 `invalidation` 为 `Some` 且 publish 返回 `Err` 才置 `false`（`admin/handlers.rs:1640-1645`）；而它可为 `None`（`main.rs:621-644`） | ✅ §4.2.2 改 `broadcast` 三态 |
 | D4 | `invalidated` 只统计 **L1** 删除 | `http.rs:250-259`（L2 删除成败不入账） | ✅ §4.2.2 并列返回 `checked` |
 | D5 | `invalidate_tenant` 是**全表 `retain`** | `http.rs:291-300`，O(全部缓存条目) 且持分片写锁 | ⚠️ 沿用（既有语义），但 §5.1 限流约束其调用频率 |
-| D6 | 单个租户令牌可诱发**全集群清缓存** | 失效流裁剪溢出 → bump generation → 每节点 `clear_all()`（`events.rs:204-214/320-332`）；`MAX_INVALIDATION_KEYS=1000` 只约束单请求键数（`admin/handlers.rs:1557`） | ✅ §5.1 每租户失效频率上限 |
+| D6 | 单个租户令牌可诱发**全集群清缓存** | 失效流裁剪**只要删除任何条目**就 bump generation（`removed > 0`；裁剪无法区分已读/未读）→ 每节点 `clear_all()`（`events.rs:204-214/320-332`）；`MAX_INVALIDATION_KEYS=1000` 只约束单请求键数（`admin/handlers.rs:1557`） | ✅ §5.1 每租户失效频率上限 |
 | D7 | 用量表**只写不读** | `src/` 内无 `SELECT ... FROM usage_record`；`UsageSink` 只有 `record`/`shutdown`（`sink.rs:46-63`） | ✅ §4.3 净新增读面 |
 | D8 | 现有"用量统计"读的是**进程内计数器** | `admin/handlers.rs:2106-2108` → `admin/metrics.rs:760-800`；重启归零、无时间维度 | ✅ §4.3.4 明确两者口径分工 |
 | D9 | 集群强制 ClickHouse sink，而 CH **没有读路径** | `main.rs:263-269`；CH 侧只有硬编码 INSERT（`sink.rs:683-688`），无 SELECT、无响应体解析，config 已被 move 进私有 flush task（`sink.rs:559-568`） | ✅ §4.3.3 新增 CH 读通道（v1 必做） |
@@ -159,8 +159,8 @@ TLS ：https://<任意能连到数据面的主机名>/tenant/{tenant_id}/api/v1/
 ```
 (1) Host → tenant                      :365-379   ← 未知域名 404 unknown_domain
 (2) tenant.enabled 闸门                 :382-385   ← 停用租户 403 tenant_disabled
-(2.5) GET /v1/models 目录拦截            :439-457
-(3) 客户端 api-key 抽取（6 种载体）      :396-410
+(3) 客户端 api-key 抽取（6 种载体）      :396-410   ← **物理上先于 (2.5) 执行**
+(2.5) GET /v1/models 目录拦截            :439-457   ← 消费 (3) 的结果（出示的 key 仅用于按前缀绑定收窄）
 (3') 缺 key → 401 missing_api_key        :460-463
 (4) 外部鉴权（缓存优先 → 租户 auth_url）  :467
 (5) 读全量 body → (6) 抽 model → (7) 限流 → (8) 路由 → (9) 故障转移
@@ -175,7 +175,7 @@ TLS ：https://<任意能连到数据面的主机名>/tenant/{tenant_id}/api/v1/
 | C. 令牌不能被当成客户端 api-key | 第 (3) 步的 `Authorization: Bearer` 是**客户端 api-key 的合法载体之一**（`hydra_core::apikey` 六种载体）。晚于它，租户令牌会被当成客户端 key：送往租户 `auth_url`（`http.rs:558-566` 把**原始 key**放进 body 与 `Authorization`）、并被 `mask_key` 后写进用量记录（`proxy.rs:1105/1111`） |
 | D. 免于业务限流/路由副作用 | 第 (7) 步 count/token 限额与第 (8) 步 SWRR 选路都不适用于控制面请求；晚拦截会白吃一次限流判定与一次路由计算 |
 
-**落点**：`request_filter` 开头新增一次前缀判定，命中则 `return tenant_api::dispatch(...).await`（`Ok(true)` 短路，Pingora 不再拨上游）；未命中则现有流程**零改动**。
+**落点（必须早于 (3) 的 `:396`）**：`request_filter` 开头新增一次前缀判定，命中则 `return tenant_api::dispatch(...).await`（`Ok(true)` 短路，Pingora 不再拨上游）；未命中则现有流程**零改动**。
 
 **短路后的日志/指标语义**（容易踩）：`logging`（`proxy.rs:1029-1157`）只在 `ctx.tenant.is_some() && ctx.selected.is_some()` 时写用量记录与 `hydra_requests_total`。租户 API 请求要**设 `ctx.tenant`（便于归因）但绝不设 `ctx.selected`** → 不产生用量记录、不污染业务指标；状态码写 `ctx.status_code`。计费口径因此天然干净：**租户自助请求不进 `usage_record`，也不会被计入自己的 token 用量**（否则租户查用量会把查询本身算进去，形成自指噪声）。
 
@@ -337,7 +337,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
 
 #### 4.2.3 收敛屏障（L3）的机制
 
-**问题（今天的具体缺陷）**：消费者的 `last_id` 只存在于那个 loop 的局部变量里（`events.rs:291`），**从不对外发布**。因此整个系统里没有任何一处能回答"集群现在清到哪了"——`published: true` 是唯一信号，而它与"已生效"无关。
+**问题（今天的具体缺陷）**：消费者的 `last_id` 只存在于 `spawn_invalidation_consumer` 的循环局部变量里（`events.rs:293` 声明 / `:311` 推进），**从不对外发布**。因此整个系统里没有任何一处能回答"集群现在清到哪了"——`published: true` 是唯一信号，而它与"已生效"无关。
 
 **机制（全部放进既有的 `InvalidationStream`，不新增子系统）**：
 
@@ -349,7 +349,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
 
 - **屏障令牌 = `XADD` 返回的流 ID**（如 `1758096000123-0`）。用它而不是自增计数器，是因为它**由 Redis 在写入时分配**，因此"事件存在"与"令牌已分配"是同一个原子动作，不存在"令牌可见但事件还没落地"的窗口。比较按 `(ms, seq)` 数值对，不按字符串。
 - 消费者在**成功应用一批之后**，把该批的最大 ID 一次性 HSET 上去；顺序是**先 apply 后 ack**（绝不允许先 ack——那会让屏障说谎）。
-- **generation bump 路径（裁剪溢出）的 ack 规则**：`clear_all()` 会清掉**所有**缓存项，因此它**取代**了任何在它之前已发布的事件；但节点**不能**为它没读到的事件 ID 记账。因此该路径只做两件事：① `clear_all()`；② **不推进水位**。后果是相关事件会以 `lagging` 出现（`state: pending`），而**不**是假报 `applied`。这是有意的保守选择：**宁可报未收敛，也不谎报已收敛**。§4.2.5 给出该情形下的硬上界。
+- **generation bump 路径（裁剪删除任何条目即触发）的 ack 规则**：`clear_all()` 会清掉**所有**缓存项，因此它**取代**了任何在它之前已发布的事件（注意：触发条件是"裁剪删除了任何条目"，不是"丢了未读条目"）；但节点**不能**为它没读到的事件 ID 记账。因此该路径只做两件事：① `clear_all()`；② **不推进水位**。后果是相关事件会以 `lagging` 出现（`state: pending`），而**不**是假报 `applied`。这是有意的保守选择：**宁可报未收敛，也不谎报已收敛**。§4.2.5 给出该情形下的硬上界。
 - 等待循环：`publish` → 取 event_id → 读注册表存活节点列表（`registry.list_nodes`）→ 轮询 HASH，直到 `∀ live node: applied >= event_id` 或超时。**只等存活节点**：已死节点不在注册表里，也不在给它们送流量的负载均衡池里。
 - **不是转发**：整条屏障只读共享 Redis 的 HASH，**不向对端发任何请求**，因此 §6.2 "本设计不需要任何转发"的结论不变（也就不需要集群令牌、内部端点或新信任边界）。
 
@@ -560,7 +560,7 @@ AppState.usage: Arc<dyn UsageQuery>
 | 失败限流 | 按**源 IP** 与**令牌摘要**两个维度固定窗口：默认 10 次失败/分钟 → `429` + `Retry-After`；持续超限 → 15 分钟锁定该维度（`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` / `_LOCKOUT_SECS`） |
 | 成功限流 | 按租户令牌：默认 60 次/分钟（`HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`），防止租户 API 被当作免费的 CPU/DB 消耗面 |
 | 反放大 | E3 窗口上限（默认 31 天）+ `group_by` 白名单，避免一次请求全表扫描 |
-| **失效风暴防护** | 针对 D6：E2 追加"每租户失效频率上限"（默认 10 次/分钟）；超限 429。三个理由：① 失效流裁剪溢出会 bump generation，进而让**每个节点清空整个缓存**（`events.rs:204-214/320-332`）；② 每次失效会让**所有**相关节点回源 `auth_url`，是租户自己认证服务的流量放大器；③ 收敛屏障本身要读 Redis（发布 + 轮询 HASH），高频调用会把共享主干变成热点——单个租户的凭证不得成为跨租户可用性武器 |
+| **失效风暴防护** | 针对 D6：E2 追加"每租户失效频率上限"（默认 10 次/分钟）；超限 429。三个理由：① 失效流裁剪**只要删除任何条目**就会 bump generation（≈ 每 30s 里事件数超过 `maxlen=10_000`，即约 **>333 事件/秒**持续 30s 即触发），进而让**每个节点清空整个缓存**（L1+L2）——与消费者是否落后**无关**（`events.rs:204-214/320-332`）；② 每次失效会让**所有**相关节点回源 `auth_url`，是租户自己认证服务的流量放大器；③ 收敛屏障本身要读 Redis（发布 + 轮询 HASH），高频调用会把共享主干变成热点——单个租户的凭证不得成为跨租户可用性武器 |
 | 实现位置 | 独立小组件（`DashMap` 固定窗口；`cluster-redis` 下用 Redis 计数，使 edge 水平扩展时限额不被放大 N 倍，参照 `redis/rate_limit.rs` 的窗口原语）。**不复用** `proxy::limiter::Limiter`：它是 `LimitRole` 驱动的业务配额（`limiter.rs:25-63`），语义不同 |
 | 常数时间 | 对所有候选摘要做常数时间比较（复用 `constant_time_eq` 的写法，`admin/handlers.rs:662-675`） |
 | 令牌强度 | 沿用最短 16 字符（`admin/handlers.rs:240/853-860`）；文档给出 `openssl rand -hex 32` 的生成指引（既有话术） |
@@ -627,15 +627,15 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | 失效流事件 → 各节点消费者 `invalidate_hashes` | **全部在消费的存活节点**的 L1 | ≤500ms（空闲轮询 `events.rs:272`） | `events.rs:63-86`、`:233-265` |
 | 收敛屏障（新增）：每节点水位 HASH + 发布方等待 | **可证明**：`nodes_applied == nodes_total` | 典型 <100ms | §4.2.3 |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（新增） | 消费者停摆/未注册节点的**残余窗口上界** | ≤ 该值 | §4.2.5 |
-| generation bump → `clear_all()` | 裁剪溢出时的**兜底**（全清，代价高） | 同扇出 | `events.rs:320-332` |
+| generation bump → `clear_all()` | 裁剪**删除任何条目**即触发（非"仅当丢了未读条目"）的**兜底**（全清 L1+L2，代价高） | 同扇出 | `events.rs:204-213`（Lua `removed > 0`）、`:320-332` |
 
 **关键的诚实声明（写进 `ops.md` 与 E2 的响应语义）**：
 
 1. `state: applied` 的含义是"**注册表中全部存活节点的消费者都已确认应用**"。它**不**覆盖未注册的节点、消费者停摆的节点、以及与失效主干网络分区的节点——这些由 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 兜底。
-2. `state: pending` 是**诚实的未收敛**，不是错误：`lagging` 列出未确认的 node_id，运维可据此定位（配合 `hydra_invalidation_consumer_stalled_seconds` 告警）。**不因为裁剪溢出无法命名被丢弃的事件 ID 就报 `applied`**——这是刻意的保守选择（§4.2.3）。
+2. `state: pending` 是**诚实的未收敛**，不是错误：`lagging` 列出未确认的 node_id，运维可据此定位（配合 `hydra_invalidation_consumer_stalled_seconds` 告警）。**不因为裁剪丢弃的事件 ID 已不可知就报 `applied`**——这是刻意的保守选择（§4.2.3）。
 3. 一次 E2 覆盖**本集群共享同一失效主干**的全部数据面节点（部署形态已确认为单一集群；多集群场景的重新评估触发条件见 §4.2.4 第 4 条）。
 
-**同时记录一个既有的放大路径（D6）**：失效流裁剪（`maxlen=10_000`，`main.rs:632-639`）一旦丢掉未读条目就 bump generation，消费者随即 `clear_all()`。因此 §5.1 的"每租户失效频率上限"不是可选项。
+**同时记录一个既有的放大路径（D6，且比 v5.1 的描述更宽）**：失效流裁剪（`maxlen=10_000`，`main.rs:632-639`，每 30s 一次）**只要删除任何条目**就 bump generation —— `trim_and_maybe_bump` 用的是 `XTRIM MAXLEN` 的 `removed > 0`（`events.rs:204-213` 的 Lua），**裁剪在原理上无法区分已读与未读**。所以"只裁掉已读条目就无害"这个假设**不成立**：只要持续 >333 事件/秒，每个 trim 周期都会让**全部节点清空整个缓存（L1+L2）**，与任何消费者是否落后无关。因此 §5.1 的"每租户失效频率上限"不是可选项。
 
 
 ### 6.4 决策记录 A-1：E2 **不**转发到 leader 的 `admin` API
@@ -678,7 +678,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 4. **B 把已删除的机制整套加回来**：`cluster_registry`/`leader_ready` 进 `AppState`、`forward_mutation` + `x-hydra-forwarded` 循环守卫、**502/504「结果未知」的歧义语义**，以及"管理口必须对所有数据面节点可达"这一新耦合（edge 刻意没有 `HYDRA_ADMIN_TOKEN`）。A 的依赖只有"共享 Redis（集群本来必需）+ 本节点内存"——**没有对端可失败**。
 5. **B 会让 `invalidated` 变得没有意义**：该字段在**接收请求的节点**上算出（`handlers.rs:1660-1667`）；转发后它统计的是 leader 的 L1 命中数，对租户更无用。
 6. **B 省不下任何代码**：A 已经调用**同一套原语**（`HttpAuthChecker::invalidate`/`invalidate_tenant`、`InvalidationStream::publish`、`apply_invalidation`），而旧端点按 §8.1 **M1 直接删除**（项目尚未上线）——它的 handler 主体原样搬进新模块，是**搬迁**而不是重写。要复用，复用的是 **handler 与底层原语**，不是**网络路径**。
-7. **B 也没有解决真正的缺口。** 真正的缺口是"**没有任何 owner 负责全集群已收敛**"：leader 处理完同样只回 `published: true`（`handlers.rs:1660-1667`），消费者水位 `last_id` 同样从不对外发布（`events.rs:291`）。**B 只是把"谁在骗你"从 edge 换成 leader。** 该缺口由收敛屏障（§4.2.3）在**失效流**上补齐，而不是由请求路径上多一跳补齐。
+7. **B 也没有解决真正的缺口。** 真正的缺口是"**没有任何 owner 负责全集群已收敛**"：leader 处理完同样只回 `published: true`（`handlers.rs:1660-1667`），消费者水位 `last_id` 同样从不对外发布（`events.rs:293/311`：`last_id` 在循环内声明与推进）。**B 只是把"谁在骗你"从 edge 换成 leader。** 该缺口由收敛屏障（§4.2.3）在**失效流**上补齐，而不是由请求路径上多一跳补齐。
 
 #### 后果
 
@@ -715,7 +715,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 |---|---|
 | `crates/hydra-core/src/tenant_api.rs`（**新增，纯**） | ① **规范形态校验**：`%Y-%m-%dT%H:%M:%SZ` 的定宽字形校验（含月/日/时/分/秒的**数值范围**检查，纯字符串运算，不做日历计算）；② **规范形态下的顺序比较**（同长度定宽 ⇒ 字典序 == 时间序）；③ 路径解析：`/tenant/{tid}/api/v1/{endpoint}` → `(tenant_id, Endpoint)`；④ 用量 DTO 与聚合行的纯计算（含 `COALESCE` 语义的零值）。**零 I/O、零 HTTP 类型、零 `chrono`** |
 | `crates/hydra-core/tests/tenant_api.rs`（新增） | 上述纯函数穷举单测（形制照 `crates/hydra-core/tests/router.rs` / `validate.rs`） |
-| `crates/hydra-server/src/tenant_api/time_bound.rs`（**新增**） | **时间入参的词法解析与归一化住在 shell，不在 core**——因为 RFC3339（带偏移）与 epoch 的解析需要日历运算，而 **`hydra-core` 没有也不允许有 `chrono`**（依赖白名单见 `crates/hydra-core/Cargo.toml:7-11`；`model.rs:299-300` 亦自述 "no `chrono` in core"）。本模块用 `chrono` 把用户的 `since`/`until`（RFC3339 / epoch 秒 / epoch 毫秒）归一化为规范字符串，并在这里做**窗口长度**判定（需要日历运算）；随后把规范字符串交给 core 做字形校验与顺序比较 |
+| `crates/hydra-server/src/tenant_api/time_bound.rs`（**新增**） | **时间入参的词法解析与归一化住在 shell，不在 core**——因为 RFC3339（带偏移）与 epoch 的解析需要日历运算，而 **`hydra-core` 没有也不允许有 `chrono`**（依赖白名单见 `crates/hydra-core/Cargo.toml:9-16`；`model.rs:299-300` 亦自述 "no `chrono` in core"）。本模块用 `chrono` 把用户的 `since`/`until`（RFC3339 / epoch 秒 / epoch 毫秒）归一化为规范字符串，并在这里做**窗口长度**判定（需要日历运算）；随后把规范字符串交给 core 做字形校验与顺序比较 |
 | `crates/hydra-server/src/tenant_api/mod.rs` | 路由（轻量段匹配，形制照 `admin/mod.rs:277-419`）、前缀判定与 `request_filter` 入口、`respond_json`（形制照 `proxy.rs:1280-1297`）、`TenantApiConfig::from_env` |
 | `crates/hydra-server/src/tenant_api/auth.rs` | 令牌闸门：`tenant_from_token(&ConfigStore, &str)`（读 `store.replication().fidelity().tenant_token_hashes`）+ 常数时间比较 + 与 `tenants_by_id` 的**同一快照读** |
 | `crates/hydra-server/src/tenant_api/handlers.rs` | E1–E3 三个 handler（`Resp = http::Response<Vec<u8>>`） |
@@ -734,7 +734,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 |---|---|---|
 | `crates/hydra-core/src/lib.rs` | `pub mod tenant_api;` | |
 | `crates/hydra-core/src/config.rs` | `ConfigData` 新增派生索引 `tenants_by_id: HashMap<String, Tenant>`（`config.rs:37-69`） | 由**同一个 loader** 从同一批行构建，与 `tenants_by_domain` 同源 → 不是第二个 owner。需同步 `ConfigData::default`、loader（`store.rs:build_config`）、以及 `entities.rs`/`config_data.rs` 的既有形状测试 |
-| `crates/hydra-server/src/proxy.rs` | `request_filter` 第 0 步插入前缀判定；`AppState` 增 2 字段 + `AppState::for_tests()` | 新增字段会**打断 13 个测试构造点**（`tests/terminate_mode.rs:206-233` 的 `AppState {..}` 字面量，加 `streaming_usage_persistence.rs:271`、`tls.rs:166`、`anthropic_passthrough.rs:302/392/506`、`terminate_mode.rs:224/600/718/1089/1320/2871`、`metrics.rs:282`）→ **必须同批**提供 `AppState::for_tests(...)` 并迁移这 13 处 |
+| `crates/hydra-server/src/proxy.rs` | `request_filter` 第 0 步插入前缀判定；`AppState` 增 2 字段 + `AppState::for_tests()` | 新增字段会**打断 12 处测试构造点**（`tests/terminate_mode.rs:206-233` 的 helper——它**内含** `:224`——加 `:600/718/1089/1320/2871`、`streaming_usage_persistence.rs:271`、`tls.rs:166`、`anthropic_passthrough.rs:302/392/506`、`metrics.rs:282`；**不重复计 `:224`**）→ **必须同批**提供 `AppState::for_tests(...)` 并迁移这 12 处。仓库内 `AppState { .. }` 字面量共 **14** 处：1 处结构体定义（`proxy.rs:108`）、1 处生产构造（`main.rs:571`，随本方案的构造后移处理、不迁移到 `for_tests()`）、12 处测试 |
 | `AppState`（`proxy.rs:108-128`） | **只加两个字段**：`invalidation: Option<InvalidationStream>`（`not(cluster-redis)` 下设 `Option<()>` 占位，与 `AdminState` 同款，`admin/mod.rs:108-113`）、`usage: Arc<dyn UsageQuery>` | 收敛屏障没有增加字段（长在 `InvalidationStream` 上，见下）。**DB 池也不新增字段**——用 `ConfigStore::pool()`（`store.rs:374-379`）：同一个 store 实例的公开访问器，"本节点有没有本地库"只有一个 owner，避免 `AppState.pool` 与之漂移。**不需要** `key_provider`/`admin_token`/`cluster_registry`/`leader_ready`/`reload_lock`/`snapshot_stale`。E2 的屏障还需要"存活节点列表"：`registry.list_nodes()` 已存在（`cluster_api::cluster_status` 在用），但**不把 registry 放进 `AppState`**——改为在 `main.rs` 把一个 `Arc<dyn Fn() -> Vec<String>>` 注入 `tenant_api` 配置（与 `AdminState.leader_ready` 同一闭包注入手法，`admin/mod.rs:104`）。这样数据面**仍然拿不到注册表**，也就仍然没有任何转发能力 |
 | `crates/hydra-server/src/main.rs` | ① `AppState` 构造**后移到 `invalidation_stream` 之后**（`:621-644` 之后）；`:594` 的 `state.sink.clone()` 改为先克隆 `sink`。② `usage: Arc<dyn UsageQuery>` 由 `:261` 已读的 `sink_kind` 选择唯一实现。③ `allow_ttl_max` 从 env 接进 `AuthConfig`。④ `cluster.node_id` 接进 E2 响应构造（`HYDRA_CLUSTER_ID` 已随 Q13 删除） | **只有 1 个迟到资源**（`invalidation`），所以后移是小改动。替代方案：`ArcSwapOption`/`OnceLock` 后置填充；**推荐后移**，不留半初始化状态。`node_id` 已存在（注册表/租约/熔断投票都用它） |
 | `crates/hydra-server/src/sink.rs` | 把 CH 的传输与寻址**下沉到新模块 `clickhouse.rs`**（Q14=T1，见 §7.1），`ClickHouseSink` 改为调用它；**行为与期限必须逐行不变** | 这是本次唯一动到"正在工作的生产代码"的改动（§12 已列风险）：既有 4 条 `clickhouse_sink` 测试即回归网，且提取前后本应**零行为差异** |
@@ -906,7 +906,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | T22 | 前缀与业务路径边界 | `POST /v1/chat/completions` 仍**原样透传**（wiremock 收到 1 次）；`/tenant/t/api/v1/usage` 不落到上游（`received_requests` 为空） |
 | T23 | E1 的 `base_url` 字段 | 与实际可用前缀一致（自述不自相矛盾） |
 
-> ⚠️ **`AppState` 加字段会打断 13 个既有构造点**（见 §7.2）→ **必须同批**提供 `AppState::for_tests()` 并迁移。
+> ⚠️ **`AppState` 加字段会打断 12 处测试构造点**（另 1 处是生产构造 `main.rs:571`；见 §7.2）→ **必须同批**提供 `AppState::for_tests()` 并迁移。
 
 ### 10.3 集群（`--features server,cluster-redis,usage-clickhouse`，**真实 Redis**）
 
@@ -920,7 +920,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | C4 | **收敛屏障：两节点 + 消费者都在跑** | 发布后两节点水位均前进；E2 返回 **200** + `state:"applied"` + `nodes_applied == nodes_total` |
 | C5 | **收敛屏障：远端消费者停摆** | E2 在 `timeout_ms` 后返回 **202** + `state:"pending"` + `lagging` **精确列出该节点**；`consumer_stalled_seconds` 上升 |
 | C6 | **先 apply 后 ack 的顺序（关键负例）** | 构造"消费者读到事件但 apply 前中止" → 水位**不得**前进（若实现成先 ack 后 apply，此用例必须失败） |
-| C7 | generation bump 路径 | 触发裁剪溢出 → 各节点 `clear_all()` 且水位**不推进**；若同时有在途事件，E2 报 `pending` 而**不是** `applied` |
+| C7 | generation bump 路径 | 让流里的事件数超过 `maxlen` 使 `XTRIM` 删除条目（**不依赖"未读"条件**，裁剪无法区分）→ 各节点 `clear_all()` 且水位**不推进**；若同时有在途事件，E2 报 `pending` 而**不是** `applied` |
 | C8 | 屏障**不是转发** | 抓取 E2 期间的出站：本节点未向任何对端发起 HTTP（无 `x-hydra-forwarded`）；只读写共享 Redis |
 | C9 | 存活节点集合 | 心跳过期的节点**不**出现在 `nodes_total`，也不阻塞收敛 |
 | C10 | 失效主干的边界 | 两个独立 Redis 的实例互不影响：在 A 上发 E2，B 的节点水位**不动**（把"覆盖范围 = 本集群"这条契约的边界钉成可执行断言；Q13 确认单集群，但边界本身不能靠假设） |
@@ -990,7 +990,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 | Q5 | 是否提供用量明细 | v1 不做 ↔ 一并做 | **v1 不做**（§4.3.5）。补充理由（v4）：CH 侧**没有等价的单调自增列**，明细分页需要另一套游标语义 |
 | Q6 | `ConfigData` 派生索引 | 新增 `tenants_by_id` ↔ `whoami` 线性扫描 `tenants_by_domain.values()` | **新增派生索引**（同源构建，非第二 owner；顺带让存在性判定 O(1)） |
 | Q7 | `enabled` 是否作为闸门 | 全不闸（推荐）↔ 对 E3 也闸 | **全不闸**：只剩读与缓存删除，停用租户的自救必须畅通 |
-| Q8 | `AppState` 迟到资源 | 构造后移（推荐）↔ `ArcSwapOption`/`OnceLock` 后置填充 | **后移**（只 1 个迟到资源，改动小）；顺带提供 `AppState::for_tests()` 收敛 13 个测试构造点 |
+| Q8 | `AppState` 迟到资源 | 构造后移（推荐）↔ `ArcSwapOption`/`OnceLock` 后置填充 | **后移**（只 1 个迟到资源，改动小）；顺带提供 `AppState::for_tests()` 收敛 12 处测试构造点 |
 | Q9 | 管理口 `auth_url` 写入的网段校验（**既有边界，非本次需求**） | 本次顺带做 ↔ 单列小改动 | **单列**：本次变更不去碰管理 API 的既有行为；但它值得一个独立小任务（含 `POST /api/v1/tenants/auth/test` 探活） |
 | Q10 | E2 默认是否等待收敛 | 默认 `wait=converged`（预算 2s）↔ 默认立即返回 + 客户端自行轮询 | **默认等待**。端点的意义就是"让封禁立刻在整条数据面生效"，同步确认才是正确默认；不接受长延迟的调用方可传 `wait=none` |
 | Q11 | 收敛屏障的位置 | 扩 `InvalidationStream`（推荐）↔ 新建独立 `InvalidationBarrier` ↔ 放进 `tenant_api` | **扩 `InvalidationStream`**：水位与失效流共用 `hydra:{ctl:*}` 命名空间与同一个 Redis 池，拆开就是第二套"谁负责让全集群失效"的答案 |
@@ -1026,7 +1026,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 | CH INSERT 重试导致重复行 ⇒ `requests` 高估 | 中 | §4.3.3 CH-F；CH 表无 `trace_id` 列无法去重 → 契约把 `requests` 标注为**近似值**，`ops.md` 写明成因 | 无（已知偏差，需在文档中声明而非隐藏） |
 | **改动正在工作的 CH 写通道**（Q14 已选 T1） | 中 | **把改动拆成两个 commit**：commit 1 只做"传输下沉到 `clickhouse.rs`"（零行为差异，靠既有 4 条 `clickhouse_sink` 测试 + 本机活实例的 `#[ignore]` 那条作回归网）；commit 2 才新增读路径。回归失败时能立刻区分"搬迁搬错"与"新代码有问题"（§10.4） | 回滚 commit 1 即回到现状；读路径随之推迟 |
 | **注入错 `UsageQuery` 实现导致返回假的 0** | 中 | 启动时单点注入（取代运行时分支）；T14 断言注入实现与 `sink_kind` 一致（两种组合各一条）；`source` 字段由实现自报，租户可自行核对 | 无（必须在实现期覆盖） |
-| `AppState` 加字段打断测试编译 | 低 | `for_tests()` 收敛 13 处（同批） | 无（纯机械） |
+| `AppState` 加字段打断测试编译 | 低 | `for_tests()` 收敛 12 处测试构造点（同批；生产构造在 `main.rs:571` 另行后移） | 无（纯机械） |
 | 需求移除后**运维工单量上升**（改域名/auth_url） | 中 | `ops.md` 新增运维流程节；Admin UI 表单与探活按钮已存在 | 若要恢复自助写，**必须重新做 T1/T2 的全部对策**（§5 的已移除威胁表就是那份清单） |
 | 前缀保留导致既有透传行为变化 | 低 | 前缀几乎不可能与 provider 路径冲突（T22 覆盖）；总开关可完全回到基线 | 总开关 |
 | 派生索引 `tenants_by_id` 与 `tenants_by_domain` 漂移 | 低 | 同源构建于同一 loader 函数；`config_data.rs`/`entities.rs` 既有形状测试覆盖两者 | 无 |
@@ -1229,7 +1229,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
      空闲 sleep ≤500ms                                                   :272
    }
 裁剪任务：trim_and_maybe_bump(maxlen=10_000, 30s)  main.rs:632-639
-   └─ 裁剪若丢掉未读条目 → generation++ → 触发上面所有节点的 clear_all()
+   └─ 裁剪删除任何条目（XTRIM removed>0，无法区分已读/未读）→ generation++ → 触发所有节点 clear_all()
 ```
 
 ### A.6 三条最容易踩的不变量（直接决定 §4.2 的设计）
@@ -1246,7 +1246,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 |---|---|
 | I1（L1 不查 L2） | §4.2.2 第 1 层「L1 扇出」**不可省** |
 | I2（清必须清两层） | §4.2.2 第 2 层「L2 权威」 |
-| `last_id` 从不发布（`events.rs:291`） | §4.2.3 第 3 层「收敛屏障」——这是"清干净没有"唯一可回答的方式 |
+| `last_id` 从不发布（`events.rs:293/311`：`last_id` 在循环内声明与推进） | §4.2.3 第 3 层「收敛屏障」——这是"清干净没有"唯一可回答的方式 |
 | TTL 绝对不过期回滑 + `expires_in` 可抬高 allow TTL | §4.2.5 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（把残余窗口从"租户决定"改成"运维决定"） |
 | 消费者停摆只 `warn!`（`events.rs:336-338`） | §4.2.6 `consumer_stalled_seconds` 告警 |
 | 无 single-flight | §4.2.5 默认值取现状值（不取更小）的理由之一 |
@@ -1258,12 +1258,13 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 | 日期 | 版本 | 变更 |
 |---|---|---|
 | 2026-09-17 | v1 | 初稿：现状分析（D1–D10）、三平面模型、数据面保留前缀拦截、快照令牌索引、五个端点（含域名/auth_url 自助设置）、T1/T2 安全论证、集群转发方案（管理口同路径挂载）、待决策 Q1–Q8 |
+| 2026-09-17 | **v5.2** | **第 1 轮 oracle 复审（逐条事实证伪）findings 全部处置**：**[F-1]（FALSE）** `AppState` 构造点计数错误——写作"13 个测试构造点"，实为 **12 处测试**（`terminate_mode.rs:224` **内含于** `:206-233` 的 helper，被重复计了一次）；仓库内 `AppState { .. }` 字面量共 **14** 处 = 1 结构体定义（`proxy.rs:108`）+ 1 生产构造（`main.rs:571`）+ 12 测试。两文档的计数、列举与两条用它做完整性校验的语句全部改正，并加上可执行的计数校验命令（`grep -c "AppState {"` 应为 14）。**[I-1]（IMPRECISE）** `events.rs:291` 是签名收尾行，`last_id` 实际在 `:293` 声明、`:311` 推进——两文档 7 处引用改为 `events.rs:293/311`。**[I-2]（IMPRECISE，**实质上把风险说轻了**）** 失效流裁剪的 generation bump **不是**"仅当丢掉未读条目"：`trim_and_maybe_bump` 用的是 `XTRIM MAXLEN` 的 `removed > 0`（`events.rs:204-213` 的 Lua），**裁剪在原理上无法区分已读/未读** → 只要持续 **>333 事件/秒**（`maxlen=10_000` ÷ 30s 间隔）每个 trim 周期都会让**全部节点清空整个 L1+L2**，**与消费者是否落后无关**。D6 / §5.1 / §6.3 / C7 与附录 A.5 的措辞全部改正，"只裁已读条目就无害"的错误假设已显式否证。另采纳复审的两处精度修正：`hydra-core` 依赖白名单行号 `Cargo.toml:9-16`、以及 §3.2 的步骤列表原把 (2.5) 画在 (3) 之上（代码里 `:396` 先执行并喂给 `:454`）已修正为物理顺序并加注"第 0 步必须早于 `:396`"。其余 27/30 条断言（含 6 条 ClickHouse 事实被复审用 curl **独立复测**、逐字节一致）确认为真 |
 | 2026-09-17 | **v5.1** | **修正一处事实错误**：§7.1 原把"RFC3339（带偏移）/ epoch → `%Y-%m-%dT%H:%M:%SZ`"放在 `hydra-core`，但 **`hydra-core` 没有 `chrono`、且依赖白名单不允许引入**（`crates/hydra-core/Cargo.toml:7-11`；`model.rs:299-300` 自述 "no `chrono` in core"）。改为**职责切分**：词法解析与归一化、窗口长度判定放 shell 的 `tenant_api/time_bound.rs`（用 `chrono`）；core 只做规范形态的字形+数值范围校验与顺序比较（纯字符串，零日历运算）。§4.3.2 第 1 条同步注明归一化 owner |
 | 2026-09-17 | **v5** | **Q14 与 Q13 收口**：① **Q14 = T1** → CH 传输下沉为共享模块 `clickhouse.rs`（"怎么跟 CH 说话"的唯一 owner），写路径与读路径共用；§7.1 新增该模块条目，§7.2 `sink.rs` 改为"调用新模块、行为逐行不变"，§10.4 新增**"零行为差异"回归门禁**（把改动拆成"只搬迁"与"新增读路径"两个 commit），§12 相应风险从条件风险改为已选定风险并给出回滚点。② **Q13 = 不会（单一集群）** → **删除 `HYDRA_CLUSTER_ID` 与 `fleet.cluster` 字段**（反熵：只有一片数据面时，"清的是哪一片"没有可回答的对象），E2 的覆盖范围直接定义为"本集群"，并把"引入第二个集群"写成 §4.2.4 与 §6.4 A-1 的**重新评估触发条件**（约束被显式记录，而非遗失）；配置项 10 → 9。§11 待决策表收敛为 **Q1/Q2/Q5–Q11 共 9 项**（全部为工程内部选择或有建议值），已答项 5 项存档于 §11.1。**设计已具备进入实施计划的条件** |
 | 2026-09-17 | **v4** | **三项待决已答，据其收口设计**：① **生产必跑集群、用量走 ClickHouse、首发可用** → CH 读路径从"第二刀"提升为 **v1 必做**：新增 §4.3.3（对仓库自带活实例 ClickHouse 24.3 实测得到 6 条硬事实：**64 位整数默认被序列化成 JSON 字符串**、空集 `MAX(created_at)` 返回 `""`、`{name:String}`+`param_*` 绑定实测抗注入、主键对范围+等值谓词确实裁剪 `Granules: 1/2`、错误响应为 404+`Code: N`、INSERT 重试可产生重复行且 CH 表无 `trace_id` 无法去重）、§4.3.4（**`AppState.usage: Arc<dyn UsageQuery>` 取代 `usage_backend` 枚举**——两个后端都在 v1 后分支已无必要，且分支写错正是"假 0"的成因）、§4.3.1 双后端 SQL（CH 版实测可跑）、新增 `usage_query.rs` 与 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS`、T14a–T14c 与 C13/C13a 共 5 条新测试、`decode_error` 指标；删除 `501 usage_query_unavailable` 分支。② **尚未上线** → 旧路径 **M1 直接删除**：§8.1 重写（管理面回到单一凭证语义、§3.0 规则 1 去掉唯一豁免、删除 `Deprecation`/`Sunset`/`legacy_route_total`/`published` 兼容字段），新增 C16 断言旧路由 404。③ **allow TTL 默认 300 确认**（§4.2.5）。§11 重构为「待决策 Q1/Q2/Q5–Q11/Q13 + 新增 Q14 CH 传输选型/Q15 CH 排序键」+「§11.1 已答项」；§12 风险表相应重写；**三个端点在全部角色（含集群 edge）上可用，仍然没有任何转发** |
 | 2026-09-17 | **v3.2** | 新增 **§6.4 决策记录 A-1：E2 不转发到 leader 的 admin API**——含既有端点"能精确清除"的证据表、转发链路**技术可行**的确认、选项 A/B/C 对照、7 条否决理由（第 1 条决定性：扇出由共享失效流完成，转发不产生全集群清除；第 2 条：LB 指向 edge，转发等于清一个不承载租户流量的节点）、已接受代价与**重新评估的触发条件**；新增 **§6.5** 说明本项目的决策记录归属（无 ADR 体系 → 正文决策记录节）与 ADR 门禁的 Retro/Memory Filter 结论（未执行决策不建独立 ADR 文件）。§6.2 加交叉引用，§11 声明已决项不在待决策表内 |
 | 2026-09-17 | **v3.1** | 新增 **附录 A：现状认证缓存的结构、TTL 语义与失效流程**（结构图 / 键空间 / 请求流程图 / "**没有请求递增 TTL**"的逐路径对照 / 失效接口的双入口流程与集群扇出图 / 三条不变量 I1–I3 及其与 §4.2 的对应表）。纯事实基线补充，无设计变更 |
-| 2026-09-17 | **v3** | **需求收紧：E2 必须在「全部数据面节点」上清除，而不是只清本节点**（§4.2）。原设计把"发布到失效流"当成"已生效"，这是错的：远端节点的 **L1 命中项不会**因为发布方删了 L2 而消失（L1 命中不查 L2），而消费者的 `last_id` 只存在于局部变量里（`events.rs:291`）**从不对外发布** → `published: true` 与"已生效"无关。新增 **L3 收敛屏障**（每节点已应用水位 HASH + 发布方等待全部存活节点确认，长在既有 `InvalidationStream` 上，**不新增字段、不是转发**）、**200/202/503 三态**（取代会说谎的布尔）、**残余窗口硬上界** `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（默认 300 = 现状；今天该窗口由被停用租户的 `expires_in` 决定）、以及 `consumer_stalled_seconds` 等 7 个指标（"活着但不消费"今天完全不可见）。集群测试从 9 条扩到 17 条，新增"先 apply 后 ack""generation bump 不得假报 applied""跨集群隔离""屏障不是转发"等关键负例。配置项 6 → 9 |
+| 2026-09-17 | **v3** | **需求收紧：E2 必须在「全部数据面节点」上清除，而不是只清本节点**（§4.2）。原设计把"发布到失效流"当成"已生效"，这是错的：远端节点的 **L1 命中项不会**因为发布方删了 L2 而消失（L1 命中不查 L2），而消费者的 `last_id` 只存在于局部变量里（`events.rs:293/311`：`last_id` 在循环内声明与推进）**从不对外发布** → `published: true` 与"已生效"无关。新增 **L3 收敛屏障**（每节点已应用水位 HASH + 发布方等待全部存活节点确认，长在既有 `InvalidationStream` 上，**不新增字段、不是转发**）、**200/202/503 三态**（取代会说谎的布尔）、**残余窗口硬上界** `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（默认 300 = 现状；今天该窗口由被停用租户的 `expires_in` 决定）、以及 `consumer_stalled_seconds` 等 7 个指标（"活着但不消费"今天完全不可见）。集群测试从 9 条扩到 17 条，新增"先 apply 后 ack""generation bump 不得假报 applied""跨集群隔离""屏障不是转发"等关键负例。配置项 6 → 9 |
 | 2026-09-17 | **v2** | **需求变更：移除"通过接口自动设置绑定域名与 Auth URL"**（§2.3）。随之**删除**：域名 zone 白名单与 409 冲突处理、`auth_url` 形态/网段校验与请求期出口校验、窄写 DB 函数、`key_provider`/`reload_lock`/`snapshot_stale`、`enabled` 写闸门、管理口第二挂载点与全部 leader 转发机制、`host_mismatch` 指标、6 个环境变量。**后果**：威胁从 5 个缩到 3 个；`AppState` 增字段从 8 个缩到 2 个；端点从 5 个缩到 3 个（`whoami` 改为纯快照只读）；**不再存在任何转发路径**（§6.2）；唯一能力缺口收敛为"集群下用量端点 501"（§4.3.3）。配置项 11 → 6。运维代偿：`ops.md` 新增"租户改域名/auth_url"流程节 |
 
 ---
