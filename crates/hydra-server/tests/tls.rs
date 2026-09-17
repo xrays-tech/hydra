@@ -163,15 +163,15 @@ async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    let state = Arc::new(AppState {
-        store: store.clone(),
+    let state = AppState::for_tests(
+        store.clone(),
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     (store, state)
 }
 

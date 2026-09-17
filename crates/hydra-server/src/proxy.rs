@@ -125,6 +125,81 @@ pub struct AppState {
     pub sink: Arc<dyn UsageSink>,
     /// Proxy / failover / breaker policy.
     pub proxy: ProxyConfig,
+
+    /// Tenant API runtime configuration (the master switch). See
+    /// [`crate::tenant_api`].
+    #[cfg(feature = "proxy")]
+    pub tenant_api: crate::tenant_api::TenantApiConfig,
+
+    /// Cache-clearing fan-out and its convergence barrier (T6). `None` in a build
+    /// without `cluster-redis`, where the local clear IS the complete answer:
+    /// `HYDRA_ROLE=leader|edge` is refused at startup without that feature, so a
+    /// feature-less build cannot be a cluster. Mirrors `AdminState`'s shape.
+    #[cfg(feature = "cluster-redis")]
+    pub invalidation: Option<crate::cluster::events::InvalidationStream>,
+    /// Placeholder so single-node builds keep a uniform shape.
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    pub invalidation: Option<()>,
+
+    /// Usage read capability for `GET /usage` (T8), chosen from the configured
+    /// sink kind. `None` means "this node has no usage store it can read", which
+    /// the endpoint reports as 503 rather than answering a well-formed zero.
+    #[cfg(feature = "db")]
+    pub usage: Option<Arc<dyn crate::usage_query::UsageQuery>>,
+    /// Placeholder so non-`db` builds keep a uniform shape.
+    #[cfg(not(feature = "db"))]
+    #[allow(dead_code)]
+    pub usage: Option<()>,
+}
+
+#[cfg(feature = "proxy")]
+impl AppState {
+    /// Build shared state for tests.
+    ///
+    /// The twelve test construction sites used to spell out every field, so each
+    /// new field broke all of them. This constructor makes adding a field a change
+    /// in ONE place. Every parameter is required on purpose: the barrier tests
+    /// need `invalidation: Some(..)` and the kill-switch test needs
+    /// `enabled: false`, and a defaulted parameter would push them straight back
+    /// to struct literals.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_tests(
+        store: ConfigStore,
+        auth: Arc<HttpAuthChecker>,
+        breaker: Arc<CircuitBreaker>,
+        limiter: Arc<dyn crate::proxy::limiter::Limiter>,
+        sink: Arc<dyn UsageSink>,
+        proxy: ProxyConfig,
+        tenant_api: crate::tenant_api::TenantApiConfig,
+    ) -> Arc<Self> {
+        // "Is there a local DB?" has ONE owner -- `ConfigStore::pool()` -- rather
+        // than a second copy on `AppState` that could drift from it.
+        #[cfg(feature = "db")]
+        let usage = store.pool().map(|p| {
+            Arc::new(crate::usage_query::SqliteUsageQuery::new(p.clone()))
+                as Arc<dyn crate::usage_query::UsageQuery>
+        });
+        Arc::new(Self {
+            store,
+            auth,
+            breaker,
+            limiter,
+            admission: crate::proxy::admission::AdmissionControl::new(),
+            sink,
+            proxy,
+            tenant_api,
+            #[cfg(feature = "cluster-redis")]
+            invalidation: None,
+            #[cfg(not(feature = "cluster-redis"))]
+            invalidation: None,
+            #[cfg(feature = "db")]
+            usage,
+            #[cfg(not(feature = "db"))]
+            usage: None,
+        })
+    }
 }
 
 /// The `ProxyHttp` impl wiring the W1/W2/W3 pure functions to a terminate-mode
@@ -359,6 +434,39 @@ impl ProxyHttp for HydraProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // (0) Tenant self-service API. Intercepted BEFORE Host→tenant (an IP or
+        //     own-hostname call must not 404), before the client api-key
+        //     extraction (`Authorization: Bearer` is ALSO a client api-key
+        //     transport — a tenant token must never be forwarded to `auth_url`
+        //     or masked into a usage record), and before the `/v1/models`
+        //     catalog intercept.
+        //
+        //     The PREFIX is what is reserved, not the three literal paths:
+        //     gating on "did a route parse?" would let a near miss fall through
+        //     into precisely the pipeline this comment forbids.
+        //
+        //     The prefix test borrows (zero allocation) and the path is copied
+        //     only once a request is actually ours, so the hot path does not pay
+        //     for the control plane.
+        #[cfg(feature = "proxy")]
+        if self.state.tenant_api.enabled {
+            let is_ours = {
+                let p = session.req_header().uri.path();
+                // The bare `/tenant` counts as reserved too. Matching only
+                // `/tenant/<…>` would leave that one spelling to fall through
+                // into the pipeline — and a caller that mistypes the base URL
+                // still presents its tenant token in `Authorization`, which the
+                // pipeline would then read as a client api-key. There is no
+                // legitimate way for the reserved name to reach an upstream.
+                p == crate::tenant_api::RESERVED_PREFIX.trim_end_matches('/')
+                    || p.starts_with(crate::tenant_api::RESERVED_PREFIX)
+            };
+            if is_ours {
+                let path = session.req_header().uri.path().to_string();
+                return crate::tenant_api::dispatch(&self.state, session, ctx, &path).await;
+            }
+        }
+
         let cfg_guard = self.state.store.snapshot();
         let cfg: &ConfigData = &cfg_guard;
 

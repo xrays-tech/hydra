@@ -299,15 +299,15 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
-        sink: recording.clone(),
-        proxy: ProxyConfig::default(),
-    });
+        recording.clone(),
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/messages");
     let client = test_client();
@@ -389,15 +389,15 @@ async fn v1_chat_completions_regression_generic_scanner() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
-        sink: recording.clone(),
-        proxy: ProxyConfig::default(),
-    });
+        recording.clone(),
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -503,15 +503,15 @@ async fn v1_messages_upstream_gets_x_api_key_and_anthropic_version() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
-        sink: recording.clone(),
-        proxy: ProxyConfig::default(),
-    });
+        recording.clone(),
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let client = test_client();
     let body = r#"{"model":"claude-3-5-sonnet-test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;

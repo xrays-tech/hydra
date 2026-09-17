@@ -279,15 +279,15 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
 
-    let proxy_state = Arc::new(AppState {
-        store: store.clone(),
-        auth: auth.clone(),
-        breaker: breaker.clone(),
+    let proxy_state = AppState::for_tests(
+        store.clone(),
+        auth.clone(),
+        breaker.clone(),
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
 
     let admin_state = Arc::new(AdminState::new(
         Some(pool),

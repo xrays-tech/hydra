@@ -1,0 +1,230 @@
+//! The tenant self-service API on the **data-plane listener**.
+//!
+//! ## Why the data plane
+//!
+//! The tenant's only self-service endpoint used to live on the admin service,
+//! which binds `127.0.0.1` by default: a tenant could not reach it at all unless
+//! the operator exposed the whole management API (every provider key, every
+//! tenant row) on the same listener. The data-plane listener is the one tenants
+//! already reach, already has per-tenant TLS, and is the surface they are
+//! documented against. So the tenant API is a **reserved prefix on the data
+//! plane**, not a second listener and not a second service.
+//!
+//! ## The prefix is reserved, the three paths are not
+//!
+//! Interception keys on `path.starts_with("/tenant/")`, NOT on "one of the three
+//! known routes parsed". Matching only the three literal paths would let
+//! `/tenant/t1/api/v1/typo` — and every other near miss — fall through into the
+//! normal proxy pipeline: Host→tenant resolution, then the client api-key
+//! extraction. The tenant's own access token travels in `Authorization: Bearer`,
+//! which is ALSO a legitimate client api-key transport, so a fall-through would
+//! POST that token to the tenant's `auth_url` and mask it into a usage record.
+//! Anything under the reserved prefix is therefore answered here, and a path
+//! that is not one of the three routes gets a local `404`.
+//!
+//! ## Fail-closed vocabulary
+//!
+//! | condition | answer |
+//! |---|---|
+//! | no/invalid token | `401 unauthorized` (the two are indistinguishable on purpose) |
+//! | token valid, URL tenant id different | `403 tenant_id_mismatch` |
+//! | this node holds no config yet | `503 not_ready` |
+//! | path under the prefix, not a route | `404 not_found` |
+//!
+//! ## What this module owns
+//!
+//! Routing, the gate, and the response shape. Business logic is delegated: the
+//! cache primitives to [`crate::http::AuthCache`], cache-clearing fan-out and its
+//! convergence barrier to [`crate::cluster::events::InvalidationStream`], and
+//! usage reads to [`crate::usage_query::UsageQuery`]. The interception in
+//! `proxy::request_filter` is one call into [`dispatch`].
+
+pub mod auth;
+
+use hydra_core::tenant_api::{parse_route, Endpoint};
+use pingora_http::ResponseHeader;
+use pingora_proxy::Session;
+use tracing::debug;
+
+use crate::proxy::ctx::RequestContext;
+use crate::proxy::AppState;
+
+/// The reserved data-plane prefix. Everything under it is answered by this
+/// module and never reaches the proxy pipeline.
+pub const RESERVED_PREFIX: &str = "/tenant/";
+
+/// Minimum accepted length of a tenant access token, enforced when an operator
+/// sets one. The gate itself does not care, but a human-chosen short token on an
+/// internet-facing port is guessable, and the minimum is the cheapest thing that
+/// makes guessing impractical.
+pub const MIN_TENANT_TOKEN_LEN: usize = 16;
+
+/// Runtime configuration for the tenant API.
+///
+/// Deliberately minimal: every field here is one that changes behaviour. (A knob
+/// that is read but ignored is the "ghost switch" this repository has been
+/// bitten by — see the historical `[proxy] non_route_strategy` in `design.md`
+/// §15.1 — so parameters are added by the task that makes them take effect.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantApiConfig {
+    /// Master switch (`HYDRA_TENANT_API`, default on). When off, `request_filter`
+    /// does not intercept anything under `/tenant/` and the process behaves
+    /// exactly as it did before this API existed.
+    pub enabled: bool,
+}
+
+impl Default for TenantApiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl TenantApiConfig {
+    /// Read the switch from the environment. Only `off`/`0`/`false` disable it;
+    /// anything else (including an unset variable) leaves it on, so a typo cannot
+    /// silently remove the API.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let enabled = match std::env::var("HYDRA_TENANT_API") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false"
+            ),
+            Err(_) => true,
+        };
+        Self { enabled }
+    }
+}
+
+/// Answer a request under the reserved prefix.
+///
+/// Returns `Ok(true)`: the response has been written and Pingora must not dial an
+/// upstream. The caller (`proxy::request_filter`) only reaches this function for
+/// paths under the reserved prefix.
+pub async fn dispatch(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    path: &str,
+) -> pingora_core::Result<bool> {
+    // 1. Is it one of our routes? The reserved-prefix caller has already
+    //    guaranteed the prefix; a miss here is a local 404, never a fall-through.
+    let Some(route) = parse_route(path) else {
+        return respond_error(session, ctx, 404, "not_found", "unknown path").await;
+    };
+
+    // 2. Gate. No token and a wrong token are the same answer on purpose.
+    let Some(bearer) = bearer_token(session) else {
+        debug!(target: "hydra::tenant_api", path = %path, "no tenant token presented");
+        return respond_error(
+            session,
+            ctx,
+            401,
+            "unauthorized",
+            "invalid tenant access token",
+        )
+        .await;
+    };
+    let authenticated = match auth::authenticate(&state.store, bearer) {
+        Ok(a) => a,
+        Err(auth::AuthError::Unauthorized) => {
+            debug!(target: "hydra::tenant_api", path = %path, "tenant token rejected");
+            return respond_error(
+                session,
+                ctx,
+                401,
+                "unauthorized",
+                "invalid tenant access token",
+            )
+            .await;
+        }
+        Err(auth::AuthError::NotReady) => {
+            return respond_error(
+                session,
+                ctx,
+                503,
+                "not_ready",
+                "this node has no configuration yet",
+            )
+            .await;
+        }
+    };
+
+    // 3. The URL's tenant id is a cross-check, not an identity: the token already
+    //    said who the caller is, and a mismatch is a client-side bug worth
+    //    failing loudly (403, not 404 — the tenant id is in the caller's own base
+    //    URL, so it is not a secret).
+    if authenticated.tenant.id != route.tenant_id {
+        return respond_error(
+            session,
+            ctx,
+            403,
+            "tenant_id_mismatch",
+            "the token does not belong to the tenant in the URL",
+        )
+        .await;
+    }
+
+    // Attribute the request for logs/metrics. `ctx.selected` stays None, which is
+    // what keeps this request out of `hydra_requests_total` and out of the usage
+    // record: a tenant's own control-plane call must not be billed to it, and
+    // querying usage must not itself count as usage.
+    ctx.tenant = Some(authenticated.tenant.clone());
+
+    // 4. Route. T4 delivers the routing skeleton: no endpoint is wired yet, so
+    //    each arm answers the same local 404 the path produced before this API
+    //    existed. T5/T6/T8 replace exactly one arm each with its real handler —
+    //    which is why this task wires nothing: wiring E1 here would make T5's RED
+    //    step unable to fail for the right reason.
+    match route.endpoint {
+        Endpoint::Whoami | Endpoint::InvalidateAuthCache | Endpoint::Usage => {
+            respond_error(session, ctx, 404, "not_found", "unknown path").await
+        }
+    }
+}
+
+/// The `Authorization: Bearer …` value, if present.
+fn bearer_token(session: &Session) -> Option<&str> {
+    session
+        .req_header()
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .filter(|t| !t.is_empty())
+}
+
+/// Write the shared error envelope: `{"error":{"code","message","trace_id"}}`.
+///
+/// The same shape the admin API uses (design §13.4), so a tenant integrating
+/// against either surface parses one error model.
+async fn respond_error(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> pingora_core::Result<bool> {
+    ctx.status_code = status;
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "trace_id": ctx.trace_id }
+    })
+    .to_string();
+    let mut header = ResponseHeader::build(status, Some(3))?;
+    header.insert_header("Content-Type", "application/json")?;
+    header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+    header.insert_header("Content-Length", body.len().to_string())?;
+    // Same write pattern as `proxy::respond_catalog`: terminate the response
+    // here and never let Pingora dial an upstream.
+    session.set_keepalive(None);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(true)
+}

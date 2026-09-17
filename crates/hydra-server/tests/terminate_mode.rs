@@ -221,15 +221,15 @@ async fn build_state_with_proxy_config(
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    Arc::new(AppState {
+    AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy,
-    })
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    )
 }
 
 /// Start a Pingora proxy service on an ephemeral port, return the URL root.
@@ -597,15 +597,15 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
     );
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
-        breaker: breaker.clone(),
+        breaker.clone(),
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -715,15 +715,15 @@ async fn usage_tokens_extracted_from_response() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
-        sink: recording.clone(),
-        proxy: ProxyConfig::default(),
-    });
+        recording.clone(),
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -1086,15 +1086,15 @@ async fn rate_limit_429_even_when_routing_would_503() {
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -1317,15 +1317,15 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
     );
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
-        breaker: breaker.clone(),
+        breaker.clone(),
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -2868,15 +2868,15 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
         .unwrap(),
     );
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
-    let state = Arc::new(AppState {
+    let state = AppState::for_tests(
         store,
         auth,
-        breaker: breaker.clone(),
-        limiter: Arc::new(RateLimiter::new()),
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
+        breaker.clone(),
+        Arc::new(RateLimiter::new()),
         sink,
-        proxy: ProxyConfig::default(),
-    });
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();

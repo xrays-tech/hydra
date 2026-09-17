@@ -72,6 +72,22 @@ pub mod sink;
 #[cfg(feature = "usage-clickhouse")]
 pub mod clickhouse;
 
+/// Tenant self-service API: the reserved `/tenant/` prefix on the DATA-PLANE
+/// listener, gated by the tenant access token.
+///
+/// Gated on `proxy`: it is called from `proxy::request_filter` and holds
+/// `AppState`.
+#[cfg(feature = "proxy")]
+pub mod tenant_api;
+
+/// The usage read capability behind `GET /tenant/{id}/api/v1/usage`.
+///
+/// A separate trait rather than a method on `UsageSink` (which is a
+/// fire-and-forget write channel); the ClickHouse implementation arrives with
+/// the `usage-clickhouse` feature.
+#[cfg(feature = "db")]
+pub mod usage_query;
+
 // --- W4: Pingora proxy shell ----------------------------------------------
 /// Downstream listener topology — the single owner of "which port speaks which
 /// protocol" (design §12.1 / §15.1). The decision is a pure function of

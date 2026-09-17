@@ -268,15 +268,15 @@ async fn build_state_with_sqlite_sink(pool: sqlx::SqlitePool) -> std::sync::Arc<
     // task (no waiting for a timer). flush_secs=3600: only the size threshold
     // fires within the test window.
     let sink: std::sync::Arc<dyn UsageSink> = std::sync::Arc::new(SqliteSink::new(pool, 1, 3600));
-    std::sync::Arc::new(AppState {
+    AppState::for_tests(
         store,
         auth,
         breaker,
         limiter,
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
-        proxy: ProxyConfig::default(),
-    })
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    )
 }
 
 // ===========================================================================

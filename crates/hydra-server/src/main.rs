@@ -568,15 +568,12 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let limiter: Arc<dyn hydra_server::proxy::limiter::Limiter> = Arc::new(RateLimiter::new());
     let admission = hydra_server::proxy::admission::AdmissionControl::new();
 
-    let state = Arc::new(AppState {
-        store: store.clone(),
-        auth: auth.clone(),
-        breaker: breaker.clone(),
-        limiter: limiter.clone(),
-        admission: admission.clone(),
-        sink,
-        proxy: proxy_cfg.clone(),
-    });
+    // The sink is moved into `AppState` further down, once the invalidation
+    // stream exists (see the note there), so keep a handle for the flush hook and
+    // for the usage reader that both need it before then.
+    let sink_for_flush = sink.clone();
+    let sink_kind_for_api = sink_kind.clone();
+    let pool_for_api = pool.clone();
 
     // (2e-bis) Flush usage on SIGTERM/SIGINT.
     //
@@ -591,7 +588,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // performs the graceful connection drain, and jumping that queue would cut
     // it short. Both observe the same signal (tokio broadcasts to every
     // registered listener), so the flush runs alongside the drain.
-    spawn_sink_flush_on_shutdown(state.sink.clone());
+    spawn_sink_flush_on_shutdown(sink_for_flush);
 
     // (2f) Background tasks (spawned onto this background runtime; they live as
     //      long as the runtime, which is kept alive in `main`).
@@ -640,6 +637,41 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     } else {
         None
     };
+
+    // (2e-ter) Shared proxy state. Built HERE — after the invalidation stream —
+    // so `AppState` can hold it directly instead of every consumer reaching for a
+    // late-filled cell. The two fields below it are the reason this order exists.
+    //
+    // `usage` is chosen once, from the configured sink kind, by a LIBRARY function
+    // rather than a branch in this file: the choice is what stops a cluster node
+    // (which has a local SQLite file that the ClickHouse sink never writes to)
+    // from answering a well-formed "zero usage".
+    #[cfg(feature = "db")]
+    // The ClickHouse reader lands with T8. Until then a cluster node has no
+    // readable store, so `usage` stays `None` and the endpoint says so (503)
+    // rather than answering a well-formed zero — and E3 does not exist yet, so
+    // nothing is user-visible in the meantime.
+    let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
+        hydra_server::usage_query::select_sqlite(&sink_kind_for_api, pool_for_api.as_ref()).ok();
+
+    let state = Arc::new(AppState {
+        store: store.clone(),
+        auth: auth.clone(),
+        breaker: breaker.clone(),
+        limiter: limiter.clone(),
+        admission: admission.clone(),
+        sink,
+        proxy: proxy_cfg.clone(),
+        tenant_api: hydra_server::tenant_api::TenantApiConfig::from_env(),
+        #[cfg(feature = "cluster-redis")]
+        invalidation: invalidation_stream.clone(),
+        #[cfg(not(feature = "cluster-redis"))]
+        invalidation: None,
+        #[cfg(feature = "db")]
+        usage,
+        #[cfg(not(feature = "db"))]
+        usage: None,
+    });
     #[cfg(not(feature = "cluster-redis"))]
     let invalidation_stream: Option<()> = None;
 
