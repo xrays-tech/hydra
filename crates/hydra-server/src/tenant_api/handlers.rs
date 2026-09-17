@@ -94,36 +94,40 @@ struct InvalidateRequest {
     api_keys: Option<Vec<String>>,
 }
 
-/// Where the fleet stands, as reported to the tenant: the shared
-/// [`FleetReport`] plus how long this request actually waited for it.
+/// Where the fleet stands, as reported to the tenant: the SHARED
+/// [`FleetReport`](crate::cluster::events::FleetReport) itself.
+///
+/// It is serialized directly rather than copied into a local struct: the
+/// operator's `DELETE /api/v1/auth/cache` reports the same object, so a copy here
+/// would be a second owner of one response shape — and two shapes that must agree
+/// always eventually stop agreeing.
+#[cfg(feature = "cluster-redis")]
+type FleetView = crate::cluster::events::FleetReport;
+
+/// The same shape in a build without `cluster-redis`, which cannot be a cluster
+/// (`main` refuses `HYDRA_ROLE=leader|edge`), so the local clear IS the whole
+/// answer.
+#[cfg(not(feature = "cluster-redis"))]
 #[derive(Serialize)]
-struct FleetView {
-    /// `applied` | `pending` | `single_node` | `unavailable`.
+pub struct FleetView {
     state: &'static str,
     nodes_total: usize,
     nodes_applied: usize,
-    /// Nodes that have not confirmed. Named, so an operator can act instead of
-    /// guessing which node is behind.
     lagging: Vec<String>,
-    /// The stream event this answer is about, for correlating with the operator's
-    /// own view of the bus.
     event_id: Option<String>,
     waited_ms: u64,
 }
 
+#[cfg(not(feature = "cluster-redis"))]
 impl FleetView {
-    /// The report comes from the SHARED barrier (`cluster::events`), so this
-    /// endpoint and the operator's `DELETE /api/v1/auth/cache` cannot disagree
-    /// about what "applied" means.
-    #[cfg(feature = "cluster-redis")]
-    fn from_report(report: crate::cluster::events::FleetReport, waited_ms: u64) -> Self {
+    fn single_node() -> Self {
         Self {
-            state: report.state,
-            nodes_total: report.nodes_total,
-            nodes_applied: report.nodes_applied,
-            lagging: report.lagging,
-            event_id: report.event_id,
-            waited_ms,
+            state: "single_node",
+            nodes_total: 1,
+            nodes_applied: 1,
+            lagging: Vec::new(),
+            event_id: None,
+            waited_ms: 0,
         }
     }
 }
@@ -292,7 +296,6 @@ pub async fn invalidate(
     crate::admin::metrics::record_auth_cache_size(state.auth.cache().len());
 
     // --- 3: fan out, then CONFIRM ------------------------------------------
-    let started = std::time::Instant::now();
     let (fleet, status) =
         fan_out_and_confirm(state, &tenant_id, &keys, wait_for_fleet, budget).await;
 
@@ -301,10 +304,7 @@ pub async fn invalidate(
         checked,
         tenant_id: tenant_id.clone(),
         scope,
-        fleet: FleetView {
-            waited_ms: started.elapsed().as_millis() as u64,
-            ..fleet
-        },
+        fleet,
     };
     super::respond_json(session, ctx, status, &view).await
 }
@@ -332,7 +332,6 @@ async fn fan_out_and_confirm(
         .live_nodes
         .as_ref()
         .map_or_else(Vec::new, |f| f());
-    let started = std::time::Instant::now();
     let report = crate::cluster::events::broadcast_and_confirm(
         state.invalidation.as_ref(),
         Some(tenant_id.to_string()),
@@ -342,14 +341,18 @@ async fn fan_out_and_confirm(
     )
     .await;
     let status = report.http_status;
-    let waited_ms = started.elapsed().as_millis() as u64;
     // "Did it actually get cleared everywhere, and how long did that take" is
     // the operator's question about this endpoint, and these two are its answer.
-    crate::admin::metrics::record_tenant_api_invalidate_converge(report.state, started.elapsed());
+    // The report measures its own wait, so this histogram cannot disagree with
+    // the `waited_ms` the tenant was just told.
+    crate::admin::metrics::record_tenant_api_invalidate_converge(
+        report.state,
+        std::time::Duration::from_millis(report.waited_ms),
+    );
     if report.state == "pending" {
         crate::admin::metrics::record_tenant_api_invalidate_pending();
     }
-    (FleetView::from_report(report, waited_ms), status)
+    (report, status)
 }
 
 /// A build without `cluster-redis` cannot be a cluster: `main` refuses
@@ -363,17 +366,7 @@ async fn fan_out_and_confirm(
     _wait_for_fleet: bool,
     _budget: Option<std::time::Duration>,
 ) -> (FleetView, u16) {
-    (
-        FleetView {
-            state: "single_node",
-            nodes_total: 1,
-            nodes_applied: 1,
-            lagging: vec![],
-            event_id: None,
-            waited_ms: 0,
-        },
-        200,
-    )
+    (FleetView::single_node(), 200)
 }
 
 // ---------------------------------------------------------------------------

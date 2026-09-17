@@ -1546,16 +1546,24 @@ struct InvalidateResponse {
     tenant_id: Option<String>,
     /// `keys` | `tenant`.
     scope: &'static str,
-    /// Where the fleet stands. Replaces the `published: bool` field, which lied:
+    /// Where the fleet stands: the SHARED report the tenant API's E2 returns,
+    /// serialized directly. It replaces the `published: bool` field, which lied —
     /// it defaulted to `true` and only became `false` when a stream existed AND
     /// the publish failed, so a build with no stream claimed a broadcast that
-    /// never happened. The report comes from the barrier shared with the tenant
-    /// API's E2, so the operator's view and the tenant's view cannot disagree.
+    /// never happened. One type for both entry points, so the operator's view and
+    /// the tenant's view cannot drift apart.
     fleet: Fleet,
 }
 
-/// The same tri-state the tenant API reports, minus `http_status` (which the
-/// admin endpoint already carries as the HTTP status).
+/// Re-exported under the tenant API's name for this module's readers; the type is
+/// the barrier's own report (`http_status` is `#[serde(skip)]`, so it never
+/// appears in the body — the admin endpoint already carries the status).
+#[cfg(feature = "cluster-redis")]
+type Fleet = crate::cluster::events::FleetReport;
+
+/// Without `cluster-redis` this cannot be a cluster, so the local clear is the
+/// whole answer. Same shape, same field names as the cluster report.
+#[cfg(not(feature = "cluster-redis"))]
 #[derive(Serialize)]
 struct Fleet {
     state: &'static str,
@@ -1629,10 +1637,6 @@ pub(super) async fn auth_cache_invalidate(
     if let Some(resp) = invalidate_shape_error(req.api_keys.as_deref(), trace_id) {
         return resp;
     }
-    // Only the cluster arm measures the wait; without `cluster-redis` there is
-    // nothing to wait for.
-    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_variables))]
-    let started = std::time::Instant::now();
     let checked = req.api_keys.as_ref().map_or(0, Vec::len);
     let scope = if req.api_keys.is_none() {
         "tenant"
@@ -1686,32 +1690,25 @@ pub(super) async fn auth_cache_invalidate(
         )
         .await
     };
+    #[cfg(feature = "cluster-redis")]
+    let report_status = report.http_status;
     // Without `cluster-redis` this cannot be a cluster (`main` refuses
     // `HYDRA_ROLE=leader|edge` without the feature), so the local clear IS the
     // whole answer — the same derivation the tenant API's E2 makes.
     #[cfg(not(feature = "cluster-redis"))]
-    let fleet = Fleet {
-        state: "single_node",
-        nodes_total: 1,
-        nodes_applied: 1,
-        lagging: Vec::new(),
-        event_id: None,
-        waited_ms: 0,
-    };
-    #[cfg(feature = "cluster-redis")]
     let (fleet, status) = (
         Fleet {
-            state: report.state,
-            nodes_total: report.nodes_total,
-            nodes_applied: report.nodes_applied,
-            lagging: report.lagging,
-            event_id: report.event_id,
-            waited_ms: started.elapsed().as_millis() as u64,
+            state: "single_node",
+            nodes_total: 1,
+            nodes_applied: 1,
+            lagging: Vec::new(),
+            event_id: None,
+            waited_ms: 0,
         },
-        report.http_status,
+        200u16,
     );
-    #[cfg(not(feature = "cluster-redis"))]
-    let status = 200u16;
+    #[cfg(feature = "cluster-redis")]
+    let (fleet, status) = (report, report_status);
 
     // Refresh the cache-size gauge after mutation.
     metrics::record_auth_cache_size(state.auth.cache().len());

@@ -131,6 +131,11 @@ pub struct FleetReport {
     pub lagging: Vec<String>,
     /// The stream entry this report is about, for cross-referencing the bus.
     pub event_id: Option<String>,
+    /// How long the publish-and-confirm actually took. Measured HERE, because
+    /// this function is the whole operation — a caller measuring around the call
+    /// would include its own bookkeeping and, worse, could report a plausible
+    /// number it never spent.
+    pub waited_ms: u64,
     /// The HTTP status that goes with this outcome. Carried HERE so the two
     /// entry points cannot map the same state to different statuses.
     #[serde(skip)]
@@ -138,6 +143,13 @@ pub struct FleetReport {
 }
 
 impl FleetReport {
+    /// How long this report's wait took. One place stamps it, so no arm can
+    /// forget and no arm can invent one.
+    fn measured(mut self, started: tokio::time::Instant) -> Self {
+        self.waited_ms = started.elapsed().as_millis() as u64;
+        self
+    }
+
     /// No stream at all: this node's own clear IS the whole answer. Only
     /// reachable for the single-node `all` role — `main` refuses to start a
     /// `leader`/`edge` without a Redis backbone, so "cluster member with no
@@ -151,6 +163,7 @@ impl FleetReport {
             nodes_applied: 1,
             lagging: Vec::new(),
             event_id: None,
+            waited_ms: 0,
             http_status: 200,
         }
     }
@@ -176,6 +189,7 @@ pub async fn broadcast_and_confirm(
     // asserts that they are behind when the truth is that nobody looked.
     budget: Option<std::time::Duration>,
 ) -> FleetReport {
+    let started = tokio::time::Instant::now();
     let Some(stream) = stream else {
         return FleetReport::single_node();
     };
@@ -189,8 +203,10 @@ pub async fn broadcast_and_confirm(
                 nodes_applied: 0,
                 lagging: Vec::new(),
                 event_id: None,
+                waited_ms: 0,
                 http_status: 503,
-            };
+            }
+            .measured(started);
         }
     };
     let Some(timeout) = budget else {
@@ -200,8 +216,10 @@ pub async fn broadcast_and_confirm(
             nodes_applied: 0,
             lagging: live_nodes,
             event_id: Some(event_id),
+            waited_ms: 0,
             http_status: 202,
-        };
+        }
+        .measured(started);
     };
     match stream.await_applied(&event_id, &live_nodes, timeout).await {
         AppliedOutcome::Applied {
@@ -213,8 +231,10 @@ pub async fn broadcast_and_confirm(
             nodes_applied,
             lagging: Vec::new(),
             event_id: Some(event_id),
+            waited_ms: 0,
             http_status: 200,
-        },
+        }
+        .measured(started),
         AppliedOutcome::Pending {
             nodes_applied,
             nodes_total,
@@ -225,8 +245,10 @@ pub async fn broadcast_and_confirm(
             nodes_applied,
             lagging,
             event_id: Some(event_id),
+            waited_ms: 0,
             http_status: 202,
-        },
+        }
+        .measured(started),
         AppliedOutcome::Unavailable(e) => {
             tracing::warn!(error = %e, "convergence barrier could not run");
             FleetReport {
@@ -235,8 +257,10 @@ pub async fn broadcast_and_confirm(
                 nodes_applied: 0,
                 lagging: live_nodes,
                 event_id: Some(event_id),
+                waited_ms: 0,
                 http_status: 503,
             }
+            .measured(started)
         }
     }
 }
