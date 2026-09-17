@@ -326,6 +326,10 @@ is refreshed after mutation (§17).
 > side can still pass. Shorten `[auth] allow_ttl_secs` or call invalidate
 > proactively on tenant-side revocation (design §16.1).
 
+> 租户侧的完整对接说明（字段表、错误码、边界、排障）在
+> [`tenant-api-integration.md`](tenant-api-integration.md) —— 给租户看，不是给你看的。
+> 本节只讲运维关心的部分。
+
 ### 5.1 Tenant self-service API — **on the DATA plane** (2026-09-17)
 
 Each tenant can be given an **Access Token** (admin UI Tenants form →
