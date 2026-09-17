@@ -464,7 +464,11 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
    - 管理 token 调 `/tenant/.../whoami` → 401；
    - 租户 token 调 `/api/v1/providers` → 401；
    - **T19/令牌只在快照**：只改 store 的快照（`apply_snapshot`）不改 DB，鉴权仍按快照判定；
-   - **T22/边界**：`POST /v1/chat/completions` 仍原样透传（wiremock 收到 1 次），`/tenant/...` 不落到上游。
+   - **T22/边界**：`POST /v1/chat/completions` 仍原样透传（wiremock 收到 1 次），`/tenant/...` 不落到上游；
+   - **T8/令牌不得被当成客户端 api-key**：用租户令牌调 `/tenant/{tid}/api/v1/whoami` 时，断言 **wiremock 上的 `auth_url` 收到 0 次请求**（外部鉴权从未运行）、且响应头/日志里不出现该令牌。这条钉住的是"拦截必须早于 api-key 抽取"（设计 §3.2 理由 C）；
+   - **T9/不计费**：调用任意租户端点后断言 `usage_record` **新增 0 行**、`hydra_requests_total` **未增加**（设计 §3.2 的短路序保证 `ctx.selected` 为空）；
+   - **C14/令牌索引随快照**（需 `cluster-redis`，放集群套件）：leader 改某租户令牌 → `reload_all` → 远端节点（含 edge）用**新令牌**可鉴权、**旧令牌 401**（证明闸门读的是快照而不是 DB）；
+   - **C18/内部面不外泄**：`/api/v1/internal/*` 在数据面（8080）上**不是**内部路由——它在管理口才存在（`admin/mod.rs:582-604`），断言数据面对该前缀按普通租户路径处理（既不返回内部数据、也不出现 `cluster_token` 语义）。
 2. **Verify RED**：`cargo test -p hydra-server --features server --test tenant_api` → 失败（前缀未拦截，请求落到业务管线 → 断言不符）。
 3. **GREEN**（按此顺序）：
    a. `AppState`（`proxy.rs:108-128`）加 `invalidation: Option<InvalidationStream>`（含 `not(cluster-redis)` 的 `Option<()>` 占位，对齐 `admin/mod.rs:108-113`）与 `usage: Arc<dyn UsageQuery>`；提供 `pub fn for_tests(pool, store, auth, breaker, limiter, sink, proxy) -> Arc<AppState>`；
@@ -510,7 +514,10 @@ cargo test -p hydra-server --features server
 
 **Steps**
 1. **红灯**：追加 T1（正确 token → 200，字段齐全）、**T2 的加强版**（响应体里不得出现任何摘要/密钥：断言 body 不含 `access_token`、不含 `cert_key`）、T7（**停用租户仍 200**）、T20（`replication()==None` → 503）。
-2. **Verify RED** → 失败。
+2. **Verify RED** → 失败。补充断言：
+   - **T23/自述不自相矛盾**：响应里的 `base_url` 必须与实际可用前缀一致（用它去拼一次请求，断言得到 200，而不是 404）；
+   - **C12/edge 上 E1 可用**（集群套件）：edge 节点（`pool=None`）调 E1 → 200 且来自快照 —— 这条是"E1 不需要 DB、不需要转发"的证据；
+   - **T7 的 E1 部分**：**停用**租户调 E1 → 200（自救路径必须畅通；E2/E3 的部分在 T6/T8 各自覆盖）。
 3. **GREEN**：`handlers::whoami(state) -> Resp`，返回 `{tenant_id,name,enabled,domain,auth_url,config_version,base_url}`；`config_version` 用 `store.version()`（`store.rs:381-385`）；`base_url = format!("/tenant/{tid}/api/v1")`。
 4. **Verify GREEN**。
 5. **Commit**：`feat(server): tenant API E1 GET /whoami (snapshot-only)`
@@ -523,8 +530,8 @@ cargo test -p hydra-server --features server
 **Impact/Compat**：`DELETE /api/v1/auth/cache`（运维用）响应体由 `published: bool` 换成 `fleet` 对象；`tenant_api` 复用既有 `AuthCache`/`InvalidationStream` 原语，不新增失效机制。
 
 **Steps**
-1. **红灯**（`tests/tenant_api.rs`）：T11（精确 key → `invalidated>=1`，随后同 key 请求**必须回源**，wiremock 断言 `auth_url` 被再次调用）、T12（空 body → `scope:"tenant"`）、T13（1001 key → 400 `too_many_keys`；单个 4097 字节 → 400 `invalid_api_key`）、T21（失败限流 → 429）、**T24（单节点 → `state:"single_node"`）**。
-   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、C2（集群成员但无 Redis 后端 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）。
+1. **红灯**（`tests/tenant_api.rs`）：T11（精确 key → `invalidated>=1`，随后同 key 请求**必须回源**，wiremock 断言 `auth_url` 被再次调用）、T12（空 body → `scope:"tenant"`）、T13（1001 key → 400 `too_many_keys`；单个 4097 字节 → 400 `invalid_api_key`）、T21（失败限流 → 429）、**C3（单节点 `all` → `state:"single_node"`）**。
+   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、C2（集群成员但无 Redis 后端 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
 2. **Verify RED** → 失败（`fleet` 字段不存在 / 水位不存在）。
 3. **GREEN**：
    a. **先钉住 cfg 形状**（已实测核对）：`cluster::events` 与 `cluster::registry` 都是 `#[cfg(feature = "cluster-redis")]` 门控的（`cluster/mod.rs:23-24`、`:27-28`），因此 `InvalidationStream` 在无该特性时**根本不存在**。于是：
@@ -558,7 +565,7 @@ cargo test -p hydra-server --features server,cluster-redis
 
 **Steps**
 1. **红灯**：`tests/http_auth.rs` 加一条：wiremock 认证应答带 `expires_in=86400`，断言缓存项 TTL 被封到上限（用注入 `Clock` 的确定性写法，避免 sleep）。
-2. **Verify RED** → 失败（TTL 为 86400s）。
+2. **Verify RED** → 失败（TTL 为 86400s）。补充：**C11（`HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 端到端生效）**——同一输出下断言 `hydra_auth_allow_ttl_capped_total` 增加。
 3. **GREEN**：`AuthConfig` 加 `allow_ttl_max: Duration`（`default()` = 300s）；`AuthCache::new/with_clock` 接收并保存；`set`/`set_if_unchanged` 对 **allow** 项套 `ttl.min(allow_ttl_max)`（**deny 不受影响**）；`main.rs` 从 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 读取并接线；新增计数 `hydra_auth_allow_ttl_capped_total{tenant}`（`metrics.rs`）。
 4. **Verify GREEN** + `cargo test -p hydra-server --features server --test http_auth --test auth_cache`。
 5. **Commit**：`fix(auth): cap the allow-cache TTL so a stalled node's stale window is operator-bounded`
@@ -578,6 +585,8 @@ cargo test -p hydra-server --features server,cluster-redis
    - **T14c**：HTTP 404 + `Code: 60. DB::Exception: …` → `usage_store_unavailable`；
    - **T15/T16/T17**：SQLite 时间窗与手写 SQL 对照（含 NULL 语义与 `errors`）；`since` 传空格分隔形态 → 归一化后正确，且**对照"若不归一化会多算整天"的反例**；窗口超上限 / `since > until` → 400；
    - **T18**：`?tenant_id=other` 被忽略（契约无此参数）。
+   - **C13（集群下 E3 在 edge 上可用）**：`sink=clickhouse` 时 edge 调 E3 → **200 且 `source:"clickhouse"`**，数字与直连 CH 手跑 SQL 一致（= "集群下可用且不需要转发"的证据）；
+   - **C13a（CH 不可达不是假 0）**：把 CH 端口指错 → **503 `usage_store_unavailable`**，且 `usage_query_seconds` 有观测值；断言**不是 200 + 全 0、不是 panic**；
    - **`#[ignore]` 活 CH 用例**（形制照 `tests/clickhouse_sink.rs:172-180`）：真连本机 CH，断言与手跑 SQL 一致。
 2. **Verify RED** → 失败。
 3. **GREEN**：
@@ -626,7 +635,9 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 
 **Steps**
 1. 删除 `admin/mod.rs:616-668` 整块（租户令牌路由）；`handlers.rs` 删除 `tenant_id_for_token`；`admin-ui/api-docs.js` 移除旧条目。
-2. **Verify 旧路径确实消失**：加 C16 断言。**注意：断言必须用两种凭证分别验证，单一断言会写成错的**（本节已实测追踪过 admin 路由器的顺序）：
+2. **红灯（C16）**：先写断言再删除路由 —— 删除前它会**红**（因为删除前租户令牌返回 200，而断言要求 401）。
+
+   **Verify 旧路径确实消失**：加 C16 断言。**注意：断言必须用两种凭证分别验证，单一断言会写成错的**（本节已实测追踪过 admin 路由器的顺序）：
 
    | 凭证 | 删除**前** | 删除**后** | 说明 |
    |---|---|---|---|
@@ -686,6 +697,72 @@ rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' crates/hydra-server/src cra
 ```
 
 ---
+
+## 设计用例覆盖矩阵（44/44，可审计）
+
+> 本表是"设计 §10 的每一条用例都被某个任务的红灯覆盖"的证据。**生成方式**：从设计 §10.2/§10.3 的表格里机械抽取用例 ID，再逐个回到本计划的任务红灯段落里匹配。第一轮机械检查曾发现 **13 条未被覆盖**（`T8 T9 T23 C3 C5 C11 C12 C13 C13a C14 C16 C17 C18`），其中 **C5（远端消费者停摆 → 202+lagging）是收敛屏障最核心的负例**；已全部补入对应任务。复核命令：
+
+```bash
+python3 - <<'PY'
+import re
+plan=open('dev-docs/aegis/plans/2026-09-17-tenant-api.md',encoding='utf-8').read()
+design=open('dev-docs/design-tenant-api.md',encoding='utf-8').read()
+d_t=re.findall(r'^### 10\.2 数据面集成.*?(?=^### 10\.3)',design,re.S|re.M)[0]
+d_c=re.findall(r'^### 10\.3 集群.*?(?=^### 10\.4)',design,re.S|re.M)[0]
+ids=[x for x in re.findall(r'^\| (T\d+[a-c]?) \|',d_t,re.M)]+[x for x in re.findall(r'^\| (C\d+[a-c]?) \|',d_c,re.M)]
+parts=re.split(r'^### (T\d+) — ',plan,flags=re.M); tasks={parts[i]:parts[i+1] for i in range(1,len(parts),2)}
+miss=[cid for cid in ids if not any(re.search(r'\b'+cid+r'\b', body[m.start():m.start()+1600])
+      for body in tasks.values() for m in re.finditer(r'红灯', body))]
+print("用例总数", len(ids), "未分配", miss)
+PY
+```
+
+| 设计用例 | 覆盖任务 | 备注 |
+|---|---|---|
+| T1 | T5 | E1 正常路径 |
+| T2 | T4 | 401 且**未触碰 DB** |
+| T3 | T4 | 错令牌，文案一致 |
+| T4 | T4 | 跨租户 → 403（非 404） |
+| T5 | T4 | 管理 token 不跨平面 |
+| T6 | T4 | 租户 token 不进管理面 |
+| T7 | T5（E1）/ T6（E2）/ T8（E3） | 停用租户自救路径畅通 |
+| T8 | T4 | 令牌未被当成客户端 key（`auth_url` 收 0 次） |
+| T9 | T4 | 不计费、不进业务指标（含 E3 自指防护） |
+| T10 | T4 | `HYDRA_TENANT_API=off` 回基线 |
+| T11 | T6 | 精确 key → 强制回源 |
+| T12 | T6 | 空 body = 全租户 |
+| T13 | T6 | 上限 400 |
+| T14 | T8 | 注入实现与 sink kind 一致 |
+| T14a | T8 | **CH 引号整数（最危险）** |
+| T14b | T8 | CH 空集 → `as_of: null` |
+| T14c | T8 | CH 错误分类 |
+| T15 | T8 | 与手写 SQL 对照 |
+| T16 | T8 | 空格分隔输入归一化 + 反例 |
+| T17 | T8 | 窗口上限 |
+| T18 | T8 | `?tenant_id=` 被忽略 |
+| T19 | T4 | 令牌只在快照 |
+| T20 | T4（闸门）/ T5（E1） | `replication()==None` → 503 |
+| T21 | T6 | 失败限流 429 |
+| T22 | T4 | 前缀与业务路径边界 |
+| T23 | T5 | `base_url` 自述一致 |
+| C1 | T6 | edge E2 + 流载荷只有摘要 |
+| C2 | T6 | 集群成员无 Redis → 503 |
+| C3 | T6 | 单节点 → `single_node` |
+| C4 | T6 | 收敛 200 |
+| **C5** | **T6** | **远端消费者停摆 → 202 + lagging** |
+| C6 | T6 | 先 apply 后 ack |
+| C7 | T6 | generation bump 不得假报 applied |
+| C8 | T6 | 屏障不是转发 |
+| C9 | T6 | 死节点不阻塞收敛 |
+| C10 | T6 | 失效主干边界 |
+| C11 | T7 | allow TTL 封顶端到端 |
+| C12 | T5 | edge E1 来自快照 |
+| C13 | T8 | 集群 E3 在 edge 可用 |
+| C13a | T8 | CH 不可达 → 503 非假 0 |
+| C14 | T4 | 令牌索引随快照 |
+| C16 | T9 | 旧路径消失（双凭证断言） |
+| C17 | T6 | 重复消费幂等 |
+| C18 | T4 | 数据面不暴露内部面 |
 
 ## 兼容性与风险
 
