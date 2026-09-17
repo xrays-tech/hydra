@@ -1283,6 +1283,37 @@ Execution Route:
 
 > **留档的操作事实**：本地 `8080/8081` 已被开发实例占用，e2e 必须换端口（`HYDRA_LISTEN=127.0.0.1:18080 HYDRA_ADMIN_ADDR=127.0.0.1:18081`）；Playwright 浏览器缓存目录默认在 `~/.cache`（只读）→ 需 `PLAYWRIGHT_BROWSERS_PATH` 指到工作区内。
 
+## 指标交付核对（交付期，可重跑）
+
+第一版矩阵核的是"归属"，不是"交付"——T10 的交付核对因此查出 **9 个指标在代码里根本不存在**（`requests_total` / `auth_failures_total` / `auth_latency_seconds` / `throttled_total` / `invalidate_pending_total` / `invalidate_converge_seconds` / 三个消费者 gauge），而设计与 `ops.md` 都已在让运维按 `hydra_invalidation_consumer_stalled_seconds > 60` 告警。同一轮还查出 **3 个幽灵开关**（`HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` / `_AUTH_FAIL_LIMIT_PER_MIN` / `_LOCKOUT_SECS`：文档有、代码从不读取）。全部补齐（提交 `6023661`）。
+
+```bash
+# 指标：设计的 §9.1 表格 ↔ 代码里是否真的注册（不是"有没有任务"）
+python3 - <<'PY'
+import re, subprocess
+design = open('dev-docs/design-tenant-api.md', encoding='utf-8').read()
+sec = re.findall(r'^### 9\.1 新指标(.*?)(?=^### 9\.2)', design, re.S | re.M)[0]
+names = re.findall(r'^\| `([a-z_0-9]+)` \|', sec, re.M)
+missing = [n for n in names if not subprocess.run(
+    ['grep', '-rl', f'"{n}"', 'crates/hydra-server/src/'],
+    capture_output=True, text=True).stdout.strip()]
+print(f"{len(names)} 个声明指标，缺失：", missing or "无")
+PY
+
+# 环境变量：文档 ↔ 代码是否真的读取
+for v in HYDRA_TENANT_API HYDRA_TENANT_API_RATE_LIMIT_PER_MIN \
+         HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN HYDRA_TENANT_API_LOCKOUT_SECS \
+         HYDRA_TENANT_API_INVALIDATE_PER_MIN HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS \
+         HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS \
+         HYDRA_AUTH_ALLOW_TTL_MAX_SECS; do
+  printf '%-46s %s\n' "$v" "$(grep -rq "\"$v\"" crates/hydra-server/src/ && echo ok || echo MISSING)"
+done
+```
+
+**当前结果：12/12 指标已注册、9/9 环境变量被读取。**
+
+同样地，`hydra_tenant_api_requests_total` 的 `endpoint` 标签必须在**每一条出口**上都被设置——包括在路由解析之前就返回的 404/405。实现方式是把标签放在 `RequestContext` 上（而不是穿进四个响应写出函数，那会改掉约 20 个调用点，而"只覆盖记得改的路径"的指标比没有指标更糟）。
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）
