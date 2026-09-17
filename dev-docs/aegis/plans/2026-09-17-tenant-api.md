@@ -334,6 +334,29 @@ fn clickhouse_quoted_int64_and_plain_number_are_both_accepted() {
 }
 
 #[test]
+fn decode_json_each_row_accepts_quoted_and_plain_int64() {
+    // 活实例实测：{"requests":"8",...} —— 64 位整数默认被序列化成 JSON 字符串。
+    // 解码器若只认 number，就会静默返回 0 用量（设计 §4.3.3 CH-A，最危险的陷阱）。
+    let quoted = r#"{"requests":"8","tokens_in":"247","tokens_out":"18","cache_hit_tokens":"0","errors":"0","last_seen":"2026-09-15T07:32:06Z"}"#;
+    let plain  = r#"{"requests":8,"tokens_in":247,"tokens_out":18,"cache_hit_tokens":0,"errors":0,"last_seen":"2026-09-15T07:32:06Z"}"#;
+    for body in [quoted, plain] {
+        let agg = decode_usage_json_each_row(body).expect("decodable");
+        assert_eq!(agg.totals.requests, 8, "body={body}");
+        assert_eq!(agg.totals.tokens_in, 247, "body={body}");
+        assert_eq!(agg.as_of.as_deref(), Some("2026-09-15T07:32:06Z"));
+    }
+    // 不可解析的数字必须报错，绝不静默成 0
+    assert!(decode_usage_json_each_row(r#"{"requests":"abc"}"#).is_err());
+    assert!(decode_usage_json_each_row(r#"{"requests":-1}"#).is_err());
+    // 缺字段也必须报错（不是 0）
+    assert!(decode_usage_json_each_row(r#"{}"#).is_err());
+    // 空集：CH 返回 "" 而不是 null
+    let empty = decode_usage_json_each_row(r#"{"requests":"0","tokens_in":"0","tokens_out":"0","cache_hit_tokens":"0","errors":"0","last_seen":""}"#).expect("decodable");
+    assert_eq!(empty.totals.requests, 0);
+    assert_eq!(empty.as_of, None, "CH 的空集是 \"\" 而非 null，必须归一为 None");
+}
+
+#[test]
 fn as_of_maps_empty_string_and_null_to_none() {
     // SQLite: NULL → None；ClickHouse: MAX(created_at) 空集 → "" （实测）→ 必须也是 None
     assert_eq!(normalize_as_of(None), None);
@@ -376,6 +399,11 @@ fn route_parsing_is_exact_and_rejects_near_misses() {
    - `normalize_as_of`：`None`/空串 → `None`。
    - `parse_route`：以 `/tenant/` 严格前缀开头，取到下一个 `/` 前的 `tenant_id`（非空且不含 `/`），其余必须**精确等于** `api/v1/whoami`、`api/v1/auth/cache/invalidate`、`api/v1/usage` 三者之一。
    - DTO：`UsageTotals { requests, tokens_in, tokens_out, cache_hit_tokens, errors: u64 }` + `Default`（全 0，即 `COALESCE` 语义）、`UsageRow { key: String, totals: UsageTotals }`、`UsageAggregate { totals, rows, as_of: Option<String> }`。
+   - **`decode_usage_json_each_row(body: &str) -> Result<UsageAggregate, DecodeError>`（本次新增，是本模块的核心交付之一）**：把 CH 的 `FORMAT JSONEachRow` 响应体解码成 `UsageAggregate`。职责边界：**逐行 `serde_json` 解析 + 用 `parse_lenient_u64` 取数 + 用 `normalize_as_of` 归一 `last_seen`**；`totals` 行是最后一行（聚合查询只返回一行；`group_by` 时前 N 行是分组行、末行是总量）。任何字段缺失/类型不可解析 → **`Err(DecodeError)`，绝不 `unwrap_or(0)`**。
+
+   **为什么解码器必须在 core 而不是 `usage_query.rs`**（这是本任务被重新划定范围的原因，两个理由都成立）：
+   1. **铁律 2**：它是纯字符串/JSON 判定，零 I/O，本该在 core 直测；
+   2. **它决定"静默 0"陷阱的测试是否会在主门禁里跑**。`clickhouse.rs` 必须被 `#[cfg(feature = "usage-clickhouse")]` 门控（见 T3 的编译级缺口），而 `usage-clickhouse` **不被 `server` 隐含**。若解码器住在 `usage_query.rs`/`clickhouse.rs`，那么 T14a/T14b（引号整数、空串 `as_of`）这两条最危险的负例就**只在次级的三特性矩阵里运行**，而主门禁 `cargo test -p hydra-server --features server` 看不见它们。放进 core 之后，它们在 `cargo test -p hydra-core`（无任何特性、CI 第一个 job）里**总是**运行。
 
 4. **Verify GREEN**：`cargo test -p hydra-core --test tenant_api` → 全绿；`cargo test -p hydra-core` → 15 套件全绿（无回归）。
 
@@ -631,10 +659,9 @@ cargo test -p hydra-server --features server,cluster-redis
 **Impact/Compat**：纯新增读面；`UsageSink` trait **不改**（它的语义是 fire-and-forget 写入）。
 
 **Steps**
-1. **红灯**（`tests/usage_query.rs`，纯函数部分确定性、不需要真 CH）：
+1. **红灯**（`tests/usage_query.rs`）。**注意职责边界**：JSONEachRow 的**解码**已在 T1 交付并在 `hydra-core` 单测里覆盖（T14a/T14b 的核心断言在那里，因此总在 CI 第一个 job 运行）；本任务的红灯只覆盖**传输与接线**：
    - **T14**：断言注入的实现与 `sink_kind` 一致（`sqlite`→`SqliteUsageQuery`、`clickhouse`→`ClickHouseUsageQuery`）；
-   - **T14a（最危险）**：喂 `{"requests":"8"}` 与 `{"requests":8}` **都必须解出 8**；喂 `{"requests":"abc"}` **必须 `decode_error` 而不是 0**；
-   - **T14b**：`{"requests":"0","last_seen":""}` → `as_of: null`（**不是空串**）；
+   - **T14a/T14b（端到端复验）**：用**假 CH 传输**（一个返回固定 `JSONEachRow` 字节的替身——它是**真实外部边界**，符合铁律 2 允许的 wiremock/进程级替身范畴）喂 `{"requests":"8"}` → 端点返回 8；喂 `{"requests":"abc"}` → **拒绝**（`decode_error`，**不是 0**）；喂 `last_seen:""` → `as_of: null`。纯函数层的等价断言在 T1，这里验的是"解码器确实被接上了"；
    - **T14c**：HTTP 404 + `Code: 60. DB::Exception: …` → `usage_store_unavailable`；
    - **T15/T16/T17**：SQLite 时间窗与手写 SQL 对照（含 NULL 语义与 `errors`）；`since` 传空格分隔形态 → 归一化后正确，且**对照"若不归一化会多算整天"的反例**；窗口超上限 / `since > until` → 400；
    - **T18**：`?tenant_id=other` 被忽略（契约无此参数）。
