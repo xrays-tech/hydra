@@ -1197,6 +1197,38 @@ Execution Route:
 
 ---
 
+## Batch A 自审记录（T1 / T2 / T3，2026-09-17）
+
+### 状态
+
+| 任务 | 提交 | 门禁 | TDD 证据 |
+|---|---|---|---|
+| **T1** `hydra-core` 纯函数 | `c312880` | fmt / clippy / core 16 target / 防火墙 全绿 | **真红**：骨架版（每个函数编码一个真实缺陷类）跑出 `5 passed; 12 failed`，失败均为**断言**失败（`parse_route` 把 `t1/api/v1/whoami` 当 tenant_id、解码器对空 body 回 `Ok(全 0)`、宽松整数拒绝 `"12345"`）；换真实现后 `17 passed` |
+| **T2** `ConfigData.tenants_by_id` | `af7b88a` | fmt / 两种特性 clippy / core 16 / 三特性 **30 target** 全绿 | **真红**：字段先留空 → `left: 0, right: 1`（`tenants_by_id` 必须与 `tenants_by_domain` **同源**，断言的是"同源"而非"非空"）；GREEN 后 11 passed |
+| **T3** CH 传输下沉（只搬迁） | `7cce5ba` | fmt / 两种特性 clippy / 三特性 30 target 全绿 | 重构类：以既有测试为回归网。**零行为差异**已证：`clickhouse_sink` 与钉住的基线**逐字一致**（3 passed / 1 ignored）；活 ClickHouse 行数 **10 → 12**；无 `usage-clickhouse` 时仍能编译 |
+
+### 漂移检查
+
+| 项 | 结论 |
+|---|---|
+| 是否仍在原任务意图内 | ✅ 三个提交各自只做一件事（纯函数 / 派生索引 / 搬迁） |
+| 是否仍在兼容边界内 | ✅ 数据面路径未动（`proxy.rs` 尚未修改）；`ConfigData` 新字段不上 wire（有测试钉住） |
+| 是否出现新 owner / fallback / adapter / 分支 | ✅ 无。T3 反而**删掉**了两个本可留下的读路径辅助函数（无人调用 → `-D warnings` 拒绝死代码），把它们留给 T8 |
+| 退役轨道是否仍明确 | ✅ T9 的退役清单未变（`tenant_cache.rs` 的 3 留 5 迁、旧路由、`tenant_id_for_token`） |
+| 证据是否支撑下一步声明 | ✅ 每一提交都有可复跑的门禁输出 |
+
+### 执行期对计划的修正（3 处，均已在提交信息里记录）
+
+| # | 计划所写 | 实际 | 处理 |
+|---|---|---|---|
+| 1 | "内联测试必须与实现一起搬进 `clickhouse.rs`，否则 `sink.rs` 在 `usage-clickhouse` 下编译不过" | **不成立**：那些测试引用的是 `ClickHouseConfig`（搬走）与 `insert_batch_clickhouse_http`（留下并改为委托），加一行 `use` 即可编译 | **偏离计划**：测试**留在原处**，继续断言它们本来要断言的 **sink 级**行为；`clickhouse.rs` 另加原语级测试（含从真实 socket 读回请求行、证明 SQL 与每个 `param_*` 都被百分号编码）。覆盖面上升，且没有测试离开 `--lib` |
+| 2 | `reindex_tenants` 写成 `pub(crate) fn reindex_tenants(cfg: &mut ConfigData)` | 实现为 **`ConfigData` 的方法**（在 core 里） | **更优**：纯逻辑归 core，自动受 core 覆盖率门槛约束，且"唯一写入口"由类型自身承载 |
+| 3 | 预期 `ConfigData` 穷举字面量改动 2 处 | **恰好 2 处**（`store.rs:178`、`hydra-core/tests/validate.rs:275`），无第三处 | ✅ 预测准确。**但第 2 处差点漏掉**：`cargo check -p hydra-server --all-targets` **不会**编译 `hydra-core` 的测试目标，只在**工作区级** clippy 下才暴露 → 已作为操作教训记录：改 `hydra-core` 的公开结构体后必须跑工作区级门禁 |
+
+### TDD 抓到的真缺陷（1 处）
+
+T1 的测试在"真实现"下仍有 **1 条失败**，而它是**实现的真缺陷**：`last_seen` **缺失**时我把它当成了"无记录"。聚合 SQL 永远投影该列（`MAX(created_at) AS last_seen`），所以"缺失"意味着响应形状漂移、不是空结果集。区分「存在但为空」（合法空集）与「缺失」（形状漂移）正是设计禁止"静默成 0"的那条原则。已修实现而非改测试。
+
 ## 门禁记录：计划阶段（2026-09-17）
 
 ### 判定
