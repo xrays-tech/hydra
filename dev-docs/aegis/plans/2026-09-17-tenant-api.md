@@ -1218,6 +1218,18 @@ Execution Route:
 | 已声明的边界 | 限流窗口是**每进程**的，N 节点舰队允许 N 倍速率；它仍然约束了每个节点的发布速率（驱动 generation bump 的那个量），共享窗口是明确的后续项 |
 | 门禁 | fmt clean；两种 clippy 组合 clean；三特性 **32 target 全绿、0 失败**；core 16；数据面新套件 19 条；集群新套件 7 条（**真实 Redis**，helper 在未设 `HYDRA_TEST_REDIS_URL` 时 panic，因此永不静默跳过） |
 
+### T7 — allow TTL 硬上界 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（本提交）
+
+| 项 | 结果 |
+|---|---|
+| 交付 | `AuthCache.allow_ttl_max` + builder `with_allow_ttl_max`（**不加构造参数**：默认 = `allow_ttl`，56 个调用点全部照旧编译）+ `allow_ttl_max()`/`capped_allows()`；上限在 `set` 里应用（**唯一写入口**，`set_if_unchanged` 委托它 ⇒ 两条路径不可能漂移）；`AuthConfig.allow_ttl_max`（默认 300s）+ `DEFAULT_ALLOW_TTL_MAX_SECS`；`main.rs` 单点构造 + `allow_ttl_max_from_env()`；指标 `hydra_auth_allow_ttl_capped_total{tenant}` |
+| **TDD 证据（严格断言级 RED）** | 先放"能编译但错误"的骨架（存下 cap 但无人读、计数器恒 0、指标恒 0.0）⇒ **2 passed / 3 failed，全部是断言失败**（非编译失败）。两条通过的是**负向对照**（deny 不被封顶、默认 cap 不改变正常 allow），它们本来就该通过 |
+| **L2 是这条上界的真正战场** | 设计写的是"L1/**L2** 的 allow 项上限"，而 `--lib` 单测够不到 L2。补一条真 Redis 测试 `a_capped_allow_has_a_capped_l2_ttl`，并用**注入缺陷**验证其判别力：把 `set` 改成"L1 用 clamp 后的 ttl、L2 收原始 ttl"（只封一半）⇒ 该测试**失败并打印 `got 86400s`**，而 L1 侧 5 条**全绿**。即：**若只有 L1 测试，"cap 只在单节点成立、集群里 L2 会把长 TTL 喂回来"这个缺陷会整个漏过** |
+| 测试里抓到的一处**假隔离** | `a_capped_write_is_counted` 原断言 `allow_ttl_capped_total("t1") == 1.0`：单跑通过、**在模块内失败**。原因是 prometheus 计数器是**进程全局且单调**的，同模块其它测试也在为 `t1` 记账。已改为唯一 tenant + **增量断言**（`after - before`）。这不是计数器坏了，是我的断言假设了不存在的隔离 |
+| 为什么**不**在 L2 回填路径上也 clamp | 回填的 TTL 来自 Redis 的 `PTTL`，而**写入 L2 的就是 clamp 后的值**（`PX(ttl)`，已由上面那条测试钉住）。在回填处再 clamp 只会让 L1 条目过期后立刻从 L2 重新填回，**不改变实际生效窗口**，却制造"已经过期了"的错觉。真正的上界由"写入时封顶"保证：`stalled` 节点的 L1 与从 L2 回填的 L1 都不超过 cap |
+| 已声明边界 | 调低该开关**不会**追溯缩短已写入 Redis 的长 TTL 项（TTL 变更的固有语义）；要立刻生效用 E2 失效。`expires_in` 更长的租户会产生更多 `auth_url` 回源（§4.2.5 已写的取舍） |
+| 门禁 | fmt clean；`clippy -D warnings` **两种**特性组合 clean；core 16 target 全绿；`--features server` **31 target 全绿**；三特性矩阵 **33 target 全绿、0 失败** |
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）

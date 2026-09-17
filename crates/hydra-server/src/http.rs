@@ -66,6 +66,16 @@ pub struct AuthCache {
     epoch: std::sync::atomic::AtomicU64,
     allow_ttl: Duration,
     deny_ttl: Duration,
+    /// Ceiling on the *allow* TTL (design §4.2.5, T7). The tenant's auth
+    /// response may carry `expires_in`, and `parse_expires_in` accepts any
+    /// `u64` with no ceiling — so without this, the residual window in which a
+    /// revoked key keeps working on a node that missed the invalidation was
+    /// chosen by the TENANT being revoked. Now it is chosen by the operator.
+    /// Denies are never capped (their TTL is already short by design).
+    allow_ttl_max: Duration,
+    /// Number of allow writes whose requested TTL was clamped, for the
+    /// per-tenant metric and for tests.
+    capped: std::sync::atomic::AtomicU64,
     now: Clock,
     /// Optional Redis L2 (cluster P4): consulted on L1 miss before the
     /// upstream `auth_url`. `None` in single-node mode.
@@ -92,9 +102,35 @@ impl AuthCache {
             epoch: std::sync::atomic::AtomicU64::new(0),
             allow_ttl,
             deny_ttl,
+            allow_ttl_max: allow_ttl,
+            capped: std::sync::atomic::AtomicU64::new(0),
             now,
             l2: None,
         }
+    }
+
+    /// Bound allow entries at `max` (design §4.2.5, T7). Builder rather than a
+    /// new required constructor argument: the default is derived from
+    /// `allow_ttl`, so every existing construction site keeps compiling and
+    /// keeps its current behaviour.
+    #[must_use]
+    pub fn with_allow_ttl_max(mut self, max: Duration) -> Self {
+        self.allow_ttl_max = max;
+        self
+    }
+
+    /// The effective allow-TTL ceiling.
+    #[must_use]
+    pub fn allow_ttl_max(&self) -> Duration {
+        self.allow_ttl_max
+    }
+
+    /// Allow writes whose requested TTL exceeded the cap. A non-zero value
+    /// means a tenant is asking for long TTLs and the operator should consider
+    /// whether the knob is set where they want it.
+    #[must_use]
+    pub fn capped_allows(&self) -> u64 {
+        self.capped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach the Redis L2 backend (cluster P4). L1 stays the hot path; the
@@ -225,6 +261,21 @@ impl AuthCache {
     /// Store a fresh decision: `expires_at = now + ttl`. Overwrites any prior
     /// entry for the same `(tenant_id, api_key)`.
     pub async fn set(&self, tenant_id: &str, api_key: &str, allowed: bool, ttl: Duration) {
+        // T7 (design §4.2.5): clamp ALLOW TTLs to the operator's ceiling. This
+        // is the single write entry point — `set_if_unchanged` delegates here —
+        // so the production path and the direct path cannot drift apart. The
+        // Redis L2 is written with the CLAMPED ttl (below), otherwise a node
+        // could pick up the uncapped TTL from L2 and the cap would be per-node.
+        let (ttl, capped) = if allowed && ttl > self.allow_ttl_max {
+            (self.allow_ttl_max, true)
+        } else {
+            (ttl, false)
+        };
+        if capped {
+            self.capped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::admin::metrics::record_allow_ttl_capped(tenant_id);
+        }
         let hash = sha256_hex(api_key.as_bytes());
         let expires_at = (self.now)() + ttl;
         self.map.insert(
@@ -397,6 +448,11 @@ pub enum FailMode {
     Open,
 }
 
+/// Default ceiling on an allow TTL, in seconds (design §4.2.5). Equal to the
+/// default `allow_ttl`, so an unconfigured deployment is byte-for-byte
+/// unchanged; the knob only *lowers* the ceiling a tenant can raise.
+pub const DEFAULT_ALLOW_TTL_MAX_SECS: u64 = 300;
+
 /// Auth subsystem configuration (design §15.1 `[auth]`).
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
@@ -405,6 +461,9 @@ pub struct AuthConfig {
     /// Cache TTL for a *deny* decision (default 30 s — short, so a tenant-side
     /// unblock recovers quickly).
     pub deny_ttl: Duration,
+    /// Ceiling on an *allow* TTL, including one raised by the tenant auth
+    /// service's `expires_in` (design §4.2.5, T7; default 300 s).
+    pub allow_ttl_max: Duration,
     /// Per-call timeout for the `auth_url` round-trip (default 2000 ms).
     pub timeout: Duration,
     /// Fail-mode when the upstream is unavailable (default `Closed`).
@@ -416,6 +475,7 @@ impl Default for AuthConfig {
         Self {
             allow_ttl: Duration::from_secs(300),
             deny_ttl: Duration::from_secs(30),
+            allow_ttl_max: Duration::from_secs(DEFAULT_ALLOW_TTL_MAX_SECS),
             timeout: Duration::from_millis(2000),
             fail_mode: FailMode::Closed,
         }
@@ -942,6 +1002,143 @@ fn generate_trace_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("hydra-{nanos:x}")
+}
+
+#[cfg(test)]
+mod ttl_cap_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A clock the test drives, so "how long is this entry cached" is asserted
+    /// directly instead of by sleeping.
+    fn manual_clock() -> (Clock, Arc<AtomicU64>) {
+        let base = std::time::Instant::now();
+        let offset_ms = Arc::new(AtomicU64::new(0));
+        let o = offset_ms.clone();
+        let clock: Clock = Arc::new(move || base + Duration::from_millis(o.load(Ordering::SeqCst)));
+        (clock, offset_ms)
+    }
+
+    /// THE point of the cap: a tenant's auth service may return
+    /// `expires_in: 86400` — measured against the code, `parse_expires_in`
+    /// accepts any u64 with no ceiling — and the entry used to be cached for
+    /// exactly that long. So "how long can a banned key keep working on a node
+    /// that missed the invalidation?" was decided by the tenant being banned.
+    ///
+    /// With a cap, the residual window is bounded by something the OPERATOR
+    /// chose.
+    #[tokio::test]
+    async fn an_allow_ttl_is_capped_at_the_configured_maximum() {
+        let (clock, offset) = manual_clock();
+        let cache = AuthCache::with_clock(Duration::from_secs(300), Duration::from_secs(30), clock)
+            .with_allow_ttl_max(Duration::from_secs(300));
+
+        // The tenant asks for a day.
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(86_400))
+            .await;
+
+        // 300s later it must be GONE, not still cached for another 23h45m.
+        offset.store(301_000, Ordering::SeqCst);
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            Verdict::Miss,
+            "an allow entry must not outlive the cap"
+        );
+    }
+
+    /// A DENY is not capped: its TTL is already short by design, and lengthening
+    /// the window in which a tenant-side unblock is invisible would be the wrong
+    /// direction.
+    #[tokio::test]
+    async fn a_deny_ttl_is_not_capped() {
+        let (clock, offset) = manual_clock();
+        let cache = AuthCache::with_clock(Duration::from_secs(300), Duration::from_secs(30), clock)
+            .with_allow_ttl_max(Duration::from_secs(1));
+
+        cache
+            .set("t1", "sk-d", false, Duration::from_secs(30))
+            .await;
+        offset.store(5_000, Ordering::SeqCst);
+        assert_eq!(
+            cache.check("t1", "sk-d").await,
+            Verdict::Hit(false),
+            "a deny must still be cached for its own TTL"
+        );
+    }
+
+    /// The default cap equals the default allow TTL, so a deployment that never
+    /// sets the knob sees EXACTLY the behaviour it had before.
+    #[tokio::test]
+    async fn the_default_cap_changes_nothing_for_a_normal_allow() {
+        let (clock, offset) = manual_clock();
+        let cache = AuthCache::with_clock(Duration::from_secs(300), Duration::from_secs(30), clock);
+        cache
+            .set("t1", "sk-a", true, Duration::from_secs(300))
+            .await;
+
+        offset.store(299_000, Ordering::SeqCst);
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            Verdict::Hit(true),
+            "an entry inside its TTL must still be a hit"
+        );
+    }
+
+    /// `set_if_unchanged` is the path a real verdict takes, so the cap must apply
+    /// there too — capping only `set` would leave the production path uncapped.
+    #[tokio::test]
+    async fn the_cap_applies_on_the_set_if_unchanged_path() {
+        let (clock, offset) = manual_clock();
+        let cache = AuthCache::with_clock(Duration::from_secs(300), Duration::from_secs(30), clock)
+            .with_allow_ttl_max(Duration::from_secs(300));
+        let epoch = cache.epoch();
+
+        cache
+            .set_if_unchanged(epoch, "t1", "sk-a", true, Duration::from_secs(86_400))
+            .await;
+
+        offset.store(301_000, Ordering::SeqCst);
+        assert_eq!(
+            cache.check("t1", "sk-a").await,
+            Verdict::Miss,
+            "the production write path must be capped as well"
+        );
+    }
+
+    /// A capped write is counted, so an operator can see WHICH tenants are
+    /// asking for long TTLs when deciding whether to raise the knob.
+    ///
+    /// The prometheus counter is process-global and monotonic, so this test
+    /// uses a tenant name no other test touches and asserts a DELTA: an
+    /// absolute `== 1.0` here would pass in isolation and fail in the module
+    /// (the other tests also write `t1` allows), which is a broken test rather
+    /// than a broken counter.
+    #[tokio::test]
+    async fn a_capped_write_is_counted() {
+        const T: &str = "ttl-cap-metric-tenant";
+        let (clock, _) = manual_clock();
+        let before = crate::admin::metrics::allow_ttl_capped_total(T);
+        let cache = AuthCache::with_clock(Duration::from_secs(300), Duration::from_secs(30), clock)
+            .with_allow_ttl_max(Duration::from_secs(300));
+        cache
+            .set(T, "sk-a", true, Duration::from_secs(86_400))
+            .await;
+        // Inside the cap: counted on the cache, NOT on the metric.
+        cache.set(T, "sk-b", true, Duration::from_secs(10)).await;
+        cache
+            .set(T, "sk-c", false, Duration::from_secs(86_400))
+            .await;
+
+        assert_eq!(cache.capped_allows(), 1, "only one write exceeded the cap");
+        assert_eq!(
+            crate::admin::metrics::allow_ttl_capped_total(T) - before,
+            1.0,
+            "the metric is per tenant, so it can be attributed"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -204,6 +204,42 @@ mod tests {
         );
     }
 
+    /// T7 (design §4.2.5) — the allow-TTL cap must reach the **L2**, or the
+    /// residual window is not bounded at all in a cluster.
+    ///
+    /// The design puts the cap on "L1/L2 allow entries", and the L2 is the
+    /// authority for a node whose own L1 expired: `check` re-hydrates an L1
+    /// miss from the L2 (see `clear_all_clears_the_l2_of_every_tenant` below).
+    /// So if `set` clamped the L1 but pushed the tenant's raw `expires_in` into
+    /// Redis, a stalled node would keep re-filling an ALLOW from the L2 long
+    /// past the cap — the cap would look enforced while the window stayed open.
+    #[tokio::test]
+    async fn a_capped_allow_has_a_capped_l2_ttl() {
+        let l2 = std::sync::Arc::new(l2().await);
+        let cache = crate::http::AuthCache::new(Duration::from_secs(300), Duration::from_secs(30))
+            .with_allow_ttl_max(Duration::from_secs(60))
+            .with_l2(l2.clone());
+
+        // The tenant asks for a day.
+        cache
+            .set("t7-cap", "sk-long", true, Duration::from_secs(86_400))
+            .await;
+
+        let (allowed, ttl) = l2
+            // The one shared digest form (`hydra_core::auth::sha256_hex_string`),
+            // which is what `hex_digest` delegates to.
+            .get("t7-cap", &hydra_core::auth::sha256_hex_string(b"sk-long"))
+            .await
+            .expect("l2 get")
+            .expect("the verdict must have been written to the L2");
+        assert!(allowed, "an allow verdict was written");
+        assert!(
+            ttl <= Duration::from_secs(60),
+            "the L2 must carry the CAPPED ttl, got {ttl:?} — an uncapped L2 entry \
+             keeps a stalled node's stale allow alive past the cap"
+        );
+    }
+
     /// REVIEW B2 — the whole-cache clear (cluster generation bump) must clear
     /// the L2 as well, for EVERY tenant.
     ///

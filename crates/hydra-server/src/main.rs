@@ -48,6 +48,7 @@ use hydra_server::sink::build_sink;
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
+use std::time::Duration;
 use tracing::{error, info};
 
 const DEFAULT_DB_URL: &str = "sqlite:hydra.db?mode=rwc";
@@ -132,6 +133,28 @@ fn non_route_strategy_from_env() -> Result<hydra_server::proxy::config::NonRoute
                 "HYDRA_NON_ROUTE_STRATEGY={other:?} is not a known strategy (expected \"passthrough\" or \"reject\")"
             )),
         },
+    }
+}
+
+/// `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` (T7, design §4.2.5): the ceiling on an
+/// ALLOW auth-cache TTL, including one the tenant auth service asked for via
+/// `expires_in`. Default 300 s = the default `allow_ttl`, so an unconfigured
+/// deployment is unchanged; the knob only *lowers* what a tenant can ask for.
+///
+/// Deliberately fails startup on a bad value, for the same reason as
+/// `HYDRA_NON_ROUTE_STRATEGY` above: an operator who typed `60` and silently
+/// got 300 would believe a safety bound was in force when it was not.
+fn allow_ttl_max_from_env() -> Result<Duration, String> {
+    let Ok(raw) = std::env::var("HYDRA_AUTH_ALLOW_TTL_MAX_SECS") else {
+        return Ok(Duration::from_secs(
+            hydra_server::http::DEFAULT_ALLOW_TTL_MAX_SECS,
+        ));
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "HYDRA_AUTH_ALLOW_TTL_MAX_SECS={raw:?} is not a positive integer number of seconds"
+        )),
     }
 }
 
@@ -434,10 +457,15 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
     // (2c) Auth checker (with the Redis L2 in cluster mode: L1 misses are
     // served verdicts the cluster already resolved).
-    let auth_cache_base = AuthCache::new(
-        AuthConfig::default().allow_ttl,
-        AuthConfig::default().deny_ttl,
-    );
+    // T7: the ceiling is read HERE (the single construction site) and applied
+    // to BOTH the cache and the config it is handed, so the value cannot reach
+    // one and miss the other.
+    let auth_config = AuthConfig {
+        allow_ttl_max: allow_ttl_max_from_env().map_err(Box::<dyn std::error::Error>::from)?,
+        ..AuthConfig::default()
+    };
+    let auth_cache_base = AuthCache::new(auth_config.allow_ttl, auth_config.deny_ttl)
+        .with_allow_ttl_max(auth_config.allow_ttl_max);
     #[cfg(feature = "cluster-redis")]
     let auth_cache = match &redis_backend {
         Some(b) => auth_cache_base.with_l2(Arc::new(
@@ -447,7 +475,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     };
     #[cfg(not(feature = "cluster-redis"))]
     let auth_cache = auth_cache_base;
-    let auth_config = AuthConfig::default();
     let auth = Arc::new(HttpAuthChecker::new(auth_cache, auth_config)?);
     info!("auth checker initialised");
 

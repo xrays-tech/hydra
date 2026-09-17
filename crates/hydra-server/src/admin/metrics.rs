@@ -17,6 +17,7 @@
 //! | `hydra_tokens_total` | counter | tenant, provider, model, kind | proxy `logging` |
 //! | `hydra_auth_decisions_total` | counter | tenant, verdict, source | proxy `request_filter` |
 //! | `hydra_auth_upstream_error_total` | counter | tenant | proxy `request_filter` |
+//! | `hydra_auth_allow_ttl_capped_total` | counter | tenant | `http::AuthCache::set` |
 //! | `hydra_auth_cache_size` | gauge | — | proxy `request_filter` |
 //! | `hydra_breaker_dead` | gauge | provider | breaker transitions |
 //! | `hydra_breaker_state_transitions_total` | counter | provider, to | breaker `on_failure`/`on_success` |
@@ -71,6 +72,8 @@ struct Metrics {
     tokens: IntCounterVec,
     auth_decisions: IntCounterVec,
     auth_upstream_error: IntCounterVec,
+    /// Allow writes whose TTL was clamped to `allow_ttl_max` (T7).
+    allow_ttl_capped: IntCounterVec,
     catalog_requests: IntCounterVec,
     auth_cache_size: IntGauge,
     breaker_dead: IntGaugeVec,
@@ -191,6 +194,12 @@ fn metrics() -> Option<&'static Metrics> {
             auth_upstream_error: register_int_counter_vec!(
                 "hydra_auth_upstream_error_total",
                 "Auth upstream failures",
+                &["tenant"]
+            )
+            .ok()?,
+            allow_ttl_capped: register_int_counter_vec!(
+                "hydra_auth_allow_ttl_capped_total",
+                "Allow verdicts whose TTL was clamped to the configured maximum",
                 &["tenant"]
             )
             .ok()?,
@@ -433,6 +442,25 @@ pub fn record_catalog(tenant: &str) {
 pub fn record_auth_cache_size(n: usize) {
     if let Some(m) = metrics() {
         m.auth_cache_size.set(n as i64);
+    }
+}
+
+/// Record an allow verdict whose TTL was clamped to `allow_ttl_max` (T7).
+/// Attributing this per tenant is the point: it tells an operator WHICH tenant
+/// is asking for long TTLs when they are deciding whether to raise the knob.
+pub fn record_allow_ttl_capped(tenant: &str) {
+    if let Some(m) = metrics() {
+        m.allow_ttl_capped.with_label_values(&[tenant]).inc();
+    }
+}
+
+/// Current value of the allow-TTL-capped counter for a tenant (0.0 when
+/// metrics are unregistered, which mirrors a metric that was never recorded).
+#[must_use]
+pub fn allow_ttl_capped_total(tenant: &str) -> f64 {
+    match metrics() {
+        Some(m) => m.allow_ttl_capped.with_label_values(&[tenant]).get() as f64,
+        None => 0.0,
     }
 }
 

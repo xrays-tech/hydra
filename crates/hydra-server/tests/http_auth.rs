@@ -34,6 +34,10 @@ fn config(fail_mode: FailMode, timeout: Duration) -> AuthConfig {
     AuthConfig {
         allow_ttl: ALLOW_TTL,
         deny_ttl: DENY_TTL,
+        // T7: this suite predates the allow-TTL ceiling and its fixtures assert
+        // the pre-T7 TTLs verbatim, so the cap is pinned to the fixture's own
+        // allow TTL — the cap has its own tests (`http::ttl_cap_tests`).
+        allow_ttl_max: ALLOW_TTL,
         timeout,
         fail_mode,
     }
