@@ -268,6 +268,7 @@ Execution Readiness View:
 | `dev-docs/design.md` | §13.2 拆分、§11.7 指向新路径、§9.3 补 CH 读 |
 | `dev-docs/ops.md` | §5.1 改路径；新增"租户 API 开通/关闭"、"租户改域名/auth_url 流程"、"CH 用量查询运维"三节 |
 | `admin-ui/app.js`、`admin-ui/api-docs.js` | 租户页展示 base URL 与令牌状态；API 文档拆分 |
+| `crates/hydra-server/tests/tenant_cache.rs` | **部分删除（P0-2）**：删掉 5 个打旧路由的测试，保留 3 个测管理 API 令牌生命周期的测试 —— 详见 T9 步骤 0 |
 | `dev-docs/aegis/INDEX.md` | 登记本计划（`kind=plan`） |
 
 ---
@@ -513,6 +514,7 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
 ### T4 — `tenant_api` 骨架 + 数据面前缀拦截 + 令牌闸门
 
 **Files**：`crates/hydra-server/src/tenant_api/{mod,auth,time_bound}.rs`（新建）、`crates/hydra-server/src/proxy.rs`、`crates/hydra-server/src/main.rs`、12 处测试构造点
+**本任务不交付任何端点**（P0-1）：只交付"闸门 + 路由骨架"，三个端点一律 `404 unknown path`。
 **Why**：R1+R2 的落地：专用入口、数据面可达、只认租户令牌。令牌闸门读快照是"edge 也能鉴权 / 零转发"的前提。
 **Change Necessity**：拦截必须进 `request_filter` 第 0 步（设计 §3.2 的 A/B/C/D 四条理由，C 条最硬：晚于 api-key 抽取会把租户令牌送去 `auth_url`）。
 **Impact/Compat**：`AppState` 加 2 字段 → **打断 12 处测试构造点**（`grep -rn "AppState {" crates/` 共 14 处 = 1 结构体定义 + 1 生产构造 + 12 测试），必须同批提供 `for_tests()` 并迁移这 12 处；`main.rs:571` 的生产构造另行后移。
@@ -529,6 +531,7 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
    - **T8/令牌不得被当成客户端 api-key**：用租户令牌调 `/tenant/{tid}/api/v1/whoami` 时，断言 **wiremock 上的 `auth_url` 收到 0 次请求**（外部鉴权从未运行）、且响应头/日志里不出现该令牌。这条钉住的是"拦截必须早于 api-key 抽取"（设计 §3.2 理由 C）；
    - **T9/不计费**：调用任意租户端点后断言 `usage_record` **新增 0 行**、`hydra_requests_total` **未增加**（设计 §3.2 的短路序保证 `ctx.selected` 为空）；
    - **C14/令牌索引随快照**（需 `cluster-redis`，放集群套件）：leader 改某租户令牌 → `reload_all` → 远端节点（含 edge）用**新令牌**可鉴权、**旧令牌 401**（证明闸门读的是快照而不是 DB）；
+   - **T20 在本任务的收窄形式（P0-1 修订）**：设计原文的 T20 是"`replication()==None` → E1/**E2**/**E3** 均 503"。但 T4 阶段只有闸门、三个端点都还是 404，所以 T4 **只断言闸门层**：`replication()==None` 时**令牌校验失败 → 503 `not_ready`**（而不是放行、也不是 401）。E1/E2/E3 各自的 503 形式分别在 T5/T6/T8 追加，并在其中明确写"这是 T20 在该端点的落地"。
    - **C18/内部面不外泄**：`/api/v1/internal/*` 在数据面（8080）上**不是**内部路由——它在管理口才存在（`admin/mod.rs:582-604`），断言数据面对该前缀按普通租户路径处理（既不返回内部数据、也不出现 `cluster_token` 语义）。
 2. **Verify RED**：`cargo test -p hydra-server --features server --test tenant_api` → 失败（前缀未拦截，请求落到业务管线 → 断言不符）。
 3. **GREEN**（按此顺序）：
@@ -551,12 +554,18 @@ if let Some(route) = hydra_core::tenant_api::parse_route(session.req_header().ur
     }
 }
 ```
-   g. `dispatch` 内：令牌闸门 → URL `tenant_id` 交叉校验（403）→ 端点分派。**增量接线规则（避免任何占位实现）**：
-      - T1 的 `parse_route` **一次写全**三个端点的匹配（它是纯匹配器，完备性由 T1 的单测钉住）；
-      - T4 的 `dispatch` 只把 `Endpoint::Whoami` 接上真实 handler；**未接线**的端点返回 `404 unknown path` ——
-        这与今天的系统行为**完全一致**（那些路径本来就不存在），因此不是占位，而是"该路由尚未提供"的诚实状态；
-      - T5 把 `Endpoint::InvalidateAuthCache` 接上，T7 把 `Endpoint::Usage` 接上；
-      - 每个任务的 RED 只覆盖它本次接线的端点；**没有任何一个任务的产物是"桩"**。
+   g. `dispatch` 内：令牌闸门 → URL `tenant_id` 交叉校验（403）→ 端点分派。**接线规则（P0-1 修订，v5.3）**：
+
+      | 任务 | 本任务接线的端点 | 未接线端点的行为 |
+      |---|---|---|
+      | **T4** | **一个都不接** —— 只做闸门 + 路由骨架 | 三个端点全部 `404 unknown path` |
+      | T5 | `Endpoint::Whoami` | 其余两个 404 |
+      | T6 | `Endpoint::InvalidateAuthCache` | 剩下的 404 |
+      | T8 | `Endpoint::Usage` | 无（全部接完） |
+
+      **这条规则是被一条 P0 逼出来的，理由必须写在代码注释里**：v5.2 曾写成"T4 接上 `Whoami`"，但那让 **T5（本身就是 E1 whoami 任务）的红灯永远无法变红** —— T4 一接线，设计 T1 用例就通过了，T5 的"先红后绿"变成假的，直接违反本计划的 `TDD Route: strict` 与铁律 1。因此 **T4 不接任何端点**：它的产物是一个**诚实的路由骨架**（`match` 的三个分支都返回 `404 unknown path`），并且**每接线一个端点就删掉一个 404 分支**，到 T8 时骨架里不再有任何 404。
+
+      **关于"这算不算桩"**：算"骨架"而不是"桩"，区别在于——骨架的每一个分支都返回**当前正确**的行为（这三个路径今天在数据面上本来就是 404），而桩返回的是"假装成功"或占位值。本计划的产物始终没有"假装成功"的分支；且这条区分已写入 §反熵核对供评审复核。T1 的 `parse_route` 仍然**一次写全**三端点（纯匹配器，完备性由 T1 单测钉住），所以 T4 的 404 是"路由已知但未提供"，不是"路由未知"。
 4. **GREEN 补充：入口与闸门指标**（设计 §9.1 的前三个，`admin/metrics.rs`）：
    - `hydra_tenant_api_requests_total{endpoint,status}` —— 在 `dispatch` 出口处记一次（**标签必须低基数**：`endpoint` 是三个枚举值，`status` 是 HTTP 码）；
    - `hydra_tenant_api_auth_failures_total{reason}` —— `missing|unknown|mismatch|tenant_gone|not_ready`；
@@ -586,7 +595,7 @@ cargo test -p hydra-server --features server
    - **T23/自述不自相矛盾**：响应里的 `base_url` 必须与实际可用前缀一致（用它去拼一次请求，断言得到 200，而不是 404）；
    - **C12/edge 上 E1 可用**（集群套件）：edge 节点（`pool=None`）调 E1 → 200 且来自快照 —— 这条是"E1 不需要 DB、不需要转发"的证据；
    - **T7 的 E1 部分**：**停用**租户调 E1 → 200（自救路径必须畅通；E2/E3 的部分在 T6/T8 各自覆盖）。
-3. **GREEN**：`handlers::whoami(state) -> Resp`，返回 `{tenant_id,name,enabled,domain,auth_url,config_version,base_url}`；`config_version` 用 `store.version()`（`store.rs:381-385`）；`base_url = format!("/tenant/{tid}/api/v1")`。
+3. **GREEN**：**先把 `dispatch` 里 `Endpoint::Whoami` 的 404 分支替换为真实调用**（这是本任务红灯能变红的必要动作），再实现 `handlers::whoami(state) -> Resp`，返回 `{tenant_id,name,enabled,domain,auth_url,config_version,base_url}`；`config_version` 用 `store.version()`（`store.rs:381-385`）；`base_url = format!("/tenant/{tid}/api/v1")`。
 4. **Verify GREEN**。
 5. **Commit**：`feat(server): tenant API E1 GET /whoami (snapshot-only)`
 
@@ -609,10 +618,12 @@ cargo test -p hydra-server --features server
       - 因此**不存在**"集群成员但没有失效通道"这一状态在无特性构建里的对应物；该状态只可能出现在"编译了 cluster-redis 但没有 Redis 后端"（`main.rs:621-644` 下 `invalidation_stream = None`）→ 回 **503**（C2）。
 
    b. `cluster/events.rs`：新增键 `hydra:{ctl:inv:applied}`（**一个 HASH**：`node_id → last_applied_event_id`）。消费者在**成功 apply 一批之后**把该批最大事件 ID 一次性 HSET（**先 apply 后 ack**，顺序不可颠倒）；新增 `applied_watermarks() -> HashMap<String,String>` 与 `await_applied(event_id, live_nodes, timeout) -> AppliedOutcome {Applied{nodes}, Pending{nodes_applied, nodes_total, lagging}, SingleNode, Unavailable}`；**generation bump 路径 `clear_all()` 之后不推进水位**（被裁剪的事件 ID 已不可知，不得为没读到的事件记账）。
-   c. `tenant_api/handlers.rs::invalidate`：校验/上限复用（把 `admin/handlers.rs` 的 `invalidate_shape_error`、`MAX_INVALIDATION_KEYS`、`MAX_API_KEY_LEN` 提为 `pub(crate)`）；本节点调 `state.auth.invalidate[_tenant]`；`publish`；然后 `await_applied`；按结果回 **200 / 202 / 503**；响应体按设计 §4.2 的 `fleet` 对象；`checked` 与 `invalidated` 并列。
-   d. `tenant_api/throttle.rs`：固定窗口限额（源 IP / 令牌摘要 / 租户成功 / **每租户失效频率**），`cluster-redis` 下走 Redis 计数（参照 `redis/rate_limit.rs` 的窗口原语），其余用 `DashMap`。
-   e. `admin/handlers.rs::auth_cache_invalidate` 响应改用同一 `fleet` 结构（**共用同一个 `await_applied` 实现**，不复制）。
-   f. 存活节点列表：`main.rs` 注入 `Arc<dyn Fn() -> Vec<String> + Send + Sync>`（返回存活 node_id），与 `AdminState.leader_ready` 同一闭包注入手法（`admin/mod.rs:104`）——**不把 registry 放进 `AppState`**。
+   c. **接线**：把 `dispatch` 里 `Endpoint::InvalidateAuthCache` 的 404 分支替换为真实调用（本任务的红灯在接线前会因 404 而失败，这就是红灯的原因）；并在本任务追加 **T20 的 E2 形式**（`replication()==None` → 503 `not_ready`）。
+
+   d. `tenant_api/handlers.rs::invalidate`：校验/上限复用（把 `admin/handlers.rs` 的 `invalidate_shape_error`、`MAX_INVALIDATION_KEYS`、`MAX_API_KEY_LEN` 提为 `pub(crate)`）；本节点调 `state.auth.invalidate[_tenant]`；`publish`；然后 `await_applied`；按结果回 **200 / 202 / 503**；响应体按设计 §4.2 的 `fleet` 对象；`checked` 与 `invalidated` 并列。
+   e. `tenant_api/throttle.rs`：固定窗口限额（源 IP / 令牌摘要 / 租户成功 / **每租户失效频率**），`cluster-redis` 下走 Redis 计数（参照 `redis/rate_limit.rs` 的窗口原语），其余用 `DashMap`。
+   f. `admin/handlers.rs::auth_cache_invalidate` 响应改用同一 `fleet` 结构（**共用同一个 `await_applied` 实现**，不复制）。
+   g. 存活节点列表：`main.rs` 注入 `Arc<dyn Fn() -> Vec<String> + Send + Sync>`（返回存活 node_id），与 `AdminState.leader_ready` 同一闭包注入手法（`admin/mod.rs:104`）——**不把 registry 放进 `AppState`**。
 4. **GREEN 补充：屏障与消费者健康指标**（设计 §9.1 的中段六个，**这是"清干净没有"唯一可被外部观测的方式**）：
 
    | 指标 | 类型 | 标签 | 为什么必须有 |
@@ -714,6 +725,36 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 **Impact/Compat**：**破坏性**（用户已确认）。管理面回到单一凭证语义，不再有"排在 admin 闸门之前"的特殊分支。
 
 **Steps**
+0. **先清掉旧路由的测试消费者（P0-2，必须在删除路由之前做）**。`crates/hydra-server/tests/tenant_cache.rs` 是旧路由在仓库里**真正的调用方**，而且它 `#![cfg(all(feature = "db", feature = "http-client", feature = "proxy"))]`（`tests/tenant_cache.rs:7`）——即它跑在**主 CI job**（`ci.yml:100` `cargo test -p hydra-server --features server`）里。直接删路由会让主门禁变红，并且**静默丢掉 5 条测试的覆盖面**。
+
+   逐条判定（已读过该文件）：
+
+   | 测试 | 行 | 打哪个端点 | 处置 |
+   |---|---|---|---|
+   | `tenant_token_set_never_echoed_and_has_flag` | `:144` | 管理 API（令牌写入/不回显/`has_access_token`） | **保留** |
+   | `tenant_token_blank_keeps_and_empty_clears` | `:175` | 管理 API（blank=保留、`""`=清除） | **保留** |
+   | `tenant_token_too_short_rejected_400` | `:218` | 管理 API（最短长度 400） | **保留** |
+   | `tenant_token_invalidates_own_cache` | `:244` | **旧路由**（期望 200） | **迁移 → 删除** |
+   | `tenant_token_invalidates_selected_keys` | `:261` | **旧路由**（期望 200） | **迁移 → 删除** |
+   | `tenant_token_wrong_or_missing_rejected` | `:287` | **旧路由**（期望 401） | **迁移 → 删除** |
+   | `tenant_token_mismatched_url_tenant_is_403` | `:302` | **旧路由**（期望 403） | **迁移 → 删除** |
+   | `tenant_without_token_cannot_use_endpoint` | `:312` | **旧路由**（未配置令牌 → 401） | **迁移 → 删除** |
+
+   **"迁移"不是丢覆盖面，而是换承载文件** —— 这 5 条断言的意图**已经**写在 T4/T5/T6 的红灯清单里（401/403/200 矩阵、精确 key、配额上限），只是从管理口换成数据面：
+
+   | 被删的旧测试 | 新承载（必须逐条对应） |
+   |---|---|
+   | `tenant_token_invalidates_own_cache`（200） | T6 的 T11/T12 |
+   | `tenant_token_invalidates_selected_keys`（200） | T6 的 T11 |
+   | `tenant_token_wrong_or_missing_rejected`（401） | T4 的 T3 |
+   | `tenant_token_mismatched_url_tenant_is_403`（403） | T4 的 T4 |
+   | `tenant_without_token_cannot_use_endpoint`（401） | T4 的 T2（无令牌 401）＋ T5 的"令牌有效但租户行不存在/未配置 → 401" |
+
+   **辅助函数**：`invalidate()` 助手（`:122-141`，打旧路径）随 5 条测试一起删除；`admin_state()`/`start_admin()`/`create_tenant()`/`client()`/`wait_ready()` **保留**（3 条管理 API 测试与后续管理面测试仍需要）。
+   **文件头部模块文档**（`:1-5`）也要改：它现在描述的是"租户令牌路由 + 管理侧令牌生命周期"，应改为只描述后者，并指向新位置（数据面租户 API 的测试在 `tests/tenant_api.rs`／文档在 `design-tenant-api.md`）。
+
+   **验证本步**：`cargo test -p hydra-server --features server --test tenant_cache` → 期望 **3 passed / 0 failed**（删 5 条后）；此时旧路由仍在，主门禁仍绿。
+
 1. 删除 `admin/mod.rs:616-668` 整块（租户令牌路由）；`handlers.rs` 删除 `tenant_id_for_token`；`admin-ui/api-docs.js` 移除旧条目。
 2. **红灯（C16）**：先写断言再删除路由 —— 删除前它会**红**（因为删除前租户令牌返回 200，而断言要求 401）。
 
@@ -885,6 +926,8 @@ PY
 | `admin/mod.rs:616-668` 租户令牌路由 | 活跃 | **T9 删除** | 旧路径返回 **404**（不是 401） |
 | `admin/handlers.rs::tenant_id_for_token` | 活跃 | **T9 删除**（由 `tenant_from_token(&ConfigStore,..)` 取代） | `grep` 无残留调用；且 C16 的双凭证断言成立（租户令牌 401 / 管理令牌 404） |
 | `admin/handlers.rs::tenant_auth_cache_invalidate` | 活跃 | **T6 搬进新模块**，T9 删除原位置 | 同一行为只有一个实现 |
+| **`tests/tenant_cache.rs` 的 5 条旧路由测试** | **活跃**（跑在主 CI job 里） | **T9 步骤 0 删除**，断言意图迁到 `tests/tenant_api.rs`（映射表见 T9 步骤 0） | 删除后 `--test tenant_cache` 为 **3 passed**；且 5 条意图在 `tenant_api` 套件里各有对应断言（否则覆盖面静默下降） |
+| `tests/tenant_cache.rs` 的 `invalidate()` 助手 | 活跃 | 随 5 条测试一起删除 | 编译通过即证明没有残留调用 |
 | `InvalidateResponse::published` | 活跃 | **T6 删除**（无存量调用方） | 响应体只有 `fleet` 对象 |
 | `sink.rs` 内的私有 CH 传输 | 活跃 | **T3 下沉**（搬迁，非复制） | `sink.rs` 不再含 URL 解析/请求构造 |
 | `HYDRA_SETTINGS_*` 域名/URL 校验模块 | **从未存在** | 设计 v2 已移除需求 | 无（不是"留着不用"） |
