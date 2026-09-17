@@ -917,6 +917,64 @@ async fn clickhouse_a_non_numeric_counter_is_a_failure_not_a_zero() {
     );
 }
 
+/// A response that fills the transport's size cap is cut off mid-stream, which
+/// is a TOO-BIG answer, not a decode failure. The 503 must tell the caller to
+/// narrow the window or shrink the grouping — never to "retry", which returns
+/// the same truncated bytes. (A unit test over `response_truncated` pins the
+/// detection; this one pins that the tenant actually sees the actionable message.)
+#[cfg(feature = "usage-clickhouse")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clickhouse_a_cap_filling_result_is_actionable_not_a_generic_retry() {
+    use wiremock::matchers::{any, method};
+    use wiremock::{Mock, ResponseTemplate};
+    let pool = common::setup_pool().await;
+    // A body well past the transport's 64 KiB cap: `send` stops reading at the
+    // cap, so the response is cut off mid-stream. `group_by=model` on purpose so
+    // the metric label combination is unique to THIS failure (the counter is
+    // process-global), mirroring the sibling decode test.
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(70 * 1024)))
+        .mount(&server)
+        .await;
+    let before = hydra_server::admin::metrics::tenant_api_usage_query_total(
+        "clickhouse",
+        "model",
+        "result_too_large",
+    );
+    let (status, v) = ch_usage(
+        &pool,
+        &server.uri(),
+        "since=2026-09-15T00:00:00Z&until=2026-09-16T00:00:00Z&group_by=model",
+    )
+    .await;
+    assert_eq!(status, 503, "a too-big result must not be a 200: {v}");
+    assert_eq!(v["error"]["code"], "usage_store_unavailable", "{v}");
+    // The message must be the actionable one, not the generic "retry or contact
+    // the operator" a plain store/decode failure gets: retrying a too-big result
+    // returns the same truncated body.
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("response-size cap"),
+        "a truncated result must name the cap it hit: {msg}"
+    );
+    assert!(
+        !msg.contains("retry"),
+        "a too-big result must not suggest retrying: {msg}"
+    );
+    // And the operator's signal is the new metric label, not a decode error.
+    assert_eq!(
+        hydra_server::admin::metrics::tenant_api_usage_query_total(
+            "clickhouse",
+            "model",
+            "result_too_large"
+        ) - before,
+        1.0,
+        "a cap-filling result must be attributed as `result_too_large`, not `decode_error`"
+    );
+}
+
 /// A response missing `last_seen` is a shape drift, not "no records": the
 /// aggregate query always projects it.
 #[cfg(feature = "usage-clickhouse")]

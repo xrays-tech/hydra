@@ -293,7 +293,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
     "state": "applied",      // applied | pending | single_node | unavailable
     "nodes_total": 5,        // 注册表中的**存活**数据面节点数
     "nodes_applied": 5,
-    "lagging": [],           // 尚未确认的 node_id（state=pending 时非空）
+    "lagging": [],           // 尚未确认的 node_id（state=pending 且有落后节点时非空；nodes_total=0 时为空）
     "event_id": "1758096000123-0",
     "waited_ms": 37
   }
@@ -355,14 +355,14 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
 - **屏障令牌 = `XADD` 返回的流 ID**（如 `1758096000123-0`）。用它而不是自增计数器，是因为它**由 Redis 在写入时分配**，因此"事件存在"与"令牌已分配"是同一个原子动作，不存在"令牌可见但事件还没落地"的窗口。比较按 `(ms, seq)` 数值对，不按字符串。
 - 消费者在**成功应用一批之后**，把该批的最大 ID 一次性 HSET 上去；顺序是**先 apply 后 ack**（绝不允许先 ack——那会让屏障说谎）。
 - **generation bump 路径（裁剪删除任何条目即触发）的 ack 规则**：`clear_all()` 会清掉**所有**缓存项，因此它**取代**了任何在它之前已发布的事件（注意：触发条件是"裁剪删除了任何条目"，不是"丢了未读条目"）；但节点**不能**为它没读到的事件 ID 记账。因此该路径只做两件事：① `clear_all()`；② **不推进水位**。后果是相关事件会以 `lagging` 出现（`state: pending`），而**不**是假报 `applied`。这是有意的保守选择：**宁可报未收敛，也不谎报已收敛**。§4.2.5 给出该情形下的硬上界。
-- 等待循环：`publish` → 取 event_id → 读注册表存活节点列表（`registry.list_nodes`）→ 轮询 HASH，直到 `∀ live node: applied >= event_id` 或超时。**只等存活节点**：已死节点不在注册表里，也不在给它们送流量的负载均衡池里。
+- 等待循环：`publish` → 取 event_id → 读注册表存活节点列表（`registry.list_nodes`）→ 轮询 HASH，直到 `∀ live node: applied >= event_id` 或超时。**只等存活节点**：已死节点不在注册表里，也不在给它们送流量的负载均衡池里。**空集不是"已收敛"**：`list_nodes` 读的是本节点自己注册进注册表的那个 hash，空结果意味着视图陈旧/尚未填充（启动窗口、或注册表行已过期但 Redis 仍可连），而不是"没有对端"——因此空存活节点集**不**判为 `applied`，屏障返回 `pending` 且 `nodes_total: 0`（`lagging: []`）。
 - **不是转发**：整条屏障只读共享 Redis 的 HASH，**不向对端发任何请求**，因此 §6.2 "本设计不需要任何转发"的结论不变（也就不需要集群令牌、内部端点或新信任边界）。
 
 #### 4.2.4 契约里必须写清的四条语义
 
 1. **调用顺序：先封禁，后失效。** 失效只删除缓存项；下一次请求会**立即回源**（`http.rs:537-547` → `:559-566`）。若租户尚未在自己的 auth 服务里封禁该 key，回源返回 allow 并**重新缓存**——等于"越清越糟"。正确顺序：**租户侧封禁 → 调 E2 → 确认 `state: applied`**。
 2. **`invalidated: 0` 不等于失败**：它只统计**本节点 L1 命中数**（`http.rs:250-259`）；目标 key 可能只在 L2、只在别的节点的 L1、或从未被缓存——这些情况下"下次请求本来就会回源"。并列返回 `checked`（D4）。
-3. **`state` 四态取代会说谎的 `published`**（D3）：`applied`（全部存活节点已确认，200）/ `pending`（超时未收敛，202，`lagging` 列出未确认节点）/ `single_node`（本节点即全部数据面，200）/ **`unavailable`（通道存在但发布或水位读取失败，503）**。**"无失效流"归 `single_node` 而不是 503**：`main` 只在没有 Redis 主干时把流留成 `None`，而 leader/edge 缺它**拒绝启动**，所以"无流"只可能是单节点 `all` 角色；"集群成员但无通道"在运行期不可构造（早期的 C2 措辞已按此修订，见 §10.3）。
+3. **`state` 四态取代会说谎的 `published`**（D3）：`applied`（全部存活节点已确认，200；空存活节点集不判 `applied`，返回 `pending`，见 §4.2.3）/ `pending`（超时未收敛，202，`lagging` 列出未确认节点）/ `single_node`（本节点即全部数据面，200）/ **`unavailable`（通道存在但发布或水位读取失败，503）**。**"无失效流"归 `single_node` 而不是 503**：`main` 只在没有 Redis 主干时把流留成 `None`，而 leader/edge 缺它**拒绝启动**，所以"无流"只可能是单节点 `all` 角色；"集群成员但无通道"在运行期不可构造（早期的 C2 措辞已按此修订，见 §10.3）。
 4. **覆盖范围 = 本集群**（已确认部署形态：**单一集群，半年内无多集群/多地域计划**）。一次 E2 覆盖**共享同一失效主干（同一个 Redis）**的全部数据面节点；`nodes_total`/`nodes_applied`/`lagging` 三个字段共同回答"清干净没有、还差谁"。
 
    > 因此 **v5 删除了 `HYDRA_CLUSTER_ID` 与 `fleet.cluster` 字段**：只有一个集群时，"刚才清的是哪一片"没有可回答的对象，留下就是一个永远为空的字段（反熵：不为假想需求保留机制）。
@@ -412,7 +412,7 @@ GET /tenant/{tid}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17T00:00
   "tenant_id": "t_abc",
   "since": "2026-09-16T00:00:00Z",
   "until": "2026-09-17T00:00:00Z",
-  "as_of": "2026-09-16T23:59:57Z",     // 本租户最新一条记录时间；无记录时为 null
+  "as_of": "2026-09-16T23:59:57Z",     // 本次查询窗口内最新一条记录时间（= 窗口内 MAX(created_at)；默认 until=now 时即存储最新）；无记录时为 null
   "totals": {"requests":1234,"tokens_in":456789,"tokens_out":12345,
              "cache_hit_tokens":9999,"errors":7},
   "rows": [{"key":"gpt-4o","requests":800,"tokens_in":300000,"tokens_out":9000,
@@ -422,7 +422,7 @@ GET /tenant/{tid}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17T00:00
 → 400 invalid_since / invalid_until    形态非法或 since > until
 → 400 invalid_group_by                 group_by 不在白名单
 → 400 window_too_large                 窗口超上限（默认 31 天）
-→ 503 usage_store_unavailable          计量存储不可达，或响应无法解码（CH 连接失败/超时/形状漂移；或本节点无本地库）
+→ 503 usage_store_unavailable          计量存储不可达，或响应无法解码，或结果超过响应体上限（CH 连接失败/超时/形状漂移；本节点无本地库；或结果 > ~64 KiB 被截断——后者应缩小窗口/分组，重试无效）
 ```
 
 **入参约定**（T8 落地，均为对外契约的一部分）：
@@ -430,7 +430,7 @@ GET /tenant/{tid}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17T00:00
 - 时间戳接受 RFC3339（`Z` 或带偏移）、**无时区的 `T` 分隔形态**、**空格分隔形态**（历史遗留输入）、epoch 秒与 epoch 毫秒；一律归一化为规范形态后再入查询，应答里回显的是**归一化后**的值。
 - `group_by ∈ {none(默认), model, provider, day}`；未知值 400，**绝不插值**（列名来自白名单）。
 - **契约里不存在 `tenant_id` 参数**：身份只来自令牌，多传该参数被**忽略**（不是报错，因为它是无害的多余输入）。
-- 解码失败与存储不可达对租户是**同一个 503**，但**指标标签不同**（`result=decode_error` / `store_unavailable`）——运维据此发现"存储答了但答的不是我们要的形状"。
+- 解码失败、存储不可达、结果超限对租户是**同一个 503**，但**指标标签不同**（`result=decode_error` / `store_unavailable` / `result_too_large`）——运维据此发现"存储答了但答的不是我们要的形状"，或"结果太大被截断"（后者让调用方缩小窗口/分组，重试无效）。
 
 > 与 v3 相比：**`501 usage_query_unavailable` 分支被删除**（CH 读路径进 v1）。原来的"防御分支 `Sqlite + pool=None`"也改由同一码 `usage_store_unavailable` 表达——它分不清"配置里没有 store"与"store 连不上"，但对租户而言两者的正确反应相同（重试/找运维），无需暴露内部拓扑。
 
@@ -591,7 +591,7 @@ AppState.usage: Arc<dyn UsageQuery>
 |---|---|
 | 索引化校验 | §3.4：0 DB I/O ⇒ 移除"未授权请求即 DB 放大器"这一条 |
 | 失败限流 | 按**源 IP** 与**令牌摘要**两个维度固定窗口：默认 10 次失败/分钟 → `429` + `Retry-After`；持续超限 → 15 分钟锁定该维度（`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` / `_LOCKOUT_SECS`） |
-| 成功限流 | 按租户令牌：默认 60 次/分钟（`HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`），防止租户 API 被当作免费的 CPU/DB 消耗面 |
+| 已授权限流 | 按租户：默认 60 次/分钟（`HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`），**计数所有通过的已认证请求**——包括随后被 API 以 4xx/5xx 拒绝的，唯一不计的是 `403`（URL 写错租户）；防止租户 API 被当作免费的 CPU/DB 消耗面 |
 | 反放大 | E3 窗口上限（默认 31 天）+ `group_by` 白名单，避免一次请求全表扫描 |
 | **失效风暴防护** | 针对 D6：E2 追加"每租户失效频率上限"（默认 10 次/分钟）；超限 429。三个理由：① 失效流裁剪**只要删除任何条目**就会 bump generation（≈ 每 30s 里事件数超过 `maxlen=10_000`，即约 **>333 事件/秒**持续 30s 即触发），进而让**每个节点清空整个缓存**（L1+L2）——与消费者是否落后**无关**（`events.rs:204-214/320-332`）；② 每次失效会让**所有**相关节点回源 `auth_url`，是租户自己认证服务的流量放大器；③ 收敛屏障本身要读 Redis（发布 + 轮询 HASH），高频调用会把共享主干变成热点——单个租户的凭证不得成为跨租户可用性武器 |
 | 实现位置 | 独立小组件（`DashMap` 固定窗口；`cluster-redis` 下用 Redis 计数，使 edge 水平扩展时限额不被放大 N 倍，参照 `redis/rate_limit.rs` 的窗口原语）。**不复用** `proxy::limiter::Limiter`：它是 `LimitRole` 驱动的业务配额（`limiter.rs:25-63`），语义不同 |
@@ -664,7 +664,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 
 **关键的诚实声明（写进 `ops.md` 与 E2 的响应语义）**：
 
-1. `state: applied` 的含义是"**注册表中全部存活节点的消费者都已确认应用**"。它**不**覆盖未注册的节点、消费者停摆的节点、以及与失效主干网络分区的节点——这些由 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 兜底。
+1. `state: applied` 的含义是"**注册表中全部存活节点的消费者都已确认应用**"。它**不**覆盖未注册的节点、消费者停摆的节点、以及与失效主干网络分区的节点——这些由 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 兜底。**空存活节点集也不判 `applied`**：`list_nodes` 读的是本节点自注册的注册表 hash，空结果 = 视图陈旧/未填充（而非"没有对端"），空集上的"∀ 已确认"是空真——屏障此时返回 `pending`（`nodes_total: 0`）而非 `applied`。
 2. `state: pending` 是**诚实的未收敛**，不是错误：`lagging` 列出未确认的 node_id，运维可据此定位（配合 `hydra_invalidation_consumer_stalled_seconds` 告警）。**不因为裁剪丢弃的事件 ID 已不可知就报 `applied`**——这是刻意的保守选择（§4.2.3）。
 3. 一次 E2 覆盖**本集群共享同一失效主干**的全部数据面节点（部署形态已确认为单一集群；多集群场景的重新评估触发条件见 §4.2.4 第 4 条）。
 
@@ -794,7 +794,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HYDRA_TENANT_API` | `on` | 总开关；`off` 时前缀整体不拦截（回到基线行为） |
-| `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | 每租户令牌成功请求上限 |
+| `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | 每租户**已授权**请求上限 |
 | `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` | `10` | 每 IP / 每摘要失败上限 |
 | `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | 持续超限锁定时长 |
 | `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | 每租户失效频率上限（防 D6 放大） |
@@ -854,7 +854,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | `hydra_tenant_api_requests_total` | counter | `endpoint`(whoami/invalidate/usage/**unrouted**), `status` | 入口流量与结果分布。`unrouted` = 保留前缀下不是三条路由的路径（404 在路由解析**之前**返回，因此归属只能是它）；它正是"租户打错路径"的信号 |
 | `hydra_tenant_api_auth_failures_total` | counter | `reason`(missing/unknown/mismatch/**locked**) | 令牌失败分类（**不含**令牌本身）。被锁定而拒绝时记 `locked`（`throttled` 回答"拒了什么"，这个标签回答"闸门为什么没跑"）。**`tenant_gone` 不可达**：快照里有令牌摘要却没有对应租户行时，实现返回 `not_ready`(503) 而非鉴权失败——那是配置快照换代的中间态，fail-closed 更诚实（见 §3.3），故该值与代码不符已删除 |
 | `hydra_tenant_api_throttled_total` | counter | `scope`(ip/token/tenant/invalidate) | 限流触发。四个值现在都可产生（E2 的每租户失效限流记 `invalidate`） |
-| `hydra_tenant_api_usage_query_total` | counter | `source`(sqlite/clickhouse), `group_by`, `result`(ok/store_unavailable/decode_error) | **`decode_error` 专指 CH 响应解析失败**——它是"整数被引号包裹"那类陷阱的唯一外部信号，否则表现为静默 0。**`too_large` 已删除**：窗口超限在查询之前就返回 400 `window_too_large`，该请求根本不会到达查询，因此这个值不可达 |
+| `hydra_tenant_api_usage_query_total` | counter | `source`(sqlite/clickhouse), `group_by`, `result`(ok/store_unavailable/decode_error/**result_too_large**) | **`decode_error` 专指 CH 响应解析失败**——它是"整数被引号包裹"那类陷阱的唯一外部信号，否则表现为静默 0。**`too_large` 已删除**：窗口超限在查询之前就返回 400 `window_too_large`，该请求根本不会到达查询，因此这个值不可达。但**结果体超限**（CH 结果超过 ~64 KiB 响应上限）现在**可达**：内部变体 `ResultTooLarge`、指标标签 `result_too_large`，对外仍是 503 `usage_store_unavailable` 并附"缩小窗口/分组"的 actionable 消息——重试无用，须窄化 `since`/`until` 或降低 `group_by` 基数 |
 | `hydra_tenant_api_usage_query_seconds` | histogram | `source` | CH 查询延迟；主键以 `created_at` 前导 ⇒ 宽窗口的代价随窗口增长，必须可观测 |
 | `hydra_tenant_api_auth_latency_seconds` | histogram | — | 令牌校验耗时（回归 §3.4 的"零 DB I/O"声明） |
 | `hydra_tenant_api_invalidate_pending_total` | counter | — | E2 返回 202 的次数。**持续 >0 说明集群里有节点清不掉** |

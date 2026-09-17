@@ -84,6 +84,12 @@ pub enum UsageQueryError {
     StoreUnavailable(String),
     /// The store answered with something we could not decode. Also never zero.
     Decode(String),
+    /// The store answered, but the answer was larger than the gateway's
+    /// response-size cap, so it was cut off mid-stream. Unlike the other two,
+    /// retrying returns the SAME truncated bytes: the caller must narrow
+    /// `since`/`until` or reduce `group_by` instead. The `usize` is the cap in
+    /// bytes, reported so the tenant can see the limit it ran into.
+    ResultTooLarge(usize),
 }
 
 impl std::fmt::Display for UsageQueryError {
@@ -91,6 +97,12 @@ impl std::fmt::Display for UsageQueryError {
         match self {
             Self::StoreUnavailable(e) => write!(f, "usage store unavailable: {e}"),
             Self::Decode(e) => write!(f, "usage response not decodable: {e}"),
+            Self::ResultTooLarge(cap) => {
+                write!(
+                    f,
+                    "usage result exceeded the {cap}-byte gateway response cap"
+                )
+            }
         }
     }
 }
@@ -323,17 +335,27 @@ impl ClickHouseUsageQuery {
     /// failed query with HTTP 404 and a `Code: N. DB::Exception: …` text
     /// (measured), so the status and the body are both kept for the operator.
     async fn run(&self, sql: &str, params: &[(&str, &str)]) -> Result<String, UsageQueryError> {
-        let (status, raw) = crate::clickhouse::send(&self.cfg, sql, params, b"")
+        let result = crate::clickhouse::send(&self.cfg, sql, params, b"")
             .await
             .map_err(UsageQueryError::StoreUnavailable)?;
-        if !crate::clickhouse::is_ok_status(&status) {
+        if !crate::clickhouse::is_ok_status(&result.status_line) {
             return Err(UsageQueryError::StoreUnavailable(format!(
                 "clickhouse said {:?}: {}",
-                status.trim(),
-                crate::clickhouse::response_body(&raw)
+                result.status_line.trim(),
+                crate::clickhouse::response_body(&result.body)
             )));
         }
-        Ok(crate::clickhouse::response_body(&raw))
+        // A body that filled the transport's cap was cut off mid-stream: it is a
+        // TOO-BIG answer, not a malformed one, and the two must not be conflated.
+        // Retrying a too-big answer returns the same truncated bytes, so this is
+        // the one 503 the caller fixes by narrowing the window or shrinking the
+        // grouping — never by calling again.
+        if result.truncated {
+            return Err(UsageQueryError::ResultTooLarge(
+                crate::clickhouse::MAX_CLICKHOUSE_RESPONSE,
+            ));
+        }
+        Ok(crate::clickhouse::response_body(&result.body))
     }
 }
 

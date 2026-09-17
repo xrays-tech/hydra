@@ -621,16 +621,19 @@ async fn insert_batch_clickhouse_http(
         body.push('\n');
     }
 
-    let (status_line, resp) = send(cfg, CLICKHOUSE_INSERT, &[], body.as_bytes()).await?;
+    let result = send(cfg, CLICKHOUSE_INSERT, &[], body.as_bytes()).await?;
 
     // ClickHouse returns HTTP 200 + empty body on a successful INSERT; any other
-    // status carries the error text in the body.
-    if is_ok_status(&status_line) {
+    // status carries the error text in the body. The writer does not need to
+    // distinguish truncation from a normal error: both mean "the batch did not
+    // land" and are retried.
+    if is_ok_status(&result.status_line) {
         Ok(())
     } else {
-        let body_text = response_body(&resp);
+        let body_text = response_body(&result.body);
         Err(format!(
-            "clickhouse insert rejected: status=`{status_line}` body={body_text}"
+            "clickhouse insert rejected: status=`{}` body={body_text}",
+            result.status_line
         ))
     }
 }

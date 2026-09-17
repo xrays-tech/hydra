@@ -145,6 +145,20 @@ pub(crate) fn url_encode(s: &str) -> String {
     out
 }
 
+/// The result of a complete ClickHouse HTTP exchange.
+#[derive(Debug)]
+pub(crate) struct SendResult {
+    /// The first line of the HTTP response (e.g. `HTTP/1.1 200 OK`).
+    pub(crate) status_line: String,
+    /// The raw response bytes (status line + headers + body).
+    pub(crate) body: Vec<u8>,
+    /// True when the read stopped because [`MAX_CLICKHOUSE_RESPONSE`] was
+    /// reached before EOF. A truncated body is not decodable as JSON; the
+    /// reader must treat this as an actionable `ResultTooLarge` rather than a
+    /// generic decode failure.
+    pub(crate) truncated: bool,
+}
+
 /// Send one request over ClickHouse's HTTP interface and return the response.
 ///
 /// `query` is the SQL (INSERT or SELECT), `params` are `param_*` bindings for
@@ -152,7 +166,7 @@ pub(crate) fn url_encode(s: &str) -> String {
 /// statement), and `body` is the request payload (`FORMAT JSONEachRow` rows, or
 /// empty for a SELECT).
 ///
-/// Returns `(status_line, raw_body)` on **any** complete HTTP response —
+/// Returns a [`SendResult`] on **any** complete HTTP response —
 /// including non-2xx, because classifying those belongs to the caller
 /// ([`is_ok_status`] for the writer, the `Code: N` body for the reader). Returns
 /// `Err` only when the exchange itself did not complete (connect failed, or a
@@ -165,7 +179,7 @@ pub(crate) async fn send(
     query: &str,
     params: &[(&str, &str)],
     body: &[u8],
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<SendResult, String> {
     // POST /?<passthrough params>&query=<url-encoded SQL>&param_k=v … HTTP/1.1
     let mut request = String::with_capacity(body.len() + query.len() * 2 + 256);
     request.push_str("POST /?");
@@ -251,6 +265,7 @@ pub(crate) async fn send(
     // could grow `resp` without bound.
     let mut resp = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut truncated = false;
     loop {
         let n = tokio::time::timeout(cfg.io_timeout, stream.read(&mut chunk))
             .await
@@ -264,12 +279,11 @@ pub(crate) async fn send(
         if n == 0 {
             break;
         }
-        let room = MAX_CLICKHOUSE_RESPONSE.saturating_sub(resp.len());
-        if room == 0 {
-            // Enough to classify the status/error; stop waiting for EOF.
+        if fill_capped(&mut resp, &chunk[..n]) {
+            // Bytes were discarded: the response crossed the cap on this read.
+            truncated = true;
             break;
         }
-        resp.extend_from_slice(&chunk[..n.min(room)]);
     }
 
     let status_line = String::from_utf8_lossy(&resp)
@@ -277,7 +291,11 @@ pub(crate) async fn send(
         .next()
         .unwrap_or("")
         .to_string();
-    Ok((status_line, resp))
+    Ok(SendResult {
+        status_line,
+        body: resp,
+        truncated,
+    })
 }
 
 /// Whether a response status line means success.
@@ -320,6 +338,25 @@ pub(crate) fn response_body(resp: &[u8]) -> String {
         body.to_vec()
     };
     String::from_utf8_lossy(&decoded).trim().to_string()
+}
+
+/// Append `chunk` to `resp`, capped at [`MAX_CLICKHOUSE_RESPONSE`].
+///
+/// Returns `true` when any bytes were discarded because the buffer crossed the
+/// cap. A chunk that *exactly* fills the remaining room is NOT truncation: the
+/// response may still be complete (EOF on the next read). Only a chunk that
+/// *exceeds* the room proves bytes were lost.
+fn fill_capped(resp: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let room = MAX_CLICKHOUSE_RESPONSE.saturating_sub(resp.len());
+    if chunk.len() > room {
+        if room > 0 {
+            resp.extend_from_slice(&chunk[..room]);
+        }
+        true
+    } else {
+        resp.extend_from_slice(chunk);
+        false
+    }
 }
 
 /// The first index of `needle` in `hay`.
@@ -508,6 +545,48 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `fill_capped`: the buffer-append decision, tested deterministically
+    // -----------------------------------------------------------------------
+
+    /// A chunk that fits entirely under the cap appends all bytes and reports
+    /// no truncation.
+    #[test]
+    fn fill_capped_under_cap_appends_all() {
+        let mut resp = Vec::new();
+        let truncated = fill_capped(&mut resp, &[0u8; 100]);
+        assert!(!truncated);
+        assert_eq!(resp.len(), 100);
+    }
+
+    /// A chunk that *exactly* fills the remaining room is NOT truncation: the
+    /// response may still be complete (EOF on the next read). This is the case
+    /// the old length-based heuristic (`resp.len() >= MAX`) got wrong.
+    #[test]
+    fn fill_capped_exactly_at_cap_is_not_truncated() {
+        let mut resp = vec![0u8; MAX_CLICKHOUSE_RESPONSE - 10];
+        let truncated = fill_capped(&mut resp, &[0u8; 10]);
+        assert!(
+            !truncated,
+            "exactly filling the cap is a complete response, not truncation"
+        );
+        assert_eq!(resp.len(), MAX_CLICKHOUSE_RESPONSE);
+    }
+
+    /// A chunk that *crosses* the cap must be flagged truncated, and only the
+    /// remaining `room` bytes are appended (the excess is dropped).
+    #[test]
+    fn fill_capped_crossing_cap_is_truncated_and_drops_excess() {
+        let mut resp = vec![0u8; MAX_CLICKHOUSE_RESPONSE - 10];
+        let truncated = fill_capped(&mut resp, &[0u8; 20]);
+        assert!(truncated, "a read that crosses the cap must be flagged");
+        assert_eq!(
+            resp.len(),
+            MAX_CLICKHOUSE_RESPONSE,
+            "only `room` bytes appended; the excess is dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Transport: real sockets, real deadlines
     // -----------------------------------------------------------------------
 
@@ -563,7 +642,7 @@ mod tests {
         .await
         .expect("must not hang")
         .expect("a 200 is a complete exchange");
-        assert!(is_ok_status(&out.0), "{:?}", out.0);
+        assert!(is_ok_status(&out.status_line), "{:?}", out.status_line);
         let request = rx.await.expect("the server recorded the request");
         assert!(
             request.starts_with("POST /?query=SELECT%20%7Bt%3AString%7D"),
@@ -616,15 +695,23 @@ mod tests {
         )
         .await;
         let cfg = cfg_for(addr, 500, 500);
-        let (status, body) = send(&cfg, "SELECT * FROM nope", &[], b"")
+        let result = send(&cfg, "SELECT * FROM nope", &[], b"")
             .await
             .expect("a 404 is a complete exchange");
-        assert!(!is_ok_status(&status), "{status}");
-        assert!(status.contains("404"), "{status}");
+        assert!(
+            !is_ok_status(&result.status_line),
+            "{:?}",
+            result.status_line
+        );
+        assert!(
+            result.status_line.contains("404"),
+            "{:?}",
+            result.status_line
+        );
         // The raw body reaches the caller, which is what lets the reader (T8)
         // classify a failing query from its `Code: N` text.
         assert!(
-            response_body(&body).contains("DB::Exception"),
+            response_body(&result.body).contains("DB::Exception"),
             "error body must survive the transport"
         );
     }
@@ -632,4 +719,58 @@ mod tests {
     // -----------------------------------------------------------------------
     // The reader's config differs from the writer's ONLY in its deadlines
     // -----------------------------------------------------------------------
+
+    /// A response that exceeds [`MAX_CLICKHOUSE_RESPONSE`] must be flagged as
+    /// truncated so the reader can distinguish "the result is too large to
+    /// decode" from "the store answered garbage".
+    #[tokio::test]
+    async fn an_over_cap_response_is_flagged_truncated() {
+        // Build a response whose total size exceeds the cap.
+        let body_size = MAX_CLICKHOUSE_RESPONSE + 100;
+        let header =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\nConnection: close\r\n\r\n");
+        let body = vec![b'a'; body_size];
+        let mut full_response = Vec::with_capacity(header.len() + body_size);
+        full_response.extend_from_slice(header.as_bytes());
+        full_response.extend_from_slice(&body);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.write_all(&full_response).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let cfg = cfg_for(addr, 500, 500);
+        let result = send(&cfg, "SELECT 1", &[], b"")
+            .await
+            .expect("a complete exchange");
+        assert!(
+            result.truncated,
+            "a response over the cap must be flagged truncated"
+        );
+        assert_eq!(
+            result.body.len(),
+            MAX_CLICKHOUSE_RESPONSE,
+            "the buffer must be exactly at the cap"
+        );
+    }
+
+    /// A response within the cap must NOT be flagged truncated.
+    #[tokio::test]
+    async fn a_within_cap_response_is_not_flagged_truncated() {
+        let addr =
+            spawn_responder("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        let cfg = cfg_for(addr, 500, 500);
+        let result = send(&cfg, "SELECT 1", &[], b"").await.expect("exchange");
+        assert!(
+            !result.truncated,
+            "a small response must not be flagged truncated"
+        );
+    }
 }

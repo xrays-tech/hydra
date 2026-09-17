@@ -665,9 +665,12 @@ pub fn tenant_api_invalidate_pending_total() -> f64 {
     }
 }
 
-/// Record one E3 usage read. `result` is `ok`, `store_unavailable` or
-/// `decode_error`; the last two are the same 503 to the tenant and are told
-/// apart here so an operator can see a shape drift without reading logs.
+/// Record one E3 usage read. `result` is `ok`, `store_unavailable`,
+/// `decode_error`, or `result_too_large`; the latter three are the same 503 to
+/// the tenant and are told apart here so an operator can distinguish a shape
+/// drift from an unreachable store. `result_too_large` means the result
+/// exceeded the gateway's response-size cap: the caller must narrow
+/// `since`/`until` or reduce `group_by` — retrying does not help.
 pub fn record_tenant_api_usage_query(
     source: &str,
     group_by: &str,

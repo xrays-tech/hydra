@@ -821,11 +821,14 @@ fn resolved_secret_writes(
                 // Defence in depth: `validate_access_token_shape` already ran
                 // before the write, but the rule lives here too so the helper
                 // cannot silently accept a short token if a caller forgets.
-                if token.len() < 16 {
+                if token.len() < crate::tenant_api::MIN_TENANT_TOKEN_LEN {
                     return Err(err_json(
                         400,
                         "invalid_access_token",
-                        "access_token must be at least 16 characters",
+                        &format!(
+                            "access_token must be at least {} characters",
+                            crate::tenant_api::MIN_TENANT_TOKEN_LEN
+                        ),
                         trace_id,
                     ));
                 }
@@ -850,11 +853,14 @@ fn validate_access_token_shape(access_token: &Option<String>, trace_id: &str) ->
     };
     let token = raw.trim();
     // Empty means "clear the token" (see `apply_tenant_access_token_write`).
-    if !token.is_empty() && token.len() < 16 {
+    if !token.is_empty() && token.len() < crate::tenant_api::MIN_TENANT_TOKEN_LEN {
         return Err(err_json(
             400,
             "invalid_access_token",
-            "access_token must be at least 16 characters",
+            &format!(
+                "access_token must be at least {} characters",
+                crate::tenant_api::MIN_TENANT_TOKEN_LEN
+            ),
             trace_id,
         ));
     }
@@ -1563,15 +1569,34 @@ type Fleet = crate::cluster::events::FleetReport;
 
 /// Without `cluster-redis` this cannot be a cluster, so the local clear is the
 /// whole answer. Same shape, same field names as the cluster report.
+///
+/// `pub(crate)` so the tenant API's non-cluster `FleetView` can reference the
+/// same type instead of hand-syncing a second copy.
 #[cfg(not(feature = "cluster-redis"))]
 #[derive(Serialize)]
-struct Fleet {
+pub(crate) struct Fleet {
     state: &'static str,
     nodes_total: usize,
     nodes_applied: usize,
     lagging: Vec<String>,
     event_id: Option<String>,
     waited_ms: u64,
+}
+
+#[cfg(not(feature = "cluster-redis"))]
+impl Fleet {
+    /// The single-node derivation: a build without `cluster-redis` cannot have
+    /// peers, so the local clear IS the whole fleet answer.
+    pub(crate) fn single_node() -> Self {
+        Self {
+            state: "single_node",
+            nodes_total: 1,
+            nodes_applied: 1,
+            lagging: Vec::new(),
+            event_id: None,
+            waited_ms: 0,
+        }
+    }
 }
 
 /// Cap on how many api-keys ONE invalidation request may name (review N4).
@@ -1696,17 +1721,7 @@ pub(super) async fn auth_cache_invalidate(
     // `HYDRA_ROLE=leader|edge` without the feature), so the local clear IS the
     // whole answer — the same derivation the tenant API's E2 makes.
     #[cfg(not(feature = "cluster-redis"))]
-    let (fleet, status) = (
-        Fleet {
-            state: "single_node",
-            nodes_total: 1,
-            nodes_applied: 1,
-            lagging: Vec::new(),
-            event_id: None,
-            waited_ms: 0,
-        },
-        200u16,
-    );
+    let (fleet, status) = (Fleet::single_node(), 200u16);
     #[cfg(feature = "cluster-redis")]
     let (fleet, status) = (report, report_status);
 

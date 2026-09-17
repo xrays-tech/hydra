@@ -876,6 +876,92 @@ async fn invalidate_clears_exactly_the_named_key() {
     let _ = probe("sk-key-to-clear").await;
 }
 
+/// The per-tenant invalidate throttle is checked BEFORE the local cache clear,
+/// and that order is the security property: a throttled call must NOT clear the
+/// cache. If the clear were reordered ahead of the throttle check, a banned key
+/// would be re-served (cleared) by a request the tenant was not even allowed to
+/// make — the throttle would be a no-op. This pins the order end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_throttled_invalidate_does_not_clear_the_cache() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        // A budget of one: the second invalidate in the window is refused.
+        invalidate_per_min: 1,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state.clone());
+
+    // Seed a cached verdict so there is something real to clear. The direct
+    // seam is the same one `a_suspended_tenant_can_still_use_all_three_endpoints`
+    // uses: `state.auth.cache()`.
+    state
+        .auth
+        .cache()
+        .set("t1", "sk-victim", true, Duration::from_secs(300))
+        .await;
+    assert_eq!(state.auth.cache().len(), 1, "the seeded verdict is cached");
+
+    // First invalidate: allowed (budget of one). It clears the entry.
+    let (s1, v1) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
+    assert_eq!(s1, 200, "the first invalidate must succeed: {v1}");
+    assert!(
+        state.auth.cache().is_empty(),
+        "the first invalidate cleared it"
+    );
+
+    // Re-seed the same verdict: it is back in the L1, and the second call is
+    // about to be judged against the (already spent) invalidate budget.
+    state
+        .auth
+        .cache()
+        .set("t1", "sk-victim", true, Duration::from_secs(300))
+        .await;
+    assert_eq!(
+        state.auth.cache().check("t1", "sk-victim").await,
+        hydra_core::auth::Verdict::Hit(true),
+        "the re-seeded verdict is cached"
+    );
+
+    // Second invalidate, same tenant, same minute: throttled. The raw response
+    // is needed for the `Retry-After` header, so it is not sent through
+    // `post_invalidate` (which discards headers).
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/auth/cache/invalidate");
+    let resp = c
+        .post(&url)
+        .bearer_auth(TENANT_TOKEN)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("send");
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+
+    assert_eq!(status, 429, "the second invalidate must be throttled: {v}");
+    assert_eq!(v["error"]["code"], "rate_limited", "got {v}");
+    assert!(
+        retry_after.as_deref().is_some_and(|r| !r.is_empty()),
+        "a 429 must carry a Retry-After header: {text}"
+    );
+
+    // THE ordering guard: the throttled call never reached the local clear, so the
+    // re-seeded verdict is still cached. A reorder (clear before the throttle
+    // check) would have dropped it.
+    assert_eq!(
+        state.auth.cache().check("t1", "sk-victim").await,
+        hydra_core::auth::Verdict::Hit(true),
+        "a throttled invalidate must NOT clear the cache (throttle check precedes the clear): {text}"
+    );
+}
+
 /// A GET on the invalidation route must not clear anything: a prefetching client
 /// or a browser address bar is not a tenant action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1161,10 +1247,17 @@ async fn post_invalidate_query(root: &str, tenant: &str, token: &str, query: &st
     panic!("proxy never became ready at {url}");
 }
 
-/// `wait=none` is the documented escape hatch: publish and answer `202` with the
-/// `event_id`, without blocking on the fleet.
+/// `wait=none` is **accepted** on a non-cluster build: there is no convergence
+/// stream here, so the answer is `200` with `single_node` — the same answer the
+/// default `wait` produces in this build. What this test pins is that the
+/// parameter is PARSED (a misspelt value is refused, see below), not merely
+/// tolerated.
+///
+/// The real `202` "published, fleet still catching up" path is exercised at the
+/// `broadcast_and_confirm` level in `crates/hydra-server/tests/tenant_api_cluster.rs`,
+/// where an actual convergence stream exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wait_none_answers_202_without_waiting_for_the_fleet() {
+async fn wait_none_is_accepted_and_is_single_node_in_a_non_cluster_build() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;

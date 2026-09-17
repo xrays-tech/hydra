@@ -230,8 +230,8 @@ pub struct UsageAggregate {
     pub totals: UsageTotals,
     /// Group rows; empty when the query had no `group_by`.
     pub rows: Vec<UsageRow>,
-    /// Newest record this tenant has in the store, or `None` when there are
-    /// none. Lets the caller state its own consistency window (`as_of`).
+    /// Newest record in the queried window, or `None` when the window has no
+    /// records. Lets the caller state its own consistency window (`as_of`).
     pub as_of: Option<String>,
 }
 

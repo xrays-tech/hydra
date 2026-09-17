@@ -90,7 +90,7 @@ pub struct TenantApiConfig {
     /// How long `POST /auth/cache/invalidate` waits for the fleet to confirm.
     /// Elapsing is not an error — it produces `202` with the lagging nodes named.
     pub converge_timeout: std::time::Duration,
-    /// Cap on SUCCESSFUL requests per tenant per minute (design §5.1),
+    /// Cap on AUTHORISED requests per tenant per minute (design §5.1),
     /// `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`. This is the amplification budget:
     /// it is what stops one tenant's credential from spending other tenants'
     /// availability through cache fan-out and `auth_url` re-verification.
@@ -478,11 +478,29 @@ fn bearer_token(session: &Session) -> Option<&str> {
         .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            s.strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-        })
-        .filter(|t| !t.is_empty())
+        .and_then(parse_bearer)
+}
+
+/// Parse an `Authorization` header value into the Bearer token, if any.
+///
+/// RFC 9110 makes the auth-scheme case-insensitive, so `Bearer`, `bearer`,
+/// `BEARER` and any other casing are all accepted. A non-Bearer scheme, a bare
+/// scheme with no token, and an empty/whitespace-only token all yield `None` —
+/// a wrong scheme must be indistinguishable from a missing one, and neither may
+/// be mistaken for a token.
+fn parse_bearer(header: &str) -> Option<&str> {
+    // The scheme is the first ASCII-whitespace-delimited token; the remainder
+    // is the candidate token, still possibly padded with stray whitespace.
+    let (scheme, rest) = header.split_once(|c: char| c.is_ascii_whitespace())?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 /// What the gate resolved, re-exported so handlers take one argument instead of
@@ -643,4 +661,31 @@ async fn respond_error(
         "error": { "code": code, "message": message, "trace_id": ctx.trace_id }
     });
     respond_json(session, ctx, status, &body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bearer;
+
+    /// RFC 9110: the auth-scheme is case-insensitive, so every casing of
+    /// "bearer" must be accepted; a non-Bearer scheme must not be.
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        // Accepted under any casing, with the token (and any stray whitespace)
+        // returned as-is.
+        assert_eq!(parse_bearer("Bearer abc123"), Some("abc123"));
+        assert_eq!(parse_bearer("bearer abc123"), Some("abc123"));
+        assert_eq!(parse_bearer("BEARER abc123"), Some("abc123"));
+        assert_eq!(parse_bearer("BeArEr abc123"), Some("abc123"));
+        assert_eq!(parse_bearer("Bearer   padded   "), Some("padded"));
+
+        // A non-Bearer scheme is not a Bearer token at all.
+        assert_eq!(parse_bearer("Basic abc123"), None);
+
+        // A bare scheme (no token) and an empty/whitespace-only token are
+        // refused: a missing token must not be mistaken for a present one.
+        assert_eq!(parse_bearer("Bearer"), None);
+        assert_eq!(parse_bearer("Bearer "), None);
+        assert_eq!(parse_bearer("BEARER   "), None);
+    }
 }

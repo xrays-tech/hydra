@@ -171,18 +171,39 @@ async fn barrier_does_not_wait_for_a_node_that_is_not_in_the_live_set() {
             nodes_total: 1
         }
     );
+}
 
-    // An empty live set is a legitimate answer, not an error: nothing else can be
-    // serving this tenant.
-    let none = stream
-        .await_applied(event, &[], Duration::from_millis(100))
+/// The empty live set is NOT "converged". `publish` is durable once it has
+/// succeeded, but "applied on every live node" must never be asserted when no
+/// node was checked (fail-closed): the registry view is empty during the boot
+/// window before the refresh ticker first populates it, and after rows expire
+/// while Redis is still reachable — both are "stale/unpopulated", not "no peers".
+///
+/// Hermetic on purpose: the empty-set branch returns before any Redis I/O, so a
+/// pool pointed at a dead port (no real Redis) exercises exactly the logic under
+/// test and cannot hang.
+#[tokio::test]
+async fn barrier_reports_pending_not_applied_when_the_live_set_is_empty() {
+    // Nothing listens here: bind, read the port, then drop the listener.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    drop(l);
+    let url = format!("redis://{addr}");
+    let cfg = fred::types::config::Config::from_url(&url).expect("config");
+    let pool = fred::clients::Pool::new(cfg, None, None, None, 1).expect("pool");
+    let stream = InvalidationStream::new(pool);
+
+    let outcome = stream
+        .await_applied("1700000000200-0", &[], Duration::from_millis(100))
         .await;
     assert_eq!(
-        none,
-        AppliedOutcome::Applied {
+        outcome,
+        AppliedOutcome::Pending {
             nodes_applied: 0,
-            nodes_total: 0
-        }
+            nodes_total: 0,
+            lagging: Vec::new()
+        },
+        "an empty live set must be `pending` (nothing checked), never `applied`"
     );
 }
 
@@ -301,5 +322,58 @@ async fn wait_none_publishes_and_reports_pending_without_looking_at_the_fleet() 
         started.elapsed() < Duration::from_millis(200),
         "must not wait: took {:?}",
         started.elapsed()
+    );
+}
+
+/// A publish that fails (the bus cannot be reached) must be `unavailable` (503),
+/// never `applied`. This pins the publish-failure arm of `broadcast_and_confirm`,
+/// which sits BEFORE the convergence barrier: no event was enqueued, so there is
+/// nothing to confirm — the caller must not believe the fleet was told.
+#[tokio::test]
+async fn a_failed_publish_reports_unavailable_not_applied() {
+    // Nothing listens here: bind, read the port, then drop the listener.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    drop(l);
+    let url = format!("redis://{addr}");
+    let cfg = fred::types::config::Config::from_url(&url).expect("config");
+    // fred's default `default_command_timeout` is `0` (wait forever), so an
+    // `XADD` against a dead port would block until the process is killed. A
+    // short command timeout (matching the production pool's intent in
+    // `redis/mod.rs`) turns the dead bus into a fast, ordinary error, which is
+    // the condition the publish-failure arm exists to report.
+    let perf = fred::types::config::PerformanceConfig {
+        default_command_timeout: Duration::from_millis(200),
+        ..fred::types::config::PerformanceConfig::default()
+    };
+    let pool = fred::clients::Pool::new(cfg, Some(perf), None, None, 1).expect("pool");
+    // Deliberately NOT connected: publish must fail rather than hang or lie.
+    let stream = InvalidationStream::new(pool);
+
+    // Wrap in a timeout: a retrying Redis client must not hang CI.
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        hydra_server::cluster::events::broadcast_and_confirm(
+            Some(&stream),
+            Some("t1".to_string()),
+            vec!["sk-a".to_string()],
+            vec!["node-a".to_string()],
+            Some(Duration::from_millis(200)),
+        ),
+    )
+    .await
+    .expect("a dead bus must fail fast, not hang the CI");
+
+    assert_eq!(
+        report.state, "unavailable",
+        "a publish failure must be `unavailable`, never `applied`"
+    );
+    assert_eq!(
+        report.http_status, 503,
+        "the caller must not believe the fleet was told"
+    );
+    assert!(
+        report.event_id.is_none(),
+        "nothing was enqueued, so there is no event id to reconcile against"
     );
 }

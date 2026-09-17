@@ -371,12 +371,20 @@ impl InvalidationStream {
         timeout: std::time::Duration,
     ) -> AppliedOutcome {
         let deadline = tokio::time::Instant::now() + timeout;
-        // An empty live set is a legitimate answer, not an error: nothing else
-        // can be serving this tenant.
+        // An empty live set is NOT an answer, and it must never be reported as
+        // "applied". `publish` has already succeeded — the event is durable on the
+        // stream — but "converged on every live node" must not be asserted when no
+        // node was checked (fail-closed). The registry view is empty during the
+        // boot window before the refresh ticker first populates it, and after
+        // registry rows expire while Redis is still reachable; in both cases
+        // `list_nodes` (which reads the hash this node itself registered into)
+        // returning nothing means the view is stale/unpopulated, NOT "no peers
+        // exist". `Pending` (zero nodes) is the honest outcome.
         if live_nodes.is_empty() {
-            return AppliedOutcome::Applied {
+            return AppliedOutcome::Pending {
                 nodes_applied: 0,
                 nodes_total: 0,
+                lagging: Vec::new(),
             };
         }
         // The last observation, so a budget that expires between polls still

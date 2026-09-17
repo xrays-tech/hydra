@@ -106,31 +106,10 @@ type FleetView = crate::cluster::events::FleetReport;
 
 /// The same shape in a build without `cluster-redis`, which cannot be a cluster
 /// (`main` refuses `HYDRA_ROLE=leader|edge`), so the local clear IS the whole
-/// answer.
+/// answer. References the admin handler's shared type so the two endpoints
+/// cannot drift apart.
 #[cfg(not(feature = "cluster-redis"))]
-#[derive(Serialize)]
-pub struct FleetView {
-    state: &'static str,
-    nodes_total: usize,
-    nodes_applied: usize,
-    lagging: Vec<String>,
-    event_id: Option<String>,
-    waited_ms: u64,
-}
-
-#[cfg(not(feature = "cluster-redis"))]
-impl FleetView {
-    fn single_node() -> Self {
-        Self {
-            state: "single_node",
-            nodes_total: 1,
-            nodes_applied: 1,
-            lagging: Vec::new(),
-            event_id: None,
-            waited_ms: 0,
-        }
-    }
-}
+type FleetView = crate::admin::handlers::Fleet;
 
 #[derive(Serialize)]
 struct InvalidateView {
@@ -383,7 +362,7 @@ struct UsageView {
     tenant_id: String,
     since: String,
     until: String,
-    /// Newest record this tenant has in the store, or `null` when there are none.
+    /// Newest record in the queried window, or `null` when the window has none.
     /// Never an empty string: ClickHouse answers `""` for an empty set and the
     /// decoder maps that to `None`.
     as_of: Option<String>,
@@ -493,14 +472,27 @@ pub async fn usage(
                 super::respond_json(session, ctx, 200, &view).await
             }
             Err(e) => {
-                // `Decode` and `StoreUnavailable` are the same answer to the
-                // caller — "usage is unavailable right now" — while the metric
-                // label keeps them apart for the operator. Turning a decode
-                // failure into a zeroed 200 is exactly the silent lie the
-                // capability exists to prevent.
-                let result = match e {
-                    crate::usage_query::UsageQueryError::StoreUnavailable(_) => "store_unavailable",
-                    crate::usage_query::UsageQueryError::Decode(_) => "decode_error",
+                // All three map to the same 503 + code for the tenant, but the
+                // MESSAGE must differ: `store_unavailable` and `decode_error` are
+                // transient ("retry or contact the operator"), while a too-large
+                // result is permanent for this request — retrying returns the same
+                // cut-off body, so the caller must narrow the window or shrink the
+                // grouping instead. The metric label keeps the three apart for the
+                // operator. Turning any of these into a zeroed 200 is exactly the
+                // silent lie the capability exists to prevent.
+                let (result, message) = match &e {
+                    crate::usage_query::UsageQueryError::StoreUnavailable(_) => (
+                        "store_unavailable",
+                        "the usage store could not be read; retry or contact the operator",
+                    ),
+                    crate::usage_query::UsageQueryError::Decode(_) => (
+                        "decode_error",
+                        "the usage store could not be read; retry or contact the operator",
+                    ),
+                    crate::usage_query::UsageQueryError::ResultTooLarge(_) => (
+                        "result_too_large",
+                        "the usage result exceeded the gateway's response-size cap; narrow since/until or reduce group_by",
+                    ),
                 };
                 tracing::warn!(
                     target: "hydra::tenant_api",
@@ -516,14 +508,7 @@ pub async fn usage(
                     result,
                     started.elapsed(),
                 );
-                super::respond_error(
-                    session,
-                    ctx,
-                    503,
-                    "usage_store_unavailable",
-                    "the usage store could not be read; retry or contact the operator",
-                )
-                .await
+                super::respond_error(session, ctx, 503, "usage_store_unavailable", message).await
             }
         }
     }

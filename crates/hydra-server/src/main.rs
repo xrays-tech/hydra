@@ -717,26 +717,46 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             let live = live.clone();
             async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-                ticker.tick().await; // skip the immediate first tick
-                loop {
-                    ticker.tick().await;
-                    match reg.list_nodes().await {
-                        Ok(nodes) => {
-                            let ids: Vec<String> = nodes
-                                .into_iter()
-                                .filter(|n| n.alive)
-                                .map(|n| n.node_id)
-                                .collect();
-                            live.store(Arc::new(ids));
-                        }
-                        Err(e) => {
-                            // Keep the PREVIOUS view rather than reporting an
-                            // empty fleet: "no live nodes" reads as "converged"
-                            // to the barrier, which is the one failure mode that
-                            // must never be guessed at.
-                            tracing::warn!(error = %e, "live-node refresh failed; keeping the previous view");
+                // One refresh immediately, then one per second. The previous form
+                // skipped the first tick, so the view stayed empty for up to a
+                // second after boot — and an empty view must never be read as
+                // "converged". Refreshing up front shrinks that window to a single
+                // `list_nodes` round trip.
+                let refresh_once = || {
+                    // Clone the `Arc`s so the closure is `Fn` (callable every tick)
+                    // while each future owns its own handles.
+                    let reg = reg.clone();
+                    let live = live.clone();
+                    async move {
+                        match reg.list_nodes().await {
+                            Ok(nodes) => {
+                                let ids: Vec<String> = nodes
+                                    .into_iter()
+                                    .filter(|n| n.alive)
+                                    .map(|n| n.node_id)
+                                    .collect();
+                                live.store(Arc::new(ids));
+                            }
+                            Err(e) => {
+                                // Keep the PREVIOUS view rather than reporting an
+                                // empty fleet: an empty set makes the barrier
+                                // report `pending` (nobody checked), and a stale
+                                // view of nodes we KNOW were live is strictly more
+                                // informative than "we cannot enumerate the fleet".
+                                // Either way the answer is never "converged".
+                                tracing::warn!(error = %e, "live-node refresh failed; keeping the previous view");
+                            }
                         }
                     }
+                };
+                refresh_once().await;
+                // `interval`'s first tick resolves immediately; consume it so the
+                // rhythm really is "once now, then once per second" rather than two
+                // back-to-back `list_nodes` calls at boot.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    refresh_once().await;
                 }
             }
         };

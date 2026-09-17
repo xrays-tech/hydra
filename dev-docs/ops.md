@@ -54,7 +54,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `RUST_LOG` / `HYDRA_LOG` | `info` | `tracing` env filter. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
 | `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
-| `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on SUCCESSFUL requests (429 beyond it). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
+| `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on AUTHORISED requests (429 beyond it) — counts every authenticated request the node accepts for the tenant, including ones it then rejects with 4xx/5xx (only the 403 URL-tenant mismatch is exempt). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
 | `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` | `10` | Cap on FAILED authentications, per **source IP** and per **token digest** independently. |
 | `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | Once a dimension exceeds its failure budget it is locked for this long, and every request on it gets `429` (not `401`) — a locked-out guesser must not be able to tell a real token from a guessed one. |
 | `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | Per-tenant invalidation cap (429 beyond it). Each one fans out to every node and re-hits the tenant's `auth_url` from all of them. |
@@ -311,7 +311,7 @@ Response (2026-09-17): the flat `invalidated`/`tenant_id` body gained
 ```
 
 `fleet.state` is **`applied`** (200 — every live node confirmed), **`pending`**
-(202 — published, `lagging` names the nodes that have not confirmed), **`single_node`**
+(202 — published, not all confirmed; `lagging` names the laggards, or is **empty** when `nodes_total=0` because the node could not enumerate the live fleet), **`single_node`**
 (200 — this node is the whole data plane) or **`unavailable`** (503 — the channel
 exists but did not answer; **the fleet was NOT told**).
 
@@ -393,6 +393,8 @@ configured rate; the per-node bound is what the fan-out actually depends on.
 minute (default 10) because each one fans out to every node and re-hits the
 tenant's `auth_url` from all of them.
 
+> **Known limitation (no fix promised):** when a tenant-API request body exceeds the 1 MiB cap, the node replies `413` and closes the connection **without draining the rest of the body** — a client still uploading a large body may observe a connection reset before it reads the `413` body.
+
 ### 5.2 How long can a revoked key keep working? (`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`)
 
 The honest answer, in order:
@@ -443,10 +445,12 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 
 | symptom | cause | action |
 | --- | --- | --- |
-| `503 usage_store_unavailable` | the store is unreachable, OR it answered something undecodable | check `hydra_tenant_api_usage_query_total{result}`: `store_unavailable` vs `decode_error`. The tenant sees the same code either way, on purpose |
+| `503 usage_store_unavailable` | the store is unreachable, OR it answered something undecodable, OR the result exceeded the response cap | check `hydra_tenant_api_usage_query_total{result}`: `store_unavailable` / `decode_error` / `result_too_large`. The tenant sees the same code all three ways, on purpose. For `result_too_large` the fix is to narrow `since`/`until` or reduce `group_by` cardinality (see the cap note below) — **not** a retry |
 | `400 window_too_large` | window wider than `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` (default 31) | narrow the window; in ClickHouse the table's key leads with `created_at`, so a wide window scans other tenants' rows |
 | `400 invalid_since` / `invalid_until` | the bound is not RFC3339 / epoch / space-separated, or `since > until` | the response echoes the NORMALISED window — compare against what you sent |
 | latency climbs (`hydra_tenant_api_usage_query_seconds`) | wide windows | lower the window cap, and consider changing the CH table key to `ORDER BY (tenant_id, created_at)` (needs a rebuild + backfill; not done here) |
+
+> **ClickHouse usage reads are response-size-capped (~64 KiB — `MAX_CLICKHOUSE_RESPONSE` in `crates/hydra-server/src/clickhouse.rs`).** A result that exceeds the cap (a very wide `group_by` over a long window) fails the read and surfaces as `503 usage_store_unavailable` with a "narrow the query" message — **not** a retryable error. Narrow `since`/`until` or reduce `group_by` cardinality (e.g. `day` instead of `model`).
 
 ---
 
