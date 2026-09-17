@@ -438,7 +438,10 @@ cargo tree -p hydra-core --no-default-features   # 防火墙：仍无 tokio/ping
 pub tenants_by_id: HashMap<String, Tenant>,
 ```
 
-- 把构建逻辑抽成 `pub(crate) fn reindex_tenants(cfg: &mut ConfigData)`，**两个调用点共用一个实现**：`store.rs::build_config`（loader）与 `cluster/snapshot.rs::hydrate`（反序列化之后，紧跟解封 fidelity 的那一段，约 `snapshot.rs:325-340`）；
+- 把构建逻辑抽成 `pub(crate) fn reindex_tenants(cfg: &mut ConfigData)`，**两个调用点共用一个实现**：
+  - `store.rs::build_config`（loader 侧）；
+  - **`cluster/snapshot.rs::hydrate` 内部**：函数体已有 `let mut cfg = self.cfg;`（**`snapshot.rs:283`**），就在这一行之后、构造 `HydratedWire` 之前调用 `reindex_tenants(&mut cfg)`。**必须在这个位置**：`hydrate` 返回的 `HydratedWire.cfg` 随即被 `store.rs:424-434` 的 `apply_snapshot` 交给 `ReplicationContent::from_hydrated`，所以重建必须发生在**交付之前**，而不是"apply 之后"。
+- **一个必须写进代码注释的副作用**：`ReplicationContent` `derive(PartialEq)` 且持有 `Arc<ConfigData>`，而 `ConfigData` 也 derive `PartialEq` ⇒ **`tenants_by_id` 会参与"复制内容是否变化"的代际判定**。因为两侧都由同一个 `reindex_tenants` 从 `tenants_by_domain` 派生，判定仍然正确（派生字段不携带额外信息）；但它意味着实现者若在别处**手改** `tenants_by_id`（例如测试里直接 insert 却不改 domain 索引），会让代际判定出现"无源变化"。**因此：禁止在 `reindex_tenants` 之外写这个字段** —— 它只有一个写入口。
 - 因此 **`cluster/snapshot.rs` 与 `store.rs` 都要进 T2 的 Files**；
 - 同函数两处调用 ⇒ 不需要 `WIRE_VERSION` 变更；空索引只可能出现在"尚未收到第一帧快照"的 edge 上，而那时 `replication()` 为 `None` → 闸门回 503，语义正确。
 
@@ -620,13 +623,18 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
 //     The path is copied into an owned String on purpose (P1-1): `parse_route`
 //     returns a route borrowing the path, and `dispatch` takes `&mut Session`,
 //     so holding the borrow across the call is E0502.
-if self.state.tenant_api.enabled {
+if self.state.tenant_api.enabled
+    && session.req_header().uri.path().starts_with("/tenant/")
+{
+    // 只有命中的请求才分配：上面那次前缀判定是**零分配**的，所以
+    // 99.99% 的业务请求在这条 if 上付出的代价是一次字节比较，
+    // 而不是一次 String 分配。数据面热路径不得为控制面买单。
     let path = session.req_header().uri.path().to_string();
-    if path.starts_with("/tenant/") {
-        return crate::tenant_api::dispatch(&self.state, session, ctx, &path).await;
-    }
+    return crate::tenant_api::dispatch(&self.state, session, ctx, &path).await;
 }
 ```
+
+> **为什么不是"先取 owned path 再判前缀"**（P1-1 的第一版就是这么写的）：那样每个请求都会分配一个 `String`，把控制面路径的复杂度分摊到全部业务流量上。`str::starts_with` 在借用上完成判定、不产生所有权，因此这里的顺序是"**零分配判定 → 命中才 owned**"。
 
 `dispatch` 内部：`parse_route(&path)` → `Some(route)` 走下面的流程；`None` → **本地 `404 unknown path`**（并且**绝不**把该前缀交给代理管线）。
    g. `dispatch` 内：令牌闸门 → URL `tenant_id` 交叉校验（403）→ 端点分派。**接线规则（P0-1 修订，v5.3）**：
@@ -802,17 +810,37 @@ grep -rc "AuthCache::new\|AuthCache::with_clock" crates/ --include=*.rs | awk -F
 1. **红灯**（`tests/usage_query.rs`）。**注意职责边界**：JSONEachRow 的**解码**已在 T1 交付并在 `hydra-core` 单测里覆盖（T14a/T14b 的核心断言在那里，因此总在 CI 第一个 job 运行）；本任务的红灯只覆盖**传输与接线**：
    - **T14（P1-9 修订：原写法不可写）**：注入点原本在 `main.rs` 的 `bootstrap()` 里，而它是**二进制目标** —— `tests/usage_query.rs` 根本调不到。因此**把选择逻辑提取成库函数**（本任务的一个明确交付物）：
 
+     **签名必须 cfg 配对**（自查补：`clickhouse::ClickHouseConfig` 本身被 `usage-clickhouse` 门控，所以一个"总是存在"的 `select` 拿不到那个类型）：
+
      ```rust
      // usage_query.rs
-     /// 按 sink kind 选择唯一实现。`main.rs` 只调用它，测试也断言它。
+     #[cfg(feature = "usage-clickhouse")]
      pub fn select(
          sink_kind: &str,
          pool: Option<&sqlx::SqlitePool>,
          ch_cfg: Option<&clickhouse::ClickHouseConfig>,
      ) -> Result<Box<dyn UsageQuery>, SelectError>;
+
+     /// 无 CH 特性时 `sink_kind == "clickhouse"` 不可能出现（`build_sink` 会
+     /// 在启动期失败），所以这个变体只可能返回 Sqlite 实现或 Err。
+     #[cfg(not(feature = "usage-clickhouse"))]
+     pub fn select(
+         sink_kind: &str,
+         pool: Option<&sqlx::SqlitePool>,
+     ) -> Result<Box<dyn UsageQuery>, SelectError>;
      ```
 
-     T14 于是断言：`select("sqlite", Some(pool), None)` → `source()=="sqlite"`；`select("clickhouse", None, Some(cfg))` → `source()=="clickhouse"`（需 `--features usage-clickhouse`）；`select("sqlite", None, None)` → `Err`；`select("nonsense", ..)` → `Err`。**"返回假 0"的唯一守卫因此变成一条可运行的库单测**，而不是一段测不到的 `main.rs` 分支。
+     T14 于是断言（**按特性分两组**）：
+
+     | 断言 | 需要的特性 |
+     |---|---|
+     | `select("sqlite", Some(pool), …)` → `source()=="sqlite"` | 无 |
+     | `select("sqlite", None, …)` → `Err` | 无 |
+     | `select("nonsense", …)` → `Err` | 无 |
+     | `select("clickhouse", None, Some(cfg))` → `source()=="clickhouse"` | `usage-clickhouse` |
+     | `select("clickhouse", …)` 在**无特性**构建里不可构造 → 用 `#[cfg(not(...))]` 断言"该 kind 无法被选中"（`Err`）即可 | 反向 |
+
+     **"返回假 0"的唯一守卫因此变成一条可运行的库单测**，而不是一段测不到的 `main.rs` 分支；且它在**两种特性组合下都被编译并断言**。
      **T8 的测试命令必须带 `--features server,usage-clickhouse`**，否则 CH 那一半连编译都进不去（v5.2 的命令漏了这点）。
    - **T16 也属阻塞项**（P2-7）：它是设计 §4.3.2 第 2 条"多算一整天"陷阱的回归锚点，级别与 T14a/T14b 相同，必须与它们一起在 T8 的红灯清单里作为**阻塞**存在。
    - **T14a/T14b（端到端复验）**：用**假 CH 传输**（一个返回固定 `JSONEachRow` 字节的替身——它是**真实外部边界**，符合铁律 2 允许的 wiremock/进程级替身范畴）喂 `{"requests":"8"}` → 端点返回 8；喂 `{"requests":"abc"}` → **拒绝**（`decode_error`，**不是 0**）；喂 `last_seen:""` → `as_of: null`。纯函数层的等价断言在 T1，这里验的是"解码器确实被接上了"；
