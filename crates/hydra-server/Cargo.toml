@@ -74,6 +74,10 @@ proxy = [
     "dep:async-trait",
     "dep:bytes",
     "dep:http",
+    # Trusted-proxy client-IP resolution (XFF) for the tenant API's failure
+    # limiter (design §5.1, C). `tenant_api` is `#[cfg(feature = "proxy")]`, so
+    # the dependency is enabled with the proxy shell.
+    "dep:ipnet",
 ]
 # Downstream TLS backends (design §12.1). Exactly one should be combined with
 # `proxy`/`server`. Both imply `proxy` (the shell) and forward the matching
@@ -113,6 +117,10 @@ rand = { version = "0.8", optional = true }
 async-trait = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 http = { version = "1", optional = true }
+# IP/CIDR parsing for the tenant API's trusted-proxy XFF handling (feature
+# `proxy`; see `tenant_api::trusted_proxy`). Resolved from the existing
+# transitive pin, so no new download is required.
+ipnet = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }

@@ -703,6 +703,36 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // load balancer's pool and must not hold a convergence decision hostage.
     #[allow(unused_mut)]
     let mut tenant_api_cfg = hydra_server::tenant_api::TenantApiConfig::from_env();
+    // C: trust `X-Forwarded-For` only from configured trusted proxies, so the
+    // failure limiter keys on the REAL client IP behind the LB rather than the
+    // LB's egress address (design §5.1, C). A malformed value fails startup
+    // rather than silently changing bucketing; an empty/unset value trusts nobody.
+    tenant_api_cfg.trusted_proxies =
+        hydra_server::tenant_api::TenantApiConfig::trusted_proxies_from_env()
+            .map_err(Box::<dyn std::error::Error>::from)?;
+    if !tenant_api_cfg.trusted_proxies.is_empty() {
+        warn!(
+            count = tenant_api_cfg.trusted_proxies.len(),
+            "trusting X-Forwarded-For from these peers only; a trusted peer that \
+             does not strip inbound X-Forwarded-For lets clients rotate limiter buckets"
+        );
+        // Catch-all range footgun: a /0 entry trusts X-Forwarded-For from ANY
+        // peer, which makes the per-IP dimension forgeable and effectively
+        // disables it. Warn loudly but do not fail startup (the operator may
+        // have a reason, e.g. a single-node test rig behind NAT).
+        let has_catch_all = tenant_api_cfg
+            .trusted_proxies
+            .iter()
+            .any(|net| net.prefix_len() == 0);
+        if has_catch_all {
+            warn!(
+                "HYDRA_TRUSTED_PROXIES contains a catch-all range (0.0.0.0/0 or ::/0); \
+                 this trusts X-Forwarded-For from ANY peer, making the per-IP lockout \
+                 dimension forgeable and effectively disabling it. Remove the /0 entry \
+                 and list only the specific proxy IPs you control."
+            );
+        }
+    }
     // ONE live-node view, shared by the tenant API's E2 and the operator's
     // `DELETE /api/v1/auth/cache`: two views could disagree about the fleet, and
     // the whole point of the barrier is that both callers get the same answer.

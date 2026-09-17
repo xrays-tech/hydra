@@ -1412,6 +1412,7 @@ dependencies = [
  "http",
  "hydra-core",
  "include_dir",
+ "ipnet",
  "pingora",
  "pingora-core",
  "pingora-http",

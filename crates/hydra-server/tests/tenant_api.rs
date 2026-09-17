@@ -147,6 +147,67 @@ async fn send_until_ready(
     panic!("proxy never became ready at {url}");
 }
 
+/// A raw GET with a caller-controlled `X-Forwarded-For`, for the trusted-proxy
+/// tests. A real end client never sets this — only a trusted proxy does — so the
+/// test plays the proxy's role by setting it directly (its peer is 127.0.0.1).
+async fn send_with_xff(
+    c: &reqwest::Client,
+    url: &str,
+    bearer: Option<&str>,
+    xff: Option<&str>,
+) -> reqwest::Response {
+    for _ in 0..60 {
+        let mut req = c.get(url);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        if let Some(x) = xff {
+            req = req.header("x-forwarded-for", x);
+        }
+        match req.send().await {
+            Ok(r) => return r,
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    panic!("proxy never became ready at {url}");
+}
+
+/// A raw GET with TWO separate `X-Forwarded-For` header lines (as emitted by
+/// proxies that append a new line rather than merging into one). The first
+/// line is the "forged" value a client might inject; the second is the
+/// proxy-appended real client. The test relies on both lines being emitted on
+/// the wire — if reqwest collapsed them, the server would see only the first
+/// (forged) line and the discriminating assertions below would fail.
+async fn send_with_xff_two_lines(
+    c: &reqwest::Client,
+    url: &str,
+    bearer: Option<&str>,
+    first_line: &str,
+    second_line: &str,
+) -> reqwest::Response {
+    let first = reqwest::header::HeaderValue::from_str(first_line).expect("valid header value");
+    let second = reqwest::header::HeaderValue::from_str(second_line).expect("valid header value");
+    for _ in 0..60 {
+        let mut req = c.get(url);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        // Build a HeaderMap with two entries for the same key. `append` (not
+        // `insert`) ensures both are present; when serialized to the wire this
+        // produces two separate `X-Forwarded-For:` header lines.
+        let xff_name = reqwest::header::HeaderName::from_static("x-forwarded-for");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(xff_name.clone(), first.clone());
+        headers.append(xff_name, second.clone());
+        req = req.headers(headers);
+        match req.send().await {
+            Ok(r) => return r,
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    panic!("proxy never became ready at {url}");
+}
+
 async fn body_json(r: reqwest::Response) -> (u16, Value) {
     let status = r.status().as_u16();
     let text = r.text().await.unwrap_or_default();
@@ -1045,13 +1106,217 @@ async fn repeated_bad_tokens_are_throttled_then_locked_out() {
         "8 failures against a budget of 3 must eventually be refused"
     );
 
-    // ...and the refusal persists for the lockout window, even with the RIGHT
-    // token: a locked dimension must not leak whether the token exists.
-    let r = send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await;
+    // The lockout still refuses FURTHER FAILURES: another bad token is 429 (the
+    // lockout has not leaked a 401 that would tell a guesser the token "wasn't
+    // found").
+    let r = send_until_ready(&c, &url, Some("sk-still-wrong-0000000000"), None).await;
     assert_eq!(
         r.status().as_u16(),
         429,
-        "a locked-out source must stay refused, even with a valid token"
+        "the failure lockout must keep refusing further failures"
+    );
+
+    // ...and, under B1, a request that presents a VALID token is never refused
+    // by the failure lockout: the lockout only ever stops *failed*
+    // authentications. (Before B1 this asserted 429 — the cross-tenant blackout
+    // the pre-gate lockout caused behind a shared LB.)
+    let r = send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await;
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "a valid token must never be refused by the failure lockout (B1)"
+    );
+}
+
+/// C: with a trusted proxy configured, the failure limiter keys on the XFF
+/// client, NOT the shared peer. The test client's peer is 127.0.0.1; declaring it
+/// trusted makes the node read `X-Forwarded-For`. Drive one XFF client past its
+/// budget until the lockout trips, then a DIFFERENT XFF client (same peer) is
+/// still fresh — which is only possible if the bucket is the XFF, not the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trusted_proxy_keys_the_limiter_on_the_xff_client_not_the_peer() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        // A budget small enough to reach inside a test.
+        auth_fail_limit_per_min: 3,
+        lockout_secs: 60,
+        // The test client's peer (127.0.0.1) is a trusted proxy, so XFF is
+        // honoured and the limiter keys on it.
+        trusted_proxies: hydra_server::tenant_api::trusted_proxy::parse_trusted_proxies(
+            "127.0.0.1/32",
+        )
+        .expect("trusted proxy"),
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    // Drive the "1.1.1.1" bucket (the XFF client) past its budget. A FRESH token
+    // each request, so ONLY the XFF-client (IP) dimension accumulates — the token
+    // dimension can never lock (each token is distinct).
+    let mut first_429 = false;
+    for i in 0..8 {
+        let tok = format!("sk-wrong-a-{i:04}");
+        let r = send_with_xff(&c, &url, Some(&tok), Some("1.1.1.1")).await;
+        let status = r.status().as_u16();
+        if status == 429 {
+            first_429 = true;
+            break;
+        }
+        assert_eq!(status, 401, "below the budget the answer is still 401");
+    }
+    assert!(
+        first_429,
+        "8 failures from one XFF client must trip the lockout"
+    );
+
+    // A different XFF client (same peer), fresh token: NOT locked. If the limiter
+    // keyed on the peer 127.0.0.1, this would be 429.
+    let r = send_with_xff(&c, &url, Some("sk-wrong-b-0000"), Some("2.2.2.2")).await;
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "a different XFF client must not inherit the first client's lockout \
+         (the limiter keys on the XFF, not the peer)"
+    );
+}
+
+/// C: with NO trusted proxies, `X-Forwarded-For` is ignored — every failure
+/// counts against the shared peer (the LB), so different XFF values still lock the
+/// SAME peer. This is the conservative default and the whole reason a trusted
+/// proxy must be configured to key on the real client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_untrusted_peer_ignores_xff_and_locks_the_shared_peer() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        // A budget small enough to reach inside a test.
+        auth_fail_limit_per_min: 3,
+        lockout_secs: 60,
+        // No trusted proxies: XFF is ignored, so every failure is the peer.
+        trusted_proxies: Vec::new(),
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    // Two different XFF values (same token would also work, but a fresh token each
+    // request keeps ONLY the peer/IP dimension accumulating, which is the point).
+    let mut first_429 = false;
+    for i in 0..8 {
+        let tok = format!("sk-wrong-peer-{i:04}");
+        let xff = if i % 2 == 0 {
+            Some("9.9.9.9")
+        } else {
+            Some("8.8.8.8")
+        };
+        let r = send_with_xff(&c, &url, Some(&tok), xff).await;
+        let status = r.status().as_u16();
+        if status == 429 {
+            first_429 = true;
+            break;
+        }
+        assert_eq!(status, 401, "below the budget the answer is still 401");
+    }
+    assert!(
+        first_429,
+        "8 failures across two XFF values must trip the shared-peer lockout"
+    );
+
+    // A third XFF value (same peer) is locked too: XFF is ignored, so all of them
+    // share the peer's bucket.
+    let r = send_with_xff(&c, &url, Some("sk-wrong-peer-0000"), Some("7.7.7.7")).await;
+    assert_eq!(
+        r.status().as_u16(),
+        429,
+        "with no trusted proxy, every XFF shares the peer's lockout"
+    );
+}
+
+/// N-2: when a trusted proxy appends the real client as a SEPARATE header line
+/// (rather than merging into one comma-joined value), the server must collect
+/// ALL `X-Forwarded-For` lines so that a client-forged first line cannot shadow
+/// the proxy-appended real client.
+///
+/// Non-vacuousness: if reqwest emitted only one header line (or the server read
+/// only the first line), the limiter would key on the rotating forged IP and
+/// never accumulate to the budget — the 429 assertion below would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_line_xff_keys_on_the_proxy_appended_line_not_the_forged_first_line() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        auth_fail_limit_per_min: 3,
+        lockout_secs: 60,
+        trusted_proxies: hydra_server::tenant_api::trusted_proxy::parse_trusted_proxies(
+            "127.0.0.1/32",
+        )
+        .expect("trusted proxy"),
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    // The FIXED real-client IP in the second (proxy-appended) line. This is
+    // the IP the limiter must key on.
+    let real_client = "203.0.113.7";
+
+    // Drive the real_client bucket past its budget. The first (forged) line
+    // rotates per request — if the server keyed on it, each request would be a
+    // fresh bucket and no 429 would ever appear. The second line is fixed, so
+    // the limiter accumulates on real_client.
+    let mut first_429 = false;
+    for i in 0..8 {
+        let tok = format!("sk-wrong-a-{i:04}");
+        let forged = format!("10.0.0.{i}");
+        let r = send_with_xff_two_lines(&c, &url, Some(&tok), &forged, real_client).await;
+        let status = r.status().as_u16();
+        if status == 429 {
+            first_429 = true;
+            break;
+        }
+        assert_eq!(
+            status, 401,
+            "below the budget the answer is still 401 (request {i}, forged={forged})"
+        );
+    }
+    assert!(
+        first_429,
+        "8 failures with a fixed second-line IP must trip the lockout \
+         (if only the first line were read, the rotating forged IP would never \
+         accumulate to the budget)"
+    );
+
+    // After the lockout: a DIFFERENT forged first line but the SAME second line
+    // is still locked — proving the key is the second line, not the first.
+    let r =
+        send_with_xff_two_lines(&c, &url, Some("sk-wrong-b-0000"), "10.0.0.200", real_client).await;
+    assert_eq!(
+        r.status().as_u16(),
+        429,
+        "a different forged first line but the same second line must still be locked"
+    );
+
+    // A DIFFERENT second line (same peer) is a fresh bucket: NOT locked.
+    let r = send_with_xff_two_lines(
+        &c,
+        &url,
+        Some("sk-wrong-c-0000"),
+        "10.0.0.99",
+        "198.51.100.1",
+    )
+    .await;
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "a different second-line IP must be a fresh bucket (not locked)"
     );
 }
 

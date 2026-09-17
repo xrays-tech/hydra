@@ -44,6 +44,7 @@ pub mod handlers;
 pub mod limit;
 pub mod throttle;
 pub mod time_bound;
+pub mod trusted_proxy;
 
 use hydra_core::tenant_api::{parse_route, Endpoint};
 use pingora_http::ResponseHeader;
@@ -123,6 +124,14 @@ pub struct TenantApiConfig {
     /// maintains, and MUST filter `alive == true` — the registry also reports dead
     /// rows, and a dead node must not hold a convergence decision hostage.
     pub live_nodes: Option<std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Trusted proxies for `X-Forwarded-For` client-IP resolution (design §5.1, C).
+    ///
+    /// When non-empty, the failure limiter keys on the real client IP taken from
+    /// `X-Forwarded-For`, but ONLY for requests whose peer is in this list; from
+    /// any other peer the header is ignored and the peer itself is the key. Empty
+    /// (the default) preserves the old conservative behaviour: every request is
+    /// keyed on its peer, so behind a load balancer all tenants share one bucket.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl std::fmt::Debug for TenantApiConfig {
@@ -137,6 +146,7 @@ impl std::fmt::Debug for TenantApiConfig {
             .field("lockout_secs", &self.lockout_secs)
             .field("usage_max_window_days", &self.usage_max_window_days)
             .field("live_nodes", &self.live_nodes.is_some())
+            .field("trusted_proxies", &self.trusted_proxies.len())
             .finish()
     }
 }
@@ -152,6 +162,10 @@ impl Default for TenantApiConfig {
             invalidate_per_min: 10,
             usage_max_window_days: time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS,
             live_nodes: None,
+            // Trust nobody by default: `HYDRA_TRUSTED_PROXIES` is read and
+            // validated in `main` (fail-closed), not here, so a typo cannot
+            // silently change bucketing and `Default` stays infallible.
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -202,7 +216,24 @@ impl TenantApiConfig {
             // Wired by `main` for cluster nodes; a single-node build leaves it
             // `None`, and the endpoint then reports `single_node`.
             live_nodes: None,
+            // Deliberately empty here: `HYDRA_TRUSTED_PROXIES` is parsed and
+            // validated in `main` (a typo fails startup), so `from_env` stays
+            // infallible and cannot silently change bucketing.
+            trusted_proxies: Vec::new(),
         }
+    }
+
+    /// Read `HYDRA_TRUSTED_PROXIES` (a comma-separated list of IPs / CIDRs) into
+    /// the trusted-proxy list. Unset or empty → trust nobody (the conservative
+    /// default).
+    ///
+    /// Returns `Err` naming the offending entry on a malformed value: a typo here
+    /// must FAIL STARTUP, not silently disable XFF handling. Kept as a separate,
+    /// fallible function (rather than folded into [`Self::from_env`]) so the
+    /// infallible config default and the fail-closed env validation are distinct.
+    pub fn trusted_proxies_from_env() -> Result<Vec<ipnet::IpNet>, String> {
+        let raw = std::env::var("HYDRA_TRUSTED_PROXIES").unwrap_or_default();
+        trusted_proxy::parse_trusted_proxies(&raw)
     }
 }
 
@@ -254,33 +285,39 @@ pub async fn dispatch(
         .await;
     }
 
-    // 2. Limiters, BEFORE the gate.
+    // 2. The failure limiter. It is consulted ONLY where authentication FAILS —
+    //    never before the token is verified, and never on the success path.
     //
-    //    Order matters: (a) a locked dimension must be cheap to enforce, and
-    //    (b) a locked-out caller must not be able to tell a real token from a
-    //    guessed one — that is why a lockout answers 429, not 401.
-    let ip = client_ip(session);
+    //    The old pre-gate check refused EVERY request from a locked IP, valid
+    //    token included. Behind the documented LB→edge topology every tenant
+    //    shares the LB's egress IP, so ~11 bad tokens blacked out the whole
+    //    tenant API for the lockout window, renewable (design §5.1). B1 removes
+    //    that: a request that presents a VALID token is never refused by the
+    //    failure lockout. The accepted trade-off is the reversal of the
+    //    no-validity-oracle property the pre-gate check used to give — during a
+    //    lockout a guessing caller can distinguish `429` (wrong token) from
+    //    `200` (right token). That marginal guessing value is ~0 for the
+    //    ≥16-char tokens the gate enforces (MIN_TENANT_TOKEN_LEN), while the
+    //    cross-tenant DoS it removed is real, and the 403 URL-mismatch channel
+    //    below already leaks validity today.
+    let ip = client_ip(session, &state.tenant_api.trusted_proxies);
     let now = std::time::Instant::now();
     let fail_window = std::time::Duration::from_secs(60);
     let lockout = std::time::Duration::from_secs(state.tenant_api.lockout_secs);
     let presented_digest = bearer_token(session).map(limit::token_digest);
-    if let Some(r) = state
-        .tenant_api_limiter
-        .locked(&ip, presented_digest.as_deref(), now)
-    {
-        crate::admin::metrics::record_tenant_api_throttled(r.scope);
-        // Also classified as an auth failure with reason `locked`: `throttled`
-        // answers "what was refused", `auth_failures{reason}` answers "why the
-        // gate never ran". The second is what an operator graphs to see a
-        // guesser being locked out, and without it that label could never occur.
-        crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
-        return respond_throttled(session, ctx, r).await;
-    }
 
     // 2b. Gate. No token and a wrong token are the same answer on purpose.
     let gate_started = std::time::Instant::now();
     let Some(bearer) = bearer_token(session) else {
         debug!(target: "hydra::tenant_api", path = %path, "no tenant token presented");
+        // A locked caller must not extend its own lockout: answer 429 without
+        // recording another failure (B1 — the lockout only ever grows from real
+        // failures, never from a caller that is already locked).
+        if let Some(r) = state.tenant_api_limiter.locked(&ip, None, now) {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
+            return respond_throttled(session, ctx, r).await;
+        }
         if let Some(r) = state.tenant_api_limiter.record_failure(
             &ip,
             None,
@@ -306,6 +343,16 @@ pub async fn dispatch(
         Ok(a) => a,
         Err(auth::AuthError::Unauthorized) => {
             debug!(target: "hydra::tenant_api", path = %path, "tenant token rejected");
+            // Same as the missing-token branch: a locked caller answers 429
+            // without recording another failure (B1).
+            if let Some(r) = state
+                .tenant_api_limiter
+                .locked(&ip, presented_digest.as_deref(), now)
+            {
+                crate::admin::metrics::record_tenant_api_throttled(r.scope);
+                crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
+                return respond_throttled(session, ctx, r).await;
+            }
             crate::admin::metrics::record_tenant_api_auth_failure(
                 "unknown",
                 gate_started.elapsed(),
@@ -404,7 +451,7 @@ pub async fn dispatch(
     }
 }
 
-/// The client's source IP, as a limiter key.
+/// The client IP, as a limiter key.
 ///
 /// **The port is dropped, and that is load-bearing**: `Session::client_addr()`
 /// returns `SocketAddr`, i.e. `ip:port`, and every request arrives on a NEW
@@ -413,22 +460,62 @@ pub async fn dispatch(
 /// the limiter would look installed and enforce nothing. (The end-to-end lockout
 /// test is what caught this.)
 ///
-/// `X-Forwarded-For` is deliberately NOT consulted: it is caller-controlled, so
-/// using it would let an attacker choose its own bucket. Behind a load balancer
-/// every request therefore shares the balancer's address, which is the
-/// conservative direction (it can only throttle more, never less).
+/// `X-Forwarded-For` is caller-controlled, so it is honoured ONLY when the
+/// connecting peer is one of `trusted` (design §5.1, C):
+///
+/// - `trusted` empty (the default) preserves the old conservative behaviour:
+///   the header is ignored and the peer is the key, so behind a load balancer
+///   every tenant shares the LB's bucket (it can only throttle more, never less).
+/// - `trusted` non-empty: for a peer in the list the key is the
+///   rightmost-non-trusted entry of the header (see
+///   [`trusted_proxy::resolve_client_ip`]); for any other peer the header is
+///   ignored and the peer is the key, so a spoofing client cannot rotate buckets.
+///
+/// Multiple `X-Forwarded-For` header **lines** (as emitted by HAProxy and other
+/// proxies that append rather than merge) are concatenated in order before the
+/// rightmost-non-trusted walk, so the proxy-appended real client is found even
+/// when a client-forged first line precedes it.
+///
+/// The misconfiguration risk is real and is warned about at startup: a trusted
+/// peer that does NOT strip inbound `X-Forwarded-For` lets clients choose their
+/// own bucket and evade the per-IP budget.
 ///
 /// `unknown` when the session carries no address at all (an in-process test
-/// harness): one shared bucket, again the conservative direction.
-fn client_ip(session: &Session) -> String {
+/// harness): one shared bucket, again the conservative direction. A non-Inet
+/// peer (a Unix socket) has no IP to resolve, so its whole rendering is used.
+fn client_ip(session: &Session, trusted: &[ipnet::IpNet]) -> String {
     match session.client_addr() {
         // `as_inet()` drops the port (and the Unix-socket / unnamed variants,
-        // which fall back to their whole rendering — a bounded set of keys, not
-        // a per-connection one).
-        Some(a) => a
-            .as_inet()
-            .map(|s| s.ip().to_string())
-            .unwrap_or_else(|| a.to_string()),
+        // which have no IP to consult, so they fall back to their whole
+        // rendering — a bounded set of keys, not a per-connection one).
+        Some(a) => match a.as_inet() {
+            Some(s) => {
+                let peer = s.ip();
+                // Collect ALL `x-forwarded-for` header lines in order. Some
+                // proxies (notably HAProxy) append a new line rather than
+                // merging into one comma-joined value, so a client-forged first
+                // line must not shadow the proxy-appended real client in a
+                // later line. Joining them into one string lets the existing
+                // rightmost-non-trusted walk in `resolve_client_ip` find the
+                // correct entry.
+                let xff: Option<String> = {
+                    let values = session
+                        .req_header()
+                        .headers
+                        .get_all("x-forwarded-for")
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .collect::<Vec<_>>();
+                    if values.is_empty() {
+                        None
+                    } else {
+                        Some(values.join(", "))
+                    }
+                };
+                trusted_proxy::resolve_client_ip(peer, xff.as_deref(), trusted).to_string()
+            }
+            None => a.to_string(),
+        },
         None => "unknown".to_string(),
     }
 }

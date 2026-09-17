@@ -32,6 +32,17 @@
 //! only the failure dimension for the digest they are guessing, which stops
 //! mattering the moment they stop).
 //!
+//! ## The lockout is consulted only on the failure path (B1)
+//!
+//! `locked` is checked before a *failed* authentication is recorded, so a locked
+//! caller is refused with `429` without extending its own lockout. It is NEVER
+//! consulted on the success path: a request that presents a VALID token is never
+//! refused by these budgets. That is the fix for the cross-tenant blackout behind
+//! a shared load balancer (every tenant on the LB's egress IP), and the price is
+//! the deliberate reversal of the old no-validity-oracle property — during a
+//! lockout a guesser can tell `429` (wrong) from `200` (right). See
+//! [`record_failure`] for why the marginal guessing value is ~0.
+//!
 //! ## Bound, stated honestly
 //!
 //! Every window lives in this process: an N-node fleet allows N times the
@@ -74,11 +85,16 @@ impl TenantApiLimiter {
         Self::default()
     }
 
-    /// Refuse before the gate even runs when this caller is locked out.
+    /// Whether a caller's failure dimensions are currently locked out.
     ///
-    /// Checked FIRST on purpose: a locked dimension must not be allowed to keep
-    /// spending work (the whole point of a lockout, as opposed to a rate limit,
-    /// is that it is cheap to enforce).
+    /// Consulted on the FAILURE path only (design §5.1, B1): it is checked before
+    /// a failed authentication is recorded, so a locked caller is refused with
+    /// `429` without extending its own lockout. It is NEVER consulted on the
+    /// success path — a request that presents a valid token is never refused by
+    /// the failure lockout, which is exactly the fix for the cross-tenant
+    /// blackout behind a shared LB. A locked dimension must be cheap to enforce
+    /// (the whole point of a lockout, as opposed to a rate limit), which is why
+    /// this is a pure check over `locks`.
     #[must_use]
     pub fn locked(&self, ip: &str, token_digest: Option<&str>, now: Instant) -> Option<Refused> {
         for (scope, key) in self.dimensions(ip, token_digest) {
@@ -119,8 +135,13 @@ impl TenantApiLimiter {
     /// dimension once it goes over its budget.
     ///
     /// Returns the refusal for the CURRENT request when the budget was already
-    /// spent, so the caller answers `429` instead of `401` — a locked-out caller
-    /// must not be able to tell whether the token it guessed exists.
+    /// spent, so the caller answers `429` instead of `401` for THAT failure. Note
+    /// the deliberate reversal of the old no-validity-oracle property (design
+    /// §5.1, B1): this only ever refuses *failed* authentications. A request that
+    /// presents a VALID token is never refused by these budgets — during a lockout
+    /// a guesser CAN tell `429` (wrong) from `200` (right). That is accepted
+    /// because the marginal guessing value is ~0 for ≥16-char tokens, while the
+    /// cross-tenant DoS the old pre-gate lockout caused is real.
     pub fn record_failure(
         &self,
         ip: &str,

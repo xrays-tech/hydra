@@ -56,7 +56,8 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
 | `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on AUTHORISED requests (429 beyond it) — counts every authenticated request the node accepts for the tenant, including ones it then rejects with 4xx/5xx (only the 403 URL-tenant mismatch is exempt). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
 | `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` | `10` | Cap on FAILED authentications, per **source IP** and per **token digest** independently. |
-| `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | Once a dimension exceeds its failure budget it is locked for this long, and every request on it gets `429` (not `401`) — a locked-out guesser must not be able to tell a real token from a guessed one. |
+| `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | Once a dimension exceeds its failure budget it is locked for this long. **The lockout is consulted only on the authentication-failure path**: a request with a valid token is never refused by it, so a locked-out guesser **can** distinguish `429` (wrong token) from `200` (right token) — the no-validity-oracle property is deliberately given up (marginal guessing value ≈ 0 at ≥16-char tokens, and the `403` URL-tenant-mismatch channel already exposes validity). |
+| `HYDRA_TRUSTED_PROXIES` | *(unset)* | Comma-separated **IP or CIDR** allowlist of reverse proxies whose `X-Forwarded-For` is trusted (IPv4/IPv6; a bare IP is treated as /32 or /128). Unset/empty = trust nobody (use the socket peer IP — the conservative default). When the peer is trusted, the per-IP limiter reads **all** `X-Forwarded-For` header lines (in order) and keys on the **rightmost** address that is not itself a trusted proxy, falling back to the peer when there is no `X-Forwarded-For` / all entries are trusted proxies / any entry is invalid. **A malformed entry fails startup.** Misconfiguration risk: trusting a proxy that does not strip inbound `X-Forwarded-For` lets a client forge it and rotate its per-IP bucket, effectively disabling the per-IP dimension. |
 | `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | Per-tenant invalidation cap (429 beyond it). Each one fans out to every node and re-hits the tenant's `auth_url` from all of them. |
 | `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` | `31` | E3 window ceiling. Not cosmetic: the ClickHouse table's key leads with `created_at`, so a wide window scans every tenant's rows in it. |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
@@ -380,13 +381,31 @@ An invalid/missing/unconfigured token is 401 (fail-closed), worded identically
 for "no token" and "wrong token". Lost token ⇒ the operator rotates it (the API
 never returns it).
 
-The failure budget keys on the **socket peer IP**, never `X-Forwarded-For` (a
-caller-controlled header must not choose its own bucket). Behind a load balancer
-every request therefore shares the balancer's address — conservative, but it means
-the per-IP budget is effectively a fleet-wide one there: raise
-`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` if legitimate clients are being
-throttled. All windows are per-process, so an N-node fleet allows N times the
-configured rate; the per-node bound is what the fan-out actually depends on.
+The failure budget is a **lockout**, not just throttling: when a dimension (per
+**source IP**, per **token digest**, or per **tenant**) exceeds its budget it is
+locked for `HYDRA_TENANT_API_LOCKOUT_SECS` (default 900), and once that failure
+window rolls the attacker can re-trip it (~11 requests / 15 min) — so the
+interruption is effectively renewable. Under B1 the lockout is consulted **only on
+the authentication-failure path**: a request carrying a **valid token is never
+refused** by it. The old whole-API blackout for co-located tenants therefore no
+longer occurs — what remains is that **failed** attempts from clients sharing an
+egress IP are counted together. The budget keys on the **socket peer IP**, never
+`X-Forwarded-For` (a caller-controlled header must not choose its own bucket);
+behind a load balancer every request shares the balancer's address, so the per-IP
+budget is effectively fleet-wide there. **Do not** "fix" legitimate-client
+throttling by raising `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` — raising it
+proportionally raises the token-guessing budget (the dimension's purpose), so it is
+not a free mitigation. Instead configure `HYDRA_TRUSTED_PROXIES` when behind a
+trusted LB (so the per-IP dimension keys on the real client), and/or rate-limit per
+real client IP at the LB/WAF. All windows are per-process, so an N-node fleet
+allows N times the configured rate; the per-node bound is what the fan-out actually
+depends on.
+
+> **`HYDRA_TRUSTED_PROXIES` deployment checklist (read before setting it):**
+> - **Confirm the LB both appends and strips.** It must **append** the real client IP to `X-Forwarded-For` **and** **strip/override any inbound `X-Forwarded-For`** from the client. Trusting a proxy that forwards a client-supplied XFF unmodified lets clients forge the header and rotate limiter buckets — the per-IP budget is **silently defeated**.
+> - **Multiple header lines are handled.** The node reads **all** `X-Forwarded-For` header lines (in order) and walks right-to-left skipping trusted proxies, so both the merged-single-header form and the separate-line append form (common in HAProxy) resolve correctly.
+> - **Catch-all disables the per-IP dimension.** A `0.0.0.0/0` or `::/0` entry trusts XFF from **any** peer and therefore defeats the per-IP dimension; the node **warns loudly at startup** but does not refuse to start.
+> - **Observability.** Watch `hydra_tenant_api_auth_failures_total{reason}`: many **distinct IPs accelerating in unison** is the signature of a misconfigured (non-stripping) trusted proxy, not a single-source guesser.
 
 `503 not_ready` means this node has no configuration snapshot yet — retry.
 `429 rate_limited` carries `Retry-After`; invalidations are capped per tenant per
