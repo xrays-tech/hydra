@@ -28,6 +28,77 @@ type StreamRows =
 /// The generation counter key (bumped on trim-overflow).
 pub const GENERATION_KEY: &str = "hydra:{ctl:gen}";
 
+/// One key PER NODE: `hydra:{ctl:inv:applied}:<node_id>` → last fully-applied
+/// stream id.
+///
+/// A hash would need fred's private `Map` type at the call site; more to the
+/// point, the waiter already holds the live-node list, so it can `MGET` exactly
+/// those keys. That also keeps the read bounded by the live set rather than by
+/// every node id that has ever published.
+///
+/// ## Why this key exists
+///
+/// The consumer has always tracked its read position in a LOCAL variable
+/// (`last_id` inside `spawn_invalidation_consumer`) and has never published it.
+/// So before this key, nothing anywhere could answer "has the fleet applied the
+/// event I just published?" — a publisher only knew it had enqueued something,
+/// and the HTTP answer it gave the tenant (`published: true`) said exactly that
+/// and no more. A tenant that had just banned a key could not tell whether other
+/// nodes were still serving it.
+///
+/// The watermark is what makes the difference observable: a publisher waits
+/// until every LIVE node's watermark has reached its event id, and reports the
+/// truth when they have not.
+pub const APPLIED_KEY_PREFIX: &str = "hydra:{ctl:inv:applied}:";
+
+/// TTL on a watermark. It is only ever read for nodes the registry calls LIVE,
+/// so the TTL exists purely to bound key growth after a node is rebuilt with a
+/// new identity — not to expire the answer of a live node.
+const APPLIED_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// The watermark key for one node.
+#[must_use]
+pub fn applied_key(node_id: &str) -> String {
+    format!("{APPLIED_KEY_PREFIX}{node_id}")
+}
+
+/// Compare two Redis stream ids (`<ms>-<seq>`), which are NOT comparable as
+/// plain strings (`"9-1" > "10-0"` lexicographically but not chronologically).
+#[must_use]
+pub fn stream_id_ge(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> (u64, u64) {
+        match s.split_once('-') {
+            Some((ms, seq)) => (ms.parse().unwrap_or(0), seq.parse().unwrap_or(0)),
+            None => (s.parse().unwrap_or(0), 0),
+        }
+    };
+    parse(a) >= parse(b)
+}
+
+/// The outcome of waiting for the fleet to apply one event.
+///
+/// There is deliberately NO `SingleNode` variant: this is a method on a stream,
+/// and "there is no stream" means there is no object to call it on. The call site
+/// decides that case, because only it can see the `Option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedOutcome {
+    /// Every live node has applied at least the given event.
+    Applied {
+        nodes_applied: usize,
+        nodes_total: usize,
+    },
+    /// The deadline passed with nodes still behind. The `lagging` list names
+    /// them, so an operator can act instead of guessing.
+    Pending {
+        nodes_applied: usize,
+        nodes_total: usize,
+        lagging: Vec<String>,
+    },
+    /// The barrier itself could not run (the bus became unreachable). Never
+    /// reported as "applied": a barrier that cannot check must not claim success.
+    Unavailable(String),
+}
+
 /// One invalidation event as published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalidation {
@@ -83,6 +154,146 @@ impl InvalidationStream {
         }
         let id: String = self.pool.xadd(EVENTS_KEY, false, None, "*", fields).await?;
         Ok(id)
+    }
+
+    /// Record that `node_id` has FULLY applied everything up to `event_id`.
+    ///
+    /// **Call order is load-bearing: apply first, acknowledge second.** An
+    /// acknowledgement written before the clear would let the publisher tell the
+    /// tenant "applied everywhere" while this node was still serving the stale
+    /// verdict — the barrier would certify exactly the thing it exists to detect.
+    pub async fn mark_applied(&self, node_id: &str, event_id: &str) -> Result<(), RedisError> {
+        let _: Option<String> = self
+            .pool
+            .set(
+                applied_key(node_id),
+                event_id,
+                Some(Expiration::EX(APPLIED_TTL_SECS)),
+                None,
+                false,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The applied watermark of each node in `nodes`, as currently published.
+    ///
+    /// Read with ONE `MGET`: asking node by node would turn a bounded wait into
+    /// N round trips per poll.
+    pub async fn applied_watermarks(
+        &self,
+        nodes: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, RedisError> {
+        let mut out = std::collections::HashMap::with_capacity(nodes.len());
+        if nodes.is_empty() {
+            return Ok(out);
+        }
+        let keys: Vec<String> = nodes.iter().map(|n| applied_key(n)).collect();
+        let values: Vec<Option<String>> = self.pool.mget(keys).await?;
+        for (node, v) in nodes.iter().zip(values) {
+            if let Some(id) = v {
+                out.insert(node.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Wait until every node in `live_nodes` has applied `event_id`, or the
+    /// deadline passes.
+    ///
+    /// Only LIVE nodes are awaited: a node whose heartbeat has expired is not in
+    /// the registry, is not receiving traffic from the load balancer, and must not
+    /// hold a convergence decision hostage. The caller passes exactly the live
+    /// set (and must filter `alive == true` from the registry, which also reports
+    /// dead rows).
+    ///
+    /// Polling rather than a pub/sub notification, deliberately: the wait is
+    /// bounded (typically tens of milliseconds), the alternative adds a second
+    /// channel to keep correct, and a missed notification would turn into a
+    /// timeout — i.e. a false "not applied" for a fleet that did apply.
+    pub async fn await_applied(
+        &self,
+        event_id: &str,
+        live_nodes: &[String],
+        timeout: std::time::Duration,
+    ) -> AppliedOutcome {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // An empty live set is a legitimate answer, not an error: nothing else
+        // can be serving this tenant.
+        if live_nodes.is_empty() {
+            return AppliedOutcome::Applied {
+                nodes_applied: 0,
+                nodes_total: 0,
+            };
+        }
+        // The last observation, so a budget that expires between polls still
+        // reports WHICH nodes were behind rather than collapsing to "all of them".
+        let mut last: Option<(usize, Vec<String>)> = None;
+        loop {
+            // EVERY poll is bounded by what is left of the budget. Without this,
+            // a Redis client that keeps retrying a dead connection would hold the
+            // tenant's request open indefinitely — the deadline would never be
+            // reached because a single `await` never returned. A poll that cannot
+            // complete in the remaining time is reported as Unavailable
+            // (fail-closed), never as "applied".
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let polled = tokio::time::timeout(remaining, self.applied_watermarks(live_nodes)).await;
+            let polled = match polled {
+                Ok(r) => r,
+                Err(_) => {
+                    return AppliedOutcome::Unavailable(
+                        "the watermark read did not complete within the convergence budget".into(),
+                    )
+                }
+            };
+            match polled {
+                Ok(marks) => {
+                    let lagging: Vec<String> = live_nodes
+                        .iter()
+                        .filter(|n| {
+                            marks
+                                .get(n.as_str())
+                                .is_none_or(|id| !stream_id_ge(id, event_id))
+                        })
+                        .cloned()
+                        .collect();
+                    if lagging.is_empty() {
+                        return AppliedOutcome::Applied {
+                            nodes_applied: live_nodes.len(),
+                            nodes_total: live_nodes.len(),
+                        };
+                    }
+                    let applied = live_nodes.len() - lagging.len();
+                    if tokio::time::Instant::now() >= deadline {
+                        return AppliedOutcome::Pending {
+                            nodes_applied: applied,
+                            nodes_total: live_nodes.len(),
+                            lagging,
+                        };
+                    }
+                    last = Some((applied, lagging));
+                }
+                Err(e) => return AppliedOutcome::Unavailable(e.to_string()),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Budget exhausted between polls: report the last real observation.
+        match last {
+            Some((nodes_applied, lagging)) => AppliedOutcome::Pending {
+                nodes_applied,
+                nodes_total: live_nodes.len(),
+                lagging,
+            },
+            // Never managed a single read inside the budget.
+            None => AppliedOutcome::Pending {
+                nodes_applied: 0,
+                nodes_total: live_nodes.len(),
+                lagging: live_nodes.to_vec(),
+            },
+        }
     }
 
     /// Read events newer than `last_id` (up to `count`). `"0"` reads from the
@@ -288,6 +499,7 @@ pub fn spawn_invalidation_consumer(
     stream: InvalidationStream,
     auth: std::sync::Arc<crate::http::HttpAuthChecker>,
     store: crate::store::ConfigStore,
+    node_id: String,
 ) {
     tokio::spawn(async move {
         let mut last_id = "0".to_string();
@@ -316,6 +528,23 @@ pub fn spawn_invalidation_consumer(
                         // the node that received the request — never on an
                         // edge data-plane node consuming the stream).
                         crate::admin::metrics::record_auth_cache_size(auth.cache().len());
+                        // ACKNOWLEDGE THE WHOLE BATCH, AFTER APPLYING IT.
+                        // This is the order the barrier depends on: a publisher
+                        // waits for this watermark, and an acknowledgement
+                        // written before the clear would let it tell a tenant
+                        // "applied everywhere" while this node was still serving
+                        // the stale verdict. One write per batch, not per event:
+                        // the watermark is a position, not a log.
+                        if let Err(e) = stream.mark_applied(&node_id, &last_id).await {
+                            // The clear DID happen here; only the evidence did
+                            // not land. Reported so a publisher sees this node as
+                            // lagging rather than silently believing it.
+                            tracing::warn!(
+                                error = %e,
+                                node = %node_id,
+                                "invalidation applied but the watermark write failed;                                  publishers will see this node as lagging"
+                            );
+                        }
                     }
                     match stream.generation().await {
                         Ok(g) if g != gen => {
@@ -324,6 +553,15 @@ pub fn spawn_invalidation_consumer(
                                 generation = g,
                                 "invalidation generation bumped; clearing local auth cache (L1 + L2)"
                             );
+                            // DELIBERATELY NO WATERMARK ADVANCE HERE. A bump means
+                            // the stream was trimmed, so the events between our last
+                            // read and the trim are GONE — their ids are unknowable,
+                            // and a node may not account for an event it never read.
+                            // The whole-cache clear below supersedes their EFFECT
+                            // (everything is gone), but the barrier must keep
+                            // reporting those events as unapplied rather than claim
+                            // a position it cannot name. Conservative on purpose:
+                            // report "not converged" rather than lie about it.
                             // L1 **and** L2 (B2): clearing only the L1 let the
                             // next `check` re-hydrate the very verdict this
                             // clear exists to drop, for the rest of its TTL.
@@ -789,7 +1027,7 @@ mod tests {
                 .expect("publish");
         }
 
-        spawn_invalidation_consumer(stream.clone(), auth.clone(), store);
+        spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
         let started = std::time::Instant::now();
         let mut drained = false;
         for _ in 0..400 {
@@ -841,7 +1079,7 @@ mod tests {
             std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
         );
 
-        spawn_invalidation_consumer(stream.clone(), auth.clone(), store);
+        spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
         spawn_trim_task(stream.clone(), 2, Duration::from_millis(20));
 
         // Publish past maxlen (2) → the trim task removes 3 → bumps.

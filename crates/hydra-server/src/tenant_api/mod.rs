@@ -41,6 +41,7 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod throttle;
 
 use hydra_core::tenant_api::{parse_route, Endpoint};
 use pingora_http::ResponseHeader;
@@ -66,17 +67,51 @@ pub const MIN_TENANT_TOKEN_LEN: usize = 16;
 /// that is read but ignored is the "ghost switch" this repository has been
 /// bitten by — see the historical `[proxy] non_route_strategy` in `design.md`
 /// §15.1 — so parameters are added by the task that makes them take effect.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct TenantApiConfig {
     /// Master switch (`HYDRA_TENANT_API`, default on). When off, `request_filter`
     /// does not intercept anything under `/tenant/` and the process behaves
     /// exactly as it did before this API existed.
     pub enabled: bool,
+    /// How long `POST /auth/cache/invalidate` waits for the fleet to confirm.
+    /// Elapsing is not an error — it produces `202` with the lagging nodes named.
+    pub converge_timeout: std::time::Duration,
+    /// Cap on invalidations per tenant per minute. Each one costs the auth-cache
+    /// fan-out, an upstream re-verification wave on every affected node, and — if
+    /// the stream is trimmed past a lagging consumer — a fleet-wide whole-cache
+    /// clear. That is too much power to hand a single tenant's credential without
+    /// a ceiling.
+    pub invalidate_per_min: u32,
+    /// The ids of the LIVE data-plane nodes, or `None` off-cluster.
+    ///
+    /// Injected as a closure rather than by handing `AppState` the node registry:
+    /// the data plane must not gain the ability to talk to its peers (design
+    /// §6.4, decision A-1). The closure reads a registry the node already
+    /// maintains, and MUST filter `alive == true` — the registry also reports dead
+    /// rows, and a dead node must not hold a convergence decision hostage.
+    pub live_nodes: Option<std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for TenantApiConfig {
+    /// Manual: a boxed closure has no `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantApiConfig")
+            .field("enabled", &self.enabled)
+            .field("converge_timeout", &self.converge_timeout)
+            .field("invalidate_per_min", &self.invalidate_per_min)
+            .field("live_nodes", &self.live_nodes.is_some())
+            .finish()
+    }
 }
 
 impl Default for TenantApiConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            converge_timeout: std::time::Duration::from_millis(2_000),
+            invalidate_per_min: 10,
+            live_nodes: None,
+        }
     }
 }
 
@@ -93,7 +128,25 @@ impl TenantApiConfig {
             ),
             Err(_) => true,
         };
-        Self { enabled }
+        let converge_timeout = std::env::var("HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| std::time::Duration::from_millis(2_000));
+        let invalidate_per_min = std::env::var("HYDRA_TENANT_API_INVALIDATE_PER_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(10);
+        Self {
+            enabled,
+            converge_timeout,
+            invalidate_per_min,
+            // Wired by `main` for cluster nodes; a single-node build leaves it
+            // `None`, and the endpoint then reports `single_node`.
+            live_nodes: None,
+        }
     }
 }
 
@@ -113,6 +166,27 @@ pub async fn dispatch(
     let Some(route) = parse_route(path) else {
         return respond_error(session, ctx, 404, "not_found", "unknown path").await;
     };
+
+    // 1b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
+    //     a method-agnostic handler would let a prefetching client, a
+    //     mis-configured health check or a browser address bar clear caches.
+    //     The method contract belongs to ROUTING, not to each handler, so it is
+    //     checked once here.
+    let expected = match route.endpoint {
+        Endpoint::Whoami | Endpoint::Usage => "GET",
+        Endpoint::InvalidateAuthCache => "POST",
+    };
+    let method = session.req_header().method.as_str();
+    if method != expected {
+        return respond_error(
+            session,
+            ctx,
+            405,
+            "method_not_allowed",
+            &format!("{} requires {expected}", path),
+        )
+        .await;
+    }
 
     // 2. Gate. No token and a wrong token are the same answer on purpose.
     let Some(bearer) = bearer_token(session) else {
@@ -185,9 +259,12 @@ pub async fn dispatch(
         // same local 404 the path produced before this API existed — a routing
         // skeleton, not a stub: the behaviour is correct for a route that is not
         // served yet.
-        Endpoint::InvalidateAuthCache | Endpoint::Usage => {
-            respond_error(session, ctx, 404, "not_found", "unknown path").await
+        // T6: E2 is wired.
+        Endpoint::InvalidateAuthCache => {
+            handlers::invalidate(state, session, ctx, &authenticated).await
         }
+        // T8 replaces this arm.
+        Endpoint::Usage => respond_error(session, ctx, 404, "not_found", "unknown path").await,
     }
 }
 
@@ -224,6 +301,93 @@ pub(super) async fn respond_json<T: serde::Serialize>(
     let mut header = ResponseHeader::build(status, Some(3))?;
     header.insert_header("Content-Type", "application/json")?;
     header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+    header.insert_header("Content-Length", body.len().to_string())?;
+    session.set_keepalive(None);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(true)
+}
+
+/// Read the whole request body, bounded.
+///
+/// The tenant API is a control surface: its bodies are a key list, never a
+/// payload. The cap therefore exists to stop an anonymous-looking caller (the
+/// gate runs before this, but the body is read before the handler decides
+/// anything) from making the node buffer arbitrarily, not to accommodate large
+/// legitimate requests.
+pub(super) async fn read_body(session: &mut Session) -> Result<Vec<u8>, (u16, Vec<u8>)> {
+    const MAX_BODY: usize = 1024 * 1024;
+    let mut buf = Vec::new();
+    loop {
+        match session.as_downstream_mut().read_request_body().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > MAX_BODY {
+                    // A small tuple, not a whole `Response`: the error is only
+                    // ever re-emitted immediately, and a `Response` in the Err
+                    // variant is large enough that clippy objects (rightly).
+                    return Err((
+                        413,
+                        br#"{"error":{"code":"payload_too_large","message":"request body exceeds 1 MiB"}}"#
+                            .to_vec(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(buf),
+            Err(e) => {
+                tracing::warn!(error = %e, "tenant API: reading the request body failed");
+                return Err((
+                    400,
+                    br#"{"error":{"code":"invalid_request","message":"could not read the request body"}}"#
+                        .to_vec(),
+                ));
+            }
+        }
+    }
+}
+
+/// Write an already-built error response, re-emitting it through this module's
+/// writer so the envelope, the trace header and the termination behaviour stay
+/// uniform no matter which helper produced the body.
+pub(super) async fn respond_raw(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    status: u16,
+    body: Vec<u8>,
+) -> pingora_core::Result<bool> {
+    ctx.status_code = status;
+    let mut header = ResponseHeader::build(status, Some(3))?;
+    header.insert_header("Content-Type", "application/json")?;
+    header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+    header.insert_header("Content-Length", body.len().to_string())?;
+    session.set_keepalive(None);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(bytes::Bytes::from(body)), true)
+        .await?;
+    Ok(true)
+}
+
+/// `respond_json` plus `Retry-After`, for the rate-limited answer.
+pub(super) async fn respond_json_with_retry_after<T: serde::Serialize>(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    status: u16,
+    body: &T,
+    retry_after_secs: u64,
+) -> pingora_core::Result<bool> {
+    ctx.status_code = status;
+    let body = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    let mut header = ResponseHeader::build(status, Some(4))?;
+    header.insert_header("Content-Type", "application/json")?;
+    header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+    header.insert_header("Retry-After", retry_after_secs.to_string())?;
     header.insert_header("Content-Length", body.len().to_string())?;
     session.set_keepalive(None);
     session

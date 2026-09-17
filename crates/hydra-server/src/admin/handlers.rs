@@ -663,7 +663,7 @@ fn sha256_hex_str(s: &str) -> String {
 ///
 /// `pub(super)` so the admin service's own gates (`cluster token` on
 /// `/api/v1/internal/*`) share the same primitive instead of using `==`.
-pub(super) fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1554,15 +1554,15 @@ struct InvalidateResponse {
 /// uncapped list lets one request (a *tenant* token is enough) write a
 /// multi-hundred-MB entry onto the shared backbone — and, before that, issue
 /// two Redis commands per key (`DEL` + `SREM`). 1000 keys ⇒ ~65 KB per entry.
-pub(super) const MAX_INVALIDATION_KEYS: usize = 1_000;
+pub(crate) const MAX_INVALIDATION_KEYS: usize = 1_000;
 
 /// Cap on a single api-key's length. Real keys are short; this only blocks
 /// abuse of the field as arbitrary payload.
-pub(super) const MAX_API_KEY_LEN: usize = 4_096;
+pub(crate) const MAX_API_KEY_LEN: usize = 4_096;
 
 /// Reject an invalidation request that names too many keys, or a key that is
 /// absurdly long. `None` = acceptable.
-fn invalidate_shape_error(keys: Option<&[String]>, trace_id: &str) -> Option<Resp> {
+pub(crate) fn invalidate_shape_error(keys: Option<&[String]>, trace_id: &str) -> Option<Resp> {
     let keys = keys?;
     if keys.len() > MAX_INVALIDATION_KEYS {
         return Some(err_json(

@@ -24,6 +24,8 @@
 //! generation of the snapshot and answered from another.
 
 use hydra_core::auth::sha256_hex_string;
+
+use constant_time_eq as ct_eq;
 use hydra_core::config::ConfigData;
 use hydra_core::model::Tenant;
 
@@ -70,7 +72,7 @@ pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTe
     // Fold over every row, so the work does not depend on where a match is.
     let mut matched: Option<&str> = None;
     for (tenant_id, stored) in hashes.iter() {
-        if constant_time_eq(&present, stored) {
+        if ct_eq(&present, stored) {
             matched = Some(tenant_id.as_str());
         }
     }
@@ -94,26 +96,14 @@ pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTe
     }
 }
 
-/// Constant-time string comparison.
+/// Constant-time string comparison — the SAME implementation the admin
+/// token gate and the tenant-token gate on the admin plane use.
 ///
-/// Length is compared first (an unavoidable early return, but both operands here
-/// are always 64-character hex digests, so it leaks nothing useful); the content
-/// comparison then accumulates every byte difference instead of stopping at the
-/// first one. A plain `==` on `&str` stops at the first differing byte, which is
-/// a (weak, remote) timing oracle over the token — the repo already made this
-/// choice for its other token gates.
-#[must_use]
-pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+/// Re-exported rather than copied: two constant-time comparators are two places
+/// for a timing bug to hide, and the repository already had one. Its reasoning
+/// lives with it (`admin::handlers`): a plain `==` on `&str` stops at the first
+/// differing byte, which is a (weak, remote) timing oracle over the token.
+pub(crate) use crate::admin::handlers::constant_time_eq;
 
 #[cfg(test)]
 mod tests {

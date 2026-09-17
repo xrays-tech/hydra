@@ -126,10 +126,14 @@ pub struct AppState {
     /// Proxy / failover / breaker policy.
     pub proxy: ProxyConfig,
 
-    /// Tenant API runtime configuration (the master switch). See
-    /// [`crate::tenant_api`].
+    /// Tenant API runtime configuration. See [`crate::tenant_api`].
     #[cfg(feature = "proxy")]
     pub tenant_api: crate::tenant_api::TenantApiConfig,
+
+    /// Per-tenant rate window for `POST /auth/cache/invalidate`. State, not
+    /// configuration — which is why it is not inside `TenantApiConfig`.
+    #[cfg(feature = "proxy")]
+    pub tenant_api_throttle: Arc<crate::tenant_api::throttle::Throttle>,
 
     /// Cache-clearing fan-out and its convergence barrier (T6). `None` in a build
     /// without `cluster-redis`, where the local clear IS the complete answer:
@@ -190,6 +194,7 @@ impl AppState {
             sink,
             proxy,
             tenant_api,
+            tenant_api_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]

@@ -427,7 +427,14 @@ async fn every_path_under_the_reserved_prefix_is_answered_locally() {
 async fn disabling_the_api_restores_the_proxy_pipeline() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig { enabled: false }).await;
+    let state = build_state(
+        &pool,
+        TenantApiConfig {
+            enabled: false,
+            ..TenantApiConfig::default()
+        },
+    )
+    .await;
     let root = start_proxy(state);
     let (status, v) = body_json(
         send_until_ready(
@@ -701,4 +708,192 @@ async fn whoami_works_on_an_edge_from_the_snapshot_alone() {
     assert_eq!(v["name"], "edge-tenant");
     // The snapshot's version, not a database's.
     assert_eq!(v["config_version"].as_u64(), Some(7));
+}
+
+// ---------------------------------------------------------------------------
+// T6 — E2 `POST /auth/cache/invalidate`
+// ---------------------------------------------------------------------------
+
+async fn post_invalidate(
+    root: &str,
+    tenant: &str,
+    token: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let c = client();
+    let url = format!("{root}/tenant/{tenant}/api/v1/auth/cache/invalidate");
+    for _ in 0..60 {
+        let mut req = c.post(&url).bearer_auth(token);
+        if let Some(b) = &body {
+            req = req.json(b);
+        }
+        if let Ok(r) = req.send().await {
+            return body_json(r).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    panic!("proxy never became ready at {url}");
+}
+
+/// C3: a single-node build has no peers, so the local clear IS the whole answer
+/// and the report must say exactly that — not "applied" (which implies a fleet
+/// confirmed) and not "pending" (which implies someone is behind).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidate_reports_single_node_when_there_are_no_peers() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
+    assert_eq!(status, 200, "got {v}");
+    assert_eq!(v["fleet"]["state"], "single_node", "got {v}");
+    assert_eq!(v["fleet"]["nodes_total"], 1);
+    assert_eq!(
+        v["scope"], "tenant",
+        "an absent body means the whole tenant: {v}"
+    );
+    assert_eq!(v["checked"], 0);
+}
+
+/// T13: the shape caps. A request that names absurd keys is rejected before any
+/// cache work happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidate_rejects_an_oversized_request() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let too_many: Vec<String> = (0..1_001).map(|i| format!("sk-{i}")).collect();
+    let (status, v) = post_invalidate(
+        &root,
+        "t1",
+        TENANT_TOKEN,
+        Some(serde_json::json!({ "api_keys": too_many })),
+    )
+    .await;
+    assert_eq!(status, 400, "got {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("api_keys"),
+        "got {v}"
+    );
+
+    let (status2, v2) = post_invalidate(
+        &root,
+        "t1",
+        TENANT_TOKEN,
+        Some(serde_json::json!({ "api_keys": ["x".repeat(4_097)] })),
+    )
+    .await;
+    assert_eq!(status2, 400, "got {v2}");
+}
+
+/// T11: a precise key clears that key HERE and forces the next request for it to
+/// re-query the tenant's auth service.
+///
+/// The cache is keyed `(tenant_id, sha256(key))`, so this is the only way to
+/// verify the clear took effect: observe that the upstream is asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidate_clears_exactly_the_named_key() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/verify"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(r#"{"allowed":true}"#, "application/json"),
+        )
+        .expect(2) // once for the first request, once after the clear
+        .mount(&auth_server)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.local", Some(TENANT_TOKEN)).await;
+    // Point the tenant at the mock auth service.
+    let mut t = hydra_server::db::get_tenant(&pool, "t1")
+        .await
+        .expect("get");
+    t.auth_url = format!("{}/verify", auth_server.uri());
+    hydra_server::db::update_tenant(&pool, &t)
+        .await
+        .expect("update");
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state.clone());
+
+    // A client request with key K populates the cache.
+    let c = client();
+    let chat = format!("{root}/v1/chat/completions");
+    let probe = |key: &str| {
+        let c = c.clone();
+        let url = chat.clone();
+        let key = key.to_string();
+        async move {
+            for _ in 0..60 {
+                let r = c
+                    .post(&url)
+                    .bearer_auth(&key)
+                    .header("host", "acme.local")
+                    .json(&serde_json::json!({"model": "nope", "messages": []}))
+                    .send()
+                    .await;
+                if let Ok(r) = r {
+                    return r.status().as_u16();
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            panic!("never ready");
+        }
+    };
+    let _ = probe("sk-key-to-clear").await;
+    assert!(
+        !state.auth.cache().is_empty(),
+        "the first request must have cached a verdict"
+    );
+
+    let before = state.auth.cache().len();
+    let (status, v) = post_invalidate(
+        &root,
+        "t1",
+        TENANT_TOKEN,
+        Some(serde_json::json!({ "api_keys": ["sk-key-to-clear"] })),
+    )
+    .await;
+    assert_eq!(status, 200, "got {v}");
+    assert_eq!(v["checked"], 1, "got {v}");
+    assert_eq!(v["scope"], "keys", "got {v}");
+    assert_eq!(
+        v["invalidated"], 1,
+        "the named key was cached, so exactly one entry must go: {v}"
+    );
+    assert!(state.auth.cache().len() < before, "the cache must shrink");
+
+    // And the next request for that key goes upstream again (the mock's
+    // `.expect(2)` is asserted when it is dropped).
+    let _ = probe("sk-key-to-clear").await;
+}
+
+/// A GET on the invalidation route must not clear anything: a prefetching client
+/// or a browser address bar is not a tenant action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidate_is_post_only() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = body_json(
+        send_until_ready(
+            &client(),
+            &format!("{root}/tenant/t1/api/v1/auth/cache/invalidate"),
+            Some(TENANT_TOKEN),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, 405, "got {v}");
+    assert_eq!(v["error"]["code"], "method_not_allowed", "got {v}");
 }

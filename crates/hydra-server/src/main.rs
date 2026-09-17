@@ -622,6 +622,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             stream.clone(),
             auth.clone(),
             store.clone(),
+            cluster.node_id.clone(),
         );
         // F-6: keep the invalidation stream bounded. A trim that removes
         // entries bumps the generation so lagging consumers re-hydrate
@@ -646,6 +647,55 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // rather than a branch in this file: the choice is what stops a cluster node
     // (which has a local SQLite file that the ClickHouse sink never writes to)
     // from answering a well-formed "zero usage".
+    // The tenant API's live-node view.
+    //
+    // Injected as a CLOSURE over a periodically-refreshed snapshot, never as the
+    // registry itself: the data plane must not gain the ability to talk to its
+    // peers (design §6.4, decision A-1), and calling the async registry from the
+    // request path would either block a worker or panic ("cannot start a runtime
+    // from within a runtime") — so a background task owns the async read and the
+    // closure is a cheap load.
+    //
+    // `alive == true` is the filter: a node whose heartbeat expired is not in the
+    // load balancer's pool and must not hold a convergence decision hostage.
+    #[allow(unused_mut)]
+    let mut tenant_api_cfg = hydra_server::tenant_api::TenantApiConfig::from_env();
+    #[cfg(feature = "cluster-redis")]
+    if let Some(reg) = &registry {
+        let live: Arc<arc_swap::ArcSwap<Vec<String>>> =
+            Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+        let refresh = {
+            let reg = reg.clone();
+            let live = live.clone();
+            async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    match reg.list_nodes().await {
+                        Ok(nodes) => {
+                            let ids: Vec<String> = nodes
+                                .into_iter()
+                                .filter(|n| n.alive)
+                                .map(|n| n.node_id)
+                                .collect();
+                            live.store(Arc::new(ids));
+                        }
+                        Err(e) => {
+                            // Keep the PREVIOUS view rather than reporting an
+                            // empty fleet: "no live nodes" reads as "converged"
+                            // to the barrier, which is the one failure mode that
+                            // must never be guessed at.
+                            tracing::warn!(error = %e, "live-node refresh failed; keeping the previous view");
+                        }
+                    }
+                }
+            }
+        };
+        tokio::spawn(refresh);
+        tenant_api_cfg.live_nodes = Some(Arc::new(move || live.load().to_vec()));
+    }
+
     #[cfg(feature = "db")]
     // The ClickHouse reader lands with T8. Until then a cluster node has no
     // readable store, so `usage` stays `None` and the endpoint says so (503)
@@ -662,7 +712,8 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         admission: admission.clone(),
         sink,
         proxy: proxy_cfg.clone(),
-        tenant_api: hydra_server::tenant_api::TenantApiConfig::from_env(),
+        tenant_api: tenant_api_cfg,
+        tenant_api_throttle: Arc::new(hydra_server::tenant_api::throttle::Throttle::new()),
         #[cfg(feature = "cluster-redis")]
         invalidation: invalidation_stream.clone(),
         #[cfg(not(feature = "cluster-redis"))]
