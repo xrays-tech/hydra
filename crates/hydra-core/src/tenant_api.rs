@@ -244,6 +244,16 @@ pub struct UsageAggregate {
 ///
 /// A missing or unparseable field is [`DecodeError::Field`] — deliberately
 /// *not* a zero.
+///
+/// ## Do not feed this a `UNION ALL`
+///
+/// The "rows first, totals last" order is a property of the BODY, and a
+/// ClickHouse `UNION ALL` does not guarantee it: measured on the bundled
+/// ClickHouse 24.3 this shape came back totals-first in 1 of 6 runs, and a bare
+/// `ORDER BY` after the `UNION ALL` did not stabilise it. The reader therefore
+/// issues the totals and grouped queries separately and uses
+/// [`decode_usage_rows_json_each_row`] for the second. Use this function only for
+/// a body whose last line is the totals **by construction**.
 pub fn decode_usage_json_each_row(body: &str) -> Result<UsageAggregate, DecodeError> {
     let mut objects: Vec<Value> = Vec::new();
     for line in body.lines() {
@@ -290,6 +300,47 @@ pub fn decode_usage_json_each_row(body: &str) -> Result<UsageAggregate, DecodeEr
         rows,
         as_of,
     })
+}
+
+/// Decode the **grouped** `JSONEachRow` response of the ClickHouse reader: every
+/// non-empty line is one group row.
+///
+/// This is a separate function from [`decode_usage_json_each_row`] because the
+/// two backends cannot share a body shape. The SQLite reader issues two queries
+/// (totals, then groups) and so must the ClickHouse reader, because a single
+/// `UNION ALL` of the two **does not preserve branch order**: measured on the
+/// bundled ClickHouse 24.3, the same query returned the totals row first in 1 of
+/// 6 runs, and adding `ORDER BY is_total` did not fix it (a bare `ORDER BY` after
+/// a `UNION ALL` binds to the last branch only). An order-dependent decoder would
+/// therefore read a *group* row as the overall totals — a 200 that is
+/// syntactically fine and semantically wrong, which is the exact failure class
+/// this module exists to prevent.
+///
+/// An empty body is **not** an error here: a tenant with no matching rows has no
+/// group rows at all, and ClickHouse answers the grouped query with an empty body.
+pub fn decode_usage_rows_json_each_row(body: &str) -> Result<Vec<UsageRow>, DecodeError> {
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| DecodeError::Malformed(format!("{e}: {line}")))?;
+        if !v.is_object() {
+            return Err(DecodeError::Malformed(format!("not an object: {line}")));
+        }
+        let key = v
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DecodeError::Field("key".to_string()))?
+            .to_string();
+        rows.push(UsageRow {
+            key,
+            totals: totals_from(&v)?,
+        });
+    }
+    Ok(rows)
 }
 
 /// The five numeric fields of one aggregate line. Every one is required.

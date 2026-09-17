@@ -370,3 +370,179 @@ async fn fan_out_and_confirm(
         200,
     )
 }
+
+// ---------------------------------------------------------------------------
+// E3 — GET /usage
+// ---------------------------------------------------------------------------
+
+/// The body of `GET /usage`.
+///
+/// The window is echoed in its **normalised** form, so a caller can see exactly
+/// which rows were counted even when it sent a space-separated or epoch bound.
+#[derive(Serialize)]
+struct UsageView {
+    /// Taken from the token, never from the query string (design §5.2).
+    tenant_id: String,
+    since: String,
+    until: String,
+    /// Newest record this tenant has in the store, or `null` when there are none.
+    /// Never an empty string: ClickHouse answers `""` for an empty set and the
+    /// decoder maps that to `None`.
+    as_of: Option<String>,
+    totals: hydra_core::tenant_api::UsageTotals,
+    rows: Vec<hydra_core::tenant_api::UsageRow>,
+    /// `none` | `model` | `provider` | `day`, echoing the accepted whitelist.
+    group_by: &'static str,
+    /// Which metering store answered. Reported by the reader itself, so it
+    /// cannot disagree with the code that actually ran.
+    source: &'static str,
+}
+
+/// `GET /tenant/{tenant_id}/api/v1/usage?since=…&until=…&group_by=…`
+///
+/// `since` is required and `until` defaults to now. The bounds are normalised to
+/// the canonical fixed-width UTC form before they reach a store, because both
+/// backends compare `created_at` **as a string** and a differently-spelled bound
+/// would silently widen the window (see [`super::time_bound`]).
+///
+/// A read that could not be completed is a `503`, never a zeroed body: a
+/// syntactically valid `{"requests":0}` is indistinguishable from "you used
+/// nothing", which is the one answer this endpoint must not invent.
+pub async fn usage(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+) -> pingora_core::Result<bool> {
+    // The capability, not a probe for a pool: in a cluster the leader also has a
+    // local SQLite file, and it contains no usage rows at all.
+    #[cfg(feature = "db")]
+    {
+        let Some(reader) = state.usage.as_ref() else {
+            return super::respond_error(
+                session,
+                ctx,
+                503,
+                "usage_store_unavailable",
+                "this node has no usage store it can read",
+            )
+            .await;
+        };
+
+        let tenant_id = auth.tenant.id.clone();
+        let raw = session.req_header().uri.query().unwrap_or("");
+        let params = super::time_bound::query_params(raw);
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+
+        // `group_by` is a whitelist and is validated BEFORE the store is touched:
+        // the column name is interpolated into SQL, so an unknown value must
+        // never reach a query builder.
+        let group_by = match get("group_by") {
+            None => crate::usage_query::GroupBy::None,
+            Some(v) => match crate::usage_query::GroupBy::parse(v) {
+                Some(g) => g,
+                None => {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_group_by",
+                        "`group_by` must be one of none, model, provider, day",
+                    )
+                    .await
+                }
+            },
+        };
+
+        let group_by_label = crate::usage_query::group_by_label(group_by);
+        let started = std::time::Instant::now();
+        let window = match super::time_bound::resolve(
+            get("since"),
+            get("until"),
+            state.tenant_api.usage_max_window_days,
+            super::time_bound::now(),
+        ) {
+            Ok(w) => w,
+            Err(e) => return super::respond_error(session, ctx, 400, e.code(), &e.message()).await,
+        };
+
+        match reader
+            .aggregate(&tenant_id, &window.since, &window.until, group_by)
+            .await
+        {
+            Ok(agg) => {
+                crate::admin::metrics::record_tenant_api_usage_query(
+                    reader.source(),
+                    group_by_label,
+                    "ok",
+                    started.elapsed(),
+                );
+                let view = UsageView {
+                    tenant_id,
+                    since: window.since,
+                    until: window.until,
+                    as_of: agg.as_of,
+                    totals: agg.totals,
+                    rows: agg.rows,
+                    group_by: group_by_label,
+                    source: reader.source(),
+                };
+                super::respond_json(session, ctx, 200, &view).await
+            }
+            Err(e) => {
+                // `Decode` and `StoreUnavailable` are the same answer to the
+                // caller — "usage is unavailable right now" — while the metric
+                // label keeps them apart for the operator. Turning a decode
+                // failure into a zeroed 200 is exactly the silent lie the
+                // capability exists to prevent.
+                let result = match e {
+                    crate::usage_query::UsageQueryError::StoreUnavailable(_) => "store_unavailable",
+                    crate::usage_query::UsageQueryError::Decode(_) => "decode_error",
+                };
+                tracing::warn!(
+                    target: "hydra::tenant_api",
+                    tenant = %tenant_id,
+                    source = reader.source(),
+                    result,
+                    error = %e,
+                    "usage query failed"
+                );
+                crate::admin::metrics::record_tenant_api_usage_query(
+                    reader.source(),
+                    group_by_label,
+                    result,
+                    started.elapsed(),
+                );
+                super::respond_error(
+                    session,
+                    ctx,
+                    503,
+                    "usage_store_unavailable",
+                    "the usage store could not be read; retry or contact the operator",
+                )
+                .await
+            }
+        }
+    }
+    // A build without `db` has no `usage` field at all: the sink kind cannot be
+    // `sqlite` and `main` refuses to start without a database, so the endpoint is
+    // unreachable. Answering `not_ready` keeps the shape honest rather than
+    // pretending to know the tenant id.
+    #[cfg(not(feature = "db"))]
+    {
+        let _ = (state, auth);
+        super::respond_error(
+            session,
+            ctx,
+            503,
+            "usage_store_unavailable",
+            "this build has no usage store",
+        )
+        .await
+    }
+}

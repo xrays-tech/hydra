@@ -1230,6 +1230,39 @@ Execution Route:
 | 已声明边界 | 调低该开关**不会**追溯缩短已写入 Redis 的长 TTL 项（TTL 变更的固有语义）；要立刻生效用 E2 失效。`expires_in` 更长的租户会产生更多 `auth_url` 回源（§4.2.5 已写的取舍） |
 | 门禁 | fmt clean；`clippy -D warnings` **两种**特性组合 clean；core 16 target 全绿；`--features server` **31 target 全绿**；三特性矩阵 **33 target 全绿、0 失败** |
 
+### T8 — 双后端读路径（含 ClickHouse）+ E3 `GET /usage`（本提交）
+
+| 项 | 结果 |
+|---|---|
+| 交付 | `usage_query.rs`：`ClickHouseUsageQuery`（两次查询、`{t:String}` 绑定、chunked 解帧）+ `select`（**签名在两种特性组合下一致**）；`tenant_api/time_bound.rs`（新建：RFC3339/epoch/空格形态的词法解析 + 归一化 + 窗口判定 + 百分号解码 + 查询串解析）；E3 handler + dispatch 接线；`TenantApiConfig.usage_max_window_days`（`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`）；指标 `hydra_tenant_api_usage_query_total{source,group_by,result}` + `_seconds{source}`；`AppState::for_tests_with_usage`；`main.rs` 用 `select` 注入（不再是临时 `.ok()`）；core 新增"仅行"解码器 `decode_usage_rows_json_each_row`；`tests/usage_query.rs`（**28 条**，含 1 条活 CH `--ignored`） |
+| **实测新事实 CH-G（推翻了设计原先的假设）** | 设计 §4.3.1 假定"分组时一条查询返回：分组行在前、总计行在后"。**实测不成立**：`UNION ALL` 的分支顺序不保证 —— 同一语句 6 次里 **1 次把总计行排在最先**；补 `ORDER BY is_total` **无效**（`UNION ALL` 之后的裸 `ORDER BY` 只绑定到最后一个分支）。对照实验：两条语句**分开**执行时 6/6 与 3/3 全稳定。**若按位置解码，会把某个分组的数字当成整体总计**（单分组时数字完全相同，肉眼不可辨）。→ 读侧改为**两次查询**（与 SQLite 臂同构），core 新增"仅行"解码器；分组查询无 `last_seen` 列，且无匹配行时实测返回**空体**（与总计查询的"必有 `last_seen`"语义不同，故为两个函数） |
+| **实测新事实 CH-H（只有活实例能发现）** | CH 的响应是 **`Transfer-Encoding: chunked` 且无 `Content-Length`**（实测响应头）。按 `\r\n\r\n` 切出的"body"是 `7C\r\n{…}` → JSON 报 `trailing characters at line 1 column 2`。**26 条 wiremock 替身测试全绿，只有 `--ignored` 的活 CH 用例失败** —— 这是"替身必然掩盖传输层事实"的教科书例子。→ 传输层新增 `clickhouse::response_body`（解 chunked，容忍被 64 KiB 上限截断），并让写路径的报错文本一并受益；新增 5 条 `--lib` 单测钉住它 |
+| 分组查询的其它实测 | 分组行顺序稳定（6/6），但仍用既有的 `rows_by_key` 做**顺序无关**比较，不把 SQL 排序当契约；`MAX(created_at)` 空集为 `""`（CH-B 复现）；绑定值 `x' OR 1=1 --` 原样返回（CH-C 复现） |
+| **TDD 证据（注入 A：E3 摘回 404 骨架）** | **9 passed / 17 failed**。仍然通过的 9 条**恰好是**不需要端点的能力断言（5 条 `select_*`、3 条 SQLite reader 级、1 条 CH 绑定 reader 级）；**每一条端点契约测试都失败**。这正是"失败原因正确"的形态 |
+| **TDD 证据（注入 B：把读失败变成"假 0 的 200"）** | **22 passed / 4 failed**，失败的 4 条**全部**是"禁止假 0"断言（非数字计数、缺 `last_seen`、404+`Code:60`、端口指错）。即：本设计的最高价值属性有 4 条独立测试守着 |
+| 计划外新增测试 | `clickhouse_a_5xx_is_a_store_failure_too`（T14c 原文要求"HTTP 5xx/连接超时 → 同码"，原先只覆盖了 404 与连接失败） |
+
+### T8 执行期对计划的修正（4 处）
+
+| # | 计划所写 | 实际 | 处理 |
+|---|---|---|---|
+| 1 | `select` 用 **cfg 配对的两个签名**，CH 版收 `Option<&clickhouse::ClickHouseConfig>` | 该类型是 `pub(crate)`，`pub fn` 拿不到（计划只发现了"特性门控"这一半问题，没发现**可见性**这一半）；而且两个 arity 会让 `main` 与测试各自 cfg 分叉 | **偏离计划**：签名**统一**为 `select(kind, pool, ch_url: Option<&str>)`，只门控 `"clickhouse"` 分支。传 **URL 字符串**同时解决可见性与 arity，且不让本函数成为第二个"CH URL 怎么解析"的 owner（解析仍在 `clickhouse.rs`）。无 CH 特性时该 kind 落到 `UnknownKind` ⇒ T14 的"反向断言"用同一行代码表达 |
+| 2 | `UsageQueryError::WindowTooLarge { max_days }` | 窗口长度判定需要日历运算，设计 §7.1 已明确它属于 `time_bound`（shell），而窗口上限是 `TenantApiConfig` 的配置 | **偏离计划**：`WindowTooLarge` 只存在于 `time_bound::BoundError`，handler 在**触碰存储之前**就回 400；`UsageQueryError` 保持 `StoreUnavailable` / `Decode` 两态 |
+| 3 | 解码用 core 的 `parse_lenient_u64` 与 `normalize_as_of` | 这两者已被 `decode_usage_json_each_row` 封装，而该函数要求"最后一行是总计"——CH 上**不可靠**（CH-G） | **偏离计划（更优）**：分组体走**新增的** core 函数 `decode_usage_rows_json_each_row`，解码逻辑仍由 core 单一持有（不是把解析逻辑抄进 server），并给原函数补了"**不要喂它 `UNION ALL`**"的文档警告 |
+| 4 | 测试里有"喂 `{"requests":"8"}` → 端点返回 8" | 端点级注入需要一个能塞进 CH reader 的构造点，`for_tests` 只会从 `store.pool()` 派生 | 新增 `AppState::for_tests_with_usage`（`for_tests` 委托它）。**它不是第二条选择路径**：调用方必须用 `select` 拿到 reader，即与 `main` 同一个函数 |
+
+### T8 里我自己的 3 处测试错误（均由测试自己暴露）
+
+| # | 我写错的地方 | 真相 | 修正 |
+|---|---|---|---|
+| 1 | T16 的"反例"断言：空格形态的 `since` 会多算一整天 | **只在边界不是午夜时成立**：午夜的 `2026-09-16 00:00:00` 与规范形态逐字符比较结果相同（日位先于分隔符），所以我的 fixture 恰好选了唯一不暴露问题的时刻 —— **反例本身是断言不成立的**。实测确认后改用 `12:00:00` | 反例改为非午夜边界，并**同时断言两个方向**（端点 1 行 / 朴素比较 2 行） |
+| 2 | T18 忘了给主租户配令牌 → 401 | 断言 200 却得到 401，读消息才看出是 fixture 缺令牌 | 补 `seed_tenant(T, …, TOKEN)` |
+| 3 | 绑定断言走**端点**，用百分号编码的租户 id 拼路径 | 路由器不做路径解码，`route.tenant_id` ≠ 认证租户 → 403，请求根本没到 CH（测的是路由器，不是绑定） | 断言下移到 **reader 级**（SQL 真正被构造的地方），并加"`&` 不得作为分隔符存活"的断言 |
+
+> 另记一条**操作教训**：一次 `python replace` 未命中且**没有断言**，导致"请求已改、断言未改"的半成品状态 —— 表现为**单跑通过、并行偶发失败**（进程全局计数器 + 标签组合不唯一）。凡 `replace` 必断言出现次数，与既有"多 rep 脚本失败即整体不写盘"的教训同类。
+>
+> 另记一条**门禁教训**：`clickhouse.rs` 被 `usage-clickhouse` 门控，因此 `clippy --features server` **根本看不到它**；`while_let_loop` 只在**三特性 clippy** 下报出。矩阵不是形式主义。
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）

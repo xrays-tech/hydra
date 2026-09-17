@@ -49,7 +49,7 @@ use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const DEFAULT_DB_URL: &str = "sqlite:hydra.db?mode=rwc";
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
@@ -601,6 +601,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let sink_for_flush = sink.clone();
     let sink_kind_for_api = sink_kind.clone();
     let pool_for_api = pool.clone();
+    // Same value the SINK was built from: one parse of `HYDRA_CLICKHOUSE_URL`,
+    // used by both the writer and the reader, so they cannot disagree about
+    // which store they are talking to.
+    let ch_url_for_api = ch_url.clone();
 
     // (2e-bis) Flush usage on SIGTERM/SIGINT.
     //
@@ -724,12 +728,27 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     }
 
     #[cfg(feature = "db")]
-    // The ClickHouse reader lands with T8. Until then a cluster node has no
-    // readable store, so `usage` stays `None` and the endpoint says so (503)
-    // rather than answering a well-formed zero — and E3 does not exist yet, so
-    // nothing is user-visible in the meantime.
+    // The read capability is chosen from the SINK KIND, in one library function
+    // (`select`), not by probing for a pool: in a cluster the leader also has a
+    // local SQLite file and it holds no usage rows at all, so "is there a pool?"
+    // would answer a well-formed zero from an empty table.
+    //
+    // A failure here is NOT fatal: the endpoint reports 503 for a missing
+    // capability, which is the honest answer, and refusing to boot the whole
+    // data plane over an unreadable metering store would take the proxy down
+    // with it.
     let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
-        hydra_server::usage_query::select_sqlite(&sink_kind_for_api, pool_for_api.as_ref()).ok();
+        match hydra_server::usage_query::select(
+            &sink_kind_for_api,
+            pool_for_api.as_ref(),
+            ch_url_for_api.as_deref(),
+        ) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                warn!(kind = %sink_kind_for_api, error = ?e, "no usage reader for this sink kind; GET /usage will report 503");
+                None
+            }
+        };
 
     let state = Arc::new(AppState {
         store: store.clone(),

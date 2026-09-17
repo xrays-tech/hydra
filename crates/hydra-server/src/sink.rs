@@ -445,7 +445,7 @@ use tokio::sync::mpsc as ch_mpsc;
 // `FORMAT JSONEachRow` payload and interprets the answer.
 #[cfg(feature = "usage-clickhouse")]
 use crate::clickhouse::{
-    is_ok_status, parse_clickhouse_url, response_body_text, send, ClickHouseConfig,
+    is_ok_status, parse_clickhouse_url, response_body, send, ClickHouseConfig,
 };
 
 /// Optional ClickHouse `UsageSink`. Same batching/backoff/Drop semantics as
@@ -628,7 +628,7 @@ async fn insert_batch_clickhouse_http(
     if is_ok_status(&status_line) {
         Ok(())
     } else {
-        let body_text = response_body_text(&resp);
+        let body_text = response_body(&resp);
         Err(format!(
             "clickhouse insert rejected: status=`{status_line}` body={body_text}"
         ))

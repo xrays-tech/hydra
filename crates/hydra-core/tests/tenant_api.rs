@@ -7,8 +7,9 @@
 //! syntactically valid, semantically wrong answer.
 
 use hydra_core::tenant_api::{
-    canonical_le, decode_usage_json_each_row, is_canonical_timestamp, normalize_as_of,
-    parse_lenient_u64, parse_route, Endpoint, TenantApiRoute, UsageRow, UsageTotals,
+    canonical_le, decode_usage_json_each_row, decode_usage_rows_json_each_row,
+    is_canonical_timestamp, normalize_as_of, parse_lenient_u64, parse_route, Endpoint,
+    TenantApiRoute, UsageRow, UsageTotals,
 };
 use serde_json::json;
 
@@ -293,4 +294,69 @@ fn a_group_row_without_a_key_is_an_error() {
         r#"{"requests":"1","tokens_in":"1","tokens_out":"1","cache_hit_tokens":"0","errors":"0","last_seen":""}"#,
     );
     assert!(decode_usage_json_each_row(body).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The grouped (rows-only) body — measured ClickHouse shapes
+// ---------------------------------------------------------------------------
+
+/// The grouped query's body is **rows only** and has no `last_seen` column: the
+/// reader issues totals and groups as two separate queries, because a single
+/// `UNION ALL` of them does not preserve branch order (measured: totals-first in
+/// 1 of 6 runs on ClickHouse 24.3, and `ORDER BY is_total` did not fix it).
+#[test]
+fn grouped_rows_decode_without_a_last_seen_column() {
+    let body = concat!(
+        r#"{"key":"Qwen/Qwen2.5-7B-Instruct","requests":"8","tokens_in":"247","tokens_out":"18","cache_hit_tokens":"0","errors":"0"}"#,
+        "\n",
+        r#"{"key":"gpt-4o","requests":"2","tokens_in":"10","tokens_out":"3","cache_hit_tokens":"5","errors":"1"}"#,
+    );
+    let rows = decode_usage_rows_json_each_row(body).expect("grouped body decodes");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].key, "Qwen/Qwen2.5-7B-Instruct");
+    assert_eq!(rows[0].totals.requests, 8);
+    assert_eq!(rows[1].key, "gpt-4o");
+    assert_eq!(rows[1].totals.cache_hit_tokens, 5);
+    assert_eq!(rows[1].totals.errors, 1);
+}
+
+/// ClickHouse answers the grouped query with an **empty body** when nothing
+/// matches, so "no rows" must be `Ok(vec![])` — not an error, and not a row.
+#[test]
+fn an_empty_grouped_body_is_no_rows_rather_than_an_error() {
+    assert!(decode_usage_rows_json_each_row("")
+        .expect("empty")
+        .is_empty());
+    assert!(decode_usage_rows_json_each_row("\n  \n")
+        .expect("blank lines")
+        .is_empty());
+}
+
+/// A grouped line without a key cannot be attributed to anything, so reading it
+/// as a row named "" would fabricate a group.
+#[test]
+fn a_grouped_line_without_a_key_is_an_error() {
+    let body =
+        r#"{"requests":"1","tokens_in":"1","tokens_out":"1","cache_hit_tokens":"0","errors":"0"}"#;
+    assert!(decode_usage_rows_json_each_row(body).is_err());
+}
+
+/// The quoted-integer trap applies here too: a non-numeric counter must be
+/// refused instead of silently read as 0.
+#[test]
+fn a_non_numeric_grouped_counter_is_an_error_not_a_zero() {
+    let body = r#"{"key":"gpt-4o","requests":"abc","tokens_in":"1","tokens_out":"1","cache_hit_tokens":"0","errors":"0"}"#;
+    assert!(decode_usage_rows_json_each_row(body).is_err());
+}
+
+/// Both integer spellings are accepted on this path as well (CH-A).
+#[test]
+fn grouped_counters_decode_from_strings_and_from_numbers() {
+    let quoted = r#"{"key":"k","requests":"8","tokens_in":"1","tokens_out":"1","cache_hit_tokens":"0","errors":"0"}"#;
+    let plain =
+        r#"{"key":"k","requests":8,"tokens_in":1,"tokens_out":1,"cache_hit_tokens":0,"errors":0}"#;
+    assert_eq!(
+        decode_usage_rows_json_each_row(quoted).expect("quoted")[0].totals,
+        decode_usage_rows_json_each_row(plain).expect("plain")[0].totals
+    );
 }

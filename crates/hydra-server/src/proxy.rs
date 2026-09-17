@@ -185,6 +185,39 @@ impl AppState {
             Arc::new(crate::usage_query::SqliteUsageQuery::new(p.clone()))
                 as Arc<dyn crate::usage_query::UsageQuery>
         });
+        Self::for_tests_with_usage(
+            store,
+            auth,
+            breaker,
+            limiter,
+            sink,
+            proxy,
+            tenant_api,
+            #[cfg(feature = "db")]
+            usage,
+        )
+    }
+
+    /// As [`Self::for_tests`], with the usage capability passed in **as the final
+    /// value** instead of being derived from the store's pool.
+    ///
+    /// This is not a second selection path: callers get the reader from
+    /// [`crate::usage_query::select`], the same function `main` uses, so a test
+    /// cannot inject a combination the binary could not build. It exists because
+    /// the ClickHouse cases need a reader pointed at a process-level double, and
+    /// the store's pool is the wrong store for them.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_tests_with_usage(
+        store: ConfigStore,
+        auth: Arc<HttpAuthChecker>,
+        breaker: Arc<CircuitBreaker>,
+        limiter: Arc<dyn crate::proxy::limiter::Limiter>,
+        sink: Arc<dyn UsageSink>,
+        proxy: ProxyConfig,
+        tenant_api: crate::tenant_api::TenantApiConfig,
+        #[cfg(feature = "db")] usage: Option<Arc<dyn crate::usage_query::UsageQuery>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             auth,

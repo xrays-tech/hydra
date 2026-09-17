@@ -42,6 +42,7 @@
 pub mod auth;
 pub mod handlers;
 pub mod throttle;
+pub mod time_bound;
 
 use hydra_core::tenant_api::{parse_route, Endpoint};
 use pingora_http::ResponseHeader;
@@ -82,6 +83,12 @@ pub struct TenantApiConfig {
     /// clear. That is too much power to hand a single tenant's credential without
     /// a ceiling.
     pub invalidate_per_min: u32,
+    /// Ceiling on the E3 window, in days
+    /// (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`, default 31).
+    ///
+    /// Not an optimisation: it is what stops one tenant's query from scanning
+    /// every other tenant's rows in the store (design §5.1).
+    pub usage_max_window_days: u32,
     /// The ids of the LIVE data-plane nodes, or `None` off-cluster.
     ///
     /// Injected as a closure rather than by handing `AppState` the node registry:
@@ -99,6 +106,7 @@ impl std::fmt::Debug for TenantApiConfig {
             .field("enabled", &self.enabled)
             .field("converge_timeout", &self.converge_timeout)
             .field("invalidate_per_min", &self.invalidate_per_min)
+            .field("usage_max_window_days", &self.usage_max_window_days)
             .field("live_nodes", &self.live_nodes.is_some())
             .finish()
     }
@@ -110,6 +118,7 @@ impl Default for TenantApiConfig {
             enabled: true,
             converge_timeout: std::time::Duration::from_millis(2_000),
             invalidate_per_min: 10,
+            usage_max_window_days: time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS,
             live_nodes: None,
         }
     }
@@ -139,10 +148,19 @@ impl TenantApiConfig {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(10);
+        // A missing, unparseable or zero value falls back to the default: 0
+        // would reject every request, which is a denial of service triggered by
+        // a typo.
+        let usage_max_window_days = std::env::var("HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS);
         Self {
             enabled,
             converge_timeout,
             invalidate_per_min,
+            usage_max_window_days,
             // Wired by `main` for cluster nodes; a single-node build leaves it
             // `None`, and the endpoint then reports `single_node`.
             live_nodes: None,
@@ -263,8 +281,8 @@ pub async fn dispatch(
         Endpoint::InvalidateAuthCache => {
             handlers::invalidate(state, session, ctx, &authenticated).await
         }
-        // T8 replaces this arm.
-        Endpoint::Usage => respond_error(session, ctx, 404, "not_found", "unknown path").await,
+        // T8: E3 is wired.
+        Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
     }
 }
 

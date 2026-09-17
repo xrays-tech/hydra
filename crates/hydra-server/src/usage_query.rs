@@ -98,10 +98,15 @@ impl std::fmt::Display for UsageQueryError {
 /// Why a sink kind could not be turned into a reader.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SelectError {
-    /// The kind is not `sqlite` or `clickhouse`.
+    /// The kind is not `sqlite` or `clickhouse` — or it IS `clickhouse` in a
+    /// build without the `usage-clickhouse` feature, where the kind cannot occur
+    /// at all because `sink::build_sink` refuses it at startup. Reporting the
+    /// kind as unknown keeps the two guards from drifting apart.
     UnknownKind(String),
     /// `sqlite` without a pool.
     MissingPool,
+    /// `clickhouse` without a URL.
+    MissingUrl,
 }
 
 /// Read-only aggregate access to the metering store.
@@ -239,20 +244,177 @@ impl UsageQuery for SqliteUsageQuery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ClickHouse (cluster deployments: the shared external store)
+// ---------------------------------------------------------------------------
+
+/// The ClickHouse-backed reader.
+///
+/// ## Two queries, not one
+///
+/// The SQLite arm issues the totals query and (when grouping) the group query
+/// separately, and this arm does the same. A single query with a `UNION ALL` of
+/// the two would be fewer round-trips, but it **cannot be decoded
+/// positionally**: measured on the bundled ClickHouse 24.3, the same statement
+/// returned the totals row FIRST in 1 of 6 runs, and adding `ORDER BY is_total`
+/// did not stabilise it (a bare `ORDER BY` after a `UNION ALL` binds to the last
+/// branch only). A positional decoder would then read a *group* row as the
+/// overall totals — one model's numbers reported as the tenant's whole usage.
+/// Two queries have no ordering assumption to get wrong.
+///
+/// ## Binding, never interpolation
+///
+/// `tenant_id` and the bounds travel as `{name:String}` placeholders bound
+/// through `param_*`, and both the SQL and every bound value are percent-encoded
+/// by [`crate::clickhouse::send`]. Measured: a bound value of `x' OR 1=1 --`
+/// arrives as a literal string, so a tenant id — attacker-influenced text — can
+/// never become SQL. `group_by` is a **whitelist** mapped to a column name, so
+/// it is the one fragment that is interpolated, and only ever with a constant.
+#[cfg(feature = "usage-clickhouse")]
+pub struct ClickHouseUsageQuery {
+    cfg: crate::clickhouse::ClickHouseConfig,
+}
+
+/// Totals row. `MAX(created_at)` is `""` (not NULL) for an empty set on
+/// ClickHouse, which `normalize_as_of` maps to `None`.
+#[cfg(feature = "usage-clickhouse")]
+const CH_TOTALS_SELECT: &str = "\
+SELECT count()                                     AS requests, \
+       COALESCE(sum(tokens_in), 0)                 AS tokens_in, \
+       COALESCE(sum(tokens_out), 0)                AS tokens_out, \
+       COALESCE(sum(cache_hit_tokens), 0)          AS cache_hit_tokens, \
+       COALESCE(sum(if(status_code >= 400, 1, 0)), 0) AS errors, \
+       MAX(created_at)                             AS last_seen \
+FROM usage_record \
+WHERE tenant_id = {t:String} AND created_at >= {s:String} AND created_at < {e:String} \
+FORMAT JSONEachRow";
+
+/// `group_by` → the ClickHouse expression that keys a row. A whitelist: the
+/// string is interpolated into the query, so it must never come from input.
+#[cfg(feature = "usage-clickhouse")]
+fn ch_group_expr(g: GroupBy) -> Option<&'static str> {
+    match g {
+        GroupBy::None => None,
+        GroupBy::Model => Some("model_key"),
+        GroupBy::Provider => Some("provider_id"),
+        // `created_at` is a fixed-width `YYYY-MM-DDTHH:MM:SSZ` string on both
+        // backends, so the date is a safe 10-byte slice. No date function: it
+        // would both change semantics and drop the primary-key pruning.
+        GroupBy::Day => Some("substr(created_at, 1, 10)"),
+    }
+}
+
+#[cfg(feature = "usage-clickhouse")]
+impl ClickHouseUsageQuery {
+    /// Built from the configured URL. Parsing stays in
+    /// [`crate::clickhouse`], the one owner of what a ClickHouse URL means.
+    fn new(url: &str) -> Self {
+        let mut cfg = crate::clickhouse::parse_clickhouse_url(url);
+        // The reader has its own deadline (`HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS`),
+        // independent of the writer's: a tenant waiting on a slow query must not
+        // inherit the flush task's much longer allowance, and vice versa.
+        cfg.io_timeout = crate::clickhouse::env_millis("HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS", 5_000);
+        Self { cfg }
+    }
+
+    /// Run one statement and return its response body.
+    ///
+    /// A non-2xx is a *failure*, not a body to decode: ClickHouse answers a
+    /// failed query with HTTP 404 and a `Code: N. DB::Exception: …` text
+    /// (measured), so the status and the body are both kept for the operator.
+    async fn run(&self, sql: &str, params: &[(&str, &str)]) -> Result<String, UsageQueryError> {
+        let (status, raw) = crate::clickhouse::send(&self.cfg, sql, params, b"")
+            .await
+            .map_err(UsageQueryError::StoreUnavailable)?;
+        if !crate::clickhouse::is_ok_status(&status) {
+            return Err(UsageQueryError::StoreUnavailable(format!(
+                "clickhouse said {:?}: {}",
+                status.trim(),
+                crate::clickhouse::response_body(&raw)
+            )));
+        }
+        Ok(crate::clickhouse::response_body(&raw))
+    }
+}
+
+#[cfg(feature = "usage-clickhouse")]
+impl UsageQuery for ClickHouseUsageQuery {
+    fn aggregate<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        since: &'a str,
+        until: &'a str,
+        group_by: GroupBy,
+    ) -> Pin<Box<dyn Future<Output = Result<UsageAggregate, UsageQueryError>> + Send + 'a>> {
+        Box::pin(async move {
+            let params: [(&str, &str); 3] = [("t", tenant_id), ("s", since), ("e", until)];
+            let totals_body = self.run(CH_TOTALS_SELECT, &params).await?;
+            // The totals query always projects `last_seen`, so a decode failure
+            // here is a shape drift or a non-numeric counter — either way it must
+            // surface as a failure, never as a zeroed `totals`.
+            let totals = hydra_core::tenant_api::decode_usage_json_each_row(&totals_body)
+                .map_err(|e| UsageQueryError::Decode(format!("totals: {e:?}")))?;
+
+            let mut rows = Vec::new();
+            if let Some(expr) = ch_group_expr(group_by) {
+                let sql = format!(
+                    "SELECT {expr} AS key, count() AS requests, \
+                            COALESCE(sum(tokens_in), 0) AS tokens_in, \
+                            COALESCE(sum(tokens_out), 0) AS tokens_out, \
+                            COALESCE(sum(cache_hit_tokens), 0) AS cache_hit_tokens, \
+                            COALESCE(sum(if(status_code >= 400, 1, 0)), 0) AS errors \
+                     FROM usage_record \
+                     WHERE tenant_id = {{t:String}} AND created_at >= {{s:String}} \
+                       AND created_at < {{e:String}} \
+                     GROUP BY key ORDER BY key FORMAT JSONEachRow"
+                );
+                let body = self.run(&sql, &params).await?;
+                rows = hydra_core::tenant_api::decode_usage_rows_json_each_row(&body)
+                    .map_err(|e| UsageQueryError::Decode(format!("rows: {e:?}")))?;
+            }
+
+            Ok(UsageAggregate {
+                totals: totals.totals,
+                rows,
+                as_of: totals.as_of,
+            })
+        })
+    }
+
+    fn source(&self) -> &'static str {
+        "clickhouse"
+    }
+}
+
 /// Choose the reader for a configured sink kind.
 ///
 /// This is a **library function, not a `main.rs` branch**, so the choice that
-/// guards against the "report zero usage" failure is directly testable. The
-/// ClickHouse arm arrives in T8 together with its implementation and the
-/// `usage-clickhouse` feature gating.
-pub fn select_sqlite(
+/// guards against the "report zero usage" failure is directly testable — the
+/// injection point lives in the binary and no integration test can reach it.
+///
+/// The signature is the same with and without `usage-clickhouse`; only the arm
+/// is gated. Passing the ClickHouse **URL** rather than a parsed config keeps
+/// this signature free of a `usage-clickhouse`-gated type (and of the
+/// `pub(crate)` visibility of that type), and leaves `clickhouse` the single
+/// owner of how a URL becomes a transport: this function never parses one.
+// Without `usage-clickhouse` there is no arm that reads the URL, but the
+// parameter stays in the signature: one call shape for `main` and for the tests,
+// in both feature combinations.
+#[cfg_attr(not(feature = "usage-clickhouse"), allow(unused_variables))]
+pub fn select(
     sink_kind: &str,
     pool: Option<&SqlitePool>,
+    ch_url: Option<&str>,
 ) -> Result<std::sync::Arc<dyn UsageQuery>, SelectError> {
     match sink_kind {
         "sqlite" => {
             let pool = pool.ok_or(SelectError::MissingPool)?;
             Ok(std::sync::Arc::new(SqliteUsageQuery::new(pool.clone())))
+        }
+        #[cfg(feature = "usage-clickhouse")]
+        "clickhouse" => {
+            let url = ch_url.ok_or(SelectError::MissingUrl)?;
+            Ok(std::sync::Arc::new(ClickHouseUsageQuery::new(url)))
         }
         other => Err(SelectError::UnknownKind(other.to_string())),
     }

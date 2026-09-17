@@ -417,9 +417,17 @@ GET /tenant/{tid}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17T00:00
   "source": "clickhouse"               // sqlite | clickhouse（本次应答来自哪一个计量存储）
 }
 → 400 invalid_since / invalid_until    形态非法或 since > until
+→ 400 invalid_group_by                 group_by 不在白名单
 → 400 window_too_large                 窗口超上限（默认 31 天）
-→ 503 usage_store_unavailable          计量存储不可达（CH 连接失败/超时；或本节点无本地库）
+→ 503 usage_store_unavailable          计量存储不可达，或响应无法解码（CH 连接失败/超时/形状漂移；或本节点无本地库）
 ```
+
+**入参约定**（T8 落地，均为对外契约的一部分）：
+- `since` **必填**；`until` **可省略，省略即"服务端当前时刻"** —— 需求原文是"获取某个时间戳以后的用量"，因此单参数调用必须可用。
+- 时间戳接受 RFC3339（`Z` 或带偏移）、**无时区的 `T` 分隔形态**、**空格分隔形态**（历史遗留输入）、epoch 秒与 epoch 毫秒；一律归一化为规范形态后再入查询，应答里回显的是**归一化后**的值。
+- `group_by ∈ {none(默认), model, provider, day}`；未知值 400，**绝不插值**（列名来自白名单）。
+- **契约里不存在 `tenant_id` 参数**：身份只来自令牌，多传该参数被**忽略**（不是报错，因为它是无害的多余输入）。
+- 解码失败与存储不可达对租户是**同一个 503**，但**指标标签不同**（`result=decode_error` / `store_unavailable`）——运维据此发现"存储答了但答的不是我们要的形状"。
 
 > 与 v3 相比：**`501 usage_query_unavailable` 分支被删除**（CH 读路径进 v1）。原来的"防御分支 `Sqlite + pool=None`"也改由同一码 `usage_store_unavailable` 表达——它分不清"配置里没有 store"与"store 连不上"，但对租户而言两者的正确反应相同（重试/找运维），无需暴露内部拓扑。
 
@@ -463,7 +471,21 @@ FORMAT JSONEachRow
 
 实测输出（真实 8 行数据）：`{"requests":"8","tokens_in":"247","tokens_out":"18","cache_hit_tokens":"0","errors":"0","last_seen":"2026-09-15T07:32:06Z"}`
 
-`group_by=model|provider` 改 `GROUP BY model_key` / `GROUP BY provider_id`（两侧同形；CH 侧实测 `{"key":"…","requests":"8","tokens_in":"247"}`）。`group_by=day` 用 `substr(created_at,1,10)`（定宽格式下是安全切片，两侧通用）。
+**分组查询是第二条独立语句**（**不是**一条 `UNION ALL`，理由见 CH-G）：
+
+```sql
+SELECT model_key AS key, count() AS requests,
+       COALESCE(sum(tokens_in),0) AS tokens_in, COALESCE(sum(tokens_out),0) AS tokens_out,
+       COALESCE(sum(cache_hit_tokens),0) AS cache_hit_tokens,
+       COALESCE(sum(if(status_code >= 400,1,0)),0) AS errors
+FROM usage_record
+WHERE tenant_id = {t:String} AND created_at >= {s:String} AND created_at < {e:String}
+GROUP BY key ORDER BY key FORMAT JSONEachRow
+```
+
+实测输出 `{"key":"Qwen/Qwen2.5-7B-Instruct","requests":"8","tokens_in":"247","tokens_out":"18","cache_hit_tokens":"0","errors":"0"}`（**没有 `last_seen` 列**，因此由"仅行"解码器解析）；无匹配行时实测返回**空体**。
+
+`group_by=provider` 用 `provider_id`，`group_by=day` 用 `substr(created_at,1,10)`（定宽格式下是安全切片，两侧通用，且两侧都不对列套函数——套函数会同时改变语义并放弃主键裁剪）。
 
 其他写入路径事实（两侧共享）：批量 flush，`batch_size` 默认 256 / `flush_secs` 默认 5（`sink.rs:941-943`）；`record()` 非阻塞、丢弃即计数（`sink.rs:316-335`）；**一行 = 一次成功选中 provider 的请求**（`proxy.rs:1101-1103`），选路前失败不进表；**无任何裁剪**（`MAX_RETAINED = 10_000` 只拒绝尚未写入的记录，`sink.rs:90-93`）；token 三列可空。
 
@@ -486,6 +508,8 @@ FORMAT JSONEachRow
 | **CH-D** | 查询失败 → **HTTP 404 + 纯文本 `Code: 60. DB::Exception: … (UNKNOWN_TABLE)`**（与写路径 `sink.rs:1207` 已断言的形态一致） | 只按 HTTP 状态判失败会把"业务错误"与"5xx 不可达"混为一谈；错误分类要读状态码 + `Code: N` |
 | **CH-E** | 主键 `ORDER BY (created_at, tenant_id, provider_id)`；`EXPLAIN indexes=1` 显示谓词同时进 `PrimaryKey`，`Granules: 1/2`（**裁剪生效**）。但 `tenant_id` 是**第二**列 | 窄窗口裁剪很好；**31 天窗口**仍会扫描该窗口内全部租户的行，再按 `tenant_id` 过滤。因此窗口上限不是可选优化，而是必需（§5.1 反放大）。运维若要在规模上做大量按租户查询，可另开任务把 CH 表改成 `ORDER BY (tenant_id, created_at)`（需重建表 + 回填，**本次不做**） |
 | **CH-F** | 写路径的 INSERT 重试会在"响应读超时"后**重发整批**（`sink.rs:207-231`），而 CH INSERT 不去重 | 存在**重复行** → `COUNT(*)` 高估 requests。且 CH 表**没有 `trace_id` 列**（列清单见 `init.sql:15-31`），无法按 trace 去重。契约必须把 `requests` 标注为"近似值"，并把这件事写进 `ops.md` |
+| **CH-G**（T8 实测新增，**推翻了本节原先"一次查询、行在前总计在后"的假设**） | `UNION ALL` 的**分支顺序不保证**：同一语句（`SELECT … GROUP BY key UNION ALL SELECT …`）6 次里有 **1 次把总计行排在了最前**；补 `ORDER BY is_total` **无效**（`UNION ALL` 之后的裸 `ORDER BY` 只作用于最后一个分支）。对照实验：把两条语句**分开**执行，各自 6/6、3/3 稳定 | 按"最后一行是总计"做**位置解码**会读到**某一行分组的数字**当成整体总计——即"语法正确、语义错误"，且量级看起来正常（单分组时甚至完全一样）。**因此读侧必须发两次查询**（总计 + 分组，与 SQLite 臂同构），core 侧的"仅行"解码器 `decode_usage_rows_json_each_row` 因此新增 |
+| **CH-H**（T8 实测新增，**只有活实例能发现**） | CH 的 HTTP 响应是 **`Transfer-Encoding: chunked`、且无 `Content-Length`**（实测响应头）。按 `\r\n\r\n` 切出"body"得到的是 `7C\r\n{…}`，JSON 解析报 `trailing characters at line 1 column 2` | 用 `Content-Length` 的替身（wiremock）**测不出来**：T8 的 26 条替身测试全绿，只有 `--ignored` 的活 CH 用例失败。传输层必须解 chunked（`clickhouse::response_body`），且这条事实必须由**活实例用例**守住 |
 
 **传输选型（新决策 Q14，见 §11）**：CH 侧今天只有一条**裸 TCP 手写 HTTP** 的写通道（`sink.rs:711-734`，刻意不用 `clickhouse` crate，理由见 `sink.rs:428-437`）。读路径需要**真正的响应体读取 + JSONEachRow 解码**，而现有写通道只把响应体当错误文本丢弃（`sink.rs:801-811`）。两个选项：
 
@@ -497,6 +521,10 @@ FORMAT JSONEachRow
 无论选哪个，**CH 的 URL/凭据解析必须只有一个 owner**：今天 `ClickHouseConfig` 是私有的、且在 `sink.rs:559-568` 被 move 进 flush task 闭包，读侧够不着 → 必须把它提成可复用的解析函数（同一次解析、两处使用），而不是在读侧再写一份 `parse_url`。
 
 **读侧配置可达性**：`build_sink` 返回类型抹除的 `Box<dyn UsageSink>`（`sink.rs:963`），读侧无法下钻。因此读能力必须**单独注入**（见 §4.3.4），而不是给 `UsageSink` 加查询方法——`UsageSink` 的语义是"fire-and-forget 写入通道"（`sink.rs:39-63`），让它同时当查询服务会改变它的含义。
+
+**分组查询的空结果**：CH 在无匹配行时对分组查询返回**空体**（实测 `''`），而不是空行或 null → "仅行"解码器必须把空体解成**空集合**（`Ok(vec![])`），而总计查询的空体则仍是形状漂移（它永远投影 `last_seen`）。两者语义不同，故分成两个解码函数。
+
+**分组查询的确定性**：分组查询用 `GROUP BY key ORDER BY key`，分组行**顺序稳定**（6/6 实测）；但仍按既有 `rows_by_key` 做**顺序无关**比较，不把 SQL 排序当成契约。
 
 #### 4.3.4 读能力如何进入 `AppState`（**取代 v3 的 `usage_backend` 枚举**）
 

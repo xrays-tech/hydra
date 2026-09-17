@@ -290,14 +290,81 @@ pub(crate) fn is_ok_status(status_line: &str) -> bool {
     status_line.contains(" 200 ")
 }
 
-/// The HTTP body of a response, trimmed, for error reporting.
-pub(crate) fn response_body_text(resp: &[u8]) -> String {
-    String::from_utf8_lossy(resp)
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .to_string()
+/// The HTTP body of a response, with `Transfer-Encoding: chunked` **decoded**,
+/// trimmed.
+///
+/// ClickHouse frames its answers as chunks (measured: `Transfer-Encoding:
+/// chunked`, no `Content-Length`), so the bytes after the header block begin
+/// with a hex chunk size and end with a `0` chunk. Reading them undecoded yields
+/// `"7C\r\n{...}"`, which a JSON parser rejects with "trailing characters at
+/// line 1 column 2". The **live** ClickHouse test caught exactly that; a
+/// `Content-Length`-based double cannot reproduce it.
+///
+/// Truncation is tolerated: the transport caps the read at
+/// [`MAX_CLICKHOUSE_RESPONSE`], so a cut-off body returns whatever chunk data was
+/// complete. A caller that needs a *valid* body (the reader) fails its own decode
+/// check rather than acting on a partial one.
+pub(crate) fn response_body(resp: &[u8]) -> String {
+    let Some(split) = find_subslice(resp, b"\r\n\r\n") else {
+        return String::new();
+    };
+    let head = String::from_utf8_lossy(&resp[..split]);
+    let body = &resp[split + 4..];
+    let chunked = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+    let decoded = if chunked {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    String::from_utf8_lossy(&decoded).trim().to_string()
+}
+
+/// The first index of `needle` in `hay`.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Decode HTTP/1.1 chunked framing. Stops at the terminating `0` chunk, and on
+/// anything malformed or truncated returns what was decoded so far.
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body;
+    // `while let` rather than `loop { let … else { break } }`: the condition is
+    // re-evaluated per iteration in both spellings, and every other exit here is
+    // a `break` (the terminating `0` chunk, a malformed size, a truncated chunk),
+    // which `while let` supports unchanged.
+    while let Some(pos) = find_subslice(rest, b"\r\n") {
+        // A chunk-size line may carry extensions after `;`.
+        let size_line = &rest[..pos];
+        let hex = size_line.split(|b| *b == b';').next().unwrap_or(b"");
+        let Ok(hex) = std::str::from_utf8(hex) else {
+            break;
+        };
+        let Ok(n) = usize::from_str_radix(hex.trim(), 16) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        let start = pos + 2;
+        let end = start.saturating_add(n);
+        if rest.len() < end {
+            out.extend_from_slice(&rest[start.min(rest.len())..]);
+            break;
+        }
+        out.extend_from_slice(&rest[start..end]);
+        rest = &rest[end..];
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -387,14 +454,57 @@ mod tests {
     }
 
     #[test]
-    fn response_body_text_takes_the_part_after_the_headers() {
+    fn response_body_takes_the_part_after_the_headers() {
         let resp = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 60\r\nConnection: close\r\n\r\nCode: 60. DB::Exception: Table usage_record does not exist";
         assert_eq!(
-            response_body_text(resp),
+            response_body(resp),
             "Code: 60. DB::Exception: Table usage_record does not exist"
         );
         // A response with no body is an empty string, not a panic.
-        assert_eq!(response_body_text(b"HTTP/1.1 200 OK\r\n\r\n"), "");
+        assert_eq!(response_body(b"HTTP/1.1 200 OK\r\n\r\n"), "");
+    }
+
+    /// ClickHouse frames its answers as chunks, so the bytes after the headers
+    /// are `size\r\ndata\r\n…0\r\n\r\n`. Reading them undecoded is what the
+    /// LIVE instance exposed; a `Content-Length` double cannot.
+    #[test]
+    fn a_chunked_response_is_decoded() {
+        let body = "{\"requests\":\"8\"}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            body
+        );
+        assert_eq!(response_body(resp.as_bytes()), body);
+    }
+
+    /// Multiple chunks, and a chunk extension (`;name=value`), are both legal.
+    #[test]
+    fn multiple_chunks_and_extensions_are_decoded() {
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;ext=1\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n";
+        assert_eq!(response_body(resp.as_bytes()), "abcdefg");
+    }
+
+    /// The read is size-capped, so a cut-off chunk must return the complete part
+    /// instead of panicking — the reader then fails its own decode check.
+    #[test]
+    fn a_truncated_chunked_body_returns_what_was_complete() {
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n5\r\nxy";
+        assert_eq!(response_body(resp.as_bytes()), "abcdxy");
+    }
+
+    /// A chunked header on a body that is not chunked must not invent data.
+    #[test]
+    fn a_malformed_chunk_size_yields_no_body_rather_than_a_guess() {
+        // `zz` is not hex, so the decoder stops instead of guessing.
+        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello";
+        assert_eq!(response_body(resp.as_bytes()), "");
+    }
+
+    /// No header terminator at all: nothing to report rather than a panic.
+    #[test]
+    fn a_response_without_a_header_terminator_has_no_body() {
+        assert_eq!(response_body(b"HTTP/1.1 200 OK\r\n"), "");
     }
 
     // -----------------------------------------------------------------------
@@ -514,7 +624,7 @@ mod tests {
         // The raw body reaches the caller, which is what lets the reader (T8)
         // classify a failing query from its `Code: N` text.
         assert!(
-            response_body_text(&body).contains("DB::Exception"),
+            response_body(&body).contains("DB::Exception"),
             "error body must survive the transport"
         );
     }

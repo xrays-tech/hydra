@@ -18,6 +18,8 @@
 //! | `hydra_auth_decisions_total` | counter | tenant, verdict, source | proxy `request_filter` |
 //! | `hydra_auth_upstream_error_total` | counter | tenant | proxy `request_filter` |
 //! | `hydra_auth_allow_ttl_capped_total` | counter | tenant | `http::AuthCache::set` |
+//! | `hydra_tenant_api_usage_query_total` | counter | source, group_by, result | `tenant_api::handlers::usage` |
+//! | `hydra_tenant_api_usage_query_seconds` | histogram | source | `tenant_api::handlers::usage` |
 //! | `hydra_auth_cache_size` | gauge | — | proxy `request_filter` |
 //! | `hydra_breaker_dead` | gauge | provider | breaker transitions |
 //! | `hydra_breaker_state_transitions_total` | counter | provider, to | breaker `on_failure`/`on_success` |
@@ -74,6 +76,13 @@ struct Metrics {
     auth_upstream_error: IntCounterVec,
     /// Allow writes whose TTL was clamped to `allow_ttl_max` (T7).
     allow_ttl_capped: IntCounterVec,
+    /// E3 usage reads, by store / grouping / outcome (`result` includes
+    /// `decode_error`, which the tenant sees only as "unavailable").
+    tenant_api_usage_query: IntCounterVec,
+    /// E3 usage-read latency, by store. A wide window is what makes this move,
+    /// and it is the signal behind the `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`
+    /// knob.
+    tenant_api_usage_query_seconds: HistogramVec,
     catalog_requests: IntCounterVec,
     auth_cache_size: IntGauge,
     breaker_dead: IntGaugeVec,
@@ -201,6 +210,18 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_auth_allow_ttl_capped_total",
                 "Allow verdicts whose TTL was clamped to the configured maximum",
                 &["tenant"]
+            )
+            .ok()?,
+            tenant_api_usage_query: register_int_counter_vec!(
+                "hydra_tenant_api_usage_query_total",
+                "Tenant API usage reads, by store, grouping and outcome",
+                &["source", "group_by", "result"]
+            )
+            .ok()?,
+            tenant_api_usage_query_seconds: register_histogram_vec!(
+                "hydra_tenant_api_usage_query_seconds",
+                "Tenant API usage-read latency, by store",
+                &["source"]
             )
             .ok()?,
             catalog_requests: register_int_counter_vec!(
@@ -451,6 +472,40 @@ pub fn record_auth_cache_size(n: usize) {
 pub fn record_allow_ttl_capped(tenant: &str) {
     if let Some(m) = metrics() {
         m.allow_ttl_capped.with_label_values(&[tenant]).inc();
+    }
+}
+
+/// Record one E3 usage read. `result` is `ok`, `store_unavailable` or
+/// `decode_error`; the last two are the same 503 to the tenant and are told
+/// apart here so an operator can see a shape drift without reading logs.
+pub fn record_tenant_api_usage_query(
+    source: &str,
+    group_by: &str,
+    result: &str,
+    elapsed: std::time::Duration,
+) {
+    if let Some(m) = metrics() {
+        m.tenant_api_usage_query
+            .with_label_values(&[source, group_by, result])
+            .inc();
+        m.tenant_api_usage_query_seconds
+            .with_label_values(&[source])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Current value of the E3 usage-read counter for one label combination, so a
+/// test can assert that a failure is attributed (a `decode_error` is
+/// indistinguishable from an unreachable store in the response, and telling them
+/// apart is the operator's only signal of a shape drift).
+#[must_use]
+pub fn tenant_api_usage_query_total(source: &str, group_by: &str, result: &str) -> f64 {
+    match metrics() {
+        Some(m) => m
+            .tenant_api_usage_query
+            .with_label_values(&[source, group_by, result])
+            .get() as f64,
+        None => 0.0,
     }
 }
 
