@@ -428,7 +428,30 @@ cargo test -p hydra-server --features server --test loader --test repo --test co
 **Risk**：回归网 = 既有 4 条 `clickhouse_sink` 测试（含 1 条 `#[ignore]`），外加本机活实例手工跑那条 ignored。
 
 **Steps**
-1. **先建回归基线**：`cargo test -p hydra-server --features server,usage-clickhouse --test clickhouse_sink` → 记录输出（3 passed, 1 ignored）。
+1. **先建回归基线**（**本计划已在 2026-09-17 预采集，搬迁后必须逐字复现**）：
+
+```text
+$ cargo test -p hydra-server --features server,usage-clickhouse --test clickhouse_sink
+running 4 tests
+test clickhouse_sink_writes_batch ... ignored, needs a real ClickHouse at CH_URL (e.g. http://127.0.0.1:8123)
+test clickhouse_json_row_matches_usage_record_schema ... ok
+test clickhouse_json_row_escapes_special_chars ... ok
+test clickhouse_json_row_new_metrics_null_when_absent ... ok
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+```
+
+```text
+$ curl -s --data-binary "SELECT count() FROM usage_record" http://127.0.0.1:8123/     # 8
+$ CH_URL=http://127.0.0.1:8123 cargo test -p hydra-server --features server,usage-clickhouse \
+    --test clickhouse_sink -- --ignored --nocapture
+test clickhouse_sink_writes_batch ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored
+$ curl -s --data-binary "SELECT count() FROM usage_record" http://127.0.0.1:8123/     # 10  ← +2，证明确实写进了活 CH
+```
+
+**这条 ignored 用例不是摆设**：它真的往 `hydra-local-clickhouse` 里写了 2 行。所以搬迁的回归网是"3 条纯 JSON 形状测试 + 1 条真实写库"，覆盖面比"只有 3 条"强——复审若质疑回归网是否足够，这就是答案。
+
+同时确认两条特性组合可编译（搬迁前基线）：`--features server,usage-clickhouse --all-targets` ✅、`--features server,cluster-redis,usage-clickhouse --all-targets` ✅、`--features server,cluster-redis --all-targets` ✅（`cargo check` 全绿）。
 2. 新建 `clickhouse.rs`，**逐行**搬运以下四块（不改逻辑）：
    - `ClickHouseConfig` 与其 URL/凭据解析（原 `sink.rs:446-469`，含 `user:pass@` → Basic 头）；
    - `url_encode`（原 `sink.rs:899-914`）；
