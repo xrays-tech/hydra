@@ -600,7 +600,7 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
       | `tenant_api` | `TenantApiConfig` | `enabled`（`HYDRA_TENANT_API`）、限流参数、**T6 的存活节点列表闭包** |
 
       **`for_tests` 必须能表达新测试所需的值**（P1-12）：`pub fn for_tests(pool, store, auth, breaker, limiter, sink, proxy, usage: Arc<dyn UsageQuery>, invalidation: Option<InvalidationStream>, tenant_api: TenantApiConfig) -> Arc<AppState>`。四个新增参数都**必填**而不是默认值 —— 因为 C1/C4/C6/C7 需要 `invalidation: Some(stream)`、C4/C5/C9/C10 需要真实的存活节点闭包、T10 需要 `enabled: false`；若给它们默认值，这些测试就得改回结构体字面量，`for_tests()` 的收敛意义就没了。**新测试同样只能用 `for_tests()`**（禁止新增 `AppState { .. }` 字面量，否则 §7.2 的计数校验失去意义）。
-   b. 迁移 **12 处**测试构造点到 `for_tests()`：`tests/terminate_mode.rs:206-233` 的 helper（**它内含 `:224`，不要重复计**）＋ `:600/:718/:1089/:1320/:2871`、`tests/streaming_usage_persistence.rs:271`、`tests/tls.rs:166`、`tests/anthropic_passthrough.rs:302/392/506`、`tests/metrics.rs:282`。**计数校验**：`grep -rn "AppState {" crates/ --include=*.rs | wc -l` 应为 **14**（1 定义 + 1 生产 + 12 测试），迁移后测试侧应为 0；
+   b. 迁移 **12 处**测试构造点到 `for_tests()`：`tests/terminate_mode.rs:206-233` 的 helper（**它内含 `:224`，不要重复计**）＋ `:600/:718/:1089/:1320/:2871`、`tests/streaming_usage_persistence.rs:271`、`tests/tls.rs:166`、`tests/anthropic_passthrough.rs:302/392/506`、`tests/metrics.rs:282`。**计数校验（命令已按 T4 实测修正）**：`grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" | wc -l` —— 迁移前 **14**（1 定义 + 1 生产 + 12 测试），T4 之后应为 **2**（只剩定义与 `main.rs` 的生产构造）。**注意**：裸的 `grep -c "AppState {"` 在 T4 之后会数到 `impl AppState {` 而给出 3，所以必须排除它；
    c. `main.rs`：把 `AppState` 构造**移到 `invalidation_stream` 之后**（`:621-644` 之后）；`:594` 的 `state.sink.clone()` 改为先克隆 `sink`；
    d. `tenant_api/mod.rs`：`pub async fn dispatch(state: &AppState, session, ctx) -> PingoraResult<bool>`；轻量段匹配（形制照 `admin/mod.rs:277-419`）；`respond_json`（形制照 `respond_catalog`，`proxy.rs:1280-1297`）；`TenantApiConfig::from_env()`（`HYDRA_TENANT_API=on|off`，默认 on）；
    e. `tenant_api/auth.rs`：`pub fn tenant_from_token(store: &ConfigStore, bearer: &str) -> Option<String>`。**必须在同一次 `replication()` guard 内**同时取令牌摘要表与 `tenants_by_id`（设计 §3.3 规则 4）；常数时间比较；`replication()` 为 `None` → `NotReady`（503）；
@@ -1196,6 +1196,32 @@ Execution Route:
 ```
 
 ---
+
+## 实施记录（开发期回填）
+
+### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）
+
+| 项 | 结果 |
+|---|---|
+| 新增 | `tenant_api/mod.rs`（路由 + 闸门 + 响应信封 + `RESERVED_PREFIX` + `TenantApiConfig`）、`tenant_api/auth.rs`（快照闸门 + 常数时间比较）、`usage_query.rs`（`UsageQuery` trait + `SqliteUsageQuery` + `select_sqlite`）、`tests/tenant_api.rs`（10 条） |
+| 修改 | `proxy.rs`（`AppState` +3 字段、`for_tests`、拦截点）、`main.rs`（构造后移 + 注入）、`lib.rs`（两个模块声明）、12 处测试构造点 |
+| **TDD 证据** | **RED（摘除拦截）：2 passed / 8 failed** —— 失败形态正是设计预测的：保留前缀的请求返回了**管线自己的信封** `{"error":{"message":"unknown_domain","type":"proxy_error"}}`，证明租户路径当时被当成普通数据面请求处理。**GREEN：10 passed** |
+| 门禁 | fmt clean；`clippy -D warnings` 在**两种**特性组合下 clean；core 16 target；三特性 **31 target** 全绿；限域生产 grep 为空 |
+| 计数校验 | `AppState` 字面量 12 处测试 → `for_tests()`；剩余 **2** 处（定义 + 生产构造，命令见 T4） |
+
+### T4 执行期对计划的修正（3 处）
+
+| # | 计划所写 | 实际 | 处理 |
+|---|---|---|---|
+| 1 | `for_tests(pool, store, auth, …)` | `pool` 参数**多余**：`ConfigStore::pool()` 已是"本节点有没有本地库"的唯一 owner，再放一份到 `AppState` 就有漂移风险 | **去掉 `pool` 参数**，`usage` 由 `store.pool()` 派生。副作用是 12 处站点的字段映射变成 1:1，迁移可机械完成 |
+| 2 | `usage` 字段与 `AppState` 同批（T4），`usage_query.rs` 在 T8 | `AppState` 加字段会打断 12 处站点，所以**一次加完**才是对的；因此 `usage_query.rs` 的 **SQLite 臂**随 T4 落地（CH 臂仍留 T8） | 采纳。`SqliteUsageQuery` 是真实可用的读实现（T8 接上 E3 handler），不是桩；集群部署下 `usage` 暂为 `None`，端点回 503 而**不是**零 —— T8 收口，已在提交信息里标明 |
+| 3 | 拦截条件 `starts_with(RESERVED_PREFIX)` | `/tenant`（无尾斜杠）不匹配，会漏进管线 —— 而它同样可能带着租户令牌 | **裸 `/tenant` 也算保留**（`p == "/tenant" || p.starts_with("/tenant/")`）。这是被保留前缀的最后一条缝隙 |
+
+### T4 里被测试抓到的两处**假覆盖**（我的断言写错了）
+
+RED 阶段有 2 条测试**通过**，查"哪 2 条"才发现是我的断言写错：我读的是 `error.code`，而**数据面短路信封把原因放在 `error.message`、根本没有 `code`**，于是 `!matches!(code, "unknown_domain"|…)` 恒真。两条已改为**对信封形状的差分断言**（我们的信封必有 `code` + `trace_id`、且绝无 `type: proxy_error`）。
+
+另 2 条在 RED 下仍通过，**属正当**并已记录：一条是"关闭开关 == 基线"的等价性断言的另一半（其配对断言证明开启时行为不同），一条是"数据面永不暴露内部路由"的回归守卫——两者本来就不是功能测试，强行让它们变红才是错的。
 
 ## Batch A 自审记录（T1 / T2 / T3，2026-09-17）
 
