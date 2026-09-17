@@ -517,7 +517,10 @@ pub(super) async fn respond_json<T: serde::Serialize>(
 /// gate runs before this, but the body is read before the handler decides
 /// anything) from making the node buffer arbitrarily, not to accommodate large
 /// legitimate requests.
-pub(super) async fn read_body(session: &mut Session) -> Result<Vec<u8>, (u16, Vec<u8>)> {
+pub(super) async fn read_body(
+    session: &mut Session,
+    trace_id: &str,
+) -> Result<Vec<u8>, (u16, Vec<u8>)> {
     const MAX_BODY: usize = 1024 * 1024;
     let mut buf = Vec::new();
     loop {
@@ -529,8 +532,7 @@ pub(super) async fn read_body(session: &mut Session) -> Result<Vec<u8>, (u16, Ve
                     // variant is large enough that clippy objects (rightly).
                     return Err((
                         413,
-                        br#"{"error":{"code":"payload_too_large","message":"request body exceeds 1 MiB"}}"#
-                            .to_vec(),
+                        error_body("payload_too_large", "request body exceeds 1 MiB", trace_id),
                     ));
                 }
                 buf.extend_from_slice(&chunk);
@@ -540,12 +542,29 @@ pub(super) async fn read_body(session: &mut Session) -> Result<Vec<u8>, (u16, Ve
                 tracing::warn!(error = %e, "tenant API: reading the request body failed");
                 return Err((
                     400,
-                    br#"{"error":{"code":"invalid_request","message":"could not read the request body"}}"#
-                        .to_vec(),
+                    error_body(
+                        "invalid_request",
+                        "could not read the request body",
+                        trace_id,
+                    ),
                 ));
             }
         }
     }
+}
+
+/// The shared error envelope, as bytes.
+///
+/// The two `read_body` failures used to return hand-written static JSON without
+/// `trace_id`, which contradicted this module's own promise that the tenant API's
+/// envelope "always carries `code` and `trace_id`" — and `trace_id` is the only
+/// thing that ties a 413 to the log line that explains it. Built with
+/// `serde_json` rather than a format string so the escaping cannot drift.
+fn error_body(code: &str, message: &str, trace_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": { "code": code, "message": message, "trace_id": trace_id }
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec())
 }
 
 /// Write an already-built error response, re-emitting it through this module's

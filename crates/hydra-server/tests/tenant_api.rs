@@ -1079,3 +1079,62 @@ async fn a_wrong_tenant_in_the_url_does_not_spend_the_success_budget() {
     assert_eq!(s1, 200, "a 403 must not consume the budget");
     assert_eq!(s2, 200);
 }
+
+/// The two `read_body` failures used to hand back hand-written static JSON with
+/// no `trace_id` — the one field that ties a rejection to the log line that
+/// explains it, and which this API's envelope promises on EVERY response.
+///
+/// The body cap is the reason the cap exists at all: the gate runs before the
+/// body is read, so a caller that already holds a token can otherwise make the
+/// node buffer arbitrarily.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_body_is_413_in_the_documented_envelope() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/auth/cache/invalidate");
+
+    // 2 MiB: one key far past the 1 MiB body cap.
+    let huge = "x".repeat(2 * 1024 * 1024);
+    let body = format!(r#"{{"api_keys":["{huge}"]}}"#);
+    let mut resp = None;
+    for _ in 0..60 {
+        match c
+            .post(&url)
+            .bearer_auth(TENANT_TOKEN)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    let r = resp.expect("proxy never became ready");
+    let status = r.status().as_u16();
+    let header_trace = r
+        .headers()
+        .get("X-Hydra-Trace-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = r.text().await.unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+
+    assert_eq!(status, 413, "the body cap must fire: {text}");
+    assert_eq!(v["error"]["code"], "payload_too_large", "{text}");
+    assert!(
+        v["error"]["trace_id"].is_string(),
+        "the envelope must carry trace_id (this 413 body used to omit it): {text}"
+    );
+    assert_eq!(
+        header_trace.as_deref(),
+        v["error"]["trace_id"].as_str(),
+        "the header and the body must agree on the trace id: {text}"
+    );
+}

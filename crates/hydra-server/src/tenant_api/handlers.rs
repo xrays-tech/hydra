@@ -163,7 +163,7 @@ pub async fn invalidate(
     let tenant_id = auth.tenant.id.clone();
 
     // --- request body -------------------------------------------------------
-    let body = match crate::tenant_api::read_body(session).await {
+    let body = match crate::tenant_api::read_body(session, &ctx.trace_id).await {
         Ok(b) => b,
         // `read_body` reports (status, body); re-emit it through this module's
         // writer so the envelope and termination stay uniform.
