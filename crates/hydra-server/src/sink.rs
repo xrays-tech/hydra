@@ -437,105 +437,16 @@ async fn insert_batch_sqlite(
 // `insert_batch_clickhouse_http`.
 
 #[cfg(feature = "usage-clickhouse")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[cfg(feature = "usage-clickhouse")]
 use tokio::sync::mpsc as ch_mpsc;
 
-/// Configuration parsed once from the ClickHouse URL.
+// The ClickHouse transport lives in `crate::clickhouse` — the single owner of
+// "how to talk to ClickHouse" (URL/credential interpretation, request shape,
+// deadlines, status classification). The writer below only builds the
+// `FORMAT JSONEachRow` payload and interprets the answer.
 #[cfg(feature = "usage-clickhouse")]
-#[derive(Clone)]
-struct ClickHouseConfig {
-    /// `host:port` for the TCP connection (e.g. `127.0.0.1:8123`).
-    host_port: String,
-    /// HTTP Basic credentials from `user:pass@host` URL userinfo, if present.
-    /// Sent as `Authorization: Basic <base64(user:pass)>` — ClickHouse's HTTP
-    /// interface accepts Basic auth natively.
-    auth: Option<(String, String)>,
-    /// Any query string from the URL (e.g. `?database=dogress` or
-    /// `?user=x&password=y`), WITHOUT the leading `?`. Appended to the POST
-    /// request's query string; empty when the URL had none.
-    query_params: String,
-    /// Deadline for the TCP connect
-    /// (`HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS`, default 3000).
-    connect_timeout: Duration,
-    /// Deadline for EACH of write / flush / response read
-    /// (`HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`, default 15000).
-    ///
-    /// Without these, a ClickHouse that accepts the connection but never answers
-    /// — or a black-holed route — pinned the single flush task forever, the
-    /// bounded channel filled and usage records were dropped (audit §3.9).
-    io_timeout: Duration,
-}
-
-/// Largest response we buffer from ClickHouse. A successful `INSERT` answers
-/// `200` with an empty body; only error text is ever sent, so anything past
-/// this is truncation-safe and keeps a misbehaving server from growing our heap.
-#[cfg(feature = "usage-clickhouse")]
-const MAX_CLICKHOUSE_RESPONSE: usize = 64 * 1024;
-
-/// Read `KEY` as a positive millisecond count, falling back to `default_ms`.
-#[cfg(feature = "usage-clickhouse")]
-fn env_millis(key: &str, default_ms: u64) -> Duration {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(default_ms))
-}
-
-/// Parse a ClickHouse URL into transport + credentials. Accepted forms:
-///
-/// - `http://host:port` / `https://host:port` / bare `host:port` (anonymous);
-/// - `http://user:pass@host:port` — userinfo becomes HTTP Basic auth;
-/// - any of the above plus a query string (`?database=dogress`,
-///   `?user=x&password=y`), which is passed through verbatim.
-///
-/// CR/LF in credentials are stripped (header-injection guard); the password is
-/// otherwise sent as-is inside the Basic auth header.
-#[cfg(feature = "usage-clickhouse")]
-fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
-    let stripped = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    // Split off the query string first (kept for passthrough).
-    let (authority, query) = match stripped.split_once('?') {
-        Some((a, q)) => (a, Some(q)),
-        None => (stripped, None),
-    };
-    // Split off userinfo (`user[:pass]@`).
-    let (userinfo, host_port) = match authority.split_once('@') {
-        Some((ui, hp)) => (Some(ui), hp),
-        None => (None, authority),
-    };
-    let auth = userinfo.and_then(|ui| {
-        let (user, pass) = match ui.split_once(':') {
-            Some((u, p)) => (u, p),
-            None => (ui, ""),
-        };
-        if user.is_empty() {
-            None
-        } else {
-            Some((strip_crlf(user), strip_crlf(pass)))
-        }
-    });
-    ClickHouseConfig {
-        // Trim a trailing '/' (and any path): the sink only dials host:port.
-        host_port: host_port.trim_end_matches('/').to_string(),
-        auth,
-        query_params: query.unwrap_or("").to_string(),
-        connect_timeout: env_millis("HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS", 3_000),
-        io_timeout: env_millis("HYDRA_CLICKHOUSE_IO_TIMEOUT_MS", 15_000),
-    }
-}
-
-/// Strip CR/LF so user-supplied URL credentials can never inject HTTP headers.
-#[cfg(feature = "usage-clickhouse")]
-fn strip_crlf(s: &str) -> String {
-    s.chars().filter(|&c| c != '\r' && c != '\n').collect()
-}
+use crate::clickhouse::{
+    is_ok_status, parse_clickhouse_url, response_body_text, send, ClickHouseConfig,
+};
 
 /// Optional ClickHouse `UsageSink`. Same batching/backoff/Drop semantics as
 /// [`SqliteSink`]; only the insert transport differs.
@@ -689,6 +600,11 @@ const CLICKHOUSE_INSERT: &str =
 
 /// Insert a batch into ClickHouse over HTTP. On failure returns the error
 /// message (the batch is retained by the caller for retry).
+///
+/// The exchange itself lives in [`crate::clickhouse::send`]; what stays here is
+/// the payload (`FORMAT JSONEachRow` rows) and the *classification* of the
+/// answer — a 200 means the batch landed, anything else carries ClickHouse's
+/// error text, which the caller logs and retries.
 #[cfg(feature = "usage-clickhouse")]
 async fn insert_batch_clickhouse_http(
     cfg: &ClickHouseConfig,
@@ -705,106 +621,14 @@ async fn insert_batch_clickhouse_http(
         body.push('\n');
     }
 
-    // POST /?query=<url-encoded INSERT>& … with the rows in the body.
-    // URL query params (e.g. `?database=dogress`, or `?user=&password=`) are
-    // passed through verbatim; `user:pass@` userinfo becomes Basic auth.
-    let mut request = String::with_capacity(body.len() + 256);
-    request.push_str("POST /?");
-    if !cfg.query_params.is_empty() {
-        request.push_str(&cfg.query_params);
-        request.push('&');
-    }
-    request.push_str("query=");
-    request.push_str(&url_encode(CLICKHOUSE_INSERT));
-    request.push_str(" HTTP/1.1\r\n");
-    request.push_str("Host: ");
-    request.push_str(&cfg.host_port);
-    request.push_str("\r\n");
-    if let Some((user, pass)) = &cfg.auth {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let token = B64.encode(format!("{user}:{pass}"));
-        request.push_str("Authorization: Basic ");
-        request.push_str(&token);
-        request.push_str("\r\n");
-    }
-    request.push_str("Content-Length: ");
-    request.push_str(&body.len().to_string());
-    request.push_str("\r\nConnection: close\r\n\r\n");
-    request.push_str(&body);
-
-    // Every step is deadline-bound (audit §3.9): this runs on the single sink
-    // flush task, so one blocked await would stop ALL usage metering for the
-    // whole node and silently overflow the channel behind it.
-    let hp = cfg.host_port.clone();
-    let mut stream = tokio::time::timeout(
-        cfg.connect_timeout,
-        tokio::net::TcpStream::connect(&cfg.host_port),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "clickhouse connect {hp}: timed out after {}ms",
-            cfg.connect_timeout.as_millis()
-        )
-    })?
-    .map_err(|e| format!("clickhouse connect {hp}: {e}"))?;
-
-    tokio::time::timeout(cfg.io_timeout, stream.write_all(request.as_bytes()))
-        .await
-        .map_err(|_| {
-            format!(
-                "clickhouse write: timed out after {}ms",
-                cfg.io_timeout.as_millis()
-            )
-        })?
-        .map_err(|e| format!("clickhouse write: {e}"))?;
-    tokio::time::timeout(cfg.io_timeout, stream.flush())
-        .await
-        .map_err(|_| {
-            format!(
-                "clickhouse flush: timed out after {}ms",
-                cfg.io_timeout.as_millis()
-            )
-        })?
-        .map_err(|e| format!("clickhouse flush: {e}"))?;
-
-    // Read the response with BOTH a deadline and a size cap. `read_to_end`
-    // alone would wait for EOF: a server that sends a status line and then keeps
-    // the connection open would hang us until the deadline, and a chatty server
-    // could grow `resp` without bound.
-    let mut resp = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = tokio::time::timeout(cfg.io_timeout, stream.read(&mut chunk))
-            .await
-            .map_err(|_| {
-                format!(
-                    "clickhouse read: timed out after {}ms",
-                    cfg.io_timeout.as_millis()
-                )
-            })?
-            .map_err(|e| format!("clickhouse read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        let room = MAX_CLICKHOUSE_RESPONSE.saturating_sub(resp.len());
-        if room == 0 {
-            // Enough to classify the status/error; stop waiting for EOF.
-            break;
-        }
-        resp.extend_from_slice(&chunk[..n.min(room)]);
-    }
+    let (status_line, resp) = send(cfg, CLICKHOUSE_INSERT, &[], body.as_bytes()).await?;
 
     // ClickHouse returns HTTP 200 + empty body on a successful INSERT; any other
     // status carries the error text in the body.
-    let resp_text = String::from_utf8_lossy(&resp);
-    let status_line = resp_text.lines().next().unwrap_or("");
-    if status_line.contains(" 200 ") {
+    if is_ok_status(&status_line) {
         Ok(())
     } else {
-        // Trim the body to a reasonable size for the error message.
-        let body_text = resp_text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+        let body_text = response_body_text(&resp);
         Err(format!(
             "clickhouse insert rejected: status=`{status_line}` body={body_text}"
         ))
@@ -894,25 +718,6 @@ fn json_opt_u64_into(out: &mut String, v: Option<u64>) {
     }
 }
 
-/// Percent-encode a string for use in a `?query=` URL segment (RFC 3986
-/// unreserved characters kept; everything else `%HH`).
-#[cfg(feature = "usage-clickhouse")]
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
-}
-
 // ===========================================================================
 // Config-driven selection (design §9.3)
 // ===========================================================================
@@ -989,61 +794,6 @@ pub fn build_sink(
         other => Err(BuildSinkError::UnknownKind {
             kind: other.to_string(),
         }),
-    }
-}
-
-#[cfg(all(test, feature = "usage-clickhouse"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_url_anonymous() {
-        let cfg = parse_clickhouse_url("http://127.0.0.1:8123");
-        assert_eq!(cfg.host_port, "127.0.0.1:8123");
-        assert!(cfg.auth.is_none());
-        assert_eq!(cfg.query_params, "");
-    }
-
-    #[test]
-    fn parse_url_bare_host() {
-        let cfg = parse_clickhouse_url("clickhouse:8123");
-        assert_eq!(cfg.host_port, "clickhouse:8123");
-        assert!(cfg.auth.is_none());
-    }
-
-    #[test]
-    fn parse_url_userinfo_becomes_basic_auth() {
-        let cfg = parse_clickhouse_url("http://sh_admin:sH_9527!@clickhouse:8123");
-        assert_eq!(cfg.host_port, "clickhouse:8123");
-        assert_eq!(cfg.auth, Some(("sh_admin".into(), "sH_9527!".into())));
-        assert_eq!(cfg.query_params, "");
-    }
-
-    #[test]
-    fn parse_url_user_only() {
-        let cfg = parse_clickhouse_url("http://alice@clickhouse:8123");
-        assert_eq!(cfg.auth, Some(("alice".into(), "".into())));
-    }
-
-    #[test]
-    fn parse_url_query_passthrough() {
-        let cfg = parse_clickhouse_url("http://clickhouse:8123/?database=dogress&user=x");
-        assert_eq!(cfg.host_port, "clickhouse:8123");
-        assert!(cfg.auth.is_none(), "query user must NOT become Basic auth");
-        assert_eq!(cfg.query_params, "database=dogress&user=x");
-    }
-
-    #[test]
-    fn parse_url_userinfo_and_query() {
-        let cfg = parse_clickhouse_url("http://u:p@clickhouse:8123/?database=dogress");
-        assert_eq!(cfg.auth, Some(("u".into(), "p".into())));
-        assert_eq!(cfg.query_params, "database=dogress");
-    }
-
-    #[test]
-    fn parse_url_strips_crlf_from_credentials() {
-        let cfg = parse_clickhouse_url("http://u\r\n:pa\r\nss@clickhouse:8123");
-        assert_eq!(cfg.auth, Some(("u".into(), "pass".into())));
     }
 }
 

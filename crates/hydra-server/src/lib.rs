@@ -62,6 +62,16 @@ pub mod http;
 #[cfg(feature = "runtime")]
 pub mod sink;
 
+// The single owner of "how to talk to ClickHouse" (URL/credentials, request
+// shape, deadlines, status classification). Shared by the usage writer
+// (`sink.rs`) and the tenant API usage reader (`usage_query.rs`).
+//
+// Gated because the whole module depends on `tokio::io` and on ClickHouse's
+// HTTP interface; `usage-clickhouse` is NOT implied by `server`, and without it
+// `sink_kind == "clickhouse"` cannot occur at all (`build_sink` refuses it).
+#[cfg(feature = "usage-clickhouse")]
+pub mod clickhouse;
+
 // --- W4: Pingora proxy shell ----------------------------------------------
 /// Downstream listener topology — the single owner of "which port speaks which
 /// protocol" (design §12.1 / §15.1). The decision is a pure function of
