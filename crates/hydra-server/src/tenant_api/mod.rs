@@ -384,24 +384,16 @@ pub async fn dispatch(
     // querying usage must not itself count as usage.
     ctx.tenant = Some(authenticated.tenant.clone());
 
-    // 4. Route. T4 delivers the routing skeleton: no endpoint is wired yet, so
-    //    each arm answers the same local 404 the path produced before this API
-    //    existed. T5/T6/T8 replace exactly one arm each with its real handler —
-    //    which is why this task wires nothing: wiring E1 here would make T5's RED
-    //    step unable to fail for the right reason.
+    // 4. Route. All three endpoints are served; a path under the reserved prefix
+    //    that is not one of them was refused a local 404 above, so this match is
+    //    exhaustive over the routes `parse_route` can produce.
     match route.endpoint {
-        // T5: E1 is wired. It needs nothing but the row the gate already
-        // resolved, so there is no second lookup to keep consistent.
+        // Answered from the row the gate already resolved: no second lookup, so
+        // there is nothing that could disagree with the authorisation.
         Endpoint::Whoami => handlers::whoami(session, ctx, &authenticated).await,
-        // T6 and T8 replace these two arms, one each. Until then they answer the
-        // same local 404 the path produced before this API existed — a routing
-        // skeleton, not a stub: the behaviour is correct for a route that is not
-        // served yet.
-        // T6: E2 is wired.
         Endpoint::InvalidateAuthCache => {
             handlers::invalidate(state, session, ctx, &authenticated).await
         }
-        // T8: E3 is wired.
         Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
     }
 }
