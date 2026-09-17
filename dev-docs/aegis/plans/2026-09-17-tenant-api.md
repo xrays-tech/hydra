@@ -1197,6 +1197,27 @@ Execution Route:
 
 ---
 
+
+### T5 — E1 `GET /whoami`（`8b5395a`）
+
+| 项 | 结果 |
+|---|---|
+| 交付 | `tenant_api/handlers.rs`（`whoami`）；闸门现在同时返回它所依据的快照版本（`AuthenticatedTenant.config_version`），响应报告**同一个值**——取一次新鲜的 `store.version()` 会让响应归属于比授权它更新的一版配置 |
+| 暴露字段 | 租户自己的 id/name/enabled + 绑定的域名与 auth_url（只读；修改仍是运维动作）+ config_version + base_url |
+| **TDD 证据** | **RED 7 failed**：5 条新 E1 测试 + 2 条 T4 里用 404 当"已鉴权"标记的断言，失败原因全部是**我们自己的骨架 404**（正确原因，非 setup 错误）→ **GREEN 15 passed** |
+| 亮点 | C12（edge 无 DB）：测试构造**无 pool 的 `ConfigStore`** 并喂一帧 `HydratedWire`，走的是真实副本路径（`apply_snapshot`）而非数据库；版本 7 从线缆进到响应，证明"E1 不需要 DB、不需要转发" |
+
+### T6 — E2 全集群清除 + 收敛屏障（`0a81aa3`）
+
+| 项 | 结果 |
+|---|---|
+| 交付 | 屏障（`events.rs`：每节点水位键 + 单次 MGET、数值化流 ID 比较、apply-then-ack、generation bump 不推进水位、只等存活节点）；E2 handler（三层语义 + 200/202/503 + `fleet` 报告）；限流器（`throttle.rs`，4 条单测）；routing 层的方法契约（GET → 405）；`main.rs` 注入存活节点闭包（后台刷新，避免在异步上下文里 `block_on`） |
+| **测试抓到的两个真 bug** | ① **`await_applied` 会挂死租户请求**：截止检查只在两次轮询之间，Redis 客户端对死连接重试时单次 `await` 永不返回 → 每次轮询改为受剩余预算约束，未完成的轮询报 `Unavailable`（fail-closed）。由"指向已关闭端口"的测试**把整个测试二进制跑超时**发现。② **`invalidation == None` 的语义反了**：原实现报 `unavailable`(503)，导致**编译了 cluster-redis 的单节点部署**对一次实际已全局成功的清除回 503。"无流"只可能是单节点 `all` 角色（`main` 只在没有 Redis 主干时为 `None`，而 leader/edge 缺它就拒绝启动）→ 改为 `single_node`，`Unavailable` 保留给"有流但失败"。**只有三特性矩阵能暴露它**——`--features server` 两种实现都通过，这正是计划强制跑两者的原因 |
+| 顺带删除 | `constant_time_eq` 被写了两份（admin 一份、我一份）→ 合并为一份，租户闸门复用 admin 的实现 |
+| **TDD 证据** | E2 接线被改回 404 后重跑：4 条新测试中 **3 条失败**（第 4 条 `invalidate_is_post_only` 测的是 routing 的方法契约，删掉方法校验它才变红——已记录为"与接线无关但非空断言"） |
+| 已声明的边界 | 限流窗口是**每进程**的，N 节点舰队允许 N 倍速率；它仍然约束了每个节点的发布速率（驱动 generation bump 的那个量），共享窗口是明确的后续项 |
+| 门禁 | fmt clean；两种 clippy 组合 clean；三特性 **32 target 全绿、0 失败**；core 16；数据面新套件 19 条；集群新套件 7 条（**真实 Redis**，helper 在未设 `HYDRA_TEST_REDIS_URL` 时 panic，因此永不静默跳过） |
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）
