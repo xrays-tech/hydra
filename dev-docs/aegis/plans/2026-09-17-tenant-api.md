@@ -395,7 +395,11 @@ cargo tree -p hydra-core --no-default-features   # 防火墙：仍无 tokio/ping
 **Files**：`crates/hydra-core/src/config.rs`、`crates/hydra-server/src/store.rs`（`build_config`）、`crates/hydra-core/tests/config_data.rs`
 **Why**：E1 要按 `tenant_id` O(1) 取行；今天只有 `tenants_by_domain`（键是域名）。
 **Change Necessity**：备选是线性扫描 `tenants_by_domain.values()`。选派生索引是因为**存在性判定**（令牌有效但租户行不存在）也走同一索引，且它与 `models_by_key` 之于 `provider_models` 同构——**同批行、同 loader**，不是第二个 source of truth。
-**Impact/Compat**：`ConfigData` 是 `pub` 字段结构体，新增字段会打断所有构造点 → 必须同时给出 `Default` 并修所有构造点。
+**Impact/Compat**：`ConfigData` 是 `pub` 字段结构体，但**穷举字面量只有 2 处**（已实测核对：`grep -rn -A1 "ConfigData {" crates/` 后逐处读过）：
+- `crates/hydra-server/src/store.rs:178` —— `build_config` 的返回字面量，**正是本任务要改的地方**；
+- `crates/hydra-core/tests/validate.rs:275` —— 一个测试字面量，补一个 `HashMap::new()` 即可。
+
+其余 7 处（`hydra-core/tests/{router,validate,admission}.rs`、`hydra-server/src/{proxy,cluster/snapshot}.rs`、`hydra-server/tests/load_breaker_swrr.rs`）都用 `ConfigData::default()` + 字段赋值，**新增字段不会打断它们**（另有 38 处 `ConfigData::default()` 调用点同样不受影响）。所以本任务是"1 处生产 + 1 处测试 + `Default` + loader 构建"，不是"修一片"。
 
 **Steps**
 1. **红灯**：在 `crates/hydra-core/tests/config_data.rs` 加一条断言：手工构造两个租户（domain 与 id 不同序），断言 `tenants_by_id` 能按 id 取到、且 `len()` 与 `tenants_by_domain` 一致。
@@ -405,7 +409,7 @@ cargo tree -p hydra-core --no-default-features   # 防火墙：仍无 tokio/ping
    - `ConfigData::default()` 补 `HashMap::new()`；
    - `store.rs::build_config`：在填 `tenants_by_domain` 的同一循环里同时 `insert(t.id.clone(), t.clone())`（**同一批行、同一循环**，禁止第二次查库）。
 4. **Verify GREEN**：`cargo test -p hydra-core` + `cargo test -p hydra-server --features server --test loader` + `cargo test -p hydra-server --features server --test repo`。
-5. 修所有因此编译失败的 `ConfigData { .. }` 构造点（`grep -rn "ConfigData {" crates/`）。
+5. 编译并修掉因新增字段而失败的构造点：**预期只有 `crates/hydra-core/tests/validate.rs:275` 一处**（`store.rs:178` 已在步骤 3 改过）。若编译器报出第三处，说明有未预期的穷举字面量，**必须停下报告**而不是顺手补上——那意味着 `ConfigData` 的构造分散程度超出本计划已知的事实。
 6. **Commit**：`feat(core,server): derive ConfigData.tenants_by_id alongside tenants_by_domain`
 
 **Verification**：
