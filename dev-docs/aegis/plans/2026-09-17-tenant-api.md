@@ -1314,6 +1314,26 @@ done
 
 同样地，`hydra_tenant_api_requests_total` 的 `endpoint` 标签必须在**每一条出口**上都被设置——包括在路由解析之前就返回的 404/405。实现方式是把标签放在 `RequestContext` 上（而不是穿进四个响应写出函数，那会改掉约 20 个调用点，而"只覆盖记得改的路径"的指标比没有指标更糟）。
 
+### T10 — 全门禁 + 交付核对 + Playwright（本提交）
+
+| 项 | 结果 |
+|---|---|
+| **core** | 16 target、**187 passed / 0 failed** |
+| **server 单特性** | **33 target、435 passed / 0 failed** |
+| **server 三特性矩阵** | **33 target、538 passed / 0 failed** |
+| **活 ClickHouse `--ignored`** | 1 passed（读者数字与手跑 SQL 逐字段一致：`requests=8` / `tokens_in=247`，分组行也一致） |
+| **clippy（workspace，CI 的两种组合）** | 各 **0 error**（`--features hydra-server/server`；`server,cluster-redis,usage-clickhouse`） |
+| **依赖防火墙（按 CI 原样命令）** | OK（`hydra-core` 无 tokio/pingora/sqlx/reqwest/hyper） |
+| **脚本门禁** | `check_i18n.js` → `OK (338 en keys, 4 locales, code↔en consistent)`；`check_i18n.test.cjs` → pass 1 / fail 0；`ask_llm.test.sh` → ALL PASSED |
+| **Playwright（Chromium，真 release 二进制 + 真 SQLite + `tests/e2e/seed.sh`）** | **15/15 passed**，含 **T2.4 auth-cache invalidate**（真实走到改写后的 `app.js` 与新的 `fleet` 响应体） |
+| **findings 处置核对** | **24/24 通过**（可重跑 `.acceptance/findings-disposition.py`） |
+| **设计用例覆盖矩阵** | **44/44 已分配**（矩阵内嵌脚本重跑：`用例总数 44 未分配 []`） |
+| **`AppState` 字面量计数** | **2**（定义 + `main.rs` 生产构造；命令 `grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" \| wc -l`） |
+| **指标交付核对（本轮新增）** | **12/12 指标已注册、9/9 环境变量被读取** —— 这一轮查出并补掉了前述 9 个未实现指标 + 3 个幽灵开关（提交 `6023661`） |
+| **限流窗口 GC（本轮新增）** | 交付核对还查出 `TenantApiLimiter::gc` / `Throttle::gc` **在生产代码里从未被调用**：失败维度按**源 IP**（调用方可选）建键 ⇒ 无界内存增长，限流器自己成了它要防的那种攻击面。已按既有 `spawn_gc_task` 形制接线（提交 `e99eca4`） |
+
+> **交付期修正**：计划里"矩阵即可复跑证据"的说法不完整 —— 归属矩阵**不能**替代交付核对。已在 `## 指标交付核对（交付期，可重跑）` 补上可重跑的核对脚本，并在矩阵抬头加了警示。这正是"文档说交付了、代码里没有"这类缺口能被抓住的唯一方式。
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）
