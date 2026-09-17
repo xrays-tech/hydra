@@ -106,7 +106,7 @@ Change Necessity:
   晚于 api-key 抽取会把租户令牌当客户端 key 送去 auth_url）；② 收敛屏障必须由消费者发布水位
   （今天 `last_id` 只存在于循环局部变量里，`events.rs:293/311`）；③ CH 读通道今天完全不存在。
 - Minimum change boundary: 新模块 tenant_api/（3 文件）+ clickhouse.rs（传输下沉，读写成同源）
-  + usage_query.rs（双后端读）+ hydra-core 纯函数模块 + ConfigData 派生索引；AppState 只增 2 字段；
+  + usage_query.rs（双后端读）+ hydra-core 纯函数模块 + ConfigData 派生索引；**AppState 只增 3 字段**（`invalidation` / `usage` / `tenant_api`，见 T4）；
   改 reach 点：proxy.rs（1 处拦截）、main.rs（构造后移 + 注入）、cluster/events.rs（水位）、
   http.rs（TTL 上限）、sink.rs（改为调用新传输）、admin/mod.rs（删旧路由）。
 - Decision: code-change
@@ -255,7 +255,7 @@ Execution Readiness View:
 | `crates/hydra-core/src/lib.rs` | `pub mod tenant_api;` |
 | `crates/hydra-core/src/config.rs` | `ConfigData.tenants_by_id` + `Default` |
 | `crates/hydra-server/src/store.rs` | `build_config` 同批构建 `tenants_by_id` |
-| `crates/hydra-server/src/proxy.rs` | `request_filter` 第 0 步拦截；`AppState` +2 字段；`AppState::for_tests()` |
+| `crates/hydra-server/src/proxy.rs` | `request_filter` 第 0 步拦截；**`AppState` +3 字段**（`invalidation` / `usage` / `tenant_api` —— P1-12：v5.2 说"+2"是错的，拦截片段里的 `self.state.tenant_api.enabled` 就是第三个）；`AppState::for_tests()` |
 | `crates/hydra-server/src/main.rs` | `AppState` 构造后移；注入 `usage`、`invalidation`、存活节点列表闭包、`allow_ttl_max` |
 | `crates/hydra-server/src/sink.rs` | CH 传输改为调用 `clickhouse.rs`（行为逐行不变） |
 | `crates/hydra-server/src/cluster/events.rs` | 水位 HASH 写入（先 apply 后 ack）、`applied_watermarks()`、`await_applied()`、generation bump 不推进水位 |
@@ -431,13 +431,22 @@ cargo tree -p hydra-core --no-default-features   # 防火墙：仍无 tokio/ping
 其余 7 处（`hydra-core/tests/{router,validate,admission}.rs`、`hydra-server/src/{proxy,cluster/snapshot}.rs`、`hydra-server/tests/load_breaker_swrr.rs`）都用 `ConfigData::default()` + 字段赋值，**新增字段不会打断它们**（另有 38 处 `ConfigData::default()` 调用点同样不受影响）。所以本任务是"1 处生产 + 1 处测试 + `Default` + loader 构建"，不是"修一片"。
 
 **Steps**
-1. **红灯**：在 `crates/hydra-core/tests/config_data.rs` 加一条断言：手工构造两个租户（domain 与 id 不同序），断言 `tenants_by_id` 能按 id 取到、且 `len()` 与 `tenants_by_domain` 一致。
-2. **Verify RED**：`cargo test -p hydra-core --test config_data` → 编译失败（字段不存在）。
+1. **红灯（P1-11 修订：必须在 loader 上，不能在 core 里手工构造）**：
+
+   v5.2 把这个红灯放在 `crates/hydra-core/tests/config_data.rs` 并"手工构造两个租户"——**那是无效的**：派生逻辑住在 `crates/hydra-server/src/store.rs` 的 `build_config`（唯一的 I/O 侧构建点），一个手工字面量的 core 测试只在自己断言自己，**没有任何生产改动能让它变绿**，只能靠改测试。而且 v5.2 写的"Verify RED：编译失败"**违反本计划自己的 TDD 规则**（红灯必须**因断言失败**而失败，不是因编译失败；T1 有"两段式"的说明，T2 没有）。
+
+   正确做法 —— 红灯打在**真的拥有该派生逻辑的地方**，并且**先加字段再加断言**：
+
+   - 步骤 1a：**先**在 `ConfigData` 上加字段（含 `Default`）→ 此时 `cargo test -p hydra-server --features server` 因 `store.rs:178` 的字面量缺字段而**编译失败**；补上 `tenants_by_id: HashMap::new()` 使其**编译通过但不填**（这是"骨架"，不是桩：它返回当下正确的行为——空索引）；
+   - 步骤 1b：在 `crates/hydra-server/tests/loader.rs` 加红灯：seed 一个租户 → `ConfigStore::load` → 断言 `snap.tenants_by_id.get("<id>")` 命中且 `len()` 与 `tenants_by_domain` 一致（同时断言反向一致：每个 domain 行的 id 都在 id 索引里）。此时**因断言失败而红**（loader 还没填）；
+   - 步骤 1c：`crates/hydra-core/tests/config_data.rs` 只保留**形状**断言（`Default` 出来是空索引、`serde(skip)` 不期望它在 wire 上）——不试图在那里验派生。
+
+2. **Verify RED**：`cargo test -p hydra-server --features server --test loader` → **因断言失败而红**（不是编译失败）。
 3. **GREEN**：
    - `config.rs`：`pub tenants_by_id: HashMap<String, Tenant>,` 加在 `tenants_by_domain` 之后，doc 注释写明"派生索引，与 `tenants_by_domain` 同源；不是第二份真相"；
    - `ConfigData::default()` 补 `HashMap::new()`；
    - `store.rs::build_config`：在填 `tenants_by_domain` 的同一循环里同时 `insert(t.id.clone(), t.clone())`（**同一批行、同一循环**，禁止第二次查库）。
-4. **Verify GREEN**：`cargo test -p hydra-core` + `cargo test -p hydra-server --features server --test loader` + `cargo test -p hydra-server --features server --test repo`。
+4. **Verify GREEN**：`cargo test -p hydra-core` + `cargo test -p hydra-server --features server --test loader`（红灯转绿）+ `cargo test -p hydra-server --features server --test repo`。
 5. 编译并修掉因新增字段而失败的构造点：**预期只有 `crates/hydra-core/tests/validate.rs:275` 一处**（`store.rs:178` 已在步骤 3 改过）。若编译器报出第三处，说明有未预期的穷举字面量，**必须停下报告**而不是顺手补上——那意味着 `ConfigData` 的构造分散程度超出本计划已知的事实。
 6. **Commit**：`feat(core,server): derive ConfigData.tenants_by_id alongside tenants_by_domain`
 
@@ -543,7 +552,7 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
 **本任务不交付任何端点**（P0-1）：只交付"闸门 + 路由骨架"，三个端点一律 `404 unknown path`。
 **Why**：R1+R2 的落地：专用入口、数据面可达、只认租户令牌。令牌闸门读快照是"edge 也能鉴权 / 零转发"的前提。
 **Change Necessity**：拦截必须进 `request_filter` 第 0 步（设计 §3.2 的 A/B/C/D 四条理由，C 条最硬：晚于 api-key 抽取会把租户令牌送去 `auth_url`）。
-**Impact/Compat**：`AppState` 加 2 字段 → **打断 12 处测试构造点**（`grep -rn "AppState {" crates/` 共 14 处 = 1 结构体定义 + 1 生产构造 + 12 测试），必须同批提供 `for_tests()` 并迁移这 12 处；`main.rs:571` 的生产构造另行后移。
+**Impact/Compat**：`AppState` 加 **3 字段** → **打断 12 处测试构造点**（`grep -rn "AppState {" crates/ --include=*.rs` 共 14 处 = 1 结构体定义 + 1 生产构造 + 12 测试），必须同批提供 `for_tests()` 并迁移这 12 处；`main.rs:571` 的生产构造另行后移。
 
 **Steps**
 1. **红灯**：新建 `crates/hydra-server/tests/tenant_api.rs`，写 T2/T3/T4/T5/T6/T10/T19/T20/T22（见设计 §10.2），只保留**令牌与闸门相关**的断言：
@@ -561,7 +570,15 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
    - **C18/内部面不外泄**：`/api/v1/internal/*` 在数据面（8080）上**不是**内部路由——它在管理口才存在（`admin/mod.rs:582-604`），断言数据面对该前缀按普通租户路径处理（既不返回内部数据、也不出现 `cluster_token` 语义）。
 2. **Verify RED**：`cargo test -p hydra-server --features server --test tenant_api` → 失败（前缀未拦截，请求落到业务管线 → 断言不符）。
 3. **GREEN**（按此顺序）：
-   a. `AppState`（`proxy.rs:108-128`）加 `invalidation: Option<InvalidationStream>`（含 `not(cluster-redis)` 的 `Option<()>` 占位，对齐 `admin/mod.rs:108-113`）与 `usage: Arc<dyn UsageQuery>`；提供 `pub fn for_tests(pool, store, auth, breaker, limiter, sink, proxy) -> Arc<AppState>`；
+   a. `AppState`（`proxy.rs:108-128`）加 **3 个字段**：
+
+      | 字段 | 类型 | 用途 |
+      |---|---|---|
+      | `invalidation` | `Option<InvalidationStream>`（`not(cluster-redis)` 下设 `Option<()>` 占位，对齐 `admin/mod.rs:108-113`） | E2 的扇出与收敛屏障 |
+      | `usage` | `Arc<dyn UsageQuery>` | E3 的读能力（T4 阶段先用 `SqliteUsageQuery`，T8 起按 sink kind 选择） |
+      | `tenant_api` | `TenantApiConfig` | `enabled`（`HYDRA_TENANT_API`）、限流参数、**T6 的存活节点列表闭包** |
+
+      **`for_tests` 必须能表达新测试所需的值**（P1-12）：`pub fn for_tests(pool, store, auth, breaker, limiter, sink, proxy, usage: Arc<dyn UsageQuery>, invalidation: Option<InvalidationStream>, tenant_api: TenantApiConfig) -> Arc<AppState>`。四个新增参数都**必填**而不是默认值 —— 因为 C1/C4/C6/C7 需要 `invalidation: Some(stream)`、C4/C5/C9/C10 需要真实的存活节点闭包、T10 需要 `enabled: false`；若给它们默认值，这些测试就得改回结构体字面量，`for_tests()` 的收敛意义就没了。**新测试同样只能用 `for_tests()`**（禁止新增 `AppState { .. }` 字面量，否则 §7.2 的计数校验失去意义）。
    b. 迁移 **12 处**测试构造点到 `for_tests()`：`tests/terminate_mode.rs:206-233` 的 helper（**它内含 `:224`，不要重复计**）＋ `:600/:718/:1089/:1320/:2871`、`tests/streaming_usage_persistence.rs:271`、`tests/tls.rs:166`、`tests/anthropic_passthrough.rs:302/392/506`、`tests/metrics.rs:282`。**计数校验**：`grep -rn "AppState {" crates/ --include=*.rs | wc -l` 应为 **14**（1 定义 + 1 生产 + 12 测试），迁移后测试侧应为 0；
    c. `main.rs`：把 `AppState` 构造**移到 `invalidation_stream` 之后**（`:621-644` 之后）；`:594` 的 `state.sink.clone()` 改为先克隆 `sink`；
    d. `tenant_api/mod.rs`：`pub async fn dispatch(state: &AppState, session, ctx) -> PingoraResult<bool>`；轻量段匹配（形制照 `admin/mod.rs:277-419`）；`respond_json`（形制照 `respond_catalog`，`proxy.rs:1280-1297`）；`TenantApiConfig::from_env()`（`HYDRA_TENANT_API=on|off`，默认 on）；
@@ -641,7 +658,7 @@ cargo test -p hydra-server --features server
 
 ### T6 — E2 `POST /auth/cache/invalidate` + 收敛屏障（L1 扇出 + L2 权威 + L3 确认）
 
-**Files**：`crates/hydra-server/src/tenant_api/handlers.rs`、`tenant_api/throttle.rs`（新建）、`tenant_api/mod.rs`、`crates/hydra-server/src/cluster/events.rs`、`crates/hydra-server/src/admin/handlers.rs`（管理端响应改 `fleet`）
+**Files**：`crates/hydra-server/src/tenant_api/handlers.rs`、`tenant_api/throttle.rs`（新建）、`tenant_api/mod.rs`、`crates/hydra-server/src/cluster/events.rs`、`crates/hydra-server/src/admin/handlers.rs`（管理端响应改 `fleet`）、**`crates/hydra-server/src/main.rs`**（P1-12：`spawn_invalidation_consumer(stream, auth, store)`（`events.rs:287`，调用点 `main.rs:622-630`）必须**新增 `node_id` 入参**，否则消费者无法把水位写进 `hydra:{ctl:inv:applied}` 的 HASH —— 签名与调用点都要改，`main.rs` 因此在本任务的 scope fence 内）、**`crates/hydra-server/src/admin/metrics.rs`**（6 个屏障/消费者指标）
 **Why**：R3 —— **必须在全部数据面节点生效，且调用方能确知是否生效**。这是本次最核心的交付。
 **Change Necessity**：今天远端节点的 L1 命中项不会因发布方删了 L2 而消失（L1 命中不查 L2），且消费者的 `last_id` 只存在局部变量里（`events.rs:293/311`：`last_id` 在循环内声明与推进）从不发布 → 系统里没有任何一处能回答"清干净没有"。
 **Impact/Compat**：`DELETE /api/v1/auth/cache`（运维用）响应体由 `published: bool` 换成 `fleet` 对象；`tenant_api` 复用既有 `AuthCache`/`InvalidationStream` 原语，不新增失效机制。
