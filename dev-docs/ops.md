@@ -349,6 +349,22 @@ curl -X POST http://<data-plane-addr>/tenant/t-acme/api/v1/auth/cache/invalidate
    "fleet":{"state":"applied","nodes_total":3,"nodes_applied":3,"lagging":[],"event_id":"1737-0","waited_ms":41}}
 ```
 
+**Two optional query parameters control the wait** (design §4.2.2 / Q10):
+
+| parameter | values | effect |
+|---|---|---|
+| `wait` | `converged` (default) \| `none` | `none` publishes and answers `202` immediately with the `event_id` — use it in bulk scripting where blocking per call is not worth it, then reconcile later |
+| `timeout_ms` | `1`..`60000` | overrides `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` for this one request |
+
+Both are **validated, not tolerated**: an unknown `wait` is `400 invalid_wait` and an
+out-of-range `timeout_ms` is `400 invalid_timeout_ms`. A misspelt value that behaved
+like the default would leave you believing you had asked for (or skipped) a wait you
+never got.
+
+> `wait=none` returning `202` with `"lagging"` listing the nodes is **not** a claim
+> that those nodes are behind — nobody looked. Treat it as "in flight" and reconcile
+> with `event_id`. If you need to know, use the default.
+
 **The old management-plane route is deleted.** It was
 `POST /api/v1/tenants/{id}/auth/cache/invalidate`, and it ran *before* the admin
 gate — so exposing it meant exposing every operator endpoint on the same port,
