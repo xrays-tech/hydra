@@ -54,6 +54,9 @@ disk at runtime. The release binary is the only artefact you ship.
 | `RUST_LOG` / `HYDRA_LOG` | `info` | `tracing` env filter. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
 | `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
+| `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on SUCCESSFUL requests (429 beyond it). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
+| `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` | `10` | Cap on FAILED authentications, per **source IP** and per **token digest** independently. |
+| `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | Once a dimension exceeds its failure budget it is locked for this long, and every request on it gets `429` (not `401`) — a locked-out guesser must not be able to tell a real token from a guessed one. |
 | `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | Per-tenant invalidation cap (429 beyond it). Each one fans out to every node and re-hits the tenant's `auth_url` from all of them. |
 | `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` | `31` | E3 window ceiling. Not cosmetic: the ClickHouse table's key leads with `created_at`, so a wide window scans every tenant's rows in it. |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
@@ -356,6 +359,14 @@ cross-check (mismatch → 403 `tenant_id_mismatch`), and `Host` plays no part.
 An invalid/missing/unconfigured token is 401 (fail-closed), worded identically
 for "no token" and "wrong token". Lost token ⇒ the operator rotates it (the API
 never returns it).
+
+The failure budget keys on the **socket peer IP**, never `X-Forwarded-For` (a
+caller-controlled header must not choose its own bucket). Behind a load balancer
+every request therefore shares the balancer's address — conservative, but it means
+the per-IP budget is effectively a fleet-wide one there: raise
+`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` if legitimate clients are being
+throttled. All windows are per-process, so an N-node fleet allows N times the
+configured rate; the per-node bound is what the fan-out actually depends on.
 
 `503 not_ready` means this node has no configuration snapshot yet — retry.
 `429 rate_limited` carries `Retry-After`; invalidations are capped per tenant per

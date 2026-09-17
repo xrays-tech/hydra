@@ -768,6 +768,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         proxy: proxy_cfg.clone(),
         tenant_api: tenant_api_cfg.clone(),
         tenant_api_throttle: Arc::new(hydra_server::tenant_api::throttle::Throttle::new()),
+        tenant_api_limiter: Arc::new(hydra_server::tenant_api::limit::TenantApiLimiter::new()),
         #[cfg(feature = "cluster-redis")]
         invalidation: invalidation_stream.clone(),
         #[cfg(not(feature = "cluster-redis"))]

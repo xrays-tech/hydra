@@ -506,6 +506,26 @@ impl InvalidationStream {
     }
 
     /// Current generation (`0` when never bumped).
+    /// How many entries the stream currently holds AFTER `last_id`, at most
+    /// `cap`.
+    ///
+    /// Saturating on purpose: it is a metric, and a backlog of a million events
+    /// is the same signal as a backlog of `cap`. `XLEN` alone cannot answer this
+    /// — it counts from the beginning of time, and the stream is never trimmed
+    /// in a way this node can rely on — so the entries are read (bounded) and
+    /// counted. `cap` is the read batch, so the cost is one bounded `XRANGE`.
+    pub async fn lag_since(&self, last_id: &str, cap: u64) -> Result<u64, RedisError> {
+        let start = match last_id.split_once('-') {
+            // Exclusive lower bound: "(<ms>-<seq>" means "strictly after".
+            Some((ms, seq)) => format!("({ms}-{seq}"),
+            // "0"/"0-0" means "the whole stream".
+            None => "0".to_string(),
+        };
+        let resp: fred::types::Value = self.pool.xrange(EVENTS_KEY, start, "+", Some(cap)).await?;
+        // NIL (idle/absent) and an empty array both mean "nothing after us".
+        Ok(resp.array_len().unwrap_or(0) as u64)
+    }
+
     pub async fn generation(&self) -> Result<i64, RedisError> {
         let g: Option<i64> = self.pool.get(GENERATION_KEY).await?;
         Ok(g.unwrap_or(0))
@@ -619,7 +639,31 @@ pub fn spawn_invalidation_consumer(
     tokio::spawn(async move {
         let mut last_id = "0".to_string();
         let mut gen: i64 = stream.generation().await.unwrap_or(0);
+        // When the applied watermark last MOVED. "Alive but not consuming" —
+        // a consumer that panicked and restarted, a node partitioned from Redis,
+        // a node that was never registered — is invisible without this: the
+        // consumer's only reaction to a failure is a `warn!` and a retry, and a
+        // stalled node keeps serving stale ALLOWs from its L1 for the full TTL.
+        let mut last_advance = tokio::time::Instant::now();
         loop {
+            // Publish the consumer's health BEFORE doing work, so a stall is
+            // visible even while every read is failing: on the failure path
+            // below the loop still reaches here on the next iteration.
+            let applied_ms = last_id
+                .split('-')
+                .next()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let lag = stream
+                .lag_since(&last_id, INVALIDATION_READ_BATCH)
+                .await
+                .unwrap_or(0);
+            crate::admin::metrics::record_invalidation_consumer(
+                &node_id,
+                applied_ms,
+                lag as i64,
+                last_advance.elapsed().as_secs() as i64,
+            );
             let mut more_to_read = false;
             match stream.read_since(&last_id, INVALIDATION_READ_BATCH).await {
                 Ok(events) => {
@@ -637,6 +681,8 @@ pub fn spawn_invalidation_consumer(
                             apply_invalidation(auth.cache(), &inv, &known).await;
                             last_id = id;
                         }
+                        // The watermark moved: reset the stall clock.
+                        last_advance = tokio::time::Instant::now();
                         // Keep the local `hydra_auth_cache_size` gauge
                         // truthful: entries cleared HERE never pass through
                         // the admin invalidation handlers (which run only on

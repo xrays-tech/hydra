@@ -897,3 +897,149 @@ async fn invalidate_is_post_only() {
     assert_eq!(status, 405, "got {v}");
     assert_eq!(v["error"]["code"], "method_not_allowed", "got {v}");
 }
+
+// ---------------------------------------------------------------------------
+// T21 — failure limiting and lockout (design §5.1)
+// ---------------------------------------------------------------------------
+
+/// A data-plane listener is internet-facing, so the gate needs a budget. Before
+/// this, an unauthenticated caller could drive it as fast as it could open
+/// connections — and each attempt, if it ever succeeded, was a cross-tenant
+/// compromise.
+///
+/// Asserted end to end because the ORDER is the security property: the lockout
+/// must be checked before the gate (so it is cheap) and it must answer `429`
+/// rather than `401` (so a locked-out guesser cannot tell a real token from a
+/// guessed one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_bad_tokens_are_throttled_then_locked_out() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        // A budget small enough to reach inside a test.
+        auth_fail_limit_per_min: 3,
+        lockout_secs: 60,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    let mut first_429 = None;
+    for i in 0..8 {
+        let r = send_until_ready(&c, &url, Some("sk-wrong-token-000000000000"), None).await;
+        let status = r.status().as_u16();
+        if status == 429 {
+            first_429 = Some(i);
+            let retry = r
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(!retry.is_empty(), "a 429 must carry Retry-After");
+            let body = r.text().await.unwrap_or_default();
+            assert!(
+                body.contains("rate_limited"),
+                "the envelope must say why: {body}"
+            );
+            // The message names the DIMENSION, which is what an operator needs
+            // to tell "one host is guessing" from "one token is being probed".
+            assert!(
+                body.contains("ip") || body.contains("token"),
+                "the refused dimension must be named: {body}"
+            );
+            break;
+        }
+        assert_eq!(status, 401, "below the budget the answer is still 401");
+    }
+    assert!(
+        first_429.is_some(),
+        "8 failures against a budget of 3 must eventually be refused"
+    );
+
+    // ...and the refusal persists for the lockout window, even with the RIGHT
+    // token: a locked dimension must not leak whether the token exists.
+    let r = send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await;
+    assert_eq!(
+        r.status().as_u16(),
+        429,
+        "a locked-out source must stay refused, even with a valid token"
+    );
+}
+
+/// The success budget is per tenant and independent of the failure budget: an
+/// attacker burning its own failures must not consume the budget a tenant's real
+/// clients depend on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_per_tenant_success_budget_is_enforced_and_is_not_spent_by_failures() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        rate_limit_per_min: 2,
+        auth_fail_limit_per_min: 100,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    // A pile of failures first, with a HIGH failure budget so nothing is locked.
+    for _ in 0..5 {
+        let r = send_until_ready(&c, &url, Some("sk-wrong-token-000000000000"), None).await;
+        assert_eq!(r.status().as_u16(), 401, "no lockout at this budget");
+    }
+
+    // The successful budget is still intact: 2 successes, then 429.
+    let (s1, _) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    let (s2, _) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    let (s3, v3) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    assert_eq!(s1, 200, "{v3}");
+    assert_eq!(s2, 200, "two successes fit the budget: {v3}");
+    assert_eq!(s3, 429, "the third exceeds it: {v3}");
+    assert_eq!(v3["error"]["code"], "rate_limited", "{v3}");
+}
+
+/// The counters are labelled so an operator can act, and the token itself is
+/// never one of the labels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_throttled_request_is_counted_and_a_bad_token_is_classified() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        rate_limit_per_min: 1,
+        auth_fail_limit_per_min: 100,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+
+    let unknown_before = hydra_server::admin::metrics::tenant_api_auth_failures_total("unknown");
+    let missing_before = hydra_server::admin::metrics::tenant_api_auth_failures_total("missing");
+    let throttled_before = hydra_server::admin::metrics::tenant_api_throttled_total("tenant");
+
+    // One classified failure of each kind...
+    let _ = send_until_ready(&c, &url, Some("sk-wrong-token-000000000000"), None).await;
+    let _ = send_until_ready(&c, &url, None, None).await;
+    // ...then spend the success budget and get throttled.
+    let _ = send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await;
+    let (status, _) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    assert_eq!(status, 429);
+
+    assert!(
+        hydra_server::admin::metrics::tenant_api_auth_failures_total("unknown") > unknown_before,
+        "a wrong token must be classified as `unknown`"
+    );
+    assert!(
+        hydra_server::admin::metrics::tenant_api_auth_failures_total("missing") > missing_before,
+        "no credential must be classified as `missing`"
+    );
+    assert!(
+        hydra_server::admin::metrics::tenant_api_throttled_total("tenant") > throttled_before,
+        "the refusal must be attributed to the tenant dimension"
+    );
+}

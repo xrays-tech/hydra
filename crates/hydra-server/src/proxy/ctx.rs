@@ -79,6 +79,15 @@ pub struct RequestContext {
     pub route_error: Option<RouteError>,
     /// Per-request trace id (echoed back as `X-Hydra-Trace-Id`).
     pub trace_id: String,
+    /// Which tenant-API endpoint is answering, for
+    /// `hydra_tenant_api_requests_total`. `None` for ordinary proxy traffic and
+    /// for a request under the reserved prefix that never parsed as a route.
+    ///
+    /// Carried here rather than passed to the response writers: the writers are
+    /// called from ~20 places (including every failure path), and a metric that
+    /// only covers the paths someone remembered to update is worse than none.
+    #[cfg(feature = "proxy")]
+    pub tenant_api_endpoint: Option<&'static str>,
 }
 
 impl RequestContext {
@@ -103,6 +112,8 @@ impl RequestContext {
             usage: None,
             route_error: None,
             trace_id: crate::proxy::new_trace_id(),
+            #[cfg(feature = "proxy")]
+            tenant_api_endpoint: None,
         }
     }
 }

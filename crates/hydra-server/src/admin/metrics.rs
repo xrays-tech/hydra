@@ -20,6 +20,15 @@
 //! | `hydra_auth_allow_ttl_capped_total` | counter | tenant | `http::AuthCache::set` |
 //! | `hydra_tenant_api_usage_query_total` | counter | source, group_by, result | `tenant_api::handlers::usage` |
 //! | `hydra_tenant_api_usage_query_seconds` | histogram | source | `tenant_api::handlers::usage` |
+//! | `hydra_tenant_api_requests_total` | counter | endpoint, status | `tenant_api` response writers |
+//! | `hydra_tenant_api_auth_failures_total` | counter | reason | `tenant_api::dispatch` gate |
+//! | `hydra_tenant_api_auth_latency_seconds` | histogram | — | `tenant_api::dispatch` gate |
+//! | `hydra_tenant_api_throttled_total` | counter | scope | `tenant_api::limit` |
+//! | `hydra_tenant_api_invalidate_pending_total` | counter | — | `tenant_api::handlers::invalidate` (202) |
+//! | `hydra_tenant_api_invalidate_converge_seconds` | histogram | result | `tenant_api::handlers::invalidate` |
+//! | `hydra_invalidation_consumer_applied_id` | gauge | node | `cluster::events` consumer |
+//! | `hydra_invalidation_consumer_lag_events` | gauge | node | `cluster::events` consumer |
+//! | `hydra_invalidation_consumer_stalled_seconds` | gauge | node | `cluster::events` consumer (**the alerting signal**) |
 //! | `hydra_auth_cache_size` | gauge | — | proxy `request_filter` |
 //! | `hydra_breaker_dead` | gauge | provider | breaker transitions |
 //! | `hydra_breaker_state_transitions_total` | counter | provider, to | breaker `on_failure`/`on_success` |
@@ -54,8 +63,9 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
 };
 use serde::Serialize;
 
@@ -83,6 +93,28 @@ struct Metrics {
     /// and it is the signal behind the `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`
     /// knob.
     tenant_api_usage_query_seconds: HistogramVec,
+    /// Every tenant-API response, by endpoint and status. This is the entry
+    /// traffic view; it deliberately does NOT feed `hydra_requests_total`, which
+    /// is the billed data-plane family.
+    tenant_api_requests: IntCounterVec,
+    /// Token-gate failures by reason. The reason vocabulary is low-cardinality
+    /// and never contains a token.
+    tenant_api_auth_failures: IntCounterVec,
+    /// Token-gate latency. The gate is documented as zero-I/O (it reads the
+    /// config snapshot); this is the regression detector for that claim.
+    tenant_api_auth_latency: Histogram,
+    /// Requests the tenant-API limiters refused, by dimension.
+    tenant_api_throttled: IntCounterVec,
+    /// E2 answers that were `202` — published but not confirmed everywhere.
+    /// Persistently non-zero means some node is not consuming the stream.
+    tenant_api_invalidate_pending: IntCounter,
+    /// How long the convergence barrier took, by outcome.
+    tenant_api_invalidate_converge: HistogramVec,
+    /// Per-node consumer watermark (the barrier's data source), and how long it
+    /// has been standing still.
+    invalidation_consumer_applied_id: IntGaugeVec,
+    invalidation_consumer_lag_events: IntGaugeVec,
+    invalidation_consumer_stalled_seconds: IntGaugeVec,
     catalog_requests: IntCounterVec,
     auth_cache_size: IntGauge,
     breaker_dead: IntGaugeVec,
@@ -222,6 +254,58 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_tenant_api_usage_query_seconds",
                 "Tenant API usage-read latency, by store",
                 &["source"]
+            )
+            .ok()?,
+            tenant_api_requests: register_int_counter_vec!(
+                "hydra_tenant_api_requests_total",
+                "Tenant API responses, by endpoint and status",
+                &["endpoint", "status"]
+            )
+            .ok()?,
+            tenant_api_auth_failures: register_int_counter_vec!(
+                "hydra_tenant_api_auth_failures_total",
+                "Tenant API token-gate failures, by reason",
+                &["reason"]
+            )
+            .ok()?,
+            tenant_api_auth_latency: register_histogram!(
+                "hydra_tenant_api_auth_latency_seconds",
+                "Tenant API token-gate latency (documented as zero-I/O)"
+            )
+            .ok()?,
+            tenant_api_throttled: register_int_counter_vec!(
+                "hydra_tenant_api_throttled_total",
+                "Tenant API requests refused by a limiter, by dimension",
+                &["scope"]
+            )
+            .ok()?,
+            tenant_api_invalidate_pending: register_int_counter!(
+                "hydra_tenant_api_invalidate_pending_total",
+                "Invalidations published but not confirmed by every live node (202)"
+            )
+            .ok()?,
+            tenant_api_invalidate_converge: register_histogram_vec!(
+                "hydra_tenant_api_invalidate_converge_seconds",
+                "Time to confirm an invalidation across the fleet, by outcome",
+                &["result"]
+            )
+            .ok()?,
+            invalidation_consumer_applied_id: register_int_gauge_vec!(
+                "hydra_invalidation_consumer_applied_id",
+                "Per-node applied watermark (stream id, ms part)",
+                &["node"]
+            )
+            .ok()?,
+            invalidation_consumer_lag_events: register_int_gauge_vec!(
+                "hydra_invalidation_consumer_lag_events",
+                "Events between the stream tail and this node's watermark",
+                &["node"]
+            )
+            .ok()?,
+            invalidation_consumer_stalled_seconds: register_int_gauge_vec!(
+                "hydra_invalidation_consumer_stalled_seconds",
+                "How long this node's applied watermark has not advanced (alert > 60)",
+                &["node"]
             )
             .ok()?,
             catalog_requests: register_int_counter_vec!(
@@ -472,6 +556,112 @@ pub fn record_auth_cache_size(n: usize) {
 pub fn record_allow_ttl_capped(tenant: &str) {
     if let Some(m) = metrics() {
         m.allow_ttl_capped.with_label_values(&[tenant]).inc();
+    }
+}
+
+/// Record one tenant-API response.
+pub fn record_tenant_api_request(endpoint: &str, status: u16) {
+    if let Some(m) = metrics() {
+        m.tenant_api_requests
+            .with_label_values(&[endpoint, &status.to_string()])
+            .inc();
+    }
+}
+
+/// Record a token-gate failure and how long the (zero-I/O) gate took.
+pub fn record_tenant_api_auth_failure(reason: &str, elapsed: std::time::Duration) {
+    if let Some(m) = metrics() {
+        m.tenant_api_auth_failures
+            .with_label_values(&[reason])
+            .inc();
+        m.tenant_api_auth_latency.observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Record a successful token-gate decision (latency only: the gate's cost is
+/// the point, not the outcome).
+pub fn record_tenant_api_auth_latency(elapsed: std::time::Duration) {
+    if let Some(m) = metrics() {
+        m.tenant_api_auth_latency.observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Record a limiter refusal. `scope` is `ip` | `token` | `tenant` | `invalidate`.
+pub fn record_tenant_api_throttled(scope: &str) {
+    if let Some(m) = metrics() {
+        m.tenant_api_throttled.with_label_values(&[scope]).inc();
+    }
+}
+
+/// Record an invalidation that was published but not confirmed everywhere.
+pub fn record_tenant_api_invalidate_pending() {
+    if let Some(m) = metrics() {
+        m.tenant_api_invalidate_pending.inc();
+    }
+}
+
+/// Record how long the convergence barrier took, by outcome.
+pub fn record_tenant_api_invalidate_converge(result: &str, elapsed: std::time::Duration) {
+    if let Some(m) = metrics() {
+        m.tenant_api_invalidate_converge
+            .with_label_values(&[result])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Publish one consumer's watermark, its lag and how long the watermark has
+/// stood still.
+///
+/// `stalled_seconds` is the only signal that distinguishes "this node is alive
+/// and serving" from "this node is alive, serving and NOT consuming the
+/// invalidation stream" — before it, that state was completely invisible (the
+/// consumer only logged a warning and retried).
+pub fn record_invalidation_consumer(
+    node: &str,
+    applied_id_ms: i64,
+    lag_events: i64,
+    stalled_seconds: i64,
+) {
+    if let Some(m) = metrics() {
+        m.invalidation_consumer_applied_id
+            .with_label_values(&[node])
+            .set(applied_id_ms);
+        m.invalidation_consumer_lag_events
+            .with_label_values(&[node])
+            .set(lag_events);
+        m.invalidation_consumer_stalled_seconds
+            .with_label_values(&[node])
+            .set(stalled_seconds);
+    }
+}
+
+/// Current value of `hydra_tenant_api_throttled_total{scope}` (tests).
+#[must_use]
+pub fn tenant_api_throttled_total(scope: &str) -> f64 {
+    match metrics() {
+        Some(m) => m.tenant_api_throttled.with_label_values(&[scope]).get() as f64,
+        None => 0.0,
+    }
+}
+
+/// Current value of `hydra_tenant_api_auth_failures_total{reason}` (tests).
+#[must_use]
+pub fn tenant_api_auth_failures_total(reason: &str) -> f64 {
+    match metrics() {
+        Some(m) => m
+            .tenant_api_auth_failures
+            .with_label_values(&[reason])
+            .get() as f64,
+        None => 0.0,
+    }
+}
+
+/// Current value of `hydra_tenant_api_invalidate_pending_total` (tests).
+#[must_use]
+pub fn tenant_api_invalidate_pending_total() -> f64 {
+    match metrics() {
+        Some(m) => m.tenant_api_invalidate_pending.get() as f64,
+        None => 0.0,
     }
 }
 

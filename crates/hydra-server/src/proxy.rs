@@ -135,6 +135,12 @@ pub struct AppState {
     #[cfg(feature = "proxy")]
     pub tenant_api_throttle: Arc<crate::tenant_api::throttle::Throttle>,
 
+    /// Admission control for the whole tenant API: the per-tenant success budget,
+    /// the per-IP / per-token-digest failure budgets and the lockout state.
+    /// State, not configuration.
+    #[cfg(feature = "proxy")]
+    pub tenant_api_limiter: Arc<crate::tenant_api::limit::TenantApiLimiter>,
+
     /// Cache-clearing fan-out and its convergence barrier (T6). `None` in a build
     /// without `cluster-redis`, where the local clear IS the complete answer:
     /// `HYDRA_ROLE=leader|edge` is refused at startup without that feature, so a
@@ -228,6 +234,7 @@ impl AppState {
             proxy,
             tenant_api,
             tenant_api_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
+            tenant_api_limiter: Arc::new(crate::tenant_api::limit::TenantApiLimiter::new()),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]

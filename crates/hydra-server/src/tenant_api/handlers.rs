@@ -271,6 +271,7 @@ async fn fan_out_and_confirm(
         .live_nodes
         .as_ref()
         .map_or_else(Vec::new, |f| f());
+    let started = std::time::Instant::now();
     let report = crate::cluster::events::broadcast_and_confirm(
         state.invalidation.as_ref(),
         Some(tenant_id.to_string()),
@@ -280,7 +281,14 @@ async fn fan_out_and_confirm(
     )
     .await;
     let status = report.http_status;
-    (FleetView::from_report(report, 0), status)
+    let waited_ms = started.elapsed().as_millis() as u64;
+    // "Did it actually get cleared everywhere, and how long did that take" is
+    // the operator's question about this endpoint, and these two are its answer.
+    crate::admin::metrics::record_tenant_api_invalidate_converge(report.state, started.elapsed());
+    if report.state == "pending" {
+        crate::admin::metrics::record_tenant_api_invalidate_pending();
+    }
+    (FleetView::from_report(report, waited_ms), status)
 }
 
 /// A build without `cluster-redis` cannot be a cluster: `main` refuses

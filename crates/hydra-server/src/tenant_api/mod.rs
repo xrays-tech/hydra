@@ -41,6 +41,7 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod limit;
 pub mod throttle;
 pub mod time_bound;
 
@@ -55,6 +56,17 @@ use crate::proxy::AppState;
 /// The reserved data-plane prefix. Everything under it is answered by this
 /// module and never reaches the proxy pipeline.
 pub const RESERVED_PREFIX: &str = "/tenant/";
+
+/// Read a positive `u32` from the environment, falling back to `default` for a
+/// missing, unparseable or zero value. Zero is rejected on purpose: a limit of
+/// zero would refuse every request, turning a typo into an outage.
+fn env_positive_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
 
 /// Minimum accepted length of a tenant access token, enforced when an operator
 /// sets one. The gate itself does not care, but a human-chosen short token on an
@@ -77,6 +89,19 @@ pub struct TenantApiConfig {
     /// How long `POST /auth/cache/invalidate` waits for the fleet to confirm.
     /// Elapsing is not an error — it produces `202` with the lagging nodes named.
     pub converge_timeout: std::time::Duration,
+    /// Cap on SUCCESSFUL requests per tenant per minute (design §5.1),
+    /// `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`. This is the amplification budget:
+    /// it is what stops one tenant's credential from spending other tenants'
+    /// availability through cache fan-out and `auth_url` re-verification.
+    pub rate_limit_per_min: u32,
+    /// Cap on FAILED authentications per source IP and per token digest
+    /// (`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN`). The gate is zero-I/O now,
+    /// but "cheap times unbounded" is still an amplifier, and a successful guess
+    /// is a cross-tenant compromise.
+    pub auth_fail_limit_per_min: u32,
+    /// How long a dimension stays locked once it exceeds its failure budget
+    /// (`HYDRA_TENANT_API_LOCKOUT_SECS`).
+    pub lockout_secs: u64,
     /// Cap on invalidations per tenant per minute. Each one costs the auth-cache
     /// fan-out, an upstream re-verification wave on every affected node, and — if
     /// the stream is trimmed past a lagging consumer — a fleet-wide whole-cache
@@ -106,6 +131,9 @@ impl std::fmt::Debug for TenantApiConfig {
             .field("enabled", &self.enabled)
             .field("converge_timeout", &self.converge_timeout)
             .field("invalidate_per_min", &self.invalidate_per_min)
+            .field("rate_limit_per_min", &self.rate_limit_per_min)
+            .field("auth_fail_limit_per_min", &self.auth_fail_limit_per_min)
+            .field("lockout_secs", &self.lockout_secs)
             .field("usage_max_window_days", &self.usage_max_window_days)
             .field("live_nodes", &self.live_nodes.is_some())
             .finish()
@@ -117,6 +145,9 @@ impl Default for TenantApiConfig {
         Self {
             enabled: true,
             converge_timeout: std::time::Duration::from_millis(2_000),
+            rate_limit_per_min: 60,
+            auth_fail_limit_per_min: 10,
+            lockout_secs: 900,
             invalidate_per_min: 10,
             usage_max_window_days: time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS,
             live_nodes: None,
@@ -143,11 +174,14 @@ impl TenantApiConfig {
             .filter(|v| *v > 0)
             .map(std::time::Duration::from_millis)
             .unwrap_or_else(|| std::time::Duration::from_millis(2_000));
-        let invalidate_per_min = std::env::var("HYDRA_TENANT_API_INVALIDATE_PER_MIN")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(10);
+        // Each of these falls back to its default on a missing/unparseable/zero
+        // value: 0 would refuse every request, i.e. a denial of service
+        // triggered by a typo in an env var.
+        let rate_limit_per_min = env_positive_u32("HYDRA_TENANT_API_RATE_LIMIT_PER_MIN", 60);
+        let auth_fail_limit_per_min =
+            env_positive_u32("HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN", 10);
+        let lockout_secs = u64::from(env_positive_u32("HYDRA_TENANT_API_LOCKOUT_SECS", 900));
+        let invalidate_per_min = env_positive_u32("HYDRA_TENANT_API_INVALIDATE_PER_MIN", 10);
         // A missing, unparseable or zero value falls back to the default: 0
         // would reject every request, which is a denial of service triggered by
         // a typo.
@@ -159,6 +193,9 @@ impl TenantApiConfig {
         Self {
             enabled,
             converge_timeout,
+            rate_limit_per_min,
+            auth_fail_limit_per_min,
+            lockout_secs,
             invalidate_per_min,
             usage_max_window_days,
             // Wired by `main` for cluster nodes; a single-node build leaves it
@@ -185,6 +222,16 @@ pub async fn dispatch(
         return respond_error(session, ctx, 404, "not_found", "unknown path").await;
     };
 
+    // The endpoint is known from here on, so EVERY exit below — including the
+    // 401/403/404/405/429 ones — can be attributed in
+    // `hydra_tenant_api_requests_total`. It is carried on the context rather
+    // than threaded through the four writers, which would change every call site.
+    ctx.tenant_api_endpoint = Some(match route.endpoint {
+        Endpoint::Whoami => "whoami",
+        Endpoint::InvalidateAuthCache => "invalidate",
+        Endpoint::Usage => "usage",
+    });
+
     // 1b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
     //     a method-agnostic handler would let a prefetching client, a
     //     mis-configured health check or a browser address bar clear caches.
@@ -206,9 +253,40 @@ pub async fn dispatch(
         .await;
     }
 
-    // 2. Gate. No token and a wrong token are the same answer on purpose.
+    // 2. Limiters, BEFORE the gate.
+    //
+    //    Order matters: (a) a locked dimension must be cheap to enforce, and
+    //    (b) a locked-out caller must not be able to tell a real token from a
+    //    guessed one — that is why a lockout answers 429, not 401.
+    let ip = client_ip(session);
+    let now = std::time::Instant::now();
+    let fail_window = std::time::Duration::from_secs(60);
+    let lockout = std::time::Duration::from_secs(state.tenant_api.lockout_secs);
+    let presented_digest = bearer_token(session).map(limit::token_digest);
+    if let Some(r) = state
+        .tenant_api_limiter
+        .locked(&ip, presented_digest.as_deref(), now)
+    {
+        crate::admin::metrics::record_tenant_api_throttled(r.scope);
+        return respond_throttled(session, ctx, r).await;
+    }
+
+    // 2b. Gate. No token and a wrong token are the same answer on purpose.
+    let gate_started = std::time::Instant::now();
     let Some(bearer) = bearer_token(session) else {
         debug!(target: "hydra::tenant_api", path = %path, "no tenant token presented");
+        if let Some(r) = state.tenant_api_limiter.record_failure(
+            &ip,
+            None,
+            state.tenant_api.auth_fail_limit_per_min,
+            fail_window,
+            lockout,
+            now,
+        ) {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            return respond_throttled(session, ctx, r).await;
+        }
+        crate::admin::metrics::record_tenant_api_auth_failure("missing", gate_started.elapsed());
         return respond_error(
             session,
             ctx,
@@ -222,6 +300,21 @@ pub async fn dispatch(
         Ok(a) => a,
         Err(auth::AuthError::Unauthorized) => {
             debug!(target: "hydra::tenant_api", path = %path, "tenant token rejected");
+            crate::admin::metrics::record_tenant_api_auth_failure(
+                "unknown",
+                gate_started.elapsed(),
+            );
+            if let Some(r) = state.tenant_api_limiter.record_failure(
+                &ip,
+                presented_digest.as_deref(),
+                state.tenant_api.auth_fail_limit_per_min,
+                fail_window,
+                lockout,
+                now,
+            ) {
+                crate::admin::metrics::record_tenant_api_throttled(r.scope);
+                return respond_throttled(session, ctx, r).await;
+            }
             return respond_error(
                 session,
                 ctx,
@@ -232,6 +325,9 @@ pub async fn dispatch(
             .await;
         }
         Err(auth::AuthError::NotReady) => {
+            // Not an auth FAILURE: nothing was refused, this node simply has no
+            // configuration yet. Counting it would let a caller that can reach an
+            // un-snapshotted edge burn its own failure budget.
             return respond_error(
                 session,
                 ctx,
@@ -242,12 +338,29 @@ pub async fn dispatch(
             .await;
         }
     };
+    crate::admin::metrics::record_tenant_api_auth_latency(gate_started.elapsed());
+
+    // 2c. The per-tenant SUCCESS budget. Counted after the token is verified, so
+    //     an unauthenticated caller can never spend a tenant's budget.
+    match state.tenant_api_limiter.check_success(
+        &authenticated.tenant.id,
+        state.tenant_api.rate_limit_per_min,
+        fail_window,
+        now,
+    ) {
+        Ok(()) => {}
+        Err(r) => {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            return respond_throttled(session, ctx, r).await;
+        }
+    }
 
     // 3. The URL's tenant id is a cross-check, not an identity: the token already
     //    said who the caller is, and a mismatch is a client-side bug worth
     //    failing loudly (403, not 404 — the tenant id is in the caller's own base
     //    URL, so it is not a secret).
     if authenticated.tenant.id != route.tenant_id {
+        crate::admin::metrics::record_tenant_api_auth_failure("mismatch", gate_started.elapsed());
         return respond_error(
             session,
             ctx,
@@ -286,6 +399,73 @@ pub async fn dispatch(
     }
 }
 
+/// The client's source IP, as a limiter key.
+///
+/// **The port is dropped, and that is load-bearing**: `Session::client_addr()`
+/// returns `SocketAddr`, i.e. `ip:port`, and every request arrives on a NEW
+/// ephemeral port. Keying the failure budget on the full socket address would
+/// give every connection its own bucket, so the per-IP limit would never trip —
+/// the limiter would look installed and enforce nothing. (The end-to-end lockout
+/// test is what caught this.)
+///
+/// `X-Forwarded-For` is deliberately NOT consulted: it is caller-controlled, so
+/// using it would let an attacker choose its own bucket. Behind a load balancer
+/// every request therefore shares the balancer's address, which is the
+/// conservative direction (it can only throttle more, never less).
+///
+/// `unknown` when the session carries no address at all (an in-process test
+/// harness): one shared bucket, again the conservative direction.
+fn client_ip(session: &Session) -> String {
+    match session.client_addr() {
+        // `as_inet()` drops the port (and the Unix-socket / unnamed variants,
+        // which fall back to their whole rendering — a bounded set of keys, not
+        // a per-connection one).
+        Some(a) => a
+            .as_inet()
+            .map(|s| s.ip().to_string())
+            .unwrap_or_else(|| a.to_string()),
+        None => "unknown".to_string(),
+    }
+}
+
+/// The `429` a limiter produces, with `Retry-After`.
+async fn respond_throttled(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    refused: limit::Refused,
+) -> pingora_core::Result<bool> {
+    let (tenant_id, trace_id) = (
+        ctx.tenant.as_ref().map(|t| t.id.clone()),
+        ctx.trace_id.clone(),
+    );
+    tracing::warn!(
+        target: "hydra::tenant_api",
+        scope = refused.scope,
+        tenant = tenant_id.as_deref().unwrap_or("-"),
+        trace_id = %trace_id,
+        "tenant API request throttled"
+    );
+    let body = serde_json::json!({
+        "error": {
+            "code": "rate_limited",
+            "message": format!(
+                "too many requests on the {} dimension; retry in {}s",
+                refused.scope, refused.retry_after
+            ),
+            "trace_id": trace_id,
+        }
+    });
+    respond_json_with_retry_after(session, ctx, 429, &body, refused.retry_after).await
+}
+
+/// The metric label for the endpoint being answered. `unrouted` covers a path
+/// under the reserved prefix that is not one of the three routes, and a request
+/// rejected before the route was parsed — a low-cardinality constant, never the
+/// path itself.
+fn endpoint_label(ctx: &RequestContext) -> &'static str {
+    ctx.tenant_api_endpoint.unwrap_or("unrouted")
+}
+
 /// The `Authorization: Bearer …` value, if present.
 fn bearer_token(session: &Session) -> Option<&str> {
     session
@@ -315,6 +495,7 @@ pub(super) async fn respond_json<T: serde::Serialize>(
     body: &T,
 ) -> pingora_core::Result<bool> {
     ctx.status_code = status;
+    crate::admin::metrics::record_tenant_api_request(endpoint_label(ctx), status);
     let body = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut header = ResponseHeader::build(status, Some(3))?;
     header.insert_header("Content-Type", "application/json")?;
@@ -378,6 +559,7 @@ pub(super) async fn respond_raw(
     body: Vec<u8>,
 ) -> pingora_core::Result<bool> {
     ctx.status_code = status;
+    crate::admin::metrics::record_tenant_api_request(endpoint_label(ctx), status);
     let mut header = ResponseHeader::build(status, Some(3))?;
     header.insert_header("Content-Type", "application/json")?;
     header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
@@ -401,6 +583,7 @@ pub(super) async fn respond_json_with_retry_after<T: serde::Serialize>(
     retry_after_secs: u64,
 ) -> pingora_core::Result<bool> {
     ctx.status_code = status;
+    crate::admin::metrics::record_tenant_api_request(endpoint_label(ctx), status);
     let body = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut header = ResponseHeader::build(status, Some(4))?;
     header.insert_header("Content-Type", "application/json")?;
