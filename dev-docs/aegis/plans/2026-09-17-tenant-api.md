@@ -626,7 +626,19 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 
 **Steps**
 1. 删除 `admin/mod.rs:616-668` 整块（租户令牌路由）；`handlers.rs` 删除 `tenant_id_for_token`；`admin-ui/api-docs.js` 移除旧条目。
-2. **Verify 旧路径确实消失**：加 C16 断言 —— `POST /api/v1/tenants/{id}/auth/cache/invalidate` 返回 **404 而非 401**（证明路由不存在，而不是被闸门挡住）。
+2. **Verify 旧路径确实消失**：加 C16 断言。**注意：断言必须用两种凭证分别验证，单一断言会写成错的**（本节已实测追踪过 admin 路由器的顺序）：
+
+   | 凭证 | 删除**前** | 删除**后** | 说明 |
+   |---|---|---|---|
+   | 租户令牌 | 200（旧路由在 admin 闸门之前） | **401** `missing or invalid admin token` | 旧路由消失后请求继续下落到 admin 闸门（`admin/mod.rs:670-679`）→ 被拒 |
+   | 管理令牌 | 404（`parts.len()>2` 的深路径拒绝，`admin/mod.rs:363-366`） | **404** | 与删除前相同，**不能单独作为证伪信号** |
+
+   因此 C16 必须断言**两条同时成立**：
+   - 租户令牌打该路径 → **401**（**关键**：删除前是 200，所以 200→401 就是"租户路由已消失"的证伪信号）；
+   - 管理令牌打该路径 → **404**（证明该路径从未是运维资源）。
+
+   > 只断言"404"是错的：租户令牌在删除后返回的是 401，写成 404 会让这个测试**永远失败**——
+   > 这正是"证伪信号必须先用真实代码走一遍"的例子。
 3. **反熵核对**：`grep -rn "tenant_id_for_token\|auth/cache/invalidate" crates/` → 只剩新模块与测试。
 4. 文档：`design.md` §13.2 端点表拆分（租户端点移出「管理 Web API」）、新增「租户自助 API（数据面）」节、§11.7 表格指向新路径、§9.3 补 CH 读；`ops.md` §5.1 改路径 + 新增三节（租户 API 开通/关闭、**租户改域名/auth_url 的运维流程**、**CH 用量查询运维**：`requests` 为近似值的成因、宽窗口代价、`ORDER BY` 建议）。
 5. 前端：`app.js` 租户页展示 base URL 与令牌状态；`api-docs.js` 拆分为"租户 API / 运维 API"两页。
@@ -694,7 +706,7 @@ rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' crates/hydra-server/src cra
 | 退役对象 | 当前状态 | 处理 | 证伪信号 |
 |---|---|---|---|
 | `admin/mod.rs:616-668` 租户令牌路由 | 活跃 | **T9 删除** | 旧路径返回 **404**（不是 401） |
-| `admin/handlers.rs::tenant_id_for_token` | 活跃 | **T9 删除**（由 `tenant_from_token(&ConfigStore,..)` 取代） | `grep` 无残留调用 |
+| `admin/handlers.rs::tenant_id_for_token` | 活跃 | **T9 删除**（由 `tenant_from_token(&ConfigStore,..)` 取代） | `grep` 无残留调用；且 C16 的双凭证断言成立（租户令牌 401 / 管理令牌 404） |
 | `admin/handlers.rs::tenant_auth_cache_invalidate` | 活跃 | **T6 搬进新模块**，T9 删除原位置 | 同一行为只有一个实现 |
 | `InvalidateResponse::published` | 活跃 | **T6 删除**（无存量调用方） | 响应体只有 `fleet` 对象 |
 | `sink.rs` 内的私有 CH 传输 | 活跃 | **T3 下沉**（搬迁，非复制） | `sink.rs` 不再含 URL 解析/请求构造 |
