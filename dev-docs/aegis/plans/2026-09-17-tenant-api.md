@@ -252,9 +252,11 @@ Execution Readiness View:
 
 | 文件 | 改动 |
 |---|---|
-| `crates/hydra-core/src/lib.rs` | `pub mod tenant_api;` |
+| `crates/hydra-core/src/lib.rs` | `pub mod tenant_api;`（core 无特性门控，永远编译） |
+| `crates/hydra-server/src/lib.rs` | **三个新模块各自门控（P2-2）**：`#[cfg(feature = "proxy")] pub mod tenant_api;`（引用 `crate::proxy::AppState`）、`#[cfg(feature = "usage-clickhouse")] pub mod clickhouse;`（用 `tokio::io`）、`#[cfg(feature = "db")] pub mod usage_query;`（其中的 CH 半再单独 `#[cfg(feature = "usage-clickhouse")]`）。实测 `lib.rs:37-86` 里**每一个**模块都是门控的，且 `Cargo.toml` 的 `default` 为空、tokio 为 optional ⇒ 不加门控会让**无特性**的 `cargo build -p hydra-server` 编译失败，而 `dev-plan.md:201` 把 `cargo build --all` 列为出口准则 |
 | `crates/hydra-core/src/config.rs` | `ConfigData.tenants_by_id` + `Default` |
-| `crates/hydra-server/src/store.rs` | `build_config` 同批构建 `tenants_by_id` |
+| `crates/hydra-server/src/store.rs` | `build_config` 经 `reindex_tenants` 构建 `tenants_by_id` |
+| `crates/hydra-server/src/cluster/snapshot.rs` | `hydrate` 之后调用同一个 `reindex_tenants` 重建派生索引（P2-3） |
 | `crates/hydra-server/src/proxy.rs` | `request_filter` 第 0 步拦截；**`AppState` +3 字段**（`invalidation` / `usage` / `tenant_api` —— P1-12：v5.2 说"+2"是错的，拦截片段里的 `self.state.tenant_api.enabled` 就是第三个）；`AppState::for_tests()` |
 | `crates/hydra-server/src/main.rs` | `AppState` 构造后移；注入 `usage`、`invalidation`、存活节点列表闭包、`allow_ttl_max` |
 | `crates/hydra-server/src/sink.rs` | CH 传输改为调用 `clickhouse.rs`（行为逐行不变） |
@@ -424,6 +426,22 @@ cargo tree -p hydra-core --no-default-features   # 防火墙：仍无 tokio/ping
 **Files**：`crates/hydra-core/src/config.rs`、`crates/hydra-server/src/store.rs`（`build_config`）、`crates/hydra-core/tests/config_data.rs`
 **Why**：E1 要按 `tenant_id` O(1) 取行；今天只有 `tenants_by_domain`（键是域名）。
 **Change Necessity**：备选是线性扫描 `tenants_by_domain.values()`。选派生索引是因为**存在性判定**（令牌有效但租户行不存在）也走同一索引，且它与 `models_by_key` 之于 `provider_models` 同构——**同批行、同 loader**，不是第二个 source of truth。
+**⚠️ 必须先做的 serde 决策（P2-3）**：`ConfigData` **会随集群线缆传输**（`cluster/snapshot.rs:129` `pub cfg: ConfigData`，wire DTO 上带 `#[serde(deny_unknown_fields)]`）。所以朴素的"加一个 `pub` 字段"有两个后果：① 快照把租户行**传两遍**；② 混版本时要么反序列化失败，要么（加 `#[serde(default)]` 后）**静默得到空索引** → 令牌有效却被判 `403 tenant_not_found`。
+
+**本任务采用：`#[serde(skip, default)]` + 在 hydrate 处重建**（派生索引应当被**重建**而不是被传输）：
+
+```rust
+// config.rs
+/// 派生索引（与 tenants_by_domain 同源）。**不上线缆**：hydrate 时由
+/// tenants_by_domain 重建 —— 既不让快照体积翻倍，也不引入混版本反序列化风险。
+#[serde(skip, default)]
+pub tenants_by_id: HashMap<String, Tenant>,
+```
+
+- 把构建逻辑抽成 `pub(crate) fn reindex_tenants(cfg: &mut ConfigData)`，**两个调用点共用一个实现**：`store.rs::build_config`（loader）与 `cluster/snapshot.rs::hydrate`（反序列化之后，紧跟解封 fidelity 的那一段，约 `snapshot.rs:325-340`）；
+- 因此 **`cluster/snapshot.rs` 与 `store.rs` 都要进 T2 的 Files**；
+- 同函数两处调用 ⇒ 不需要 `WIRE_VERSION` 变更；空索引只可能出现在"尚未收到第一帧快照"的 edge 上，而那时 `replication()` 为 `None` → 闸门回 503，语义正确。
+
 **Impact/Compat**：`ConfigData` 是 `pub` 字段结构体，但**穷举字面量只有 2 处**（已实测核对：`grep -rn -A1 "ConfigData {" crates/` 后逐处读过）：
 - `crates/hydra-server/src/store.rs:178` —— `build_config` 的返回字面量，**正是本任务要改的地方**；
 - `crates/hydra-core/tests/validate.rs:275` —— 一个测试字面量，补一个 `HashMap::new()` 即可。
@@ -761,7 +779,20 @@ cargo test -p hydra-server --features server,cluster-redis
 
 **Steps**
 1. **红灯**（`tests/usage_query.rs`）。**注意职责边界**：JSONEachRow 的**解码**已在 T1 交付并在 `hydra-core` 单测里覆盖（T14a/T14b 的核心断言在那里，因此总在 CI 第一个 job 运行）；本任务的红灯只覆盖**传输与接线**：
-   - **T14**：断言注入的实现与 `sink_kind` 一致（`sqlite`→`SqliteUsageQuery`、`clickhouse`→`ClickHouseUsageQuery`）；
+   - **T14（P1-9 修订：原写法不可写）**：注入点原本在 `main.rs` 的 `bootstrap()` 里，而它是**二进制目标** —— `tests/usage_query.rs` 根本调不到。因此**把选择逻辑提取成库函数**（本任务的一个明确交付物）：
+
+     ```rust
+     // usage_query.rs
+     /// 按 sink kind 选择唯一实现。`main.rs` 只调用它，测试也断言它。
+     pub fn select(
+         sink_kind: &str,
+         pool: Option<&sqlx::SqlitePool>,
+         ch_cfg: Option<&clickhouse::ClickHouseConfig>,
+     ) -> Result<Box<dyn UsageQuery>, SelectError>;
+     ```
+
+     T14 于是断言：`select("sqlite", Some(pool), None)` → `source()=="sqlite"`；`select("clickhouse", None, Some(cfg))` → `source()=="clickhouse"`（需 `--features usage-clickhouse`）；`select("sqlite", None, None)` → `Err`；`select("nonsense", ..)` → `Err`。**"返回假 0"的唯一守卫因此变成一条可运行的库单测**，而不是一段测不到的 `main.rs` 分支。
+     **T8 的测试命令必须带 `--features server,usage-clickhouse`**，否则 CH 那一半连编译都进不去（v5.2 的命令漏了这点）。
    - **T14a/T14b（端到端复验）**：用**假 CH 传输**（一个返回固定 `JSONEachRow` 字节的替身——它是**真实外部边界**，符合铁律 2 允许的 wiremock/进程级替身范畴）喂 `{"requests":"8"}` → 端点返回 8；喂 `{"requests":"abc"}` → **拒绝**（`decode_error`，**不是 0**）；喂 `last_seen:""` → `as_of: null`。纯函数层的等价断言在 T1，这里验的是"解码器确实被接上了"；
    - **T14c**：HTTP 404 + `Code: 60. DB::Exception: …` → `usage_store_unavailable`；
    - **T15/T16/T17**：SQLite 时间窗与手写 SQL 对照（含 NULL 语义与 `errors`）；`since` 传空格分隔形态 → 归一化后正确，且**对照"若不归一化会多算整天"的反例**；窗口超上限 / `since > until` → 400；
@@ -799,7 +830,7 @@ pub trait UsageQuery: Send + Sync {
    f. 指标：`hydra_tenant_api_usage_query_total{source,group_by,result}`（含 `decode_error`）与 `hydra_tenant_api_usage_query_seconds{source}`。
 4. **Verify GREEN** + 活 CH：
 ```bash
-cargo test -p hydra-server --features server --test usage_query
+cargo test -p hydra-server --features server,usage-clickhouse --test usage_query
 CH_URL=http://127.0.0.1:8123 cargo test -p hydra-server --features server,usage-clickhouse \
   --test usage_query -- --ignored --nocapture
 curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tenant_id FORMAT JSONEachRow" \
@@ -861,7 +892,17 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 
    > 只断言"404"是错的：租户令牌在删除后返回的是 401，写成 404 会让这个测试**永远失败**——
    > 这正是"证伪信号必须先用真实代码走一遍"的例子。
-3. **反熵核对**：`grep -rn "tenant_id_for_token\|auth/cache/invalidate" crates/` → 只剩新模块与测试。
+3. **反熵核对（P2-1 修订：原断言写得太满，会误报）**：`grep -rn "tenant_id_for_token\|auth/cache/invalidate" crates/` 的真实结果**不是空的**——除新模块与测试外还有：
+
+   | 残留位置 | 性质 | 处置 |
+   |---|---|---|
+   | `crates/hydra-server/src/cluster/content.rs:28` | **注释**里提到旧路径 | 改成指向新路径或删掉该句 |
+   | `crates/hydra-server/tests/cluster.rs:799` | **测试注释** | 同上 |
+   | `crates/hydra-server/tests/tenant_cache.rs:2,131` | 本任务步骤 0 已删 | 步骤 0 完成后自然消失 |
+
+   因此**正确断言是"无生产调用点"而非"零匹配"**：`rg -n "tenant_id_for_token" crates/` **必须为空**（该函数被删）；`auth/cache/invalidate` 只允许出现在注释与测试里。
+
+   **另外三处 UI 文档腐化必须一并处理**（`check_i18n.js` 只校验键集合、不校验文案，抓不到）：`admin-ui/api-docs.js` 的旧条目，以及 **`admin-ui/i18n.js` 4 个语言里引用旧路径的 `tip.blankKeep` 文案**（约 `:203/:539/:875/:1211`）。
 4. **`ops.md` 必须新增的一条告警规则**（设计 §4.2.6 要求，属本任务的交付物）：`hydra_invalidation_consumer_stalled_seconds > 60` 即告警 —— 这条规则是"活着但不消费的节点"唯一的外部信号，而它依赖 T6 交付的 gauge；若 T6 没交付该 gauge，本步**必须发现并回退到 T6**，不得只写文档。
 5. 文档：`design.md` §13.2 端点表拆分（租户端点移出「管理 Web API」）、新增「租户自助 API（数据面）」节、§11.7 表格指向新路径、§9.3 补 CH 读；`ops.md` §5.1 改路径 + 新增三节（租户 API 开通/关闭、**租户改域名/auth_url 的运维流程**、**CH 用量查询运维**：`requests` 为近似值的成因、宽窗口代价、`ORDER BY` 建议）。
 5. 前端：`app.js` 租户页展示 base URL 与令牌状态；`api-docs.js` 拆分为"租户 API / 运维 API"两页。
