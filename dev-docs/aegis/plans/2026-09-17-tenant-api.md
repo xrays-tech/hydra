@@ -730,6 +730,27 @@ rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' crates/hydra-server/src cra
 | Q10 | E2 默认等待收敛 | `wait=converged`，预算 2s |
 | Q11 | 收敛屏障位置 | 扩 `InvalidationStream`（T6） |
 
+### 开发前基线（2026-09-17，本机实测）
+
+开发启动前先确认"门禁当前是全绿的"，否则开发期的失败无法归因。实测结果（`RUSTFLAGS=-D warnings`、`SQLX_OFFLINE=true`）：
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo fmt --check` | ✅ OK |
+| `cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings` | ✅ OK |
+| `cargo test -p hydra-core` | ✅ OK（15 套件全绿） |
+| `cargo tree -p hydra-core --no-default-features` | ✅ OK（依赖防火墙仍成立） |
+| `cargo test -p hydra-server --features server` | ✅ OK |
+
+**本地环境与 CI 的差异（已实测，必须写进每条验证命令）**：
+
+| 依赖 | CI | 本机 | 证据 |
+|---|---|---|---|
+| Redis | `redis://127.0.0.1:6379` | **`redis://127.0.0.1:6380`** | `hydra-local-redis-test 127.0.0.1:6380->6379/tcp`；6379 在宿主上 `Connection refused`（`hydra-local-redis` 只暴露容器内 6379，未映射到宿主）。`tests/common/mod.rs:45-52` 对未设/不可达是**明确失败**而非跳过，所以用错端口会让集群套件直接红 |
+| ClickHouse | 未在 CI 中跑 | **`http://127.0.0.1:8123`**（`hydra-local-clickhouse`，24.3.18.7，表内已有真实数据） | `curl 'http://127.0.0.1:8123/?query=SELECT%201'` → `1` |
+
+> 因此：本文中所有照抄 `ci.yml` 的 `HYDRA_TEST_REDIS_URL=...6379` 一律以 **6380** 在本机执行；活 CH 用例用 `CH_URL=http://127.0.0.1:8123`。
+
 ## 验证与门禁
 
 **门禁 = 上述 T10 全套命令全绿 + Playwright 全绿 + oracle 架构复核无 P0/P1 遗留 + 实现交叉审核无 P0/P1 遗留。**
