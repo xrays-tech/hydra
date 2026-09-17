@@ -648,7 +648,7 @@ cargo test -p hydra-server --features server
 
 **Steps**
 1. **红灯**（`tests/tenant_api.rs`）：T11（精确 key → `invalidated>=1`，随后同 key 请求**必须回源**，wiremock 断言 `auth_url` 被再次调用）、T12（空 body → `scope:"tenant"`）、T13（1001 key → 400 `too_many_keys`；单个 4097 字节 → 400 `invalid_api_key`）、T21（失败限流 → 429）、**C3（单节点 `all` → `state:"single_node"`）**。
-   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、C2（集群成员但无 Redis 后端 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
+   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、**C2（P1-5 修订：原"C2 = 集群成员但无 Redis 后端"**运行期不可构造**——leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动（`main.rs:196-201`）。改为：**有失效流但发布失败** —— 用指向**已关闭端口**的 Redis 构造流 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）**、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
 2. **Verify RED** → 失败（`fleet` 字段不存在 / 水位不存在）。
 3. **GREEN**：
    a. **先钉住 cfg 形状**（已实测核对）：`cluster::events` 与 `cluster::registry` 都是 `#[cfg(feature = "cluster-redis")]` 门控的（`cluster/mod.rs:23-24`、`:27-28`），因此 `InvalidationStream` 在无该特性时**根本不存在**。于是：
@@ -657,7 +657,15 @@ cargo test -p hydra-server --features server
       - **`"single_node"` 是可推导的、不是猜测**：无 `cluster-redis` 特性时 `HYDRA_ROLE=leader|edge` 会被启动检查拒绝（`main.rs:241-243` "requires the 'cluster-redis' cargo feature"），所以"无特性 ⇒ 不是集群 ⇒ 本地清除即全部"。
       - 因此**不存在**"集群成员但没有失效通道"这一状态在无特性构建里的对应物；该状态只可能出现在"编译了 cluster-redis 但没有 Redis 后端"（`main.rs:621-644` 下 `invalidation_stream = None`）→ 回 **503**（C2）。
 
-   b. `cluster/events.rs`：新增键 `hydra:{ctl:inv:applied}`（**一个 HASH**：`node_id → last_applied_event_id`）。消费者在**成功 apply 一批之后**把该批最大事件 ID 一次性 HSET（**先 apply 后 ack**，顺序不可颠倒）；新增 `applied_watermarks() -> HashMap<String,String>` 与 `await_applied(event_id, live_nodes, timeout) -> AppliedOutcome {Applied{nodes}, Pending{nodes_applied, nodes_total, lagging}, SingleNode, Unavailable}`；**generation bump 路径 `clear_all()` 之后不推进水位**（被裁剪的事件 ID 已不可知，不得为没读到的事件记账）。
+   b. `cluster/events.rs`：新增键 `hydra:{ctl:inv:applied}`（**一个 HASH**：`node_id → last_applied_event_id`）。消费者在**成功 apply 一批之后**把该批最大事件 ID 一次性 HSET（**先 apply 后 ack**，顺序不可颠倒）；**generation bump 路径 `clear_all()` 之后不推进水位**（被裁剪的事件 ID 已不可知，不得为没读到的事件记账）。
+
+      **接口定义（P1-5 修订 —— v5.2 的 `AppliedOutcome` 有三处不可实现，逐条给出正确形态）**：
+
+      | # | v5.2 的问题 | 事实（file:line） | 修订后的定义 |
+      |---|---|---|---|
+      | ① | `SingleNode` 不可能从 `await_applied` 返回 | 它是 `InvalidationStream` 上的方法，而"没有流"恰恰意味着**没有这个对象** | `AppliedOutcome { Applied { nodes_applied, nodes_total }, Pending { nodes_applied, nodes_total, lagging: Vec<String> }, Unavailable(String) }` —— **删除 `SingleNode`**；它由**调用点**按 `state.invalidation == None` 决定（回 `state: "single_node"`） |
+      | ② | `Unavailable` 的触发条件**运行期不可构造** | leader/edge 缺 `HYDRA_REDIS_URL` 直接拒绝启动（`main.rs:196-201`），故"集群成员 + 无失效通道"不存在 | `Unavailable` 重定义为**可达**的：**有流，但 `publish` 失败或水位轮询失败**（Redis 中途不可达 / 命令报错）。这也是 C2 唯一可写的构造方式 |
+      | ③ | 同步闭包取不到存活节点 | `NodeRegistry::list_nodes` 是 **`async`**（`registry.rs:245`，返回 `Result<Vec<NodeStatus>, RedisError>`），且**含死节点**（`alive: false`） | 注入 `Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync>`（内部 `list_nodes().await`，**只保留 `alive == true`**），或注入后台任务刷新的 `Arc<ArcSwap<Vec<String>>>`。**必须显式过滤 `.alive`**，否则 C9 会静默失效 |
    c. **接线**：把 `dispatch` 里 `Endpoint::InvalidateAuthCache` 的 404 分支替换为真实调用（本任务的红灯在接线前会因 404 而失败，这就是红灯的原因）；并在本任务追加 **T20 的 E2 形式**（`replication()==None` → 503 `not_ready`）。
 
    d. `tenant_api/handlers.rs::invalidate`：校验/上限复用（把 `admin/handlers.rs` 的 `invalidate_shape_error`、`MAX_INVALIDATION_KEYS`、`MAX_API_KEY_LEN` 提为 `pub(crate)`）；本节点调 `state.auth.invalidate[_tenant]`；`publish`；然后 `await_applied`；按结果回 **200 / 202 / 503**；响应体按设计 §4.2 的 `fleet` 对象；`checked` 与 `invalidated` 并列。
@@ -698,7 +706,32 @@ cargo test -p hydra-server --features server,cluster-redis
 **Steps**
 1. **红灯**：`tests/http_auth.rs` 加一条：wiremock 认证应答带 `expires_in=86400`，断言缓存项 TTL 被封到上限（用注入 `Clock` 的确定性写法，避免 sleep）。
 2. **Verify RED** → 失败（TTL 为 86400s）。补充：**C11（`HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 端到端生效）**——同一输出下断言 `hydra_auth_allow_ttl_capped_total` 增加。
-3. **GREEN**：`AuthConfig` 加 `allow_ttl_max: Duration`（`default()` = 300s）；`AuthCache::new/with_clock` 接收并保存；`set`/`set_if_unchanged` 对 **allow** 项套 `ttl.min(allow_ttl_max)`（**deny 不受影响**）；`main.rs` 从 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 读取并接线；新增计数 `hydra_auth_allow_ttl_capped_total{tenant}`（`metrics.rs`）。
+3. **GREEN**（**P1-6 修订：不得给 `AuthCache::new`/`with_clock` 加参数**）：
+
+   **实测**：`AuthCache::new` / `AuthCache::with_clock` 在仓库里有 **56 个调用点、分布在 16 个文件**（约 50 个在测试里）。给它们加参数会让 T7 的"一个提交、可验证"边界当场不可能，而改动量在跑编译器之前完全看不见。
+
+   正确做法 —— **保持 2 参数构造函数不变，用 builder 式 setter 注入上限**：
+
+   ```rust
+   // http.rs
+   pub struct AuthCache { /* ... */ allow_ttl_max: Duration, /* ... */ }
+
+   impl AuthCache {
+       /// 默认上限 = allow_ttl ⇒ **所有既有调用点的语义逐字不变**。
+       pub fn new(allow_ttl: Duration, deny_ttl: Duration) -> Self { /* allow_ttl_max = allow_ttl */ }
+       pub fn with_clock(allow_ttl: Duration, deny_ttl: Duration, now: Clock) -> Self { /* 同上 */ }
+       /// 唯一新增入口：只由 `main` 读取 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` 后调用。
+       #[must_use]
+       pub fn with_allow_ttl_max(mut self, max: Duration) -> Self { self.allow_ttl_max = max; self }
+   }
+   ```
+
+   - `set` / `set_if_unchanged`：**仅 allow 项**套 `ttl.min(self.allow_ttl_max)`（deny 不受影响）；
+   - `AuthConfig` 加 `allow_ttl_max: Duration`（`default()` = 300s），**只由 `main.rs` 使用**；
+   - 新增计数 `hydra_auth_allow_ttl_capped_total{tenant}`（`admin/metrics.rs`，**该文件已在 T7 的 Files 里**）；
+   - **T7 的 Files 因此只有 `http.rs` / `main.rs` / `admin/metrics.rs` + 测试，零外部改动** —— 这就是"最小改动面"的证据。
+
+   **何时才允许改签名**：仅当该上限是**每个缓存实例必填**时才值得付 56 个调用点的代价；这里它有安全默认（= 现状值），所以不该付。
 4. **Verify GREEN** + `cargo test -p hydra-server --features server --test http_auth --test auth_cache`。
 5. **Commit**：`fix(auth): cap the allow-cache TTL so a stalled node's stale window is operator-bounded`
 
@@ -854,8 +887,21 @@ cargo test   -p hydra-server --features server,cluster-redis,usage-clickhouse   
 
 node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash scripts/ask_llm.test.sh   # ci.yml:162-168
 
-# 生产代码 grep 门禁（dev-plan.md:197-206 / wave-6:64）
-rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' crates/hydra-server/src crates/hydra-core/src
+# 生产代码 grep 门禁 —— 必须限定到本次新增/改动的文件（P1-10）
+# 实测：对 crates/hydra-server/src + crates/hydra-core/src 全量跑该模式，**今日即命中 358 行**
+# （含 main.rs:909 一处真实的生产 expect，以及大量位于 src/ 内联 #[cfg(test)] 模块里的断言）。
+# 全量要求"为空"是**永远无法变绿**的门禁，会逼开发者删掉合法断言或干脆不再信任它。
+rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' \
+   crates/hydra-core/src/tenant_api.rs crates/hydra-server/src/tenant_api/ \
+   crates/hydra-server/src/usage_query.rs crates/hydra-server/src/clickhouse.rs
+# 期望为空。**基线例外（已记录）**：main.rs:909 的
+#   .expect("the cert store is built whenever a TLS listener is configured")
+# 是既有生产代码、不属本次改动，**不得**为过门禁而改它。
+# 对本次改动的既有文件另用 diff 复核新增行：
+#   git diff -U0 <base> -- crates/hydra-server/src/proxy.rs crates/hydra-server/src/main.rs \
+#       crates/hydra-server/src/http.rs crates/hydra-server/src/sink.rs \
+#       crates/hydra-server/src/cluster/events.rs crates/hydra-server/src/admin/mod.rs \
+#       crates/hydra-server/src/admin/handlers.rs | rg '^\+.*(unwrap\(\)|expect\(|panic!)'   # 期望为空
 ```
 
 ---
@@ -908,7 +954,7 @@ PY
 | T22 | T4 | 前缀与业务路径边界 |
 | T23 | T5 | `base_url` 自述一致 |
 | C1 | T6 | edge E2 + 流载荷只有摘要 |
-| C2 | T6 | 集群成员无 Redis → 503 |
+| C2 | T6 | **有流但发布失败** → 503（原措辞不可构造，见 T6） |
 | C3 | T6 | 单节点 → `single_node` |
 | C4 | T6 | 收敛 200 |
 | **C5** | **T6** | **远端消费者停摆 → 202 + lagging** |
