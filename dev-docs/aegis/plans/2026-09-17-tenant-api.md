@@ -1382,6 +1382,17 @@ done
 | 6 | `grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` | **2**（两文档已改用这条命令） |
 | 7 | `grep -n 'error_body("payload_too_large"'` | 413 body 经统一构造器，带 `trace_id`；测试注入验证过判别力 |
 
+### 修复后的回归复验（不是"修了就算"）
+
+| 复验对象 | 方式 | 结果 |
+|---|---|---|
+| 管理面 `fleet` 响应（类型收敛后） | 真 release 二进制 + 真 SQLite 起服务并 curl | `{"invalidated":0,"checked":1,"tenant_id":"t-e2e","scope":"keys","fleet":{"state":"single_node","nodes_total":1,"nodes_applied":1,"lagging":[],"event_id":null,"waited_ms":0}}` —— 字段与收敛前**逐字一致** |
+| 前端（`app.js` 读 `fleet`）+ 整条管理面链路 | **Playwright 复跑**（重建 release 二进制后） | **15/15 passed**，含 T2.4 auth-cache invalidate |
+| `wait=none` 的真实语义 | 真 Redis 集群套件新增用例 | 发布、返回 202、带 `event_id`、`lagging` = 未查看过的节点集、且**不等待**（<200ms） |
+| 7 条复审修复 | 逐条机械命令（见上表） | 7/7 落地 |
+| 12 个指标 | 注册 + **生产**调用点（排除 `#[cfg(test)]` 段）逐指标核对 | 12/12 |
+| A-1 零转发不变量 | `AppState` 字段清单 + 租户路径 grep | `AppState` 不含 registry / `leader_ready`；租户路径无任何转发调用或转发头 |
+
 ### 我自己在自查中查出的 5 个真问题（均已修 + 均有测试）
 
 | 问题 | 性质 | 处置 |
