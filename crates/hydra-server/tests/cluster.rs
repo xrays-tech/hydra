@@ -796,7 +796,7 @@ async fn standby_materializes_replica() {
     let kp: Arc<dyn KeyProvider> = Arc::new(kp());
     // A tenant access-token HASH. It lives in no `ConfigData` field, and before
     // T1 the wire carried no token hashes at all — a promoted replica answered
-    // `has_access_token: false` and 401'd every `/auth/cache/invalidate`. Set it
+    // `has_access_token: false` and 401'd every tenant-API request. Set it
     // BEFORE the wire is built.
     let token_hash = "5f4dcc3b5aa765d61d8327deb882cf99";
     repo::set_tenant_access_token_hash(&leader_pool, "t1", Some(token_hash))

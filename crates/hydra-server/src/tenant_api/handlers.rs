@@ -90,10 +90,11 @@ struct InvalidateRequest {
     api_keys: Option<Vec<String>>,
 }
 
-/// Where the fleet stands, as reported to the tenant.
+/// Where the fleet stands, as reported to the tenant: the shared
+/// [`FleetReport`] plus how long this request actually waited for it.
 #[derive(Serialize)]
 struct FleetView {
-    /// `applied` | `pending` | `single_node`.
+    /// `applied` | `pending` | `single_node` | `unavailable`.
     state: &'static str,
     nodes_total: usize,
     nodes_applied: usize,
@@ -104,6 +105,23 @@ struct FleetView {
     /// own view of the bus.
     event_id: Option<String>,
     waited_ms: u64,
+}
+
+impl FleetView {
+    /// The report comes from the SHARED barrier (`cluster::events`), so this
+    /// endpoint and the operator's `DELETE /api/v1/auth/cache` cannot disagree
+    /// about what "applied" means.
+    #[cfg(feature = "cluster-redis")]
+    fn from_report(report: crate::cluster::events::FleetReport, waited_ms: u64) -> Self {
+        Self {
+            state: report.state,
+            nodes_total: report.nodes_total,
+            nodes_applied: report.nodes_applied,
+            lagging: report.lagging,
+            event_id: report.event_id,
+            waited_ms,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -248,105 +266,21 @@ async fn fan_out_and_confirm(
     tenant_id: &str,
     keys: &[String],
 ) -> (FleetView, u16) {
-    use crate::cluster::events::AppliedOutcome;
-    let Some(stream) = &state.invalidation else {
-        // NO STREAM MEANS "NOT PART OF A CLUSTER", so the local clear really is
-        // the whole answer — and building with `cluster-redis` does not change
-        // that. `main` leaves the stream `None` exactly when there is no Redis
-        // backbone, and a `leader`/`edge` role REFUSES TO START without one, so
-        // "no stream" can only be the single-node `all` role.
-        //
-        // Getting this backwards (reporting `unavailable`, as this code first
-        // did) makes a single-node deployment built with the cluster feature
-        // answer 503 to a clear that actually succeeded everywhere. Only the
-        // three-feature test matrix catches that, which is why the plan mandates
-        // running it. `Unavailable` is reserved for a stream that EXISTS and then
-        // fails — publish error or watermark-read failure.
-        return (
-            FleetView {
-                state: "single_node",
-                nodes_total: 1,
-                nodes_applied: 1,
-                lagging: vec![],
-                event_id: None,
-                waited_ms: 0,
-            },
-            200,
-        );
-    };
-    let event_id = match stream
-        .publish(Some(tenant_id.to_string()), keys.to_vec())
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(error = %e, "invalidation publish failed");
-            return (
-                FleetView {
-                    state: "unavailable",
-                    nodes_total: 0,
-                    nodes_applied: 0,
-                    lagging: vec![],
-                    event_id: None,
-                    waited_ms: 0,
-                },
-                503,
-            );
-        }
-    };
     let live = state
         .tenant_api
         .live_nodes
         .as_ref()
         .map_or_else(Vec::new, |f| f());
-    let outcome = stream
-        .await_applied(&event_id, &live, state.tenant_api.converge_timeout)
-        .await;
-    match outcome {
-        AppliedOutcome::Applied {
-            nodes_applied,
-            nodes_total,
-        } => (
-            FleetView {
-                state: "applied",
-                nodes_total,
-                nodes_applied,
-                lagging: vec![],
-                event_id: Some(event_id),
-                waited_ms: 0,
-            },
-            200,
-        ),
-        AppliedOutcome::Pending {
-            nodes_applied,
-            nodes_total,
-            lagging,
-        } => (
-            FleetView {
-                state: "pending",
-                nodes_total,
-                nodes_applied,
-                lagging,
-                event_id: Some(event_id),
-                waited_ms: 0,
-            },
-            202,
-        ),
-        AppliedOutcome::Unavailable(e) => {
-            tracing::warn!(error = %e, "convergence barrier could not run");
-            (
-                FleetView {
-                    state: "unavailable",
-                    nodes_total: live.len(),
-                    nodes_applied: 0,
-                    lagging: live,
-                    event_id: Some(event_id),
-                    waited_ms: 0,
-                },
-                503,
-            )
-        }
-    }
+    let report = crate::cluster::events::broadcast_and_confirm(
+        state.invalidation.as_ref(),
+        Some(tenant_id.to_string()),
+        keys.to_vec(),
+        live,
+        state.tenant_api.converge_timeout,
+    )
+    .await;
+    let status = report.http_status;
+    (FleetView::from_report(report, 0), status)
 }
 
 /// A build without `cluster-redis` cannot be a cluster: `main` refuses

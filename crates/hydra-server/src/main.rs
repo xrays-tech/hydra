@@ -691,6 +691,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // load balancer's pool and must not hold a convergence decision hostage.
     #[allow(unused_mut)]
     let mut tenant_api_cfg = hydra_server::tenant_api::TenantApiConfig::from_env();
+    // ONE live-node view, shared by the tenant API's E2 and the operator's
+    // `DELETE /api/v1/auth/cache`: two views could disagree about the fleet, and
+    // the whole point of the barrier is that both callers get the same answer.
+    #[cfg(feature = "cluster-redis")]
+    let mut fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = None;
     #[cfg(feature = "cluster-redis")]
     if let Some(reg) = &registry {
         let live: Arc<arc_swap::ArcSwap<Vec<String>>> =
@@ -724,7 +729,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             }
         };
         tokio::spawn(refresh);
-        tenant_api_cfg.live_nodes = Some(Arc::new(move || live.load().to_vec()));
+        let view: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(move || live.load().to_vec());
+        tenant_api_cfg.live_nodes = Some(view.clone());
+        fleet_live = Some(view);
     }
 
     #[cfg(feature = "db")]
@@ -758,7 +766,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         admission: admission.clone(),
         sink,
         proxy: proxy_cfg.clone(),
-        tenant_api: tenant_api_cfg,
+        tenant_api: tenant_api_cfg.clone(),
         tenant_api_throttle: Arc::new(hydra_server::tenant_api::throttle::Throttle::new()),
         #[cfg(feature = "cluster-redis")]
         invalidation: invalidation_stream.clone(),
@@ -915,6 +923,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         cluster_registry: registry,
         #[cfg(not(feature = "cluster-redis"))]
         cluster_registry: None,
+        #[cfg(feature = "cluster-redis")]
+        fleet_live,
+        #[cfg(feature = "cluster-redis")]
+        converge_timeout: tenant_api_cfg.converge_timeout,
     })
 }
 
@@ -943,6 +955,13 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     cluster_registry: Option<()>,
+    /// The live-node view the tenant API uses, carried to `run_server` so the
+    /// admin service waits on the SAME fleet — a second view could disagree.
+    #[cfg(feature = "cluster-redis")]
+    fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// The convergence budget, same value for both entry points.
+    #[cfg(feature = "cluster-redis")]
+    converge_timeout: std::time::Duration,
     /// Resolved multi-tenant cert store (design §12.1 single source). Built in
     /// `bootstrap` — not in `run_server` — because it registers itself as a
     /// follower of the config snapshot, and a snapshot can be applied (by the
@@ -1132,6 +1151,16 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         admin_state.invalidation = c.invalidation_stream;
         admin_state.cluster_registry = c.cluster_registry;
     }
+    // The same live-node view and convergence budget the tenant API got, so
+    // `DELETE /api/v1/auth/cache` can report the fleet honestly (and so the two
+    // entry points cannot disagree about what "applied" means).
+    #[cfg(feature = "cluster-redis")]
+    let admin_state = match c.fleet_live {
+        Some(view) => admin_state.with_fleet(view, c.converge_timeout),
+        // No live-node view (not a cluster): the local clear is the whole
+        // answer and the report says `single_node`.
+        None => admin_state,
+    };
     let admin_state = Arc::new(admin_state);
     let admin_app = AdminService::new(admin_state);
     let mut admin_service =

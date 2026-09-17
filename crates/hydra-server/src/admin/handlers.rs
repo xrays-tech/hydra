@@ -1539,13 +1539,31 @@ struct InvalidateRequest {
 
 #[derive(Serialize)]
 struct InvalidateResponse {
+    /// How many entries THIS node removed from its L1. Not a fleet count.
     invalidated: usize,
+    /// How many keys the request named (0 for a whole-tenant clear).
+    checked: usize,
     tenant_id: Option<String>,
-    /// L-6: whether the cluster-wide broadcast reached the invalidation stream.
-    /// `false` means remote nodes keep their cached verdict until it expires —
-    /// the LOCAL cache was still invalidated. A failed publish used to be a log
-    /// line plus a 200, so the caller could not tell the fleet was not told.
-    published: bool,
+    /// `keys` | `tenant`.
+    scope: &'static str,
+    /// Where the fleet stands. Replaces the `published: bool` field, which lied:
+    /// it defaulted to `true` and only became `false` when a stream existed AND
+    /// the publish failed, so a build with no stream claimed a broadcast that
+    /// never happened. The report comes from the barrier shared with the tenant
+    /// API's E2, so the operator's view and the tenant's view cannot disagree.
+    fleet: Fleet,
+}
+
+/// The same tri-state the tenant API reports, minus `http_status` (which the
+/// admin endpoint already carries as the HTTP status).
+#[derive(Serialize)]
+struct Fleet {
+    state: &'static str,
+    nodes_total: usize,
+    nodes_applied: usize,
+    lagging: Vec<String>,
+    event_id: Option<String>,
+    waited_ms: u64,
 }
 
 /// Cap on how many api-keys ONE invalidation request may name (review N4).
@@ -1611,6 +1629,16 @@ pub(super) async fn auth_cache_invalidate(
     if let Some(resp) = invalidate_shape_error(req.api_keys.as_deref(), trace_id) {
         return resp;
     }
+    // Only the cluster arm measures the wait; without `cluster-redis` there is
+    // nothing to wait for.
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_variables))]
+    let started = std::time::Instant::now();
+    let checked = req.api_keys.as_ref().map_or(0, Vec::len);
+    let scope = if req.api_keys.is_none() {
+        "tenant"
+    } else {
+        "keys"
+    };
     let count = match (req.tenant_id.as_deref(), req.api_keys.as_deref()) {
         (Some(tid), Some(keys)) => state.auth.invalidate(tid, keys).await,
         (Some(tid), None) => state.auth.invalidate_tenant(tid).await,
@@ -1637,34 +1665,61 @@ pub(super) async fn auth_cache_invalidate(
             total
         }
     };
-    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
-    let mut published = true;
-    // Broadcast the invalidation cluster-wide (P4): every node drops the
-    // affected local cache entries via the stream; the L2 entries they
-    // re-hydrate from are gone too (they were deleted below on this node).
+    // Broadcast the invalidation cluster-wide (P4) and WAIT for the fleet to
+    // confirm it, through the same barrier the tenant API's E2 uses. The status
+    // now distinguishes "applied everywhere" (200) from "published, not yet
+    // confirmed" (202, with the laggards named) and "the channel did not answer"
+    // (503) — the flat 200 + `published: false` this replaced told the operator
+    // nothing they could act on.
     #[cfg(feature = "cluster-redis")]
-    if let Some(stream) = &state.invalidation {
-        if let Err(e) = stream
-            .publish(
-                req.tenant_id.clone(),
-                req.api_keys.clone().unwrap_or_default(),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "invalidation publish failed");
-            published = false;
-        }
-    }
+    let report = {
+        let live = state.live_nodes.as_ref().map_or_else(Vec::new, |f| f());
+        crate::cluster::events::broadcast_and_confirm(
+            state.invalidation.as_ref(),
+            req.tenant_id.clone(),
+            req.api_keys.clone().unwrap_or_default(),
+            live,
+            state.converge_timeout,
+        )
+        .await
+    };
+    // Without `cluster-redis` this cannot be a cluster (`main` refuses
+    // `HYDRA_ROLE=leader|edge` without the feature), so the local clear IS the
+    // whole answer — the same derivation the tenant API's E2 makes.
+    #[cfg(not(feature = "cluster-redis"))]
+    let fleet = Fleet {
+        state: "single_node",
+        nodes_total: 1,
+        nodes_applied: 1,
+        lagging: Vec::new(),
+        event_id: None,
+        waited_ms: 0,
+    };
+    #[cfg(feature = "cluster-redis")]
+    let (fleet, status) = (
+        Fleet {
+            state: report.state,
+            nodes_total: report.nodes_total,
+            nodes_applied: report.nodes_applied,
+            lagging: report.lagging,
+            event_id: report.event_id,
+            waited_ms: started.elapsed().as_millis() as u64,
+        },
+        report.http_status,
+    );
+    #[cfg(not(feature = "cluster-redis"))]
+    let status = 200u16;
+
     // Refresh the cache-size gauge after mutation.
     metrics::record_auth_cache_size(state.auth.cache().len());
-    ok_json(
-        200,
-        &InvalidateResponse {
-            invalidated: count,
-            tenant_id: req.tenant_id,
-            published,
-        },
-    )
+    let body = InvalidateResponse {
+        invalidated: count,
+        checked,
+        tenant_id: req.tenant_id,
+        scope,
+        fleet,
+    };
+    ok_json(status, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,98 +1762,6 @@ struct AuthTestResult {
     duration_ms: u64,
     /// Truncated response body for debugging (empty when unreachable).
     body_snippet: String,
-}
-
-/// Resolve the tenant id owning `bearer` (the tenant self-service access
-/// token, migration 0009): SHA-256 of the presented token compared
-/// constant-time against the stored hashes. `None` ⇒ unknown / missing /
-/// unconfigured token (fail-closed 401).
-pub(super) async fn tenant_id_for_token(state: &AdminState, bearer: &str) -> Option<String> {
-    let presented = sha256_hex_str(bearer);
-    let pool = state.pool.as_ref()?;
-    let pairs = crate::db::list_tenant_access_token_hashes(pool)
-        .await
-        .ok()?;
-    for (tid, stored) in pairs {
-        if constant_time_eq(&presented, &stored) {
-            return Some(tid);
-        }
-    }
-    None
-}
-
-/// Body of the tenant self-service invalidation endpoint (optional).
-#[derive(Deserialize)]
-struct TenantCacheInvalidateRequest {
-    /// api-keys to invalidate for the tenant; absent/empty ⇒ clear ALL of
-    /// the tenant's cached auth decisions.
-    #[serde(default)]
-    api_keys: Option<Vec<String>>,
-}
-
-/// Tenant self-service auth-cache invalidation (migration 0009): clears the
-/// authenticated tenant's own cached auth decisions — 欠费停机 / 付费恢复等
-/// 场景。The tenant id is NOT client-chosen here: the router resolved it from
-/// the access token and already verified it matches the URL's tenant_id.
-/// Whether the cluster-wide broadcast went out (L-6). `false` means remote
-/// nodes keep their cached verdict until it expires — the local cache was still
-/// invalidated.
-#[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut, unused_variables))]
-pub(super) async fn tenant_auth_cache_invalidate(
-    state: &AdminState,
-    session: &mut ServerSession,
-    tenant_id: &str,
-    trace_id: &str,
-) -> Resp {
-    let body = match read_body(session, trace_id).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let req: TenantCacheInvalidateRequest =
-        if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
-            TenantCacheInvalidateRequest { api_keys: None }
-        } else {
-            match parse_body(&body, trace_id) {
-                Ok(r) => r,
-                Err(r) => return r,
-            }
-        };
-    if let Some(resp) = invalidate_shape_error(req.api_keys.as_deref(), trace_id) {
-        return resp;
-    }
-    let count = match req.api_keys.as_deref() {
-        Some(keys) if !keys.is_empty() => state.auth.invalidate(tenant_id, keys).await,
-        _ => state.auth.invalidate_tenant(tenant_id).await,
-    };
-    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
-    let mut published = true;
-    // Broadcast the invalidation cluster-wide (P4), mirroring the admin
-    // auth-cache endpoint: every node drops the affected local cache entries.
-    #[cfg(feature = "cluster-redis")]
-    if let Some(stream) = &state.invalidation {
-        if let Err(e) = stream
-            .publish(
-                Some(tenant_id.to_string()),
-                req.api_keys.clone().unwrap_or_default(),
-            )
-            .await
-        {
-            // L-6: a failed broadcast used to be a log line and a 200 — the
-            // caller could not tell that remote nodes keep their stale verdict
-            // until the TTL expires. It is reported in the response now.
-            tracing::warn!(error = %e, "invalidation publish failed");
-            published = false;
-        }
-    }
-    metrics::record_auth_cache_size(state.auth.cache().len());
-    ok_json(
-        200,
-        &InvalidateResponse {
-            invalidated: count,
-            tenant_id: Some(tenant_id.to_string()),
-            published,
-        },
-    )
 }
 
 /// Simulated probe against a tenant `auth_url`: POSTs the exact request the

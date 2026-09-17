@@ -978,10 +978,32 @@ async function doInvalidate() {
   const invalidatedMsg = (n) => t("common.token.invalidated", { n, y: n === 1 ? "y" : "ies" });
   try {
     const r = await api("DELETE", "/auth/cache", { body });
-    box.className = "alert ok";
-    box.textContent = invalidatedMsg(r.invalidated) + ".";
+    // The response carries WHERE THE FLEET STANDS, not a boolean: `applied`
+    // (every live node confirmed), `pending` (published, the laggards are named)
+    // or `single_node`. Ignoring it was how an operator came to believe a
+    // banned key had been cleared everywhere when no node had been told.
+    const fleet = r.fleet || {};
+    const state = fleet.state || "unknown";
+    const lagging = (fleet.lagging || []).join(", ");
+    // An explicit map, not a template string: `scripts/check_i18n.js` can only
+    // verify keys it can see, and a key built at runtime is a key that can go
+    // missing from three of the four locales unnoticed.
+    const FLEET_KEYS = {
+      applied: "common.token.fleet.applied",
+      pending: "common.token.fleet.pending",
+      single_node: "common.token.fleet.single_node",
+      unavailable: "common.token.fleet.unavailable",
+    };
+    const fleetMsg = t(FLEET_KEYS[state] || "common.token.fleet.unknown", {
+      total: fleet.nodes_total ?? "?",
+      applied: fleet.nodes_applied ?? "?",
+      lagging: lagging || "-",
+    });
+    const ok = state === "applied" || state === "single_node";
+    box.className = ok ? "alert ok" : "alert err";
+    box.textContent = `${invalidatedMsg(r.invalidated)}. ${fleetMsg}`;
     box.classList.remove("hidden");
-    toast(invalidatedMsg(r.invalidated), "ok");
+    toast(fleetMsg, ok ? "ok" : "err");
   } catch (e) {
     box.className = "alert err";
     box.textContent = e.message;

@@ -111,6 +111,21 @@ pub struct AdminState {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     pub invalidation: Option<()>,
+    /// The ids of the LIVE data-plane nodes, or `None` when this process did
+    /// not inject them. Used by `DELETE /api/v1/auth/cache` to WAIT for the
+    /// fleet to confirm an invalidation instead of reporting a boolean that
+    /// could not be false.
+    ///
+    /// A closure rather than the registry itself, for the same reason
+    /// `tenant_api::TenantApiConfig::live_nodes` is one: reading the registry is
+    /// async, the handler is not, and a dead row must not hold a decision
+    /// hostage. `main` injects the SAME refreshed view it gives the tenant API,
+    /// so the operator's report and a tenant's report cannot disagree.
+    #[cfg(feature = "cluster-redis")]
+    pub live_nodes: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// How long `DELETE /api/v1/auth/cache` waits for confirmation.
+    #[cfg(feature = "cluster-redis")]
+    pub converge_timeout: std::time::Duration,
     /// Fleet registry (cluster P4): backs `GET /api/v1/cluster/status` for
     /// the Admin UI Health page (whole-cluster view: nodes, roles, liveness,
     /// lease holder). `None` off-cluster.
@@ -157,11 +172,33 @@ impl AdminState {
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
             invalidation: None,
+            // Both are injected by `main` through the builder below, not by a
+            // new `new` parameter: this constructor has 14 call sites, and a
+            // defaulted parameter is exactly what pushes them back to struct
+            // literals.
+            #[cfg(feature = "cluster-redis")]
+            live_nodes: None,
+            #[cfg(feature = "cluster-redis")]
+            converge_timeout: std::time::Duration::from_millis(2_000),
             #[cfg(feature = "cluster-redis")]
             cluster_registry: None,
             #[cfg(not(feature = "cluster-redis"))]
             cluster_registry: None,
         }
+    }
+
+    /// Inject the live-node view and the convergence budget for
+    /// `DELETE /api/v1/auth/cache` (cluster mode).
+    #[cfg(feature = "cluster-redis")]
+    #[must_use]
+    pub fn with_fleet(
+        mut self,
+        live_nodes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        converge_timeout: std::time::Duration,
+    ) -> Self {
+        self.live_nodes = Some(live_nodes);
+        self.converge_timeout = converge_timeout;
+        self
     }
 
     /// The leader-mode SQLite pool. Only leader/all admin routes reach this —
@@ -610,60 +647,6 @@ impl ServeHttp for AdminService {
         if method == "GET" {
             if let Some(resp) = static_files::try_serve_admin(&path) {
                 return resp;
-            }
-        }
-
-        // Tenant self-service endpoint (migration 0009): POST
-        // /api/v1/tenants/{tenant_id}/auth/cache/invalidate — gated by the
-        // TENANT access token (NOT the admin token). Identity comes from the
-        // token; the URL tenant_id must match it or the call is rejected
-        // (no cross-tenant spoofing). Runs before the admin-token gate so a
-        // tenant never needs the operator's admin token (欠费停机 / 付费恢复).
-        let tenant_self_path = path
-            .strip_prefix("/api/v1/tenants/")
-            .and_then(|r| r.strip_suffix("/auth/cache/invalidate"));
-        if let Some(url_tenant) = tenant_self_path {
-            if method == "POST" && !url_tenant.is_empty() && !url_tenant.contains('/') {
-                let Some(bearer) = Self::bearer_token(session).map(str::to_string) else {
-                    return handlers::err_json(
-                        401,
-                        "unauthorized",
-                        "invalid tenant access token",
-                        &trace_id,
-                    );
-                };
-                let Some(tenant_id) = handlers::tenant_id_for_token(&self.state, &bearer).await
-                else {
-                    return handlers::err_json(
-                        401,
-                        "unauthorized",
-                        "invalid tenant access token",
-                        &trace_id,
-                    );
-                };
-                if tenant_id != url_tenant {
-                    return handlers::err_json(
-                        403,
-                        "forbidden",
-                        "token does not match tenant_id",
-                        &trace_id,
-                    );
-                }
-                // Leader write gate: a standby forwards the invalidation to
-                // the ACTUAL lease holder (which re-validates the token).
-                if let Some(resp) = self
-                    .maybe_forward_mutation(&method, &path, query.as_deref(), session, &trace_id)
-                    .await
-                {
-                    return resp;
-                }
-                return handlers::tenant_auth_cache_invalidate(
-                    &self.state,
-                    session,
-                    &tenant_id,
-                    &trace_id,
-                )
-                .await;
             }
         }
 

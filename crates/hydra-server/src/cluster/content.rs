@@ -24,8 +24,10 @@ use crate::crypto::KeyProvider;
 
 /// Tenant access-token HASH (`tenant_id` → hash) — never the token itself.
 ///
-/// Carried so a replica can answer `has_access_token` and serve
-/// `POST /tenants/{id}/auth/cache/invalidate` without a 401 (plan §7-7).
+/// Carried so a replica can answer `has_access_token` and serve the tenant
+/// self-service endpoints on the DATA plane
+/// (`POST /tenant/{id}/api/v1/auth/cache/invalidate`) without a 401 — the
+/// snapshot, not the database, is what the tenant gate reads (design §3.4).
 pub type TenantTokenHashes = Vec<(String, String)>;
 
 /// The rows a replica needs BEYOND `ConfigData` to rebuild itself faithfully.

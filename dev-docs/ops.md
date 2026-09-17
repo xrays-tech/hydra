@@ -52,6 +52,12 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_USAGE_SINK` | `sqlite` | `sqlite` or `clickhouse`. **Runtime switch — one binary contains BOTH sinks** when built with `--features server,usage-clickhouse` (the release scripts do this), so flipping the sink needs no rebuild. |
 | `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. |
 | `RUST_LOG` / `HYDRA_LOG` | `info` | `tracing` env filter. |
+| `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
+| `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
+| `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | Per-tenant invalidation cap (429 beyond it). Each one fans out to every node and re-hits the tenant's `auth_url` from all of them. |
+| `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` | `31` | E3 window ceiling. Not cosmetic: the ClickHouse table's key leads with `created_at`, so a wide window scans every tenant's rows in it. |
+| `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
+| `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
 
 > The current binary reads the proxy/admin addresses and DB URL from env (the
 > `hydra.toml` shape in design §15.1 is the *target* schema; env vars are the
@@ -292,7 +298,24 @@ curl -X DELETE http://127.0.0.1:8081/api/v1/auth/cache \
 curl -X DELETE .../api/v1/auth/cache -d '{"tenant_id":"t-acme"}'
 ```
 
-Response: `{ "invalidated": N, "tenant_id": "..." }`. The next request for an
+Response (2026-09-17): the flat `invalidated`/`tenant_id` body gained
+`checked` / `scope` / **`fleet`**, and the `published: bool` field is GONE:
+
+```jsonc
+{"invalidated":2,"checked":2,"tenant_id":"t-acme","scope":"keys",
+ "fleet":{"state":"applied","nodes_total":3,"nodes_applied":3,
+          "lagging":[],"event_id":"1737-0","waited_ms":41}}
+```
+
+`fleet.state` is **`applied`** (200 — every live node confirmed), **`pending`**
+(202 — published, `lagging` names the nodes that have not confirmed), **`single_node`**
+(200 — this node is the whole data plane) or **`unavailable`** (503 — the channel
+exists but did not answer; **the fleet was NOT told**).
+
+`published` was removed because it could not be false when there was no
+invalidation stream: it defaulted to `true` and only flipped on a publish error, so
+a single-node build asserted a broadcast that never happened. Never treat a 202 as
+"done" — retry or investigate the named `lagging` nodes. The next request for an
 invalidated key re-hits the tenant `auth_url`. The `hydra_auth_cache_size` gauge
 is refreshed after mutation (§17).
 
@@ -300,25 +323,99 @@ is refreshed after mutation (§17).
 > side can still pass. Shorten `[auth] allow_ttl_secs` or call invalidate
 > proactively on tenant-side revocation (design §16.1).
 
-### 5.1 Tenant self-service invalidation (欠费停机 / 付费恢复, migration 0009)
+### 5.1 Tenant self-service API — **on the DATA plane** (2026-09-17)
 
 Each tenant can be given an **Access Token** (admin UI Tenants form →
-`Access token` field + Generate button; stored as a SHA-256 hash, never
-echoed, rotate by setting a new value). The tenant then clears its OWN auth
-cache without the operator:
+`Access token` field + Generate button; stored as a SHA-256 hash, never echoed,
+rotate by setting a new value). The tenant then serves itself, on the
+**data-plane listener** (`HYDRA_LISTEN`, i.e. the port its clients already use):
+
+| endpoint | what it does |
+| --- | --- |
+| `GET  /tenant/{tid}/api/v1/whoami` | the tenant's own non-secret config + snapshot version |
+| `POST /tenant/{tid}/api/v1/auth/cache/invalidate` | clear the tenant's cache **across every data-plane node** |
+| `GET  /tenant/{tid}/api/v1/usage?since=…&until=…&group_by=…` | token usage in a window (SQLite single node, ClickHouse in a cluster) |
 
 ```bash
-curl -X POST http://<admin-addr>/api/v1/tenants/<tenant_id>/auth/cache/invalidate \
+# 欠费停机 / 付费恢复: force re-auth for one key, everywhere
+curl -X POST http://<data-plane-addr>/tenant/t-acme/api/v1/auth/cache/invalidate \
   -H "Authorization: Bearer <tenant-access-token>" \
   -H "content-type: application/json" \
   -d '{"api_keys":["sk-aaa"]}'     # optional; empty body = clear ALL for the tenant
-→ {"invalidated":1,"tenant_id":"<tenant_id>"}
+→ {"invalidated":1,"checked":1,"tenant_id":"t-acme","scope":"keys",
+   "fleet":{"state":"applied","nodes_total":3,"nodes_applied":3,"lagging":[],"event_id":"1737-0","waited_ms":41}}
 ```
 
-The token's tenant must match the URL's `tenant_id` (403 otherwise); an
-invalid/missing/unconfigured token is 401 (fail-closed). Cluster mode
-broadcasts the invalidation fleet-wide; a standby forwards to the active
-leader. Lost token ⇒ operator rotates it (the API never returns it).
+**The old management-plane route is deleted.** It was
+`POST /api/v1/tenants/{id}/auth/cache/invalidate`, and it ran *before* the admin
+gate — so exposing it meant exposing every operator endpoint on the same port,
+which is why the management port can stay bound to loopback.
+
+Identity comes from the **token only**: the URL's `{tenant_id}` is a
+cross-check (mismatch → 403 `tenant_id_mismatch`), and `Host` plays no part.
+An invalid/missing/unconfigured token is 401 (fail-closed), worded identically
+for "no token" and "wrong token". Lost token ⇒ the operator rotates it (the API
+never returns it).
+
+`503 not_ready` means this node has no configuration snapshot yet — retry.
+`429 rate_limited` carries `Retry-After`; invalidations are capped per tenant per
+minute (default 10) because each one fans out to every node and re-hits the
+tenant's `auth_url` from all of them.
+
+### 5.2 How long can a revoked key keep working? (`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`)
+
+The honest answer, in order:
+
+1. **Normal case**: as long as the invalidation takes to converge — the response's
+   `fleet.state: applied` means every live node has applied it. If you get a
+   `202`, the named `lagging` nodes are still serving the old verdict.
+2. **A node that is alive and serving traffic but whose consumer is NOT
+   advancing** (consumer task died, network partition to Redis, node not in the
+   registry): nothing clears its L1, so the fallback is the entry's own TTL — and
+   that TTL used to be whatever the TENANT asked for via `expires_in`.
+   `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` (default **300**) now bounds it. Lower it to
+   make revocation take effect faster on such a node; raise it to reduce
+   `auth_url` traffic. It never caps a DENY (those are already short).
+   *Lowering it does not retroactively shorten entries already written to Redis —
+   use an invalidation for that.*
+3. **Watch `hydra_invalidation_consumer_stalled_seconds`**: it measures how long
+   a node's applied watermark has not advanced. **Alert above 60 s** — that is the
+   signal that case 2 is happening, and before this metric existed the condition
+   was completely invisible.
+
+### 5.3 Usage accounting: two rates that legitimately disagree
+
+- `GET /api/v1/stats/usage` (management) reads **in-process prometheus counters**:
+  process health, **resets on restart**, no time dimension.
+- `GET /tenant/{tid}/api/v1/usage` (tenant) reads the **metering store**
+  (persistent rows, time window, `source: sqlite|clickhouse`): the
+  reconciliation view.
+
+They cannot match, and neither is "the bug":
+
+| what is lost | which rate loses it |
+| --- | --- |
+| everything before a restart | the counters |
+| requests that failed before provider selection, and the four drop paths | the rows |
+| nothing (deliberate) | — |
+
+**In a ClickHouse cluster `requests` is an APPROXIMATION**: an INSERT retried
+after a read timeout re-sends the whole batch, and the CH table has no `trace_id`
+column to de-duplicate on, so `COUNT(*)` can overstate. Tokens and `errors` are
+unaffected in the same way (they are summed from the same duplicated rows). Use
+it for trends and reconciliation, not for invoicing.
+
+E3 **never** writes a usage row: querying usage does not bill as usage (a
+tenant's own control-plane calls leave `ctx.selected` empty).
+
+### 5.4 E3 troubleshooting
+
+| symptom | cause | action |
+| --- | --- | --- |
+| `503 usage_store_unavailable` | the store is unreachable, OR it answered something undecodable | check `hydra_tenant_api_usage_query_total{result}`: `store_unavailable` vs `decode_error`. The tenant sees the same code either way, on purpose |
+| `400 window_too_large` | window wider than `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` (default 31) | narrow the window; in ClickHouse the table's key leads with `created_at`, so a wide window scans other tenants' rows |
+| `400 invalid_since` / `invalid_until` | the bound is not RFC3339 / epoch / space-separated, or `since > until` | the response echoes the NORMALISED window — compare against what you sent |
+| latency climbs (`hydra_tenant_api_usage_query_seconds`) | wide windows | lower the window cap, and consider changing the CH table key to `ORDER BY (tenant_id, created_at)` (needs a rebuild + backfill; not done here) |
 
 ---
 

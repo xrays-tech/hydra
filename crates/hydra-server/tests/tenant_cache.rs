@@ -1,8 +1,17 @@
-//! Tenant self-service auth-cache invalidation (migration 0009): the
-//! `POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate` endpoint gated by
-//! the TENANT access token (not the admin token), plus the tenant token
-//! lifecycle via the admin API (set/rotate/clear, has_access_token view, never
-//! echoed).
+//! The tenant access-token lifecycle on the **management** API (migration 0009):
+//! set / rotate / clear, the `has_access_token` view, and that the token is
+//! never echoed back.
+//!
+//! The self-service endpoints themselves moved to the **data plane**, where a
+//! tenant can actually reach them without the operator exposing the whole
+//! management API: `POST /tenant/{tenant_id}/api/v1/auth/cache/invalidate` and
+//! friends. Their tests live in `tests/tenant_api.rs` (single node) and
+//! `tests/tenant_api_cluster.rs` (real Redis), and the contract is
+//! `dev-docs/design-tenant-api.md`. The five tests that used to live here drove
+//! the deleted `POST /api/v1/tenants/{id}/auth/cache/invalidate` route; each of
+//! their assertions is carried by a data-plane test (see the T9 record in
+//! `dev-docs/aegis/plans/2026-09-17-tenant-api.md`), so this file no longer
+//! asserts anything about cache invalidation.
 
 #![cfg(all(feature = "db", feature = "http-client", feature = "proxy"))]
 
@@ -119,27 +128,6 @@ async fn create_tenant(port: u16, id: &str, token: Option<&str>) -> serde_json::
     .await
 }
 
-async fn invalidate(
-    port: u16,
-    tenant_id: &str,
-    bearer: &str,
-    body: Option<serde_json::Value>,
-) -> (u16, serde_json::Value) {
-    let c = client();
-    let mut req = c
-        .post(format!(
-            "http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/auth/cache/invalidate"
-        ))
-        .header("authorization", format!("Bearer {bearer}"));
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    let r = req.send().await.expect("request");
-    let status = r.status().as_u16();
-    let json: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
-    (status, json)
-}
-
 #[tokio::test]
 async fn tenant_token_set_never_echoed_and_has_flag() {
     let port = start_admin(admin_state().await);
@@ -240,78 +228,60 @@ async fn tenant_token_too_short_rejected_400() {
     assert_eq!(body["error"]["code"], "invalid_access_token", "got {body}");
 }
 
-#[tokio::test]
-async fn tenant_token_invalidates_own_cache() {
-    let state = admin_state().await;
-    let port = start_admin(state.clone());
-    create_tenant(port, "t-cache", Some(TENANT_TOKEN)).await;
-    // seed one cached allow decision for this tenant's key
-    state
-        .auth
-        .cache()
-        .set("t-cache", "sk-real-key-123", true, Duration::from_secs(300))
-        .await;
-    let (status, json) = invalidate(port, "t-cache", TENANT_TOKEN, None).await;
-    assert_eq!(status, 200, "got {json}");
-    assert_eq!(json["tenant_id"], "t-cache", "got {json}");
-    assert_eq!(json["invalidated"], 1, "got {json}");
-}
+// ---------------------------------------------------------------------------
+// C16 — the old management-plane tenant route is GONE
+// ---------------------------------------------------------------------------
 
+/// The tenant's self-service endpoint used to live on the management API, at
+/// `POST /api/v1/tenants/{id}/auth/cache/invalidate`, reachable with a TENANT
+/// token through a special branch placed **before** the admin gate. It is now
+/// served on the data plane only.
+///
+/// **Both credentials must be asserted, because only one of them is a
+/// falsification signal** (measured on the router, not assumed):
+///
+/// | credential | before the deletion | after | is it evidence? |
+/// |---|---|---|---|
+/// | tenant token | `200` (the special branch ran first) | `401` (falls through to the admin gate) | **yes** — 200→401 is the signal |
+/// | admin token | `404` (`parts.len() > 2` refuses the deep path) | `404` | **no** — identical either way |
+///
+/// Asserting only the 404 would therefore be a test that can never fail, and
+/// asserting only "404" for the tenant token would be a test that can never pass.
 #[tokio::test]
-async fn tenant_token_invalidates_selected_keys() {
-    let state = admin_state().await;
-    let port = start_admin(state.clone());
-    create_tenant(port, "t-sel", Some(TENANT_TOKEN)).await;
-    state
-        .auth
-        .cache()
-        .set("t-sel", "sk-a", true, Duration::from_secs(300))
-        .await;
-    state
-        .auth
-        .cache()
-        .set("t-sel", "sk-b", true, Duration::from_secs(300))
-        .await;
-    let (status, json) = invalidate(
-        port,
-        "t-sel",
-        TENANT_TOKEN,
-        Some(serde_json::json!({ "api_keys": ["sk-a"] })),
-    )
-    .await;
-    assert_eq!(status, 200, "got {json}");
-    assert_eq!(json["invalidated"], 1, "got {json}");
-}
-
-#[tokio::test]
-async fn tenant_token_wrong_or_missing_rejected() {
+async fn the_old_management_plane_tenant_route_is_gone() {
     let port = start_admin(admin_state().await);
-    create_tenant(port, "t-auth", Some(TENANT_TOKEN)).await;
-    // wrong token
-    let (s1, j1) = invalidate(port, "t-auth", "sk-wrong-token-abcdefghijklmnop", None).await;
-    assert_eq!(s1, 401, "got {j1}");
-    // no token
-    let (s2, j2) = invalidate(port, "t-auth", "", None).await;
-    assert_eq!(s2, 401, "got {j2}");
-    // admin token is NOT a tenant token here
-    let (s3, j3) = invalidate(port, "t-auth", TOKEN, None).await;
-    assert_eq!(s3, 401, "got {j3}");
-}
+    create_tenant(port, "t-gone", Some(TENANT_TOKEN)).await;
+    let url = format!("http://127.0.0.1:{port}/api/v1/tenants/t-gone/auth/cache/invalidate");
 
-#[tokio::test]
-async fn tenant_token_mismatched_url_tenant_is_403() {
-    let port = start_admin(admin_state().await);
-    create_tenant(port, "t-own", Some(TENANT_TOKEN)).await;
-    create_tenant(port, "t-other", Some("sk-other-token-0123456789abcdef")).await;
-    // t-own's token used against t-other's URL → 403 (no cross-tenant spoofing)
-    let (s, j) = invalidate(port, "t-other", TENANT_TOKEN, None).await;
-    assert_eq!(s, 403, "got {j}");
-}
+    // (a) The tenant token: 200 while the old route existed, 401 now.
+    let r = client()
+        .post(&url)
+        .header("authorization", format!("Bearer {TENANT_TOKEN}"))
+        .send()
+        .await
+        .expect("request");
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 401,
+        "a tenant token must no longer reach any management route: {body}"
+    );
+    assert!(
+        body.contains("admin token"),
+        "it must be the ADMIN gate that refuses it, not a stray route: {body}"
+    );
 
-#[tokio::test]
-async fn tenant_without_token_cannot_use_endpoint() {
-    let port = start_admin(admin_state().await);
-    create_tenant(port, "t-notoken", None).await;
-    let (s, j) = invalidate(port, "t-notoken", "sk-anything-0123456789abcdef", None).await;
-    assert_eq!(s, 401, "got {j}");
+    // (b) The admin token: 404, which proves the path is not an operator
+    //     resource either. Same before and after, so it is a guard, not a signal.
+    let r = client()
+        .post(&url)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        r.status().as_u16(),
+        404,
+        "the tenant self-service path must not exist on the management API"
+    );
 }

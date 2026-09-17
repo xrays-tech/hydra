@@ -112,6 +112,121 @@ pub struct Invalidation {
     pub legacy_keys: Vec<String>,
 }
 
+/// The fleet-wide result of one invalidation, in the tri-state the HTTP layer
+/// reports — **shared by both entry points** (the tenant API's E2 and the
+/// operator's `DELETE /api/v1/auth/cache`).
+///
+/// It exists because the boolean it replaces lied: `published: true` was the
+/// initial value and only ever became `false` when a stream existed AND the
+/// publish failed, so a build with no stream reported `true` about a broadcast
+/// that never happened. `state` cannot be true-by-default — it is produced by
+/// the same barrier the tenant API waits on.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FleetReport {
+    /// `applied` | `pending` | `single_node` | `unavailable`.
+    pub state: &'static str,
+    pub nodes_total: usize,
+    pub nodes_applied: usize,
+    /// Nodes that did not confirm, named so an operator can act.
+    pub lagging: Vec<String>,
+    /// The stream entry this report is about, for cross-referencing the bus.
+    pub event_id: Option<String>,
+    /// The HTTP status that goes with this outcome. Carried HERE so the two
+    /// entry points cannot map the same state to different statuses.
+    #[serde(skip)]
+    pub http_status: u16,
+}
+
+impl FleetReport {
+    /// No stream at all: this node's own clear IS the whole answer. Only
+    /// reachable for the single-node `all` role — `main` refuses to start a
+    /// `leader`/`edge` without a Redis backbone, so "cluster member with no
+    /// channel" cannot occur, and a stream that exists but fails is
+    /// `unavailable` (503), not this.
+    #[must_use]
+    pub fn single_node() -> Self {
+        Self {
+            state: "single_node",
+            nodes_total: 1,
+            nodes_applied: 1,
+            lagging: Vec::new(),
+            event_id: None,
+            http_status: 200,
+        }
+    }
+}
+
+/// Publish an invalidation and wait for the fleet to confirm it.
+///
+/// The single implementation of the three layers (design §4.2.2): L1 fan-out
+/// through the stream, L2 authority already deleted synchronously by the caller,
+/// L3 confirmation through the per-node applied watermarks.
+///
+/// Status semantics: `200` applied (or `single_node`), `202` published but not
+/// confirmed (the laggards are named — the work is in flight, which is not an
+/// error), `503` the channel exists but did not answer.
+pub async fn broadcast_and_confirm(
+    stream: Option<&InvalidationStream>,
+    tenant_id: Option<String>,
+    api_keys: Vec<String>,
+    live_nodes: Vec<String>,
+    timeout: std::time::Duration,
+) -> FleetReport {
+    let Some(stream) = stream else {
+        return FleetReport::single_node();
+    };
+    let event_id = match stream.publish(tenant_id, api_keys).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalidation publish failed");
+            return FleetReport {
+                state: "unavailable",
+                nodes_total: 0,
+                nodes_applied: 0,
+                lagging: Vec::new(),
+                event_id: None,
+                http_status: 503,
+            };
+        }
+    };
+    match stream.await_applied(&event_id, &live_nodes, timeout).await {
+        AppliedOutcome::Applied {
+            nodes_applied,
+            nodes_total,
+        } => FleetReport {
+            state: "applied",
+            nodes_total,
+            nodes_applied,
+            lagging: Vec::new(),
+            event_id: Some(event_id),
+            http_status: 200,
+        },
+        AppliedOutcome::Pending {
+            nodes_applied,
+            nodes_total,
+            lagging,
+        } => FleetReport {
+            state: "pending",
+            nodes_total,
+            nodes_applied,
+            lagging,
+            event_id: Some(event_id),
+            http_status: 202,
+        },
+        AppliedOutcome::Unavailable(e) => {
+            tracing::warn!(error = %e, "convergence barrier could not run");
+            FleetReport {
+                state: "unavailable",
+                nodes_total: live_nodes.len(),
+                nodes_applied: 0,
+                lagging: live_nodes,
+                event_id: Some(event_id),
+                http_status: 503,
+            }
+        }
+    }
+}
+
 /// Redis Streams invalidation bus.
 #[derive(Clone)]
 pub struct InvalidationStream {

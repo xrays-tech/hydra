@@ -1170,7 +1170,7 @@ pub trait AuthChecker: Send + Sync {
 | --- | --- |
 | 租户系统判定某些 key 欠费/封禁 | 调 Admin 接口删除这些 key 的缓存（见 §13.2），租户侧 auth 服务随后返回拒绝 |
 | 某租户整体策略变更 | 调 Admin 接口按 `tenant_id` 清空该租户全部缓存 |
-| **租户自助**（欠费停机 / 付费恢复） | 租户持自己的 **Access Token** 调 `POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate` 清除自己名下缓存（见 §13.2；令牌→租户身份由服务端校验，URL 的 tenant_id 必须与令牌归属一致，防越权） |
+| **租户自助**（欠费停机 / 付费恢复） | 租户持自己的 **Access Token** 调**数据面**的 `POST /tenant/{tenant_id}/api/v1/auth/cache/invalidate` 清除自己名下缓存（见 §13.2；身份只来自令牌，URL 的 tenant_id 是一致性交叉校验，不一致 → 403）。原管理面路由已删除 |
 
 失效后：缓存内允许项被删 → 下次请求 `Miss` → 回源 → 由租户 `auth_url` 重新决定（是否欠费、是否阻断全由租户自决）；欠费拒绝 Hydra 以 402 + `type:"insufficient_quota"` 向客户端透出（§11.3，2026-09-09）。
 
@@ -1268,20 +1268,25 @@ impl TlsAccept for HydraCertStore {
 - 语义：从 `AuthCache` 中**尝试删除**匹配项（不存在则忽略），删除后这些 key 下次请求将强制回源 `auth_url` 重新认证；
 - `tenant_id` 缺省时仅按 `api_keys` 跨租户匹配（因 key 在缓存中以 `sha256(api_key)` 为值，可定位）；
 - `tenant_id` 提供且 `api_keys` 缺省 → 清空该租户全部缓存项；
-- 返回：`{ "invalidated": <n>, "tenant_id": "..." }`。
+- 返回（**2026-09-17 起**）：`{ "invalidated": <n>, "checked": <n>, "tenant_id": ..., "scope": "keys"|"tenant", "fleet": { "state": ..., "nodes_total": ..., "nodes_applied": ..., "lagging": [...], "event_id": ..., "waited_ms": ... } }`。
+  - `state` 为 **`applied`（200，全部存活节点已确认）/ `pending`（202，已发布未收敛，`lagging` 列出未确认节点）/ `single_node`（200，本节点即全部数据面）/ `unavailable`（503，失效通道存在但未应答）**。
+  - **`published: bool` 字段已删除**：它初值为 `true`、仅当"存在失效流且发布失败"才为 `false`，因此**没有失效流时它会断言一次并未发生的广播**——这正是租户以为"已全集群生效"而实际上没有任何节点被告知的成因。四个新指标（消费者水位/滞后/停摆秒数/202 计数）见 `design-tenant-api.md` §4.2.6。
+  - 该 `fleet` 对象与租户面端点 **共用同一个收敛屏障实现**（`cluster::events::broadcast_and_confirm`），两个入口不可能对"已生效"给出不同答案。
 
-**租户自助失效接口**（`POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate`，迁移 0009）：
+**租户自助端点：已迁至数据面**（2026-09-17）。原管理面路由 `POST /api/v1/tenants/{tenant_id}/auth/cache/invalidate`（迁移 0009）**已删除**：它排在 admin 闸门**之前**，因此"开放租户自助"与"开放整个运维 API（providers / provider-keys / tenants / limit-roles 全套 CRUD）"是同一个动作，而管理口默认绑回环，租户物理上够不着。
 
-```jsonc
-// 鉴权：Authorization: Bearer <tenant-access-token>  （租户令牌，非 admin token）
-// 请求体（可选；缺省/空 = 清空该租户全部缓存）
-{ "api_keys": ["sk-aaa", "sk-bbb"] }
-```
+新位置（同一监听器即租户已经能到达的数据面，带每租户 TLS）：
 
-- 租户令牌在 admin-UI / admin API 为租户配置（`tenant.access_token_hash`，SHA-256 单向存储，永不回显；编辑留空=保留，改值=轮换，显式 `""`=清除）；
-- 服务端以令牌反查租户 id 并校验 == URL 的 tenant_id（不一致 → 403）；未配置令牌/令牌无效 → 401（fail-closed）；
-- 语义同管理端 `DELETE /api/v1/auth/cache`：清除该租户缓存项 → 下次请求强制回源；集群模式广播全节点（P4），standby 转发至活跃 leader；
-- 返回：`{ "invalidated": <n>, "tenant_id": "..." }`；edge 节点不提供（无 DB）。
+| 端点 | 方法 | 用途 |
+| --- | --- | --- |
+| `/tenant/{tenant_id}/api/v1/whoami` | GET | 本租户的非机密配置 + 快照版本（`domain` / `auth_url` 只读） |
+| `/tenant/{tenant_id}/api/v1/auth/cache/invalidate` | POST | 清除本租户缓存（跨**全部**数据面节点，含收敛确认） |
+| `/tenant/{tenant_id}/api/v1/usage` | GET | 某时间窗内的 token 用量（单节点读 SQLite，集群读 ClickHouse） |
+
+- 鉴权：`Authorization: Bearer <tenant-access-token>`；身份**只**来自令牌，URL 的 `{tenant_id}` 是一致性**交叉校验**（不一致 → 403），`Host` 不参与判定；
+- 令牌仍在 admin-UI / admin API 配置（`tenant.access_token_hash`，SHA-256 单向存储，永不回显；编辑留空=保留，改值=轮换，显式 `""`=清除）；
+- 3 个端点在**全部角色**（含集群 edge）上可用，且**没有任何转发**——集群不需要把请求转给 leader，因为用量读的是共享 ClickHouse、失效是广播 + 水位确认；
+- 完整契约、错误码、限流、残余窗口上界（`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`）见 **`design-tenant-api.md`**（本文件不再重复维护）。
 
 **写后一致性**：除认证缓存失效/熔断复位外，每个配置写 handler 成功后立即 `store.reload_all()`，确保内存与 DB 一致；返回最新快照给调用方。
 
@@ -1501,7 +1506,8 @@ PRAGMA mmap_size = 134217728;
 
 ### Phase 7 — 管理 API + 热更新 + 认证失效 + 指标（1.5d）
 - `AdminService` + REST 全资源 CRUD；
-- `DELETE /api/v1/auth/cache` 强制失效；熔断器查看/复位；
+- `DELETE /api/v1/auth/cache` 强制失效（响应带 `fleet` 三态）；熔断器查看/复位；
+- 租户自助的三端点位于**数据面** `/tenant/{tenant_id}/api/v1/*`（§13.2），见 `design-tenant-api.md`；
 - 写后 `reload_all`（联动 SWRR 清空）；`/metrics`、`/health`；
 - §17 指标全部接入。
 
