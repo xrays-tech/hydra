@@ -139,7 +139,7 @@ Change Necessity:
 | 面 | 边界 |
 |---|---|
 | 数据面既有路径 | `POST /v1/chat/completions`、`/v1/messages`、`GET /v1/models`、passthrough 行为**逐字节不变**（§10.2 T22 断言上游 `received_requests()` 计数一致） |
-| 新增保留前缀 | `/tenant/` 不再进入代理管线。这是**唯一的行为变更面**（几乎不可能与 LLM provider 路径冲突）；`HYDRA_TENANT_API=off` 可完全回到基线 |
+| 新增保留前缀 | `path.starts_with("/tenant/")` 之后**整段**不再进入代理管线（**是前缀而非三个字面路径** —— P1-2：否则 `/tenant/…/typo` 会落到 api-key 抽取与外部鉴权，把租户令牌送去 `auth_url`）。前缀下未匹配的路由本地 404。这是**唯一的行为变更面**（几乎不可能与 LLM provider 路径冲突）；`HYDRA_TENANT_API=off` 可完全回到基线 |
 | 管理面 | **破坏性**：删除 `POST /api/v1/tenants/{id}/auth/cache/invalidate`（用户已确认尚未上线）。`DELETE /api/v1/auth/cache` 保留，但响应体由 `published: bool` 换成 `fleet` 对象 |
 | 认证判定语义 | 除 `HYDRA_AUTH_ALLOW_TTL_MAX_SECS`（默认 = 现状值）外**不改**；不设 `expires_in` 的租户**零行为变化** |
 | 配置 | 新增 4 个 env（`HYDRA_TENANT_API` 等），全部有安全默认；删除 `HYDRA_CLUSTER_ID`（v5，从未存在过） |
@@ -461,7 +461,17 @@ cargo test -p hydra-server --features server --test loader --test repo --test co
 - **无该特性时 `sink_kind` 永远不可能是 `"clickhouse"`**（`build_sink` 对不可用 kind 直接报错，启动即失败）→ 所以这条 cfg 分支是**编译期问题而不是运行期分支**；
 - `usage_query.rs` 的 `ClickHouseUsageQuery` 与 `main.rs` 的选择逻辑都要有 cfg 分支（无特性时只可能注入 `SqliteUsageQuery`）；
 - 验证矩阵里的 `--features server,cluster-redis,usage-clickhouse` 与 `--features server`（**无** usage-clickhouse）**两种都要编译过**——后者是 T3 最容易漏的门。
-**Risk**：回归网 = 既有 4 条 `clickhouse_sink` 测试（含 1 条 `#[ignore]`），外加本机活实例手工跑那条 ignored。
+**Risk / 回归网的真相（P1-3 修订，已实测核对）**：v5.2 声称"回归网 = 既有 4 条 `clickhouse_sink` 测试"，**这是不够的**：那 4 条里 3 条非 ignored 的只调用 `build_clickhouse_json_row`（`tests/clickhouse_sink.rs:65/118/143`）——而这个函数**留在 `sink.rs` 不动**；第 4 条是 `#[ignore]` 且**不断言任何东西**（`:180` 原文 "assert no panic + graceful drop"）。
+
+**真正覆盖本次搬迁对象的测试住在 `sink.rs` 的内联模块里，而 `--test clickhouse_sink` 根本不会运行库单测**：
+
+| 测试 | 位置 | 覆盖什么 |
+|---|---|---|
+| `parse_clickhouse_url` 系列（约 7 条） | `sink.rs:996` 起的 `mod tests` | URL/凭据/查询串解析 —— **整块要搬** |
+| 传输层测试（含 `a_clickhouse_that_never_answers_times_out`） | `sink.rs:1054` 起的 `#[cfg(test)]`，见 `:1226` | 连接/写/flush/读的期限语义 —— **整块要搬** |
+| 活实例写库 | `tests/clickhouse_sink.rs:172-181`（`#[ignore]`） | 端到端能写进真 CH |
+
+因此 T3 的纪律是：**内联测试模块与实现一起搬进 `clickhouse.rs`**（否则 `sink.rs` 在 `usage-clickhouse` 下**根本编译不过**——它们引用了被搬走的 `ClickHouseConfig`/`insert_batch_clickhouse_http`），并且 **Verification 必须包含 `--lib`**。
 
 **Steps**
 1. **先建回归基线**（**本计划已在 2026-09-17 预采集，搬迁后必须逐字复现**）：
@@ -492,7 +502,20 @@ $ curl -s --data-binary "SELECT count() FROM usage_record" http://127.0.0.1:8123
 
    - **`ClickHouseConfig` 与其 URL/凭据解析**（原 `sink.rs:446-469` 定义、`:529-530` 读 env、Basic 头在请求构造处）。它有 **4 个字段**，其中两个是**已经存在的期限**：`connect_timeout`（`HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS`，默认 3000ms）与 `io_timeout`（`HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`，默认 15000ms，用于**每一次** write/flush/read）。**因此不要发明新参数**：原语直接沿用这两个字段（写路径行为逐字不变）；读路径的 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` 在**构造读侧 config 时**填进这两个字段即可（例如 `connect_timeout = min(query_timeout, 3000ms)`、`io_timeout = query_timeout`）——把差异放在 config 构造处，原语本身保持唯一形态。
    - **`url_encode`**（原 `sink.rs:899-914`）。
-   - **裸 TCP HTTP 原语**（原 `sink.rs:711-797`）：`POST /?<query_params>&query=<url_encode(sql)>`、`Host`、可选 `Authorization: Basic base64(user:pass)`、`Content-Length`、`Connection: close`、connect/IO 期限、**以及一个已有的有界响应读取循环**。
+   - **裸 TCP HTTP 原语**（原 `sink.rs:711-797`）：`POST /?<query_params>&query=<url_encode(sql)>&<param_k=v_k...>`、`Host`、可选 `Authorization: Basic base64(user:pass)`、`Content-Length`、`Connection: close`、connect/IO 期限、**以及一个已有的有界响应读取循环**。
+
+     **签名（P1-4 修订）**：v5.2 写的 `send(cfg, body, timeout)` **两头都不成立** —— ① 有**两个独立期限**（`connect_timeout` 3000ms / `io_timeout` 15000ms，都来自 `env_millis`，`sink.rs:529-530`），一个 `Duration` 表达不了，所以"零行为差异"当场破坏；② 读路径的 SQL 与 `param_*` 绑定没有入参，读侧就得自己拼请求行 —— 那正是设计禁止的第二个 owner。正确签名是：
+
+     ```rust
+     pub(crate) async fn send(
+         cfg: &ClickHouseConfig,   // 已含 connect_timeout 与 io_timeout
+         query: &str,              // INSERT 或 SELECT
+         params: &[(String, String)], // 读路径的 {t:String} 绑定；写路径传空切片
+         body: &[u8],              // INSERT 的 JSONEachRow 载荷；SELECT 传空
+     ) -> Result<(String /*status_line*/, Vec<u8> /*body*/), String>
+     ```
+
+     两个期限**留在 `ClickHouseConfig` 里**（写路径逐字不变）；读路径在**构造自己的 config 时**把 `connect_timeout`/`io_timeout` 填成 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` 派生的值 —— 差异只出现在 config 构造处，原语保持唯一形态。**每个 `param_*` 的值也必须 `url_encode`**（见 T8）。
    - **状态行分类**（原 `sink.rs:801-811`）。
 
    **一处必须纠正的旧描述**：本计划 v5.1 曾称写通道"把响应体当错误文本丢弃"。读了源码后准确的说法是：**它已经把响应体读进来了**（`resp`，带 `MAX_CLICKHOUSE_RESPONSE = 64 KiB` 上限，`sink.rs:475`，且**不等 EOF** 就停止读取），只是**把这段 body 当作错误文本使用**。所以读路径新增的负担比原先估计的**小**：**读取与限长已存在且被测试覆盖，真正新增的只有 `FORMAT JSONEachRow` 的解码**。原语应返回 `(status_line, body)`，写路径继续把 body 当错误文本，读路径去解码它。
@@ -501,6 +524,9 @@ $ curl -s --data-binary "SELECT count() FROM usage_record" http://127.0.0.1:8123
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/usage-clickhouse -- -D warnings
+# ★ 关键：--lib 才会跑被搬走的内联测试（parse_clickhouse_url 系列 + 传输期限测试）。
+#   只跑 --test clickhouse_sink 的话，本 commit 真正搬走的东西一条都没测到（P1-3）。
+cargo test -p hydra-server --features server,usage-clickhouse --lib
 cargo test -p hydra-server --features server,usage-clickhouse --test clickhouse_sink   # 期望与步骤 1 完全一致
 # 活实例（本机有 hydra-local-clickhouse）：
 CH_URL=http://127.0.0.1:8123 cargo test -p hydra-server --features server,usage-clickhouse \
@@ -542,18 +568,32 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
    e. `tenant_api/auth.rs`：`pub fn tenant_from_token(store: &ConfigStore, bearer: &str) -> Option<String>`。**必须在同一次 `replication()` guard 内**同时取令牌摘要表与 `tenants_by_id`（设计 §3.3 规则 4）；常数时间比较；`replication()` 为 `None` → `NotReady`（503）；
    f. `proxy.rs::request_filter` 开头（`let cfg_guard` 之前）插入：
 ```rust
-// (0) Tenant self-service API — data-plane reserved prefix. Intercepted BEFORE
-//     Host→tenant (otherwise an IP/own-hostname call 404s and "set my domain"
-//     could never bootstrap), before the api-key extraction (Authorization:
+// (0) Tenant self-service API. Intercepted BEFORE Host→tenant (otherwise an
+//     IP/own-hostname call 404s), before the api-key extraction (Authorization:
 //     Bearer is ALSO a client api-key transport — a tenant token must never be
-//     forwarded to auth_url or masked into a usage record), and before the
-//     /v1/models catalog intercept.
-if let Some(route) = hydra_core::tenant_api::parse_route(session.req_header().uri.path()) {
-    if self.state.tenant_api.enabled {
-        return crate::tenant_api::dispatch(&self.state, session, ctx, route).await;
+//     forwarded to auth_url at http.rs:558-566 or masked into a usage record at
+//     proxy.rs:1105), and before the /v1/models catalog intercept.
+//
+//     THE PREFIX IS RESERVED, NOT THE THREE PATHS (P1-2): gating on
+//     `parse_route(..).is_some()` would let `/tenant/t1/api/v1/models`,
+//     `/tenant/t1/api/v2/whoami` and every typo fall through into the normal
+//     pipeline — Host→tenant, api-key extraction, external auth — which is
+//     exactly the path the security invariant above forbids. So: any path under
+//     `/tenant/` is answered locally (404 for a non-route), and the proxy
+//     pipeline never sees that prefix.
+//
+//     The path is copied into an owned String on purpose (P1-1): `parse_route`
+//     returns a route borrowing the path, and `dispatch` takes `&mut Session`,
+//     so holding the borrow across the call is E0502.
+if self.state.tenant_api.enabled {
+    let path = session.req_header().uri.path().to_string();
+    if path.starts_with("/tenant/") {
+        return crate::tenant_api::dispatch(&self.state, session, ctx, &path).await;
     }
 }
 ```
+
+`dispatch` 内部：`parse_route(&path)` → `Some(route)` 走下面的流程；`None` → **本地 `404 unknown path`**（并且**绝不**把该前缀交给代理管线）。
    g. `dispatch` 内：令牌闸门 → URL `tenant_id` 交叉校验（403）→ 端点分派。**接线规则（P0-1 修订，v5.3）**：
 
       | 任务 | 本任务接线的端点 | 未接线端点的行为 |
