@@ -165,6 +165,7 @@ fn configdata_construct_and_index() {
     // --- Default is fully empty (no panics, no stray entries) -------------
     let empty = ConfigData::default();
     assert!(empty.tenants_by_domain.is_empty());
+    assert!(empty.tenants_by_id.is_empty());
     assert!(empty.models_by_key.is_empty());
     assert!(empty.tenant_providers.is_empty());
     assert!(empty.tenant_models.is_empty());
@@ -182,4 +183,90 @@ fn configdata_construct_and_index() {
         "clone must be independent of original"
     );
     let _ = HashMap::<String, Provider>::new();
+}
+
+// ---------------------------------------------------------------------------
+// tenants_by_id — derived index: one write entry point, and it stays off the wire
+// ---------------------------------------------------------------------------
+
+/// `reindex_tenants` is the ONLY writer, and it derives from
+/// `tenants_by_domain` — including **replacing** whatever was there, so a
+/// stale entry cannot survive a domain-index change.
+#[test]
+fn reindex_tenants_derives_from_the_domain_index_and_replaces() {
+    let mut cfg = ConfigData::default();
+    let acme = sample_tenant();
+    cfg.tenants_by_domain
+        .insert(acme.domain.clone(), acme.clone());
+
+    // A hand-written entry that the domain index does NOT contain must not
+    // survive: this is the "second write entry point" the design forbids.
+    let mut ghost = sample_tenant();
+    ghost.id = "t_ghost".into();
+    ghost.domain = "ghost.example".into();
+    cfg.tenants_by_id.insert(ghost.id.clone(), ghost);
+    assert_eq!(cfg.tenants_by_id.len(), 1, "precondition");
+
+    cfg.reindex_tenants();
+
+    assert_eq!(cfg.tenants_by_id.len(), 1, "the ghost must be replaced");
+    assert!(!cfg.tenants_by_id.contains_key("t_ghost"));
+    assert_eq!(
+        cfg.tenants_by_id.get("t_acme").map(|t| t.domain.as_str()),
+        Some("acme.com")
+    );
+
+    // Removing the tenant from the domain index removes it here too.
+    cfg.tenants_by_domain.clear();
+    cfg.reindex_tenants();
+    assert!(cfg.tenants_by_id.is_empty());
+}
+
+/// The index must NOT travel the cluster wire.
+///
+/// `ConfigData` is a field of `SnapshotWire` (`cluster/snapshot.rs`), so a
+/// non-skipped field would (a) ship every tenant row twice per snapshot and
+/// (b) break — or, with `serde(default)`, silently empty out — a mixed-version
+/// deserialization. Silently emptying is the dangerous half: an empty
+/// `tenants_by_id` turns a valid tenant token into `403 tenant_not_found`.
+/// The replica rebuilds it in `hydrate` instead.
+#[test]
+fn tenants_by_id_is_not_serialized_and_deserializes_empty() {
+    let mut cfg = ConfigData::default();
+    let acme = sample_tenant();
+    cfg.tenants_by_domain
+        .insert(acme.domain.clone(), acme.clone());
+    cfg.reindex_tenants();
+    assert_eq!(
+        cfg.tenants_by_id.len(),
+        1,
+        "precondition: populated in memory"
+    );
+
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    // 精确断言：wire 形态里**根本不存在** tenants_by_id 这个键。
+    let as_value: serde_json::Value = serde_json::from_str(&json).expect("parse back");
+    assert!(
+        as_value.get("tenants_by_id").is_none(),
+        "the derived index must not appear in the wire form: {json}"
+    );
+    assert!(
+        as_value.get("tenants_by_domain").is_some(),
+        "the source index MUST travel — the replica re-derives from it"
+    );
+
+    let back: ConfigData = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(
+        back.tenants_by_domain.len(),
+        1,
+        "the SOURCE index does travel — it is what the replica re-derives from"
+    );
+    assert!(
+        back.tenants_by_id.is_empty(),
+        "the derived index must arrive empty; hydrate rebuilds it"
+    );
+    // ...and rebuilding from what DID travel restores it exactly.
+    let mut back = back;
+    back.reindex_tenants();
+    assert_eq!(back.tenants_by_id, cfg.tenants_by_id);
 }

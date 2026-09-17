@@ -194,6 +194,48 @@ async fn loader_build_indexes_correct() {
     );
 }
 
+/// `tenants_by_id` 是**派生索引**，必须与 `tenants_by_domain` 同源同批。
+///
+/// 它存在的理由只有一个：令牌闸门要用 `tenant_id` 做 O(1) 取用（设计 §3.4）。
+/// 因此这里断言的不是"某个字段非空"，而是**同源** —— 两个索引的基数一致，且每个
+/// domain 行的 id 都能在 id 索引里取到**同一行**。只断言非空会漏掉"填了一半"。
+#[tokio::test]
+async fn loader_derives_tenants_by_id_from_the_same_rows() {
+    let pool = common::setup_pool().await;
+    seed(&pool).await;
+
+    let cfg = build_config(&pool, &kp()).await.expect("build");
+
+    assert!(
+        !cfg.tenants_by_domain.is_empty(),
+        "the seed must produce at least one tenant, or this test proves nothing"
+    );
+    assert_eq!(
+        cfg.tenants_by_id.len(),
+        cfg.tenants_by_domain.len(),
+        "tenants_by_id must be derived from the SAME rows as tenants_by_domain"
+    );
+    for (domain, t) in &cfg.tenants_by_domain {
+        let by_id = cfg
+            .tenants_by_id
+            .get(&t.id)
+            .unwrap_or_else(|| panic!("tenant {} (domain {domain}) must be reachable by id", t.id));
+        assert_eq!(
+            by_id.domain, t.domain,
+            "id index must point at the same row"
+        );
+        assert_eq!(by_id.auth_url, t.auth_url);
+    }
+    // 反向：id 索引里不能有 domain 索引中没有的行（防止"多填"）。
+    for (id, t) in &cfg.tenants_by_id {
+        assert!(
+            cfg.tenants_by_domain.contains_key(&t.domain),
+            "id index row {id} has domain {} which is absent from the domain index",
+            t.domain
+        );
+    }
+}
+
 /// T5.2 — `provider_model.status ∈ {0, -1}` is excluded from `models_by_key`.
 /// Use distinct model keys (same `(key, provider_id)` would hit the UNIQUE
 /// constraint) so each offline status is exercised independently.

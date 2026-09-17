@@ -274,6 +274,7 @@ fn validate_output_is_deterministic() {
 fn validate_empty_config_is_clean() {
     let cfg = ConfigData {
         tenants_by_domain: HashMap::new(),
+        tenants_by_id: HashMap::new(),
         models_by_key: HashMap::new(),
         tenant_providers: HashMap::new(),
         tenant_models: HashMap::new(),

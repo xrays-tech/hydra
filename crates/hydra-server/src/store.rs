@@ -175,8 +175,11 @@ pub async fn build_config(
         .filter(|b| b.enabled)
         .collect();
 
-    let cfg = ConfigData {
+    let mut cfg = ConfigData {
         tenants_by_domain,
+        // 派生索引：由紧随其后的 reindex_tenants 填充（唯一写入口，
+        // 在 core 里，与副本侧的 hydrate 共用同一实现）。
+        tenants_by_id: HashMap::new(),
         models_by_key,
         tenant_providers,
         tenant_models,
@@ -186,6 +189,10 @@ pub async fn build_config(
         key_prefix_bindings,
         certs,
     };
+
+    // 派生索引在这里一次性建好：loader 是 leader 侧唯一的构建点，
+    // 与副本侧 hydrate 的调用共用 core 里的同一个实现。
+    cfg.reindex_tenants();
 
     validate_and_log(&cfg)?;
     Ok(cfg)

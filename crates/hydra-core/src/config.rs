@@ -38,6 +38,20 @@ pub struct ConfigData {
     /// `domain` (lowercase) → tenant (incl. the `localhost` special case).
     pub tenants_by_domain: HashMap<String, Tenant>,
 
+    /// `tenant_id` → tenant. **派生索引**，与 `tenants_by_domain` 同源（同一次
+    /// 加载、同一批行），供"由令牌反查租户"的 O(1) 取用。
+    ///
+    /// **不上集群线缆**（`serde(skip)`）：它是派生值，副本侧由
+    /// [`ConfigData::reindex_tenants`] 从 `tenants_by_domain` 重建 —— 传输它既会让
+    /// 每份快照把租户行传两遍，也会引入"旧 leader / 新副本"的字段缺失问题
+    /// （缺字段时若静默成空索引，有效令牌会被判 403）。
+    ///
+    /// **只有一个写入口**：[`ConfigData::reindex_tenants`]。别处写它会让
+    /// `ReplicationContent` 的 `PartialEq` 代际判定出现"无源变化"
+    /// （`ReplicationContent` 持 `Arc<ConfigData>`，而本结构体 derive `PartialEq`）。
+    #[serde(skip, default)]
+    pub tenants_by_id: HashMap<String, Tenant>,
+
     /// `model_key` → online providers serving it (`provider_id` + weight).
     /// Only `provider_model.status == 1` entries are included by the loader.
     pub models_by_key: HashMap<String, Vec<ModelProvider>>,
@@ -66,6 +80,27 @@ pub struct ConfigData {
     /// W1–W2 carries `CertMeta`, W4 resolves to a parsed `ResolvedCert` on the
     /// server side while this map remains the single source of truth.
     pub certs: HashMap<String, CertMeta>,
+}
+
+impl ConfigData {
+    /// 从 `tenants_by_domain` 重建 `tenants_by_id`（唯一写入口）。
+    ///
+    /// 纯函数：无 I/O、不确定输入之外的状态。两个调用点都必须经过它 ——
+    /// `store.rs::build_config`（leader 加载）与 `cluster/snapshot.rs::SnapshotWire::hydrate`
+    /// （副本从线缆反序列化之后）。因为它们共用同一个实现，派生规则不可能分叉，
+    /// 也不需要 `WIRE_VERSION` 变更：`serde(skip)` 之后两侧都由本函数产生。
+    ///
+    /// 空的 `tenants_by_domain`（尚未收到第一帧快照的 edge）产生空索引，这是正确的：
+    /// 此时 `ConfigStore::replication()` 为 `None`，令牌闸门回 503 `not_ready`，
+    /// 而不是把有效令牌误判为 403。
+    pub fn reindex_tenants(&mut self) {
+        self.tenants_by_id.clear();
+        self.tenants_by_id.extend(
+            self.tenants_by_domain
+                .values()
+                .map(|t| (t.id.clone(), t.clone())),
+        );
+    }
 }
 
 /// One row of `models_by_key`: which provider serves a model and at what weight.

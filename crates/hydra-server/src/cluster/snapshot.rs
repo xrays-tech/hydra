@@ -281,6 +281,11 @@ impl SnapshotWire {
         }
 
         let mut cfg = self.cfg;
+        // 派生索引不上线缆（`ConfigData.tenants_by_id` 是 `serde(skip)`），
+        // 因此在**交付之前**用与 loader 相同的实现从 tenants_by_domain 重建。
+        // 位置要紧：这个 cfg 随后被交给 `apply_snapshot` →
+        // `ReplicationContent::from_hydrated`，重建必须发生在交付之前。
+        cfg.reindex_tenants();
 
         // Provider keys: unseal, keep the wire's identity, and re-project
         // `cfg.provider_keys` so the hot path sees the same keys.
