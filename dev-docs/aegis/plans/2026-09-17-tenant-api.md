@@ -777,7 +777,18 @@ cargo test -p hydra-server --features server,cluster-redis
    - **T7 的 Files 因此只有 `http.rs` / `main.rs` / `admin/metrics.rs` + 测试，零外部改动** —— 这就是"最小改动面"的证据。
 
    **何时才允许改签名**：仅当该上限是**每个缓存实例必填**时才值得付 56 个调用点的代价；这里它有安全默认（= 现状值），所以不该付。
-4. **Verify GREEN** + `cargo test -p hydra-server --features server --test http_auth --test auth_cache`。
+4. **Verify GREEN**：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
+cargo test -p hydra-server --features server --test http_auth      # 含 C11：expires_in=86400 被封顶
+cargo test -p hydra-server --features server --test auth_cache     # 既有 TTL 语义无回归
+cargo test -p hydra-server --features server --lib                 # AuthCache 内联单测（无回归）
+cargo test -p hydra-server --features server                       # 主门禁全绿
+# 计数校验（P1-6 的证据）：构造函数调用点数量必须与改动前一致
+grep -rc "AuthCache::new\|AuthCache::with_clock" crates/ --include=*.rs | awk -F: '{s+=$2} END {print s" 个调用点（改动前基线为 56）"}'
+```
 5. **Commit**：`fix(auth): cap the allow-cache TTL so a stalled node's stale window is operator-bounded`
 
 ### T8 — **commit 2**：`usage_query.rs` 双后端读路径（含 CH）
@@ -1155,3 +1166,14 @@ Execution Route:
 - Fallback: 若某个任务被证实独立（例如 T1 与 T3 之间无文件重叠），可把该任务派给子代理
 - User confirmation required: no
 ```
+
+---
+
+## 修订记录（复审驱动）
+
+| 轮次 | 触发 | 处置 |
+|---|---|---|
+| **初稿** | 依设计 v5.1（需求四轮变更后） | 9 个任务、TDD Route strict、覆盖矩阵与指标矩阵 |
+| **自审** | 计划期机械核对 | ① 修掉 T4 "增量接线"的含糊表述（原文出现"折中/占位不成立"这类自相矛盾措辞）；② `UsageQuery` 改为与兄弟 trait `UsageSink` **同一种手写 desugar 风格**；③ 补 ADR/决策信号携带节（A-1 连同真实备选与基线同步问题）；④ **实测**发现 44 条设计用例中 **13 条无任务覆盖**（含 C5 这一收敛屏障的核心负例）→ 全部补齐并落成可重跑的覆盖矩阵；⑤ **实测**发现 12 个指标中 **9 个无归属任务** → 落成指标交付矩阵；⑥ 实测 T2 的 `ConfigData` 穷举字面量只有 **2 处**（非"一片"）；⑦ 实测 `cluster::events` 为特性门控 → 补 `AppState.invalidation` 的双字段 cfg 形状；⑧ **自证伪**：T9 原写的"旧路径 → 404"是错的（租户令牌会落到 admin 闸门 → **401**）→ 改为双凭证断言 |
+| **复审第 1 路：逐条事实证伪**（30 条断言：27 真 / 1 假 / 2 不准） | 对抗式证伪，含 6 条 ClickHouse 事实用 curl **独立复测** | **[F-1 假]** `AppState` 构造点从"13 个测试"改正为 **12 处测试**（`terminate_mode.rs:224` 内含于 `:206-233` 的 helper 被重复计）＋计数校验命令；**[I-1 不准]** `events.rs:291` → `:293/311`（7 处引用）；**[I-2 不准，且把风险说轻了]** 裁剪的 generation bump **不是**"仅当丢掉未读条目"——`XTRIM removed>0` **无法区分已读/未读**，故 >333 事件/秒持续 30s 就会让全部节点清空 L1+L2，**与消费者是否落后无关**；D6/§5.1/§6.3/C7/附录 A.5 措辞全部改正 |
+| **复审第 2 路：架构对抗**（2 P0 / 12 P1 / 9 P2；该路因跑时病态被中断后另起有界复审） | 与作者独立的事实核对 | **[P0-1]** v5.2 的"T4 接 whoami"与 T5（本身就是 whoami 任务）自相矛盾 → **T4 不接任何端点**（只交付闸门 + 诚实的路由骨架），T5/T6/T8 各替换一个 404 分支；T20 按端点分段落地。**[P0-2]** `tests/tenant_cache.rs` 是旧路由**真正的调用方**且跑在**主 CI job** → T9 新增步骤 0（实测 8 条 → 留 3 删 5 + 断言意图映射表）。**[P1-1]** 拦截片段借用冲突（E0502）→ 先取 owned path。**[P1-2]** `/tenant/` 必须是**前缀**而非三个字面路径（否则 near-miss 会落到外部鉴权，把租户令牌送去 `auth_url`）。**[P1-3]** T3 的回归网真相：真正覆盖搬迁对象的是 `sink.rs` 的**内联模块**，`--test clickhouse_sink` 不会跑它 → 内联测试随实现一起搬 + Verification 加 `--lib`。**[P1-4]** CH 原语签名两头不成立（两个期限 + 读侧 SQL/params 无入参）→ 给出正确签名。**[P1-5]** 屏障接口三处不可实现（`SingleNode` 不该由流方法返回、`Unavailable` 原定义运行期不可构造、`list_nodes` 是 async 且含死节点）→ 逐条重定义。**[P1-6]** 不得给 `AuthCache::new/with_clock` 加参数（**实测 56 个调用点 / 16 个文件**）→ 改用 builder。**[P1-9]** T14 不可写（注入点在二进制目标）→ 提取 `usage_query::select` 库函数。**[P1-10]** 生产 grep 门禁全量跑**今日已命中 358 行**、永远无法变绿 → 限定到新增/改动文件 + 记录基线例外。**[P1-11]** T2 的红灯必须落在 **loader** 上（core 里手工构造的断言无法由生产改动转绿）。**[P1-12]** `AppState` 实为**加 3 字段**（含 `tenant_api`），`for_tests` 必须能表达新测试所需值，T6 的 Files 缺 `main.rs`（`node_id` 穿线）。**9 条 P2** 全部处置：反熵 grep 断言限域 + 4 语言 i18n 文案、三个新模块的**特性门控**、`ConfigData` 上 wire 的 **serde 决策**（`skip, default` + hydrate 重建）、core 套件计数（13→14）、用例编号（无 C15、无 T24）、C6 的确定性构造 + `checked` 断言 + T16 进阻塞项、T5/T9 补 Verification 块、admin UI 只能展示路径 |
