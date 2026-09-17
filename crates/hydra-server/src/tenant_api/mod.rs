@@ -340,21 +340,6 @@ pub async fn dispatch(
     };
     crate::admin::metrics::record_tenant_api_auth_latency(gate_started.elapsed());
 
-    // 2c. The per-tenant SUCCESS budget. Counted after the token is verified, so
-    //     an unauthenticated caller can never spend a tenant's budget.
-    match state.tenant_api_limiter.check_success(
-        &authenticated.tenant.id,
-        state.tenant_api.rate_limit_per_min,
-        fail_window,
-        now,
-    ) {
-        Ok(()) => {}
-        Err(r) => {
-            crate::admin::metrics::record_tenant_api_throttled(r.scope);
-            return respond_throttled(session, ctx, r).await;
-        }
-    }
-
     // 3. The URL's tenant id is a cross-check, not an identity: the token already
     //    said who the caller is, and a mismatch is a client-side bug worth
     //    failing loudly (403, not 404 — the tenant id is in the caller's own base
@@ -369,6 +354,28 @@ pub async fn dispatch(
             "the token does not belong to the tenant in the URL",
         )
         .await;
+    }
+
+    // 3b. The per-tenant SUCCESS budget.
+    //
+    //     Deliberately AFTER both the token check and the URL cross-check: the
+    //     budget meters *authorised work*, and a client whose base URL names the
+    //     wrong tenant (403) is a configuration bug — letting that burn the
+    //     tenant's own quota would mean a buggy client can lock its tenant out of
+    //     its own API. The caller already holds a valid token, so the "unmetered
+    //     403" this leaves open buys an attacker nothing: they could simply use
+    //     their own URL.
+    match state.tenant_api_limiter.check_success(
+        &authenticated.tenant.id,
+        state.tenant_api.rate_limit_per_min,
+        fail_window,
+        now,
+    ) {
+        Ok(()) => {}
+        Err(r) => {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            return respond_throttled(session, ctx, r).await;
+        }
     }
 
     // Attribute the request for logs/metrics. `ctx.selected` stays None, which is

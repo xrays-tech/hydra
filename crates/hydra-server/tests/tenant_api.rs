@@ -1043,3 +1043,39 @@ async fn a_throttled_request_is_counted_and_a_bad_token_is_classified() {
         "the refusal must be attributed to the tenant dimension"
     );
 }
+
+/// The success budget meters AUTHORISED work: a client whose base URL names the
+/// wrong tenant must not be able to burn its own tenant's quota. Otherwise a
+/// single misconfigured client locks its tenant out of its own API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_tenant_in_the_url_does_not_spend_the_success_budget() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        rate_limit_per_min: 2,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+    let c = client();
+
+    // Five rejected cross-checks: t1's token against t2's URL.
+    for _ in 0..5 {
+        let r = send_until_ready(
+            &c,
+            &format!("{root}/tenant/t2/api/v1/whoami"),
+            Some(TENANT_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(r.status().as_u16(), 403, "the cross-check must refuse");
+    }
+
+    // t1's own calls still have their full budget.
+    let url = format!("{root}/tenant/t1/api/v1/whoami");
+    let (s1, _) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    let (s2, _) = body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
+    assert_eq!(s1, 200, "a 403 must not consume the budget");
+    assert_eq!(s2, 200);
+}
