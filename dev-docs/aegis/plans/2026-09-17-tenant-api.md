@@ -1366,9 +1366,23 @@ done
 
 该路在**修改工作树做变异测试**时仍在运行，我因上述事故已将其**中止**，因此它**没有交付报告**。它唯一的产出（`zz_adv_probe.rs` 的 413 断言）已被我人工复核、保留为正式测试并**验证了判别力**（第 8 条）。
 
-**因此本门禁的判定依据是**：① 一路完整的逐条证伪（7/7 已处置）+ ② 我自己按同一清单做的对抗式自查（本轮共查出 4 个真问题：限流器 GC 从未被调用、成功预算被 403 消耗、`client_ip` 带端口致 IP 维度失效、断言弱形态）+ ③ 全部可复跑门禁。**不是**"两路都干净"。
+**因此本门禁的判定依据是**：① 一路完整的逐条证伪（7/7 已处置，且修复本身由我逐条机械复核，证据见上表）+ ② 我自己按同一清单做的对抗式自查（本轮共查出 **5** 个真问题：限流器 GC 从未被调用、成功预算被 403 消耗、`client_ip` 带端口致 IP 维度失效、断言弱形态、两个重复的 fleet 响应类型）+ ③ 全部可复跑门禁（core 187 / 单特性 440 / 三特性 544 / 活 CH 1 / clippy 两种组合 0 / 防火墙 / 脚本 / findings 24-24 / 指标 12-12 / 环境变量 9-9）。**不是**"多路都干净" —— 被中止的那一路没有交付报告，且我没有第三路独立复证的可交付结论。
 
-### 我自己在自查中查出的 4 个真问题（均已修 + 均有测试）
+### 复审修复的机械复核（我自己跑，不等复审）
+
+7 条全部落地，每条都有可复跑证据：
+
+| # | 复核命令 | 结果 |
+|---|---|---|
+| 1 | `grep -n "invalid_wait\|invalid_timeout_ms\|MAX_CONVERGE_MS" crates/hydra-server/src/tenant_api/handlers.rs` | 常量 + 两个 400 分支齐备；另有 3 条端到端测试（`wait=none` 202、拼错 400、越界/非数/负数 400 + 边界 1 通过） |
+| 2 | `grep -rn "fleet_invalidation_unavailable" dev-docs/ crates/` | 仅剩"该码从未存在"的说明性文字，无任何地方再声称它存在 |
+| 3 | `grep -n "state\` 四态" dev-docs/design-tenant-api.md` | 已改为四态并写明"无流归 single_node"的理由 |
+| 4 | `grep -n 'record_tenant_api_throttled("invalidate")\|record_tenant_api_auth_failure("locked"'` | 两个此前不可达的标签现在都有生产者 |
+| 5 | `cargo test … --test tenant_cache` | **4 passed**（计划已改为 4，并注明 3 是中间态） |
+| 6 | `grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` | **2**（两文档已改用这条命令） |
+| 7 | `grep -n 'error_body("payload_too_large"'` | 413 body 经统一构造器，带 `trace_id`；测试注入验证过判别力 |
+
+### 我自己在自查中查出的 5 个真问题（均已修 + 均有测试）
 
 | 问题 | 性质 | 处置 |
 |---|---|---|
@@ -1376,6 +1390,7 @@ done
 | 成功预算在 URL 交叉校验**之前**扣减 ⇒ 客户端配错 URL 的 403 会烧掉**自己租户**的配额 | 与设计"成功限流"的语义不符，且一个配错的客户端可把租户锁在自己的 API 之外 | 移到交叉校验之后，并加测试**双向**钉住（连打 5 次 403 后配额仍完整） |
 | `client_ip` 用了 `session.client_addr().to_string()`，**带端口** ⇒ 每条连接一个桶 ⇒ 源 IP 维度等于失效 | 端到端锁定测试抓到（拿到 200 而不是 429） | 改用 `as_inet().ip()`；并写明**不读 `X-Forwarded-For`**（调用方可控的头不能决定自己的桶），LB 后的共享桶后果写进 `ops.md` |
 | `assert_ne!(v["totals"]["requests"], 0)` 无法区分"没有 totals"与"totals 非零"（缺字段索引出 `Null`，而 `Null != 0` 为真） | 弱断言，与同文件兄弟测试的 `is_null()` 不一致 | 改为 `is_null()`；并注入验证（回退后该测试失败） |
+| **`FleetView`（租户面）与 `Fleet`（管理面）是两个字段完全相同、各自手工映射的结构** | 同一个响应形状有两个 owner；"必须保持一致的两份形状终将不一致"，且映射处有三处可以漏字段 | **收敛为一个类型**：`waited_ms` 移进 `FleetReport`（屏障自己测量"发布+等待"，两个入口的 `waited_ms` 与 `invalidate_converge_seconds` 因此不可能互相矛盾），两个入口**直接序列化同一个 report**；`cluster-redis` 缺席时各自保留一个 cfg 配对的 `single_node` 占位（因类型在 cluster 模块内），两者都注明"同形同名"。删掉 2 个结构、2 处手工映射 |
 
 ## 实施记录（开发期回填）
 
