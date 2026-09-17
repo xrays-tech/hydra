@@ -425,6 +425,13 @@ cargo test -p hydra-server --features server --test loader --test repo --test co
 **Why**：Q14=T1 要求"怎么跟 CH 说话"只有一个 owner；读路径需要真正的响应体读取，而现有写通道把响应体当错误文本丢弃（`sink.rs:801-811`）。
 **Change Necessity**：备选是读侧再写一份 `parse_url`/状态分类 —— 那会让 URL/凭据/协议的解释分叉成两套（设计 §4.3.3 T2 已论证否决）。
 **Impact/Compat**：**这是本次唯一动到正在工作的生产代码的改动**。纪律：本 commit **只做搬迁**，不夹带任何读路径代码；行为与期限**逐行不变**。
+
+**编译级缺口（v5.2 补，已核对 `Cargo.toml`）**：CH 侧全部代码今天受 `#[cfg(feature = "usage-clickhouse")]` 门控（`sink.rs:441-444` 等），而 **`usage-clickhouse` 不被 `server` 隐含**（`crates/hydra-server/Cargo.toml:84` 的 `server = ["db","http-client","proxy","tls-boringssl"]`；CI 的第二个 job 正因如此显式加它，见 `ci.yml:102-108`）。因此：
+
+- `clickhouse.rs` 整体必须 `#[cfg(feature = "usage-clickhouse")]` 门控，`lib.rs` 的 `pub mod clickhouse;` 同门控；
+- **无该特性时 `sink_kind` 永远不可能是 `"clickhouse"`**（`build_sink` 对不可用 kind 直接报错，启动即失败）→ 所以这条 cfg 分支是**编译期问题而不是运行期分支**；
+- `usage_query.rs` 的 `ClickHouseUsageQuery` 与 `main.rs` 的选择逻辑都要有 cfg 分支（无特性时只可能注入 `SqliteUsageQuery`）；
+- 验证矩阵里的 `--features server,cluster-redis,usage-clickhouse` 与 `--features server`（**无** usage-clickhouse）**两种都要编译过**——后者是 T3 最容易漏的门。
 **Risk**：回归网 = 既有 4 条 `clickhouse_sink` 测试（含 1 条 `#[ignore]`），外加本机活实例手工跑那条 ignored。
 
 **Steps**
@@ -452,11 +459,14 @@ $ curl -s --data-binary "SELECT count() FROM usage_record" http://127.0.0.1:8123
 **这条 ignored 用例不是摆设**：它真的往 `hydra-local-clickhouse` 里写了 2 行。所以搬迁的回归网是"3 条纯 JSON 形状测试 + 1 条真实写库"，覆盖面比"只有 3 条"强——复审若质疑回归网是否足够，这就是答案。
 
 同时确认两条特性组合可编译（搬迁前基线）：`--features server,usage-clickhouse --all-targets` ✅、`--features server,cluster-redis,usage-clickhouse --all-targets` ✅、`--features server,cluster-redis --all-targets` ✅（`cargo check` 全绿）。
-2. 新建 `clickhouse.rs`，**逐行**搬运以下四块（不改逻辑）：
-   - `ClickHouseConfig` 与其 URL/凭据解析（原 `sink.rs:446-469`，含 `user:pass@` → Basic 头）；
-   - `url_encode`（原 `sink.rs:899-914`）；
-   - 裸 TCP HTTP 原语（原 `sink.rs:711-797`）：连接、请求行、`Content-Length`、`Connection: close`、connect/IO deadlines。**签名加一个显式 `timeout: Duration` 入参**（写路径传它原来硬编码的值，保证零行为差异；读路径将传 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS`）；
-   - 状态行分类（原 `sink.rs:801-811`）：保留既有 `status_line.contains(" 200 ")` 语义，**并额外**提供 `parse_exception_code(body) -> Option<u32>`（识别 `Code: N. DB::Exception:`，供读侧分类用；写路径暂不使用）。
+2. 新建 `clickhouse.rs`，**逐行**搬运以下四块（不改逻辑）。**下列事实已逐处读过源码，按它们搬运即可**：
+
+   - **`ClickHouseConfig` 与其 URL/凭据解析**（原 `sink.rs:446-469` 定义、`:529-530` 读 env、Basic 头在请求构造处）。它有 **4 个字段**，其中两个是**已经存在的期限**：`connect_timeout`（`HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS`，默认 3000ms）与 `io_timeout`（`HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`，默认 15000ms，用于**每一次** write/flush/read）。**因此不要发明新参数**：原语直接沿用这两个字段（写路径行为逐字不变）；读路径的 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` 在**构造读侧 config 时**填进这两个字段即可（例如 `connect_timeout = min(query_timeout, 3000ms)`、`io_timeout = query_timeout`）——把差异放在 config 构造处，原语本身保持唯一形态。
+   - **`url_encode`**（原 `sink.rs:899-914`）。
+   - **裸 TCP HTTP 原语**（原 `sink.rs:711-797`）：`POST /?<query_params>&query=<url_encode(sql)>`、`Host`、可选 `Authorization: Basic base64(user:pass)`、`Content-Length`、`Connection: close`、connect/IO 期限、**以及一个已有的有界响应读取循环**。
+   - **状态行分类**（原 `sink.rs:801-811`）。
+
+   **一处必须纠正的旧描述**：本计划 v5.1 曾称写通道"把响应体当错误文本丢弃"。读了源码后准确的说法是：**它已经把响应体读进来了**（`resp`，带 `MAX_CLICKHOUSE_RESPONSE = 64 KiB` 上限，`sink.rs:475`，且**不等 EOF** 就停止读取），只是**把这段 body 当作错误文本使用**。所以读路径新增的负担比原先估计的**小**：**读取与限长已存在且被测试覆盖，真正新增的只有 `FORMAT JSONEachRow` 的解码**。原语应返回 `(status_line, body)`，写路径继续把 body 当错误文本，读路径去解码它。
 3. `sink.rs` 改为调用新模块：删掉搬走的实现，保留批量/flush/重试/丢弃计数逻辑不变。
 4. **Verify 零差异**：
 ```bash
@@ -655,7 +665,7 @@ pub trait UsageQuery: Send + Sync {
 }
 ```
    b. `SqliteUsageQuery { pool: SqlitePool }`：查询用**运行时校验的 `sqlx::query`**（与 `sink.rs:383-384` 同风格 ⇒ **不改 `.sqlx/`**）；SQL 见设计 §4.3.1；`as_of` 走 `normalize_as_of`。
-   c. `ClickHouseUsageQuery { cfg: clickhouse::ClickHouseConfig, client_timeout: Duration }`：SQL 见设计 §4.3.1，**必须用 `{t:String}`/`{s:String}`/`{e:String}` + `param_*` 绑定**（实测抗注入），`FORMAT JSONEachRow`；`group_by` 是**白名单**映射到列名（绝不插值）；解码用 core 的 `parse_lenient_u64` 与 `normalize_as_of`（CH-A/CH-B）；错误按 `Code: N` 分类（CH-D）。
+   c. `ClickHouseUsageQuery { cfg: clickhouse::ClickHouseConfig }`：SQL 见设计 §4.3.1，**必须用 `{t:String}`/`{s:String}`/`{e:String}` + `param_*` 绑定**（实测抗注入），`FORMAT JSONEachRow`。**两个 url 编码点都要做**（读源码得到）：① SQL 本身经 `url_encode` 进 `query=`；② **每个 `param_*` 的值同样必须 `url_encode`** —— 它们也在查询串里，而 `tenant_id`/时间戳里出现 `&`、`+`、`%` 会静默改变绑定值（`+` 在查询串里还可能被解成空格）。漏掉 ② 是"绑定了但仍被篡改"的隐蔽缺陷；`group_by` 是**白名单**映射到列名（绝不插值）；解码用 core 的 `parse_lenient_u64` 与 `normalize_as_of`（CH-A/CH-B）；错误按 `Code: N` 分类（CH-D）。
    d. `db.rs`：仅新增 SQLite 聚合查询函数。
    e. `main.rs`：按 `sink_kind` 注入 `Arc<dyn UsageQuery>`；CH 分支复用 `clickhouse.rs` 的解析（与写路径**同一次解析函数**）。
    f. 指标：`hydra_tenant_api_usage_query_total{source,group_by,result}`（含 `decode_error`）与 `hydra_tenant_api_usage_query_seconds{source}`。
