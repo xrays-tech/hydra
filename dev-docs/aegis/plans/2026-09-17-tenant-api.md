@@ -269,7 +269,7 @@ Execution Readiness View:
 | `crates/hydra-server/tests/{terminate_mode,streaming_usage_persistence,tls,anthropic_passthrough,metrics}.rs` | 迁移 **12 处**测试 `AppState` 构造点到 `for_tests()`（`terminate_mode.rs:206-233` 的 helper **内含** `:224`，不重复计） |
 | `dev-docs/design.md` | §13.2 拆分、§11.7 指向新路径、§9.3 补 CH 读 |
 | `dev-docs/ops.md` | §5.1 改路径；新增"租户 API 开通/关闭"、"租户改域名/auth_url 流程"、"CH 用量查询运维"三节 |
-| `admin-ui/app.js`、`admin-ui/api-docs.js` | 租户页展示 base URL 与令牌状态；API 文档拆分 |
+| `admin-ui/app.js`、`admin-ui/api-docs.js` | 租户页展示 **base URL 的路径部分**（`/tenant/{id}/api/v1`）与令牌状态（`has_access_token`）；API 文档拆分租户/运维两页。**P2-9：只能展示路径** —— 租户 API 在**数据面监听器**（8080/8443），而 admin UI 由管理口（8081）提供、管理 API 不暴露数据面主机名，故"完整 base URL"不可知；写成路径才能被 Playwright 稳定断言 |
 | `crates/hydra-server/tests/tenant_cache.rs` | **部分删除（P0-2）**：删掉 5 个打旧路由的测试，保留 3 个测管理 API 令牌生命周期的测试 —— 详见 T9 步骤 0 |
 | `dev-docs/aegis/INDEX.md` | 登记本计划（`kind=plan`） |
 
@@ -408,7 +408,7 @@ fn route_parsing_is_exact_and_rejects_near_misses() {
    1. **铁律 2**：它是纯字符串/JSON 判定，零 I/O，本该在 core 直测；
    2. **它决定"静默 0"陷阱的测试是否会在主门禁里跑**。`clickhouse.rs` 必须被 `#[cfg(feature = "usage-clickhouse")]` 门控（见 T3 的编译级缺口），而 `usage-clickhouse` **不被 `server` 隐含**。若解码器住在 `usage_query.rs`/`clickhouse.rs`，那么 T14a/T14b（引号整数、空串 `as_of`）这两条最危险的负例就**只在次级的三特性矩阵里运行**，而主门禁 `cargo test -p hydra-server --features server` 看不见它们。放进 core 之后，它们在 `cargo test -p hydra-core`（无任何特性、CI 第一个 job）里**总是**运行。
 
-4. **Verify GREEN**：`cargo test -p hydra-core --test tenant_api` → 全绿；`cargo test -p hydra-core` → 15 套件全绿（无回归）。
+4. **Verify GREEN**：`cargo test -p hydra-core --test tenant_api` → 全绿；`cargo test -p hydra-core` → **14 套件**全绿（P2-5 实测：`ls crates/hydra-core/tests/*.rs` 今日为 **13** 个文件，本任务新增 `tenant_api.rs` 后为 14；v5.2 写的"15 套件"是错的）。
 
 5. **Commit**：`feat(core): tenant API pure functions (timestamp form, route parsing, CH-lenient numbers)`
 
@@ -672,7 +672,17 @@ cargo test -p hydra-server --features server
    - **T7 的 E1 部分**：**停用**租户调 E1 → 200（自救路径必须畅通；E2/E3 的部分在 T6/T8 各自覆盖）。
 3. **GREEN**：**先把 `dispatch` 里 `Endpoint::Whoami` 的 404 分支替换为真实调用**（这是本任务红灯能变红的必要动作），再实现 `handlers::whoami(state) -> Resp`，返回 `{tenant_id,name,enabled,domain,auth_url,config_version,base_url}`；`config_version` 用 `store.version()`（`store.rs:381-385`）；`base_url = format!("/tenant/{tid}/api/v1")`。
 4. **Verify GREEN**。
-5. **Commit**：`feat(server): tenant API E1 GET /whoami (snapshot-only)`
+5. **Verify GREEN**：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
+cargo test -p hydra-server --features server --test tenant_api                        # E1 全部用例
+cargo test -p hydra-server --features server,cluster-redis --test tenant_api_cluster  # C12
+cargo test -p hydra-server --features server                                          # 无回归
+```
+
+6. **Commit**：`feat(server): tenant API E1 GET /whoami (snapshot-only)`
 
 ### T6 — E2 `POST /auth/cache/invalidate` + 收敛屏障（L1 扇出 + L2 权威 + L3 确认）
 
@@ -683,7 +693,7 @@ cargo test -p hydra-server --features server
 
 **Steps**
 1. **红灯**（`tests/tenant_api.rs`）：T11（精确 key → `invalidated>=1`，随后同 key 请求**必须回源**，wiremock 断言 `auth_url` 被再次调用）、T12（空 body → `scope:"tenant"`）、T13（1001 key → 400 `too_many_keys`；单个 4097 字节 → 400 `invalid_api_key`）、T21（失败限流 → 429）、**C3（单节点 `all` → `state:"single_node"`）**。
-   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、**C2（P1-5 修订：原"C2 = 集群成员但无 Redis 后端"**运行期不可构造**——leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动（`main.rs:196-201`）。改为：**有失效流但发布失败** —— 用指向**已关闭端口**的 Redis 构造流 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）**、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
+   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、**C2（P1-5 修订：原"C2 = 集群成员但无 Redis 后端"**运行期不可构造**——leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动（`main.rs:196-201`）。改为：**有失效流但发布失败** —— 用指向**已关闭端口**的 Redis 构造流 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）**、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例；P2-7 修订：必须确定性构造）** —— "杀掉运行中的消费者、卡在 apply 与 ack 之间"**没有确定性路径**（禁止 `#[cfg(test)]` 缝子，也禁止 mock Redis）。改为**直接测批处理步骤**：把该批的"apply 后 ack"提成 `pub(crate) fn apply_batch_then_ack(cache, events, node_id)`（`events.rs:431-478` 已有"直接测 `apply_invalidation`"的既有先例），断言 **apply 失败时不得 HSET**；反向：apply 成功时水位必须 HSET 到该批最大事件 ID。、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
 2. **Verify RED** → 失败（`fleet` 字段不存在 / 水位不存在）。
 3. **GREEN**：
    a. **先钉住 cfg 形状**（已实测核对）：`cluster::events` 与 `cluster::registry` 都是 `#[cfg(feature = "cluster-redis")]` 门控的（`cluster/mod.rs:23-24`、`:27-28`），因此 `InvalidationStream` 在无该特性时**根本不存在**。于是：
@@ -793,6 +803,7 @@ cargo test -p hydra-server --features server,cluster-redis
 
      T14 于是断言：`select("sqlite", Some(pool), None)` → `source()=="sqlite"`；`select("clickhouse", None, Some(cfg))` → `source()=="clickhouse"`（需 `--features usage-clickhouse`）；`select("sqlite", None, None)` → `Err`；`select("nonsense", ..)` → `Err`。**"返回假 0"的唯一守卫因此变成一条可运行的库单测**，而不是一段测不到的 `main.rs` 分支。
      **T8 的测试命令必须带 `--features server,usage-clickhouse`**，否则 CH 那一半连编译都进不去（v5.2 的命令漏了这点）。
+   - **T16 也属阻塞项**（P2-7）：它是设计 §4.3.2 第 2 条"多算一整天"陷阱的回归锚点，级别与 T14a/T14b 相同，必须与它们一起在 T8 的红灯清单里作为**阻塞**存在。
    - **T14a/T14b（端到端复验）**：用**假 CH 传输**（一个返回固定 `JSONEachRow` 字节的替身——它是**真实外部边界**，符合铁律 2 允许的 wiremock/进程级替身范畴）喂 `{"requests":"8"}` → 端点返回 8；喂 `{"requests":"abc"}` → **拒绝**（`decode_error`，**不是 0**）；喂 `last_seen:""` → `as_of: null`。纯函数层的等价断言在 T1，这里验的是"解码器确实被接上了"；
    - **T14c**：HTTP 404 + `Code: 60. DB::Exception: …` → `usage_store_unavailable`；
    - **T15/T16/T17**：SQLite 时间窗与手写 SQL 对照（含 NULL 语义与 `errors`）；`since` 传空格分隔形态 → 归一化后正确，且**对照"若不归一化会多算整天"的反例**；窗口超上限 / `since > until` → 400；
@@ -907,7 +918,20 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 5. 文档：`design.md` §13.2 端点表拆分（租户端点移出「管理 Web API」）、新增「租户自助 API（数据面）」节、§11.7 表格指向新路径、§9.3 补 CH 读；`ops.md` §5.1 改路径 + 新增三节（租户 API 开通/关闭、**租户改域名/auth_url 的运维流程**、**CH 用量查询运维**：`requests` 为近似值的成因、宽窗口代价、`ORDER BY` 建议）。
 5. 前端：`app.js` 租户页展示 base URL 与令牌状态；`api-docs.js` 拆分为"租户 API / 运维 API"两页。
 6. **Playwright（强制）**：见 T10。
-7. **Commit**：`refactor(admin,docs,ui)!: delete the admin-plane tenant route; document the data-plane tenant API`
+7. **Verify + Commit**：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
+cargo test -p hydra-server --features server                       # 主门禁：删路由后必须仍全绿（P0-2 的验收形式）
+cargo test -p hydra-server --features server --test tenant_cache   # 3 passed / 0 failed
+cargo test -p hydra-server --features server --test tenant_api     # C16 双凭证断言
+rg -n "tenant_id_for_token" crates/                                # 期望为空
+node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs
+npx playwright test --config=playwright.config.cjs                 # 浏览器腿
+```
+
+8. **Commit**：`refactor(admin,docs,ui)!: delete the admin-plane tenant route; document the data-plane tenant API`
 
 ### T10 — 门禁 + 验收证据回填
 
@@ -965,6 +989,8 @@ rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' \
 ---
 
 ## 设计用例覆盖矩阵（44/44，可审计）
+
+> **编号说明（P2-6）**：设计 §10.3 的编号**跳过 C15**（实际是 C1–C14、C13a、C16–C18，共 **17** 行），§10.2 是 T1–T23 加 T14a/b/c（共 **26** 行）。本文因此不再笼统写"集群 18 条 / 数据面 23 条"，而按实测行数表述；**单节点的用例编号是 C3**（v5.2 一度写作"T24"，设计里不存在该编号，已改正）。
 
 > 本表是"设计 §10 的每一条用例都被某个任务的红灯覆盖"的证据。**生成方式**：从设计 §10.2/§10.3 的表格里机械抽取用例 ID，再逐个回到本计划的任务红灯段落里匹配。第一轮机械检查曾发现 **13 条未被覆盖**（`T8 T9 T23 C3 C5 C11 C12 C13 C13a C14 C16 C17 C18`），其中 **C5（远端消费者停摆 → 202+lagging）是收敛屏障最核心的负例**；已全部补入对应任务。复核命令：
 
@@ -1039,6 +1065,7 @@ PY
 | `hydra_tenant_api_requests_total` | T4 | `dispatch` 出口 |
 | `hydra_tenant_api_auth_failures_total` | T4 | 闸门失败点 |
 | `hydra_tenant_api_auth_latency_seconds` | T4 | 包住令牌校验 |
+| **响应字段 `checked`** | T6 | 断言它与 `invalidated` **并列返回**（P2-7：v5.2 只把它写进契约示例，**没有任何测试断言它存在** —— "契约里有、测试里没有"的字段） |
 | `hydra_tenant_api_throttled_total` | T6 | 限流器 |
 | `hydra_tenant_api_invalidate_pending_total` | T6 | E2 返回 202 的分支 |
 | `hydra_tenant_api_invalidate_converge_seconds` | T6 | `await_applied` 返回后 |
@@ -1102,7 +1129,7 @@ PY
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings` | ✅ OK |
-| `cargo test -p hydra-core` | ✅ OK（15 套件全绿） |
+| `cargo test -p hydra-core` | ✅ OK（**13 个测试文件**全绿；T1 之后为 14） |
 | `cargo tree -p hydra-core --no-default-features` | ✅ OK（依赖防火墙仍成立） |
 | `cargo test -p hydra-server --features server` | ✅ OK |
 
