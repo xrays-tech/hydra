@@ -1221,3 +1221,72 @@ async fn an_out_of_range_timeout_ms_is_rejected() {
     let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "timeout_ms=1").await;
     assert_eq!(status, 200, "the boundary value 1 must be accepted: {v}");
 }
+
+/// A SUSPENDED tenant (欠费停机) must still be able to run its own recovery: read
+/// its state, force a re-authentication after a top-up, and check what it has
+/// used. The gate never consults `enabled` — suspension is the tenant's own
+/// policy, expressed through its `auth_url`, and a tenant that cannot reach the
+/// recovery path cannot recover.
+///
+/// E1 alone was covered; this pins all three, because the contract document for
+/// tenants states all three and a document is only as good as its test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let mut t = hydra_server::db::get_tenant(&pool, "t1")
+        .await
+        .expect("get");
+    t.enabled = false;
+    hydra_server::db::update_tenant(&pool, &t)
+        .await
+        .expect("disable");
+    // A cached allow, so E2 has something real to clear.
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    state
+        .auth
+        .cache()
+        .set("t1", "sk-cached", true, Duration::from_secs(300))
+        .await;
+    let root = start_proxy(state);
+    let c = client();
+
+    let _ = &c;
+    let (s1, v1) = get_tenant_json(&root, "t1", TENANT_TOKEN, "whoami").await;
+    assert_eq!(s1, 200);
+    assert_eq!(v1["enabled"], false, "suspended, and it can see that: {v1}");
+
+    let (s2, v2) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
+    assert_eq!(
+        s2, 200,
+        "a suspended tenant must be able to force re-auth: {v2}"
+    );
+    assert!(
+        v2["invalidated"].as_u64().unwrap_or(0) >= 1,
+        "the cached allow must actually be gone: {v2}"
+    );
+
+    let (s3, v3) = get_tenant_json(
+        &root,
+        "t1",
+        TENANT_TOKEN,
+        "usage?since=2026-09-01T00:00:00Z&until=2026-09-02T00:00:00Z",
+    )
+    .await;
+    assert_eq!(s3, 200, "and must be able to read its own usage: {v3}");
+    assert_eq!(v3["source"], "sqlite", "{v3}");
+}
+
+/// A raw GET against a tenant path, for the cases that need a URL the
+/// convenience helpers do not build (a query string, a suspended tenant).
+async fn get_tenant_json(root: &str, tenant: &str, token: &str, suffix: &str) -> (u16, Value) {
+    let c = client();
+    let url = format!("{root}/tenant/{tenant}/api/v1/{suffix}");
+    for _ in 0..60 {
+        match c.get(&url).bearer_auth(token).send().await {
+            Ok(r) => return body_json(r).await,
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    panic!("proxy never became ready at {url}");
+}
