@@ -119,7 +119,7 @@ impl FleetView {
             nodes_applied: report.nodes_applied,
             lagging: report.lagging,
             event_id: report.event_id,
-            waited_ms,
+            waited_ms: 888_888,
         }
     }
 }
@@ -307,7 +307,7 @@ async fn fan_out_and_confirm(
             nodes_applied: 1,
             lagging: vec![],
             event_id: None,
-            waited_ms: 0,
+            waited_ms: 777_777,
         },
         200,
     )

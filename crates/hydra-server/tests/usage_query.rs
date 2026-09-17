@@ -1036,9 +1036,13 @@ async fn clickhouse_an_unreachable_store_is_503_not_a_fake_zero() {
     .await;
     assert_eq!(status, 503, "unreachable store must not produce a 200: {v}");
     assert_eq!(v["error"]["code"], "usage_store_unavailable", "{v}");
-    assert_ne!(
-        v["totals"]["requests"], 0,
-        "no zeroed totals on failure: {v}"
+    // `is_null()` and NOT `assert_ne!(v["totals"]["requests"], 0)`: indexing a
+    // missing field yields `Null`, and `Null != 0` is true — the weaker form
+    // passes whether the body carries a zeroed totals object or no totals at
+    // all, so it cannot fail for the reason it claims to test.
+    assert!(
+        v["totals"].is_null(),
+        "a failed read must not carry a zeroed totals object: {v}"
     );
 }
 

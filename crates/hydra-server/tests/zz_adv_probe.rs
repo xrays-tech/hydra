@@ -147,7 +147,10 @@ async fn probe_oversized_body_envelope() {
     println!("PROBE1 status={status}");
     println!("PROBE1 header_trace={hdr_trace:?}");
     println!("PROBE1 body={text}");
-    println!("PROBE1 body_has_trace={}", v["error"]["trace_id"].is_string());
+    println!(
+        "PROBE1 body_has_trace={}",
+        v["error"]["trace_id"].is_string()
+    );
     assert_eq!(status, 413, "expected the body cap to fire: {text}");
     assert!(
         v["error"]["trace_id"].is_string(),
