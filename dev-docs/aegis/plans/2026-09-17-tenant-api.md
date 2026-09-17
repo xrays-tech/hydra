@@ -1263,6 +1263,24 @@ Execution Route:
 >
 > 另记一条**门禁教训**：`clickhouse.rs` 被 `usage-clickhouse` 门控，因此 `clippy --features server` **根本看不到它**；`while_let_loop` 只在**三特性 clippy** 下报出。矩阵不是形式主义。
 
+### T9 — 删除旧路由 + 管理面 `fleet` 报告 + 文档 + 前端（本提交）
+
+| 项 | 结果 |
+|---|---|
+| **步骤 0（先做，P0-2）** | `tests/tenant_cache.rs` 是旧路由在仓库里**唯一真正的调用方**，且跑在**主 CI job**。按计划先删 5 条旧路由测试 + `invalidate()` 辅助函数、改写模块文档：**8 → 3 条**（与计划预测一致），此时旧路由仍在、主门禁仍绿 |
+| **C16 双凭证断言（先红后绿）** | 删除**前**实测：租户令牌打旧路径 → **200** + `{"invalidated":0,"tenant_id":"t-gone","published":true}`（**`published: true` 是谎报**，D3 的现场）；管理令牌 → 404。删除**后**：租户令牌 → **401**（落到 admin 闸门），管理令牌 → **404**。测试**同时断言两条**并写明：只有"租户令牌 200→401"是证伪信号，"404"两边相同、单独断言就是永远测不出东西的测试 |
+| 删除 | `admin/mod.rs` 的租户令牌路由整块（2372 字符）；`handlers.rs` 的 `tenant_id_for_token` + `tenant_auth_cache_invalidate` + `TenantCacheInvalidateRequest`（92 行）。**保留**了 `invalidate_shape_error` / `MAX_INVALIDATION_KEYS` / `MAX_API_KEY_LEN`（数据面复用），并显式核对未被误删 |
+| **管理面响应改 `fleet` 三态** | `published: bool` **删除**。它初值 `true`、仅当"有失效流且发布失败"才为 `false` ⇒ **没有失效流时它会断言一次并未发生的广播**。改为与租户面**同一个** `cluster::events::broadcast_and_confirm` 产出的 `FleetReport`，状态码因此也有 200/202/503 三态。实测响应：`{"invalidated":0,"checked":0,"tenant_id":"t-e2e","scope":"tenant","fleet":{"state":"single_node","nodes_total":1,"nodes_applied":1,"lagging":[],"event_id":null,"waited_ms":0}}` |
+| `AdminState` 的注入方式 | 新增 `live_nodes` + `converge_timeout`，**用 builder（`with_fleet`）而不是给 `new` 加参数**：该构造函数有 **14 个调用点**（与本计划 P1-6 对 `AuthCache` 的判定同一理由）。`main` 把**同一个**存活节点视图同时给租户面与管理面——两份视图会对"舰队是谁"给出不同答案，而屏障的全部意义就是两个调用方拿到同一个答案 |
+| 前端 | `api-docs.js`：删除旧租户条目 + 管理端条目补 `fleet` 三态与新错误码；`app.js`：`published` 布尔改为展示 `fleet` 状态（`applied`/`single_node` 成功样式，`pending`/`unavailable` 错误样式 + 落后节点列表）；`i18n.js`：**4 种语言**各 5 条新文案，并**删除 4 条已失效的 `apidocs.summary.POST.api.v1.tenants…` key**；`tip.blankKeep` 的示例路径改为数据面 |
+| 一处"检查器看不见的 key" | 我最初用模板字符串 `t(\`common.token.fleet.${state}\`)` 拼 key —— `scripts/check_i18n.js` **看不到**运行时拼出的 key，于是报了 5 个 `DEAD-EN-KEY`。改为**显式映射表**（`FLEET_KEYS`）：既是检查器可见的，也避免"某个 key 在另外三种语言里缺失而无人发现" |
+| 文档 | `design.md` §13.2（管理端响应 + 租户自助段整体改写为数据面三端点）、§11.7 表格、§9.3/§1500 附近的列表；`ops.md` §1.1 补 **6 个新环境变量**、§5 响应体更新、**§5.1 重写为数据面自述**、**新增 §5.2（残余窗口上界）/ §5.3（两种用量口径及其各自漏算）/ §5.4（E3 排障表）** |
+| **Playwright（T10 的一部分，本提交一并取得）** | 用 release 二进制 + 真 SQLite + `tests/e2e/seed.sh` 起真服务，**15/15 通过**，含 **T2.4 auth-cache invalidate** —— 它真实走到改写后的 `app.js` 与新的 `fleet` 响应体（原断言 `toContainText(/Invalidated 0/)` 仍成立，因为失效条数文案未变） |
+| 手工验收证据（活实例） | `DELETE /api/v1/auth/cache` 返回上面的 `fleet` 体；旧路径 **管理令牌 → 404 / 租户令牌 → 401**；`git status` 无残留（Playwright 装到工作区后被清理，未污染仓库根） |
+| 门禁 | fmt clean；`clippy --workspace --all-targets` **两种组合** clean；`-p hydra-core` 16 target；`--features server` **全绿**；三特性矩阵 **全绿**；`check_i18n.js` `OK (338 en keys, 4 locales, code↔en consistent)`；`check_i18n.test.cjs` 通过；`ask_llm.test.sh` 通过；依赖防火墙按 CI 原样命令通过 |
+
+> **留档的操作事实**：本地 `8080/8081` 已被开发实例占用，e2e 必须换端口（`HYDRA_LISTEN=127.0.0.1:18080 HYDRA_ADMIN_ADDR=127.0.0.1:18081`）；Playwright 浏览器缓存目录默认在 `~/.cache`（只读）→ 需 `PLAYWRIGHT_BROWSERS_PATH` 指到工作区内。
+
 ## 实施记录（开发期回填）
 
 ### T4 — 骨架 + 数据面前缀拦截 + 令牌闸门（`d7f289b`）
