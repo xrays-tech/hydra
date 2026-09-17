@@ -48,6 +48,7 @@ pub mod time_bound;
 use hydra_core::tenant_api::{parse_route, Endpoint};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
+use std::time::Duration;
 use tracing::debug;
 
 use crate::proxy::ctx::RequestContext;
@@ -268,6 +269,11 @@ pub async fn dispatch(
         .locked(&ip, presented_digest.as_deref(), now)
     {
         crate::admin::metrics::record_tenant_api_throttled(r.scope);
+        // Also classified as an auth failure with reason `locked`: `throttled`
+        // answers "what was refused", `auth_failures{reason}` answers "why the
+        // gate never ran". The second is what an operator graphs to see a
+        // guesser being locked out, and without it that label could never occur.
+        crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
         return respond_throttled(session, ctx, r).await;
     }
 

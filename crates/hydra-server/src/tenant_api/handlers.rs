@@ -76,6 +76,10 @@ pub async fn whoami(
 // E2 — POST /auth/cache/invalidate
 // ---------------------------------------------------------------------------
 
+/// Ceiling on a per-request `timeout_ms`. Above this one caller could hold a
+/// worker (and a share of the shared Redis) for as long as it liked.
+const MAX_CONVERGE_MS: u64 = 60_000;
+
 /// The body of `POST /auth/cache/invalidate`.
 #[derive(serde::Deserialize)]
 struct InvalidateRequest {
@@ -199,6 +203,59 @@ pub async fn invalidate(
         return super::respond_raw(session, ctx, status, body).await;
     }
 
+    // --- how long to wait for the fleet -------------------------------------
+    //
+    // `wait=converged` (default) blocks until every live node has applied the
+    // event; `wait=none` publishes and answers `202` immediately with the
+    // `event_id` for later reconciliation. `timeout_ms` overrides the startup
+    // budget for this one request.
+    //
+    // Both are validated rather than ignored: a misspelt value that silently
+    // behaved like the default would leave a caller believing it had asked for
+    // (or skipped) a wait it never got.
+    let params = super::time_bound::query_params(session.req_header().uri.query().unwrap_or(""));
+    let param = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let wait_for_fleet = match param("wait") {
+        None | Some("converged") => true,
+        Some("none") => false,
+        Some(other) => {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_wait",
+                &format!("`wait` must be `converged` or `none`, not {other:?}"),
+            )
+            .await
+        }
+    };
+    let budget = match param("timeout_ms") {
+        None => Some(state.tenant_api.converge_timeout),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            // Clamped at both ends: 0 would mean "do not wait" while claiming to
+            // wait, and an unbounded value would let one caller hold a worker
+            // for as long as it likes on a shared Redis.
+            Ok(ms) if (1..=MAX_CONVERGE_MS).contains(&ms) => {
+                Some(std::time::Duration::from_millis(ms))
+            }
+            _ => {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    400,
+                    "invalid_timeout_ms",
+                    &format!("`timeout_ms` must be an integer between 1 and {MAX_CONVERGE_MS}"),
+                )
+                .await
+            }
+        },
+    };
+
     // --- rate limit ---------------------------------------------------------
     let key = format!("invalidate:{tenant_id}");
     let now = std::time::Instant::now();
@@ -207,6 +264,7 @@ pub async fn invalidate(
         .tenant_api_throttle
         .allow(&key, state.tenant_api.invalidate_per_min, window, now)
     {
+        crate::admin::metrics::record_tenant_api_throttled("invalidate");
         let retry = state
             .tenant_api_throttle
             .retry_after_secs(&key, window, now)
@@ -235,7 +293,8 @@ pub async fn invalidate(
 
     // --- 3: fan out, then CONFIRM ------------------------------------------
     let started = std::time::Instant::now();
-    let (fleet, status) = fan_out_and_confirm(state, &tenant_id, &keys).await;
+    let (fleet, status) =
+        fan_out_and_confirm(state, &tenant_id, &keys, wait_for_fleet, budget).await;
 
     let view = InvalidateView {
         invalidated,
@@ -265,6 +324,8 @@ async fn fan_out_and_confirm(
     state: &AppState,
     tenant_id: &str,
     keys: &[String],
+    wait_for_fleet: bool,
+    budget: Option<std::time::Duration>,
 ) -> (FleetView, u16) {
     let live = state
         .tenant_api
@@ -277,7 +338,7 @@ async fn fan_out_and_confirm(
         Some(tenant_id.to_string()),
         keys.to_vec(),
         live,
-        state.tenant_api.converge_timeout,
+        if wait_for_fleet { budget } else { None },
     )
     .await;
     let status = report.http_status;
@@ -299,6 +360,8 @@ async fn fan_out_and_confirm(
     _state: &AppState,
     _tenant_id: &str,
     _keys: &[String],
+    _wait_for_fleet: bool,
+    _budget: Option<std::time::Duration>,
 ) -> (FleetView, u16) {
     (
         FleetView {

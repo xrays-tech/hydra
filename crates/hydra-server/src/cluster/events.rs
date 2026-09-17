@@ -170,7 +170,11 @@ pub async fn broadcast_and_confirm(
     tenant_id: Option<String>,
     api_keys: Vec<String>,
     live_nodes: Vec<String>,
-    timeout: std::time::Duration,
+    // `None` = publish and do NOT wait (`wait=none`): the caller gets `202` with
+    // the `event_id` to reconcile against later. Distinct from a zero timeout on
+    // purpose — a zero timeout would report every node as `lagging`, which
+    // asserts that they are behind when the truth is that nobody looked.
+    budget: Option<std::time::Duration>,
 ) -> FleetReport {
     let Some(stream) = stream else {
         return FleetReport::single_node();
@@ -188,6 +192,16 @@ pub async fn broadcast_and_confirm(
                 http_status: 503,
             };
         }
+    };
+    let Some(timeout) = budget else {
+        return FleetReport {
+            state: "pending",
+            nodes_total: live_nodes.len(),
+            nodes_applied: 0,
+            lagging: live_nodes,
+            event_id: Some(event_id),
+            http_status: 202,
+        };
     };
     match stream.await_applied(&event_id, &live_nodes, timeout).await {
         AppliedOutcome::Applied {

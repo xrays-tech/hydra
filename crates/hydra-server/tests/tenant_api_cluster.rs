@@ -260,3 +260,46 @@ async fn a_published_invalidation_carries_digests_not_plaintext() {
         inv.legacy_keys
     );
 }
+
+/// `wait=none` must PUBLISH and return `202` immediately, with an `event_id` for
+/// later reconciliation — not block, and not report the fleet as lagging.
+///
+/// The distinction is the reason `budget` is an `Option` and not a zero timeout:
+/// a zero timeout would make every node look behind, which asserts something
+/// about nodes nobody looked at.
+#[tokio::test]
+async fn wait_none_publishes_and_reports_pending_without_looking_at_the_fleet() {
+    let pool = common::real_redis_pool(56).await;
+    let stream = InvalidationStream::new(pool.clone());
+    let live = vec!["node-a".to_string(), "node-b".to_string()];
+
+    let started = std::time::Instant::now();
+    let report = hydra_server::cluster::events::broadcast_and_confirm(
+        Some(&stream),
+        Some("t1".to_string()),
+        vec!["sk-a".to_string()],
+        live.clone(),
+        None,
+    )
+    .await;
+
+    assert_eq!(report.state, "pending");
+    assert_eq!(
+        report.http_status, 202,
+        "the caller was told it is in flight"
+    );
+    assert!(
+        report.event_id.is_some(),
+        "an event id is the whole point: the caller reconciles against it later"
+    );
+    assert_eq!(report.nodes_applied, 0);
+    assert_eq!(
+        report.lagging, live,
+        "nobody was checked, so nobody confirmed"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "must not wait: took {:?}",
+        started.elapsed()
+    );
+}

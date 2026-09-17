@@ -287,7 +287,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
   "tenant_id": "t_abc",
   "scope": "keys",           // keys | tenant
   "fleet": {
-    "state": "applied",      // applied | pending | single_node
+    "state": "applied",      // applied | pending | single_node | unavailable
     "nodes_total": 5,        // 注册表中的**存活**数据面节点数
     "nodes_applied": 5,
     "lagging": [],           // 尚未确认的 node_id（state=pending 时非空）
@@ -301,7 +301,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
                         "lagging":["edge-3"], "waited_ms":2000 } }
 
 → 200  （单节点部署：本地即全部）      "fleet": {"state":"single_node","nodes_total":1,"nodes_applied":1}
-→ 503 fleet_invalidation_unavailable 集群成员但失效通道不可用（today 会静默报 true —— D3）
+→ 503 + fleet.state = "unavailable"  失效通道不可用（今天会静默报 true —— D3）。**注意：没有独立的 error.code**——响应体仍是正常的 InvalidateView，失败由 fleet.state 表达（实现即如此；早期草稿写的 `fleet_invalidation_unavailable` 这个码从未存在）
 → 400 too_many_keys                  超过 1000 个
 → 400 invalid_api_key                单个 key 超 4096 字节
 → 429 rate_limited                   见 §5.1
@@ -359,7 +359,7 @@ POST /tenant/{tid}/api/v1/auth/cache/invalidate?wait=converged&timeout_ms=2000
 
 1. **调用顺序：先封禁，后失效。** 失效只删除缓存项；下一次请求会**立即回源**（`http.rs:537-547` → `:559-566`）。若租户尚未在自己的 auth 服务里封禁该 key，回源返回 allow 并**重新缓存**——等于"越清越糟"。正确顺序：**租户侧封禁 → 调 E2 → 确认 `state: applied`**。
 2. **`invalidated: 0` 不等于失败**：它只统计**本节点 L1 命中数**（`http.rs:250-259`）；目标 key 可能只在 L2、只在别的节点的 L1、或从未被缓存——这些情况下"下次请求本来就会回源"。并列返回 `checked`（D4）。
-3. **`state` 三态取代会说谎的 `published`**（D3）：`applied`（全部存活节点已确认）/ `pending`（超时未收敛，`lagging` 列出未确认节点）/ `single_node`（本节点即全部数据面）。**集群成员但无失效通道 → 直接 503**，不再返回一个永远为真的布尔。
+3. **`state` 四态取代会说谎的 `published`**（D3）：`applied`（全部存活节点已确认，200）/ `pending`（超时未收敛，202，`lagging` 列出未确认节点）/ `single_node`（本节点即全部数据面，200）/ **`unavailable`（通道存在但发布或水位读取失败，503）**。**"无失效流"归 `single_node` 而不是 503**：`main` 只在没有 Redis 主干时把流留成 `None`，而 leader/edge 缺它**拒绝启动**，所以"无流"只可能是单节点 `all` 角色；"集群成员但无通道"在运行期不可构造（早期的 C2 措辞已按此修订，见 §10.3）。
 4. **覆盖范围 = 本集群**（已确认部署形态：**单一集群，半年内无多集群/多地域计划**）。一次 E2 覆盖**共享同一失效主干（同一个 Redis）**的全部数据面节点；`nodes_total`/`nodes_applied`/`lagging` 三个字段共同回答"清干净没有、还差谁"。
 
    > 因此 **v5 删除了 `HYDRA_CLUSTER_ID` 与 `fleet.cluster` 字段**：只有一个集群时，"刚才清的是哪一片"没有可回答的对象，留下就是一个永远为空的字段（反熵：不为假想需求保留机制）。
@@ -844,14 +844,14 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 
 | 指标 | 类型 | 标签 | 说明 |
 |---|---|---|---|
-| `hydra_tenant_api_requests_total` | counter | `endpoint`(whoami/invalidate/usage), `status` | 入口流量与结果分布 |
-| `hydra_tenant_api_auth_failures_total` | counter | `reason`(missing/unknown/mismatch/tenant_gone/locked) | 令牌失败分类（**不含**令牌本身） |
-| `hydra_tenant_api_throttled_total` | counter | `scope`(ip/token/tenant/invalidate) | 限流触发 |
-| `hydra_tenant_api_usage_query_total` | counter | `source`(sqlite/clickhouse), `group_by`, `result`(ok/too_large/store_unavailable/decode_error) | **`decode_error` 专指 CH 响应解析失败**——它是"整数被引号包裹"那类陷阱的唯一外部信号，否则表现为静默 0 |
+| `hydra_tenant_api_requests_total` | counter | `endpoint`(whoami/invalidate/usage/**unrouted**), `status` | 入口流量与结果分布。`unrouted` = 保留前缀下不是三条路由的路径（404 在路由解析**之前**返回，因此归属只能是它）；它正是"租户打错路径"的信号 |
+| `hydra_tenant_api_auth_failures_total` | counter | `reason`(missing/unknown/mismatch/**locked**) | 令牌失败分类（**不含**令牌本身）。被锁定而拒绝时记 `locked`（`throttled` 回答"拒了什么"，这个标签回答"闸门为什么没跑"）。**`tenant_gone` 不可达**：快照里有令牌摘要却没有对应租户行时，实现返回 `not_ready`(503) 而非鉴权失败——那是配置快照换代的中间态，fail-closed 更诚实（见 §3.3），故该值与代码不符已删除 |
+| `hydra_tenant_api_throttled_total` | counter | `scope`(ip/token/tenant/invalidate) | 限流触发。四个值现在都可产生（E2 的每租户失效限流记 `invalidate`） |
+| `hydra_tenant_api_usage_query_total` | counter | `source`(sqlite/clickhouse), `group_by`, `result`(ok/store_unavailable/decode_error) | **`decode_error` 专指 CH 响应解析失败**——它是"整数被引号包裹"那类陷阱的唯一外部信号，否则表现为静默 0。**`too_large` 已删除**：窗口超限在查询之前就返回 400 `window_too_large`，该请求根本不会到达查询，因此这个值不可达 |
 | `hydra_tenant_api_usage_query_seconds` | histogram | `source` | CH 查询延迟；主键以 `created_at` 前导 ⇒ 宽窗口的代价随窗口增长，必须可观测 |
 | `hydra_tenant_api_auth_latency_seconds` | histogram | — | 令牌校验耗时（回归 §3.4 的"零 DB I/O"声明） |
 | `hydra_tenant_api_invalidate_pending_total` | counter | — | E2 返回 202 的次数。**持续 >0 说明集群里有节点清不掉** |
-| `hydra_tenant_api_invalidate_converge_seconds` | histogram | `result`(applied/pending) | 全集群收敛耗时（典型 <100ms；这是"清干净了没有"的量化口径） |
+| `hydra_tenant_api_invalidate_converge_seconds` | histogram | `result`(applied/pending/single_node/unavailable) | 全集群收敛耗时（典型 <100ms；这是"清干净了没有"的量化口径）。`result` 就是 `fleet.state`，因此四态全部可能出现 |
 | `hydra_invalidation_consumer_applied_id` | gauge | `node` | 各节点消费者的已应用事件水位（屏障的数据源） |
 | `hydra_invalidation_consumer_lag_events` | gauge | `node` | 流尾与本节点水位之间的事件数 |
 | `hydra_invalidation_consumer_stalled_seconds` | gauge | `node` | 水位多久没推进。**> 60s 即告警**——今天消费者只是 `warn!` 后重试（`events.rs:336-338`），"活着但不消费"完全不可见 |
@@ -945,7 +945,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | # | 用例 | 期望 |
 |---|---|---|
 | C1 | edge 上的 E2（单集群，1 个数据面节点） | 本节点 L1 清空 + 失效流出现一条 **v=2** 记录，且**断言载荷里只有摘要、无明文 key**（对齐 `tests/admin_api.rs:1550-1645` 的既有流载荷断言） |
-| C2 | 集群成员但**无 Redis 后端** | E2 → **503 `fleet_invalidation_unavailable`**（**不是** `single_node`、**不是**假的 `applied`；D3 的回归） |
+| C2 | **有失效流但通道失败**（原始措辞"集群成员但无 Redis 后端"**运行期不可构造**：leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动 → 已修订） | 用指向**已关闭端口**的 Redis 构造流 → E2 → **503 + `fleet.state:"unavailable"`**（**不是** `single_node`、**不是**假的 `applied`；D3 的回归） |
 | C3 | 单节点 `all` | E2 → `fleet.state = "single_node"`、200（本地清即全部） |
 | C4 | **收敛屏障：两节点 + 消费者都在跑** | 发布后两节点水位均前进；E2 返回 **200** + `state:"applied"` + `nodes_applied == nodes_total` |
 | C5 | **收敛屏障：远端消费者停摆** | E2 在 `timeout_ms` 后返回 **202** + `state:"pending"` + `lagging` **精确列出该节点**；`consumer_stalled_seconds` 上升 |
@@ -1288,7 +1288,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 | 日期 | 版本 | 变更 |
 |---|---|---|
 | 2026-09-17 | v1 | 初稿：现状分析（D1–D10）、三平面模型、数据面保留前缀拦截、快照令牌索引、五个端点（含域名/auth_url 自助设置）、T1/T2 安全论证、集群转发方案（管理口同路径挂载）、待决策 Q1–Q8 |
-| 2026-09-17 | **v5.2** | **第 1 轮 oracle 复审（逐条事实证伪）findings 全部处置**：**[F-1]（FALSE）** `AppState` 构造点计数错误——写作"13 个测试构造点"，实为 **12 处测试**（`terminate_mode.rs:224` **内含于** `:206-233` 的 helper，被重复计了一次）；仓库内 `AppState { .. }` 字面量共 **14** 处 = 1 结构体定义（`proxy.rs:108`）+ 1 生产构造（`main.rs:571`）+ 12 测试。两文档的计数、列举与两条用它做完整性校验的语句全部改正，并加上可执行的计数校验命令（`grep -c "AppState {"` 应为 14）。**[I-1]（IMPRECISE）** `events.rs:291` 是签名收尾行，`last_id` 实际在 `:293` 声明、`:311` 推进——两文档 7 处引用改为 `events.rs:293/311`。**[I-2]（IMPRECISE，**实质上把风险说轻了**）** 失效流裁剪的 generation bump **不是**"仅当丢掉未读条目"：`trim_and_maybe_bump` 用的是 `XTRIM MAXLEN` 的 `removed > 0`（`events.rs:204-213` 的 Lua），**裁剪在原理上无法区分已读/未读** → 只要持续 **>333 事件/秒**（`maxlen=10_000` ÷ 30s 间隔）每个 trim 周期都会让**全部节点清空整个 L1+L2**，**与消费者是否落后无关**。D6 / §5.1 / §6.3 / C7 与附录 A.5 的措辞全部改正，"只裁已读条目就无害"的错误假设已显式否证。另采纳复审的两处精度修正：`hydra-core` 依赖白名单行号 `Cargo.toml:9-16`、以及 §3.2 的步骤列表原把 (2.5) 画在 (3) 之上（代码里 `:396` 先执行并喂给 `:454`）已修正为物理顺序并加注"第 0 步必须早于 `:396`"。其余 27/30 条断言（含 6 条 ClickHouse 事实被复审用 curl **独立复测**、逐字节一致）确认为真 |
+| 2026-09-17 | **v5.2** | **第 1 轮 oracle 复审（逐条事实证伪）findings 全部处置**：**[F-1]（FALSE）** `AppState` 构造点计数错误——写作"13 个测试构造点"，实为 **12 处测试**（`terminate_mode.rs:224` **内含于** `:206-233` 的 helper，被重复计了一次）；仓库内 `AppState { .. }` 字面量共 **14** 处 = 1 结构体定义（`proxy.rs:108`）+ 1 生产构造（`main.rs:571`）+ 12 测试。两文档的计数、列举与两条用它做完整性校验的语句全部改正，并加上可执行的计数校验命令（**唯一有效形态**：`grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" | wc -l` → T4 之后为 **2**；裸 `grep -c "AppState {"` 会数到 `impl AppState {` 给出 3；**14 是改造前的历史值**）。**[I-1]（IMPRECISE）** `events.rs:291` 是签名收尾行，`last_id` 实际在 `:293` 声明、`:311` 推进——两文档 7 处引用改为 `events.rs:293/311`。**[I-2]（IMPRECISE，**实质上把风险说轻了**）** 失效流裁剪的 generation bump **不是**"仅当丢掉未读条目"：`trim_and_maybe_bump` 用的是 `XTRIM MAXLEN` 的 `removed > 0`（`events.rs:204-213` 的 Lua），**裁剪在原理上无法区分已读/未读** → 只要持续 **>333 事件/秒**（`maxlen=10_000` ÷ 30s 间隔）每个 trim 周期都会让**全部节点清空整个 L1+L2**，**与消费者是否落后无关**。D6 / §5.1 / §6.3 / C7 与附录 A.5 的措辞全部改正，"只裁已读条目就无害"的错误假设已显式否证。另采纳复审的两处精度修正：`hydra-core` 依赖白名单行号 `Cargo.toml:9-16`、以及 §3.2 的步骤列表原把 (2.5) 画在 (3) 之上（代码里 `:396` 先执行并喂给 `:454`）已修正为物理顺序并加注"第 0 步必须早于 `:396`"。其余 27/30 条断言（含 6 条 ClickHouse 事实被复审用 curl **独立复测**、逐字节一致）确认为真 |
 | 2026-09-17 | **v5.1** | **修正一处事实错误**：§7.1 原把"RFC3339（带偏移）/ epoch → `%Y-%m-%dT%H:%M:%SZ`"放在 `hydra-core`，但 **`hydra-core` 没有 `chrono`、且依赖白名单不允许引入**（`crates/hydra-core/Cargo.toml:7-11`；`model.rs:299-300` 自述 "no `chrono` in core"）。改为**职责切分**：词法解析与归一化、窗口长度判定放 shell 的 `tenant_api/time_bound.rs`（用 `chrono`）；core 只做规范形态的字形+数值范围校验与顺序比较（纯字符串，零日历运算）。§4.3.2 第 1 条同步注明归一化 owner |
 | 2026-09-17 | **v5** | **Q14 与 Q13 收口**：① **Q14 = T1** → CH 传输下沉为共享模块 `clickhouse.rs`（"怎么跟 CH 说话"的唯一 owner），写路径与读路径共用；§7.1 新增该模块条目，§7.2 `sink.rs` 改为"调用新模块、行为逐行不变"，§10.4 新增**"零行为差异"回归门禁**（把改动拆成"只搬迁"与"新增读路径"两个 commit），§12 相应风险从条件风险改为已选定风险并给出回滚点。② **Q13 = 不会（单一集群）** → **删除 `HYDRA_CLUSTER_ID` 与 `fleet.cluster` 字段**（反熵：只有一片数据面时，"清的是哪一片"没有可回答的对象），E2 的覆盖范围直接定义为"本集群"，并把"引入第二个集群"写成 §4.2.4 与 §6.4 A-1 的**重新评估触发条件**（约束被显式记录，而非遗失）；配置项 10 → 9。§11 待决策表收敛为 **Q1/Q2/Q5–Q11 共 9 项**（全部为工程内部选择或有建议值），已答项 5 项存档于 §11.1。**设计已具备进入实施计划的条件** |
 | 2026-09-17 | **v4** | **三项待决已答，据其收口设计**：① **生产必跑集群、用量走 ClickHouse、首发可用** → CH 读路径从"第二刀"提升为 **v1 必做**：新增 §4.3.3（对仓库自带活实例 ClickHouse 24.3 实测得到 6 条硬事实：**64 位整数默认被序列化成 JSON 字符串**、空集 `MAX(created_at)` 返回 `""`、`{name:String}`+`param_*` 绑定实测抗注入、主键对范围+等值谓词确实裁剪 `Granules: 1/2`、错误响应为 404+`Code: N`、INSERT 重试可产生重复行且 CH 表无 `trace_id` 无法去重）、§4.3.4（**`AppState.usage: Arc<dyn UsageQuery>` 取代 `usage_backend` 枚举**——两个后端都在 v1 后分支已无必要，且分支写错正是"假 0"的成因）、§4.3.1 双后端 SQL（CH 版实测可跑）、新增 `usage_query.rs` 与 `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS`、T14a–T14c 与 C13/C13a 共 5 条新测试、`decode_error` 指标；删除 `501 usage_query_unavailable` 分支。② **尚未上线** → 旧路径 **M1 直接删除**：§8.1 重写（管理面回到单一凭证语义、§3.0 规则 1 去掉唯一豁免、删除 `Deprecation`/`Sunset`/`legacy_route_total`/`published` 兼容字段），新增 C16 断言旧路由 404。③ **allow TTL 默认 300 确认**（§4.2.5）。§11 重构为「待决策 Q1/Q2/Q5–Q11/Q13 + 新增 Q14 CH 传输选型/Q15 CH 排序键」+「§11.1 已答项」；§12 风险表相应重写；**三个端点在全部角色（含集群 edge）上可用，仍然没有任何转发** |

@@ -1138,3 +1138,86 @@ async fn an_oversized_body_is_413_in_the_documented_envelope() {
         "the header and the body must agree on the trace id: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E2's wait / timeout_ms parameters (design §4.2.2, Q10)
+// ---------------------------------------------------------------------------
+
+async fn post_invalidate_query(root: &str, tenant: &str, token: &str, query: &str) -> (u16, Value) {
+    let c = client();
+    let url = format!("{root}/tenant/{tenant}/api/v1/auth/cache/invalidate?{query}");
+    for _ in 0..60 {
+        if let Ok(r) = c
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+        {
+            return body_json(r).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    panic!("proxy never became ready at {url}");
+}
+
+/// `wait=none` is the documented escape hatch: publish and answer `202` with the
+/// `event_id`, without blocking on the fleet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_none_answers_202_without_waiting_for_the_fleet() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=none").await;
+    // No stream in this build ⇒ `single_node`; that is the same answer the
+    // default produces here, which is why this test also pins the 400s below
+    // (the parameters must be PARSED, not merely tolerated).
+    assert_eq!(status, 200, "got {v}");
+    assert_eq!(v["fleet"]["state"], "single_node", "got {v}");
+}
+
+/// A misspelt `wait` must be refused, not silently treated as the default: a
+/// caller that asked to skip the wait and got one (or vice versa) has been lied
+/// to about the only thing these parameters control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_wait_value_is_rejected_rather_than_defaulted() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=eventually").await;
+    assert_eq!(status, 400, "got {v}");
+    assert_eq!(v["error"]["code"], "invalid_wait", "got {v}");
+
+    // The explicit default is accepted.
+    let (status, v) =
+        post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=converged&timeout_ms=1500").await;
+    assert_eq!(status, 200, "got {v}");
+}
+
+/// `timeout_ms` is clamped at both ends: `0` would mean "do not wait" while
+/// claiming to wait, and an unbounded value would let one caller hold a worker
+/// (and a share of the shared Redis) indefinitely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_out_of_range_timeout_ms_is_rejected() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    for bad in ["0", "60001", "abc", "-5"] {
+        let (status, v) =
+            post_invalidate_query(&root, "t1", TENANT_TOKEN, &format!("timeout_ms={bad}")).await;
+        assert_eq!(status, 400, "timeout_ms={bad} got {v}");
+        assert_eq!(
+            v["error"]["code"], "invalid_timeout_ms",
+            "timeout_ms={bad}: {v}"
+        );
+    }
+
+    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "timeout_ms=1").await;
+    assert_eq!(status, 200, "the boundary value 1 must be accepted: {v}");
+}

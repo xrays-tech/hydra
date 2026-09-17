@@ -651,7 +651,7 @@ if self.state.tenant_api.enabled
       **关于"这算不算桩"**：算"骨架"而不是"桩"，区别在于——骨架的每一个分支都返回**当前正确**的行为（这三个路径今天在数据面上本来就是 404），而桩返回的是"假装成功"或占位值。本计划的产物始终没有"假装成功"的分支；且这条区分已写入 §反熵核对供评审复核。T1 的 `parse_route` 仍然**一次写全**三端点（纯匹配器，完备性由 T1 单测钉住），所以 T4 的 404 是"路由已知但未提供"，不是"路由未知"。
 4. **GREEN 补充：入口与闸门指标**（设计 §9.1 的前三个，`admin/metrics.rs`）：
    - `hydra_tenant_api_requests_total{endpoint,status}` —— 在 `dispatch` 出口处记一次（**标签必须低基数**：`endpoint` 是三个枚举值，`status` 是 HTTP 码）；
-   - `hydra_tenant_api_auth_failures_total{reason}` —— `missing|unknown|mismatch|tenant_gone|not_ready`；
+   - `hydra_tenant_api_auth_failures_total{reason}` —— 实现后的可达值是 **`missing|unknown|mismatch|locked`**（`locked` = 被锁定而拒绝，`throttled` 回答"拒了什么"、这个标签回答"闸门为什么没跑"）。**`tenant_gone` 不可达**：快照里有摘要却没有租户行时返回 `not_ready`(503)，那是换代中间态、不是鉴权失败；`not_ready` 也不计失败（否则可让未取到快照的 edge 烧掉调用方自己的失败预算）；
    - `hydra_tenant_api_auth_latency_seconds` —— 包住令牌校验（**这是 §3.4"零 DB I/O"断言的回归锚点**：若有人把闸门改回查库，这个直方图会立刻变粗）。
 
    **禁止**：这些请求不得进入 `hydra_requests_total` / `hydra_tokens_total`（那两个族按 `tenant/provider/model` 打标签且目前**无基数上限**，见设计 §9.3）。
@@ -701,7 +701,7 @@ cargo test -p hydra-server --features server                                    
 
 **Steps**
 1. **红灯**（`tests/tenant_api.rs`）：T11（精确 key → `invalidated>=1`，随后同 key 请求**必须回源**，wiremock 断言 `auth_url` 被再次调用）、T12（空 body → `scope:"tenant"`）、T13（1001 key → 400 `too_many_keys`；单个 4097 字节 → 400 `invalid_api_key`）、T21（失败限流 → 429）、**C3（单节点 `all` → `state:"single_node"`）**。
-   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、**C2（P1-5 修订：原"C2 = 集群成员但无 Redis 后端"**运行期不可构造**——leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动（`main.rs:196-201`）。改为：**有失效流但发布失败** —— 用指向**已关闭端口**的 Redis 构造流 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）**、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例；P2-7 修订：必须确定性构造）** —— "杀掉运行中的消费者、卡在 apply 与 ack 之间"**没有确定性路径**（禁止 `#[cfg(test)]` 缝子，也禁止 mock Redis）。改为**直接测批处理步骤**：把该批的"apply 后 ack"提成 `pub(crate) fn apply_batch_then_ack(cache, events, node_id)`（`events.rs:431-478` 已有"直接测 `apply_invalidation`"的既有先例），断言 **apply 失败时不得 HSET**；反向：apply 成功时水位必须 HSET 到该批最大事件 ID。、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
+   **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、**C2（P1-5 修订：原"C2 = 集群成员但无 Redis 后端"**运行期不可构造**——leader/edge 缺 `HYDRA_REDIS_URL` 会拒绝启动（`main.rs:196-201`）。改为：**有失效流但发布失败** —— 用指向**已关闭端口**的 Redis 构造流 → **503 + `fleet.state:"unavailable"`**（**没有**独立的 `error.code`：响应体仍是正常 InvalidateView，失败由 `fleet.state` 表达——早期草稿的 `fleet_invalidation_unavailable` 这个码从未实现，设计与计划均已改正），不是 `single_node`、不是假 `applied`）**、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C5（远端消费者停摆 → 202 + `state:"pending"` + `lagging` 精确列出该节点，且 `consumer_stalled_seconds` 上升）**、**C6（先 apply 后 ack 的关键负例；P2-7 修订：必须确定性构造）** —— "杀掉运行中的消费者、卡在 apply 与 ack 之间"**没有确定性路径**（禁止 `#[cfg(test)]` 缝子，也禁止 mock Redis）。改为**直接测批处理步骤**：把该批的"apply 后 ack"提成 `pub(crate) fn apply_batch_then_ack(cache, events, node_id)`（`events.rs:431-478` 已有"直接测 `apply_invalidation`"的既有先例），断言 **apply 失败时不得 HSET**；反向：apply 成功时水位必须 HSET 到该批最大事件 ID。、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）、**C17（同一失效事件重复消费幂等，不报错）**。
 2. **Verify RED** → 失败（`fleet` 字段不存在 / 水位不存在）。
 3. **GREEN**：
    a. **先钉住 cfg 形状**（已实测核对）：`cluster::events` 与 `cluster::registry` 都是 `#[cfg(feature = "cluster-redis")]` 门控的（`cluster/mod.rs:23-24`、`:27-28`），因此 `InvalidationStream` 在无该特性时**根本不存在**。于是：
@@ -924,7 +924,7 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
    **辅助函数**：`invalidate()` 助手（`:122-141`，打旧路径）随 5 条测试一起删除；`admin_state()`/`start_admin()`/`create_tenant()`/`client()`/`wait_ready()` **保留**（3 条管理 API 测试与后续管理面测试仍需要）。
    **文件头部模块文档**（`:1-5`）也要改：它现在描述的是"租户令牌路由 + 管理侧令牌生命周期"，应改为只描述后者，并指向新位置（数据面租户 API 的测试在 `tests/tenant_api.rs`／文档在 `design-tenant-api.md`）。
 
-   **验证本步**：`cargo test -p hydra-server --features server --test tenant_cache` → 期望 **3 passed / 0 failed**（删 5 条后）；此时旧路由仍在，主门禁仍绿。
+   **验证本步**：`cargo test -p hydra-server --features server --test tenant_cache` → 期望 **3 passed / 0 failed**（删 5 条后；**3 是步骤 0 的中间态**——步骤 2 加的 C16 双凭证断言会让终态变成 **4 passed**，不要把它当回归）；此时旧路由仍在，主门禁仍绿。
 
 1. 删除 `admin/mod.rs:616-668` 整块（租户令牌路由）；`handlers.rs` 删除 `tenant_id_for_token`；`admin-ui/api-docs.js` 移除旧条目。
 2. **红灯（C16）**：先写断言再删除路由 —— 删除前它会**红**（因为删除前租户令牌返回 200，而断言要求 401）。
@@ -963,7 +963,7 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 cargo fmt --check
 cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
 cargo test -p hydra-server --features server                       # 主门禁：删路由后必须仍全绿（P0-2 的验收形式）
-cargo test -p hydra-server --features server --test tenant_cache   # 3 passed / 0 failed
+cargo test -p hydra-server --features server --test tenant_cache   # 4 passed / 0 failed（3 条令牌生命周期 + C16 双凭证）
 cargo test -p hydra-server --features server --test tenant_api     # C16 双凭证断言
 rg -n "tenant_id_for_token" crates/                                # 期望为空
 node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs
@@ -1127,7 +1127,7 @@ PY
 | **allow TTL 封顶抬高租户认证压力** | 中 | 默认 = 现状（零变化）；`hydra_auth_allow_ttl_capped_total{tenant}` 量化影响面；`ops.md` 给出调参建议 | 调大 `ALLOW_TTL_MAX_SECS`（代价是封禁生效变慢，二者只能取一） |
 | E2 返回 202 被误读为成功 | 中 | 用 202 而非 200；`state`/`lagging` 显式；`invalidate_pending_total` 可告警；文档给处置流程 | 无（语义即如此） |
 | 消费者停摆节点上的陈旧 allow | 中 | T7 的硬上界 + `consumer_stalled_seconds>60s` 告警 | 调小上限 |
-| `AppState` 加字段打断 **12 处**测试编译（另 1 处是 `main.rs:571` 的生产构造） | 低 | `for_tests()` 同批收敛；`grep -c "AppState {"` 校验计数（应为 14） | 无（纯机械） |
+| `AppState` 加字段打断 **12 处**测试编译（另 1 处是 `main.rs` 的生产构造） | 低 | `for_tests()` 同批收敛；**校验命令（唯一有效形态）**：`grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` → 期望 **2**（结构体定义 + `main.rs` 生产构造）。裸 `grep -c "AppState {"` 会数到 `impl AppState {` 给出 3；**14 是改造前的历史值**，不是任何阶段的期望终态 | 无（纯机械） |
 | 前缀保留改变既有透传行为 | 低 | T22 断言业务路径逐字节不变；`HYDRA_TENANT_API=off` 完全回基线 | 总开关 |
 | CH 宽窗口扫描代价 | 中 | 窗口上限（默认 31 天）+ `usage_query_seconds` | 调小上限；规模化需求走设计 Q15 |
 
@@ -1138,7 +1138,7 @@ PY
 | `admin/mod.rs:616-668` 租户令牌路由 | 活跃 | **T9 删除** | 旧路径返回 **404**（不是 401） |
 | `admin/handlers.rs::tenant_id_for_token` | 活跃 | **T9 删除**（由 `tenant_from_token(&ConfigStore,..)` 取代） | `grep` 无残留调用；且 C16 的双凭证断言成立（租户令牌 401 / 管理令牌 404） |
 | `admin/handlers.rs::tenant_auth_cache_invalidate` | 活跃 | **T6 搬进新模块**，T9 删除原位置 | 同一行为只有一个实现 |
-| **`tests/tenant_cache.rs` 的 5 条旧路由测试** | **活跃**（跑在主 CI job 里） | **T9 步骤 0 删除**，断言意图迁到 `tests/tenant_api.rs`（映射表见 T9 步骤 0） | 删除后 `--test tenant_cache` 为 **3 passed**；且 5 条意图在 `tenant_api` 套件里各有对应断言（否则覆盖面静默下降） |
+| **`tests/tenant_cache.rs` 的 5 条旧路由测试** | **活跃**（跑在主 CI job 里） | **T9 步骤 0 删除**，断言意图迁到 `tests/tenant_api.rs`（映射表见 T9 步骤 0） | 终态 `--test tenant_cache` 为 **4 passed**（3 条令牌生命周期 + C16；删除后、加 C16 前的**中间态是 3**）；且 5 条意图在 `tenant_api` 套件里各有对应断言（否则覆盖面静默下降） |
 | `tests/tenant_cache.rs` 的 `invalidate()` 助手 | 活跃 | 随 5 条测试一起删除 | 编译通过即证明没有残留调用 |
 | `InvalidateResponse::published` | 活跃 | **T6 删除**（无存量调用方） | 响应体只有 `fleet` 对象 |
 | `sink.rs` 内的私有 CH 传输 | 活跃 | **T3 下沉**（搬迁，非复制） | `sink.rs` 不再含 URL 解析/请求构造 |

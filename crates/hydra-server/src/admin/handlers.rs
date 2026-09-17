@@ -1679,7 +1679,10 @@ pub(super) async fn auth_cache_invalidate(
             req.tenant_id.clone(),
             req.api_keys.clone().unwrap_or_default(),
             live,
-            state.converge_timeout,
+            // The operator's endpoint always waits: it exists to force a
+            // re-authentication, and "I enqueued something" is the answer it
+            // used to give.
+            Some(state.converge_timeout),
         )
         .await
     };
