@@ -201,6 +201,51 @@ impl TenantApiLimiter {
     }
 }
 
+/// How long an idle counter survives a sweep.
+///
+/// Longer than the 60 s window it counts: dropping a counter that is older than
+/// its own window is lossless (the next request would reset it anyway), so the
+/// extra slack only avoids sweeping an entry that is about to be reused.
+pub const GC_IDLE: Duration = Duration::from_secs(120);
+
+/// Sweep expired windows and lockouts, forever.
+///
+/// This is NOT optional housekeeping: the failure dimensions are keyed by
+/// **source IP**, which the caller chooses. A client with a large address range
+/// (or a botnet) can otherwise add an unbounded number of entries to
+/// `fail_ip` — the limiter would become the memory-exhaustion vector it exists
+/// to prevent. The bound this gives is "the distinct failing addresses seen in
+/// the last `GC_IDLE`", which is proportional to the attack's own rate rather
+/// than to its total volume.
+///
+/// Same shape as `proxy::limiter::spawn_gc_task` and `http::spawn_gc_task`: one
+/// background task per process, driven by an interval, with the clock read once
+/// per tick so every map is swept against the same `now`.
+pub fn spawn_gc_task(
+    limiter: std::sync::Arc<TenantApiLimiter>,
+    invalidate_throttle: std::sync::Arc<super::throttle::Throttle>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick completes immediately; drop it so the first sweep is a
+        // full interval after startup.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let dropped = limiter.gc(GC_IDLE, now) + invalidate_throttle.gc(GC_IDLE, now);
+            if dropped > 0 {
+                tracing::debug!(
+                    target: "hydra::tenant_api",
+                    dropped,
+                    "swept expired tenant-API windows and lockouts"
+                );
+            }
+        }
+    });
+}
+
 /// SHA-256 hex of a presented token, for use as a limiter key. Owned here so the
 /// limiter never sees a plaintext token (the same shared helper the L1/L2 auth
 /// cache keys use).

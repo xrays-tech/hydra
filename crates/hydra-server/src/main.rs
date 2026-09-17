@@ -643,6 +643,18 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // were never evicted (unbounded memory for rotating keys, and — before the
     // guard fix in `check` — a permanently available deadlock precondition).
     hydra_server::http::spawn_gc_task(auth.clone(), std::time::Duration::from_secs(60));
+    let tenant_api_throttle = Arc::new(hydra_server::tenant_api::throttle::Throttle::new());
+    let tenant_api_limiter = Arc::new(hydra_server::tenant_api::limit::TenantApiLimiter::new());
+    // The tenant API's windows are keyed by source IP (caller-chosen) as well as
+    // by tenant, so they MUST be swept: without this the failure map grows with
+    // every address that ever failed, which is a memory-exhaustion vector handed
+    // to the caller. `state` does not exist yet here, so the two maps are
+    // constructed above and moved into it below.
+    hydra_server::tenant_api::limit::spawn_gc_task(
+        tenant_api_limiter.clone(),
+        tenant_api_throttle.clone(),
+        std::time::Duration::from_secs(60),
+    );
 
     // (2f-redis) Invalidation consumer (P4): every node consumes the
     // invalidation stream so auth-cache invalidations propagate cluster-wide.
@@ -767,8 +779,8 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         sink,
         proxy: proxy_cfg.clone(),
         tenant_api: tenant_api_cfg.clone(),
-        tenant_api_throttle: Arc::new(hydra_server::tenant_api::throttle::Throttle::new()),
-        tenant_api_limiter: Arc::new(hydra_server::tenant_api::limit::TenantApiLimiter::new()),
+        tenant_api_throttle,
+        tenant_api_limiter,
         #[cfg(feature = "cluster-redis")]
         invalidation: invalidation_stream.clone(),
         #[cfg(not(feature = "cluster-redis"))]
