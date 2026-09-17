@@ -527,11 +527,17 @@ cargo test -p hydra-server --features server
    **红灯**（`tests/tenant_api_cluster.rs`，新文件，真实 Redis）：C1（edge 上 E2：本节点 L1 清空 + 流里一条 v=2 记录且**载荷只有摘要无明文**）、C2（集群成员但无 Redis 后端 → **503 `fleet_invalidation_unavailable`**，不是 `single_node`、不是假 `applied`）、C4（两节点收敛 → 200 + `nodes_applied==nodes_total`）、**C6（先 apply 后 ack 的关键负例）**、C7（generation bump 后水位不推进，在途事件报 `pending` 而非 `applied`）、C8（屏障**不是转发**：出站无 `x-hydra-forwarded`）、C9（心跳过期节点不入 `nodes_total` 且不阻塞）、C10（两个独立 Redis 互不影响）。
 2. **Verify RED** → 失败（`fleet` 字段不存在 / 水位不存在）。
 3. **GREEN**：
-   a. `cluster/events.rs`：新增键 `hydra:{ctl:inv:applied}`（**一个 HASH**：`node_id → last_applied_event_id`）。消费者在**成功 apply 一批之后**把该批最大事件 ID 一次性 HSET（**先 apply 后 ack**，顺序不可颠倒）；新增 `applied_watermarks() -> HashMap<String,String>` 与 `await_applied(event_id, live_nodes, timeout) -> AppliedOutcome {Applied{nodes}, Pending{nodes_applied, nodes_total, lagging}, SingleNode, Unavailable}`；**generation bump 路径 `clear_all()` 之后不推进水位**（被裁剪的事件 ID 已不可知，不得为没读到的事件记账）。
-   b. `tenant_api/handlers.rs::invalidate`：校验/上限复用（把 `admin/handlers.rs` 的 `invalidate_shape_error`、`MAX_INVALIDATION_KEYS`、`MAX_API_KEY_LEN` 提为 `pub(crate)`）；本节点调 `state.auth.invalidate[_tenant]`；`publish`；然后 `await_applied`；按结果回 **200 / 202 / 503**；响应体按设计 §4.2 的 `fleet` 对象；`checked` 与 `invalidated` 并列。
-   c. `tenant_api/throttle.rs`：固定窗口限额（源 IP / 令牌摘要 / 租户成功 / **每租户失效频率**），`cluster-redis` 下走 Redis 计数（参照 `redis/rate_limit.rs` 的窗口原语），其余用 `DashMap`。
-   d. `admin/handlers.rs::auth_cache_invalidate` 响应改用同一 `fleet` 结构（**共用同一个 `await_applied` 实现**，不复制）。
-   e. 存活节点列表：`main.rs` 注入 `Arc<dyn Fn() -> Vec<String> + Send + Sync>`（返回存活 node_id），与 `AdminState.leader_ready` 同一闭包注入手法（`admin/mod.rs:104`）——**不把 registry 放进 `AppState`**。
+   a. **先钉住 cfg 形状**（已实测核对）：`cluster::events` 与 `cluster::registry` 都是 `#[cfg(feature = "cluster-redis")]` 门控的（`cluster/mod.rs:23-24`、`:27-28`），因此 `InvalidationStream` 在无该特性时**根本不存在**。于是：
+      - `AppState.invalidation` 必须**镜像 `AdminState` 的双字段写法**（`admin/mod.rs:108-113`）：有特性时 `Option<InvalidationStream>`，无特性时 `#[allow(dead_code)] Option<()>`；
+      - `handlers::invalidate` 必须有 cfg 分支：有特性 → `publish` + `await_applied`；无特性 → **只做本地清除并回 `state: "single_node"`**；
+      - **`"single_node"` 是可推导的、不是猜测**：无 `cluster-redis` 特性时 `HYDRA_ROLE=leader|edge` 会被启动检查拒绝（`main.rs:241-243` "requires the 'cluster-redis' cargo feature"），所以"无特性 ⇒ 不是集群 ⇒ 本地清除即全部"。
+      - 因此**不存在**"集群成员但没有失效通道"这一状态在无特性构建里的对应物；该状态只可能出现在"编译了 cluster-redis 但没有 Redis 后端"（`main.rs:621-644` 下 `invalidation_stream = None`）→ 回 **503**（C2）。
+
+   b. `cluster/events.rs`：新增键 `hydra:{ctl:inv:applied}`（**一个 HASH**：`node_id → last_applied_event_id`）。消费者在**成功 apply 一批之后**把该批最大事件 ID 一次性 HSET（**先 apply 后 ack**，顺序不可颠倒）；新增 `applied_watermarks() -> HashMap<String,String>` 与 `await_applied(event_id, live_nodes, timeout) -> AppliedOutcome {Applied{nodes}, Pending{nodes_applied, nodes_total, lagging}, SingleNode, Unavailable}`；**generation bump 路径 `clear_all()` 之后不推进水位**（被裁剪的事件 ID 已不可知，不得为没读到的事件记账）。
+   c. `tenant_api/handlers.rs::invalidate`：校验/上限复用（把 `admin/handlers.rs` 的 `invalidate_shape_error`、`MAX_INVALIDATION_KEYS`、`MAX_API_KEY_LEN` 提为 `pub(crate)`）；本节点调 `state.auth.invalidate[_tenant]`；`publish`；然后 `await_applied`；按结果回 **200 / 202 / 503**；响应体按设计 §4.2 的 `fleet` 对象；`checked` 与 `invalidated` 并列。
+   d. `tenant_api/throttle.rs`：固定窗口限额（源 IP / 令牌摘要 / 租户成功 / **每租户失效频率**），`cluster-redis` 下走 Redis 计数（参照 `redis/rate_limit.rs` 的窗口原语），其余用 `DashMap`。
+   e. `admin/handlers.rs::auth_cache_invalidate` 响应改用同一 `fleet` 结构（**共用同一个 `await_applied` 实现**，不复制）。
+   f. 存活节点列表：`main.rs` 注入 `Arc<dyn Fn() -> Vec<String> + Send + Sync>`（返回存活 node_id），与 `AdminState.leader_ready` 同一闭包注入手法（`admin/mod.rs:104`）——**不把 registry 放进 `AppState`**。
 4. **Verify GREEN**：数据面 + 集群两套测试全绿。
 5. **Commit**：`feat(server,cluster): tenant API E2 fleet-wide cache invalidation with a convergence barrier`
 
