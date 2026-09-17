@@ -40,6 +40,7 @@
 //! `proxy::request_filter` is one call into [`dispatch`].
 
 pub mod auth;
+pub mod handlers;
 
 use hydra_core::tenant_api::{parse_route, Endpoint};
 use pingora_http::ResponseHeader;
@@ -177,7 +178,14 @@ pub async fn dispatch(
     //    which is why this task wires nothing: wiring E1 here would make T5's RED
     //    step unable to fail for the right reason.
     match route.endpoint {
-        Endpoint::Whoami | Endpoint::InvalidateAuthCache | Endpoint::Usage => {
+        // T5: E1 is wired. It needs nothing but the row the gate already
+        // resolved, so there is no second lookup to keep consistent.
+        Endpoint::Whoami => handlers::whoami(session, ctx, &authenticated).await,
+        // T6 and T8 replace these two arms, one each. Until then they answer the
+        // same local 404 the path produced before this API existed — a routing
+        // skeleton, not a stub: the behaviour is correct for a route that is not
+        // served yet.
+        Endpoint::InvalidateAuthCache | Endpoint::Usage => {
             respond_error(session, ctx, 404, "not_found", "unknown path").await
         }
     }
@@ -197,28 +205,26 @@ fn bearer_token(session: &Session) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-/// Write the shared error envelope: `{"error":{"code","message","trace_id"}}`.
+/// What the gate resolved, re-exported so handlers take one argument instead of
+/// threading three.
+pub use auth::AuthenticatedTenant as Authenticated;
+
+/// Write a JSON body with the tenant API's headers.
 ///
-/// The same shape the admin API uses (design §13.4), so a tenant integrating
-/// against either surface parses one error model.
-async fn respond_error(
+/// Terminates the response here (as `proxy::respond_catalog` does), so Pingora
+/// never dials an upstream for a request under the reserved prefix.
+pub(super) async fn respond_json<T: serde::Serialize>(
     session: &mut Session,
     ctx: &mut RequestContext,
     status: u16,
-    code: &str,
-    message: &str,
+    body: &T,
 ) -> pingora_core::Result<bool> {
     ctx.status_code = status;
-    let body = serde_json::json!({
-        "error": { "code": code, "message": message, "trace_id": ctx.trace_id }
-    })
-    .to_string();
+    let body = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     let mut header = ResponseHeader::build(status, Some(3))?;
     header.insert_header("Content-Type", "application/json")?;
     header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
     header.insert_header("Content-Length", body.len().to_string())?;
-    // Same write pattern as `proxy::respond_catalog`: terminate the response
-    // here and never let Pingora dial an upstream.
     session.set_keepalive(None);
     session
         .write_response_header(Box::new(header), false)
@@ -227,4 +233,25 @@ async fn respond_error(
         .write_response_body(Some(bytes::Bytes::from(body)), true)
         .await?;
     Ok(true)
+}
+
+/// Write the shared error envelope: `{"error":{"code","message","trace_id"}}`.
+///
+/// The same shape the admin API uses (design §13.4), so a tenant integrating
+/// against either surface parses one error model. Note the deliberate difference
+/// from the proxy's own short-circuit body
+/// (`{"error":{"message":…,"type":"proxy_error"}}`): ours always carries `code`
+/// and `trace_id` and never `type`, which is what makes "did this request reach
+/// the tenant API or the proxy pipeline?" answerable from a response alone.
+async fn respond_error(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> pingora_core::Result<bool> {
+    let body = serde_json::json!({
+        "error": { "code": code, "message": message, "trace_id": ctx.trace_id }
+    });
+    respond_json(session, ctx, status, &body).await
 }

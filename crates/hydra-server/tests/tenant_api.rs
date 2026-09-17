@@ -248,12 +248,12 @@ async fn the_tenant_token_is_never_treated_as_a_client_key() {
         .await,
     )
     .await;
-    // T4 wires no endpoint, so an authorised call answers the routing skeleton.
-    assert_eq!(status, 404, "expected the skeleton 404, got {v}");
-    // If the token had been taken for a client key, external auth would have run
-    // against `https://auth.acme.local/verify` and failed closed with 503 — a
-    // different status and a different code. The 404 proves the gate ran first.
-    assert_eq!(v["error"]["code"], "not_found", "got {v}");
+    // An authorised call answers E1 (T5). If the token had been taken for a
+    // client key, external auth would have run against
+    // `https://auth.acme.local/verify` and failed closed with 503 — a different
+    // status and a different code. A 200 here proves the gate ran first.
+    assert_eq!(status, 200, "expected E1, got {v}");
+    assert_eq!(v["tenant_id"], "t1", "got {v}");
 }
 
 /// T19: identity comes from the SNAPSHOT, not the DB. Rotating the hash in the
@@ -280,7 +280,7 @@ async fn the_gate_reads_the_snapshot_not_the_database() {
     let (old_status, _) =
         body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
     assert_eq!(
-        old_status, 404,
+        old_status, 200,
         "the OLD token must still work until the snapshot is reloaded (it is what the gate reads)"
     );
     let (new_status, _) = body_json(send_until_ready(&c, &url, Some(rotated), None).await).await;
@@ -298,7 +298,7 @@ async fn the_gate_reads_the_snapshot_not_the_database() {
         old_after, 401,
         "the old token must stop working after the reload"
     );
-    assert_eq!(new_after, 404, "the new token must work after the reload");
+    assert_eq!(new_after, 200, "the new token must work after the reload");
 }
 
 /// A tenant with no configured token can never authenticate (fail closed).
@@ -513,4 +513,192 @@ async fn internal_routes_are_not_reachable_on_the_data_plane() {
             "internal response leaked a control-plane field `{leak}`: {v}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// T5 — E1 `GET /whoami` (snapshot-only)
+// ---------------------------------------------------------------------------
+
+async fn get_whoami(root: &str, tenant: &str, token: &str) -> (u16, Value) {
+    body_json(
+        send_until_ready(
+            &client(),
+            &format!("{root}/tenant/{tenant}/api/v1/whoami"),
+            Some(token),
+            None,
+        )
+        .await,
+    )
+    .await
+}
+
+/// T1: the snapshot view is complete and its values are the tenant's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whoami_returns_the_snapshot_view() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let expected_version = state.store.version();
+    let root = start_proxy(state);
+    let (status, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
+    assert_eq!(status, 200, "got {v}");
+    assert_eq!(v["tenant_id"], "t1");
+    assert_eq!(v["name"], "t1-name");
+    assert_eq!(v["domain"], "acme.example");
+    assert_eq!(v["auth_url"], "https://auth.acme.example/verify");
+    assert_eq!(v["enabled"], true);
+    assert_eq!(
+        v["config_version"].as_u64(),
+        Some(expected_version),
+        "the version must be the one the gate read, so a tenant can tell whether its change is live"
+    );
+    assert_eq!(v["base_url"], "/tenant/t1/api/v1");
+}
+
+/// T2 (strengthened): the response is the tenant's own NON-SECRET configuration.
+/// The token hash, the certificate private key and any provider key must not
+/// appear — not even as a key name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whoami_never_leaks_a_secret() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
+    assert_eq!(status, 200, "got {v}");
+    let body = v.to_string();
+    for forbidden in [
+        "access_token",
+        "token_hash",
+        "cert_key",
+        "cert_file",
+        "pem",
+        "private",
+        TENANT_TOKEN,
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the response must not mention {forbidden:?}: {body}"
+        );
+    }
+    // ...while the two fields it DOES expose are the tenant's own and are not
+    // credentials: the domain it is bound to and the auth endpoint Hydra calls.
+    assert!(v["domain"].is_string());
+    assert!(v["auth_url"].is_string());
+}
+
+/// T7 (E1 form): a suspended tenant must still be able to read its own state.
+/// Self-recovery depends on it, and E1 changes nothing on the data plane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whoami_answers_for_a_disabled_tenant() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let mut t = hydra_server::db::get_tenant(&pool, "t1")
+        .await
+        .expect("get");
+    t.enabled = false;
+    hydra_server::db::update_tenant(&pool, &t)
+        .await
+        .expect("disable");
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
+    assert_eq!(
+        status, 200,
+        "a suspended tenant must still read its own state: {v}"
+    );
+    assert_eq!(v["enabled"], false, "and must see that it is suspended");
+}
+
+/// T23: `base_url` must not be a self-contradiction. Using the value the API
+/// reported has to work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reported_base_url_is_actually_usable() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (_, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
+    let base = v["base_url"].as_str().expect("base_url");
+    let (status, w) = body_json(
+        send_until_ready(
+            &client(),
+            &format!("{root}{base}/whoami"),
+            Some(TENANT_TOKEN),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, 200, "the reported base_url must work: {w}");
+}
+
+/// C12: an EDGE node has no local database at all. E1 must still answer, from
+/// the replicated snapshot — this is the evidence behind "E1 needs no DB and no
+/// forwarding", and it is why an edge can serve the whole tenant API locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whoami_works_on_an_edge_from_the_snapshot_alone() {
+    use hydra_server::cluster::content::FidelityRows;
+    use hydra_server::cluster::snapshot::HydratedWire;
+
+    let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
+        Arc::new(StaticKeyProvider::new([7u8; 32], 1));
+
+    // The replica shape: a store with NO pool, fed one snapshot.
+    let store = ConfigStore::from_snapshot(hydra_core::config::ConfigData::default(), kp);
+    let mut cfg = hydra_core::config::ConfigData::default();
+    let t = Tenant {
+        id: "t1".into(),
+        name: "edge-tenant".into(),
+        domain: "edge.example".into(),
+        auth_url: "https://auth.edge.example/verify".into(),
+        cert_key: None,
+        cert_file: None,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    cfg.tenants_by_domain.insert(t.domain.clone(), t);
+    // `hydrate` does this in production; here we are the producer of the wire.
+    cfg.reindex_tenants();
+    store.apply_snapshot(HydratedWire {
+        version: 7,
+        cfg,
+        fidelity: FidelityRows {
+            limit_roles: vec![],
+            key_prefix_bindings: vec![],
+            provider_keys: vec![],
+            tenant_token_hashes: vec![(
+                "t1".to_string(),
+                sha256_hex_string(TENANT_TOKEN.as_bytes()),
+            )],
+            provider_models: vec![],
+            tenant_providers: vec![],
+            tenant_models: vec![],
+        },
+    });
+
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("checker"),
+    );
+    let state = AppState::for_tests(
+        store,
+        auth,
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
+        Arc::new(RateLimiter::new()),
+        Arc::new(NoopSink) as Arc<dyn UsageSink>,
+        ProxyConfig::default(),
+        TenantApiConfig::default(),
+    );
+    let root = start_proxy(state);
+    let (status, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
+    assert_eq!(status, 200, "an edge must serve E1 from its snapshot: {v}");
+    assert_eq!(v["tenant_id"], "t1");
+    assert_eq!(v["name"], "edge-tenant");
+    // The snapshot's version, not a database's.
+    assert_eq!(v["config_version"].as_u64(), Some(7));
 }

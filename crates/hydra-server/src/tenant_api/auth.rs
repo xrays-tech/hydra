@@ -42,10 +42,16 @@ pub enum AuthError {
     NotReady,
 }
 
-/// The tenant a request's token belongs to, plus the row the snapshot holds for
-/// it (so the caller does not need a second snapshot read).
+/// The tenant a request's token belongs to, plus the row and the snapshot version
+/// the decision was made against.
+///
+/// Both come from the **same** guard as the token comparison, so a response can
+/// never be attributed to a newer configuration than the one that authorised it —
+/// which is what lets a tenant use `config_version` to tell whether a change it
+/// made is live on the node that answered.
 pub struct AuthenticatedTenant {
     pub tenant: Tenant,
+    pub config_version: u64,
 }
 
 /// Resolve a presented bearer to a tenant, using only the config snapshot.
@@ -72,10 +78,15 @@ pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTe
         return Err(AuthError::Unauthorized);
     };
 
-    // Same guard as the hashes: the row cannot come from another generation.
+    // Same guard as the hashes: the row AND the version cannot come from another
+    // generation.
     let cfg: &ConfigData = &content.cfg;
+    let config_version = content.version;
     match cfg.tenants_by_id.get(tenant_id) {
-        Some(t) => Ok(AuthenticatedTenant { tenant: t.clone() }),
+        Some(t) => Ok(AuthenticatedTenant {
+            tenant: t.clone(),
+            config_version,
+        }),
         // A hash with no row is a snapshot in transition; it cannot be trusted,
         // and "not ready" is the honest answer (never a 403, which would look
         // like a valid-but-wrong tenant).
