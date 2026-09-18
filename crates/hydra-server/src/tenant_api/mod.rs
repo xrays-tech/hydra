@@ -10,17 +10,17 @@
 //! documented against. So the tenant API is a **reserved prefix on the data
 //! plane**, not a second listener and not a second service.
 //!
-//! ## The prefix is reserved, the three paths are not
+//! ## The prefix is reserved, the five paths are not
 //!
-//! Interception keys on `path.starts_with("/tenant/")`, NOT on "one of the three
-//! known routes parsed". Matching only the three literal paths would let
+//! Interception keys on `path.starts_with("/tenant/")`, NOT on "one of the five
+//! known routes parsed". Matching only the five literal paths would let
 //! `/tenant/t1/api/v1/typo` — and every other near miss — fall through into the
 //! normal proxy pipeline: Host→tenant resolution, then the client api-key
 //! extraction. The tenant's own access token travels in `Authorization: Bearer`,
 //! which is ALSO a legitimate client api-key transport, so a fall-through would
 //! POST that token to the tenant's `auth_url` and mask it into a usage record.
 //! Anything under the reserved prefix is therefore answered here, and a path
-//! that is not one of the three routes gets a local `404`.
+//! that is not one of the five routes gets a local `404`.
 //!
 //! ## Fail-closed vocabulary
 //!
@@ -262,6 +262,8 @@ pub async fn dispatch(
         Endpoint::Whoami => "whoami",
         Endpoint::InvalidateAuthCache => "invalidate",
         Endpoint::Usage => "usage",
+        Endpoint::ListSubTenants => "sub-tenants",
+        Endpoint::ListSubTenantRoutes => "sub-tenant-routes",
     });
 
     // 1b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
@@ -270,7 +272,10 @@ pub async fn dispatch(
     //     The method contract belongs to ROUTING, not to each handler, so it is
     //     checked once here.
     let expected = match route.endpoint {
-        Endpoint::Whoami | Endpoint::Usage => "GET",
+        Endpoint::Whoami
+        | Endpoint::Usage
+        | Endpoint::ListSubTenants
+        | Endpoint::ListSubTenantRoutes => "GET",
         Endpoint::InvalidateAuthCache => "POST",
     };
     let method = session.req_header().method.as_str();
@@ -437,7 +442,7 @@ pub async fn dispatch(
     // querying usage must not itself count as usage.
     ctx.tenant = Some(authenticated.tenant.clone());
 
-    // 4. Route. All three endpoints are served; a path under the reserved prefix
+    // 4. Route. All five endpoints are served; a path under the reserved prefix
     //    that is not one of them was refused a local 404 above, so this match is
     //    exhaustive over the routes `parse_route` can produce.
     match route.endpoint {
@@ -448,6 +453,14 @@ pub async fn dispatch(
             handlers::invalidate(state, session, ctx, &authenticated).await
         }
         Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
+        // Read-only, snapshot-fed: no DB, no upstream — an edge serves them
+        // exactly like `whoami`.
+        Endpoint::ListSubTenants => {
+            handlers::list_sub_tenants(state, session, ctx, &authenticated).await
+        }
+        Endpoint::ListSubTenantRoutes => {
+            handlers::list_sub_tenant_routes(state, session, ctx, &authenticated).await
+        }
     }
 }
 
@@ -551,7 +564,7 @@ async fn respond_throttled(
 }
 
 /// The metric label for the endpoint being answered. `unrouted` covers a path
-/// under the reserved prefix that is not one of the three routes, and a request
+/// under the reserved prefix that is not one of the five routes, and a request
 /// rejected before the route was parsed — a low-cardinality constant, never the
 /// path itself.
 fn endpoint_label(ctx: &RequestContext) -> &'static str {

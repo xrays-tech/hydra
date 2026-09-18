@@ -7,12 +7,17 @@
 //! | `whoami` (T5) | the config snapshot, through the row the gate already resolved |
 //! | `invalidate` (T6) | [`crate::http::AuthCache`] plus the invalidation stream and its barrier |
 //! | `usage` (T8) | [`crate::usage_query::UsageQuery`] |
+//! | `sub-tenants` / `sub-tenant-routes` (T7) | the config snapshot, filtered to the tenant |
 //!
 //! Nothing here re-implements a primitive: routing and the gate live in
 //! [`super`], the response envelope in [`super::respond_json`].
 
+use std::collections::HashSet;
+
 use pingora_proxy::Session;
 use serde::Serialize;
+
+use hydra_core::model::{SubTenant, SubTenantRoute};
 
 use crate::http::AuthChecker as _;
 use crate::proxy::ctx::RequestContext;
@@ -528,4 +533,128 @@ pub async fn usage(
         )
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// T7 — E4 `GET /sub-tenants` and `GET /sub-tenant-routes` (read-only,
+//       snapshot-fed; an edge with no DB serves them)
+// ---------------------------------------------------------------------------
+
+/// The body of `GET /sub-tenants`.
+///
+/// A read-only, snapshot-fed mirror of the tenant's OWN sub-tenants. Every
+/// field of a [`SubTenant`] is non-secret — the `key_prefix` is a routing
+/// selector, not a credential (design §5) — so the rows are returned as-is.
+/// Cross-tenant isolation is enforced by the `tenant_id` filter in
+/// [`list_sub_tenants`], not by trimming fields: a tenant simply never sees rows
+/// that are not its own.
+#[derive(Serialize)]
+struct SubTenantsView {
+    /// The snapshot version the rows were read from — the same guard that
+    /// supplies the data, so a tenant can reconcile its last change against this
+    /// field (and against `whoami`) instead of guessing whether it is live.
+    config_version: u64,
+    /// The tenant's own enabled sub-tenants, in config order.
+    sub_tenants: Vec<SubTenant>,
+}
+
+/// The body of `GET /sub-tenant-routes`.
+#[derive(Serialize)]
+struct SubTenantRoutesView {
+    /// The snapshot version the rows were read from (v2 reconciliation baseline).
+    config_version: u64,
+    /// The tenant's own enabled sub-tenant routes, in config order. A route is
+    /// attributed to the tenant THROUGH its sub-tenant's `tenant_id`, so a route
+    /// whose sub-tenant belongs to another tenant can never appear here — even
+    /// though the route row itself names no `tenant_id`.
+    sub_tenant_routes: Vec<SubTenantRoute>,
+}
+
+/// `GET /tenant/{tenant_id}/api/v1/sub-tenants`
+///
+/// Read-only and snapshot-fed: it reads ONLY the replication snapshot
+/// (`store.replication()`), never the database, so an edge with no local DB
+/// serves it exactly like [`whoami`]. Only the rows whose `tenant_id` equals the
+/// authenticated tenant are returned — a tenant can never read another tenant's
+/// sub-tenants.
+pub async fn list_sub_tenants(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+) -> pingora_core::Result<bool> {
+    // ONE atomic read: the rows and the version they are attributed to come from
+    // the SAME guard, so a response can never mix data from one generation with
+    // the version of another. The gate already authenticated (which requires a
+    // snapshot), so `None` is not expected; fail closed rather than invent an
+    // empty list.
+    let guard = state.store.replication();
+    let Some(content) = guard.as_ref() else {
+        return super::respond_error(
+            session,
+            ctx,
+            503,
+            "not_ready",
+            "this node has no configuration yet",
+        )
+        .await;
+    };
+    let tenant_id = &auth.tenant.id;
+    let sub_tenants: Vec<SubTenant> = content
+        .cfg
+        .sub_tenants
+        .iter()
+        .filter(|st| st.tenant_id == *tenant_id)
+        .cloned()
+        .collect();
+    let view = SubTenantsView {
+        config_version: content.version,
+        sub_tenants,
+    };
+    respond_json(session, ctx, 200, &view).await
+}
+
+/// `GET /tenant/{tenant_id}/api/v1/sub-tenant-routes`
+///
+/// Read-only and snapshot-fed, like [`list_sub_tenants`]. A route names only its
+/// `sub_tenant_id`, so tenant scoping is done in two steps: collect the ids of
+/// the tenant's own sub-tenants, then keep only routes whose sub-tenant is in
+/// that set. A route belonging to another tenant's sub-tenant cannot match.
+pub async fn list_sub_tenant_routes(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+) -> pingora_core::Result<bool> {
+    let guard = state.store.replication();
+    let Some(content) = guard.as_ref() else {
+        return super::respond_error(
+            session,
+            ctx,
+            503,
+            "not_ready",
+            "this node has no configuration yet",
+        )
+        .await;
+    };
+    let tenant_id = &auth.tenant.id;
+    let own_sub_tenants: HashSet<&str> = content
+        .cfg
+        .sub_tenants
+        .iter()
+        .filter(|st| st.tenant_id == *tenant_id)
+        .map(|st| st.id.as_str())
+        .collect();
+    let sub_tenant_routes: Vec<SubTenantRoute> = content
+        .cfg
+        .sub_tenant_routes
+        .iter()
+        .filter(|r| own_sub_tenants.contains(r.sub_tenant_id.as_str()))
+        .cloned()
+        .collect();
+    let view = SubTenantRoutesView {
+        config_version: content.version,
+        sub_tenant_routes,
+    };
+    respond_json(session, ctx, 200, &view).await
 }

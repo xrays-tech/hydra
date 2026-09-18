@@ -152,6 +152,11 @@ pub enum Endpoint {
     Whoami,
     InvalidateAuthCache,
     Usage,
+    /// `GET /sub-tenants` — the tenant's own sub-tenants (read-only, snapshot-fed).
+    ListSubTenants,
+    /// `GET /sub-tenant-routes` — the tenant's own sub-tenant routes (read-only,
+    /// snapshot-fed).
+    ListSubTenantRoutes,
 }
 
 /// A parsed tenant API path.
@@ -163,7 +168,7 @@ pub struct TenantApiRoute<'a> {
 
 /// Parse `/tenant/{tenant_id}/api/v1/...` into `(tenant_id, endpoint)`.
 ///
-/// Exact matching: the suffix must be one of the three known endpoints, so a
+/// Exact matching: the suffix must be one of the five known endpoints, so a
 /// near miss (`.../models`, `.../typo`, a trailing slash, an extra segment) is
 /// `None`. The caller then answers `404` **locally** — it must not let such a
 /// path fall through to the proxy pipeline, where a tenant token would be read
@@ -179,6 +184,11 @@ pub fn parse_route(path: &str) -> Option<TenantApiRoute<'_>> {
         "api/v1/whoami" => Endpoint::Whoami,
         "api/v1/auth/cache/invalidate" => Endpoint::InvalidateAuthCache,
         "api/v1/usage" => Endpoint::Usage,
+        // Read-only, flat paths matching the admin resource shape (T6). Both are
+        // list endpoints owned by the tenant in the URL; the item id is never
+        // part of the route, so `.../sub-tenants/{id}` is a near miss.
+        "api/v1/sub-tenants" => Endpoint::ListSubTenants,
+        "api/v1/sub-tenant-routes" => Endpoint::ListSubTenantRoutes,
         _ => return None,
     };
     Some(TenantApiRoute {
