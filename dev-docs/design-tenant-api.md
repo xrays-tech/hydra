@@ -778,7 +778,8 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
    内部端点**绕过了数据面的 URL↔token 交叉检查**（`tenant_api/mod.rs:405` 的 `tenant_id_mismatch`/403），所以这条绑定是**唯一防线**：cluster token 持有者（每个 edge/standby）或一个可重放的租户 Bearer 都不能借此写**别的租户**的数据。
 5. **凭据放置与日志约束**：租户 Bearer 走专用请求头 `x-hydra-tenant-token`（**不放 body**，避免转发路径上的 body 日志/诊断泄露活凭据）；转发链路**禁止记录**该头与请求体。
 6. **审计与归因**：经 internal 路径的每次配置写必须记录**发起租户**与**发起节点**（trace id 已在 `forward.rs:233` 中继，租户归因需新增），供事后追溯。
-7. **接收侧必须断言本节点是租约持有者**：internal 写 handler 在落库前必须检查本节点**当前持有租约**（`state.leader_ready` / `is_leader()`，同 `maybe_forward_mutation` 的 `admin/mod.rs:480-486`）：单节点（`leader_ready == None`）本地执行；**非 leader ⇒ `503 not_leader`，绝不本地执行**。理由：internal 闸门在 `admin/mod.rs:638-640` **早退 `route()`**，**不经过**既有 admin 转发路径的 leader 检查（那里的 sender 侧机制——注册表解析、FORWARD_ONCE、超时分类——**都不覆盖接收侧**）。若缺此断言，一个 standby / 被罢黜 leader 会写自己的副本 DB 并返回 200，而下一次 `restore_config` 会把它清掉——这正是理由 7 谴责的"先成功后丢失"（幻影 200）。检查—写入之间被罢黜的竞态（TOCTOU）与既有 504"结果未知"属同一**已接受**的歧义类。
+7. **接收侧必须断言本节点是租约持有者**：internal 写 handler 在落库前必须检查本节点**当前持有租约**（`state.leader_ready` / `is_leader()`，同 `maybe_forward_mutation` 的 `admin/mod.rs:480-486`）：单节点（`leader_ready == None`）本地执行；**非 leader ⇒ `503 not_leader`，绝不本地执行**。理由：internal 闸门在 `admin/mod.rs:646-652` **早退 `route()`**，**不经过**既有 admin 转发路径的 leader 检查（那里的 sender 侧机制——注册表解析、FORWARD_ONCE、超时分类——**都不覆盖接收侧**）。若缺此断言，一个 standby / 被罢黜 leader 会写自己的副本 DB 并返回 200，而下一次 `restore_config` 会把它清掉——这正是理由 7 谴责的"先成功后丢失"（幻影 200）。检查—写入之间被罢黜的竞态（TOCTOU）与既有 504"结果未知"属同一**已接受**的歧义类。
+8. **数据面转发 plumbing（信任受控）**：数据面今天**拿不到** cluster token / registry / control URL（`AppState` 无这些字段；`ControlClient` 未存入数据面）。A′ 必须向 `AppState` 注入**最小能力**——一个"解析 leader URL"的闭包 + cluster token，且**仅租户配置写路径**可用；**不得**把 `NodeRegistry` 交给数据面。转发须用**新函数**（现有 `forward_mutation` 固定中继调用方 `Authorization`，无法发送 cluster token + `x-hydra-tenant-token`，`forward.rs:236-238`）。详见 v2 计划 `plans/2026-09-18-sub-tenant-v2.md` D1/D2。
 
 #### 后果
 
