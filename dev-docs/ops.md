@@ -471,6 +471,82 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 
 > **ClickHouse usage reads are response-size-capped (~64 KiB — `MAX_CLICKHOUSE_RESPONSE` in `crates/hydra-server/src/clickhouse.rs`).** A result that exceeds the cap (a very wide `group_by` over a long window) fails the read and surfaces as `503 usage_store_unavailable` with a "narrow the query" message — **not** a retryable error. Narrow `since`/`until` or reduce `group_by` cardinality (e.g. `day` instead of `model`).
 
+### 5.5 Sub-tenant configuration (admin API)
+
+Sub-tenants and their routes are operator-managed through the admin API; the
+tenant-facing read-only mirrors are the two `GET /tenant/{tid}/api/v1/sub-tenants` /
+`sub-tenant-routes` endpoints (documented in `tenant-api-integration.md` §5.4–§5.5).
+They add **no new cluster mechanism**: the
+write path is the existing admin-CRUD pattern, which inherits the automatic leader
+forwarding of `maybe_forward_mutation`.
+
+**Resources** (flat, under `/api/v1/`, admin-token gated, design §13.2):
+
+| resource | paths |
+|---|---|
+| `sub-tenants` | `GET/POST /api/v1/sub-tenants`, `GET/PUT/DELETE /api/v1/sub-tenants/{id}` |
+| `sub-tenant-routes` | `GET/POST /api/v1/sub-tenant-routes`, `GET/PUT/DELETE /api/v1/sub-tenant-routes/{id}` |
+
+- List supports `?tenant_id=` (sub-tenants) / `?sub_tenant_id=` (routes) filters.
+- Create a sub-tenant **without** a `key_prefix` → the leader auto-generates one
+  (8 chars `[A-Z0-9]` + a `_` separator, e.g. `QQCX_`); the generate→validate→insert
+  loop retries up to 5 times on **both** a DB `UNIQUE` race and a validator overlap
+  rejection (a generated 9-char prefix can be a superstring of an existing shorter
+  one). An explicit empty prefix is `400`.
+- On a successful mutation the snapshot is reloaded (`reload_best_effort`).
+
+**Write validation is error-level, fail-closed** (pure `validate_sub_tenant_write`,
+`crates/hydra-core/src/sub_tenant.rs`): a rejected write is never persisted. Duplicates
+are `409`; every other rule violation is `400`:
+
+| condition | code | HTTP |
+|---|---|---|
+| `name` already used by another sub-tenant in the tenant | `name_duplicate` | 409 |
+| `key_prefix` already used by another sub-tenant in the tenant | `prefix_duplicate` | 409 |
+| route's `provider_id` is not a known provider | `provider_not_found` | 400 |
+| `provider_id` known but not in the tenant's `tenant_providers` | `provider_not_in_tenant` | 400 |
+| `model_key` outside the tenant's `tenant_models` (only when the tenant has a mapping) | `model_not_in_tenant` | 400 |
+| `provider_id` does not serve `model_key` | `model_not_served_by_provider` | 400 |
+| `key_prefix` empty | `empty_key_prefix` | 400 |
+| `key_prefix` non-ASCII | `invalid_key_prefix` | 400 |
+| `key_prefix` has no separator (`_`/`-`) | `invalid_key_prefix` | 400 |
+| `key_prefix` overlaps a same-tenant prefix or an enabled operator binding | `key_prefix_overlap` | 400 |
+| tenant already at the sub-tenant quota | `quota_exceeded` | 400 |
+| sub-tenant already at the route quota | `quota_exceeded` | 400 |
+
+**Per-tenant quotas** (config-DoS guard, `crates/hydra-core/src/sub_tenant.rs`):
+`MAX_SUB_TENANTS_PER_TENANT = 64`, `MAX_ROUTES_PER_SUB_TENANT = 32`.
+
+**Snapshot-side backstop** (`config::validate`, Warn-only, *not* the sole line of
+defence): warns on a route referencing an unknown sub-tenant/provider, a prefix
+without a separator, and same-tenant prefix overlap.
+
+**Default-route semantics (Q11, strict (a′))**: a **default route** (`model_key = NULL`)
+pins the sub-tenant's traffic to **one** provider; any model that provider does not
+serve becomes **unroutable for that prefix** (fail-closed `503 NoAvailableProvider`).
+This mirrors the fail-closed operator binding and is intentional — do not expect a
+model to "fall back" to normal routing when the default route's provider lacks it.
+
+**Operator-binding overlap is one-sided** (noted in the post-implementation
+review): a sub-tenant write rejects a prefix that overlaps an enabled operator
+binding, but an operator binding write does **not** check sub-tenant prefixes.
+An operator can therefore later add a binding that supersedes a sub-tenant
+prefix; by (a′) the operator wins and the sub-tenant route silently never fires
+for those keys (deterministic, and the catalog stays honest). Add such a binding
+with intent.
+
+**Observability**: v1 adds **no new Prometheus metrics** for sub-tenant routing (per
+plan; catalog consistency is pinned by core tests, not a metric).
+
+**Availability**: admin CRUD is only available on nodes that serve the admin API
+(leader / standby). **Edge nodes 404 every admin path pre-auth** (they serve only
+`/metrics` `/healthz` `/readyz`), so sub-tenant CRUD from an edge is unavailable —
+the same boundary as every existing admin resource.
+
+**Disable/delete ≠ revoke**: deleting a sub-tenant only stops steering; its keys keep
+flowing through normal routing and are revoked only by the tenant's `auth_url` (see
+`tenant-api-integration.md` §7.6).
+
 ---
 
 ## 6. Circuit-breaker operations (design §8.4)

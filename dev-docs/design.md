@@ -757,6 +757,28 @@ pub fn resolve(
 对应纯实现位于 `crates/hydra-core/src/router.rs`：`match_key_binding`（最长前缀
 匹配）+ `resolve` 候选计算 step 3.5（交集之后、过滤之前）。
 
+### 7.1c 子租户前缀路由闸门（sub_tenant / sub_tenant_route，(3.6)）
+
+在 §7.1b 之后新增**最低优先级、opt-in** 的租户级前缀路由（详见 `design-sub-tenant.md`）：
+租户为子租户（`SubTenant`）配置 `model → provider` 路由（`SubTenantRoute`），使**同一子租户下
+共享前缀的 client api-key** 被收窄到该子租户的 provider。
+
+- **作用域**：前缀**租户内唯一**（`UNIQUE(tenant_id, key_prefix)`），匹配只在本租户的路由表内进行。
+- **优先级最低（opt-in steering）**：仅在 §7.1b 的 operator key-prefix binding **未命中**时求值
+  （(3.6)）；命中 operator binding ⇒ 整体跳过子租户路由（operator 的显式处置胜出）。
+- **两级路由**：`SubTenantRoute.model_key` 非空 = 该 model 专属路由；`NULL` = 该子租户**默认路由**；
+  同子租户内模型专属 > 默认。
+- **fail-closed 求交**：命中一条启用路由 ⇒ 候选集 `∩= {route.provider_id}`，空 ⇒
+  `503 NoAvailableProvider`；**无命中 ⇒ 行为与今天完全一致**（是收窄，不是白名单）。
+- **passthrough（无 model 字段）同样受约束**：`model_key = None` 时只默认路由参与收窄（模型专属行
+  不适用）；交集空 ⇒ 503，与 binding 命中死 provider 的现有行为一致。
+- **管理面**：`/api/v1/sub-tenants`、`/api/v1/sub-tenant-routes` CRUD（§13.2 模式），写路径
+  error 级 fail-closed 校验；**停用/删除 ≠ 吊销**（key 仍走默认管线，吊销永远是租户 `auth_url` 的职责）。
+
+对应纯实现位于 `crates/hydra-core/src/router.rs`：`match_sub_tenant_route`（前缀匹配 + 两级路由
+选择）+ `resolve` 候选计算 step 3.6 + `accessible_models` 目录镜像；`proxy::passthrough_candidates`
+对默认路由做同款收窄。
+
 ### 7.2 加权 Round Robin（Nginx SWRR）
 
 采用 **Smooth Weighted Round-Robin**（与 Nginx 算法一致，分布平滑、无突刺）：

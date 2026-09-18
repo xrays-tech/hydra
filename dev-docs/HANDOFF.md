@@ -61,7 +61,7 @@ crates/hydra-server/src/
     admission.rs   AdmissionControl(DashMap<provider,ProviderGate>) Semaphore+timeout; Permit RAII; snapshot()  ← NEW MODULE
     limiter.rs / breaker_wrap.rs / config.rs (default_concurrency_policy) / provider_client.rs / ctx.rs / peer.rs
   crypto.rs       KeyProvider trait + StaticKeyProvider (AES-256-GCM); KMS slot reserved               ← NEW MODULE
-  db.rs           sqlx compile-time query!/query_as! (33 queries); encrypt-on-write/decrypt-on-read for provider keys
+  db.rs           sqlx compile-time query!/query_as! (count grows over time); encrypt-on-write/decrypt-on-read for provider keys
   store.rs        ArcSwap hot-reload ConfigStore (holds key_provider)
   http.rs         AuthCache (SHA-256 client keys)
   sink.rs         batched SQLite + ClickHouse usage sink
@@ -70,7 +70,9 @@ crates/hydra-server/src/
                   metrics.rs (17+ Prometheus metrics incl. 6 admission + mid_stream_errors) / static_files.rs (embedded UI)
 
 migrations/  0001_init · 0002_usage_metrics · 0003_provider_key_encryption · 0004_provider_concurrency
-.sqlx/       offline query cache (33 query-*.json) — committed; CI builds with SQLX_OFFLINE=true
+               · … · 0010_sub_tenant (sub-tenant + sub-tenant-route tables, see design-sub-tenant.md)
+.sqlx/       offline query cache (query-*.json) — committed; count grows as compile-time queries are
+               added (44 as of this commit, 2026-09-18); CI builds with SQLX_OFFLINE=true
 ```
 
 ---
@@ -91,8 +93,8 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
    **§7 boundary: admission errors never trip the breaker**; 503+Retry-After only when all candidates
    exhausted; migration 0004; 6 metrics; `GET /api/v1/concurrency` inspect endpoint. See
    **`dev-docs/design-admission-queue.md`** (the authoritative design).
-3. **sqlx compile-time SQL checking** (P1-6) — all 33 queries are `query!`/`query_as!`; `.sqlx/`
-   offline cache; `SQLX_OFFLINE=true` in CI (SQL drift fails the build).
+3. **sqlx compile-time SQL checking** (P1-6) — all compile-time queries are `query!`/`query_as!`;
+    `.sqlx/` offline cache; `SQLX_OFFLINE=true` in CI (SQL drift fails the build).
 4. **Admin API no longer returns plaintext keys** (P1-5) — always masked (`前十 + 中星 + 后四`);
    `?reveal=1` is now a no-op.
 5. **Mid-stream error observability** (P2-9) — `hydra_mid_stream_errors_total{provider}`; doc note
@@ -160,6 +162,16 @@ queue_wait_timeout_ms # 1000-5000
 ## 8. Resume hints for the next round
 
 - **Read first:** `dev-docs/design-admission-queue.md` (admission), `dev-docs/ops.md` (ops), this file.
+- **Sub-tenant (post-archive, 2026-09-18):** since this archive the sub-tenant feature landed —
+  migration `0010_sub_tenant.sql` (`sub_tenant` + `sub_tenant_route` tables), projected through
+  `ConfigData`/`FidelityRows`/`FidelityWireRows`/`restore.rs`, route gate (3.6) in `router.rs` +
+  `proxy.rs` passthrough, operator admin CRUD with error-level write validation, and two tenant
+  read-only endpoints. **`WIRE_VERSION` is now `3`** — upgrade **all readers/standbys to v3 first,
+  before the leader emits the new snapshot format**: `SnapshotWire`/`FidelityWireRows` are
+  `deny_unknown_fields` and `ConfigData` has no `#[serde(default)]`, so both the old-reader/new-writer
+  and new-reader/old-writer directions fail with a serde error (not the intended `WireVersion` gate)
+  at the same version. See `dev-docs/design-sub-tenant.md` and
+  `dev-docs/aegis/plans/2026-09-18-sub-tenant.md`.
 - **The admission queue is fully wired and opt-in** — to use it, set the 3 fields on a `provider` row;
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,

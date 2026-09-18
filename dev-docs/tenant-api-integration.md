@@ -9,13 +9,15 @@
 
 ## 1. 你能用它做什么
 
-三个端点，都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
+五个端点，都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
 
 | 端点 | 方法 | 用途 |
 |---|---|---|
 | `/tenant/{tenant_id}/api/v1/whoami` | `GET` | 读你自己当前的配置：绑定域名、`auth_url`、是否被停用、配置版本 |
 | `/tenant/{tenant_id}/api/v1/auth/cache/invalidate` | `POST` | **让某个/全部客户端 key 立刻重新鉴权**（欠费停机、付费恢复、封禁某个 key） |
 | `/tenant/{tenant_id}/api/v1/usage` | `GET` | 查某个时间窗内你实际产生了多少请求/token |
+| `/tenant/{tenant_id}/api/v1/sub-tenants` | `GET` | 只读列出**你自己且启用中的**子租户（前缀、启用状态、配置版本；已停用的不返回） |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `GET` | 只读列出**你自己**的子租户路由（`model → provider`、默认路由、配置版本） |
 
 **明确没有的能力**（不是漏做，是刻意不做）：
 
@@ -53,7 +55,7 @@ curl -s "$HYDRA/tenant/$TID/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-0
 2. 服务端只存 **SHA-256 摘要**，**永远不会回显明文**。所以**丢了只能让运维轮换**（换一个新值即完成轮换）。
 3. 最短 16 个字符。建议 `openssl rand -hex 32` 生成。
 4. 这是**你的**凭证，不是客户端的 api-key：
-   - 它放在 `Authorization: Bearer` 里，只用于调用本文的三个端点；
+    - 它放在 `Authorization: Bearer` 里，只用于调用本文的五个端点；
    - 它**不会**被当成客户端 key 去鉴权，也不会写进用量记录（见 §8.4）；
    - **不要**把它发给你的终端用户或用在前端代码里。
 
@@ -95,11 +97,11 @@ Authorization: Bearer <tenant access token>
 
 ### 4.4 方法约定
 
-三个端点方法固定；用错方法 → `405 method_not_allowed`。保留前缀下**任何**不是这三条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
+五个端点方法固定；用错方法 → `405 method_not_allowed`。保留前缀下**任何**不是这五条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
 
 ### 4.5 幂等性
 
-- `GET` 两个端点天然幂等。
+- 所有 `GET` 端点（`whoami` / `usage` / `sub-tenants` / `sub-tenant-routes`）天然幂等。
 - `POST auth/cache/invalidate` **幂等**：重复调用只是重复"清掉本来就已经没有的东西"。所以重试安全。
 - `invalidated` 是**本节点实际删掉的条数**，重复调用会变 0，这**不是**失败：那些 key 下次请求本来就会回源。
 
@@ -130,7 +132,7 @@ Authorization: Bearer <tenant access token>
 | 字段 | 说明 |
 |---|---|
 | `tenant_id` / `name` | 你的标识与名称 |
-| `enabled` | **你当前是否被停用**。`false` 时你的客户端请求会被拒绝，但你**仍然可以使用本 API 的三个端点**（自救路径，见 §7.1） |
+| `enabled` | **你当前是否被停用**。`false` 时你的客户端请求会被拒绝，但你**仍然可以使用本 API 的这些端点**（自救路径，见 §7.1） |
 | `domain` | 你现在绑定的域名，即你的客户端实际请求的 `Host`。**只读**：要改找运维 |
 | `auth_url` | Hydra 把你的客户端 api-key 发到哪里校验。**只读**：要改找运维 |
 | `config_version` | 本次鉴权所依据的**配置快照版本**。你刚让运维改了什么，可以轮询这个字段判断"改动是否已生效"，而不用猜 |
@@ -299,6 +301,54 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 
 > **结果过大会返回 `503 usage_store_unavailable`，且重试无效。** 当聚合结果过大（很宽的 `group_by` 叠加很长的窗口）超过网关的响应体上限时，读会失败并返回 `503 usage_store_unavailable`——这不是"重试就好"的故障：缩小 `since`/`until`，或降低 `group_by` 的基数（例如用 `group_by=day` 代替高基数的 `group_by=model`）才有效。
 
+### 5.4 `GET /tenant/{tenant_id}/api/v1/sub-tenants`
+
+只读列出**你自己**的子租户。**只读快照、不查库、不访问你的 `auth_url`**，所以在任何节点（含边缘节点）都是瞬时的。只返回 `tenant_id` 与你一致的行——你**永远看不到**别的租户的子租户。
+
+**只返回启用中的子租户**（快照本身只载入 enabled 行；已停用的子租户及其路由不会出现在本视图）。如需审计停用的配置，请联系运维用管理 API（`/api/v1/sub-tenants`）查看。
+
+```json
+{
+  "config_version": 42,
+  "sub_tenants": [
+    { "id": "st_acme_1", "tenant_id": "t_acme", "name": "Acme 内部",
+      "key_prefix": "QQCX_", "enabled": true,
+      "created_at": "2026-09-18T08:00:00Z", "updated_at": "2026-09-18T08:00:00Z" }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `config_version` | 本次读取所依据的**配置快照版本**（与 `whoami` 同义，可用来判断你的改动是否已生效） |
+| `sub_tenants` | 你本租户**启用中**的子租户，按配置顺序排列 |
+| `sub_tenants[].key_prefix` | 该子租户的 client api-key 前缀（**路由选择器**，不是机密，见 §7.6） |
+| `sub_tenants[].enabled` | 该子租户是否启用 |
+
+### 5.5 `GET /tenant/{tenant_id}/api/v1/sub-tenant-routes`
+
+只读列出**你自己**的子租户路由（`model → provider`）。**只读快照、不查库**，任何节点（含边缘）瞬时。路由行只带 `sub_tenant_id`，租户作用域是**经其子租户的 `tenant_id` 间接**判定的——别人的子租户下的路由**永远**不会出现。
+
+```json
+{
+  "config_version": 42,
+  "sub_tenant_routes": [
+    { "id": "str_acme_1", "sub_tenant_id": "st_acme_1", "model_key": null,
+      "provider_id": "p_acme", "enabled": true,
+      "created_at": "2026-09-18T08:00:00Z", "updated_at": "2026-09-18T08:00:00Z" }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `config_version` | 本次读取所依据的**配置快照版本** |
+| `sub_tenant_routes` | 你本租户子租户**启用中**的路由，按配置顺序排列 |
+| `sub_tenant_routes[].model_key` | 非空 = 该 model 专属路由；`null` = 该子租户**默认路由**（两级） |
+| `sub_tenant_routes[].provider_id` | 命中该前缀 + 该 model（或默认）时收窄到的 provider |
+
+> 这两个端点是**只读**的：要创建/修改/删除子租户或路由，由运维通过管理 API（`/api/v1/sub-tenants`、`/api/v1/sub-tenant-routes`）操作，见 `ops.md` §5.5。
+
 ---
 
 ## 6. 错误码总表
@@ -308,7 +358,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `unauthorized` | 401 | 令牌缺失 / 错误 / 该租户未配置令牌（三者文案相同） | 否（先检查令牌） |
 | `tenant_id_mismatch` | 403 | 令牌归属与 URL 里的 `tenant_id` 不一致 | 否（检查 base URL） |
 | `not_ready` | 503 | 该节点还没有配置快照 | **是** |
-| `not_found` | 404 | 保留前缀下不是这三条路由的路径 | 否（检查路径拼写） |
+| `not_found` | 404 | 保留前缀下不是这五条路由的路径 | 否（检查路径拼写） |
 | `method_not_allowed` | 405 | 方法用错 | 否 |
 | `rate_limited` | 429 | 触发频率上限（见 §7.2），带 `Retry-After` | **是**（等 `Retry-After`） |
 | `payload_too_large` | 413 | 请求体超过 1 MiB | 否 |
@@ -329,7 +379,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 
 ### 7.1 被停用（欠费停机）之后还能做什么
 
-`whoami` 里的 `enabled` 变成 `false` 之后，你的**客户端请求**会被拒绝，但**这三个端点全部照常可用**（有测试守着这一点）。这是刻意的：停用是**你的**策略（通过你的 `auth_url` 表达），如果你连恢复路径都进不去，就无法自助恢复。
+`whoami` 里的 `enabled` 变成 `false` 之后，你的**客户端请求**会被拒绝，但**这些端点全部照常可用**（有测试守着这一点）。这是刻意的：停用是**你的**策略（通过你的 `auth_url` 表达），如果你连恢复路径都进不去，就无法自助恢复。
 
 典型恢复流程：
 
@@ -384,6 +434,21 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 - `requests` 在 ClickHouse 部署下是**近似值**（见 §5.3 边界 2）。
 - 计量存储的保留期由运维决定，超出保留期的历史查不到，会表现为"该窗口没有记录"（`as_of: null`），而不是报错。
 
+### 7.6 子租户前缀的语义边界（**必读**）
+
+你看到 `sub-tenants` / `sub-tenant-routes` 返回的前缀和路由后，请理解这三条边界：
+
+1. **前缀不是身份、也不是秘密。** 任何调用方都可以出示任意前缀的 key，但路由**永远**受
+   `model ∩ 你被授权的 provider` 约束（运行时 backstop），且**认证始终发生在你的 `auth_url`**——
+   拿别人前缀的假 key 仍要过你的鉴权。因此**按子租户的归因可信度 = 你自己发 key 的纪律**
+   （你给哪个子租户发了什么前缀的 key，是只有你知道的）。Hydra 不铸造、不验证 key 的归属。
+2. **停用 / 删除子租户 ≠ 吊销。** 删掉一个子租户只是**停止按它的前缀 steering**；那些 key 仍
+   **照常走默认管线**（认证仍过你的 `auth_url`）。**吊销 key 永远是你 `auth_url` 的职责**，
+   不是 Hydra 删子租户的行为。不要以为"删了子租户 = 这些 key 失效了"。
+3. **edge 陈旧窗口。** 路由/子租户变更经控制面轮询收敛（**~1s** + 版本防倒退）；变更之后可能
+   **短暂仍按旧路由**——与一切配置变更同性质。需要立即生效时，确认快照版本已推进
+   （用 `whoami` / 上述端点的 `config_version` 对照）。
+
 ---
 
 ## 8. 排障
@@ -392,7 +457,7 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 |---|---|---|
 | `401 unauthorized` | 令牌写错/被轮换/该租户没配令牌 | 核对令牌；确认运维没给你轮换过 |
 | `403 tenant_id_mismatch` | URL 里的 `tenant_id` 和令牌不是同一个租户 | 用 `whoami` 返回的 `tenant_id` 拼 URL（`base_url` 字段直接给了前缀） |
-| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这三条之内） | 对照 §1 的路径表 |
+| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这五条之内） | 对照 §1 的路径表 |
 | `405 method_not_allowed` | 方法用错（例如用 GET 调 invalidate） | `GET` whoami/usage；`POST` invalidate |
 | `429 rate_limited` | 触发限流或锁定 | 读 `Retry-After` 再重试。持**有效令牌**时，429 只会来自每租户**已授权**频率（60/分钟）或失效频率（10/分钟）上限；**失败**锁定（按来源 IP / 令牌摘要）只拦**错误**令牌的来源，不会拦对令牌 |
 | `503 not_ready` | 该节点还没拿到配置快照 | 重试（会落到其他节点） |
@@ -419,6 +484,8 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 GET  {HYDRA}/tenant/{TID}/api/v1/whoami
 POST {HYDRA}/tenant/{TID}/api/v1/auth/cache/invalidate[?wait=converged|none][&timeout_ms=1..60000]
 GET  {HYDRA}/tenant/{TID}/api/v1/usage?since=<必填>[&until=][&group_by=none|model|provider|day]
+GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenants
+GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes
 
 Header: Authorization: Bearer <tenant access token>
 Trace:  响应头 X-Hydra-Trace-Id，报障必带
