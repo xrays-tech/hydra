@@ -732,3 +732,285 @@ fn catalog_deterministic_sort() {
         "entries by model asc, providers by id asc"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T4 — sub-tenant route gate (3.6) + catalog mirror (design-sub-tenant.md §4.1,
+// ruling a′: operator binding wins; otherwise intersect with the sub-tenant
+// route's provider, fail-closed; no match ⇒ unchanged).
+// Same fixtures/builders as above; tenant_id = "t_acme".
+// ---------------------------------------------------------------------------
+
+fn sub_tenant(
+    id: &str,
+    tenant_id: &str,
+    key_prefix: &str,
+    enabled: bool,
+) -> hydra_core::model::SubTenant {
+    hydra_core::model::SubTenant {
+        id: id.into(),
+        tenant_id: tenant_id.into(),
+        name: format!("{id} name"),
+        key_prefix: key_prefix.into(),
+        enabled,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    }
+}
+
+fn sub_tenant_route(
+    id: &str,
+    sub_tenant_id: &str,
+    model_key: Option<&str>,
+    provider_id: &str,
+    enabled: bool,
+) -> hydra_core::model::SubTenantRoute {
+    hydra_core::model::SubTenantRoute {
+        id: id.into(),
+        sub_tenant_id: sub_tenant_id.into(),
+        model_key: model_key.map(|m| m.to_string()),
+        provider_id: provider_id.into(),
+        enabled,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    }
+}
+
+/// T4 — a model-specific sub-tenant route restricts the candidate set to the
+/// routed provider.
+#[test]
+fn resolve_sub_tenant_model_route_restricts() {
+    let mut cfg = base_cfg();
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", Some("gpt-4o"), "p_b", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands =
+        resolve(&cfg, &b, &tenant, "gpt-4o", Some("QQCX_123")).expect("model-specific route");
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_b".into()]));
+}
+
+/// T4 — a default sub-tenant route (`model_key = None`) applies to a specific
+/// model (model-specific wins, else default fallback) and restricts the
+/// candidate set to the routed provider.
+#[test]
+fn resolve_sub_tenant_default_route_restricts() {
+    let mut cfg = base_cfg();
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_c", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", Some("QQCX_123")).expect("default route");
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_c".into()]));
+}
+
+/// T4 — within a sub-tenant a model-specific route wins over the default route
+/// for that model; a model with no model-specific route falls back to the
+/// default.
+#[test]
+fn resolve_sub_tenant_model_overrides_default() {
+    let mut cfg = base_cfg();
+    // A second model served by all three providers so the default route can
+    // steer it.
+    cfg.tenant_models
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("gpt-5".into());
+    cfg.models_by_key.insert(
+        "gpt-5".into(),
+        vec![
+            ModelProvider {
+                provider_id: "p_a".into(),
+                weight: 1,
+            },
+            ModelProvider {
+                provider_id: "p_b".into(),
+                weight: 1,
+            },
+            ModelProvider {
+                provider_id: "p_c".into(),
+                weight: 1,
+            },
+        ],
+    );
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    // Model-specific for gpt-4o → p_a; default → p_c.
+    cfg.sub_tenant_routes.push(sub_tenant_route(
+        "r_model",
+        "st1",
+        Some("gpt-4o"),
+        "p_a",
+        true,
+    ));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r_default", "st1", None, "p_c", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    // gpt-4o → the model-specific route wins (p_a), not the default (p_c).
+    let cands =
+        resolve(&cfg, &b, &tenant, "gpt-4o", Some("QQCX_123")).expect("model-specific wins");
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_a".into()]));
+    // gpt-5 → no model-specific route, so the default (p_c) applies.
+    let cands5 = resolve(&cfg, &b, &tenant, "gpt-5", Some("QQCX_123")).expect("default fallback");
+    assert_eq!(resolve_set(&cands5), HashSet::from(["p_c".into()]));
+}
+
+/// T4 (a′) — operator binding wins: when an operator key-prefix binding
+/// matches, the sub-tenant route gate is skipped entirely.
+#[test]
+fn resolve_sub_tenant_operator_binding_wins() {
+    let mut cfg = base_cfg();
+    // Operator binding and sub-tenant route share the same prefix; the
+    // operator's explicit disposition must win.
+    cfg.key_prefix_bindings
+        .push(binding("b1", "sk_aaa_", "p_a", true));
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "sk_aaa_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_b", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands =
+        resolve(&cfg, &b, &tenant, "gpt-4o", Some("sk_aaa_123")).expect("operator binding wins");
+    // Restricted to the operator-bound provider (p_a), NOT the sub-tenant
+    // route's provider (p_b).
+    assert_eq!(resolve_set(&cands), HashSet::from(["p_a".into()]));
+}
+
+/// T4 — a key that matches no sub-tenant prefix leaves routing unchanged
+/// (opt-in steering, not a whitelist).
+#[test]
+fn resolve_sub_tenant_prefix_mismatch_unchanged() {
+    let mut cfg = base_cfg();
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_b", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands = resolve(&cfg, &b, &tenant, "gpt-4o", Some("OTHER_123")).expect("no prefix match");
+    assert_eq!(
+        resolve_set(&cands),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()]),
+        "no sub-tenant prefix match → unrestricted"
+    );
+}
+
+/// T4 (Q11) — fail-closed: the sub-tenant route's provider does not serve the
+/// model ⇒ `NoAvailableProvider` for that prefix.
+#[test]
+fn resolve_sub_tenant_route_provider_not_serving_fails_closed() {
+    let mut cfg = base_cfg();
+    // p_d is authorised for the tenant but does NOT serve gpt-4o.
+    cfg.tenant_providers
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("p_d".into());
+    cfg.providers.insert("p_d".into(), provider("p_d", 1));
+    cfg.provider_keys.insert("p_d".into(), vec!["sk-d".into()]);
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    // Default route pins the sub-tenant to p_d, which does not serve gpt-4o.
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_d", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let err = resolve(&cfg, &b, &tenant, "gpt-4o", Some("QQCX_123")).unwrap_err();
+    assert_eq!(err, RouteError::NoAvailableProvider);
+}
+
+/// T4 — a disabled sub-tenant is ignored (no steering).
+#[test]
+fn resolve_sub_tenant_disabled_ignored() {
+    let mut cfg = base_cfg();
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", false));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_b", true));
+    let tenant = tenant();
+    let b = alive_breaker();
+    let cands =
+        resolve(&cfg, &b, &tenant, "gpt-4o", Some("QQCX_123")).expect("disabled → no restriction");
+    assert_eq!(
+        resolve_set(&cands),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()]),
+        "disabled sub-tenant is ignored"
+    );
+}
+
+/// T4 — catalog mirror: a sub-tenant route narrows the catalog to the routed
+/// provider; a model served only by other providers drops out.
+#[test]
+fn catalog_sub_tenant_restricts() {
+    let mut cfg = base_cfg();
+    // gpt-5 is served only by p_b ⇒ vanishes once the key is steered to p_a.
+    cfg.tenant_models
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("gpt-5".into());
+    cfg.models_by_key.insert(
+        "gpt-5".into(),
+        vec![ModelProvider {
+            provider_id: "p_b".into(),
+            weight: 1,
+        }],
+    );
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_a", true));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", Some("QQCX_123"));
+    assert_eq!(entries.len(), 1, "only gpt-4o survives steering to p_a");
+    assert_eq!(entries[0].model, "gpt-4o");
+    assert_eq!(entries[0].providers, vec!["p_a".to_string()]);
+}
+
+/// T4 — catalog mirror: a key that matches no sub-tenant prefix leaves the
+/// catalog unrestricted.
+#[test]
+fn catalog_sub_tenant_no_match_unchanged() {
+    let mut cfg = base_cfg();
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_a", true));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", Some("OTHER_123"));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].model, "gpt-4o");
+    assert_eq!(
+        entries[0].providers,
+        vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string()],
+        "no prefix match → unrestricted catalog"
+    );
+}
+
+/// T4 (Q11) — catalog mirror fail-closed: when the sub-tenant route's provider
+/// does not serve a model, that model is dropped from the catalog.
+#[test]
+fn catalog_sub_tenant_fail_closed_drops_model() {
+    let mut cfg = base_cfg();
+    // p_d is authorised for the tenant but does NOT serve gpt-4o.
+    cfg.tenant_providers
+        .get_mut("t_acme")
+        .unwrap()
+        .insert("p_d".into());
+    cfg.providers.insert("p_d".into(), provider("p_d", 1));
+    cfg.provider_keys.insert("p_d".into(), vec!["sk-d".into()]);
+    cfg.sub_tenants
+        .push(sub_tenant("st1", "t_acme", "QQCX_", true));
+    // Default route pins the sub-tenant to p_d, which does not serve gpt-4o.
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route("r1", "st1", None, "p_d", true));
+    let b = alive_breaker();
+    let entries = accessible_models(&cfg, &b, "t_acme", Some("QQCX_123"));
+    assert!(
+        entries.is_empty(),
+        "gpt-4o's routed provider does not serve it → dropped (fail-closed)"
+    );
+}

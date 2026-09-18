@@ -203,6 +203,8 @@ mod tests {
             provider_models: Vec::new(),
             tenant_providers: Vec::new(),
             tenant_models: Vec::new(),
+            sub_tenants: Vec::new(),
+            sub_tenant_routes: Vec::new(),
         };
         let store = ConfigStore::from_snapshot(ConfigData::default(), kp());
         store.apply_snapshot(HydratedWire {

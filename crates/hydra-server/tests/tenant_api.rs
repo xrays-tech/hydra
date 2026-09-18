@@ -743,6 +743,8 @@ async fn whoami_works_on_an_edge_from_the_snapshot_alone() {
             provider_models: vec![],
             tenant_providers: vec![],
             tenant_models: vec![],
+            sub_tenants: vec![],
+            sub_tenant_routes: vec![],
         },
     });
 
@@ -1647,4 +1649,367 @@ async fn get_tenant_json(root: &str, tenant: &str, token: &str, suffix: &str) ->
         }
     }
     panic!("proxy never became ready at {url}");
+}
+
+// ---------------------------------------------------------------------------
+// T7 — E4 `GET /sub-tenants` and `GET /sub-tenant-routes`
+//       (read-only, snapshot-fed; an edge with no DB serves them)
+// ---------------------------------------------------------------------------
+
+/// Seed a provider plus sub-tenants and routes for BOTH `t1` and `t2`, so the
+/// isolation assertions below are non-vacuous: each tenant has rows of its own
+/// AND rows belonging to the other tenant that it must never see.
+async fn seed_sub_tenants(pool: &sqlx::SqlitePool) {
+    hydra_server::db::insert_provider(
+        pool,
+        &hydra_core::model::Provider {
+            id: "p1".into(),
+            key: "prov1".into(),
+            name: "P1".into(),
+            endpoint: "http://127.0.0.1:1/".into(),
+            weight: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("insert provider");
+
+    for (id, tenant, name, prefix) in [
+        ("st1", "t1", "st-one", "QQCX_"),
+        ("st2", "t1", "st-two", "QQCY_"),
+        ("st9", "t2", "st-other", "ZZZZ_"),
+    ] {
+        hydra_server::db::insert_sub_tenant(
+            pool,
+            &hydra_core::model::SubTenant {
+                id: id.into(),
+                tenant_id: tenant.into(),
+                name: name.into(),
+                key_prefix: prefix.into(),
+                enabled: true,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("insert sub-tenant");
+    }
+
+    // `st1` (t1) has two routes: one model-specific and the default (`None`).
+    // `st9` (t2) has one. `st2` (t1) has none.
+    for (id, st, model) in [
+        ("r1", "st1", Some("gpt-4".to_string())),
+        ("r2", "st1", None),
+        ("r9", "st9", Some("gpt-4".to_string())),
+    ] {
+        hydra_server::db::insert_sub_tenant_route(
+            pool,
+            &hydra_core::model::SubTenantRoute {
+                id: id.into(),
+                sub_tenant_id: st.into(),
+                model_key: model,
+                provider_id: "p1".into(),
+                enabled: true,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .expect("insert sub-tenant route");
+    }
+}
+
+/// T7: `GET /sub-tenants` answers from the snapshot (no DB), returns only the
+/// tenant's own rows, and carries the snapshot `config_version` as the v2
+/// reconciliation baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_sub_tenants_returns_only_the_tenants_own_rows() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    seed_sub_tenants(&pool).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let expected_version = state.store.version();
+    let root = start_proxy(state);
+    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
+    assert_eq!(status, 200, "got {v}");
+    // The version the snapshot was read at — the reconciliation baseline a
+    // tenant polls to see when its change is live.
+    assert_eq!(
+        v["config_version"].as_u64(),
+        Some(expected_version),
+        "the response must carry the snapshot version: {v}"
+    );
+    // t1 sees exactly its two sub-tenants, never t2's.
+    let arr = v["sub_tenants"].as_array().expect("sub_tenants array");
+    assert_eq!(arr.len(), 2, "got {v}");
+    let names: Vec<&str> = arr
+        .iter()
+        .map(|x| x["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        names.contains(&"st-one") && names.contains(&"st-two"),
+        "got {names:?}"
+    );
+    assert!(
+        names.iter().all(|n| *n != "st-other"),
+        "t2's sub-tenant leaked into t1's view: {v}"
+    );
+}
+
+/// T7: `GET /sub-tenant-routes` answers from the snapshot and returns only the
+/// routes whose sub-tenant belongs to the caller's tenant. A route is
+/// tenant-scoped THROUGH its sub-tenant, so another tenant's route can never
+/// appear — even though the route row itself names no `tenant_id`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_sub_tenant_routes_returns_only_the_tenants_own_routes() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    seed_sub_tenants(&pool).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let expected_version = state.store.version();
+    let root = start_proxy(state);
+    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenant-routes").await;
+    assert_eq!(status, 200, "got {v}");
+    assert_eq!(
+        v["config_version"].as_u64(),
+        Some(expected_version),
+        "the response must carry the snapshot version: {v}"
+    );
+    // t1's sub-tenant `st1` has two routes (one model-specific, one default);
+    // `st2` has none; t2's `r9` (via `st9`) must NOT appear.
+    let arr = v["sub_tenant_routes"]
+        .as_array()
+        .expect("sub_tenant_routes array");
+    assert_eq!(arr.len(), 2, "got {v}");
+    let sub_ids: Vec<&str> = arr
+        .iter()
+        .map(|x| x["sub_tenant_id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        sub_ids.iter().all(|s| *s == "st1"),
+        "only t1's own sub-tenant's routes may appear: {v}"
+    );
+    assert!(
+        arr.iter().any(|x| x["model_key"].is_null()),
+        "the default route must be present: {v}"
+    );
+    assert!(
+        arr.iter()
+            .any(|x| x["model_key"] == serde_json::json!("gpt-4")),
+        "the model-specific route must be present: {v}"
+    );
+}
+
+/// T7: like every tenant endpoint, both read-only endpoints sit behind the same
+/// token gate — no token is a 401 from the gate, never a fall-through to the
+/// proxy pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_read_only_endpoints_require_a_token() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let c = client();
+    for endpoint in ["sub-tenants", "sub-tenant-routes"] {
+        let (status, v) = body_json(
+            send_until_ready(
+                &c,
+                &format!("{root}/tenant/t1/api/v1/{endpoint}"),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, 401, "{endpoint}: got {v}");
+        assert_eq!(v["error"]["code"], "unauthorized", "{endpoint}: {v}");
+    }
+}
+
+/// T7: the whole security property of the read-only view. A tenant sees ONLY
+/// its own sub-tenants and routes; `t2` must not read `t1`'s rows, and the gate
+/// still enforces the URL cross-check (`t1`'s token on `t2`'s URL is a 403).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_read_only_view_is_scoped_to_the_authenticated_tenant() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    seed_sub_tenants(&pool).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    // t2 sees exactly its own sub-tenant (st-other) — never t1's two.
+    let (s, v) = get_tenant_json(&root, "t2", OTHER_TOKEN, "sub-tenants").await;
+    assert_eq!(s, 200, "got {v}");
+    let arr = v["sub_tenants"].as_array().expect("array");
+    assert_eq!(arr.len(), 1, "t2 must see only its own sub-tenant: {v}");
+    assert_eq!(arr[0]["name"], "st-other");
+    assert_eq!(arr[0]["tenant_id"], "t2", "the row must belong to t2: {v}");
+
+    // t2 sees exactly its own route (r9, via st9) — never t1's routes.
+    let (s2, v2) = get_tenant_json(&root, "t2", OTHER_TOKEN, "sub-tenant-routes").await;
+    assert_eq!(s2, 200, "got {v2}");
+    let arr2 = v2["sub_tenant_routes"].as_array().expect("array");
+    assert_eq!(arr2.len(), 1, "t2 must see only its own route: {v2}");
+    assert_eq!(arr2[0]["sub_tenant_id"], "st9");
+    assert_eq!(arr2[0]["id"], "r9");
+
+    // The gate still enforces the URL cross-check: t1's token on t2's URL is 403.
+    let (s3, v3) = get_tenant_json(&root, "t2", TENANT_TOKEN, "sub-tenants").await;
+    assert_eq!(s3, 403, "a token for another tenant must be 403: {v3}");
+    assert_eq!(v3["error"]["code"], "tenant_id_mismatch", "got {v3}");
+}
+
+/// T7: a suspended (disabled) tenant still reads its own sub-tenant view —
+/// self-recovery depends on it, exactly as for `whoami`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspended_tenant_can_still_list_its_sub_tenants() {
+    let pool = common::setup_pool().await;
+    // `t2` is seeded so the fixture's cross-tenant rows have their tenant to
+    // reference (the assertion is purely about the suspended `t1`).
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    seed_sub_tenants(&pool).await;
+    let mut t = hydra_server::db::get_tenant(&pool, "t1")
+        .await
+        .expect("get");
+    t.enabled = false;
+    hydra_server::db::update_tenant(&pool, &t)
+        .await
+        .expect("disable");
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
+    assert_eq!(
+        status, 200,
+        "a suspended tenant must still read its own state: {v}"
+    );
+    let arr = v["sub_tenants"].as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "the two enabled sub-tenants are still listed: {v}"
+    );
+}
+
+/// T7: an EDGE node has no local database. The two read-only endpoints must
+/// still answer, from the replicated snapshot alone — the same property that
+/// makes `whoami` work on an edge, and the whole point of "snapshot-fed": an
+/// edge with no DB serves the tenant's own sub-tenant view locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_read_only_endpoints_work_on_an_edge_from_the_snapshot_alone() {
+    use hydra_server::cluster::content::FidelityRows;
+    use hydra_server::cluster::snapshot::HydratedWire;
+
+    let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
+        Arc::new(StaticKeyProvider::new([7u8; 32], 1));
+
+    // The replica shape: a store with NO pool, fed one snapshot.
+    let store = ConfigStore::from_snapshot(hydra_core::config::ConfigData::default(), kp);
+    let mut cfg = hydra_core::config::ConfigData::default();
+    let t = Tenant {
+        id: "t1".into(),
+        name: "edge-tenant".into(),
+        domain: "edge.example".into(),
+        auth_url: "https://auth.edge.example/verify".into(),
+        cert_key: None,
+        cert_file: None,
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    cfg.tenants_by_domain.insert(t.domain.clone(), t);
+    let st = hydra_core::model::SubTenant {
+        id: "st1".into(),
+        tenant_id: "t1".into(),
+        name: "edge-sub".into(),
+        key_prefix: "QQCX_".into(),
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    cfg.sub_tenants.push(st.clone());
+    let route = hydra_core::model::SubTenantRoute {
+        id: "r1".into(),
+        sub_tenant_id: "st1".into(),
+        model_key: None, // the default route
+        provider_id: "p1".into(),
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    cfg.sub_tenant_routes.push(route.clone());
+    // `hydrate` does this in production; here we are the producer of the wire.
+    cfg.reindex_tenants();
+    store.apply_snapshot(HydratedWire {
+        version: 9,
+        cfg,
+        fidelity: FidelityRows {
+            limit_roles: vec![],
+            key_prefix_bindings: vec![],
+            provider_keys: vec![],
+            tenant_token_hashes: vec![(
+                "t1".to_string(),
+                sha256_hex_string(TENANT_TOKEN.as_bytes()),
+            )],
+            provider_models: vec![],
+            tenant_providers: vec![],
+            tenant_models: vec![],
+            sub_tenants: vec![st],
+            sub_tenant_routes: vec![route],
+        },
+    });
+
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("checker"),
+    );
+    let state = AppState::for_tests(
+        store,
+        auth,
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
+        Arc::new(RateLimiter::new()),
+        Arc::new(NoopSink) as Arc<dyn UsageSink>,
+        ProxyConfig::default(),
+        TenantApiConfig::default(),
+    );
+    let root = start_proxy(state);
+
+    // The edge serves both read-only endpoints from its snapshot alone.
+    let (s1, v1) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
+    assert_eq!(
+        s1, 200,
+        "an edge must serve /sub-tenants from its snapshot: {v1}"
+    );
+    assert_eq!(
+        v1["config_version"].as_u64(),
+        Some(9),
+        "the snapshot version: {v1}"
+    );
+    let arr1 = v1["sub_tenants"].as_array().expect("array");
+    assert_eq!(arr1.len(), 1);
+    assert_eq!(arr1[0]["name"], "edge-sub");
+
+    let (s2, v2) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenant-routes").await;
+    assert_eq!(
+        s2, 200,
+        "an edge must serve /sub-tenant-routes from its snapshot: {v2}"
+    );
+    assert_eq!(
+        v2["config_version"].as_u64(),
+        Some(9),
+        "the snapshot version: {v2}"
+    );
+    let arr2 = v2["sub_tenant_routes"].as_array().expect("array");
+    assert_eq!(arr2.len(), 1);
+    assert_eq!(arr2[0]["id"], "r1");
 }

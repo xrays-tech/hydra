@@ -170,24 +170,51 @@ fn the_three_endpoints_parse() {
     );
 }
 
+/// T7.1: the two read-only sub-tenant endpoints parse. They are FLAT paths
+/// (`api/v1/sub-tenants`, `api/v1/sub-tenant-routes`), matching the admin
+/// resource shape, so `parse_route` keeps returning the same
+/// `(tenant_id, endpoint)` pair — no new `TenantApiRoute` shape.
+#[test]
+fn the_sub_tenant_endpoints_parse() {
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/sub-tenants"),
+        Some(TenantApiRoute {
+            endpoint: Endpoint::ListSubTenants,
+            tenant_id: "t1"
+        })
+    );
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/sub-tenant-routes"),
+        Some(TenantApiRoute {
+            endpoint: Endpoint::ListSubTenantRoutes,
+            tenant_id: "t1"
+        })
+    );
+}
+
 #[test]
 fn near_misses_do_not_parse() {
     for bad in [
-        "/tenant//api/v1/whoami",         // empty tenant id
-        "/tenant/a/b/api/v1/whoami",      // tenant id contains '/'
-        "/tenant/t1/api/v1",              // no endpoint
-        "/tenant/t1/api/v1/usage/",       // trailing slash
-        "/tenant/t1/api/v1/whoami/extra", // extra segment
-        "/tenant/t1/api/v2/whoami",       // wrong version
-        "/tenant/t1/api/v1/models",       // not one of ours
-        "/tenant/t1/api/v1/typo",         // typo
-        "/tenant/t1/api/v1/Whoami",       // case matters
-        "/tenantapi/v1/whoami",           // prefix glued
-        "/tenant/",                       // nothing after the prefix
-        "/tenant",                        // no prefix slash
-        "/v1/chat/completions",           // ordinary data-plane path
-        "",                               // empty
-        "/",                              // root
+        "/tenant//api/v1/whoami",               // empty tenant id
+        "/tenant/a/b/api/v1/whoami",            // tenant id contains '/'
+        "/tenant/t1/api/v1",                    // no endpoint
+        "/tenant/t1/api/v1/usage/",             // trailing slash
+        "/tenant/t1/api/v1/whoami/extra",       // extra segment
+        "/tenant/t1/api/v2/whoami",             // wrong version
+        "/tenant/t1/api/v1/models",             // not one of ours
+        "/tenant/t1/api/v1/typo",               // typo
+        "/tenant/t1/api/v1/Whoami",             // case matters
+        "/tenant/t1/api/v1/sub-tenant",         // one char short of `sub-tenants`
+        "/tenant/t1/api/v1/sub-tenants/",       // trailing slash
+        "/tenant/t1/api/v1/sub-tenants/1",      // an item id is not a route
+        "/tenant/t1/api/v1/sub-tenant-route",   // one char short of `sub-tenant-routes`
+        "/tenant/t1/api/v1/sub-tenant-routes/", // trailing slash
+        "/tenantapi/v1/whoami",                 // prefix glued
+        "/tenant/",                             // nothing after the prefix
+        "/tenant",                              // no prefix slash
+        "/v1/chat/completions",                 // ordinary data-plane path
+        "",                                     // empty
+        "/",                                    // root
     ] {
         assert!(parse_route(bad).is_none(), "{bad:?} must not parse");
     }

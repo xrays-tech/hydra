@@ -24,21 +24,23 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
+use hydra_core::config::ConfigData;
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
-    TenantProvider, UsageRecord,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
+    Tenant, TenantModel, TenantProvider, UsageRecord,
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
-use hydra_server::proxy::config::ProxyConfig;
+use hydra_server::proxy::config::{NonRouteStrategy, ProxyConfig};
 use hydra_server::proxy::limiter::RateLimiter;
 use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::store::ConfigStore;
@@ -3322,4 +3324,266 @@ async fn non_route_strategy_reject_refuses_a_model_less_body() {
         "the default Passthrough must keep working"
     );
     let _ = resp.text().await;
+}
+
+// ===========================================================================
+// T5 — model-less passthrough (3.6) sub-tenant default-route gate (Q10).
+//
+// The passthrough path (`passthrough_candidates`) applies the operator
+// key-prefix binding (3.5) and — only when that does NOT match — the sub-tenant
+// DEFAULT route (Q10: there is no model on this path, so model-specific routes
+// never apply). These tests drive a real model-less request through the proxy
+// and assert the narrowing and its fail-closed semantics.
+//
+// The `ConfigData` is built by hand and injected via `ConfigStore::from_snapshot`
+// because the DB loader's sub-tenant projection is a separate (T3) lane; this
+// keeps the passthrough tests independent of it.
+// ===========================================================================
+
+/// A single provider (weight 1, endpoint pointed at `endpoint`).
+fn provider_cfg(id: &str, endpoint: &str) -> Provider {
+    Provider {
+        id: id.into(),
+        key: format!("k_{id}"),
+        name: id.into(),
+        endpoint: endpoint.into(),
+        weight: 1,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
+    }
+}
+
+/// Base passthrough config: tenant `t1` (domain `localhost`) with two providers
+/// `p1` and `p2`, both authorised and keyed. `models_by_key`/`tenant_models` are
+/// left empty — the passthrough path does not consult them (there is no model).
+fn passthrough_base_cfg(auth_url: &str, p1_endpoint: &str, p2_endpoint: &str) -> ConfigData {
+    let mut cfg = ConfigData::default();
+    let tenant = Tenant {
+        id: "t1".into(),
+        name: "t1".into(),
+        domain: "localhost".into(),
+        auth_url: auth_url.into(),
+        cert_key: None,
+        cert_file: None,
+        enabled: true,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    cfg.tenants_by_domain.insert("localhost".into(), tenant);
+    cfg.reindex_tenants();
+    cfg.providers
+        .insert("p1".into(), provider_cfg("p1", p1_endpoint));
+    cfg.providers
+        .insert("p2".into(), provider_cfg("p2", p2_endpoint));
+    cfg.tenant_providers
+        .insert("t1".into(), HashSet::from(["p1".into(), "p2".into()]));
+    cfg.provider_keys.insert("p1".into(), vec!["sk-p1".into()]);
+    cfg.provider_keys.insert("p2".into(), vec!["sk-p2".into()]);
+    cfg
+}
+
+/// A sub-tenant whose `key_prefix` matches the test client key `test-client-key`.
+fn sub_tenant_cfg(tenant_id: &str, key_prefix: &str) -> SubTenant {
+    SubTenant {
+        id: "st1".into(),
+        tenant_id: tenant_id.into(),
+        name: "st1".into(),
+        key_prefix: key_prefix.into(),
+        enabled: true,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    }
+}
+
+/// A sub-tenant route pinning the sub-tenant to `provider_id` (`model_key = None`
+/// ⇒ the sub-tenant's default route).
+fn sub_tenant_route_cfg(
+    sub_tenant_id: &str,
+    model_key: Option<&str>,
+    provider_id: &str,
+) -> SubTenantRoute {
+    SubTenantRoute {
+        id: "r1".into(),
+        sub_tenant_id: sub_tenant_id.into(),
+        model_key: model_key.map(|m| m.to_string()),
+        provider_id: provider_id.into(),
+        enabled: true,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    }
+}
+
+/// Build an `AppState` from a hand-crafted `ConfigData` (bypasses the DB loader).
+fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<AppState> {
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::from_snapshot(cfg, key_provider);
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker::new"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
+    let limiter = Arc::new(RateLimiter::new());
+    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    AppState::for_tests(
+        store,
+        auth,
+        breaker,
+        limiter,
+        sink,
+        proxy,
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    )
+}
+
+/// T5 — a model-less passthrough request whose key matches a sub-tenant DEFAULT
+/// route is narrowed to that route's provider (not the first live provider).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passthrough_sub_tenant_default_route_narrows_to_provider() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+
+    let upstream_p1 = MockServer::start().await;
+    let upstream_p2 = MockServer::start().await;
+    // p2 is the sub-tenant default-route target — it must receive the request.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p2"}"#))
+        .expect(1)
+        .mount(&upstream_p2)
+        .await;
+    // p1 is a decoy (the first live provider) — it must NOT receive the request.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p1"}"#))
+        .mount(&upstream_p1)
+        .await;
+
+    let mut cfg = passthrough_base_cfg(
+        &format!("{}/auth", auth_server.uri()),
+        &upstream_p1.uri(),
+        &upstream_p2.uri(),
+    );
+    // Sub-tenant default route → p2. The test client key is `test-client-key`,
+    // which starts with the prefix `test-client-`.
+    cfg.sub_tenants.push(sub_tenant_cfg("t1", "test-client-"));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route_cfg("st1", None, "p2"));
+
+    let proxy = ProxyConfig {
+        non_route_strategy: NonRouteStrategy::Passthrough,
+        ..ProxyConfig::default()
+    };
+    let state = build_state_from_config(cfg, proxy);
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // Model-less request (no `model` field) → passthrough path.
+    let resp = send_until_ready(
+        &client,
+        &url,
+        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "narrowed passthrough should succeed");
+    let _ = resp.text().await;
+
+    // The request went to p2 (the default-route provider), not p1 (first live).
+    let p2_hits = upstream_p2.received_requests().await.expect("recording");
+    assert!(
+        p2_hits.iter().any(|r| r.method.as_str() == "POST"),
+        "p2 (the default-route provider) must receive the request"
+    );
+    let p1_hits = upstream_p1.received_requests().await.expect("recording");
+    assert!(
+        p1_hits.is_empty(),
+        "p1 (the first live provider) must NOT receive the request: {} hits",
+        p1_hits.len()
+    );
+}
+
+/// T5 — fail-closed (Q11): when the sub-tenant DEFAULT route's provider is
+/// unavailable (keyless), a model-less passthrough request is refused (503)
+/// rather than silently allowed onto another provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passthrough_sub_tenant_default_route_fail_closed_503() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+
+    let upstream_p1 = MockServer::start().await;
+    let upstream_p2 = MockServer::start().await;
+    // p2 is the decoy that a non-fail-closed implementation would fall back to.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p2"}"#))
+        .mount(&upstream_p2)
+        .await;
+    // p1 (the default-route target) is keyless and must never be called.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p1"}"#))
+        .mount(&upstream_p1)
+        .await;
+
+    let mut cfg = passthrough_base_cfg(
+        &format!("{}/auth", auth_server.uri()),
+        &upstream_p1.uri(),
+        &upstream_p2.uri(),
+    );
+    // Make p1 unavailable (keyless) while it is the default-route target.
+    cfg.provider_keys.remove("p1");
+    cfg.sub_tenants.push(sub_tenant_cfg("t1", "test-client-"));
+    cfg.sub_tenant_routes
+        .push(sub_tenant_route_cfg("st1", None, "p1"));
+
+    let proxy = ProxyConfig {
+        non_route_strategy: NonRouteStrategy::Passthrough,
+        ..ProxyConfig::default()
+    };
+    let state = build_state_from_config(cfg, proxy);
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // Model-less request → passthrough path. The default route pins to p1,
+    // which is keyless ⇒ fail-closed (503), NOT a silent fallback to p2.
+    let resp = send_until_ready(
+        &client,
+        &url,
+        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        503,
+        "a keyless default-route provider must fail closed (503), not fall back"
+    );
+    let _ = resp.text().await;
+
+    // Neither provider may have been called — the request was refused at routing.
+    let p2_hits = upstream_p2.received_requests().await.expect("recording");
+    assert!(
+        p2_hits.is_empty(),
+        "the request must NOT silently fall back to p2: {} hits",
+        p2_hits.len()
+    );
+    let p1_hits = upstream_p1.received_requests().await.expect("recording");
+    assert!(
+        p1_hits.is_empty(),
+        "the keyless p1 must not be called: {} hits",
+        p1_hits.len()
+    );
 }

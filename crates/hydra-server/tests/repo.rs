@@ -700,3 +700,247 @@ async fn provider_key_binding_crud() {
         "binding must be CASCADE-deleted with its provider"
     );
 }
+
+/// T4.11 — sub_tenant + sub_tenant_route CRUD (design-sub-tenant.md §3.1):
+/// round-trip for both tables, `UNIQUE(tenant_id, name)` /
+/// `UNIQUE(tenant_id, key_prefix)` conflicts, the NULL partial-unique on default
+/// routes, and `ON DELETE CASCADE` (tenant → sub_tenants → routes, provider →
+/// routes).
+#[tokio::test]
+async fn sub_tenant_crud() {
+    let pool = common::setup_pool().await;
+    repo::insert_tenant(&pool, &tenant("t1", "acme.com", true))
+        .await
+        .expect("seed tenant");
+    repo::insert_provider(&pool, &provider("p1", "openai", 1))
+        .await
+        .expect("seed provider");
+
+    let st = hydra_core::model::SubTenant {
+        id: "st1".into(),
+        tenant_id: "t1".into(),
+        name: "alpha".into(),
+        key_prefix: "QQCX_".into(),
+        enabled: true,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    repo::insert_sub_tenant(&pool, &st).await.expect("insert");
+    assert_eq!(repo::get_sub_tenant(&pool, "st1").await.unwrap(), st);
+
+    let all = repo::list_sub_tenants(&pool).await.expect("list");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].key_prefix, "QQCX_");
+
+    // update (updated_at is server-side; assert the mutated fields + created_at).
+    let mut upd = st.clone();
+    upd.name = "alpha-renamed".into();
+    upd.key_prefix = "QQCX_V2_".into();
+    upd.enabled = false;
+    repo::update_sub_tenant(&pool, &upd).await.expect("update");
+    let got = repo::get_sub_tenant(&pool, "st1").await.unwrap();
+    assert_eq!(got.name, "alpha-renamed");
+    assert_eq!(got.key_prefix, "QQCX_V2_");
+    assert!(!got.enabled);
+    assert_eq!(
+        got.created_at, st.created_at,
+        "created_at must be preserved"
+    );
+
+    // UNIQUE(tenant_id, name) conflict.
+    let err = repo::insert_sub_tenant(
+        &pool,
+        &hydra_core::model::SubTenant {
+            id: "st2".into(),
+            tenant_id: "t1".into(),
+            name: "alpha-renamed".into(),
+            key_prefix: "ZZZ_".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect_err("duplicate (tenant_id, name)");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on (tenant_id, name), got {err:?}"
+    );
+
+    // UNIQUE(tenant_id, key_prefix) conflict.
+    let err = repo::insert_sub_tenant(
+        &pool,
+        &hydra_core::model::SubTenant {
+            id: "st3".into(),
+            tenant_id: "t1".into(),
+            name: "beta".into(),
+            key_prefix: "QQCX_V2_".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect_err("duplicate (tenant_id, key_prefix)");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on (tenant_id, key_prefix), got {err:?}"
+    );
+
+    // Routes: a model-specific route and the default (NULL) route coexist.
+    let model_route = hydra_core::model::SubTenantRoute {
+        id: "sr1".into(),
+        sub_tenant_id: "st1".into(),
+        model_key: Some("gpt-4".into()),
+        provider_id: "p1".into(),
+        enabled: true,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    let default_route = hydra_core::model::SubTenantRoute {
+        id: "sr2".into(),
+        sub_tenant_id: "st1".into(),
+        model_key: None,
+        provider_id: "p1".into(),
+        enabled: true,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    repo::insert_sub_tenant_route(&pool, &model_route)
+        .await
+        .expect("insert model route");
+    assert_eq!(
+        repo::get_sub_tenant_route(&pool, "sr1").await.unwrap(),
+        model_route
+    );
+    repo::insert_sub_tenant_route(&pool, &default_route)
+        .await
+        .expect("insert default route");
+
+    // A different non-NULL model_key coexists alongside the first.
+    let model_route2 = hydra_core::model::SubTenantRoute {
+        id: "sr3".into(),
+        sub_tenant_id: "st1".into(),
+        model_key: Some("claude-3".into()),
+        provider_id: "p1".into(),
+        enabled: true,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    repo::insert_sub_tenant_route(&pool, &model_route2)
+        .await
+        .expect("second non-NULL model_key coexists");
+
+    // Partial unique: a SECOND default (NULL) route for the same sub-tenant
+    // must conflict.
+    let err = repo::insert_sub_tenant_route(
+        &pool,
+        &hydra_core::model::SubTenantRoute {
+            id: "sr4".into(),
+            sub_tenant_id: "st1".into(),
+            model_key: None,
+            provider_id: "p1".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect_err("second default (NULL) route must conflict");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on the NULL default route, got {err:?}"
+    );
+
+    let routes = repo::list_sub_tenant_routes(&pool)
+        .await
+        .expect("list routes");
+    assert_eq!(routes.len(), 3);
+
+    // update a route.
+    let mut upd_route = model_route.clone();
+    upd_route.enabled = false;
+    repo::update_sub_tenant_route(&pool, &upd_route)
+        .await
+        .expect("update route");
+    assert!(
+        !repo::get_sub_tenant_route(&pool, "sr1")
+            .await
+            .unwrap()
+            .enabled
+    );
+
+    // delete a route.
+    repo::delete_sub_tenant_route(&pool, "sr3")
+        .await
+        .expect("delete route");
+    assert!(
+        repo::get_sub_tenant_route(&pool, "sr3").await.is_err(),
+        "route should be gone after delete"
+    );
+
+    // CASCADE: deleting a sub-tenant removes its remaining routes.
+    repo::delete_sub_tenant(&pool, "st1")
+        .await
+        .expect("delete sub-tenant");
+    assert!(
+        repo::get_sub_tenant_route(&pool, "sr1").await.is_err(),
+        "routes must be CASCADE-deleted with their sub-tenant"
+    );
+
+    // CASCADE: deleting a provider cascades a route that references it.
+    repo::insert_sub_tenant(&pool, &st)
+        .await
+        .expect("re-insert sub-tenant");
+    repo::insert_sub_tenant_route(
+        &pool,
+        &hydra_core::model::SubTenantRoute {
+            id: "sr5".into(),
+            sub_tenant_id: "st1".into(),
+            model_key: Some("gpt-4".into()),
+            provider_id: "p1".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("route on p1");
+    repo::delete_provider(&pool, "p1")
+        .await
+        .expect("delete provider");
+    assert!(
+        repo::get_sub_tenant_route(&pool, "sr5").await.is_err(),
+        "route must be CASCADE-deleted with its provider"
+    );
+
+    // CASCADE: deleting the tenant removes its sub-tenant (and its routes).
+    repo::insert_provider(&pool, &provider("p2", "azure", 1))
+        .await
+        .expect("p2 for a surviving route");
+    repo::insert_sub_tenant_route(
+        &pool,
+        &hydra_core::model::SubTenantRoute {
+            id: "sr6".into(),
+            sub_tenant_id: "st1".into(),
+            model_key: None,
+            provider_id: "p2".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("default route on p2");
+    repo::delete_tenant(&pool, "t1")
+        .await
+        .expect("delete tenant");
+    assert!(
+        repo::get_sub_tenant(&pool, "st1").await.is_err(),
+        "sub-tenant must be CASCADE-deleted with its tenant"
+    );
+    assert!(
+        repo::get_sub_tenant_route(&pool, "sr6").await.is_err(),
+        "route must be CASCADE-deleted transitively with its tenant"
+    );
+}

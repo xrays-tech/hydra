@@ -16,7 +16,9 @@ mod common;
 use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
-use hydra_core::model::{LimitRole, Provider, ProviderKeyBinding};
+use hydra_core::model::{
+    LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant,
+};
 use hydra_server::cluster::content::ReplicationContent;
 use hydra_server::cluster::snapshot::SnapshotWire;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
@@ -289,5 +291,150 @@ async fn replication_content_is_idempotent_across_loads() {
         a, b,
         "two loads of an unchanged DB must be equal — otherwise `reload_all` \
          advances the generation on every call and rebuilds every replica"
+    );
+}
+
+/// T3 — a DISABLED sub-tenant / sub-tenant-route must survive replica
+/// materialization (full-row fidelity), exactly like disabled limit roles and
+/// bindings: the runtime `ConfigData` drops them, but the fidelity rows carry
+/// them so `restore_config` rebuilds the replica byte-faithfully. A partial
+/// change (wiring the enabled-only `cfg` instead of the fidelity rows) would
+/// silently destroy the replica's disabled rows after a failover.
+#[tokio::test]
+async fn replica_materialization_keeps_disabled_sub_tenants_and_routes() {
+    let leader_pool = common::setup_pool().await;
+    // The sub_tenant / sub_tenant_route FKs require a tenant and a provider.
+    repo::insert_provider(&leader_pool, &provider("p1"))
+        .await
+        .expect("insert provider");
+    repo::insert_tenant(
+        &leader_pool,
+        &Tenant {
+            id: "t1".into(),
+            name: "T".into(),
+            domain: "acme.com".into(),
+            auth_url: "https://auth.acme.com/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("insert tenant");
+
+    let st = |id: &str, prefix: &str, enabled: bool| SubTenant {
+        id: id.into(),
+        tenant_id: "t1".into(),
+        name: format!("{id}-name"),
+        key_prefix: prefix.into(),
+        enabled,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    let sr = |id: &str, model_key: Option<&str>, enabled: bool| SubTenantRoute {
+        id: id.into(),
+        sub_tenant_id: "st-on".into(),
+        model_key: model_key.map(|s| s.into()),
+        provider_id: "p1".into(),
+        enabled,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    // One enabled + one disabled of each kind (the model-specific and the
+    // default route sit on distinct partial unique indexes, so both may exist).
+    repo::insert_sub_tenant(&leader_pool, &st("st-on", "QQCX_", true))
+        .await
+        .expect("insert enabled sub-tenant");
+    repo::insert_sub_tenant(&leader_pool, &st("st-off", "ZZZZ_", false))
+        .await
+        .expect("insert disabled sub-tenant");
+    repo::insert_sub_tenant_route(&leader_pool, &sr("sr-on", Some("gpt-4"), true))
+        .await
+        .expect("insert enabled route");
+    repo::insert_sub_tenant_route(&leader_pool, &sr("sr-off", None, false))
+        .await
+        .expect("insert disabled route");
+
+    let key_provider = kp();
+    let leader_store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
+        .await
+        .expect("ConfigStore::load");
+
+    // Precondition: the RUNTIME snapshot really does drop the disabled rows —
+    // otherwise this test would not be testing the defect it documents.
+    let runtime: ConfigData = leader_store.snapshot().as_ref().clone();
+    assert_eq!(
+        runtime.sub_tenants.len(),
+        1,
+        "the runtime snapshot keeps only the ENABLED sub-tenant"
+    );
+    assert_eq!(
+        runtime.sub_tenant_routes.len(),
+        1,
+        "the runtime snapshot keeps only the ENABLED route"
+    );
+
+    // The wire is built from the leader's replication content (FULL rows) and
+    // hydrated as a replica would.
+    let content = leader_store
+        .replication()
+        .as_deref()
+        .cloned()
+        .expect("the leader has replication content");
+    assert_eq!(
+        content.fidelity().sub_tenants.len(),
+        2,
+        "the replication content keeps BOTH sub-tenants (enabled and disabled)"
+    );
+    assert_eq!(
+        content.fidelity().sub_tenant_routes.len(),
+        2,
+        "the replication content keeps BOTH routes (enabled and disabled)"
+    );
+
+    let wire = SnapshotWire::build(&content, key_provider.as_ref())
+        .await
+        .expect("build wire");
+    // The wire is what the replica sees, so it must carry the full sets too.
+    assert_eq!(wire.fidelity.sub_tenants.len(), 2);
+    assert_eq!(wire.fidelity.sub_tenant_routes.len(), 2);
+
+    let hydrated = wire.hydrate(key_provider.as_ref()).expect("hydrate");
+
+    let replica_pool = common::setup_pool().await;
+    repo::restore_config(
+        &replica_pool,
+        key_provider.as_ref(),
+        &hydrated.cfg,
+        &hydrated.fidelity,
+        hydrated.version,
+    )
+    .await
+    .expect("restore_config");
+
+    // THE ASSERTION THAT FAILS PRE-FIX: the replica holds every row, including
+    // the disabled ones the runtime snapshot filtered out.
+    let sub_tenants = repo::list_sub_tenants(&replica_pool)
+        .await
+        .expect("sub-tenants");
+    assert_eq!(
+        sub_tenants.len(),
+        2,
+        "the replica must keep BOTH sub-tenants"
+    );
+    assert!(
+        sub_tenants.iter().any(|s| s.id == "st-off" && !s.enabled),
+        "the DISABLED sub-tenant must survive materialization"
+    );
+
+    let routes = repo::list_sub_tenant_routes(&replica_pool)
+        .await
+        .expect("routes");
+    assert_eq!(routes.len(), 2, "the replica must keep BOTH routes");
+    assert!(
+        routes.iter().any(|r| r.id == "sr-off" && !r.enabled),
+        "the DISABLED sub-tenant route must survive materialization"
     );
 }

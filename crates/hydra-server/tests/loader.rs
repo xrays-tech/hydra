@@ -518,3 +518,85 @@ async fn load_key_prefix_bindings_enabled_only() {
     assert_eq!(cfg.key_prefix_bindings[0].id, "b1");
     assert_eq!(cfg.key_prefix_bindings[0].provider_id, "p1");
 }
+
+/// T3.1 — `build_config` loads only ENABLED sub-tenants into `ConfigData` (the
+/// `key_prefix` the api-key-prefix routing gate matches on). Disabled rows stay
+/// in the DB / the fidelity rows, not the runtime snapshot.
+#[tokio::test]
+async fn load_sub_tenants_enabled_only() {
+    let pool = common::setup_pool().await;
+    // A tenant + provider are required by the sub_tenant FK.
+    repo::insert_tenant(&pool, &tenant_full("t1", "acme.com"))
+        .await
+        .expect("tenant");
+    let st = |id: &str, prefix: &str, enabled: bool| hydra_core::model::SubTenant {
+        id: id.into(),
+        tenant_id: "t1".into(),
+        name: format!("{id}-name"),
+        key_prefix: prefix.into(),
+        enabled,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    repo::insert_sub_tenant(&pool, &st("st-on", "QQCX_", true))
+        .await
+        .expect("st-on");
+    repo::insert_sub_tenant(&pool, &st("st-off", "ZZZZ_", false))
+        .await
+        .expect("st-off");
+
+    let cfg = build_config(&pool, &kp()).await.expect("build_config");
+    assert_eq!(cfg.sub_tenants.len(), 1, "only enabled sub-tenants load");
+    assert_eq!(cfg.sub_tenants[0].id, "st-on");
+    assert_eq!(cfg.sub_tenants[0].key_prefix, "QQCX_");
+}
+
+/// T3.1 — `build_config` loads only ENABLED sub-tenant routes into
+/// `ConfigData`. A model-specific row and the default (`model_key = NULL`) row
+/// are distinct rows on the same sub-tenant.
+#[tokio::test]
+async fn load_sub_tenant_routes_enabled_only() {
+    let pool = common::setup_pool().await;
+    repo::insert_tenant(&pool, &tenant_full("t1", "acme.com"))
+        .await
+        .expect("tenant");
+    repo::insert_provider(&pool, &provider("p1", "openai", 1))
+        .await
+        .expect("provider");
+    repo::insert_sub_tenant(
+        &pool,
+        &hydra_core::model::SubTenant {
+            id: "st1".into(),
+            tenant_id: "t1".into(),
+            name: "st1-name".into(),
+            key_prefix: "QQCX_".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("st1");
+    let sr = |id: &str, model_key: Option<&str>, enabled: bool| hydra_core::model::SubTenantRoute {
+        id: id.into(),
+        sub_tenant_id: "st1".into(),
+        model_key: model_key.map(|s| s.into()),
+        provider_id: "p1".into(),
+        enabled,
+        created_at: now().into(),
+        updated_at: now().into(),
+    };
+    // A model-specific (enabled) row and the default (disabled) row — they sit
+    // on distinct partial unique indexes, so both may coexist.
+    repo::insert_sub_tenant_route(&pool, &sr("sr-on", Some("gpt-4"), true))
+        .await
+        .expect("sr-on");
+    repo::insert_sub_tenant_route(&pool, &sr("sr-off", None, false))
+        .await
+        .expect("sr-off");
+
+    let cfg = build_config(&pool, &kp()).await.expect("build_config");
+    assert_eq!(cfg.sub_tenant_routes.len(), 1, "only enabled routes load");
+    assert_eq!(cfg.sub_tenant_routes[0].id, "sr-on");
+    assert_eq!(cfg.sub_tenant_routes[0].model_key.as_deref(), Some("gpt-4"));
+}

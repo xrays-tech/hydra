@@ -489,14 +489,14 @@ async fn unknown_wire_version_is_rejected() {
     let mut json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&wire).expect("ser")).expect("json");
     assert_eq!(json["wire_version"], WIRE_VERSION, "the wire is stamped");
-    json["wire_version"] = serde_json::json!(3);
+    json["wire_version"] = serde_json::json!(WIRE_VERSION + 1);
 
     let future: SnapshotWire =
         serde_json::from_value(json.clone()).expect("a same-shape wire still deserializes");
     match future.hydrate(kp.as_ref()) {
         Ok(_) => panic!("hydrate must reject an unknown wire_version"),
         Err(SnapshotError::WireVersion { found, expected }) => {
-            assert_eq!(found, 3, "the reader reports what it FOUND");
+            assert_eq!(found, WIRE_VERSION + 1, "the reader reports what it FOUND");
             assert_eq!(expected, WIRE_VERSION, "and what it supports");
         }
         Err(other) => panic!("expected SnapshotError::WireVersion, got {other:?}"),
@@ -514,6 +514,142 @@ async fn unknown_wire_version_is_rejected() {
         serde_json::from_value::<SnapshotWire>(missing).is_err(),
         "`wire_version` must NOT have a serde default"
     );
+}
+
+/// T3 — the snapshot wire round-trips the sub-tenant rows: `build` projects
+/// them from the FULL fidelity rows, and `hydrate` restores them byte-for-byte,
+/// at the bumped `WIRE_VERSION` (3). This exercises the wire contract directly
+/// (build → JSON → hydrate) and needs no live Redis, so it runs under the
+/// `server`-only gate as well as the `server,cluster-redis` gate.
+#[tokio::test]
+async fn snapshot_roundtrip_carries_sub_tenant_rows() {
+    let pool = common::setup_pool().await;
+    let kp: Arc<dyn KeyProvider> = Arc::new(kp());
+
+    // Seed a tenant, provider, and one enabled + one disabled sub-tenant/route.
+    repo::insert_provider(
+        &pool,
+        &Provider {
+            id: "p1".into(),
+            key: "openai".into(),
+            name: "O".into(),
+            endpoint: "https://api.openai.com".into(),
+            weight: 1,
+            created_at: now().into(),
+            updated_at: now().into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("provider");
+    repo::insert_tenant(
+        &pool,
+        &Tenant {
+            id: "t1".into(),
+            name: "T".into(),
+            domain: "acme.com".into(),
+            auth_url: "https://auth.acme.com/v".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("tenant");
+    repo::insert_sub_tenant(
+        &pool,
+        &hydra_core::model::SubTenant {
+            id: "st-on".into(),
+            tenant_id: "t1".into(),
+            name: "on".into(),
+            key_prefix: "QQCX_".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("st-on");
+    repo::insert_sub_tenant(
+        &pool,
+        &hydra_core::model::SubTenant {
+            id: "st-off".into(),
+            tenant_id: "t1".into(),
+            name: "off".into(),
+            key_prefix: "ZZZZ_".into(),
+            enabled: false,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("st-off");
+    repo::insert_sub_tenant_route(
+        &pool,
+        &hydra_core::model::SubTenantRoute {
+            id: "sr-on".into(),
+            sub_tenant_id: "st-on".into(),
+            model_key: Some("gpt-4".into()),
+            provider_id: "p1".into(),
+            enabled: true,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("sr-on");
+    repo::insert_sub_tenant_route(
+        &pool,
+        &hydra_core::model::SubTenantRoute {
+            id: "sr-off".into(),
+            sub_tenant_id: "st-on".into(),
+            model_key: None,
+            provider_id: "p1".into(),
+            enabled: false,
+            created_at: now().into(),
+            updated_at: now().into(),
+        },
+    )
+    .await
+    .expect("sr-off");
+
+    let store = ConfigStore::load(pool.clone(), kp.clone())
+        .await
+        .expect("load");
+    let content = store.replication().as_deref().cloned().expect("content");
+    // The fidelity rows carry the FULL sets (disabled included).
+    let full_st = content.fidelity().sub_tenants.clone();
+    let full_sr = content.fidelity().sub_tenant_routes.clone();
+    assert_eq!(full_st.len(), 2);
+    assert_eq!(full_sr.len(), 2);
+
+    let wire = SnapshotWire::build(&content, kp.as_ref())
+        .await
+        .expect("build");
+    // WIRE_VERSION bumped 2 → 3 (T3.3, oracle F1).
+    assert_eq!(wire.wire_version, WIRE_VERSION, "the wire is stamped");
+    assert_eq!(WIRE_VERSION, 3, "T3 bumps the wire version to 3");
+    // The wire carries the full sets (disabled included), not just enabled.
+    assert_eq!(wire.fidelity.sub_tenants.len(), 2);
+    assert_eq!(wire.fidelity.sub_tenant_routes.len(), 2);
+
+    // JSON round-trip is what crosses the control channel.
+    let json = serde_json::to_vec(&wire).expect("serialize");
+    let wire2: SnapshotWire = serde_json::from_slice(&json).expect("deserialize");
+    let hydrated = wire2.hydrate(kp.as_ref()).expect("hydrate");
+
+    // The round-tripped fidelity rows carry the FULL sets, byte-for-byte.
+    assert_eq!(hydrated.fidelity.sub_tenants, full_st);
+    assert_eq!(hydrated.fidelity.sub_tenant_routes, full_sr);
+    // The runtime config keeps only the ENABLED rows.
+    assert_eq!(hydrated.cfg.sub_tenants.len(), 1);
+    assert_eq!(hydrated.cfg.sub_tenants[0].id, "st-on");
+    assert_eq!(hydrated.cfg.sub_tenant_routes.len(), 1);
+    assert_eq!(hydrated.cfg.sub_tenant_routes[0].id, "sr-on");
 }
 
 /// (3) An OLD reader must reject a NEW wire UNCONDITIONALLY — including the
