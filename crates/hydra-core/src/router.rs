@@ -22,9 +22,14 @@
 //! 2. **Tenant providers** — the tenant's authorised provider set (fail-closed:
 //!    absent ⇒ [`RouteError::TenantForbidden`]).
 //! 3. **Intersection** of (1) and (2); empty ⇒ [`RouteError::NoAvailableProvider`].
-//!    - **Key-prefix binding gate** — a client api-key matching an enabled
-//!      prefix binding restricts the set to the bound provider (fail-closed;
-//!      longest prefix wins; no match ⇒ no restriction).
+//!    - **Key-prefix binding gate** (3.5) — a client api-key matching an enabled
+//!      operator prefix binding restricts the set to the bound provider
+//!      (fail-closed; longest prefix wins; no match ⇒ no restriction).
+//!    - **Sub-tenant route gate** (3.6, design-sub-tenant.md §4.1) — applied only
+//!      when (3.5) did **not** match (the operator's explicit disposition wins,
+//!      ruling a′). A client api-key matching an enabled sub-tenant prefix is
+//!      restricted to that route's provider (model-specific route wins over the
+//!      default; fail-closed); no match ⇒ the set is unchanged (opt-in steering).
 //! 4. **Filter** — drop dead (`breaker.is_dead`), keyless (no api-keys), and
 //!    soft-disabled (`weight <= 0`); empty ⇒ [`RouteError::NoAvailableProvider`].
 //! 5. **Order** — the returned candidates are sorted by `provider_id` for a
@@ -51,7 +56,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::breaker::BreakerView;
 use crate::config::ConfigData;
-use crate::model::{ProviderKeyBinding, Tenant};
+use crate::model::{ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 
 pub use crate::model::{Candidate, RouteError};
 
@@ -69,6 +74,67 @@ pub fn match_key_binding<'a>(
         .max_by_key(|b| b.key_prefix.len())
 }
 
+/// Key-level sub-tenant prefix match (design-sub-tenant.md §4.1, step 3.6):
+/// the enabled [`SubTenant`] of `tenant_id` whose `key_prefix` is a prefix of
+/// `api_key`. Prefixes are unique and non-overlapping within a tenant
+/// (enforced on the write path), so at most one sub-tenant matches; the
+/// `max_by_key` longest-prefix pick is a defensive backstop. `None` when no
+/// sub-tenant prefix matches (⇒ no routing restriction).
+fn match_sub_tenant<'a>(
+    cfg: &'a ConfigData,
+    tenant_id: &str,
+    api_key: &str,
+) -> Option<&'a SubTenant> {
+    cfg.sub_tenants
+        .iter()
+        .filter(|st| st.enabled && st.tenant_id == tenant_id && api_key.starts_with(&st.key_prefix))
+        .max_by_key(|st| st.key_prefix.len())
+}
+
+/// Model-level route selection within one sub-tenant: a model-specific route
+/// (`model_key == Some(model)`) wins over the default route (`model_key =
+/// None`); when `model_key` is `None` (the model-less passthrough path, Q10)
+/// only the default route applies. `None` when the sub-tenant has no
+/// applicable route (⇒ no restriction).
+fn select_sub_tenant_route<'a>(
+    routes: &'a [SubTenantRoute],
+    sub_tenant_id: &str,
+    model_key: Option<&str>,
+) -> Option<&'a SubTenantRoute> {
+    let applicable: Vec<&'a SubTenantRoute> = routes
+        .iter()
+        .filter(|r| r.enabled && r.sub_tenant_id == sub_tenant_id)
+        .collect();
+    let default = applicable.iter().find(|r| r.model_key.is_none()).copied();
+    match model_key {
+        Some(model) => applicable
+            .iter()
+            .find(|r| r.model_key.as_deref() == Some(model))
+            .copied()
+            .or(default),
+        None => default,
+    }
+}
+
+/// Tenant-scoped sub-tenant route lookup by raw api-key prefix
+/// (design-sub-tenant.md §4.1, step 3.6).
+///
+/// Prefixes are unique/non-overlapping within a tenant, so at most one
+/// sub-tenant matches; within it, a model-specific route
+/// (`model_key == Some(model)`) wins over the default (`None`).
+/// `model_key = None` means "default route only" (the model-less passthrough
+/// path, per Q10). `None` when no sub-tenant prefix or no applicable route
+/// matches (⇒ no routing restriction — opt-in steering, not a whitelist).
+pub fn match_sub_tenant_route<'a>(
+    cfg: &'a ConfigData,
+    tenant_id: &str,
+    model_key: Option<&str>,
+    api_key: &str,
+) -> Option<&'a SubTenantRoute> {
+    match_sub_tenant(cfg, tenant_id, api_key)
+        .and_then(|st| select_sub_tenant_route(&cfg.sub_tenant_routes, &st.id, model_key))
+}
+
 /// Resolve the candidate set for one `(tenant, model_key)` request.
 ///
 /// See the module docs for the full pipeline. The returned `Vec` is sorted by
@@ -76,8 +142,10 @@ pub fn match_key_binding<'a>(
 /// caller then applies [`crate::swrr::order`] with its own per-`(tenant, model)`
 /// state to pick the first attempt and order failover.
 ///
-/// `client_api_key` feeds the §7.1b key-prefix binding gate; `None` (or no
-/// matching binding) leaves the candidate set unrestricted.
+/// `client_api_key` feeds the §7.1b key-prefix binding gate (3.5) and, only
+/// when no operator binding matches, the sub-tenant route gate (3.6,
+/// design-sub-tenant.md §4.1); `None` (or no match for either) leaves the
+/// candidate set unrestricted.
 pub fn resolve(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
@@ -122,11 +190,29 @@ pub fn resolve(
     // value matches an enabled prefix binding restricts the candidate set to
     // the bound provider — fail-closed (never falls back to unbound
     // providers). Longest prefix wins; no match ⇒ no restriction.
+    let mut binding_matched = false;
     if let Some(api_key) = client_api_key {
         if let Some(binding) = match_key_binding(&cfg.key_prefix_bindings, api_key) {
+            binding_matched = true;
             intersection.retain(|pid| pid == &binding.provider_id);
             if intersection.is_empty() {
                 return Err(RouteError::NoAvailableProvider);
+            }
+        }
+    }
+
+    // (3.6) Sub-tenant route gate (design-sub-tenant.md §4.1): applied only
+    // when the operator binding did NOT match — the operator's explicit
+    // disposition wins (ruling a′). A matching enabled sub-tenant route
+    // restricts the candidate set to its provider (fail-closed); no match
+    // leaves the set unchanged (opt-in steering, not a whitelist).
+    if !binding_matched {
+        if let Some(api_key) = client_api_key {
+            if let Some(route) = match_sub_tenant_route(cfg, &tenant.id, Some(model_key), api_key) {
+                intersection.retain(|pid| pid == &route.provider_id);
+                if intersection.is_empty() {
+                    return Err(RouteError::NoAvailableProvider);
+                }
             }
         }
     }
@@ -171,7 +257,10 @@ pub struct CatalogEntry {
 /// `models_by_key` (which the loader guarantees are `status == 1`):
 /// tenant_models whitelist (default-open) → serving providers ∩
 /// `tenant_providers` → key-prefix binding gate ([`match_key_binding`];
-/// `client_api_key` is `None` or unmatched ⇒ no restriction) → filter.
+/// `client_api_key` is `None` or unmatched ⇒ no restriction) → sub-tenant
+/// route gate (3.6, only when the binding did not match; a model whose
+/// intersection empties is dropped — fail-closed, mirroring `resolve`) →
+/// filter.
 ///
 /// Unlike [`resolve`] this is **infallible** (catalog semantics): an unknown
 /// tenant, a tenant without a `tenant_providers` entry, or a model whose
@@ -206,6 +295,18 @@ pub fn accessible_models(
         return Vec::new();
     };
 
+    // Key-level (3.5)/(3.6) predicates — they depend only on the api-key, not
+    // the model, so they are computed once, outside the per-model loop. The
+    // operator binding wins (ruling a′): when it matches, the sub-tenant gate
+    // is skipped entirely (`matched_sub_tenant` stays `None`).
+    let (operator_binding, matched_sub_tenant) = match client_api_key {
+        Some(api_key) => match match_key_binding(&cfg.key_prefix_bindings, api_key) {
+            Some(binding) => (Some(binding), None),
+            None => (None, match_sub_tenant(cfg, tenant_id, api_key)),
+        },
+        None => (None, None),
+    };
+
     let mut entries: Vec<CatalogEntry> = Vec::new();
 
     for (model_key, serving) in &cfg.models_by_key {
@@ -226,9 +327,21 @@ pub fn accessible_models(
 
         // (3.5) Key-prefix binding gate — match ⇒ keep only the bound provider
         // (fail-closed); no match (or None key) ⇒ no restriction.
-        if let Some(api_key) = client_api_key {
-            if let Some(binding) = match_key_binding(&cfg.key_prefix_bindings, api_key) {
-                providers.retain(|pid| *pid == binding.provider_id);
+        if let Some(binding) = operator_binding {
+            providers.retain(|pid| *pid == binding.provider_id);
+        }
+
+        // (3.6) Sub-tenant route gate (design-sub-tenant.md §4.1) — only when
+        // the operator binding did not match (a′). Route selection is
+        // per-model (model-specific > default); an empty intersection drops
+        // the model (fail-closed, mirroring resolve).
+        if operator_binding.is_none() {
+            if let Some(sub_tenant) = matched_sub_tenant {
+                if let Some(route) =
+                    select_sub_tenant_route(&cfg.sub_tenant_routes, &sub_tenant.id, Some(model_key))
+                {
+                    providers.retain(|pid| *pid == route.provider_id);
+                }
             }
         }
 

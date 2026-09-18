@@ -59,7 +59,7 @@ use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::{extract_model_field, ModelField};
 use hydra_core::limit::MatchCtx;
-use hydra_core::model::{Candidate, RouteError};
+use hydra_core::model::{Candidate, RouteError, SubTenantRoute};
 use hydra_core::rewrite::mask_key;
 use hydra_core::router;
 use hydra_core::swrr;
@@ -1478,12 +1478,32 @@ fn passthrough_candidates(
     client_api_key: Option<&str>,
 ) -> Option<Vec<Candidate>> {
     let providers = cfg.tenant_providers.get(tenant_id)?;
+    // (3.5) Operator key-prefix binding gate: a matching enabled binding pins the
+    // passthrough to the bound provider (fail-closed if that provider is not
+    // eligible).
     let bound = client_api_key.and_then(|k| router::match_key_binding(&cfg.key_prefix_bindings, k));
+    // (3.6) Sub-tenant default-route gate (Q10, design-sub-tenant.md §4.3): applied
+    // only when the operator binding did NOT match (operator wins, ruling a′). A
+    // matching default route pins the passthrough to that route's provider
+    // (fail-closed if it is not eligible). `model_key = None` ⇒ default route
+    // only — there is no model on this path, so model-specific routes never apply.
+    let sub_route: Option<&SubTenantRoute> = if bound.is_some() {
+        None
+    } else {
+        client_api_key.and_then(|k| router::match_sub_tenant_route(cfg, tenant_id, None, k))
+    };
+    // Provider the passthrough is pinned to, if any: the operator binding's
+    // provider (3.5) wins; else the sub-tenant default route's provider (3.6);
+    // else no pin (behaviour unchanged — connect to the first live provider).
+    let pinned: Option<&String> = bound
+        .as_ref()
+        .map(|b| &b.provider_id)
+        .or_else(|| sub_route.as_ref().map(|r| &r.provider_id));
     let mut pids: Vec<&String> = providers.iter().collect();
     pids.sort(); // deterministic ordering
     for pid in pids {
-        if let Some(b) = bound {
-            if pid != &b.provider_id {
+        if let Some(pinned_id) = pinned {
+            if pid != pinned_id {
                 continue;
             }
         }
