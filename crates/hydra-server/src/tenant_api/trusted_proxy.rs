@@ -70,8 +70,13 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ipnet::IpNet>, String> {
 /// - Otherwise the `xff` list is walked from the RIGHTMOST entry to the left,
 ///   skipping entries that are themselves in a trusted net; the first valid
 ///   non-trusted IP is the client.
-/// - If `xff` is absent, empty, entirely trusted, or has no valid IP, `peer` is
-///   returned (safe fallback).
+/// - A non-empty rightmost entry that is NOT a parseable IP means the header
+///   cannot be authenticated at all (the trusted proxy's own appended entry is
+///   load-bearing but not an IP — e.g. `ip:port` or `unknown`), so the whole
+///   header is distrusted and `peer` is returned. This is deliberate fail-closed:
+///   continuing the walk would fall back to caller-controlled earlier entries.
+/// - Otherwise, if `xff` is absent, empty, entirely trusted, or has no valid IP,
+///   `peer` is returned (safe fallback).
 #[must_use]
 pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[ipnet::IpNet]) -> IpAddr {
     // No trust configured, or this peer is not one we trust: never consult the
@@ -85,14 +90,24 @@ pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[ipnet::IpNe
     // Rightmost first: the outermost (closest-to-us) hop's view of the client is
     // the last entry it appended, so we skip the trusted proxies on the way in
     // and stop at the first entry that is itself not a trusted proxy.
+    let mut first = true;
     for entry in xff.split(',').rev() {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
         let Ok(ip) = entry.parse::<IpAddr>() else {
+            // The RIGHTMOST non-empty entry is the one the trusted proxy itself
+            // appended. If even that is not a parseable IP, the header cannot be
+            // authenticated — every earlier entry is caller-controlled — so fail
+            // closed to the peer instead of letting an attacker-chosen entry win.
+            // Junk further left (mid-chain) is still skipped.
+            if first {
+                return peer;
+            }
             continue;
         };
+        first = false;
         if trusted.iter().any(|net| net.contains(&ip)) {
             continue;
         }
@@ -223,6 +238,42 @@ mod tests {
                 &nets("10.0.0.0/8")
             ),
             ip("10.0.0.5")
+        );
+    }
+
+    /// A trusted proxy that appends a NON-IP rightmost entry (a port-suffixed
+    /// `ip:port`, or `unknown`) cannot have its header authenticated: the
+    /// rightmost entry it appended is the only trusted one, and it is junk. The
+    /// whole header must then be distrusted (peer returned) — otherwise the walk
+    /// falls through to caller-controlled earlier entries and the client picks
+    /// its own bucket. Fail closed, like the rest of this module.
+    #[test]
+    fn an_unparseable_rightmost_entry_distrusts_the_whole_header() {
+        assert_eq!(
+            resolve_client_ip(
+                ip("10.0.0.5"),
+                Some("9.9.9.9, 203.0.113.9:51234"),
+                &nets("10.0.0.0/8")
+            ),
+            ip("10.0.0.5"),
+            "junk rightmost entry must not let the forged earlier entry win"
+        );
+        assert_eq!(
+            resolve_client_ip(
+                ip("10.0.0.5"),
+                Some("9.9.9.9, unknown"),
+                &nets("10.0.0.0/8")
+            ),
+            ip("10.0.0.5")
+        );
+        // A parseable rightmost entry still resolves normally.
+        assert_eq!(
+            resolve_client_ip(
+                ip("10.0.0.5"),
+                Some("9.9.9.9, 203.0.113.7"),
+                &nets("10.0.0.0/8")
+            ),
+            ip("203.0.113.7")
         );
     }
 

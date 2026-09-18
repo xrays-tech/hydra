@@ -920,8 +920,9 @@ async fn clickhouse_a_non_numeric_counter_is_a_failure_not_a_zero() {
 /// A response that fills the transport's size cap is cut off mid-stream, which
 /// is a TOO-BIG answer, not a decode failure. The 503 must tell the caller to
 /// narrow the window or shrink the grouping — never to "retry", which returns
-/// the same truncated bytes. (A unit test over `response_truncated` pins the
-/// detection; this one pins that the tenant actually sees the actionable message.)
+/// the same truncated bytes. (Unit tests over `fill_capped`/`SendResult::truncated`
+/// pin the detection; this one pins that the tenant actually sees the actionable
+/// message.)
 #[cfg(feature = "usage-clickhouse")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clickhouse_a_cap_filling_result_is_actionable_not_a_generic_retry() {
