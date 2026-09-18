@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use hydra_core::config::{CertMeta, ConfigData};
 use hydra_core::model::{
-    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, TenantModel, TenantProvider,
+    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
+    TenantModel, TenantProvider,
 };
 
 use crate::cluster::content::{FidelityRows, ReplicationContent};
@@ -44,9 +45,24 @@ use crate::crypto::{KeyProvider, Sealed};
 /// There is deliberately NO emit switch: governing only emission would leave
 /// new nodes unable to materialize the old shape (it carries no fidelity rows),
 /// and governing acceptance too would let a new replica rebuild from v1 — i.e.
-/// perform the very wipe fail-closed exists to stop. Upgrade/rollback are an
-/// ORDER plus an accepted stall window (see `dev-docs/ops.md`).
-pub const WIRE_VERSION: u32 = 2;
+/// perform the very wipe fail-closed exists to stop.
+///
+/// **v2 → v3 (sub-tenant rows, T3).** `sub_tenants` / `sub_tenant_routes` moved
+/// INSIDE [`FidelityWireRows`], so a v2 reader REQUIRES two fields that no
+/// longer exist at the top level and a v3 reader REQUIRES two fields a v2 wire
+/// never sends. Under the SAME version number both directions would fail with a
+/// bare serde error (unknown / missing field) instead of the intended
+/// [`SnapshotError::WireVersion`] gate — and neither side could distinguish
+/// "wrong format" from "corrupt payload", so a mixed-version window would look
+/// like a data-corruption incident rather than a rollout ordering problem. The
+/// bump is therefore MANDATORY and there is NO no-bump fallback.
+///
+/// **Upgrade order (readers before emitters):** upgrade every
+/// reader/standby to v3 FIRST, and only then let the leader emit v3. If the
+/// leader emits v3 before the standbys are upgraded, the standbys reject it with
+/// `WireVersion` and hold last-known-good (safe, but frozen) — the window is the
+/// accepted stall documented in `dev-docs/ops.md`.
+pub const WIRE_VERSION: u32 = 3;
 
 /// One sealed provider key WITH its row identity, so the replica keeps the
 /// leader's primary key instead of minting a new one.
@@ -112,6 +128,12 @@ pub struct FidelityWireRows {
     pub tenant_providers: Vec<TenantProvider>,
     /// Full `tenant_model` rows (join ids preserved).
     pub tenant_models: Vec<TenantModel>,
+    /// FULL `sub_tenant` rows (disabled included). Non-secret: the `key_prefix`
+    /// is a routing selector, not a credential (design §5).
+    pub sub_tenants: Vec<SubTenant>,
+    /// FULL `sub_tenant_route` rows (disabled included). Non-secret: pins a
+    /// sub-tenant to a single provider.
+    pub sub_tenant_routes: Vec<SubTenantRoute>,
 }
 
 /// The control-channel snapshot: version + config (secrets stripped) + the
@@ -263,6 +285,8 @@ impl SnapshotWire {
                 provider_models: f.provider_models.clone(),
                 tenant_providers: f.tenant_providers.clone(),
                 tenant_models: f.tenant_models.clone(),
+                sub_tenants: f.sub_tenants.clone(),
+                sub_tenant_routes: f.sub_tenant_routes.clone(),
             },
         })
     }
@@ -345,6 +369,8 @@ impl SnapshotWire {
                 provider_models: self.fidelity.provider_models,
                 tenant_providers: self.fidelity.tenant_providers,
                 tenant_models: self.fidelity.tenant_models,
+                sub_tenants: self.fidelity.sub_tenants,
+                sub_tenant_routes: self.fidelity.sub_tenant_routes,
             },
         })
     }
@@ -441,6 +467,8 @@ mod tests {
                 provider_models: Vec::new(),
                 tenant_providers: Vec::new(),
                 tenant_models: Vec::new(),
+                sub_tenants: Vec::new(),
+                sub_tenant_routes: Vec::new(),
             },
         )
     }

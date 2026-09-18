@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 use hydra_core::model::{
-    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, TenantModel, TenantProvider,
+    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
+    TenantModel, TenantProvider,
 };
 use sqlx::SqlitePool;
 
@@ -51,6 +52,10 @@ pub struct FidelityRows {
     /// Join rows with their ids preserved.
     pub tenant_providers: Vec<TenantProvider>,
     pub tenant_models: Vec<TenantModel>,
+    /// FULL `sub_tenant` rows — including `enabled == false`.
+    pub sub_tenants: Vec<SubTenant>,
+    /// FULL `sub_tenant_route` rows — including `enabled == false`.
+    pub sub_tenant_routes: Vec<SubTenantRoute>,
 }
 
 /// Everything a replica must reproduce, plus the version it was produced at.
@@ -152,6 +157,8 @@ impl ReplicationContent {
         let provider_models = crate::db::list_provider_models_on(&mut *tx).await?;
         let tenant_providers = crate::db::list_tenant_providers_on(&mut *tx).await?;
         let tenant_models = crate::db::list_tenant_models_on(&mut *tx).await?;
+        let sub_tenants = crate::db::list_sub_tenants_on(&mut *tx).await?;
+        let sub_tenant_routes = crate::db::list_sub_tenant_routes_on(&mut *tx).await?;
         // Release the read snapshot before doing anything else with the pool.
         tx.commit().await?;
 
@@ -166,6 +173,8 @@ impl ReplicationContent {
                 provider_models,
                 tenant_providers,
                 tenant_models,
+                sub_tenants,
+                sub_tenant_routes,
             },
         })
     }

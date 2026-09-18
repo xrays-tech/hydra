@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
-use hydra_core::model::{LimitRole, ProviderKeyBinding};
+use hydra_core::model::{LimitRole, ProviderKeyBinding, SubTenant, SubTenantRoute};
 use hydra_core::swrr::SwrrState;
 
 use crate::cluster::content::ReplicationContent;
@@ -175,6 +175,20 @@ pub async fn build_config(
         .filter(|b| b.enabled)
         .collect();
 
+    // sub_tenants: only enabled sub-tenants carry the api-key-prefix routing
+    // gate (design-sub-tenant.md §4.1, step 3.6; mirrors `key_prefix_bindings`).
+    let sub_tenants: Vec<SubTenant> = db::list_sub_tenants(pool)
+        .await?
+        .into_iter()
+        .filter(|s| s.enabled)
+        .collect();
+    // sub_tenant_routes: only enabled routes steer traffic (design §3.1).
+    let sub_tenant_routes: Vec<SubTenantRoute> = db::list_sub_tenant_routes(pool)
+        .await?
+        .into_iter()
+        .filter(|r| r.enabled)
+        .collect();
+
     let mut cfg = ConfigData {
         tenants_by_domain,
         // 派生索引：由紧随其后的 reindex_tenants 填充（唯一写入口，
@@ -187,6 +201,8 @@ pub async fn build_config(
         provider_keys,
         limit_roles,
         key_prefix_bindings,
+        sub_tenants,
+        sub_tenant_routes,
         certs,
     };
 
@@ -520,6 +536,8 @@ mod tests {
                 provider_models: Vec::new(),
                 tenant_providers: Vec::new(),
                 tenant_models: Vec::new(),
+                sub_tenants: Vec::new(),
+                sub_tenant_routes: Vec::new(),
             },
         }
     }

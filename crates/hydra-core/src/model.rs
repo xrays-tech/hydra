@@ -131,6 +131,54 @@ pub struct TenantModel {
 }
 
 // ---------------------------------------------------------------------------
+// Sub-tenant family（租户分组 + 前缀路由, design-sub-tenant.md §3.1）
+// ---------------------------------------------------------------------------
+
+/// A sub-tenant: a grouping under a tenant whose client api-keys share a
+/// common `key_prefix`. The prefix is a routing selector only (not identity,
+/// not secret — see design §5); it is the source of the lowest-priority
+/// api-key-prefix routing gate (design §4.1, step 3.6). `key_prefix` is unique
+/// within the tenant (Q2) and MUST contain a separator (e.g. `QQCX_`) so a
+/// bare `starts_with` cannot swallow a longer, unrelated prefix.
+///
+/// Timestamps are ISO-8601 `String` (core has no `chrono`). Only `enabled ==
+/// true` rows are loaded into `ConfigData::sub_tenants` (mirrors
+/// `ProviderKeyBinding`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubTenant {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    /// Client api-key prefix, e.g. `QQCX_`. Must be non-empty and contain a
+    /// separator (`_` or `-`).
+    pub key_prefix: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A sub-tenant route: pins a sub-tenant's traffic to a single `provider_id`,
+/// scoped to an optional `model_key`. `model_key = None` (SQL `NULL`) is the
+/// sub-tenant's **default route** (applies to any model / to the model-missing
+/// passthrough path); a `Some(model_key)` row is a model-specific override
+/// that wins over the default for that model (design §3.1, §4.1 step 3.6).
+///
+/// Timestamps are ISO-8601 `String`. Only `enabled == true` rows are loaded
+/// into `ConfigData::sub_tenant_routes`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubTenantRoute {
+    pub id: String,
+    pub sub_tenant_id: String,
+    /// `None` = the sub-tenant's default route; `Some(key)` = a model-specific
+    /// override for `key`.
+    pub model_key: Option<String>,
+    pub provider_id: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ---------------------------------------------------------------------------
 // Key-prefix binding（路由闸门, design §7.1b）
 // ---------------------------------------------------------------------------
 

@@ -25,8 +25,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::SqlitePool;
 
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, Tenant, TenantModel,
-    TenantProvider,
+    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
+    Tenant, TenantModel, TenantProvider,
 };
 
 use crate::crypto::{self, CryptoError, KeyProvider, Sealed};
@@ -296,6 +296,56 @@ impl From<ProviderKeyBindingRow> for ProviderKeyBinding {
         ProviderKeyBinding {
             id: r.id,
             key_prefix: r.key_prefix,
+            provider_id: r.provider_id,
+            enabled: r.enabled != 0,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct SubTenantRow {
+    id: String,
+    tenant_id: String,
+    name: String,
+    key_prefix: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<SubTenantRow> for SubTenant {
+    fn from(r: SubTenantRow) -> Self {
+        SubTenant {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            name: r.name,
+            key_prefix: r.key_prefix,
+            enabled: r.enabled != 0,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct SubTenantRouteRow {
+    id: String,
+    sub_tenant_id: String,
+    model_key: Option<String>,
+    provider_id: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<SubTenantRouteRow> for SubTenantRoute {
+    fn from(r: SubTenantRouteRow) -> Self {
+        SubTenantRoute {
+            id: r.id,
+            sub_tenant_id: r.sub_tenant_id,
+            model_key: r.model_key,
             provider_id: r.provider_id,
             enabled: r.enabled != 0,
             created_at: r.created_at,
@@ -1377,6 +1427,174 @@ pub async fn update_provider_key_binding(
 
 pub async fn delete_provider_key_binding(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query!("DELETE FROM provider_key_binding WHERE id = ?", id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CRUD — sub_tenant / sub_tenant_route (design-sub-tenant.md §3.1)
+//
+// These use **runtime** `sqlx::query` / `query_as` (the `db/restore.rs` style)
+// rather than the compile-time `query!`/`query_as!` macros used above, so no
+// `.sqlx/` offline-cache refresh is required (T1 added no query macros).
+// `enabled` maps `INTEGER`↔`bool` at the boundary (`i64` in the row, `!= 0`
+// → `bool`); `model_key` maps `NULL`↔`Option<String>`; `updated_at` is set
+// server-side to `datetime('now')` on update.
+// ---------------------------------------------------------------------------
+
+/// Insert a sub-tenant. Violating `UNIQUE(tenant_id, name)` or
+/// `UNIQUE(tenant_id, key_prefix)` returns a sqlx UNIQUE violation (→ 409 by
+/// the admin layer).
+pub async fn insert_sub_tenant(pool: &SqlitePool, st: &SubTenant) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sub_tenant (id, tenant_id, name, key_prefix, enabled, created_at, \
+         updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&st.id)
+    .bind(&st.tenant_id)
+    .bind(&st.name)
+    .bind(&st.key_prefix)
+    .bind(st.enabled)
+    .bind(&st.created_at)
+    .bind(&st.updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_sub_tenant(pool: &SqlitePool, id: &str) -> Result<SubTenant, sqlx::Error> {
+    let row: SubTenantRow = sqlx::query_as(
+        "SELECT id, tenant_id, name, key_prefix, enabled, created_at, updated_at \
+         FROM sub_tenant WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.into())
+}
+
+pub async fn list_sub_tenants(pool: &SqlitePool) -> Result<Vec<SubTenant>, sqlx::Error> {
+    list_sub_tenants_on(pool).await
+}
+
+/// [`list_sub_tenants`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_sub_tenants_on<'e, E>(exec: E) -> Result<Vec<SubTenant>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<SubTenantRow> = sqlx::query_as(
+        "SELECT id, tenant_id, name, key_prefix, enabled, created_at, updated_at \
+         FROM sub_tenant ORDER BY tenant_id, name",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Update a sub-tenant's mutable fields (name / key_prefix / enabled).
+/// `updated_at` is set server-side to `datetime('now')`.
+pub async fn update_sub_tenant(pool: &SqlitePool, st: &SubTenant) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sub_tenant SET name = ?, key_prefix = ?, enabled = ?, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&st.name)
+    .bind(&st.key_prefix)
+    .bind(st.enabled)
+    .bind(&st.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_sub_tenant(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sub_tenant WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Insert a sub-tenant route. Violating the model-specific or default-route
+/// partial unique index returns a sqlx UNIQUE violation (→ 409 by the admin
+/// layer).
+pub async fn insert_sub_tenant_route(
+    pool: &SqlitePool,
+    r: &SubTenantRoute,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sub_tenant_route (id, sub_tenant_id, model_key, provider_id, enabled, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&r.id)
+    .bind(&r.sub_tenant_id)
+    .bind(&r.model_key)
+    .bind(&r.provider_id)
+    .bind(r.enabled)
+    .bind(&r.created_at)
+    .bind(&r.updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_sub_tenant_route(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<SubTenantRoute, sqlx::Error> {
+    let row: SubTenantRouteRow = sqlx::query_as(
+        "SELECT id, sub_tenant_id, model_key, provider_id, enabled, created_at, updated_at \
+         FROM sub_tenant_route WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.into())
+}
+
+pub async fn list_sub_tenant_routes(pool: &SqlitePool) -> Result<Vec<SubTenantRoute>, sqlx::Error> {
+    list_sub_tenant_routes_on(pool).await
+}
+
+/// [`list_sub_tenant_routes`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_sub_tenant_routes_on<'e, E>(
+    exec: E,
+) -> Result<Vec<SubTenantRoute>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<SubTenantRouteRow> = sqlx::query_as(
+        "SELECT id, sub_tenant_id, model_key, provider_id, enabled, created_at, updated_at \
+         FROM sub_tenant_route ORDER BY sub_tenant_id, model_key",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Update a route's mutable fields (model_key / provider_id / enabled).
+/// `updated_at` is set server-side to `datetime('now')`.
+pub async fn update_sub_tenant_route(
+    pool: &SqlitePool,
+    r: &SubTenantRoute,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sub_tenant_route SET model_key = ?, provider_id = ?, enabled = ?, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&r.model_key)
+    .bind(&r.provider_id)
+    .bind(r.enabled)
+    .bind(&r.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_sub_tenant_route(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sub_tenant_route WHERE id = ?")
+        .bind(id)
         .execute(pool)
         .await?;
     Ok(())

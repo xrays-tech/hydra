@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{LimitRole, Provider, ProviderKeyBinding, Tenant};
+use crate::model::{LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 
 /// In-memory configuration snapshot. All indexes are built once at load time
 /// and read lock-free thereafter (the server holds it inside `ArcSwap`).
@@ -75,6 +75,16 @@ pub struct ConfigData {
     /// `enabled == true` rows, like `limit_roles`). Matching is longest-prefix
     /// wins; see [`crate::router::match_key_binding`].
     pub key_prefix_bindings: Vec<ProviderKeyBinding>,
+
+    /// Enabled sub-tenants (design-sub-tenant.md §3.1). These carry the
+    /// `key_prefix` — the source of the api-key-prefix routing gate (step 3.6).
+    /// Only `enabled == true` rows (mirrors `key_prefix_bindings`).
+    pub sub_tenants: Vec<SubTenant>,
+
+    /// Enabled sub-tenant routes (design-sub-tenant.md §3.1). Each row pins a
+    /// sub-tenant's traffic to a single provider, optionally scoped to a model.
+    /// Only `enabled == true` rows (mirrors `key_prefix_bindings`).
+    pub sub_tenant_routes: Vec<SubTenantRoute>,
 
     /// `domain` → certificate metadata. Plain value here (see module docs);
     /// W1–W2 carries `CertMeta`, W4 resolves to a parsed `ResolvedCert` on the
@@ -310,6 +320,56 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
                 "provider_key_binding '{}' references unknown provider_id '{}'",
                 b.id, b.provider_id
             )));
+        }
+    }
+
+    // sub_tenants → key_prefix must be non-empty and contain a separator
+    // (`_` or `-`); a bare prefix would swallow longer, unrelated prefixes.
+    for st in &cfg.sub_tenants {
+        if st.key_prefix.is_empty() || !st.key_prefix.contains(['_', '-']) {
+            issues.push(ValidationIssue::warn(format!(
+                "sub_tenant '{}' has an invalid key_prefix '{}'; it must be \
+                 non-empty and contain a separator ('_' or '-')",
+                st.id, st.key_prefix
+            )));
+        }
+    }
+
+    // sub_tenant_routes → the referenced sub-tenant must exist and the
+    // provider must exist (referential-integrity orphans, Warn).
+    let sub_tenant_ids: HashSet<&str> = cfg.sub_tenants.iter().map(|st| st.id.as_str()).collect();
+    for r in &cfg.sub_tenant_routes {
+        if !sub_tenant_ids.contains(r.sub_tenant_id.as_str()) {
+            issues.push(ValidationIssue::warn(format!(
+                "sub_tenant_route '{}' references unknown sub_tenant_id '{}'",
+                r.id, r.sub_tenant_id
+            )));
+        }
+        if !cfg.providers.contains_key(&r.provider_id) {
+            issues.push(ValidationIssue::warn(format!(
+                "sub_tenant_route '{}' references unknown provider_id '{}'",
+                r.id, r.provider_id
+            )));
+        }
+    }
+
+    // sub_tenants → prefix overlap within the same tenant (either direction
+    // `starts_with`). The store loads enabled rows only, so this is the runtime
+    // backstop for drift the write path (T6) should have rejected at submit time.
+    for i in 0..cfg.sub_tenants.len() {
+        for j in (i + 1)..cfg.sub_tenants.len() {
+            let a = &cfg.sub_tenants[i];
+            let b = &cfg.sub_tenants[j];
+            if a.tenant_id != b.tenant_id {
+                continue;
+            }
+            if a.key_prefix.starts_with(&b.key_prefix) || b.key_prefix.starts_with(&a.key_prefix) {
+                issues.push(ValidationIssue::warn(format!(
+                    "sub_tenant '{}' and '{}' have overlapping key_prefix within \
+                     tenant '{}' ('{}' vs '{}')",
+                    a.id, b.id, a.tenant_id, a.key_prefix, b.key_prefix
+                )));
+            }
         }
     }
 
