@@ -35,5 +35,6 @@ pub mod model;
 pub mod rewrite;
 pub mod router;
 pub mod sse;
+pub mod sub_tenant;
 pub mod swrr;
 pub mod tenant_api;

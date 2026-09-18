@@ -451,6 +451,18 @@ impl AdminService {
             ("provider-key-bindings", Some(id)) => {
                 handlers::provider_key_binding_item(state, session, method, id, trace_id).await
             }
+            ("sub-tenants", None) => {
+                handlers::sub_tenant_collection(state, session, method, query, trace_id).await
+            }
+            ("sub-tenants", Some(id)) => {
+                handlers::sub_tenant_item(state, session, method, id, trace_id).await
+            }
+            ("sub-tenant-routes", None) => {
+                handlers::sub_tenant_route_collection(state, session, method, query, trace_id).await
+            }
+            ("sub-tenant-routes", Some(id)) => {
+                handlers::sub_tenant_route_item(state, session, method, id, trace_id).await
+            }
             _ => handlers::err_json(404, "not_found", "unknown path", trace_id),
         }
     }
