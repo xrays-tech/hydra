@@ -204,7 +204,7 @@
 - `crates/hydra-server/migrations/0010_sub_tenant.sql`
 - `crates/hydra-core/tests/sub_tenant.rs`（纯函数：validate + gate；或并入 `tests/router.rs`/`tests/validate.rs`，见任务）
 - `crates/hydra-server/tests/sub_tenant_admin.rs`（admin HTTP CRUD + 热加载，`--features server`）
-- v2 预留：`dev-docs/aegis/adr/A-2-data-plane-tenant-config-forwarding.md`（**v2 才创建**）
+- v2 决策记录 **A-2**：写在 `dev-docs/design-tenant-api.md` §6.4b（**不新建 ADR 文件**——本项目无 ADR 体系，见其 §6.5）
 
 ### 修改（核心）
 - `crates/hydra-core/src/model.rs` — 新增 `SubTenant`、`SubTenantRoute`
@@ -490,11 +490,11 @@ pub fn validate_sub_tenant_write(cfg: &ConfigData, ...) -> Result<(), SubTenantW
 ## v2 / v3 路线图（不在本轮实现）
 
 ### v2 — 租户自助写（A′）
-**第 0 步（前置，硬性）**：先落 **A-2** 决策记录修订 A-1。未落 A-2 不得动 v2 代码。
+**第 0 步（前置，硬性，已完成）**：**A-2 决策记录已落**于 `dev-docs/design-tenant-api.md` §6.4b（本项目无 ADR 体系，决策记录随设计文档走，见其 §6.5——**不新建独立 ADR 文件**，原计划中的 `aegis/adr/A-2-*.md` 路径作废）。A-2 显式、限定地修订 A-1 的机制偏好（仅配置写），并把实现前置条件写入 A-2（含 **4 授权绑定、5 凭据放置/禁日志、6 审计归因、7 接收侧租约断言**，以及 v1 复审 findings 1/2）。**A-2 已经 oracle 复核 GATE: PASS。**
 1. `hydra-server` internal 面新增 `/api/v1/internal/tenant-config/...`（挂在既有 `HYDRA_CLUSTER_TOKEN` 闸门 `admin/mod.rs:619-641` 下）。
 2. edge 数据面 handler → forward 到活跃 leader；复用 `forward.rs` 注册表实时解析、`FORWARD_ONCE_HEADER` 环守卫、connect/total 双超时与确定失败/结果未知分类。
-3. 请求体携带租户 Bearer；leader 侧用**同一 `authenticate`** 重鉴权（cluster token 只证明节点，不证明租户身份）。
-4. **幂等写**：PUT-by-`(tenant_id, name)` upsert + 幂等 DELETE；leader failover 在 apply 后/ack 前发生时租户重试收敛。
+3. **专用请求头 `x-hydra-tenant-token` 携带租户 Bearer（不在 body）**；leader 侧用**同一 `authenticate`** 重鉴权，并做**授权绑定**（写目标 == 已鉴权租户；A-2 前置条件 4）。
+4. **幂等写**：PUT-by-`(tenant_id, name)` upsert + **按不可变 id** 的幂等 DELETE；接收侧须断言本节点持有租约（A-2 前置条件 7），非 leader ⇒ 503；leader failover 在 apply 后/ack 前发生时租户重试收敛。
 5. 对账：`whoami.config_version`（`auth.rs:54-57`）。
 6. 每租户配额 + **独立限流维度**（防配置写扇出放大）。
 7. 分区语义：写 fail-closed（503/504），读继续用旧快照。
@@ -635,7 +635,7 @@ T1..T7 ─> T8 (文档) ─> T9 (门禁 + 证据)
 ## 实施记录与验收证据（T9，2026-09-18）
 
 ### 交付状态
-**T1–T8 全部实现**；v1 范围完成：operator admin CRUD + error 级写校验 + 路由 (3.6) + 目录镜像 + 模型缺失 passthrough 默认路由收窄 + 租户只读端点 + 文档同步。**代码未提交**（等用户决定）。
+**T1–T8 全部实现**；v1 范围完成：operator admin CRUD + error 级写校验 + 路由 (3.6) + 目录镜像 + 模型缺失 passthrough 默认路由收窄 + 租户只读端点 + 文档同步。**v1 已提交**（`da07610` 起 6 个逻辑提交，`da07610~1..1007dea`）。
 
 ### 任务 → 关键产物
 | 任务 | 产物 | 状态 |

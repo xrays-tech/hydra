@@ -728,6 +728,77 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 3. 共享 Redis 被移出架构（届时 L2 与失效流同时消失，整个 §4.2 的三层模型都要重做）；
 4. **引入第二个数据面集群/地域**（Q13 已确认半年内不会）——届时 E2 的覆盖范围、响应是否需要范围声明字段、是否强制共享失效主干，都要重新评估（§4.2.4 第 4 条）。
 
+> **2026-09-18 更新**：A-1 的机制偏好（"数据面经共享 Redis 总线协调、不直连 peer"）在**租户配置写**这一新场景下被 **§6.4b 决策记录 A-2 显式、限定地修订**。A-1 本体（E2 不转发到 leader 的 admin API）**不受影响、继续有效**——两者的判别标准见 A-2「与 A-1 的关系」。
+
+### 6.4b 决策记录 A-2：租户配置写经 internal 控制面转发到 leader
+
+- **编号**：A-2（正文内决策记录；无 ADR 体系，理由同 §6.5）
+- **日期**：2026-09-18 ｜ **状态**：**已决（待实现落地后回填"已执行"）**
+- **决策候选**：子租户自助写的实现形态——数据面节点（可能是 edge）收到租户写请求后，如何到达唯一写者 leader。
+- **依赖设计**：`dev-docs/design-sub-tenant.md` §6（头号问题）、v1 已实现（operator 代管写走既有 admin 面转发）；本决策是 v2（租户自助写）的前置。
+
+#### 背景与证据
+
+1. **A-1 的决定性理由对配置写不成立。** A-1 否决转发的第 1 条理由是"扇出已由共享失效流完成，转发不产生额外效果"（§6.4 理由 1）。该理由针对的是**单向失效事件**；而子租户 CRUD 是**对权威配置的同步写**，leader 是**唯一写者**（`store.rs`/SQLite 在 leader），所以"把写送到 leader"不是"没意义的一跳"，而是**唯一正确的落点**。A-1 该条不能外推到本场景。
+2. **既有的"edge→leader + cluster token"传输/认证模式已存在。** leader 的 admin 面有 `/api/v1/internal/*` 端点族，用 **`HYDRA_CLUSTER_TOKEN`** 认证（fail-closed、常数时间比较，`crates/hydra-server/src/admin/mod.rs:619-641`；当前唯一路由 `/internal/control`，`:373-374`）；edge **本就持有 cluster token** 并在轮询 leader 的 control URL。
+3. **admin 面转发不能原样复用给租户写。** `forward_mutation` 原样中继调用方 `Authorization`（`cluster/forward.rs:236-238`），而 admin 闸门**先**验 admin token **再**转发（`admin/mod.rs:653-662` → `:664-670`）；edge 刻意不持有 `HYDRA_ADMIN_TOKEN`（`main.rs:238-247`；`design-tenant-api.md:711`）。信任边界与闸门顺序根本不同。
+4. **可复用的转发语义全套现成**：注册表实时解析目标、`FORWARD_ONCE_HEADER` 环守卫（`forward.rs:115`）、connect/total 双超时与"确定失败 vs 结果未知"分类（`forward.rs:53-109`）。
+5. **对账基线现成**：租户 API 的 `whoami` 已返回 `config_version`（`tenant_api/auth.rs:54-57`）。
+
+#### 选项
+
+| 选项 | 内容 |
+|---|---|
+| **A′（采纳）** | 数据面 handler → leader `/api/v1/internal/tenant-config/...`；**cluster token 认节点**（`admin/mod.rs:619-641`），**专用请求头 `x-hydra-tenant-token`** 携带租户 Bearer（**不放在 body**），leader 侧用**同一 `authenticate` 重鉴权**并**做授权绑定**（写目标 == 已鉴权租户，见前置条件 4）；复用 `forward.rs` 语义；幂等 PUT-by-`(tenant_id,name)` upsert + 按**不可变 id** 的幂等 DELETE；`whoami.config_version` 对账。 |
+| B（仅当 A-2 被否时启用） | Redis 意图流：最终一致，需幂等 apply + 版本守卫 + 新建 per-request 回执/对账。 |
+| C（否决） | LB 把写流量分流到 leader。 |
+
+#### 决策
+
+**采纳 A′**，并**显式、限定地**放宽 A-1 的机制偏好：**允许数据面节点为"租户配置写"直连 leader 的 internal 控制面**。该放宽**不涉及 E2**、不改动失效流模型。
+
+#### 理由
+
+1. **配置写必须有权威落点。** 与 E2 不同，写不通过共享总线"扇出"；leader 是唯一写者，转发是唯一正确路径。
+2. **不新建信任边界类别。** 复用既有 internal 控制面 + `HYDRA_CLUSTER_TOKEN`（节点身份），叠加 leader 侧对**租户 Bearer 的二次鉴权**（租户身份）。cluster token 只证明"这是我方节点"，不证明租户身份；重鉴权在权威快照上执行，也天然防重放中的身份混淆。**更重要的是，重鉴权之外必须做授权绑定**：写目标必须等于已鉴权租户（见前置条件 4）——即 **cluster token 证明节点、Bearer 证明身份、绑定规则证明权限**，三者缺一不可。
+3. **不新建网络路径类别。** edge 已在调用 leader 的 control URL（快照轮询），写只是复用同一传输。
+4. **幂等使 failover 安全。** PUT-by-`(tenant_id,name)` upsert 收敛；**DELETE 必须按服务端生成的不可变 id**（重放落到已不存在的 id = no-op；**不得**按 `(tenant_id,name)` 删——否则迟到的 DELETE-X 重放会删掉租户后来新建的同名 X，收敛到的是"旧意图"而非最新状态）。leader 在 apply 后、ack 前失败时，租户重试收敛到同一状态。**结果未知（504）** 以 `whoami.config_version` 对账，不新建机制。
+5. **分区时 fail-closed。** 写 503/504；读继续用旧快照（数据面只读端点 §6.2 本就快照喂养）。
+6. **否决 C**：破坏 any-node 自助；样例拓扑 leader 不暴露数据面（`design-sub-tenant.md` §6.5）。
+7. **B 的核心问题**：CRUD 是同步语义，纯 fire-and-forget 会"先 202 后冲突"（失效流是单向的，没有 per-request 回执）。
+
+#### 实现前置条件（必须随 v2 一并满足，来自 v1 实现后复审 findings）
+
+1. **配额必须按 DB 全量行计数**（在写事务内），而不是按 enabled-only 快照计数——否则"停用→再建"可无限绕过 `MAX_SUB_TENANTS_PER_TENANT`/`MAX_ROUTES_PER_SUB_TENANT`，使 DB 与全量行无界增长（v1 复审 finding 1）。v1 仅 operator 面，故不阻塞；v2 必须修。
+2. **写事务内复验前缀重叠**——v1 的 validate-then-insert 存在 TOCTOU：并发两个"不等但重叠"的前缀都能过（DB unique 只挡相等），只有 warn 级 `config::validate` 兜底（v1 复审 finding 2）。
+3. **为配置写引入独立限流维度**（防经租户 API 的写扇出放大，参照 `design-tenant-api.md` §5.1 对 invalidate 的论证）。
+4. **租户绑定（授权，非仅鉴权）**：leader 重鉴权得到租户 T 后，写目标必须强制等于 T。判定映射（不得含糊）：
+   - 请求体 `tenant_id != T`（含该 id 不存在）⇒ **403**，且用**纯字符串比较、在任何存在性查询之前**判定——镜像 `tenant_api/mod.rs:403-405` 的"租户 id 就在调用方自己的 base URL 里，所以是 403 而非 404"理由，避免把端点变成租户存在性 oracle；
+   - 路由写的 `sub_tenant_id` **缺失，或属于他租户 ⇒ 统一 404**（资源域内不泄露存在性）。
+   内部端点**绕过了数据面的 URL↔token 交叉检查**（`tenant_api/mod.rs:405` 的 `tenant_id_mismatch`/403），所以这条绑定是**唯一防线**：cluster token 持有者（每个 edge/standby）或一个可重放的租户 Bearer 都不能借此写**别的租户**的数据。
+5. **凭据放置与日志约束**：租户 Bearer 走专用请求头 `x-hydra-tenant-token`（**不放 body**，避免转发路径上的 body 日志/诊断泄露活凭据）；转发链路**禁止记录**该头与请求体。
+6. **审计与归因**：经 internal 路径的每次配置写必须记录**发起租户**与**发起节点**（trace id 已在 `forward.rs:233` 中继，租户归因需新增），供事后追溯。
+7. **接收侧必须断言本节点是租约持有者**：internal 写 handler 在落库前必须检查本节点**当前持有租约**（`state.leader_ready` / `is_leader()`，同 `maybe_forward_mutation` 的 `admin/mod.rs:480-486`）：单节点（`leader_ready == None`）本地执行；**非 leader ⇒ `503 not_leader`，绝不本地执行**。理由：internal 闸门在 `admin/mod.rs:638-640` **早退 `route()`**，**不经过**既有 admin 转发路径的 leader 检查（那里的 sender 侧机制——注册表解析、FORWARD_ONCE、超时分类——**都不覆盖接收侧**）。若缺此断言，一个 standby / 被罢黜 leader 会写自己的副本 DB 并返回 200，而下一次 `restore_config` 会把它清掉——这正是理由 7 谴责的"先成功后丢失"（幻影 200）。检查—写入之间被罢黜的竞态（TOCTOU）与既有 504"结果未知"属同一**已接受**的歧义类。
+
+#### 后果
+
+| 类型 | 内容 |
+|---|---|
+| 正面 | any-node 自助写；零新集群机制类别；复用既有 internal 认证与 `forward.rs` 全套语义；幂等 + `config_version` 对账 |
+| 已接受的代价 | **数据面首次为写直连 peer**（仅指向 leader 的 control 面）；cluster token 的作用域从"取快照"扩到"提交配置写"——由 leader 重鉴权 + 租户 Bearer 约束 |
+| 已接受的限制 | 分区期间写不可用（fail-closed）；跨集群场景不覆盖（见下） |
+
+#### 重新评估的触发条件（reconsider if）
+
+1. leader 租约/选举语义改变，使"活跃 leader 是唯一写者"不再成立；
+2. 引入第二个数据面集群/地域（届时需明确写路由与一致性边界）；
+3. `HYDRA_CLUSTER_TOKEN` 被共享给非受信节点（节点身份前提被破坏）。
+
+#### 与 A-1 的关系（不得混淆）
+
+- A-1 否决的是**把 E2 失效请求转发到 leader**，其决定性理由是"扇出已由共享流完成"——**A-1 继续完整有效**。
+- A-2 只放宽"A-1 的机制偏好"，且**仅限租户配置写**这一"leader 是唯一写者"的场景。判别口诀：**请求是否需要落到唯一权威写者？** 需要 → A′；只是让各节点生效 → 共享总线（A-1）。**缓存没有权威写者**（每节点 L1 自治、L2 共享），因此 **E2 永远落在口诀的第二支**——这条是防止把 E2 重新解释为"需要到达 leader"的护栏。
+
 ### 6.5 本项目的决策记录归属（ADR 门禁结论）
 
 本项目**没有 ADR 体系**（无 `docs/adr/`、无 `dev-docs/aegis/adr/`、无 baseline 目录；`dev-docs/aegis/` 只有 `plans/`）。按 `dev-docs/aegis/README.md:8-10`，该目录下的记录是**咨询性方法包产物**，不授予完成权限。
