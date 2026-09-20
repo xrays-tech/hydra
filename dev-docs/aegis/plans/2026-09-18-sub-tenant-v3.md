@@ -284,7 +284,7 @@ T3.2/T3.3/T3.4 ──> T3.5 (文档) ──> T3.6 (门禁 + 证据)
 ## 实施记录与验收证据（T3.6，2026-09-18）
 
 ### 交付状态
-v3 **写路径**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key 派生 + 双 sink 落库。**独立 oracle 复审未跑**（specialist provider 连续失败）；**T3.4（`group_by=sub_tenant` 读取维度）与 terminate_mode 归因集成测试显式延后**（设计 §8 v3 只要求列 + 双 sink）。
+v3 **写路径 + 读取维度**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key 派生 + 双 sink 落库 + `/usage?group_by=sub_tenant`。**独立 oracle 复审未跑**（specialist provider 连续失败）；terminate_mode 归因集成测试延后（纯派生已由 core 测试覆盖，proxy 记录点接线尚无端到端断言）。
 
 ### 任务 → 产物
 | 任务 | 产物 | 状态 |
@@ -292,7 +292,7 @@ v3 **写路径**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key
 | T3.1 | `model.rs::UsageRecord.sub_tenant_id`；`router::sub_tenant_id_for_key`；core 纯测试 `sub_tenant_id_for_key_attributes_by_prefix` | ✅ |
 | T3.2 | 迁移 `0011`；SQLite INSERT + ClickHouse INSERT/JSON 行 + `init.sql`；5 处字面量 + CH 形状测试 `USAGE_COLUMNS` | ✅ |
 | T3.3 | `proxy.rs::logging` 从原始 key 派生并写入记录 | ✅ |
-| T3.4 | `group_by=sub_tenant` 读取维度 | ⏭ 延后（非设计 v3 必需） |
+| T3.4 | `GroupBy::SubTenant` + `group_expr`/`ch_group_expr` + handler 白名单/文案 + `sqlite_group_by_sub_tenant_buckets_by_attribution` | ✅ |
 | T3.5 | 文档（design-sub-tenant / ops / HANDOFF / INDEX） | ✅ |
 | T3.6 | 门禁 + 证据 | ✅ |
 
@@ -310,7 +310,6 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'      # 空
 > 注：`--features usage-clickhouse` **单独不可编译**（`clickhouse.rs` 需 tokio，既有特性门控事实）；测试用 `server,usage-clickhouse`。
 
 ### 延后 / 待办
-- **T3.4** `group_by=sub_tenant`（additive 读取维度；旧请求/响应不变）。
-- **terminate_mode 归因集成测试**：纯派生已由 core 测试覆盖；proxy 记录点接线（4 行）尚无端到端断言。
+- **terminate_mode 归因集成测试**：纯派生已由 core 测试覆盖；proxy 记录点接线（4 行）尚无端到端断言（T3.4 的读取维度已实现并有测试）。
 - **独立 oracle 复审**（计划阶段与实现后）因 provider 故障未跑；provider 恢复后补跑，且不得以自审替代。
 - **ClickHouse 既有实例迁移**：一次性 `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`（无回填）；新实例由 `init.sql` 覆盖；SQLite 由迁移 `0011` 自动完成。

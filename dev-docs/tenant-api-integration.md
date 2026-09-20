@@ -237,7 +237,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 |---|---|---|---|
 | `since` | **是** | — | 窗口起点（**含**） |
 | `until` | 否 | 服务端当前时刻 | 窗口终点（**不含**） |
-| `group_by` | 否 | `none` | `none` \| `model` \| `provider` \| `day`；其他值 → `400 invalid_group_by` |
+| `group_by` | 否 | `none` | `none` \| `model` \| `provider` \| `sub_tenant` \| `day`；其他值 → `400 invalid_group_by` |
 
 **`since` 接受的写法**（一律按 UTC 理解，除自带偏移的）：
 
@@ -279,7 +279,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `since` / `until` | **归一化后**的实际窗口（`until` 不含） |
 | `as_of` | 你在**本次查询的窗口内**最新一条记录的写入时刻（即窗口内 `MAX(created_at)`）；窗口内没有任何记录时为 `null`。默认 `until=now` 时它恰好等于你在存储里的最新一条写入，查历史窗口时约等于窗口上界。用它判断"数据到齐了没有" |
 | `totals` | 整个窗口的合计 |
-| `rows` | 按 `group_by` 分组的行；`group_by=none` 时为空数组。`key` 是分组值（模型名 / provider id / `YYYY-MM-DD`） |
+| `rows` | 按 `group_by` 分组的行；`group_by=none` 时为空数组。`key` 是分组值（模型名 / provider id / **子租户 id** / `YYYY-MM-DD`）。`group_by=sub_tenant` 时，未命中任何子租户前缀的用量归入空字符串 `""` 分组 |
 | `tokens_in` | 请求**发出**的 token（含命中缓存的） |
 | `tokens_out` | 模型**返回**的 token |
 | `cache_hit_tokens` | 命中提示词缓存的 token（是 `tokens_in` 的子集） |
