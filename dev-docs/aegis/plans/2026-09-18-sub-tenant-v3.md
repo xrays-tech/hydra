@@ -1,6 +1,6 @@
 # 实施计划：子租户 v3 —— 用量按子租户归因
 
-> 状态：**计划待 oracle 架构交叉审核**
+> 状态：**已实现（T3.1–T3.6，读取维度含 2026-09-20 更正）**；oracle 复审在仓库内只可核到 finding 1（见「实施记录与验收证据」）。2026-09-20 更正：原状态行写「计划待 oracle 架构交叉审核」，与已完成的实现不符。
 > 目标设计：`design-sub-tenant.md` §8 v3、§7.1（归因必须在**路由时**从原始 key 派生，不得事后从掩码 key 重建）
 > 前置：v1（路由）+ v2（租户自助写）已实现、复审通过并提交（`9adbea1..d799756`）
 > 日期：2026-09-18
@@ -199,8 +199,8 @@
 - 测试：`tests/terminate_mode.rs` 用现有 `Vec<UsageRecord>` 记录器：命中子租户前缀的请求记录该 id；operator binding 同时命中 ⇒ 仍按前缀归因；已停用 ⇒ None；无前缀 ⇒ None。
 
 ### T3.4 — 读取：`group_by=sub_tenant`
-- `usage_query.rs` `group_expr`/`ch_group_expr` 加 `"sub_tenant_id"`（`GroupBy::SubTenant` 或等价）；`handlers.rs` 白名单与错误文案加 `sub_tenant`；`label`。
-- 测试：`tests/usage_query.rs` SQLite + CH(wiremock) 分组；handler 白名单接受/拒绝；旧 group_by 不变。
+- `usage_query.rs` `group_expr`/`ch_group_expr` 加该维度（`GroupBy::SubTenant`）；**两侧表达式都是 `COALESCE(sub_tenant_id, '')` / `coalesce(sub_tenant_id, '')`，不是裸列名**——原因见下方「T3.4 实现更正」；`handlers.rs` 白名单与错误文案加 `sub_tenant`；`label`。
+- 测试：`tests/usage_query.rs` SQLite 分组（`sqlite_group_by_sub_tenant_buckets_by_attribution`）+ **CH(wiremock) 分组**（`clickhouse_group_by_sub_tenant_never_keys_a_row_null`，2026-09-20 补齐）；handler 白名单接受/拒绝；旧 group_by 不变。
 - 文档：`tenant-api-integration.md` usage 的 group_by 表与说明（子租户 id 不是秘密，与 §5.4 一致）。
 
 ### T3.5 — 运维与迁移文档
@@ -278,13 +278,16 @@ T3.2/T3.3/T3.4 ──> T3.5 (文档) ──> T3.6 (门禁 + 证据)
 |---|---|
 | 2026-09-18 | 初稿：v3 任务拆分 T3.1–T3.6、D1–D6 设计裁定、recon 事实基线；待 oracle 架构复核。 |
 | 2026-09-18 | 实现：写路径 T3.1/T3.2/T3.3/T3.5 落地并绿；T3.4 与归因集成测试显式延后。计划/实现后 oracle 复审因 provider 故障未跑（待补）。 |
+| 2026-09-20 | 对齐更正（文档 ↔ 代码）：① T3.4 两侧分组表达式定为 `COALESCE(sub_tenant_id, '')`（原计划写裸列名）；② 补齐 T3.4 承诺的 CH(wiremock) 分组测试；③ `design-sub-tenant.md` §8 v3 与 `HANDOFF.md` 中「读取维度未纳入/延后」的过期声明更正为已实现；④ 原记「oracle 复审未跑」更正为只记可核事实（见「实施记录」）。 |
 
 ---
 
 ## 实施记录与验收证据（T3.6，2026-09-18）
 
 ### 交付状态
-v3 **写路径 + 读取维度**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key 派生 + 双 sink 落库 + `/usage?group_by=sub_tenant`。**独立 oracle 复审未跑**（specialist provider 连续失败）；terminate_mode 归因集成测试延后（纯派生已由 core 测试覆盖，proxy 记录点接线尚无端到端断言）。
+v3 **写路径 + 读取维度**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key 派生 + 双 sink 落库 + `/usage?group_by=sub_tenant`。terminate_mode 归因集成测试延后（纯派生已由 core 测试覆盖，proxy 记录点接线尚无端到端断言）。
+
+**oracle 复审（2026-09-20，只记可核事实）**：仓库内能核到的复审痕迹**只有 finding 1** —— `group_by=sub_tenant` 的未归属（NULL）归因行会让**整窗**以 `503 decode_error` 失败（源码注释 `usage_query.rs` 将该项归因于 "oracle v3 review, finding 1"；本机活 ClickHouse 实测 `SELECT CAST(NULL,'Nullable(String)') AS key … FORMAT JSONEachRow` ⇒ `{"key":null,…}`，而 rows 解码器要求字符串 `key`）。修复见 `b3a57d7`，回归测试见 `sqlite_group_by_sub_tenant_buckets_by_attribution` + `clickhouse_group_by_sub_tenant_never_keys_a_row_null`。**复审报告全文未入库**：计划阶段复审、其余 findings 清单与门禁结论（GATE）**待补**，不得以自审替代。
 
 ### 任务 → 产物
 | 任务 | 产物 | 状态 |
@@ -311,5 +314,13 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'      # 空
 
 ### 延后 / 待办
 - **terminate_mode 归因集成测试**：纯派生已由 core 测试覆盖；proxy 记录点接线（4 行）尚无端到端断言（T3.4 的读取维度已实现并有测试）。
-- **独立 oracle 复审**（计划阶段与实现后）因 provider 故障未跑；provider 恢复后补跑，且不得以自审替代。
+- **oracle 复审报告**：入库的只有 finding 1（已修 + 已测）；计划阶段复审、其余 findings 与门禁结论待补，不得以自审替代。
 - **ClickHouse 既有实例迁移**：一次性 `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`（无回填）；新实例由 `init.sql` 覆盖；SQLite 由迁移 `0011` 自动完成。
+
+### T3.4 实现更正（2026-09-20）
+
+| 项 | 原计划 | 实现（更正后） | 为什么 |
+|---|---|---|---|
+| 分组表达式 | 两侧裸列名 `sub_tenant_id` | `COALESCE(sub_tenant_id, '')` / `coalesce(sub_tenant_id, '')` | `sub_tenant_id` 是唯一可空分组列；CH 的 SQL NULL → JSON `null`，rows 解码器要求字符串 `key` ⇒ 含未归属行的整窗 503。SQLite 侧同样显式 COALESCE，不再依赖 sqlx 的 NULL→`""` 行为 |
+| CH 分组测试 | 计划要求 | 2026-09-20 补齐 `clickhouse_group_by_sub_tenant_never_keys_a_row_null`（断言发出的 SQL 含 `coalesce(sub_tenant_id, '')`，且 `null` key 确为 `Decode` 失败） | 原实现只有 SQLite 分组测试；该修复本身是 CH 特有故障，没有 CH 覆盖就等于没有证据 |
+| `design-sub-tenant.md` / `HANDOFF.md` | 记「读取维度未纳入/延后」 | 更正为已实现（`ea953f1` / `b3a57d7`） | 文档落后于代码，属计划外的事实漂移 |

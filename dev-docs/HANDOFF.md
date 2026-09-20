@@ -194,8 +194,11 @@ queue_wait_timeout_ms # 1000-5000
   via `router::sub_tenant_id_for_key` (model-free/binding-free, enabled-only; `None` when no prefix
   matches). Both sinks write it: SQLite migration `0011`, ClickHouse `environment/clickhouse/init.sql`
   **plus a one-off `ALTER TABLE usage_record ADD COLUMN sub_tenant_id Nullable(String)` for existing
-  instances** (no backfill). `/usage`'s `group_by=sub_tenant` read dimension is **deferred** (design
-  v3 only requires the column + the two sinks). Plan: `aegis/plans/2026-09-18-sub-tenant-v3.md`.
+  instances** (no backfill). `/usage`'s `group_by=sub_tenant` read dimension **is implemented**
+  (`GroupBy::SubTenant`, commit `ea953f1`): both group expressions coalesce the nullable
+  `sub_tenant_id` to `''`, so unattributed rows bucket under the empty key instead of reaching the
+  rows decoder as a JSON `null` key — which failed the **whole window** as 503 `decode_error`
+  (fixed in `b3a57d7`). Plan: `aegis/plans/2026-09-18-sub-tenant-v3.md`.
   - `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (default **60**) — per-tenant config-write budget, enforced
     on the leader (`429 too_many_requests`); the in-process window **resets on leader failover**
     (bounded burst, anti-DoS only).
