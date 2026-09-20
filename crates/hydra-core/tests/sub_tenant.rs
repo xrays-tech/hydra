@@ -498,6 +498,39 @@ fn route_quota_boundary() {
     );
 }
 
+/// Rule 4, update at the boundary: a route UPDATE (`route_id = Some`) at
+/// `MAX_ROUTES_PER_SUB_TENANT` is accepted — the row a natural-key upsert
+/// updates must not count against its own quota. This is the idempotency
+/// invariant A-2 理由 4 requires (a retried PUT after a 504 at the quota
+/// boundary must converge instead of 400). A brand-new route at the cap still
+/// fails.
+#[test]
+fn route_quota_boundary_update_excludes_self() {
+    let cfg = {
+        let mut c = base();
+        c.sub_tenants
+            .push(sub_tenant("st1", "t1", "team-a", "AAA_"));
+        for i in 0..MAX_ROUTES_PER_SUB_TENANT {
+            c.sub_tenant_routes
+                .push(sub_tenant_route(&format!("r{i}"), "st1", None, "p1"));
+        }
+        c
+    };
+
+    // Updating the existing default route `r0` must pass at the cap.
+    let mut update = route_write("t1", "st1", "p1", None);
+    if let SubTenantWrite::Route { route_id, .. } = &mut update {
+        *route_id = Some("r0".to_string());
+    }
+    assert_eq!(validate_sub_tenant_write(&cfg, &update), Ok(()));
+
+    // A brand-new route at the cap is still rejected.
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &route_write("t1", "st1", "p1", None)),
+        Err(SubTenantWriteError::RouteQuotaExceeded)
+    );
+}
+
 // --- rule 1/2: default route (model_key = None) -----------------------------
 
 /// A default route (`model_key = None`) needs no model check — only the

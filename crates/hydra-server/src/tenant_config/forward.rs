@@ -26,12 +26,17 @@ use crate::cluster::forward::{forward_config_write, ForwardError};
 /// Why a tenant config write forward failed.
 #[derive(Debug, thiserror::Error)]
 pub enum TenantConfigForwardError {
-    /// No leader is resolvable right now: this node IS the writer, there is no
-    /// lease holder, or the holder is unresolvable (fail-closed).
+    /// No leader is resolvable right now: there is no lease holder, the holder
+    /// is unresolvable, or THIS node is the lease holder (the self-forward
+    /// guard returns no target).
     ///
-    /// This is a DEFINITE "not the writer" signal, not a transport failure: the
-    /// caller must not apply the write locally (a non-writer never writes) and
-    /// must not treat it as an unknown outcome.
+    /// This is a DEFINITE failure, not a transport failure: the data-plane
+    /// caller fails closed (`503 no_leader`) and does not treat it as an unknown
+    /// outcome. Note the lease-holder case: a cluster leader's own data plane
+    /// has no forward target, so it returns this and does NOT apply locally.
+    /// The supported topology routes tenant traffic to edges (`ops.md`); a
+    /// future refinement may let a lease holder apply tenant writes locally
+    /// through the same write core (preserving the single-writer invariant).
     #[error("no leader is resolvable; the tenant config write cannot be forwarded (fail-closed)")]
     NoLeader,
     /// The forward to the leader failed (connect / timeout / response read).

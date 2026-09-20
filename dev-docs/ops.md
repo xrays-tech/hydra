@@ -595,11 +595,22 @@ write core, then `reload_all` so `config_version` advances. The two faces share 
 write point (`apply_config_write`), so the admin / internal / local paths cannot diverge
 on validation, quota, or natural-key upsert semantics.
 
+**Cluster topology constraint (known limitation)**: a cluster node with a forwarder
+**always forwards**; a cluster **leader's own data plane** therefore has no forward
+target (the self-forward guard resolves `None`) and returns `503 no_leader` for tenant
+writes. The leader still owns the authoritative DB — it simply does not serve tenant
+writes on its data plane. The sample topology (LB → edge:8080) does not route tenant
+traffic to the leader, so this is latent today; a deployment that exposes the leader
+data plane would need the lease holder to take the local path (the single writer is the
+lease holder, so this preserves the invariant). Tracked as a refinement, not a
+correctness bug: it fails closed.
+
 **Per-tenant write rate limit (D6)**: the leader applies a fixed-window,
 **process-local** `Throttle` keyed on the authenticated tenant id
 (`AdminState.config_write_throttle` / `config_write_per_min`, `admin/mod.rs`). Budget is
 `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (**default 60**/min); beyond it the write is `429
-too_many_requests` with `Retry-After`. Because all writes land on the leader, one
+too_many_requests` (the retry seconds are in the message body; this endpoint sets **no**
+`Retry-After` header, unlike the data-plane invalidate 429). Because all writes land on the leader, one
 in-process window covers the cluster. **Anti-DoS only — the window is in-process and
 therefore RESETS when leadership moves**: a leader failover allows a bounded burst of
 config writes. This is the same accepted class as the E2 allow-TTL bound

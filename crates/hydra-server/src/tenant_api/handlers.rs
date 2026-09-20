@@ -812,10 +812,12 @@ pub async fn write(
         }
     };
 
-    // (2) V6 / D6 (A-2 6): a per-tenant config-write Throttle (fixed window,
-    //     process-local, keyed on `tenant_id`) is inserted HERE — after the
-    //     gate + binding, before the forward / local write. NOT implemented yet
-    //     (V6 adds the `Throttle`); this is the seam.
+    // (2) V6 / D6 (A-2 6): the per-tenant config-write throttle is NOT applied
+    //     on this data-plane path. It is enforced by the leader's internal
+    //     endpoint (`admin::tenant_config_api::throttle_gate`), which every
+    //     forwarded write reaches; a single-node local write is bounded by the
+    //     general tenant-API per-tenant request budget instead. Do NOT add a
+    //     second throttle here: it would double-meter forwarded writes.
 
     // (3) Dispatch: a cluster node forwards to the lease-holding leader; a
     //     single-node node (no forwarder) applies locally (D8).
@@ -1063,10 +1065,14 @@ async fn forward_write(
                          retrying"
                     ),
                 ),
-                TenantConfigForwardError::Forward(ForwardError::Other(reason)) => (
+                // `Other`'s reason embeds the reqwest error, which includes the
+                // leader's control-plane URL. Never relay that to a TENANT:
+                // the transport detail stays in the leader-facing logs, and the
+                // tenant gets a stable message.
+                TenantConfigForwardError::Forward(ForwardError::Other(_)) => (
                     502,
                     "forward_failed",
-                    format!("failed to reach the leader: {reason}"),
+                    "failed to reach the leader; the request was not applied".to_string(),
                 ),
             };
             super::respond_error(session, ctx, status, code, &message).await

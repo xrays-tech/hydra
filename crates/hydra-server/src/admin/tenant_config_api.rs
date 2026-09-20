@@ -29,10 +29,12 @@
 //!    (tenant_id, trace_id, action, resource, resource_id, config_version). The
 //!    tenant bearer and request body are NEVER logged (A-2 前置 5).
 //!
-//! **V6 / D6 rate-limit seam**: a per-tenant `Throttle` (fixed window,
-//! process-local) belongs between step 3 (binding) and step 4 (write) — keyed on
-//! the authenticated tenant `T`, so it meters authorised work. It is
-//! intentionally NOT implemented here yet (V6 adds the `Throttle`).
+//! **V6 / D6 rate limit (implemented)**: a per-tenant `Throttle` (fixed window,
+//! process-local) runs after step 2 (re-auth) and before step 4 (write), keyed
+//! on the authenticated tenant `T`, so it meters authorised work; over budget ⇒
+//! `429 too_many_requests` (see `throttle_gate`). It is enforced on this leader
+//! internal endpoint — the single-node data-plane local path is a different path
+//! and is bounded by the general tenant-API request budget.
 //!
 //! These routes are NOT routed through the admin token or
 //! `maybe_forward_mutation`: the edge already arrived here carrying the cluster

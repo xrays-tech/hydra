@@ -305,6 +305,16 @@ pub async fn create_route(
         .find(|s| s.id == sub_tenant_id)
         .ok_or(CoreError::NotFound)?;
 
+    // The natural key this upsert targets: if a row already exists for
+    // `(sub_tenant_id, model_key)`, the quota must NOT count it — the upsert
+    // updates it in place. Without this, a retried PUT at quota would be
+    // rejected 400 instead of converging (A-2 理由 4: PUT-upsert must be
+    // idempotent even after a 504 retry at the quota boundary).
+    let existing_id = routes
+        .iter()
+        .find(|r| r.sub_tenant_id == sub_tenant_id && r.model_key.as_deref() == model_key)
+        .map(|r| r.id.as_str());
+
     validate_route_in_tx(
         cfg,
         &rows,
@@ -312,7 +322,7 @@ pub async fn create_route(
         sub_tenant_id,
         provider_id,
         model_key,
-        None,
+        existing_id,
     )
     .map_err(CoreError::Validation)?;
 

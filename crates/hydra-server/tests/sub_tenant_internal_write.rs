@@ -728,3 +728,67 @@ async fn config_write_throttle_is_per_tenant() {
     .await;
     assert_eq!(r.status(), 200, "the budget is per tenant, not global");
 }
+
+/// The natural-key route PUT is idempotent: a repeated PUT converges to the
+/// SAME immutable id (D4 / A-2 理由 4). Exercises the route-upsert self-exclusion
+/// in the write core — a repeated PUT targets the existing row, so it must not
+/// be counted as a new route (the oracle v2 BLOCKING fix).
+#[tokio::test]
+async fn route_put_is_idempotent() {
+    let state = admin_state(false, Some(true)).await;
+    let port = start_admin(state.clone());
+    seed_base(&state).await;
+
+    // A sub-tenant to hang the route on.
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/internal/tenant-config/sub-tenants",
+        Some(json!({ "tenant_id": "t1", "name": "team-a", "key_prefix": "QQCX_" })),
+        Some(CLUSTER_TOKEN),
+        Some(T1_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let st: serde_json::Value = r.json().await.expect("json");
+    let st_id = st["sub_tenant"]["id"].as_str().expect("id").to_string();
+
+    let route_body = json!({
+        "sub_tenant_id": st_id,
+        "provider_id": "p1",
+        "model_key": "gpt-4o"
+    });
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/internal/tenant-config/sub-tenant-routes",
+        Some(route_body.clone()),
+        Some(CLUSTER_TOKEN),
+        Some(T1_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let id1 = r.json::<serde_json::Value>().await.expect("json")["route"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/internal/tenant-config/sub-tenant-routes",
+        Some(route_body),
+        Some(CLUSTER_TOKEN),
+        Some(T1_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), 200, "a repeated route PUT is accepted");
+    let id2 = r.json::<serde_json::Value>().await.expect("json")["route"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    assert_eq!(
+        id1, id2,
+        "a repeated route PUT by natural key converges to the same id"
+    );
+}
