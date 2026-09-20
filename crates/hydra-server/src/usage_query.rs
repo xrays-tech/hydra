@@ -179,7 +179,10 @@ fn group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
-        GroupBy::SubTenant => Some("sub_tenant_id"),
+        // COALESCE so an unattributed (NULL) row groups under the explicit ""
+        // key — identical on both backends, independent of the sqlx NULL->""
+        // quirk (oracle v3 review, finding 1).
+        GroupBy::SubTenant => Some("COALESCE(sub_tenant_id, '')"),
         // `created_at` is fixed-width `YYYY-MM-DDTHH:MM:SSZ`, so the date is a
         // safe 10-byte prefix and needs no date function (which would also make
         // the index unusable).
@@ -315,7 +318,10 @@ fn ch_group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
-        GroupBy::SubTenant => Some("sub_tenant_id"),
+        // ClickHouse emits SQL NULL as JSON `null`; the decoder requires a
+        // string `key`, so COALESCE to "" for unattributed rows (oracle v3
+        // review, finding 1 — was 503 decode_error on any NULL group).
+        GroupBy::SubTenant => Some("coalesce(sub_tenant_id, '')"),
         // `created_at` is a fixed-width `YYYY-MM-DDTHH:MM:SSZ` string on both
         // backends, so the date is a safe 10-byte slice. No date function: it
         // would both change semantics and drop the primary-key pruning.
