@@ -1,6 +1,6 @@
 # 实施计划：子租户 v3 —— 用量按子租户归因
 
-> 状态：**已实现（T3.1–T3.6，读取维度含 2026-09-20 更正）**；oracle 复审在仓库内只可核到 finding 1（见「实施记录与验收证据」）。2026-09-20 更正：原状态行写「计划待 oracle 架构交叉审核」，与已完成的实现不符。
+> 状态：**已实现（T3.1–T3.6，读取维度含 2026-09-20 更正）**；**oracle 复审（计划阶段与实现后）实际未执行**（2026-09-20 确认），见「实施记录与验收证据」。同日更正两处不实记录：原状态行写「计划待 oracle 架构交叉审核」（与已完成的实现不符）；源码注释曾把 `COALESCE` 修复归因于 "oracle v3 review, finding 1"（该复审并未跑，归因已移除）。
 > 目标设计：`design-sub-tenant.md` §8 v3、§7.1（归因必须在**路由时**从原始 key 派生，不得事后从掩码 key 重建）
 > 前置：v1（路由）+ v2（租户自助写）已实现、复审通过并提交（`9adbea1..d799756`）
 > 日期：2026-09-18
@@ -278,7 +278,8 @@ T3.2/T3.3/T3.4 ──> T3.5 (文档) ──> T3.6 (门禁 + 证据)
 |---|---|
 | 2026-09-18 | 初稿：v3 任务拆分 T3.1–T3.6、D1–D6 设计裁定、recon 事实基线；待 oracle 架构复核。 |
 | 2026-09-18 | 实现：写路径 T3.1/T3.2/T3.3/T3.5 落地并绿；T3.4 与归因集成测试显式延后。计划/实现后 oracle 复审因 provider 故障未跑（待补）。 |
-| 2026-09-20 | 对齐更正（文档 ↔ 代码）：① T3.4 两侧分组表达式定为 `COALESCE(sub_tenant_id, '')`（原计划写裸列名）；② 补齐 T3.4 承诺的 CH(wiremock) 分组测试；③ `design-sub-tenant.md` §8 v3 与 `HANDOFF.md` 中「读取维度未纳入/延后」的过期声明更正为已实现；④ 原记「oracle 复审未跑」更正为只记可核事实（见「实施记录」）。 |
+| 2026-09-20 | 对齐更正（文档 ↔ 代码）：① T3.4 两侧分组表达式定为 `COALESCE(sub_tenant_id, '')`（原计划写裸列名）；② 补齐 T3.4 承诺的 CH(wiremock) 分组测试；③ `design-sub-tenant.md` §8 v3 与 `HANDOFF.md` 中「读取维度未纳入/延后」的过期声明更正为已实现；④ 原记「oracle 复审未跑」当时被改为「只记可核事实」，现按确认更正为 **复审实际未执行**，并移除源码注释中的不实归因。 |
+| 2026-09-20 | 活实例验收：在本机 `hydra-local-clickhouse` 执行 `ops.md` 记录的一次性 `ALTER TABLE … ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`（12 行旧数据全部 NULL，无回填）；`--ignored` 活实例测试通过（reader totals 与手跑 SQL 一致 8 requests / 247 tokens_in），并新增 `group_by=sub_tenant` 活实例断言（`""` 分组 = 8 条未归属行；裸列仍返回 `{"key":null}`，即 COALESCE 存在的理由）。 |
 
 ---
 
@@ -287,7 +288,7 @@ T3.2/T3.3/T3.4 ──> T3.5 (文档) ──> T3.6 (门禁 + 证据)
 ### 交付状态
 v3 **写路径 + 读取维度**已实现：`UsageRecord.sub_tenant_id` + 路由时从原始 key 派生 + 双 sink 落库 + `/usage?group_by=sub_tenant`。terminate_mode 归因集成测试延后（纯派生已由 core 测试覆盖，proxy 记录点接线尚无端到端断言）。
 
-**oracle 复审（2026-09-20，只记可核事实）**：仓库内能核到的复审痕迹**只有 finding 1** —— `group_by=sub_tenant` 的未归属（NULL）归因行会让**整窗**以 `503 decode_error` 失败（源码注释 `usage_query.rs` 将该项归因于 "oracle v3 review, finding 1"；本机活 ClickHouse 实测 `SELECT CAST(NULL,'Nullable(String)') AS key … FORMAT JSONEachRow` ⇒ `{"key":null,…}`，而 rows 解码器要求字符串 `key`）。修复见 `b3a57d7`，回归测试见 `sqlite_group_by_sub_tenant_buckets_by_attribution` + `clickhouse_group_by_sub_tenant_never_keys_a_row_null`。**复审报告全文未入库**：计划阶段复审、其余 findings 清单与门禁结论（GATE）**待补**，不得以自审替代。
+**oracle 复审（2026-09-20 更正：实际未执行）**：oracle v3 复审（计划阶段与实现后）**没有实际跑过**（2026-09-20 用户确认；原因未记录）。此前 `usage_query.rs` 的注释把 `COALESCE(sub_tenant_id, '')` 修复归因于 "oracle v3 review, finding 1" —— **该归因不实，已从源码注释移除**；这项修复来自实现侧自查。技术事实本身与复审无关且已实测可核：未归属（NULL）行的**裸列**分组键在活实例上对真实数据返回 `{"key":null,"requests":"8"}`，而 rows 解码器要求字符串 `key`，故含未归属行的整窗会以 `503 decode_error` 失败；换成 `coalesce(sub_tenant_id, '')` 后返回 `{"key":"","requests":"8"}`。修复见 `b3a57d7`，回归测试见 `sqlite_group_by_sub_tenant_buckets_by_attribution` + `clickhouse_group_by_sub_tenant_never_keys_a_row_null` + 活实例 `live_clickhouse_aggregate_matches_a_hand_run_query`（含 `sub_tenant` 分组断言）。**复审仍待补跑，且不得以自审替代。**
 
 ### 任务 → 产物
 | 任务 | 产物 | 状态 |
@@ -305,6 +306,9 @@ cargo build --workspace --features server                              # ok
 cargo test -p hydra-core                                               # 17/17 套件全绿
 cargo test -p hydra-server --features server --test sqlite_sink --test terminate_mode
 cargo test -p hydra-server --features server,usage-clickhouse --test clickhouse_sink
+# 活实例（2026-09-20 补跑，本机 hydra-local-clickhouse；需先执行 ops.md 的 v3 ALTER）：
+CH_URL=http://127.0.0.1:8123 cargo test -p hydra-server --features server,usage-clickhouse \
+  --test usage_query -- --ignored --nocapture                          # 1 passed
 cargo test -p hydra-server --features server                          # 全量 0 failed
 cargo fmt --all -- --check
 RUSTFLAGS=-D warnings cargo clippy -p hydra-core -p hydra-server --features server --all-targets -- -D warnings
@@ -314,8 +318,8 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'      # 空
 
 ### 延后 / 待办
 - **terminate_mode 归因集成测试**：纯派生已由 core 测试覆盖；proxy 记录点接线（4 行）尚无端到端断言（T3.4 的读取维度已实现并有测试）。
-- **oracle 复审报告**：入库的只有 finding 1（已修 + 已测）；计划阶段复审、其余 findings 与门禁结论待补，不得以自审替代。
-- **ClickHouse 既有实例迁移**：一次性 `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`（无回填）；新实例由 `init.sql` 覆盖；SQLite 由迁移 `0011` 自动完成。
+- **oracle 复审**：计划阶段与实现后复审**实际未执行**（2026-09-20 确认）；代码注释中曾有的 "oracle v3 review, finding 1" 归因已移除。补跑前不得以自审替代。
+- **ClickHouse 既有实例迁移**：一次性 `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`（无回填）；新实例由 `init.sql` 覆盖；SQLite 由迁移 `0011` 自动完成。**本机 `hydra-local-clickhouse` 已于 2026-09-20 执行**（12 行旧数据全部 NULL）；未执行该步骤的实例在 v3 二进制首次写入时 flush 会失败（`NO_SUCH_COLUMN_IN_TABLE`，已实测）。
 
 ### T3.4 实现更正（2026-09-20）
 
@@ -324,3 +328,4 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'      # 空
 | 分组表达式 | 两侧裸列名 `sub_tenant_id` | `COALESCE(sub_tenant_id, '')` / `coalesce(sub_tenant_id, '')` | `sub_tenant_id` 是唯一可空分组列；CH 的 SQL NULL → JSON `null`，rows 解码器要求字符串 `key` ⇒ 含未归属行的整窗 503。SQLite 侧同样显式 COALESCE，不再依赖 sqlx 的 NULL→`""` 行为 |
 | CH 分组测试 | 计划要求 | 2026-09-20 补齐 `clickhouse_group_by_sub_tenant_never_keys_a_row_null`（断言发出的 SQL 含 `coalesce(sub_tenant_id, '')`，且 `null` key 确为 `Decode` 失败） | 原实现只有 SQLite 分组测试；该修复本身是 CH 特有故障，没有 CH 覆盖就等于没有证据 |
 | `design-sub-tenant.md` / `HANDOFF.md` | 记「读取维度未纳入/延后」 | 更正为已实现（`ea953f1` / `b3a57d7`） | 文档落后于代码，属计划外的事实漂移 |
+| 源码注释归因 | `usage_query.rs` 记 "oracle v3 review, finding 1" | 删除归因，改为该故障的可核技术说明 | 该 oracle 复审**实际未执行**（2026-09-20 确认）：把自查结果记成外部复审结论，是比文档过时更严重的事实错误 |

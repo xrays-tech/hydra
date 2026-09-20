@@ -1468,4 +1468,88 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
         "the grouped read must return the model group too"
     );
     println!("rows={:?}", agg.rows);
+
+    // v3: the same window grouped by the one **nullable** key, over the rows the
+    // instance really has. `sub_tenant_id` arrives via the documented one-off
+    // ALTER and every pre-existing row is NULL, so this window is exactly the
+    // shape that used to fail the whole read (503 decode_error) instead of
+    // answering. Two things are pinned: the reader's own grouped read, and the
+    // hand-run proof that the bare column really does put `null` on the wire —
+    // i.e. that the COALESCE is what makes the read survive real data.
+    async fn hand_query(ch: &str, sql: String) -> String {
+        reqwest::Client::new()
+            .post(format!("{ch}/"))
+            .body(sql)
+            .send()
+            .await
+            .expect("live CH")
+            .text()
+            .await
+            .expect("body")
+    }
+    let grouped = reader
+        .aggregate(
+            &tenant,
+            "2026-09-15T00:00:00Z",
+            "2026-09-16T00:00:00Z",
+            hydra_server::usage_query::GroupBy::SubTenant,
+        )
+        .await
+        .expect("a window of unattributed rows must be answered, not failed");
+    println!("sub_tenant groups={:?}", grouped.rows);
+    assert_eq!(
+        grouped.rows.iter().map(|r| r.totals.requests).sum::<u64>(),
+        grouped.totals.requests,
+        "every row must land in exactly one group: {:?}",
+        grouped.rows
+    );
+
+    let unattributed: u64 = {
+        let body = hand_query(
+            &ch,
+            format!(
+                "SELECT countIf(sub_tenant_id IS NULL) AS c FROM usage_record \
+                 WHERE tenant_id = '{tenant}' AND created_at >= '2026-09-15T00:00:00Z' \
+                 AND created_at < '2026-09-16T00:00:00Z' FORMAT JSONEachRow"
+            ),
+        )
+        .await;
+        let o: Value = serde_json::from_str(body.trim()).expect("one line");
+        o["c"].as_str().unwrap_or("0").parse().unwrap_or(0)
+    };
+    println!("hand-run: unattributed={unattributed}");
+    if unattributed > 0 {
+        let empty = grouped
+            .rows
+            .iter()
+            .find(|r| r.key.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "unattributed rows must bucket under \"\": {:?}",
+                    grouped.rows
+                )
+            });
+        assert_eq!(
+            empty.totals.requests, unattributed,
+            "the \"\" group must be the unattributed rows, no more and no fewer"
+        );
+
+        // Only meaningful while the instance still holds unattributed rows: this
+        // is the wire shape the COALESCE exists to prevent, taken from real data
+        // rather than from a hand-built `CAST(NULL …)`.
+        let bare = hand_query(
+            &ch,
+            format!(
+                "SELECT sub_tenant_id AS key, count() AS requests FROM usage_record \
+                 WHERE tenant_id = '{tenant}' AND created_at >= '2026-09-15T00:00:00Z' \
+                 AND created_at < '2026-09-16T00:00:00Z' GROUP BY key ORDER BY key FORMAT JSONEachRow"
+            ),
+        )
+        .await;
+        println!("hand-run bare column: {}", bare.trim());
+        assert!(
+            bare.contains("\"key\":null"),
+            "the bare column puts a null key on the wire — the reason for the COALESCE: {bare}"
+        );
+    }
 }

@@ -479,6 +479,10 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 > `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`
 > (**no backfill** — pre-existing rows stay NULL; `CREATE TABLE IF NOT EXISTS` does not
 > add columns to an existing table). SQLite applies migration `0011` automatically.
+> **Run it before the first v3 binary writes to that instance**: the ClickHouse insert
+> names the column, and ClickHouse rejects an insert naming a column that does not exist
+> (`NO_SUCH_COLUMN_IN_TABLE`, verified against the bundled instance on a throwaway table),
+> so usage flushes for that instance fail until the `ALTER` is applied.
 
 ### 5.5 Sub-tenant configuration (admin API)
 
