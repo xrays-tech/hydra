@@ -310,3 +310,58 @@ V4 (tx write core + count/upsert) ──> V5 (tenant write endpoints) ──> V6
 |---|---|
 | 2026-09-18 | 初稿：v2（A′）任务拆分 V1–V8、D1–D9 设计裁定、recon 事实基线；待 oracle 架构复核。 |
 | 2026-09-18 | oracle 计划阶段门禁 **GATE: PASS**。并入：D9 `name` 字符集条件（V4）、ops 的 failover 限流窗口注记（V7）、A-2 前置 7 行号更正 `:646-652`；新增 A-2 前置 8（数据面转发 plumbing 信任受控）。recon 全部引用经核验；A-1 逐字未动。 |
+| 2026-09-18 | 实现阶段：**V1–V7 全部完成**，V8 门禁执行（证据见下节）。代码**未提交**。 |
+
+---
+
+## 实施记录与验收证据（V8，2026-09-18）
+
+### 交付状态
+**V1–V7 全部实现**：数据面转发传输器、leader internal 写端点（租约断言 + 重鉴权 + 授权绑定 + 审计）、事务化写核心（修 v1 findings 1/2）、租户写端点（含 edge 本地/转发分派）、每租户配置写限流、文档同步。**代码未提交**。
+
+### 任务 → 产物
+| 任务 | 产物 | 状态 |
+|---|---|---|
+| V1 | `cluster/forward.rs::forward_config_write`、`tenant_config/forward.rs::TenantConfigForwarder`、`AppState` 注入 + `main.rs` leader-url 闭包 | ✅ |
+| V2/V3 | `admin/tenant_config_api.rs`（4 条 internal 路由 + lease_gate + reauth + binding + audit）、`admin/mod.rs` 注册 | ✅ |
+| V4 | `admin/sub_tenant_write.rs`（事务化写核心）、`hydra-core/sub_tenant.rs`（全量行快照校验 + `NameInvalid`）、`db.rs` count/upsert；admin 7 调用点重接 | ✅ |
+| V5 | `hydra-core/tenant_api.rs`（`TenantWriteRoute`/`parse_write_route`）、`tenant_api/{mod,handlers}.rs`（写端点 + forward/local 分派） | ✅ |
+| V6 | `AdminState.config_write_throttle`/`config_write_per_min` + 4 handler 接入；`HYDRA_TENANT_CONFIG_WRITE_PER_MIN`（默认 60） | ✅ |
+| V7 | design-sub-tenant/tenant-api-integration/ops/HANDOFF/design-tenant-api §6.4b/INDEX | ✅ |
+
+### 门禁证据（可重跑）
+```bash
+cargo test -p hydra-core                                    # 17/17 套件全绿
+cargo test -p hydra-server --features server                # 全量套件 0 failed
+HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 \
+  cargo test -p hydra-server --features server,cluster-redis # 仅 v1 既有 admin_api 2 例 E2 屏障失败
+cargo build --workspace --features server                   # ok
+cargo fmt --all -- --check                                  # ok
+RUSTFLAGS=-D warnings cargo clippy ... --all-targets        # ok
+cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'   # 空
+```
+> 2 例 `admin_api`（`empty_body_delete_invalidates_all_local`、`too_many_invalidation_keys_are_refused_and_publish_nothing`）为 **v1 阶段已证实的既有基线失败**（HEAD worktree 复现），非 v2 回归。
+
+### 新增测试
+- core：`TenantWriteRoute`/`parse_write_route` 正负例（V5）；`SubTenantRows` 全量行配额/重叠/`NameInvalid`（V4）。
+- server：`tests/sub_tenant_internal_write.rs` 6（gate/reauth/binding/success/cross-tenant negative/**throttle per-tenant**）；`tests/sub_tenant_data_plane_write.rs`（edge→leader e2e）；`tests/sub_tenant_admin.rs` 扩展（disabled-row 配额/重叠）。
+- `cluster/forward.rs`/`tenant_config/forward.rs` 单测（头组合、no-leader 确定失败、registry 解析转发）。
+
+### 执行期修正/偏离（须记录）
+- **V4/V5 遭遇基础设施失败**（"all candidate providers failed"，两次），V4 由续跑补齐、V5 编辑最终落盘后由我格式化并复验。
+- **`cargo fmt --all` 在 lane 全部空闲后统一应用**（失败的 lane 未自行格式化）。
+- **V6 作用域更正**：注释原称限流也覆盖"单节点本地路径"，与代码不符（`tenant_api::local_write` 未调用该 throttle）。已更正注释：cluster 下由 leader internal 端点施加；单节点本地写由租户 API 的一般 per-tenant 预算约束。计划 D6 本就限定 leader 侧，文档（V7）据此保持准确。
+- **V4 报告的全并发非等值前缀竞态**未 100% 关闭（事务内读快照），顺序/等值已关闭；与计划"check-then-write failover TOCTOU"同属已接受歧义类。
+
+### 未做（明确不属于 v2）
+- 审计持久化表（D7 用结构化日志，表另立决策）；v3 用量归因；`--features db` 单独编译（v1 既有）。
+
+### 高风险不变量自审（**独立 oracle 复审待跑**）
+由于 specialist provider 连续失败（3 次 "all candidate providers failed"），实现后**独立 oracle 对抗式复审未能运行**。orchestrator 对最高风险不变量做了代码级**自审（非独立）**：
+- `forward_config_write`：`Authorization` 仅 cluster token，租户 Bearer 走 `x-hydra-tenant-token`，调用方 `Authorization` **不中继**，bearer/body 不日志（`cluster/forward.rs:300-367`）。
+- 写核心事务：`begin → read_rows(全量行) → validate_against → upsert`；自动前缀对 overlap 与 unique **双重重试**（`admin/sub_tenant_write.rs:150-199`）；upsert 按自然键且在 name 冲突时**保留既有 id**。
+- 授权绑定：`tenant_id != T` **纯字符串比较 403（先于任何查询）**；路由 `sub_tenant_id` missing/foreign ⇒ **404**（`admin/tenant_config_api.rs:192-330`）。
+- handler 顺序：`lease_gate → reauth → throttle → apply`；单节点 `local_write` reload 并返回 `config_version`（`tenant_api/handlers.rs:899-976`）。
+- `parse_write_route`：方法感知，路径形态冲突（PUT `{name}` vs DELETE `{id}`、flat PUT 路由 vs GET 列表）按 `(method,path)` 解析，near-miss ⇒ `None`（`hydra-core/src/tenant_api.rs`）。
+
+**限制（必须保留）**：以上为自审，**不取代独立复审**。建议 provider 恢复后补跑 oracle 实现后对抗式复审；在此之前，v2 的提交须把"独立复审待跑"作为显式保留项记录，不得声称已通过独立门禁。

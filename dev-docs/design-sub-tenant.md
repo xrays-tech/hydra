@@ -1,6 +1,6 @@
 # 子租户（Sub-Tenant）与 api-key 前缀路由 — 设计文档
 
-> 状态：**设计评审通过（oracle v1 评审 + 事实核查）；实施计划已排（`dev-docs/aegis/plans/2026-09-18-sub-tenant.md`，计划阶段 oracle GATE: PASS）**
+> 状态：**设计评审通过（oracle v1 评审 + 事实核查）。v1 已实现并提交（`da07610~1..1007dea`）；v2（租户自助写 / A′）已实现（V1–V6 全绿，V8 门禁待跑；计划 `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`）**
 > 日期：2026-09-18
 > 相关：`design.md` §7.1（路由/白名单）、§7.1b（key-prefix binding）、`design-tenant-api.md`（数据面自助 API 与 A-1 决策）、`cluster.md`（LEADER/EDGE 拓扑）
 
@@ -188,13 +188,23 @@ UNIQUE(sub_tenant_id, model_key)       -- NULL = 该子租户默认路由；NULL
 
 ### 6.3 v2：方案 A′（租户自助写）
 
+**状态：已实现（v2 落地，2026-09-18，V1–V6 全绿；V8 门禁待跑）。** A′ 按 A-2（`design-tenant-api.md` §6.4b）实现，落地在 `crates/hydra-server`。
+
 复用既有 internal 控制面模式转发到租约持有者：
 
-- 传输/认证：edge 数据面 handler → leader `/api/v1/internal/tenant-config/...`，**cluster token 认证节点**（`admin/mod.rs:619-641`；原文引用 `:582-604` 为陈旧行号）；请求体内携带**租户 Bearer**，leader 侧用**同一 `authenticate` 闸门重鉴权**。cluster token 只证明“这是我方节点”，不证明租户身份；重鉴权是权威快照上的二次确认，也天然防重放中的身份混淆。
-- 复用 `forward.rs` 全套语义：注册表实时解析目标、`FORWARD_ONCE_HEADER` 环守卫、connect/total 双超时与“确定失败/结果未知”分类（503/504）。
+- 传输/认证：edge 数据面 handler → leader `/api/v1/internal/tenant-config/...`，**cluster token 认证节点**（internal 闸门在 `admin/mod.rs:679-701`）；**租户 Bearer 走专用头 `x-hydra-tenant-token`**（`cluster/forward.rs:126`，**不放 body**），leader 侧用**同一 `authenticate` 闸门重鉴权**（`admin/tenant_config_api.rs:359`）。cluster token 只证明“这是我方节点”，不证明租户身份；重鉴权是权威快照上的二次确认，也天然防重放中的身份混淆。
+- 复用 `forward.rs` 全套语义：注册表实时解析目标、`FORWARD_ONCE_HEADER` 环守卫、connect/total 双超时与“确定失败/结果未知”分类（503/504）。转发由新函数 `cluster::forward::forward_config_write`（`cluster/forward.rs:307`）执行——不复用 `forward_mutation`（它固定中继调用方 `Authorization`）。
 - **幂等写**：PUT-by-`(tenant_id, name)` upsert + 幂等 DELETE；leader failover 在 apply 后、ack 前发生时，租户重试收敛到同一状态。
 - **对账**：租户 API 的 `whoami` 已返回 `config_version`（`auth.rs:54-57`），异步/未知结果的对账不必新建机制。
-- 单节点/leader 本机：复用 `maybe_forward_mutation` 结构（`leader_ready` 为 `None` 或 `is_leader()` ⇒ 本地执行，`admin/mod.rs:480-483`）。
+- 单节点/leader 本机：`leader_ready` 为 `None` 或 `is_leader()` ⇒ 本地执行（接收侧租约断言 `lease_gate`，`admin/tenant_config_api.rs:330`）。
+
+**v2 落地补充**（在方案基础上实际实现的增量）：
+
+- **数据面转发 plumbing（A-2 前置 8，信任受控）**：数据面 `AppState` 仅获得一个 `TenantConfigForwarder`（`tenant_config/forward.rs`）——持有共享 **cluster token**（节点身份）+ 单个 **leader-URL 闭包**（唯一的 leader 解析缝，`None` ⇒ fail-closed 503）。**不**向数据面暴露 `NodeRegistry`。
+- **每租户配置写限流（D6）**：leader 侧 `AdminState.config_write_throttle` / `config_write_per_min`（`admin/mod.rs`），环境变量 `HYDRA_TENANT_CONFIG_WRITE_PER_MIN`（默认 60，`admin/mod.rs:71`）。进程内窗口，**leader failover 时重置**（有界突发，anti-DoS，与 E2 的 allow-TTL 上界同类）。
+- **事务化写核心（D5，修 v1 复审 findings 1/2）**：`admin/sub_tenant_write.rs` 每个写操作跑在**一个 SQLite 事务**内——事务内读**全量**子租户/路由行（含 disabled，`read_rows` `:85`）做配额计数（finding 1：配额按 DB 全量行，不再 enabled-only）与重叠复验（finding 2：堵住 validate-then-insert TOCTOU），再插入/upsert/更新/删除并 commit。
+- **唯一写点**：`apply_config_write`（`admin/tenant_config_api.rs:192`）是数据面本地路径（`local_write`，`tenant_api/handlers.rs:899`）与 leader internal 路径共用的**唯一写点**，两面不能在校验/配额/自然键 upsert 语义上分叉。
+- **A-1 对 E2 不受影响**：A′ 仅限配置写场景（leader 是唯一写者）；A-1 本体（E2 不转发到 leader 的 admin API）继续完整有效（`design-tenant-api.md` §6.4b「与 A-1 的关系」）。
 
 ### 6.4 必须的决策记录：A-1 修订（A-2）
 
@@ -206,7 +216,7 @@ A-1（`design-tenant-api.md` §6.4）否决的是**失效清除端点（E2）**�
 
 | 方案 | 正确性 | 信任边界 | 运维/拓扑 | 工作量 | 裁定 |
 |---|---|---|---|---|---|
-| **A′ 既有 internal 面 + forward.rs 语义转发**（cluster token 认节点 + 租户 token 认身份） | 同步 CRUD；失败分类现成；幂等 upsert 兜 failover | 需修订 A-1（数据面首次直连 peer）；leader 重鉴权 | 复用 edge→leader control URL；LB 拓扑零改动 | 中 | **v2 首选** |
+| **A′ 既有 internal 面 + forward.rs 语义转发**（cluster token 认节点 + 租户 token 认身份） | 同步 CRUD；失败分类现成；幂等 upsert 兜 failover | 需修订 A-1（数据面首次直连 peer）；leader 重鉴权 | 复用 edge→leader control URL；LB 拓扑零改动 | 中 | **v2 首选（已实现，2026-09-18）** |
 | **B Redis 意图流** | 最终一致；需幂等 apply + 版本守卫 + 新建回执/对账 | 完全符合 A-1 字面（总线模式） | Redis 已是集群硬依赖；无新网络路径 | 大 | 仅当 A-2 被否时启用 |
 | **C LB 分流到 leader** | 正确 | 无新边界 | **破坏 any-node 自助**；样例拓扑 leader 不暴露数据面 | 小 | **否决** |
 | **D 仅 admin 面（operator 代管）** | 正确且零新机制 | 无新边界 | 与一切现有配置写同构 | 最小 | **v1 采纳**（P2 的前置，非替代） |
@@ -237,8 +247,8 @@ B 的核心问题：CRUD 是同步语义，纯 fire-and-forget 会“先 202 后
 3. `router.rs` (3.6) 步 + `accessible_models` 镜像 + `proxy::passthrough_candidates` 默认路由收窄（Q10）+ `hydra-core` 纯函数单测（路由逻辑必须住 core，受依赖防火墙约束）。
 4. 租户 API **只读**端点（GET 子租户/路由，快照喂养）。
 
-### v2（租户自助写）
-A′ + A-2 决策记录 + 幂等 upsert + leader 重鉴权 + `config_version` 对账 + 每租户配额 + 独立限流维度（防配置写扇出放大，参照 §5.1 对 invalidate 的论证）。
+### v2（租户自助写）—— 已实现（2026-09-18，V1–V6 全绿，V8 门禁待跑）
+A′ + A-2 决策记录 + 幂等 upsert（`PUT` 按自然键、`DELETE` 按不可变 id）+ leader 重鉴权 + `config_version` 对账 + 每租户配额（**按 DB 全量行计数**，D5 收紧）+ 独立限流维度（每租户配置写，`HYDRA_TENANT_CONFIG_WRITE_PER_MIN`，防配置写扇出放大，参照 §5.1 对 invalidate 的论证）。落地形态见 §6.3「v2 落地补充」；4 个数据面写端点见 `tenant-api-integration.md` §5.6，运维侧（internal 路由 / 限流 / 审计 / 单节点）见 `ops.md` §5.5。
 
 ### v3（用量归因）
 `usage_record` 新列（路由时派生），ClickHouse/SQLite 双 sink 同步改。
@@ -300,3 +310,16 @@ A′ + A-2 决策记录 + 幂等 upsert + leader 重鉴权 + `config_version` �
 - **Q11 回填**：§9 补记 (a′) 的严格默认路由语义。
 
 实施任务拆分与验收矩阵见 `dev-docs/aegis/plans/2026-09-18-sub-tenant.md`。
+
+### 2026-09-18 v2 落地（租户自助写 / A′）
+
+v2（`dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`，V1–V6）已实现（未提交、全绿；V8 门禁待跑）：
+
+- **数据面转发传输器**：`tenant_config/forward.rs`（`TenantConfigForwarder`，D1/D2）+ `cluster/forward.rs::forward_config_write`（专用头 `x-hydra-tenant-token` 携租户 Bearer，`cluster/forward.rs:126`）。
+- **leader internal 写端点 + 接收侧租约断言**：`admin/tenant_config_api.rs`（`/api/v1/internal/tenant-config/...`，cluster-token 闸门 `admin/mod.rs:679-701`；`lease_gate` 非候选 404 / 无租约 503）。
+- **leader 重鉴权 + 授权绑定 + 审计**：`admin/tenant_config_api.rs`（`reauth` + `apply_config_write` 绑定；审计 `tenant_id/trace_id/action/resource/resource_id/config_version`，**从不记 bearer/body**）。
+- **事务化写核心**：`admin/sub_tenant_write.rs`（一个 SQLite 事务；修 v1 findings 1/2——全量行配额 + 事务内重叠复验）。
+- **4 个数据面写端点**：`hydra-core/src/tenant_api.rs::parse_write_route` + `tenant_api/handlers.rs`（PUT/DELETE 子租户、PUT/DELETE 路由）。
+- **每租户配置写限流（D6）**：`HYDRA_TENANT_CONFIG_WRITE_PER_MIN`（默认 60，`admin/mod.rs:71`）。
+
+**A-1 对 E2 逐字未动**（§6.4b「与 A-1 的关系」）。对外契约见 `tenant-api-integration.md` §5.6，运维侧见 `ops.md` §5.5。

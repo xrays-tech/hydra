@@ -9,7 +9,7 @@
 
 ## 1. 你能用它做什么
 
-五个端点，都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
+九个端点（**5 个只读 + 4 个写**），都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
 
 | 端点 | 方法 | 用途 |
 |---|---|---|
@@ -18,10 +18,14 @@
 | `/tenant/{tenant_id}/api/v1/usage` | `GET` | 查某个时间窗内你实际产生了多少请求/token |
 | `/tenant/{tenant_id}/api/v1/sub-tenants` | `GET` | 只读列出**你自己且启用中的**子租户（前缀、启用状态、配置版本；已停用的不返回） |
 | `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `GET` | 只读列出**你自己**的子租户路由（`model → provider`、默认路由、配置版本） |
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{name}` | `PUT` | **自助创建/更新**一个子租户（按名字 upsert）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{id}` | `DELETE` | **自助删除**一个子租户（按不可变 id，幂等）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `PUT` | **自助创建/更新**一条子租户路由（按 `sub_tenant_id`+`model_key` upsert）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` | `DELETE` | **自助删除**一条子租户路由（按不可变 id，幂等）；见 §5.6 |
 
 **明确没有的能力**（不是漏做，是刻意不做）：
 
-- **不能改任何配置**。域名、`auth_url`、证书、是否启用，都由运维通过管理 API 设置。所以本 API 没有任何"字段级越权"的可能。
+- **不能改你的租户级配置**。域名、`auth_url`、证书、是否启用，都由运维通过管理 API 设置（本 API 没有这些的写路径，所以没有"字段级越权"的可能）。**子租户与其路由是例外**：你可以用 §5.6 的写端点自助管理**自己的**子租户/路由（仍受配额与前缀规则约束，且只能作用于你自己的资源）。
 - **不能查明细**。`/usage` 只给聚合数，不给逐条请求记录。
 - **不能按 key 前缀清缓存**。见 §7.3：缓存里存的是 key 的 SHA-256 摘要，前缀不可匹配。只接受**完整 key** 或**整个租户**。
 
@@ -55,7 +59,7 @@ curl -s "$HYDRA/tenant/$TID/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-0
 2. 服务端只存 **SHA-256 摘要**，**永远不会回显明文**。所以**丢了只能让运维轮换**（换一个新值即完成轮换）。
 3. 最短 16 个字符。建议 `openssl rand -hex 32` 生成。
 4. 这是**你的**凭证，不是客户端的 api-key：
-    - 它放在 `Authorization: Bearer` 里，只用于调用本文的五个端点；
+    - 它放在 `Authorization: Bearer` 里，只用于调用本文的九个端点（5 个只读 + 4 个写）；
    - 它**不会**被当成客户端 key 去鉴权，也不会写进用量记录（见 §8.4）；
    - **不要**把它发给你的终端用户或用在前端代码里。
 
@@ -97,13 +101,14 @@ Authorization: Bearer <tenant access token>
 
 ### 4.4 方法约定
 
-五个端点方法固定；用错方法 → `405 method_not_allowed`。保留前缀下**任何**不是这五条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
+**只读端点**方法固定：`whoami`/`usage`/`sub-tenants`/`sub-tenant-routes` 只认 `GET`、`invalidate` 只认 `POST`；用错方法 → `405 method_not_allowed`。**写端点**（§5.6）按 `(方法, 路径)` 解析：`PUT`/`DELETE` 各走各的路径形状，用错方法（例如 `GET`/`POST` 打到写路径）→ `404 not_found`（**不是** 405——写路由是方法敏感的）。保留前缀下**任何**不是这九条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
 
 ### 4.5 幂等性
 
 - 所有 `GET` 端点（`whoami` / `usage` / `sub-tenants` / `sub-tenant-routes`）天然幂等。
 - `POST auth/cache/invalidate` **幂等**：重复调用只是重复"清掉本来就已经没有的东西"。所以重试安全。
 - `invalidated` 是**本节点实际删掉的条数**，重复调用会变 0，这**不是**失败：那些 key 下次请求本来就会回源。
+- 写端点（§5.6）同样**幂等**：重复 `PUT` 按自然键收敛到**同一行**（保留原 id，只更新字段到最新）；`DELETE` 按**不可变 id**，删一个已不存在的 id 是 no-op。所以"重试同一个写请求"是安全的。
 
 ### 4.6 就绪
 
@@ -347,7 +352,94 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `sub_tenant_routes[].model_key` | 非空 = 该 model 专属路由；`null` = 该子租户**默认路由**（两级） |
 | `sub_tenant_routes[].provider_id` | 命中该前缀 + 该 model（或默认）时收窄到的 provider |
 
-> 这两个端点是**只读**的：要创建/修改/删除子租户或路由，由运维通过管理 API（`/api/v1/sub-tenants`、`/api/v1/sub-tenant-routes`）操作，见 `ops.md` §5.5。
+> 这两个端点是**只读**的：要创建/修改/删除子租户或路由，用你自己的**写端点**（§5.6）；运维也可通过管理 API（`/api/v1/sub-tenants`、`/api/v1/sub-tenant-routes`）代管，见 `ops.md` §5.5。
+
+### 5.6 子租户写端点（v2：自助创建 / 修改 / 删除）
+
+v2 起，你可以**自助管理自己的子租户与其路由**，不用再等运维。四个写端点都挂在**你已在用的那个数据面地址**的保留前缀下（和只读端点同一个域名/端口），**同样只认你的租户访问令牌**（`Authorization: Bearer`，与只读端点同一道闸门——写端点不会成为更弱的门）：
+
+| 端点 | 方法 | 用途 |
+|---|---|---|
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{name}` | `PUT` | **按名字 upsert** 一个子租户（`name` 在 URL 里）。body `{key_prefix?, enabled}`；`key_prefix` 省略 ⇒ 平台自动生成一个（8 位 `[A-Z0-9]` + `_` 分隔符） |
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{id}` | `DELETE` | **按不可变 id 删除** 一个子租户（幂等） |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `PUT` | **按 `(sub_tenant_id, model_key)` upsert** 一条路由（`model_key` 省略/`null` = 该子租户**默认路由**）。body `{sub_tenant_id, model_key?, provider_id, enabled}` |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` | `DELETE` | **按不可变 id 删除** 一条路由（幂等） |
+
+#### 请求与响应
+
+```http
+# ① 创建 / 更新一个子租户（按名字 upsert）
+PUT /tenant/{tenant_id}/api/v1/sub-tenants/QQ
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "key_prefix": "QQCX_", "enabled": true }
+# key_prefix 可省略（自动生成）；enabled 默认 true；tenant_id 与 name 都来自 URL，不放 body
+
+→ 200
+{ "sub_tenant": { "id":"st_…", "tenant_id":"t_acme", "name":"QQ",
+                  "key_prefix":"QQCX_", "enabled":true,
+                  "created_at":"…", "updated_at":"…" },
+  "config_version": 43 }
+
+# ② 写一条路由（按 sub_tenant_id + model_key upsert；model_key 省略 = 默认路由）
+PUT /tenant/{tenant_id}/api/v1/sub-tenant-routes
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "sub_tenant_id": "st_…", "provider_id": "p_acme", "model_key": null, "enabled": true }
+
+→ 200
+{ "route": { "id":"str_…", "sub_tenant_id":"st_…", "model_key":null,
+             "provider_id":"p_acme", "enabled":true,
+             "created_at":"…", "updated_at":"…" },
+  "config_version": 44 }
+
+# ③ 删除（按不可变 id，幂等）
+DELETE /tenant/{tenant_id}/api/v1/sub-tenants/{id}        → 204
+DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
+```
+
+`200` 的响应体带被写的那一行（`sub_tenant` / `route`）与它**已生效于**的 `config_version`。`204` 无 body。
+
+#### 幂等性（**重要**）
+
+- **重复 `PUT` 收敛到同一行**：子租户按 `(tenant_id, name)`、路由按 `(sub_tenant_id, model_key)` upsert；同一自然键的重复 `PUT` **保留原行的不可变 id**，只把字段更新到最新值。所以"重试同一个 PUT"是安全的。
+- **`DELETE` 按不可变 id，幂等**：删除一个**已不存在**的 id 是 no-op（`204`），不会因为"名字撞了"而误删你后来新建的同名资源。
+
+#### 重试与对账（`config_version`）
+
+- **结果未知（`504 forward_result_unknown`）**：见下"传输语义"。leader 在超时内没答（或答了但读不到响应）时，写**可能已落、也可能没落**。此时**不要盲目重发**：先**重读资源**（`GET sub-tenants` / `sub-tenant-routes` 或 `whoami`）确认当前状态——若还没落，重发**同一个** `PUT`（幂等，收敛到同一行）；若已落，就不用再发。
+- **`config_version` 是你的对账基线**：每次成功写（`200`）的响应带 `config_version`；`whoami` 与两个只读列表端点也带它。轮询它从"你上次看到的版本"前进，即可判断"我的改动是否已生效"，不用猜。
+
+#### 传输语义（为什么你看到的是"正常响应"）
+
+- 请求在**边缘**（你连的那个数据面节点）用**你的令牌**鉴权；集群部署下该节点把写**透明转发**到持有 leader 租约的节点执行，单节点部署下该节点**本地执行**。两种形态你拿到的响应形状完全一致（`200` 带资源 + `config_version`，或 `204`）。你**无需也不应**感知它在哪个节点落地。
+- 你的令牌 Bearer 在转发时走**专用头 `x-hydra-tenant-token`**（**不进 body、不进日志**）；转发用节点级 cluster token 认"这是我方节点"，leader 再用**你的令牌重鉴权**并做**授权绑定**（写目标必须是你自己）。这层对你是透明的。
+- **分区 / 无 leader 时写 fail-closed**：`503`（读不到 leader / 本节点还没配置）时写**没有执行**，可重试；读继续用旧快照。
+
+#### 错误码（写端点）
+
+| HTTP | code | 含义 | 可重试 |
+|---|---|---|---|
+| `400` | `invalid_request` | 请求体不是合法 JSON | 否 |
+| `400` | `invalid_name` / `empty_key_prefix` / `invalid_key_prefix` / `key_prefix_overlap` | 名字 / 前缀校验失败（前缀须含分隔符、与同租户既有前缀及启用中的 operator binding 不重叠） | 否（改正后重发） |
+| `400` | `provider_not_found` / `provider_not_in_tenant` / `model_not_in_tenant` / `model_not_served_by_provider` | 路由的 provider/model 不在你的授权范围内 | 否（核对 provider/model） |
+| `400` | `quota_exceeded` | 子租户或路由数量到顶（每租户 64 子租户 / 每子租户 32 路由） | 否（删掉一些） |
+| `400` | `prefix_generation_failed` | 自动生成前缀多次尝试仍冲突（罕见） | **是**（重试） |
+| `401` | `unauthorized` | 令牌缺失 / 错误 / 该租户未配置令牌（三者文案相同，与只读端点一致） | 否（先检查令牌） |
+| `403` | `tenant_id_mismatch` | URL 里的 `tenant_id` 与令牌归属不一致 | 否（检查 base URL） |
+| `404` | `not_found` | 资源不存在，**或**属于别的租户（二者刻意不可区分） | 否（核对 id / `sub_tenant_id`） |
+| `409` | `name_duplicate` / `prefix_duplicate` | 名字 / 前缀与同租户既有子租户冲突 | 否（换个 name/prefix） |
+| `429` | `too_many_requests` / `rate_limited` | 触发每租户**配置写**预算（默认 60/分钟，带 `Retry-After`），或通用每租户请求预算（§7.2） | **是**（等 `Retry-After`） |
+| `503` | `not_ready` / `no_leader` | 本节点还没有配置快照 / 集群下解析不到 leader（写未执行） | **是** |
+| `504` | `forward_result_unknown` | leader 未按时应答（结果未知）——**先重读再重试**（见上） | **是**（重读后） |
+
+#### 边界（**必读**，与 §7.6 同义）
+
+1. **停用 / 删除 ≠ 吊销。** 删掉一个子租户或路由只是**停止按它的前缀 steering**；那些 client key 仍**照常走默认管线**（认证仍过你的 `auth_url`）。**吊销 key 永远是你 `auth_url` 的职责**，不是 Hydra 删子租户/路由的行为。
+2. **前缀是路由选择器，不是身份、也不是秘密。** 任何调用方都能出示任意前缀的 key，但路由永远受 `model ∩ 你被授权的 provider` 约束（运行时 backstop），认证始终在你的 `auth_url`。按子租户归因的可信度 = 你自己发 key 的纪律。
+3. **edge 陈旧窗口。** 变更经控制面轮询收敛（**~1s** + 版本防倒退），之后可能**短暂仍按旧路由**——用 `config_version` 对照确认（`whoami` / 只读端点）。
 
 ---
 
@@ -358,7 +450,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `unauthorized` | 401 | 令牌缺失 / 错误 / 该租户未配置令牌（三者文案相同） | 否（先检查令牌） |
 | `tenant_id_mismatch` | 403 | 令牌归属与 URL 里的 `tenant_id` 不一致 | 否（检查 base URL） |
 | `not_ready` | 503 | 该节点还没有配置快照 | **是** |
-| `not_found` | 404 | 保留前缀下不是这五条路由的路径 | 否（检查路径拼写） |
+| `not_found` | 404 | 保留前缀下不是这九条路由的路径；写端点上资源不存在 / 属于别的租户（§5.6） | 否（检查路径拼写 / id） |
 | `method_not_allowed` | 405 | 方法用错 | 否 |
 | `rate_limited` | 429 | 触发频率上限（见 §7.2），带 `Retry-After` | **是**（等 `Retry-After`） |
 | `payload_too_large` | 413 | 请求体超过 1 MiB | 否 |
@@ -372,6 +464,15 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `invalid_until` | 400 | `until` 写法非法 | 否 |
 | `window_too_large` | 400 | 窗口超过上限（默认 31 天） | 否（缩小窗口） |
 | `usage_store_unavailable` | 503 | 计量存储读不到或无法解析 | **是** |
+| `too_many_requests` | 429 | 每租户**配置写**预算超限（写端点，默认 60/分钟，§5.6），带 `Retry-After` | **是**（等 `Retry-After`） |
+| `no_leader` | 503 | 集群下解析不到 leader，写未执行（写端点，§5.6） | **是** |
+| `forward_result_unknown` | 504 | leader 未按时应答，结果未知（写端点，§5.6）——**先重读再重试** | **是**（重读后） |
+| `invalid_name` | 400 | 子租户名字非法（写端点，§5.6） | 否 |
+| `empty_key_prefix` / `invalid_key_prefix` / `key_prefix_overlap` | 400 | 前缀为空 / 非 ASCII / 无分隔符 / 与同租户前缀或启用中的 operator binding 重叠（写端点，§5.6） | 否 |
+| `provider_not_found` / `provider_not_in_tenant` / `model_not_in_tenant` / `model_not_served_by_provider` | 400 | 路由的 provider/model 不在你的授权范围内（写端点，§5.6） | 否 |
+| `quota_exceeded` | 400 | 子租户 / 路由数量到顶（写端点，§5.6） | 否 |
+| `prefix_generation_failed` | 400 | 自动生成前缀多次尝试仍冲突（写端点，§5.6） | **是** |
+| `name_duplicate` / `prefix_duplicate` | 409 | 名字 / 前缀与同租户既有子租户冲突（写端点，§5.6） | 否 |
 
 ---
 
@@ -403,6 +504,11 @@ curl -s -X POST $HYDRA/tenant/$TID/api/v1/auth/cache/invalidate \
 | 每**令牌摘要**鉴权失败 | 10 次/分钟 | 防一个令牌被多来源试探 |
 | 持续超限后的锁定 | 900 秒 | 被锁定的维度对**失败鉴权**返回 **`429`（而不是 401）**；持有效令牌的请求不受锁定影响 |
 | 每租户失效调用 | 10 次/分钟 | 见 §5.2 |
+| 每租户**配置写** | 60 次/分钟 | 写端点（§5.6）专用预算，由 **leader 侧**施加（`429 too_many_requests`）；运维可调（`ops.md` §5.5） |
+
+几个要点：
+
+- **配置写预算在 leader 侧**：所有配置写最终都落到唯一写者 leader，所以在 leader 上施加一个进程内窗口即覆盖整条数据面；该窗口**在 leader failover 时重置**（有界突发，anti-DoS，与 §7.4 的 allow-TTL 上界同类）。它与上面"每租户已授权请求 60/分钟"是**两个独立**的预算：前者计量"已认证的任意请求"（在边缘闸门），后者专计量"配置写"（在 leader）。
 
 几个要点：
 
@@ -457,7 +563,7 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 |---|---|---|
 | `401 unauthorized` | 令牌写错/被轮换/该租户没配令牌 | 核对令牌；确认运维没给你轮换过 |
 | `403 tenant_id_mismatch` | URL 里的 `tenant_id` 和令牌不是同一个租户 | 用 `whoami` 返回的 `tenant_id` 拼 URL（`base_url` 字段直接给了前缀） |
-| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这五条之内） | 对照 §1 的路径表 |
+| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这九条之内）；写端点上资源不存在 / 属于别的租户（§5.6） | 对照 §1 的路径表 |
 | `405 method_not_allowed` | 方法用错（例如用 GET 调 invalidate） | `GET` whoami/usage；`POST` invalidate |
 | `429 rate_limited` | 触发限流或锁定 | 读 `Retry-After` 再重试。持**有效令牌**时，429 只会来自每租户**已授权**频率（60/分钟）或失效频率（10/分钟）上限；**失败**锁定（按来源 IP / 令牌摘要）只拦**错误**令牌的来源，不会拦对令牌 |
 | `503 not_ready` | 该节点还没拿到配置快照 | 重试（会落到其他节点） |
@@ -486,6 +592,10 @@ POST {HYDRA}/tenant/{TID}/api/v1/auth/cache/invalidate[?wait=converged|none][&ti
 GET  {HYDRA}/tenant/{TID}/api/v1/usage?since=<必填>[&until=][&group_by=none|model|provider|day]
 GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenants
 GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes
+PUT    {HYDRA}/tenant/{TID}/api/v1/sub-tenants/{name}        body {key_prefix?, enabled}      (upsert by name)
+DELETE {HYDRA}/tenant/{TID}/api/v1/sub-tenants/{id}                                        (delete by immutable id)
+PUT    {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes            body {sub_tenant_id, model_key?, provider_id, enabled} (upsert by (sub_tenant_id, model_key))
+DELETE {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes/{id}     (delete by immutable id)
 
 Header: Authorization: Bearer <tenant access token>
 Trace:  响应头 X-Hydra-Trace-Id，报障必带
@@ -493,4 +603,4 @@ Trace:  响应头 X-Hydra-Trace-Id，报障必带
 E2 判定顺序：先看 HTTP，再看 fleet.state
   200 applied/single_node = 完成 ｜ 202 pending = 未确认（可重试）｜ 503 unavailable = 集群没收到
 E3 判定：as_of 为 null 表示窗口内无记录（不是报错）；集群下 requests 是近似值
-```
+写端点判定：200 = 已写（带 config_version）｜ 204 = 删除（幂等）｜ 504 forward_result_unknown = 结果未知，先重读再重发

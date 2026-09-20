@@ -172,6 +172,28 @@ queue_wait_timeout_ms # 1000-5000
   and new-reader/old-writer directions fail with a serde error (not the intended `WireVersion` gate)
   at the same version. See `dev-docs/design-sub-tenant.md` and
   `dev-docs/aegis/plans/2026-09-18-sub-tenant.md`.
+- **Sub-tenant v2 (tenant self-service write, post-archive, 2026-09-18):** on top of v1, a
+  tenant can now CRUD its **own** sub-tenants/routes on the **data plane** (A′, decision A-2 in
+  `design-tenant-api.md` §6.4b). Four data-plane write endpoints (PUT/DELETE `sub-tenants`,
+  PUT/DELETE `sub-tenant-routes` — `tenant-api-integration.md` §5.6) forward to the lease-holding
+  leader (cluster) or execute locally (single-node). New pieces:
+  - `crates/hydra-server/src/tenant_config/forward.rs` — `TenantConfigForwarder`, the data plane's
+    minimal trust-scoped capability (shared cluster token + a single leader-URL closure; **no**
+    `NodeRegistry` exposed to the data plane).
+  - `crates/hydra-server/src/admin/tenant_config_api.rs` — the leader internal write endpoint
+    `/api/v1/internal/tenant-config/{sub-tenants,sub-tenant-routes}[/{id}]` (cluster-token gated,
+    leader-only, **not** on the data-plane port): lease assertion → re-auth → authorization binding
+    → write → audit.
+  - `crates/hydra-server/src/admin/sub_tenant_write.rs` — the shared **transactional write core**
+    (one SQLite tx per write; the per-tenant quota is counted over **all** DB rows including
+    disabled — D5 tightening; prefix overlap re-validated in-tx).
+  - the tenant Bearer is carried to the leader in the dedicated **`x-hydra-tenant-token`** header
+    (`cluster/forward.rs`), never in `Authorization` and never in the body.
+  - `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (default **60**) — per-tenant config-write budget, enforced
+    on the leader (`429 too_many_requests`); the in-process window **resets on leader failover**
+    (bounded burst, anti-DoS only).
+  V1–V6 implemented (green); V8 gate pending. See
+  `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`.
 - **The admission queue is fully wired and opt-in** — to use it, set the 3 fields on a `provider` row;
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,
