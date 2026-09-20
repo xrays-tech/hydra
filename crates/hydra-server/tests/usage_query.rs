@@ -926,6 +926,38 @@ async fn fake_clickhouse(body: &'static str) -> (String, wiremock::MockServer) {
     (server.uri(), server)
 }
 
+/// Like [`fake_clickhouse`], but answers **successive** requests with the bodies
+/// in order. A `group_by` read is two queries — totals, then the grouped rows —
+/// and it is the second one whose SQL and body matter here. Running the list dry
+/// answers an empty body, so an unexpected extra query fails the read rather
+/// than hanging it.
+#[cfg(feature = "usage-clickhouse")]
+async fn fake_clickhouse_sequence(bodies: Vec<String>) -> (String, wiremock::MockServer) {
+    use wiremock::matchers::{any, method};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+        bodies,
+    )));
+    let responder = {
+        let queue = Arc::clone(&queue);
+        move |_req: &wiremock::Request| {
+            let body = queue
+                .lock()
+                .expect("the response queue is never held across a panic")
+                .pop_front()
+                .unwrap_or_default();
+            ResponseTemplate::new(200).set_body_string(body)
+        }
+    };
+    Mock::given(method("POST"))
+        .and(any())
+        .respond_with(responder)
+        .mount(&server)
+        .await;
+    (server.uri(), server)
+}
+
 /// A ClickHouse-backed node: the gate reads the local SQLite config, the usage
 /// read goes to the double — exactly the edge-node shape of C13.
 #[cfg(feature = "usage-clickhouse")]
@@ -1279,6 +1311,93 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
     assert!(
         !path_and_query.contains("&x=1"),
         "the `&` inside the tenant id must not survive as a separator: {path_and_query}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v3 (T3.4) — `group_by=sub_tenant` on ClickHouse
+// ---------------------------------------------------------------------------
+
+/// `sub_tenant_id` is the one nullable **grouping** column, and that is what
+/// makes it dangerous on ClickHouse: SQL NULL travels as JSON `null` (measured
+/// on the bundled instance — `SELECT CAST(NULL,'Nullable(String)') AS key …
+/// FORMAT JSONEachRow` answers `{"key":null,…}`), while the rows decoder
+/// requires a **string** `key`. Before the fix, a single unattributed row in
+/// the window failed the entire read as 503 `decode_error` — "the store is
+/// broken" for a window that is merely partly attributed.
+///
+/// Both halves of the fix are pinned here, because either one alone proves
+/// nothing: the shipped expression coalesces to `""`, **and** a null key really
+/// is a decode failure rather than a row that quietly disappears.
+#[cfg(feature = "usage-clickhouse")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
+    let since = "2026-09-15T00:00:00Z";
+    let until = "2026-09-16T00:00:00Z";
+    // The unattributed row arrives under the empty key — the same bucket SQLite
+    // produces — and is counted, not dropped.
+    let grouped = concat!(
+        r#"{"key":"","requests":"1","tokens_in":"7","tokens_out":"3","cache_hit_tokens":"0","errors":"0"}"#,
+        "\n",
+        r#"{"key":"st1","requests":"2","tokens_in":"205","tokens_out":"11","cache_hit_tokens":"0","errors":"0"}"#,
+        "\n",
+    );
+    let (url, server) =
+        fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), grouped.to_string()]).await;
+    let reader = select("clickhouse", None, Some(&url)).expect("select");
+    let agg = reader
+        .aggregate(
+            "local",
+            since,
+            until,
+            hydra_server::usage_query::GroupBy::SubTenant,
+        )
+        .await
+        .expect("both answers decode");
+
+    assert_eq!(agg.rows.len(), 2, "{:?}", agg.rows);
+    assert_eq!(agg.rows[0].key, "", "unattributed rows bucket under \"\"");
+    assert_eq!(agg.rows[0].totals.tokens_in, 7);
+    assert_eq!(agg.rows[1].key, "st1");
+    assert_eq!(agg.rows[1].totals.requests, 2);
+
+    // The SQL must rule the null key out **by construction**, not by luck of the
+    // data in the window.
+    let reqs = server.received_requests().await.expect("requests recorded");
+    assert_eq!(reqs.len(), 2, "totals + grouped rows, one query each");
+    let sql = reqs[1]
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == "query")
+        .map(|(_, v)| v.into_owned())
+        .expect("the SQL travels in `query=`");
+    assert!(
+        sql.contains("coalesce(sub_tenant_id, '')"),
+        "a NULL key fails the whole read: {sql}"
+    );
+    assert!(sql.contains("GROUP BY key"), "{sql}");
+
+    // And the failure it avoids is real — a null key is a decode error, never a
+    // silently missing row.
+    let null_key = concat!(
+        r#"{"key":null,"requests":"1","tokens_in":"7","tokens_out":"3","cache_hit_tokens":"0","errors":"0"}"#,
+        "\n",
+    );
+    let (null_url, _null_server) =
+        fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), null_key.to_string()]).await;
+    let null_reader = select("clickhouse", None, Some(&null_url)).expect("select");
+    let err = null_reader
+        .aggregate(
+            "local",
+            since,
+            until,
+            hydra_server::usage_query::GroupBy::SubTenant,
+        )
+        .await
+        .expect_err("a null group key must fail the read, not vanish from it");
+    assert!(
+        matches!(err, hydra_server::usage_query::UsageQueryError::Decode(_)),
+        "{err:?}"
     );
 }
 
