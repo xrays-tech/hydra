@@ -24,6 +24,7 @@ use std::time::Duration;
 use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
+use hydra_core::sub_tenant::MAX_ROUTES_PER_SUB_TENANT;
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
@@ -791,4 +792,102 @@ async fn route_put_is_idempotent() {
         id1, id2,
         "a repeated route PUT by natural key converges to the same id"
     );
+}
+
+/// Regression for the oracle v2 BLOCKING fix: at `MAX_ROUTES_PER_SUB_TENANT`, a
+/// PUT that UPDATES an existing `(sub_tenant_id, model_key)` must converge (200,
+/// same id), not be rejected as a new route. Without the `create_route`
+/// `self_route_id` resolution this returns 400 `quota_exceeded`.
+#[tokio::test]
+async fn route_put_updates_at_quota() {
+    let state = admin_state(false, Some(true)).await;
+    let port = start_admin(state.clone());
+    seed_base(&state).await;
+
+    // Distinct model keys served by p1 and allowed for t1 (route validation
+    // requires the model to be served by the provider and in `tenant_models`).
+    {
+        let db = state.db();
+        for i in 0..MAX_ROUTES_PER_SUB_TENANT {
+            let model = format!("m{i}");
+            // Distinct ids from `seed_base`'s `pm1` / `tm1` (a collision is a
+            // UNIQUE violation on the id, not the model key).
+            repo::insert_provider_model(db, &provider_model(&format!("pmx{i}"), &model, "p1"))
+                .await
+                .expect("insert provider_model");
+            repo::insert_tenant_model(
+                db,
+                &TenantModel {
+                    id: format!("tmx{i}"),
+                    tenant_id: "t1".into(),
+                    model_key: model,
+                },
+            )
+            .await
+            .expect("insert tenant_model");
+        }
+    }
+    state.store.reload_all().await.expect("reload models");
+
+    // A sub-tenant to hang the routes on.
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/internal/tenant-config/sub-tenants",
+        Some(json!({ "tenant_id": "t1", "name": "team-a", "key_prefix": "QQCX_" })),
+        Some(CLUSTER_TOKEN),
+        Some(T1_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let st_id = r.json::<serde_json::Value>().await.expect("json")["sub_tenant"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Fill to exactly the cap; remember m0's immutable id.
+    let mut first_id = String::new();
+    for i in 0..MAX_ROUTES_PER_SUB_TENANT {
+        let r = req(
+            port,
+            reqwest::Method::PUT,
+            "/api/v1/internal/tenant-config/sub-tenant-routes",
+            Some(json!({
+                "sub_tenant_id": st_id.clone(),
+                "provider_id": "p1",
+                "model_key": format!("m{i}")
+            })),
+            Some(CLUSTER_TOKEN),
+            Some(T1_TOKEN),
+        )
+        .await;
+        assert_eq!(r.status(), 200, "creating route m{i} within the cap");
+        if i == 0 {
+            first_id = r.json::<serde_json::Value>().await.expect("json")["route"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string();
+        }
+    }
+
+    // Update the EXISTING natural key at the cap: must converge to the same id.
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/internal/tenant-config/sub-tenant-routes",
+        Some(json!({ "sub_tenant_id": st_id, "provider_id": "p1", "model_key": "m0" })),
+        Some(CLUSTER_TOKEN),
+        Some(T1_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "updating an existing route at the cap must not be rejected as a new route"
+    );
+    let updated_id = r.json::<serde_json::Value>().await.expect("json")["route"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    assert_eq!(updated_id, first_id, "the update keeps the immutable id");
 }

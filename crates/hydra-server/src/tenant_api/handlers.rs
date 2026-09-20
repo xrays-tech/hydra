@@ -1056,14 +1056,15 @@ async fn forward_write(
                          have been applied — re-read the resource before retrying"
                     ),
                 ),
-                TenantConfigForwardError::Forward(ForwardError::AfterResponse(reason)) => (
+                // `AfterResponse`'s reason can embed the request URL too: keep
+                // the transport detail out of the tenant-facing message (same
+                // class as the 502 arm).
+                TenantConfigForwardError::Forward(ForwardError::AfterResponse(_)) => (
                     504,
                     "forward_result_unknown",
-                    format!(
-                        "the leader answered but the response could not be read ({reason}); the \
-                         write may or may not have been applied — re-read the resource before \
-                         retrying"
-                    ),
+                    "the leader answered but the response could not be read; the write may or \
+                     may not have been applied — re-read the resource before retrying"
+                        .to_string(),
                 ),
                 // `Other`'s reason embeds the reqwest error, which includes the
                 // leader's control-plane URL. Never relay that to a TENANT:
