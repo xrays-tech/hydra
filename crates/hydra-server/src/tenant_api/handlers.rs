@@ -15,14 +15,28 @@
 use std::collections::HashSet;
 
 use pingora_proxy::Session;
+use serde::Deserialize;
 use serde::Serialize;
+use serde_json::json;
 
 use hydra_core::model::{SubTenant, SubTenantRoute};
+use hydra_core::sub_tenant::SubTenantWriteError;
+use hydra_core::tenant_api::TenantWriteRoute;
 
+use crate::admin::sub_tenant_write::CoreError;
+use crate::admin::tenant_config_api::{
+    apply_config_write, ApplyError, TenantConfigWrite, WriteOutcome,
+};
 use crate::http::AuthChecker as _;
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
 use crate::tenant_api::{respond_json, Authenticated};
+// The forward path (and only it) is cluster-only; the imports stay gated so a
+// single-node build has no unused-import warnings.
+#[cfg(feature = "cluster-redis")]
+use crate::cluster::forward::ForwardError;
+#[cfg(feature = "cluster-redis")]
+use crate::tenant_config::TenantConfigForwardError;
 
 /// The body of `GET /whoami`.
 ///
@@ -657,4 +671,405 @@ pub async fn list_sub_tenant_routes(
         sub_tenant_routes,
     };
     respond_json(session, ctx, 200, &view).await
+}
+
+// ---------------------------------------------------------------------------
+// V5 — D9 data-plane tenant config writes (PUT/DELETE sub-tenants & routes)
+// ---------------------------------------------------------------------------
+//
+// The four self-service WRITE endpoints (sub-tenant v2, D9). The gate (token,
+// URL cross-check, success budget) already ran in [`super::dispatch`], so the
+// authenticated tenant IS the write target. From here the request is EITHER
+// forwarded to the lease-holding leader (a cluster node, D1/D2) OR applied
+// locally (a single-node node, D8):
+//
+// - a **cluster** node forwards to the leader's internal endpoint
+//   ([`crate::tenant_config::TenantConfigForwarder::forward_config_write`])
+//   and relays the leader's status + body; and
+// - a **single-node** node (no forwarder) applies the write locally through
+//   the shared write core ([`apply_config_write`]) and reloads the snapshot so
+//   `config_version` advances.
+//
+// Both faces run the SAME A-2 binding (the write target must be the
+// authenticated tenant's own resources) — the binding is enforced inside
+// [`apply_config_write`] for the local path and by the leader for the forward
+// path — so they cannot diverge. The tenant Bearer and the request body are
+// NEVER logged here.
+
+/// Default for the optional `enabled` field: `true`.
+fn default_true() -> bool {
+    true
+}
+
+/// The body of `PUT .../sub-tenants/{name}` (D9): `{key_prefix?, enabled}`.
+/// `tenant_id` and `name` come from the URL, never the body.
+#[derive(Deserialize)]
+struct SubTenantUpsertBody {
+    #[serde(default)]
+    key_prefix: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// The body of `PUT .../sub-tenant-routes` (D9):
+/// `{sub_tenant_id, model_key?, provider_id, enabled}`.
+#[derive(Deserialize)]
+struct RouteUpsertBody {
+    sub_tenant_id: String,
+    #[serde(default)]
+    model_key: Option<String>,
+    provider_id: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// A JSON body that is empty / whitespace-only is treated as `{}`.
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    let bytes = if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        b"{}"
+    } else {
+        body
+    };
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// The four D9 write endpoints: gate (already done) → binding → (forward |
+/// local write).
+pub async fn write(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+    route: TenantWriteRoute<'_>,
+) -> pingora_core::Result<bool> {
+    let tenant_id = auth.tenant.id.clone();
+    let trace_id = ctx.trace_id.clone();
+
+    // (1) Read + parse the body (PUT only; DELETE carries none) and build the
+    //     shared [`TenantConfigWrite`] (the A-2 "authorised work"). The forward
+    //     face (a cluster node) derives its internal request FROM this value, so
+    //     the forward and local faces cannot disagree on what is written.
+    let config_write = match route {
+        TenantWriteRoute::UpsertSubTenant { name, .. } => {
+            let raw = match super::read_body(session, &trace_id).await {
+                Ok(b) => b,
+                Err((status, body)) => {
+                    return super::respond_raw(session, ctx, status, body).await;
+                }
+            };
+            let req: SubTenantUpsertBody = match parse_body(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_request",
+                        &format!("request body is not valid JSON: {e}"),
+                    )
+                    .await;
+                }
+            };
+            TenantConfigWrite::UpsertSubTenant {
+                tenant_id: tenant_id.clone(),
+                name: name.to_string(),
+                key_prefix: req.key_prefix,
+                enabled: req.enabled,
+            }
+        }
+        TenantWriteRoute::DeleteSubTenant { id, .. } => {
+            TenantConfigWrite::DeleteSubTenant { id: id.to_string() }
+        }
+        TenantWriteRoute::UpsertRoute { .. } => {
+            let raw = match super::read_body(session, &trace_id).await {
+                Ok(b) => b,
+                Err((status, body)) => {
+                    return super::respond_raw(session, ctx, status, body).await;
+                }
+            };
+            let req: RouteUpsertBody = match parse_body(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_request",
+                        &format!("request body is not valid JSON: {e}"),
+                    )
+                    .await;
+                }
+            };
+            TenantConfigWrite::UpsertRoute {
+                sub_tenant_id: req.sub_tenant_id,
+                model_key: req.model_key,
+                provider_id: req.provider_id,
+                enabled: req.enabled,
+            }
+        }
+        TenantWriteRoute::DeleteRoute { id, .. } => {
+            TenantConfigWrite::DeleteRoute { id: id.to_string() }
+        }
+    };
+
+    // (2) V6 / D6 (A-2 6): a per-tenant config-write Throttle (fixed window,
+    //     process-local, keyed on `tenant_id`) is inserted HERE — after the
+    //     gate + binding, before the forward / local write. NOT implemented yet
+    //     (V6 adds the `Throttle`); this is the seam.
+
+    // (3) Dispatch: a cluster node forwards to the lease-holding leader; a
+    //     single-node node (no forwarder) applies locally (D8).
+    #[cfg(feature = "cluster-redis")]
+    if let Some(fwd) = state.tenant_config_forwarder() {
+        // The Bearer the gate already validated (D2): forward it in the
+        // dedicated `x-hydra-tenant-token` header, never `Authorization`, never
+        // the body, never logged.
+        let bearer = super::bearer_token(session).unwrap_or_default().to_string();
+        let (method, internal_path, internal_body) = internal_request(&config_write);
+        let body = serde_json::to_vec(&internal_body).unwrap_or_default();
+        return forward_write(
+            session,
+            ctx,
+            fwd,
+            &method,
+            &internal_path,
+            &bearer,
+            body,
+            &trace_id,
+        )
+        .await;
+    }
+
+    local_write(session, ctx, state, &config_write, &tenant_id, &trace_id).await
+}
+
+/// The internal endpoint (method, path, JSON body) a data-plane write maps to.
+/// Derived from the shared [`TenantConfigWrite`] so the forward face cannot
+/// disagree with the local face on what is written.
+#[cfg(feature = "cluster-redis")]
+fn internal_request(write: &TenantConfigWrite) -> (String, String, serde_json::Value) {
+    match write {
+        TenantConfigWrite::UpsertSubTenant {
+            tenant_id,
+            name,
+            key_prefix,
+            enabled,
+        } => (
+            "PUT".to_string(),
+            "/api/v1/internal/tenant-config/sub-tenants".to_string(),
+            json!({
+                "tenant_id": tenant_id,
+                "name": name,
+                "key_prefix": key_prefix,
+                "enabled": enabled,
+            }),
+        ),
+        TenantConfigWrite::DeleteSubTenant { id } => (
+            "DELETE".to_string(),
+            format!("/api/v1/internal/tenant-config/sub-tenants/{id}"),
+            json!({}),
+        ),
+        TenantConfigWrite::UpsertRoute {
+            sub_tenant_id,
+            model_key,
+            provider_id,
+            enabled,
+        } => (
+            "PUT".to_string(),
+            "/api/v1/internal/tenant-config/sub-tenant-routes".to_string(),
+            json!({
+                "sub_tenant_id": sub_tenant_id,
+                "model_key": model_key,
+                "provider_id": provider_id,
+                "enabled": enabled,
+            }),
+        ),
+        TenantConfigWrite::DeleteRoute { id } => (
+            "DELETE".to_string(),
+            format!("/api/v1/internal/tenant-config/sub-tenant-routes/{id}"),
+            json!({}),
+        ),
+    }
+}
+
+/// D8 single-node: the node is the only writer. Apply the write through the
+/// shared write core ([`apply_config_write`]), reload the snapshot so
+/// `config_version` advances, and answer with the produced resource (or the
+/// idempotent delete marker).
+async fn local_write(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    state: &AppState,
+    write: &TenantConfigWrite,
+    tenant_id: &str,
+    trace_id: &str,
+) -> pingora_core::Result<bool> {
+    // D8: a single-node node always has a local DB. An absent pool means this
+    // is not the writer (e.g. an edge that should have forwarded) — fail closed.
+    let Some(pool) = state.store.pool() else {
+        return super::respond_error(
+            session,
+            ctx,
+            503,
+            "not_ready",
+            "this node has no local database to apply the write",
+        )
+        .await;
+    };
+    // The current config (provider / model / tenant membership) the write is
+    // validated against — the same snapshot the gate read.
+    let cfg = std::sync::Arc::clone(&*state.store.snapshot());
+    match apply_config_write(pool, &cfg, tenant_id, write).await {
+        Ok(outcome) => {
+            // Write-after consistency: reload so the snapshot (and
+            // `config_version`) reflects the committed write. Best-effort: a
+            // failure is logged, not fatal (the write committed; the next reload
+            // recovers).
+            if let Err(e) = state.store.reload_all().await {
+                tracing::warn!(
+                    target: "hydra::tenant_api",
+                    tenant = %tenant_id,
+                    trace_id = %trace_id,
+                    error = %e,
+                    "post-write reload_all failed; the in-memory snapshot is now stale"
+                );
+            }
+            let version = state.store.version();
+            match outcome {
+                WriteOutcome::SubTenant(st) => {
+                    super::respond_json(
+                        session,
+                        ctx,
+                        200,
+                        &json!({ "sub_tenant": st, "config_version": version }),
+                    )
+                    .await
+                }
+                WriteOutcome::Route(r) => {
+                    super::respond_json(
+                        session,
+                        ctx,
+                        200,
+                        &json!({ "route": r, "config_version": version }),
+                    )
+                    .await
+                }
+                // Idempotent delete: 204, no body.
+                WriteOutcome::Deleted(_) => super::respond_raw(session, ctx, 204, Vec::new()).await,
+            }
+        }
+        Err(e) => {
+            // The same variant → the same status/code as the internal face,
+            // rendered in the data-plane envelope.
+            let (status, code, message) = match e {
+                ApplyError::TenantMismatch => (
+                    403,
+                    "tenant_id_mismatch",
+                    "the write target tenant does not match the authenticated tenant".to_string(),
+                ),
+                ApplyError::NotFound => (404, "not_found", "not found".to_string()),
+                ApplyError::Core(core) => map_core_err(&core),
+            };
+            super::respond_error(session, ctx, status, code, &message).await
+        }
+    }
+}
+
+/// Map the shared write core's [`CoreError`] to (status, code, message) for the
+/// data-plane envelope. The status / code are IDENTICAL to the internal face
+/// (`admin::tenant_config_api::core_err_resp`); only the rendering differs.
+fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
+    match e {
+        CoreError::Validation(v) => {
+            let (status, code) = match v {
+                SubTenantWriteError::NameDuplicate => (409, "name_duplicate"),
+                SubTenantWriteError::PrefixDuplicate => (409, "prefix_duplicate"),
+                SubTenantWriteError::ProviderNotFound => (400, "provider_not_found"),
+                SubTenantWriteError::ProviderNotInTenant => (400, "provider_not_in_tenant"),
+                SubTenantWriteError::ModelNotInTenant => (400, "model_not_in_tenant"),
+                SubTenantWriteError::ModelNotServedByProvider => {
+                    (400, "model_not_served_by_provider")
+                }
+                SubTenantWriteError::NameInvalid => (400, "invalid_name"),
+                SubTenantWriteError::PrefixEmpty => (400, "empty_key_prefix"),
+                SubTenantWriteError::PrefixNonAscii => (400, "invalid_key_prefix"),
+                SubTenantWriteError::PrefixNoSeparator => (400, "invalid_key_prefix"),
+                SubTenantWriteError::PrefixOverlap => (400, "key_prefix_overlap"),
+                SubTenantWriteError::SubTenantQuotaExceeded => (400, "quota_exceeded"),
+                SubTenantWriteError::RouteQuotaExceeded => (400, "quota_exceeded"),
+            };
+            (status, code, v.to_string())
+        }
+        CoreError::Db(d) => (500, "database_error", d.to_string()),
+        CoreError::PrefixGenerationFailed => (
+            400,
+            "prefix_generation_failed",
+            "could not generate a non-conflicting key_prefix after 5 attempts".to_string(),
+        ),
+        CoreError::NotFound => (404, "not_found", "not found".to_string()),
+    }
+}
+
+/// D1/D2: forward the tenant config write to the lease-holding leader's
+/// internal endpoint and relay its status + body. The tenant Bearer travels in
+/// the dedicated `x-hydra-tenant-token` header (never `Authorization`, never
+/// the body, never logged) — see
+/// [`crate::tenant_config::TenantConfigForwarder::forward_config_write`].
+#[cfg(feature = "cluster-redis")]
+async fn forward_write(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    fwd: &crate::tenant_config::TenantConfigForwarder,
+    method: &str,
+    internal_path: &str,
+    tenant_bearer: &str,
+    body: Vec<u8>,
+    trace_id: &str,
+) -> pingora_core::Result<bool> {
+    match fwd
+        .forward_config_write(method, internal_path, tenant_bearer, body, trace_id)
+        .await
+    {
+        // The leader is the single writer; relay its verdict verbatim (status +
+        // body) so the data plane and the internal face never disagree.
+        Ok(resp) => {
+            super::respond_raw(session, ctx, resp.status().as_u16(), resp.into_body()).await
+        }
+        // A timeout / response-read failure is AMBIGUOUS (the write may have
+        // landed): 504, re-read before retrying. A connect failure is DEFINITE
+        // (nothing left this node): 502. No leader is a fail-closed 503.
+        Err(e) => {
+            let (status, code, message) = match e {
+                TenantConfigForwardError::NoLeader => (
+                    503,
+                    "no_leader",
+                    "no leader is resolvable to apply this write; the write was not applied"
+                        .to_string(),
+                ),
+                TenantConfigForwardError::Forward(ForwardError::Timeout { secs }) => (
+                    504,
+                    "forward_result_unknown",
+                    format!(
+                        "the leader did not answer within {secs}s; the write may or may not \
+                         have been applied — re-read the resource before retrying"
+                    ),
+                ),
+                TenantConfigForwardError::Forward(ForwardError::AfterResponse(reason)) => (
+                    504,
+                    "forward_result_unknown",
+                    format!(
+                        "the leader answered but the response could not be read ({reason}); the \
+                         write may or may not have been applied — re-read the resource before \
+                         retrying"
+                    ),
+                ),
+                TenantConfigForwardError::Forward(ForwardError::Other(reason)) => (
+                    502,
+                    "forward_failed",
+                    format!("failed to reach the leader: {reason}"),
+                ),
+            };
+            super::respond_error(session, ctx, status, code, &message).await
+        }
+    }
 }

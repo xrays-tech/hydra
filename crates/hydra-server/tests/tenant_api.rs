@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
-use hydra_core::model::Tenant;
+use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
 use hydra_server::crypto::StaticKeyProvider;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
@@ -28,7 +28,7 @@ use hydra_server::store::ConfigStore;
 use hydra_server::tenant_api::TenantApiConfig;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// A sink that records nothing: these tests never proxy a request.
 struct NoopSink;
@@ -2012,4 +2012,382 @@ async fn the_read_only_endpoints_work_on_an_edge_from_the_snapshot_alone() {
     let arr2 = v2["sub_tenant_routes"].as_array().expect("array");
     assert_eq!(arr2.len(), 1);
     assert_eq!(arr2[0]["id"], "r1");
+}
+
+// ---------------------------------------------------------------------------
+// V5 — D9 data-plane tenant config writes (PUT/DELETE sub-tenants & routes)
+//
+// These run on the single-node shape (`AppState::for_tests` installs NO
+// forwarder), so every write exercises the D8 LOCAL path: gate → binding →
+// `apply_config_write` → `reload_all` → `config_version` advances. The forward
+// path is covered separately in the `cluster-redis` e2e target.
+// ---------------------------------------------------------------------------
+
+const NOW: &str = "2026-01-01T00:00:00Z";
+
+/// A tenant with a token PLUS the provider/model/bindings a route write needs
+/// (`p1` serving `gpt-4o`, `t` authorised for `p1` with `gpt-4o`).
+async fn seed_full_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Option<&str>) {
+    seed_tenant(pool, id, domain, token).await;
+    hydra_server::db::insert_provider(
+        pool,
+        &Provider {
+            id: "p1".into(),
+            key: "openai".into(),
+            name: "openai".into(),
+            endpoint: "https://api.openai.example.com".into(),
+            weight: 1,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("insert p1");
+    hydra_server::db::insert_provider_model(
+        pool,
+        &ProviderModel {
+            id: "pm1".into(),
+            key: "gpt-4o".into(),
+            name: "gpt-4o".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .expect("insert gpt-4o");
+    hydra_server::db::insert_tenant_provider(
+        pool,
+        &TenantProvider {
+            id: "tp1".into(),
+            tenant_id: id.into(),
+            provider_id: "p1".into(),
+        },
+    )
+    .await
+    .expect("insert t->p1");
+    hydra_server::db::insert_tenant_model(
+        pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: id.into(),
+            model_key: "gpt-4o".into(),
+        },
+    )
+    .await
+    .expect("insert t gpt-4o");
+}
+
+/// Send a data-plane write (PUT/DELETE) with a Bearer token and an optional
+/// JSON body, retrying until the listener accepts.
+async fn send_write(
+    root: &str,
+    method: reqwest::Method,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let c = client();
+    let url = format!("{root}{path}");
+    for _ in 0..60 {
+        let mut req = c.request(method.clone(), &url);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        if let Some(b) = &body {
+            req = req.json(b);
+        }
+        match req.send().await {
+            Ok(r) => return body_json(r).await,
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    panic!("proxy never became ready at {url}");
+}
+
+/// PUT a sub-tenant and return the produced row id.
+async fn put_sub_tenant(root: &str, tenant: &str, token: &str, name: &str) -> (u16, Value) {
+    send_write(
+        root,
+        reqwest::Method::PUT,
+        &format!("/tenant/{tenant}/api/v1/sub-tenants/{name}"),
+        Some(token),
+        Some(json!({ "key_prefix": "QQCX_", "enabled": true })),
+    )
+    .await
+}
+
+/// The D8 local write path, end to end: a single-node node applies the write
+/// itself, `config_version` advances, and a repeated PUT is idempotent (the
+/// same row id is returned).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_local_write_put_is_idempotent_and_advances_version() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let version_before = state.store.version();
+    let root = start_proxy(state.clone());
+
+    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    assert_eq!(status, 200, "got {v}");
+    let id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+    assert_eq!(v["sub_tenant"]["name"], "team-a");
+    let version_after = v["config_version"].as_u64().expect("version");
+    assert!(
+        version_after > version_before,
+        "a local write must advance config_version: before={version_before} after={version_after}"
+    );
+    // The write landed in the snapshot the data plane reads.
+    let snap = state.store.snapshot();
+    assert!(
+        snap.sub_tenants.iter().any(|s| s.id == id),
+        "the row is in the snapshot"
+    );
+    drop(snap);
+
+    // Idempotent: a repeated PUT by name converges to the SAME row.
+    let (status2, v2) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    assert_eq!(status2, 200, "got {v2}");
+    assert_eq!(
+        v2["sub_tenant"]["id"].as_str().expect("id"),
+        id,
+        "a repeated PUT by name converges to the existing row"
+    );
+}
+
+/// DELETE is idempotent: the first delete removes the row (204); a repeat is a
+/// no-op that still answers 204 (never 404, so a late replay cannot error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_local_write_delete_is_idempotent() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    assert_eq!(status, 200, "got {v}");
+    let id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+
+    let (s1, _) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        &format!("/tenant/t1/api/v1/sub-tenants/{id}"),
+        Some(TENANT_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(s1, 204, "first delete removes the row");
+    let (s2, _) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        &format!("/tenant/t1/api/v1/sub-tenants/{id}"),
+        Some(TENANT_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s2, 204,
+        "a repeated delete is an idempotent no-op (204, not 404)"
+    );
+}
+
+/// A route write upserts by `(sub_tenant_id, model_key)`; a repeated PUT
+/// converges to the same route row, and the route delete is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_local_route_write_upsert_and_idempotent_delete() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let version_before = state.store.version();
+    let root = start_proxy(state);
+
+    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    assert_eq!(status, 200, "got {v}");
+    let st_id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+
+    let route_body = json!({ "sub_tenant_id": st_id, "provider_id": "p1", "model_key": "gpt-4o", "enabled": true });
+    let (r1, rv1) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/sub-tenant-routes",
+        Some(TENANT_TOKEN),
+        Some(route_body.clone()),
+    )
+    .await;
+    assert_eq!(r1, 200, "got {rv1}");
+    let route_id = rv1["route"]["id"].as_str().expect("id").to_string();
+    assert_eq!(rv1["route"]["model_key"], "gpt-4o");
+    assert!(
+        rv1["config_version"].as_u64().expect("version") > version_before,
+        "a route write must advance config_version"
+    );
+
+    // Idempotent: a repeated PUT by (sub_tenant_id, model_key) converges.
+    let (r2, rv2) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/sub-tenant-routes",
+        Some(TENANT_TOKEN),
+        Some(route_body),
+    )
+    .await;
+    assert_eq!(r2, 200, "got {rv2}");
+    assert_eq!(
+        rv2["route"]["id"].as_str().expect("id"),
+        route_id,
+        "a repeated route PUT by (sub_tenant_id, model_key) converges"
+    );
+
+    // Idempotent delete.
+    let (d1, _) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        &format!("/tenant/t1/api/v1/sub-tenant-routes/{route_id}"),
+        Some(TENANT_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(d1, 204, "first route delete");
+    let (d2, _) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        &format!("/tenant/t1/api/v1/sub-tenant-routes/{route_id}"),
+        Some(TENANT_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(d2, 204, "a repeated route delete is an idempotent no-op");
+}
+
+/// No credential at all: 401 from the gate (the same gate a read uses).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_with_no_token_is_401() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/sub-tenants/evil",
+        None,
+        Some(json!({ "key_prefix": "EVIL_" })),
+    )
+    .await;
+    assert_eq!(status, 401, "got {v}");
+    assert_eq!(v["error"]["code"], "unauthorized", "got {v}");
+}
+
+/// The URL's tenant id is a cross-check: a token for `t1` against a `t2` URL is
+/// 403 `tenant_id_mismatch` (never 200, never a silent write to the other
+/// tenant).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_url_token_mismatch_is_403() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    // t2 only needs a token: the mismatch is decided at the gate, before any
+    // provider check, so no provider/model rows are required for it.
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t2/api/v1/sub-tenants/evil",
+        Some(TENANT_TOKEN),
+        Some(json!({ "key_prefix": "EVIL_" })),
+    )
+    .await;
+    assert_eq!(status, 403, "got {v}");
+    assert_eq!(v["error"]["code"], "tenant_id_mismatch", "got {v}");
+}
+
+/// Cross-tenant isolation: `t2`'s token cannot create a sub-tenant under `t1`,
+/// and `t1`'s existing sub-tenant is left intact by the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_cross_tenant_is_rejected_and_leaves_rows_intact() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    // t2 only needs a token: its write is refused at the gate (403) before any
+    // provider check, so no provider/model rows are required for it.
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state.clone());
+
+    // t1 owns a sub-tenant.
+    let (s, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    assert_eq!(s, 200, "got {v}");
+    let t1_id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+
+    // t2's token cannot write to t1's namespace: 403 (URL cross-check).
+    let (s2, v2) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/sub-tenants/evil",
+        Some(OTHER_TOKEN),
+        Some(json!({ "key_prefix": "EVIL_" })),
+    )
+    .await;
+    assert_eq!(s2, 403, "t2 cannot write t1's sub-tenants: {v2}");
+    assert_eq!(v2["error"]["code"], "tenant_id_mismatch", "got {v2}");
+
+    // t1's row is untouched by t2's attempt.
+    let snap = state.store.snapshot();
+    let names: Vec<String> = snap
+        .sub_tenants
+        .iter()
+        .filter(|s| s.tenant_id == "t1")
+        .map(|s| s.name.clone())
+        .collect();
+    drop(snap);
+    assert!(
+        names.contains(&"team-a".to_string()),
+        "t1 keeps its sub-tenant"
+    );
+    assert!(
+        !names.contains(&"evil".to_string()),
+        "t2's write did not land"
+    );
+    let _ = t1_id;
+}
+
+/// A near miss under the reserved prefix is answered with a LOCAL 404 — it must
+/// never fall through to the proxy pipeline (where a tenant token would be read
+/// as a client api-key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_near_miss_is_a_local_404_not_a_fallthrough() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+    for (method, path) in [
+        // PUT with no name segment (the GET list path, not a write path).
+        (reqwest::Method::PUT, "/tenant/t1/api/v1/sub-tenants"),
+        // PUT with an empty name.
+        (reqwest::Method::PUT, "/tenant/t1/api/v1/sub-tenants/"),
+        // PUT on a made-up resource.
+        (reqwest::Method::PUT, "/tenant/t1/api/v1/typo"),
+        // DELETE with no id.
+        (reqwest::Method::DELETE, "/tenant/t1/api/v1/sub-tenants/"),
+        // DELETE on a made-up resource.
+        (
+            reqwest::Method::DELETE,
+            "/tenant/t1/api/v1/sub-tenant-routes",
+        ),
+    ] {
+        let (status, v) = send_write(&root, method, path, Some(TENANT_TOKEN), None).await;
+        assert_eq!(status, 404, "{path} must be a local 404, got {v}");
+        assert_eq!(
+            v["error"]["code"], "not_found",
+            "{path} must carry our envelope: {v}"
+        );
+        // The proxy short-circuit body has `type: "proxy_error"`; ours never does.
+        assert_eq!(
+            v["error"]["type"],
+            Value::Null,
+            "{path} fell through to the proxy pipeline: {v}"
+        );
+    }
 }

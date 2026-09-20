@@ -197,6 +197,99 @@ pub fn parse_route(path: &str) -> Option<TenantApiRoute<'_>> {
     })
 }
 
+/// A method-aware tenant API **write** route (sub-tenant v2, D9).
+///
+/// The four self-service write endpoints. Their path shapes collide across
+/// methods — `PUT /sub-tenants/{name}` and `DELETE /sub-tenants/{id}` share a
+/// shape — and the flat `PUT /sub-tenant-routes` shares its path with the GET
+/// list endpoint, so these are resolved by `(method, path)` together, never by
+/// path alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantWriteRoute<'a> {
+    /// `PUT /tenant/{tenant_id}/api/v1/sub-tenants/{name}` — upsert by
+    /// `(tenant_id, name)`.
+    UpsertSubTenant { tenant_id: &'a str, name: &'a str },
+    /// `DELETE /tenant/{tenant_id}/api/v1/sub-tenants/{id}` — delete by immutable
+    /// id.
+    DeleteSubTenant { tenant_id: &'a str, id: &'a str },
+    /// `PUT /tenant/{tenant_id}/api/v1/sub-tenant-routes` — upsert by
+    /// `(sub_tenant_id, model_key)` (both carried in the body).
+    UpsertRoute { tenant_id: &'a str },
+    /// `DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` — delete by
+    /// immutable id.
+    DeleteRoute { tenant_id: &'a str, id: &'a str },
+}
+
+impl TenantWriteRoute<'_> {
+    /// The low-cardinality metric/audit label for a write route.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            TenantWriteRoute::UpsertSubTenant { .. } => "sub-tenant-upsert",
+            TenantWriteRoute::DeleteSubTenant { .. } => "sub-tenant-delete",
+            TenantWriteRoute::UpsertRoute { .. } => "sub-tenant-route-upsert",
+            TenantWriteRoute::DeleteRoute { .. } => "sub-tenant-route-delete",
+        }
+    }
+}
+
+/// Parse a tenant API **write** route, method-aware (sub-tenant v2, D9).
+///
+/// Unlike [`parse_route`] (path-only), the write routes are method-specific and
+/// their path shapes overlap the flat read paths, so this accepts only the exact
+/// `(method, path)` pairs the four write endpoints define. Every near-miss — a
+/// wrong method, a missing or extra path segment, a wrong version, an empty
+/// tenant id — is `None`, which the caller answers as a **local `404`** (it must
+/// never fall through to the proxy pipeline, where a tenant token would be read
+/// as a client api-key and POSTed to the tenant's `auth_url`).
+///
+/// The `{name}` / `{id}` segment is the **raw** path segment: a valid sub-tenant
+/// `name` is printable ASCII with no `/` (D9), so the raw segment and the stored
+/// value are compared directly, with no percent-decoding asymmetry between the
+/// edge and the leader.
+#[must_use]
+pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteRoute<'a>> {
+    let rest = path.strip_prefix("/tenant/")?;
+    let (tenant_id, suffix) = rest.split_once('/')?;
+    if tenant_id.is_empty() {
+        return None;
+    }
+    // A single path segment: non-empty and with no further `/`. Inlined (rather
+    // than a closure) so the returned segment's lifetime is unambiguously that of
+    // `path`.
+    let segment = |s: &'a str| -> Option<&'a str> {
+        if s.is_empty() || s.contains('/') {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    match method {
+        "PUT" => {
+            if let Some(name) = suffix.strip_prefix("api/v1/sub-tenants/").and_then(segment) {
+                return Some(TenantWriteRoute::UpsertSubTenant { tenant_id, name });
+            }
+            if suffix == "api/v1/sub-tenant-routes" {
+                return Some(TenantWriteRoute::UpsertRoute { tenant_id });
+            }
+            None
+        }
+        "DELETE" => {
+            if let Some(id) = suffix.strip_prefix("api/v1/sub-tenants/").and_then(segment) {
+                return Some(TenantWriteRoute::DeleteSubTenant { tenant_id, id });
+            }
+            if let Some(id) = suffix
+                .strip_prefix("api/v1/sub-tenant-routes/")
+                .and_then(segment)
+            {
+                return Some(TenantWriteRoute::DeleteRoute { tenant_id, id });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Token totals for a window (or for one group within it).
 ///
 /// `Default` is all-zero, which is exactly the `COALESCE(..., 0)` semantics the

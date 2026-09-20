@@ -46,7 +46,7 @@ pub mod throttle;
 pub mod time_bound;
 pub mod trusted_proxy;
 
-use hydra_core::tenant_api::{parse_route, Endpoint};
+use hydra_core::tenant_api::{parse_route, parse_write_route, Endpoint, TenantWriteRoute};
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use std::time::Duration;
@@ -248,8 +248,37 @@ pub async fn dispatch(
     ctx: &mut RequestContext,
     path: &str,
 ) -> pingora_core::Result<bool> {
-    // 1. Is it one of our routes? The reserved-prefix caller has already
-    //    guaranteed the prefix; a miss here is a local 404, never a fall-through.
+    let method = session.req_header().method.as_str();
+
+    // 1. Method-aware route resolution. A request under the reserved prefix is
+    //    EITHER a WRITE route (PUT/DELETE, method-specific, sub-tenant v2 D9) OR
+    //    a READ route (path-only). Resolve the write route FIRST for PUT/DELETE,
+    //    because the flat `PUT /sub-tenant-routes` shares its path with the GET
+    //    list endpoint and the method-agnostic read parse would mis-attribute it.
+    //    A near-miss is a LOCAL 404 — never a fall-through to the proxy pipeline,
+    //    where a tenant token would be read as a client api-key (design §3.2).
+    if method == "PUT" || method == "DELETE" {
+        let Some(write) = parse_write_route(method, path) else {
+            return respond_error(session, ctx, 404, "not_found", "unknown path").await;
+        };
+        let url_tenant = match write {
+            TenantWriteRoute::UpsertSubTenant { tenant_id, .. }
+            | TenantWriteRoute::DeleteSubTenant { tenant_id, .. }
+            | TenantWriteRoute::UpsertRoute { tenant_id }
+            | TenantWriteRoute::DeleteRoute { tenant_id, .. } => tenant_id,
+        };
+        // The write is authenticated with the EXACT same gate a read is, so a
+        // write endpoint cannot become a weaker door (D3). `None` ⇒ a response
+        // (401/403/429/503) was already written.
+        let Some(authenticated) = run_gate(state, session, ctx, path, url_tenant).await? else {
+            return Ok(true);
+        };
+        ctx.tenant_api_endpoint = Some(write.label());
+        ctx.tenant = Some(authenticated.tenant.clone());
+        return handlers::write(state, session, ctx, &authenticated, write).await;
+    }
+
+    // 2. The READ route (path-only). A miss is a local 404.
     let Some(route) = parse_route(path) else {
         return respond_error(session, ctx, 404, "not_found", "unknown path").await;
     };
@@ -266,7 +295,7 @@ pub async fn dispatch(
         Endpoint::ListSubTenantRoutes => "sub-tenant-routes",
     });
 
-    // 1b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
+    // 2b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
     //     a method-agnostic handler would let a prefetching client, a
     //     mis-configured health check or a browser address bar clear caches.
     //     The method contract belongs to ROUTING, not to each handler, so it is
@@ -278,7 +307,6 @@ pub async fn dispatch(
         | Endpoint::ListSubTenantRoutes => "GET",
         Endpoint::InvalidateAuthCache => "POST",
     };
-    let method = session.req_header().method.as_str();
     if method != expected {
         return respond_error(
             session,
@@ -290,151 +318,11 @@ pub async fn dispatch(
         .await;
     }
 
-    // 2. The failure limiter. It is consulted ONLY where authentication FAILS —
-    //    never before the token is verified, and never on the success path.
-    //
-    //    The old pre-gate check refused EVERY request from a locked IP, valid
-    //    token included. Behind the documented LB→edge topology every tenant
-    //    shares the LB's egress IP, so ~11 bad tokens blacked out the whole
-    //    tenant API for the lockout window, renewable (design §5.1). B1 removes
-    //    that: a request that presents a VALID token is never refused by the
-    //    failure lockout. The accepted trade-off is the reversal of the
-    //    no-validity-oracle property the pre-gate check used to give — during a
-    //    lockout a guessing caller can distinguish `429` (wrong token) from
-    //    `200` (right token). That marginal guessing value is ~0 for the
-    //    ≥16-char tokens the gate enforces (MIN_TENANT_TOKEN_LEN), while the
-    //    cross-tenant DoS it removed is real, and the 403 URL-mismatch channel
-    //    below already leaks validity today.
-    let ip = client_ip(session, &state.tenant_api.trusted_proxies);
-    let now = std::time::Instant::now();
-    let fail_window = std::time::Duration::from_secs(60);
-    let lockout = std::time::Duration::from_secs(state.tenant_api.lockout_secs);
-    let presented_digest = bearer_token(session).map(limit::token_digest);
-
-    // 2b. Gate. No token and a wrong token are the same answer on purpose.
-    let gate_started = std::time::Instant::now();
-    let Some(bearer) = bearer_token(session) else {
-        debug!(target: "hydra::tenant_api", path = %path, "no tenant token presented");
-        // A locked caller must not extend its own lockout: answer 429 without
-        // recording another failure (B1 — the lockout only ever grows from real
-        // failures, never from a caller that is already locked).
-        if let Some(r) = state.tenant_api_limiter.locked(&ip, None, now) {
-            crate::admin::metrics::record_tenant_api_throttled(r.scope);
-            crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
-            return respond_throttled(session, ctx, r).await;
-        }
-        if let Some(r) = state.tenant_api_limiter.record_failure(
-            &ip,
-            None,
-            state.tenant_api.auth_fail_limit_per_min,
-            fail_window,
-            lockout,
-            now,
-        ) {
-            crate::admin::metrics::record_tenant_api_throttled(r.scope);
-            return respond_throttled(session, ctx, r).await;
-        }
-        crate::admin::metrics::record_tenant_api_auth_failure("missing", gate_started.elapsed());
-        return respond_error(
-            session,
-            ctx,
-            401,
-            "unauthorized",
-            "invalid tenant access token",
-        )
-        .await;
+    // 3. The gate (token, failure limiter, snapshot auth, URL cross-check,
+    //    success budget). `None` ⇒ a response was already written.
+    let Some(authenticated) = run_gate(state, session, ctx, path, route.tenant_id).await? else {
+        return Ok(true);
     };
-    let authenticated = match auth::authenticate(&state.store, bearer) {
-        Ok(a) => a,
-        Err(auth::AuthError::Unauthorized) => {
-            debug!(target: "hydra::tenant_api", path = %path, "tenant token rejected");
-            // Same as the missing-token branch: a locked caller answers 429
-            // without recording another failure (B1).
-            if let Some(r) = state
-                .tenant_api_limiter
-                .locked(&ip, presented_digest.as_deref(), now)
-            {
-                crate::admin::metrics::record_tenant_api_throttled(r.scope);
-                crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
-                return respond_throttled(session, ctx, r).await;
-            }
-            crate::admin::metrics::record_tenant_api_auth_failure(
-                "unknown",
-                gate_started.elapsed(),
-            );
-            if let Some(r) = state.tenant_api_limiter.record_failure(
-                &ip,
-                presented_digest.as_deref(),
-                state.tenant_api.auth_fail_limit_per_min,
-                fail_window,
-                lockout,
-                now,
-            ) {
-                crate::admin::metrics::record_tenant_api_throttled(r.scope);
-                return respond_throttled(session, ctx, r).await;
-            }
-            return respond_error(
-                session,
-                ctx,
-                401,
-                "unauthorized",
-                "invalid tenant access token",
-            )
-            .await;
-        }
-        Err(auth::AuthError::NotReady) => {
-            // Not an auth FAILURE: nothing was refused, this node simply has no
-            // configuration yet. Counting it would let a caller that can reach an
-            // un-snapshotted edge burn its own failure budget.
-            return respond_error(
-                session,
-                ctx,
-                503,
-                "not_ready",
-                "this node has no configuration yet",
-            )
-            .await;
-        }
-    };
-    crate::admin::metrics::record_tenant_api_auth_latency(gate_started.elapsed());
-
-    // 3. The URL's tenant id is a cross-check, not an identity: the token already
-    //    said who the caller is, and a mismatch is a client-side bug worth
-    //    failing loudly (403, not 404 — the tenant id is in the caller's own base
-    //    URL, so it is not a secret).
-    if authenticated.tenant.id != route.tenant_id {
-        crate::admin::metrics::record_tenant_api_auth_failure("mismatch", gate_started.elapsed());
-        return respond_error(
-            session,
-            ctx,
-            403,
-            "tenant_id_mismatch",
-            "the token does not belong to the tenant in the URL",
-        )
-        .await;
-    }
-
-    // 3b. The per-tenant SUCCESS budget.
-    //
-    //     Deliberately AFTER both the token check and the URL cross-check: the
-    //     budget meters *authorised work*, and a client whose base URL names the
-    //     wrong tenant (403) is a configuration bug — letting that burn the
-    //     tenant's own quota would mean a buggy client can lock its tenant out of
-    //     its own API. The caller already holds a valid token, so the "unmetered
-    //     403" this leaves open buys an attacker nothing: they could simply use
-    //     their own URL.
-    match state.tenant_api_limiter.check_success(
-        &authenticated.tenant.id,
-        state.tenant_api.rate_limit_per_min,
-        fail_window,
-        now,
-    ) {
-        Ok(()) => {}
-        Err(r) => {
-            crate::admin::metrics::record_tenant_api_throttled(r.scope);
-            return respond_throttled(session, ctx, r).await;
-        }
-    }
 
     // Attribute the request for logs/metrics. `ctx.selected` stays None, which is
     // what keeps this request out of `hydra_requests_total` and out of the usage
@@ -462,6 +350,190 @@ pub async fn dispatch(
             handlers::list_sub_tenant_routes(state, session, ctx, &authenticated).await
         }
     }
+}
+
+/// Run the tenant API token gate for a request at `path` addressed to the
+/// tenant `url_tenant` (the id in the URL).
+///
+/// The single gate shared by EVERY endpoint — reads and writes alike — so a
+/// write endpoint cannot become a weaker door than a read (D3). It is the
+/// verbatim composition the read path always ran, now factored out so the
+/// write dispatch (V5, D9) reuses it rather than reimplementing it:
+///
+/// 1. **Failure limiter (B1)** — consulted ONLY where authentication fails; a
+///    valid token is never refused by it.
+/// 2. **Snapshot auth** — zero-I/O, constant-time over the stored digests
+///    ([`auth::authenticate`]); the resolved tenant and its `config_version`
+///    come from the SAME guard as the token comparison.
+/// 3. **URL cross-check** — the token already said who the caller is; a URL
+///    naming a different tenant is a client bug worth failing loudly (403, not
+///    404 — the tenant id is in the caller's own base URL, so it is not a
+///    secret).
+/// 4. **Success budget** — deliberately AFTER both the token check and the URL
+///    cross-check: the budget meters *authorised work*.
+///
+/// Returns `Ok(Some(authenticated))` when the request passes (the caller
+/// answers it) and `Ok(None)` when a response (401/403/429/503) has ALREADY
+/// been written by the gate. `Err` is a Pingora transport error from writing
+/// that response.
+#[allow(clippy::too_many_arguments)]
+async fn run_gate(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    path: &str,
+    url_tenant: &str,
+) -> pingora_core::Result<Option<Authenticated>> {
+    // The failure limiter. It is consulted ONLY where authentication FAILS —
+    // never before the token is verified, and never on the success path.
+    //
+    // The old pre-gate check refused EVERY request from a locked IP, valid
+    // token included. Behind the documented LB→edge topology every tenant
+    // shares the LB's egress IP, so ~11 bad tokens blacked out the whole
+    // tenant API for the lockout window, renewable (design §5.1). B1 removes
+    // that: a request that presents a VALID token is never refused by the
+    // failure lockout. The accepted trade-off is the reversal of the
+    // no-validity-oracle property the pre-gate check used to give — during a
+    // lockout a guessing caller can distinguish `429` (wrong token) from
+    // `200` (right token). That marginal guessing value is ~0 for the
+    // ≥16-char tokens the gate enforces (MIN_TENANT_TOKEN_LEN), while the
+    // cross-tenant DoS it removed is real, and the 403 URL-mismatch channel
+    // below already leaks validity today.
+    let ip = client_ip(session, &state.tenant_api.trusted_proxies);
+    let now = std::time::Instant::now();
+    let fail_window = Duration::from_secs(60);
+    let lockout = Duration::from_secs(state.tenant_api.lockout_secs);
+    let presented_digest = bearer_token(session).map(limit::token_digest);
+
+    let gate_started = std::time::Instant::now();
+    let Some(bearer) = bearer_token(session) else {
+        debug!(target: "hydra::tenant_api", path = %path, "no tenant token presented");
+        // A locked caller must not extend its own lockout: answer 429 without
+        // recording another failure (B1 — the lockout only ever grows from real
+        // failures, never from a caller that is already locked).
+        if let Some(r) = state.tenant_api_limiter.locked(&ip, None, now) {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
+            return respond_throttled(session, ctx, r).await.map(|_| None);
+        }
+        if let Some(r) = state.tenant_api_limiter.record_failure(
+            &ip,
+            None,
+            state.tenant_api.auth_fail_limit_per_min,
+            fail_window,
+            lockout,
+            now,
+        ) {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            return respond_throttled(session, ctx, r).await.map(|_| None);
+        }
+        crate::admin::metrics::record_tenant_api_auth_failure("missing", gate_started.elapsed());
+        return respond_error(
+            session,
+            ctx,
+            401,
+            "unauthorized",
+            "invalid tenant access token",
+        )
+        .await
+        .map(|_| None);
+    };
+    let authenticated = match auth::authenticate(&state.store, bearer) {
+        Ok(a) => a,
+        Err(auth::AuthError::Unauthorized) => {
+            debug!(target: "hydra::tenant_api", path = %path, "tenant token rejected");
+            // Same as the missing-token branch: a locked caller answers 429
+            // without recording another failure (B1).
+            if let Some(r) = state
+                .tenant_api_limiter
+                .locked(&ip, presented_digest.as_deref(), now)
+            {
+                crate::admin::metrics::record_tenant_api_throttled(r.scope);
+                crate::admin::metrics::record_tenant_api_auth_failure("locked", Duration::ZERO);
+                return respond_throttled(session, ctx, r).await.map(|_| None);
+            }
+            crate::admin::metrics::record_tenant_api_auth_failure(
+                "unknown",
+                gate_started.elapsed(),
+            );
+            if let Some(r) = state.tenant_api_limiter.record_failure(
+                &ip,
+                presented_digest.as_deref(),
+                state.tenant_api.auth_fail_limit_per_min,
+                fail_window,
+                lockout,
+                now,
+            ) {
+                crate::admin::metrics::record_tenant_api_throttled(r.scope);
+                return respond_throttled(session, ctx, r).await.map(|_| None);
+            }
+            return respond_error(
+                session,
+                ctx,
+                401,
+                "unauthorized",
+                "invalid tenant access token",
+            )
+            .await
+            .map(|_| None);
+        }
+        Err(auth::AuthError::NotReady) => {
+            // Not an auth FAILURE: nothing was refused, this node simply has no
+            // configuration yet. Counting it would let a caller that can reach an
+            // un-snapshotted edge burn its own failure budget.
+            return respond_error(
+                session,
+                ctx,
+                503,
+                "not_ready",
+                "this node has no configuration yet",
+            )
+            .await
+            .map(|_| None);
+        }
+    };
+    crate::admin::metrics::record_tenant_api_auth_latency(gate_started.elapsed());
+
+    // The URL's tenant id is a cross-check, not an identity: the token already
+    // said who the caller is, and a mismatch is a client-side bug worth
+    // failing loudly (403, not 404 — the tenant id is in the caller's own base
+    // URL, so it is not a secret).
+    if authenticated.tenant.id != url_tenant {
+        crate::admin::metrics::record_tenant_api_auth_failure("mismatch", gate_started.elapsed());
+        return respond_error(
+            session,
+            ctx,
+            403,
+            "tenant_id_mismatch",
+            "the token does not belong to the tenant in the URL",
+        )
+        .await
+        .map(|_| None);
+    }
+
+    // The per-tenant SUCCESS budget.
+    //
+    // Deliberately AFTER both the token check and the URL cross-check: the
+    // budget meters *authorised work*, and a client whose base URL names the
+    // wrong tenant (403) is a configuration bug — letting that burn the
+    // tenant's own quota would mean a buggy client can lock its tenant out of
+    // its own API. The caller already holds a valid token, so the "unmetered
+    // 403" this leaves open buys an attacker nothing: they could simply use
+    // their own URL.
+    match state.tenant_api_limiter.check_success(
+        &authenticated.tenant.id,
+        state.tenant_api.rate_limit_per_min,
+        fail_window,
+        now,
+    ) {
+        Ok(()) => {}
+        Err(r) => {
+            crate::admin::metrics::record_tenant_api_throttled(r.scope);
+            return respond_throttled(session, ctx, r).await.map(|_| None);
+        }
+    }
+
+    Ok(Some(authenticated))
 }
 
 /// The client IP, as a limiter key.
@@ -572,7 +644,11 @@ fn endpoint_label(ctx: &RequestContext) -> &'static str {
 }
 
 /// The `Authorization: Bearer …` value, if present.
-fn bearer_token(session: &Session) -> Option<&str> {
+///
+/// `pub(super)` so the write handler (V5) can re-read the authenticated tenant's
+/// bearer to forward it to the leader in the dedicated `x-hydra-tenant-token`
+/// header (D2) — the gate already validated it, so re-reading is safe.
+pub(super) fn bearer_token(session: &Session) -> Option<&str> {
     session
         .req_header()
         .headers
@@ -750,7 +826,10 @@ pub(super) async fn respond_json_with_retry_after<T: serde::Serialize>(
 /// (`{"error":{"message":…,"type":"proxy_error"}}`): ours always carries `code`
 /// and `trace_id` and never `type`, which is what makes "did this request reach
 /// the tenant API or the proxy pipeline?" answerable from a response alone.
-async fn respond_error(
+///
+/// `pub(super)` so the write handler (V5) answers its forward / local errors with
+/// the identical envelope.
+pub(super) async fn respond_error(
     session: &mut Session,
     ctx: &mut RequestContext,
     status: u16,
