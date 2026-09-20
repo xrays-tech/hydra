@@ -114,6 +114,17 @@ impl ForwardError {
 /// request again — see the module docs (forward loop guard).
 pub const FORWARD_ONCE_HEADER: &str = "x-hydra-forwarded";
 
+/// Dedicated header carrying the tenant's Bearer token when a **tenant config
+/// write** is forwarded to the leader (sub-tenant v2, decision A-2, precond. 5).
+///
+/// It is a SEPARATE header from `Authorization` on purpose: `Authorization`
+/// carries the NODE's cluster token (who the sender is), while this header
+/// carries the TENANT's Bearer (who the write is on behalf of). Keeping the
+/// tenant credential out of `Authorization` AND out of the request body means
+/// it can be neither relayed by the generic admin forwarder nor leaked by the
+/// body logging/diagnostics on the forward path.
+pub const TENANT_TOKEN_HEADER: &str = "x-hydra-tenant-token";
+
 /// Resolve the admin-mutation forward target for a standby: the ACTUAL lease
 /// holder's registered control URL, looked up live in the cluster registry.
 ///
@@ -262,11 +273,123 @@ async fn forward_mutation_with_timeout(
         .map_err(|e| ForwardError::AfterResponse(e.to_string()))
 }
 
+/// Forward one **tenant config write** to the leader's internal control
+/// endpoint (sub-tenant v2, decision A-2).
+///
+/// This is the data plane's ONLY trust-scoped path to the leader, and it is a
+/// SEPARATE function from [`forward_mutation`] on purpose. The admin forwarder
+/// relays the operator's `Authorization` verbatim (`forward.rs` fixed
+/// `authorization` relay), because the fleet shares `HYDRA_ADMIN_TOKEN`. A
+/// tenant config write cannot do that: on the edge the caller presents its
+/// TENANT Bearer in `Authorization`, which is not the cluster token and must
+/// never reach the internal gate under `Authorization`.
+///
+/// Header contract (A-2 precond. 5/8):
+/// - `Authorization: Bearer <cluster_token>` — authenticates the NODE (who
+///   sent it), via the shared control-plane token.
+/// - [`TENANT_TOKEN_HEADER`] (`x-hydra-tenant-token`): the TENANT's Bearer
+///   (who the write is on behalf of). The leader re-authenticates it and binds
+///   it to the write target. It is NEVER relayed from the caller's
+///   `Authorization` and NEVER placed in the body.
+/// - [`FORWARD_ONCE_HEADER`]: the forward-loop guard (a non-leader must never
+///   forward a request that already carried it).
+/// - `x-hydra-trace-id`: audit attribution (relayed, as the admin forwarder
+///   does).
+/// - `content-type: application/json`: the config write body is always JSON.
+///
+/// The caller's `Authorization` is deliberately NOT forwarded. The tenant
+/// Bearer and the body are never logged on this path.
+///
+/// Reuses the exact timeout / connect-classification of [`forward_mutation`]
+/// (see [`ForwardError`]): a connect failure is a definite failure, a timeout
+/// after connect is genuinely ambiguous (the write may have landed).
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_config_write(
+    base_url: &str,
+    method: &str,
+    path_and_query: &str,
+    cluster_token: &str,
+    tenant_bearer: &str,
+    body: Vec<u8>,
+    trace_id: &str,
+) -> Result<Response<Vec<u8>>, ForwardError> {
+    forward_config_write_with_timeout(
+        base_url,
+        method,
+        path_and_query,
+        cluster_token,
+        tenant_bearer,
+        body,
+        trace_id,
+        forward_timeout_secs(),
+    )
+    .await
+}
+
+/// [`forward_config_write`] with an explicit timeout — the seam that lets the
+/// timeout / error-classification path be exercised in ~1s instead of the 5s
+/// production default. The production entry point always derives the value
+/// from the environment; there is no "are we testing" branch anywhere.
+#[allow(clippy::too_many_arguments)]
+async fn forward_config_write_with_timeout(
+    base_url: &str,
+    method: &str,
+    path_and_query: &str,
+    cluster_token: &str,
+    tenant_bearer: &str,
+    body: Vec<u8>,
+    trace_id: &str,
+    secs: u64,
+) -> Result<Response<Vec<u8>>, ForwardError> {
+    // `secs` bounds the CONNECT phase; the total deadline is longer so a
+    // connect-phase failure is never masked by it (see `CONNECT_SLACK_SECS`).
+    let total_secs = secs + CONNECT_SLACK_SECS;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
+    let mut req = client_for(secs)
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|e| ForwardError::Other(format!("unsupported method {method}: {e}")))?,
+            &url,
+        )
+        // The NODE is authenticated by the shared cluster token. This is the
+        // ONLY credential in `Authorization` — the caller's `Authorization`
+        // (the tenant Bearer) is deliberately NOT relayed here.
+        .header("authorization", format!("Bearer {cluster_token}"))
+        // The TENANT's Bearer travels in a dedicated header: never in
+        // `Authorization`, never in the body, never logged (A-2 precond. 5).
+        .header(TENANT_TOKEN_HEADER, tenant_bearer)
+        .header("x-hydra-trace-id", trace_id)
+        .header(FORWARD_ONCE_HEADER, "1")
+        .header("content-type", "application/json")
+        .timeout(Duration::from_secs(total_secs));
+    if !body.is_empty() {
+        req = req.body(body);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ForwardError::from_transport(&e, total_secs))?;
+    let status = resp.status();
+    let content_type = resp.headers().get("content-type").cloned();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ForwardError::AfterResponse(format!("response read failed: {e}")))?;
+
+    let mut out = Response::builder().status(status);
+    if let Some(ct) = content_type {
+        out = out.header("content-type", ct);
+    }
+    out.body(bytes.to_vec())
+        .map_err(|e| ForwardError::AfterResponse(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::header::HeaderValue;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -430,6 +553,109 @@ mod tests {
         .await
         .expect("forward succeeds");
         assert_eq!(resp.status(), 201, "active's response is relayed verbatim");
+    }
+
+    /// The tenant config write forward must authenticate the NODE with the
+    /// cluster token in `Authorization`, carry the TENANT bearer in the
+    /// dedicated `x-hydra-tenant-token` header, and send the forward-loop
+    /// marker, the trace id, a JSON content type and the write body — then
+    /// relay the leader's response verbatim (A-2 precond. 5/8).
+    #[tokio::test]
+    async fn forward_config_write_sends_cluster_token_and_tenant_bearer_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/internal/tenant-config/sub-tenants"))
+            .and(header("authorization", "Bearer secret-cluster-token"))
+            .and(header(TENANT_TOKEN_HEADER, "sk-tenant-bearer-123"))
+            .and(header("x-hydra-forwarded", "1"))
+            .and(header("x-hydra-trace-id", "cfg-trace-42"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(
+                serde_json::json!({"tenant_id":"t1","name":"acme"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"config_version":7})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resp = forward_config_write(
+            &server.uri(),
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenants",
+            "secret-cluster-token",
+            "sk-tenant-bearer-123",
+            br#"{"tenant_id":"t1","name":"acme"}"#.to_vec(),
+            "cfg-trace-42",
+        )
+        .await
+        .expect("forward succeeds");
+        assert_eq!(resp.status(), 200, "leader's response is relayed verbatim");
+        let got: serde_json::Value =
+            serde_json::from_slice(&resp.into_body()).expect("response is JSON");
+        assert_eq!(got.get("config_version").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    /// The tenant bearer must land in the dedicated header, NOT in
+    /// `Authorization` (which carries only the cluster token). A regression
+    /// that put the tenant bearer in `Authorization` — or relayed the caller's
+    /// `Authorization` — would be a live-credential leak into the node-auth slot
+    /// (A-2 precond. 5).
+    #[tokio::test]
+    async fn forward_config_write_keeps_tenant_bearer_out_of_authorization() {
+        let server = MockServer::start().await;
+        // `Authorization` must be EXACTLY the cluster token, nothing else.
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/internal/tenant-config/sub-tenant-routes"))
+            .and(header("authorization", "Bearer only-the-cluster-token"))
+            .and(header(TENANT_TOKEN_HEADER, "sk-tenant-bearer-secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The caller's own `Authorization` (its tenant bearer) is never a
+        // parameter of this function — the only credential in `Authorization`
+        // is `cluster_token`. The tenant bearer goes in the dedicated header.
+        let _ = forward_config_write(
+            &server.uri(),
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenant-routes",
+            "only-the-cluster-token",
+            "sk-tenant-bearer-secret",
+            br#"{}"#.to_vec(),
+            "t",
+        )
+        .await
+        .expect("forward succeeds");
+    }
+
+    /// A leader whose port is CLOSED: the write never left this node, so this
+    /// is a DEFINITE failure (not "the outcome is unknown") — same
+    /// classification as the admin forwarder.
+    #[tokio::test]
+    async fn forward_config_write_refused_connection_is_a_definite_failure() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let err = forward_config_write_with_timeout(
+            &format!("http://127.0.0.1:{port}"),
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenants",
+            "token",
+            "bearer",
+            Vec::new(),
+            "t",
+            1,
+        )
+        .await
+        .expect_err("refused ⇒ error");
+        assert!(
+            matches!(err, ForwardError::Other(_)),
+            "connection refusal proves nothing was written, got {err:?}"
+        );
     }
 }
 

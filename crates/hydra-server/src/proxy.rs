@@ -161,6 +161,23 @@ pub struct AppState {
     #[cfg(not(feature = "db"))]
     #[allow(dead_code)]
     pub usage: Option<()>,
+
+    /// Trust-scoped path for tenant config writes (sub-tenant v2, decision
+    /// A-2). The data plane reaches the leader's internal control plane through
+    /// this forwarder ONLY: it carries a shared cluster token (node identity)
+    /// and a single leader-URL closure, and never the `NodeRegistry`.
+    ///
+    /// `None` on single-node / no-cluster builds and when this node is not in a
+    /// cluster — the tenant config write is then applied locally (D8). Wired in
+    /// `main` from `ClusterConfig.cluster_token` + a closure over the cluster
+    /// registry. Consumed by the tenant config write handler (v2 V5); in V1 it
+    /// is installed and available but not yet invoked from the request path.
+    #[cfg(feature = "cluster-redis")]
+    pub tenant_config_forwarder: Option<Arc<crate::tenant_config::TenantConfigForwarder>>,
+    /// Placeholder so single-node builds keep a uniform shape.
+    #[cfg(not(feature = "cluster-redis"))]
+    #[allow(dead_code)]
+    pub tenant_config_forwarder: Option<()>,
 }
 
 #[cfg(feature = "proxy")]
@@ -243,7 +260,28 @@ impl AppState {
             usage,
             #[cfg(not(feature = "db"))]
             usage: None,
+            // The test build is single-node: no cluster, so no forwarder (the
+            // tenant config write is applied locally — D8).
+            #[cfg(feature = "cluster-redis")]
+            tenant_config_forwarder: None,
+            #[cfg(not(feature = "cluster-redis"))]
+            tenant_config_forwarder: None,
         })
+    }
+
+    /// The trust-scoped tenant config write forwarder (sub-tenant v2, A-2).
+    ///
+    /// `None` on single-node / no-cluster nodes: the tenant config write is
+    /// applied locally there. The request path reads this from the tenant
+    /// config write handler (v2 V5); V1 only installs it, so this accessor is
+    /// what keeps the field a live, readable public-API member (a test in this
+    /// file reads it).
+    #[cfg(feature = "cluster-redis")]
+    #[must_use]
+    pub fn tenant_config_forwarder(&self) -> Option<&crate::tenant_config::TenantConfigForwarder> {
+        // `Option<Arc<T>>::as_deref` → `Option<&T>` (the forwarder itself, not
+        // the `Arc`), so the caller gets a plain reference.
+        self.tenant_config_forwarder.as_deref()
     }
 }
 
@@ -1772,5 +1810,59 @@ mod tests {
         // mismatch.
         note_for(Some("[::1]:8080"), Some("http://[::1]:8080/v1/x"));
         assert_eq!(crate::tls::host_authority_mismatch_count(), before + 1);
+    }
+
+    /// A sink that records nothing: this test never proxies a request.
+    #[cfg(feature = "cluster-redis")]
+    struct NoopSink;
+
+    #[cfg(feature = "cluster-redis")]
+    impl crate::sink::UsageSink for NoopSink {
+        fn record(
+            &self,
+            _r: hydra_core::model::UsageRecord,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// The trust-scoped tenant config write forwarder is installed on the data
+    /// plane state (sub-tenant v2, A-2). The `for_tests` build is single-node
+    /// (no cluster), so it is `None` here — reading it through the accessor
+    /// keeps the field a live, readable public-API member (V1 installs it; V5
+    /// reads it from the request path).
+    #[cfg(feature = "cluster-redis")]
+    #[test]
+    fn tenant_config_forwarder_is_installed_and_readable() {
+        use std::time::Duration;
+        let key_provider: Arc<dyn crate::crypto::KeyProvider> =
+            Arc::new(crate::crypto::StaticKeyProvider::new([7u8; 32], 1));
+        let store = ConfigStore::from_snapshot(ConfigData::default(), key_provider);
+        let auth = Arc::new(
+            HttpAuthChecker::new(
+                crate::http::AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+                crate::http::AuthConfig::default(),
+            )
+            .expect("HttpAuthChecker::new"),
+        );
+        let breaker = Arc::new(CircuitBreaker::new(
+            hydra_core::breaker::BreakerConfig::new(5),
+        ));
+        let limiter: Arc<dyn crate::proxy::limiter::Limiter> =
+            Arc::new(crate::proxy::limiter::RateLimiter::new());
+        let sink: Arc<dyn UsageSink> = Arc::new(NoopSink);
+        let state = AppState::for_tests(
+            store,
+            auth,
+            breaker,
+            limiter,
+            sink,
+            ProxyConfig::default(),
+            crate::tenant_api::TenantApiConfig::default(),
+        );
+        assert!(
+            state.tenant_config_forwarder().is_none(),
+            "single-node (no cluster) build installs no forwarder (local execution, D8)"
+        );
     }
 }

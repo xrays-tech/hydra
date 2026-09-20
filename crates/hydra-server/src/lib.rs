@@ -80,6 +80,12 @@ pub mod clickhouse;
 #[cfg(feature = "proxy")]
 pub mod tenant_api;
 
+/// Tenant config write forwarding (sub-tenant v2, decision A-2): the data
+/// plane's trust-scoped path to the leader's internal control plane. Gated on
+/// `proxy`: it is wired into the data-plane `AppState` (`proxy.rs`).
+#[cfg(feature = "proxy")]
+pub mod tenant_config;
+
 /// The usage read capability behind `GET /tenant/{id}/api/v1/usage`.
 ///
 /// A separate trait rather than a method on `UsageSink` (which is a

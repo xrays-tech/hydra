@@ -820,6 +820,83 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             }
         };
 
+    // (2e-quint) Tenant config write forwarder (sub-tenant v2, A-2 / D1/D2).
+    //
+    // The data plane reaches the leader's internal control plane through a
+    // TRUST-SCOPED forwarder: it holds the shared cluster token (node identity)
+    // and a single closure that resolves the active leader's control URL. The
+    // `NodeRegistry` is deliberately NOT handed to the data plane (A-2
+    // precond. 8): the closure is the only leader-resolution seam.
+    //
+    // The closure is backed by a periodically-refreshed snapshot (the same
+    // pattern as `live_nodes` above): `forward_target_from_registry` is async,
+    // so a background task owns the registry read and the closure is a cheap
+    // sync load. A `None` view is a definite fail-closed signal, never a local
+    // write.
+    //
+    // Injected only when this node participates in a cluster (has a registry
+    // and a cluster token): on single-node / no-cluster nodes it is `None`, and
+    // the tenant config write is then applied locally (D8).
+    #[cfg(feature = "cluster-redis")]
+    let tenant_config_forwarder: Option<
+        Arc<hydra_server::tenant_config::TenantConfigForwarder>,
+    > = match (&registry, &cluster.cluster_token) {
+        (Some(reg), Some(token)) => {
+            let leader_url_live: Arc<arc_swap::ArcSwap<Option<String>>> =
+                Arc::new(arc_swap::ArcSwap::from_pointee(None));
+            let refresh = {
+                let reg = reg.clone();
+                let live = leader_url_live.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                    let refresh_once = || {
+                        let reg = reg.clone();
+                        let live = live.clone();
+                        async move {
+                            match hydra_server::cluster::forward::forward_target_from_registry(&reg)
+                                .await
+                            {
+                                Ok(url) => live.store(Arc::new(url)),
+                                Err(e) => {
+                                    // Keep the previous view on a transient
+                                    // registry error: a spurious "no leader"
+                                    // would fail a write the leader could
+                                    // have accepted, and the write stays
+                                    // fail-closed either way.
+                                    tracing::warn!(
+                                        error = %e,
+                                        "tenant-config leader-URL refresh failed; keeping the previous view"
+                                    );
+                                }
+                            }
+                        }
+                    };
+                    refresh_once().await;
+                    // `interval`'s first tick resolves immediately; consume
+                    // it so the rhythm is "once now, then once per second".
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        refresh_once().await;
+                    }
+                }
+            };
+            tokio::spawn(refresh);
+            let view: Arc<dyn Fn() -> Option<String> + Send + Sync> = Arc::new(move || {
+                // `ArcSwap<Option<String>>::load()` derefs through the held
+                // `Arc` to the inner `Option<String>`; clone the inner value
+                // (NOT the `Arc`) so the closure yields a plain `Option<String>`.
+                (*(*leader_url_live.load())).clone()
+            });
+            Some(Arc::new(
+                hydra_server::tenant_config::TenantConfigForwarder::new(token.clone(), view),
+            ))
+        }
+        _ => None,
+    };
+    #[cfg(not(feature = "cluster-redis"))]
+    let tenant_config_forwarder: Option<()> = None;
+
     let state = Arc::new(AppState {
         store: store.clone(),
         auth: auth.clone(),
@@ -839,6 +916,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         usage,
         #[cfg(not(feature = "db"))]
         usage: None,
+        tenant_config_forwarder,
     });
     #[cfg(not(feature = "cluster-redis"))]
     let invalidation_stream: Option<()> = None;
