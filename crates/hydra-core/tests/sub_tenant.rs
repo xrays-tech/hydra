@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use hydra_core::config::ConfigData;
 use hydra_core::model::{Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
+use hydra_core::router::sub_tenant_id_for_key;
 use hydra_core::sub_tenant::{
     validate_sub_tenant_write, validate_sub_tenant_write_against, SubTenantRows, SubTenantWrite,
     SubTenantWriteError, MAX_ROUTES_PER_SUB_TENANT, MAX_SUB_TENANTS_PER_TENANT,
@@ -529,6 +530,37 @@ fn route_quota_boundary_update_excludes_self() {
         validate_sub_tenant_write(&cfg, &route_write("t1", "st1", "p1", None)),
         Err(SubTenantWriteError::RouteQuotaExceeded)
     );
+}
+
+// --- v3: usage attribution (sub_tenant_id_for_key) --------------------------
+
+/// Attribution is a tenant-scoped, enabled-only prefix match — model-free and
+/// binding-free. It must not attribute another tenant's prefix nor a disabled
+/// sub-tenant, and it returns `None` for an unmatched key.
+#[test]
+fn sub_tenant_id_for_key_attributes_by_prefix() {
+    let cfg = {
+        let mut c = base();
+        c.sub_tenants
+            .push(sub_tenant("st1", "t1", "team-a", "QQCX_"));
+        c.sub_tenants
+            .push(sub_tenant("st2", "t1", "team-b", "QQCY_"));
+        c.sub_tenants
+            .push(sub_tenant("st3", "t2", "other", "ZZZZ_"));
+        let mut disabled = sub_tenant("st4", "t1", "off", "OFF_");
+        disabled.enabled = false;
+        c.sub_tenants.push(disabled);
+        c
+    };
+
+    assert_eq!(sub_tenant_id_for_key(&cfg, "t1", "QQCX_abc"), Some("st1"));
+    assert_eq!(sub_tenant_id_for_key(&cfg, "t1", "QQCY_abc"), Some("st2"));
+    // Another tenant's prefix never attributes for t1.
+    assert_eq!(sub_tenant_id_for_key(&cfg, "t1", "ZZZZ_abc"), None);
+    // A disabled sub-tenant never attributes.
+    assert_eq!(sub_tenant_id_for_key(&cfg, "t1", "OFF_abc"), None);
+    // No matching prefix.
+    assert_eq!(sub_tenant_id_for_key(&cfg, "t1", "nope"), None);
 }
 
 // --- rule 1/2: default route (model_key = None) -----------------------------

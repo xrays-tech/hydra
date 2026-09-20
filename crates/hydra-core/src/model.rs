@@ -361,6 +361,11 @@ pub struct UsageRecord {
     pub provider_id: String,
     pub model_key: String,
     pub client_api_key_masked: Option<String>,
+    /// The sub-tenant this request was attributed to (v3), derived at record
+    /// time from the RAW api-key prefix — never reconstructed from the stored
+    /// masked key (design-sub-tenant.md §7.1). `None` when no enabled sub-tenant
+    /// prefix matched.
+    pub sub_tenant_id: Option<String>,
     pub status_code: u16,
     /// Tokens sent in the request (all input, cache hits included).
     pub tokens_in: Option<u64>,

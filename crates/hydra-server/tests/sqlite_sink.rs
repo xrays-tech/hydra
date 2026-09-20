@@ -29,6 +29,7 @@ fn rec(i: u32) -> UsageRecord {
         // hands it. Here we use a real masked value produced by core `mask_key`
         // (design §9.5) to prove the contract end-to-end.
         client_api_key_masked: Some(mask_key("sk-abcd1234wxyz0987")),
+        sub_tenant_id: None,
         status_code: 200,
         tokens_in: Some(10 + i as u64),
         tokens_out: Some(20 + i as u64),
@@ -190,7 +191,7 @@ async fn sink_backoff_on_db_error() {
         "CREATE TABLE usage_record (\
          id INTEGER PRIMARY KEY AUTOINCREMENT, \
          tenant_id TEXT NOT NULL, provider_id TEXT NOT NULL, model_key TEXT NOT NULL, \
-         client_api_key TEXT, status_code INTEGER NOT NULL, \
+         client_api_key TEXT, sub_tenant_id TEXT, status_code INTEGER NOT NULL, \
          tokens_in INTEGER, tokens_out INTEGER, cache_hit_tokens INTEGER, \
          latency_ms INTEGER NOT NULL, forward_latency_ms INTEGER, ttft_ms INTEGER, \
          upstream_host TEXT, error TEXT, \

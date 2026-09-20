@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS usage_record (
     provider_id        String,
     model_key          String,
     client_api_key     Nullable(String),
+    sub_tenant_id      Nullable(String),
     status_code        UInt16,
     tokens_in          Nullable(UInt64),
     tokens_out         Nullable(UInt64),

@@ -91,6 +91,22 @@ fn match_sub_tenant<'a>(
         .max_by_key(|st| st.key_prefix.len())
 }
 
+/// The sub-tenant id a request belongs to, for **usage attribution** (v3):
+/// the enabled sub-tenant of `tenant_id` whose `key_prefix` prefixes `api_key`.
+///
+/// Model-free and binding-free on purpose: attribution answers "which group does
+/// this key belong to", independent of whether routing gate (3.6) fired or an
+/// operator key-prefix binding matched. `None` when no enabled prefix matches
+/// (⇒ unattributed). Never reconstructed from the stored masked key
+/// (design-sub-tenant.md §7.1).
+pub fn sub_tenant_id_for_key<'a>(
+    cfg: &'a ConfigData,
+    tenant_id: &str,
+    api_key: &str,
+) -> Option<&'a str> {
+    match_sub_tenant(cfg, tenant_id, api_key).map(|st| st.id.as_str())
+}
+
 /// Model-level route selection within one sub-tenant: a model-specific route
 /// (`model_key == Some(model)`) wins over the default route (`model_key =
 /// None`); when `model_key` is `None` (the model-less passthrough path, Q10)

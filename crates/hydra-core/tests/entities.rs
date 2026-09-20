@@ -173,6 +173,7 @@ fn entities_derive_roundtrip() {
         provider_id: "p_01".into(),
         model_key: "gpt-4o".into(),
         client_api_key_masked: Some("sk-abcd…wxyz".into()),
+        sub_tenant_id: None,
         status_code: 200,
         tokens_in: Some(120),
         tokens_out: Some(80),

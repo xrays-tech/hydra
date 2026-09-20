@@ -394,16 +394,17 @@ async fn insert_batch_sqlite(
     for r in records {
         sqlx::query(
             "INSERT INTO usage_record \
-             (tenant_id, provider_id, model_key, client_api_key, status_code, \
+             (tenant_id, provider_id, model_key, client_api_key, sub_tenant_id, status_code, \
               tokens_in, tokens_out, cache_hit_tokens, \
               latency_ms, forward_latency_ms, ttft_ms, \
               upstream_host, error, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.tenant_id)
         .bind(&r.provider_id)
         .bind(&r.model_key)
         .bind(&r.client_api_key_masked)
+        .bind(&r.sub_tenant_id)
         .bind(i64::from(r.status_code))
         .bind(r.tokens_in.map(|v| v as i64))
         .bind(r.tokens_out.map(|v| v as i64))
@@ -593,8 +594,8 @@ fn drain_on_drop(tx: Option<mpsc::Sender<UsageRecord>>, join: Option<tokio::task
 /// schema (environment/clickhouse/init.sql) — provider-neutral token columns.
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT: &str =
-    "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, status_code, \
-     tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
+    "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, sub_tenant_id, \
+     status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
      forward_latency_ms, ttft_ms, upstream_host, error, created_at) \
      FORMAT JSONEachRow";
 
@@ -658,6 +659,11 @@ fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
     json_string_into(out, &r.model_key);
     out.push_str(",\"client_api_key\":");
     match &r.client_api_key_masked {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"sub_tenant_id\":");
+    match &r.sub_tenant_id {
         Some(v) => json_string_into(out, v),
         None => out.push_str("null"),
     }
@@ -814,6 +820,7 @@ mod audit_3_9_tests {
             provider_id: "p".into(),
             model_key: "m".into(),
             client_api_key_masked: None,
+            sub_tenant_id: None,
             status_code: 200,
             tokens_in: Some(1),
             tokens_out: Some(1),

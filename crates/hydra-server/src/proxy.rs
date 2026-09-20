@@ -1294,12 +1294,23 @@ impl ProxyHttp for HydraProxy {
         if let (Some(tenant), Some(sel)) = (ctx.tenant.as_ref(), ctx.selected.as_ref()) {
             let model = ctx.model_key.clone().unwrap_or_default();
             let masked = ctx.client_api_key.as_ref().map(|k| mask_key(k));
+            // v3 attribution: the sub-tenant this request belongs to, from the RAW
+            // key prefix (never the masked form). A cheap snapshot clone; the match
+            // is pure and independent of gate (3.6) / operator key-prefix bindings.
+            let sub_tenant_id = {
+                let cfg = self.state.store.snapshot();
+                ctx.client_api_key
+                    .as_deref()
+                    .and_then(|k| router::sub_tenant_id_for_key(&cfg, &tenant.id, k))
+                    .map(str::to_string)
+            };
             let now_iso = now_iso8601();
             let record = hydra_core::model::UsageRecord {
                 tenant_id: tenant.id.clone(),
                 provider_id: sel.provider_id.clone(),
                 model_key: model,
                 client_api_key_masked: masked,
+                sub_tenant_id,
                 status_code: status,
                 // Preserve None (→ NULL): a provider that does not report a
                 // dimension must not masquerade as a zero count.
