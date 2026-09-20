@@ -471,6 +471,123 @@ async fn sqlite_group_by_model_matches_hand_written_sql() {
     assert_eq!(rows["claude"].tokens_in, 7);
 }
 
+/// Like [`insert_usage`] but sets the v3 `sub_tenant_id` (nullable).
+#[allow(clippy::too_many_arguments)]
+async fn insert_usage_sub(
+    pool: &sqlx::SqlitePool,
+    tenant: &str,
+    provider: &str,
+    model: &str,
+    sub_tenant_id: Option<&str>,
+    status: i64,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    cache_hit: Option<i64>,
+    created_at: &str,
+) {
+    sqlx::query(
+        "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, \
+         sub_tenant_id, status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
+         created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(tenant)
+    .bind(provider)
+    .bind(model)
+    .bind("sk-cli***")
+    .bind(sub_tenant_id)
+    .bind(status)
+    .bind(tokens_in)
+    .bind(tokens_out)
+    .bind(cache_hit)
+    .bind(12i64)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert usage row with sub_tenant_id");
+}
+
+/// v3: `group_by=sub_tenant` buckets rows by the recorded sub-tenant id; rows
+/// with no attribution (NULL) group under the empty key, and the totals still
+/// cover every row.
+#[tokio::test]
+async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
+    let pool = common::setup_pool().await;
+    seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
+    insert_usage_sub(
+        &pool,
+        T,
+        "p1",
+        "gpt-4o",
+        Some("st1"),
+        200,
+        Some(100),
+        Some(10),
+        None,
+        "2026-09-16T10:00:00Z",
+    )
+    .await;
+    insert_usage_sub(
+        &pool,
+        T,
+        "p1",
+        "gpt-4o",
+        Some("st1"),
+        200,
+        Some(5),
+        Some(1),
+        None,
+        "2026-09-16T11:00:00Z",
+    )
+    .await;
+    insert_usage_sub(
+        &pool,
+        T,
+        "p2",
+        "claude",
+        Some("st2"),
+        500,
+        Some(1),
+        Some(1),
+        None,
+        "2026-09-16T12:00:00Z",
+    )
+    .await;
+    // No attribution (NULL) must still be counted, under the empty key.
+    insert_usage_sub(
+        &pool,
+        T,
+        "p2",
+        "claude",
+        None,
+        200,
+        Some(7),
+        Some(3),
+        None,
+        "2026-09-16T13:00:00Z",
+    )
+    .await;
+
+    let q = select("sqlite", Some(&pool), None).expect("select");
+    let agg = q
+        .aggregate(
+            T,
+            "2026-09-16T00:00:00Z",
+            "2026-09-17T00:00:00Z",
+            hydra_server::usage_query::GroupBy::SubTenant,
+        )
+        .await
+        .expect("aggregate");
+
+    let rows = hydra_server::usage_query::rows_by_key(&agg);
+    assert_eq!(rows["st1"].requests, 2);
+    assert_eq!(rows["st1"].tokens_in, 105);
+    assert_eq!(rows["st2"].requests, 1);
+    assert_eq!(rows["st2"].errors, 1);
+    assert_eq!(rows[""].requests, 1, "unattributed rows group under ''");
+    assert_eq!(agg.totals.requests, 4, "totals still cover every row");
+}
+
 /// A tenant with no rows in the window gets a real zero *and* `as_of: null` —
 /// this is the one place a zero is the correct answer.
 #[tokio::test]

@@ -448,7 +448,7 @@ pub async fn usage(
                         ctx,
                         400,
                         "invalid_group_by",
-                        "`group_by` must be one of none, model, provider, day",
+                        "`group_by` must be one of none, model, provider, sub_tenant, day",
                     )
                     .await
                 }

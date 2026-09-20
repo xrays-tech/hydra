@@ -46,6 +46,9 @@ pub enum GroupBy {
     None,
     Model,
     Provider,
+    /// The sub-tenant the request was attributed to (v3). Rows whose key matched
+    /// no enabled sub-tenant prefix group under the empty key.
+    SubTenant,
     /// Calendar day, derived from the fixed-width prefix of `created_at`.
     Day,
 }
@@ -59,6 +62,7 @@ impl GroupBy {
             "none" | "" => Some(Self::None),
             "model" => Some(Self::Model),
             "provider" => Some(Self::Provider),
+            "sub_tenant" => Some(Self::SubTenant),
             "day" => Some(Self::Day),
             _ => None,
         }
@@ -71,6 +75,7 @@ impl GroupBy {
             Self::None => "none",
             Self::Model => "model",
             Self::Provider => "provider",
+            Self::SubTenant => "sub_tenant",
             Self::Day => "day",
         }
     }
@@ -174,6 +179,7 @@ fn group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
+        GroupBy::SubTenant => Some("sub_tenant_id"),
         // `created_at` is fixed-width `YYYY-MM-DDTHH:MM:SSZ`, so the date is a
         // safe 10-byte prefix and needs no date function (which would also make
         // the index unusable).
@@ -309,6 +315,7 @@ fn ch_group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
+        GroupBy::SubTenant => Some("sub_tenant_id"),
         // `created_at` is a fixed-width `YYYY-MM-DDTHH:MM:SSZ` string on both
         // backends, so the date is a safe 10-byte slice. No date function: it
         // would both change semantics and drop the primary-key pruning.
