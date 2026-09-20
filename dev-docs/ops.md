@@ -472,6 +472,14 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 
 > **ClickHouse usage reads are response-size-capped (~64 KiB — `MAX_CLICKHOUSE_RESPONSE` in `crates/hydra-server/src/clickhouse.rs`).** A result that exceeds the cap (a very wide `group_by` over a long window) fails the read and surfaces as `503 usage_store_unavailable` with a "narrow the query" message — **not** a retryable error. Narrow `since`/`until` or reduce `group_by` cardinality (e.g. `day` instead of `model`).
 
+> **v3 schema migration — sub-tenant usage attribution (2026-09-18).** `usage_record`
+> gained a nullable `sub_tenant_id` column (derived at record time from the RAW api-key
+> prefix). **Fresh** ClickHouse instances get it from `environment/clickhouse/init.sql`;
+> an **already-initialised** instance needs a one-off
+> `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`
+> (**no backfill** — pre-existing rows stay NULL; `CREATE TABLE IF NOT EXISTS` does not
+> add columns to an existing table). SQLite applies migration `0011` automatically.
+
 ### 5.5 Sub-tenant configuration (admin API)
 
 Sub-tenants and their routes are operator-managed through the admin API; the

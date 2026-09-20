@@ -253,6 +253,8 @@ A′ + A-2 决策记录 + 幂等 upsert（`PUT` 按自然键、`DELETE` 按不�
 ### v3（用量归因）
 `usage_record` 新列（路由时派生），ClickHouse/SQLite 双 sink 同步改。
 
+**已实现（2026-09-18）**：`UsageRecord.sub_tenant_id: Option<String>`（`hydra-core/model.rs`），在 proxy 的 `logging` 记录点从**原始 key 前缀**经 `router::sub_tenant_id_for_key` 派生（model-free / binding-free、仅启用中的子租户；无匹配 ⇒ `None`）；SQLite 迁移 `0011`；ClickHouse `init.sql`（新实例）+ 既有实例一次性 `ALTER TABLE usage_record ADD COLUMN sub_tenant_id Nullable(String)`（无回填）；两 sink 同步写、掩码 key 逻辑不变（原始 key 永不落库）。**`/usage` 的 `group_by=sub_tenant` 读取维度未纳入本次**（设计 v3 只要求列 + 双 sink），列为后续。
+
 ---
 
 ## 9. 开放问题与已决裁定

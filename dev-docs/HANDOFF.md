@@ -189,6 +189,13 @@ queue_wait_timeout_ms # 1000-5000
     disabled — D5 tightening; prefix overlap re-validated in-tx).
   - the tenant Bearer is carried to the leader in the dedicated **`x-hydra-tenant-token`** header
     (`cluster/forward.rs`), never in `Authorization` and never in the body.
+- **Sub-tenant v3 (usage attribution, 2026-09-18):** `UsageRecord.sub_tenant_id`
+  (`hydra-core/model.rs`) is derived at the `logging` record site from the **RAW** api-key prefix
+  via `router::sub_tenant_id_for_key` (model-free/binding-free, enabled-only; `None` when no prefix
+  matches). Both sinks write it: SQLite migration `0011`, ClickHouse `environment/clickhouse/init.sql`
+  **plus a one-off `ALTER TABLE usage_record ADD COLUMN sub_tenant_id Nullable(String)` for existing
+  instances** (no backfill). `/usage`'s `group_by=sub_tenant` read dimension is **deferred** (design
+  v3 only requires the column + the two sinks). Plan: `aegis/plans/2026-09-18-sub-tenant-v3.md`.
   - `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (default **60**) — per-tenant config-write budget, enforced
     on the leader (`429 too_many_requests`); the in-process window **resets on leader failover**
     (bounded burst, anti-DoS only).
