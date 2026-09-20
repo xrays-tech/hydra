@@ -364,4 +364,10 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'   # 空
 - handler 顺序：`lease_gate → reauth → throttle → apply`；单节点 `local_write` reload 并返回 `config_version`（`tenant_api/handlers.rs:899-976`）。
 - `parse_write_route`：方法感知，路径形态冲突（PUT `{name}` vs DELETE `{id}`、flat PUT 路由 vs GET 列表）按 `(method,path)` 解析，near-miss ⇒ `None`（`hydra-core/src/tenant_api.rs`）。
 
-**限制（必须保留）**：以上为自审，**不取代独立复审**。建议 provider 恢复后补跑 oracle 实现后对抗式复审；在此之前，v2 的提交须把"独立复审待跑"作为显式保留项记录，不得声称已通过独立门禁。
+**2026-09-18 更新：独立 oracle 复审已补跑并通过（`ora-2`）**：
+- 第一轮 **GATE: FAIL**（1 个**阻塞**：`create_route` 的 route PUT 在配额边界不幂等——自然键 upsert 把待更新的既有行也计入配额，导致 504 重试返回 400）。**已修**：`create_route` 在事务内解析既有 `(sub_tenant_id, model_key)` 行并作为 `self_route_id` 传入校验（配额排除自身）；新增 core 边界测试 `route_quota_boundary_update_excludes_self`、server 幂等测试 `route_put_is_idempotent`、以及**配额边界回归测试** `route_put_updates_at_quota`（后者在未修复时会失败）。
+- 同轮关闭：陈旧 throttle 注释（`tenant_api/handlers.rs`/`tenant_config_api.rs`）、租户面 502/504 不再泄露 leader 控制面 URL、`ops.md` 的 `Retry-After` 更正、leader 数据面无转发目标返回 `503 no_leader` 的约束文档化 + `NoLeader` 注释对齐（不采用数据面本地写，属已记录 refinement）。
+- **复验 GATE: PASS**（阻塞项关闭、无新缺陷；A-2 前置 1–8 均满足）。
+- **延后观察项（不影响门禁，已记录）**：审计的发起节点字段（D7 best-effort）、并发同名首 PUT 的错误码分类（状态收敛，仅错误码不精确）、停用租户仍可写自身配置（与读路径一致的刻意语义）、internal id 的百分号编码纵深。
+
+原自审内容（保留作过程记录）：以上为 orchestrator 代码级自审；独立复审结论以上一段为准，不得再引用自审作为门禁依据。
