@@ -11,8 +11,9 @@ use std::collections::HashSet;
 use hydra_core::config::ConfigData;
 use hydra_core::model::{Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 use hydra_core::sub_tenant::{
-    validate_sub_tenant_write, SubTenantWrite, SubTenantWriteError, MAX_ROUTES_PER_SUB_TENANT,
-    MAX_SUB_TENANTS_PER_TENANT,
+    validate_sub_tenant_write, validate_sub_tenant_write_against, SubTenantRows, SubTenantWrite,
+    SubTenantWriteError, MAX_ROUTES_PER_SUB_TENANT, MAX_SUB_TENANTS_PER_TENANT,
+    MAX_SUB_TENANT_NAME_LEN,
 };
 use pretty_assertions::assert_eq;
 
@@ -512,6 +513,151 @@ fn default_route_skips_model_check() {
     };
     assert_eq!(
         validate_sub_tenant_write(&cfg, &route_write("t1", "st1", "p1", None)),
+        Ok(())
+    );
+}
+
+// --- D5: all-rows snapshot (v2 write core, A-2 prerequisites 1/2) -----------
+//
+// The transactional write core validates against the FULL set of DB rows
+// (including disabled), not just the enabled `ConfigData` snapshot. These tests
+// drive `validate_sub_tenant_write_against` with a caller-supplied
+// `SubTenantRows` to pin that behaviour.
+
+/// A `SubTenantRows` snapshot with the given sub-tenants and no routes.
+fn rows_with(sub_tenants: Vec<SubTenant>) -> SubTenantRows<'static> {
+    // Leak the vec so the borrows have a 'static lifetime for the test.
+    let st = Box::leak(sub_tenants.into_boxed_slice());
+    SubTenantRows {
+        sub_tenants: st,
+        routes: &[],
+    }
+}
+
+/// A-2 finding 1 — the quota counts **all** rows (including disabled). Here the
+/// tenant has `MAX` sub-tenants, ALL disabled (so none are in `cfg.sub_tenants`,
+/// the enabled-only snapshot). A create must still be rejected by the quota.
+#[test]
+fn quota_counts_disabled_rows() {
+    let cfg = base();
+    let mut all = Vec::new();
+    for i in 0..MAX_SUB_TENANTS_PER_TENANT {
+        let mut st = sub_tenant(
+            &format!("st{i}"),
+            "t1",
+            &format!("n{i}"),
+            &format!("ST{i:02}_"),
+        );
+        st.enabled = false;
+        all.push(st);
+    }
+    let rows = rows_with(all);
+    assert_eq!(
+        validate_sub_tenant_write_against(&cfg, &rows, &st_write("t1", "new", "ST99_")),
+        Err(SubTenantWriteError::SubTenantQuotaExceeded)
+    );
+}
+
+/// A-2 finding 2 — overlap is detected against a **disabled** row (all-rows
+/// check). If the validator only saw the enabled `cfg.sub_tenants`, the disabled
+/// row's prefix would be invisible and this create would wrongly pass.
+#[test]
+fn overlap_detected_against_disabled_row() {
+    let cfg = base();
+    let mut disabled = sub_tenant("st1", "t1", "team-a", "QQCX_");
+    disabled.enabled = false;
+    let rows = rows_with(vec![disabled]);
+    assert_eq!(
+        validate_sub_tenant_write_against(&cfg, &rows, &st_write("t1", "team-b", "QQCX_WXYZ")),
+        Err(SubTenantWriteError::PrefixOverlap)
+    );
+}
+
+/// Self-exclusion on update still works through the all-rows API: an update that
+/// keeps its own name/prefix is not self-rejected even when the row is in the
+/// supplied snapshot.
+#[test]
+fn self_exclusion_on_update_still_works() {
+    let cfg = base();
+    let existing = sub_tenant("st1", "t1", "team-a", "QQCX_");
+    let rows = rows_with(vec![existing]);
+    assert_eq!(
+        validate_sub_tenant_write_against(
+            &cfg,
+            &rows,
+            &st_write_update("t1", "team-a", "QQCX_", "st1")
+        ),
+        Ok(())
+    );
+}
+
+// --- D9: name charset rule ---------------------------------------------------
+
+/// D9 — a `name` containing `/` is rejected (it would break v2 URL-keyed
+/// `PUT /sub-tenants/{name}` addressing).
+#[test]
+fn sub_tenant_name_with_slash_is_rejected() {
+    let cfg = base();
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", "team/a", "AAA_")),
+        Err(SubTenantWriteError::NameInvalid)
+    );
+}
+
+/// D9 — an empty `name` is rejected.
+#[test]
+fn name_empty_rejected() {
+    let cfg = base();
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", "", "AAA_")),
+        Err(SubTenantWriteError::NameInvalid)
+    );
+}
+
+/// D9 — a `name` with a control character is rejected.
+#[test]
+fn name_control_char_rejected() {
+    let cfg = base();
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", "team\n-a", "AAA_")),
+        Err(SubTenantWriteError::NameInvalid)
+    );
+}
+
+/// D9 — a non-ASCII `name` is rejected.
+#[test]
+fn name_non_ascii_rejected() {
+    let cfg = base();
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", "team-ä", "AAA_")),
+        Err(SubTenantWriteError::NameInvalid)
+    );
+}
+
+/// D9 — the length boundary: a `name` of exactly `MAX_SUB_TENANT_NAME_LEN` bytes
+/// is accepted, one byte over is rejected.
+#[test]
+fn name_length_boundary() {
+    let cfg = base();
+    let at_max = "a".repeat(MAX_SUB_TENANT_NAME_LEN);
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", &at_max, "AAA_")),
+        Ok(())
+    );
+    let over = "a".repeat(MAX_SUB_TENANT_NAME_LEN + 1);
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", &over, "AAA_")),
+        Err(SubTenantWriteError::NameInvalid)
+    );
+}
+
+/// D9 — a well-formed printable-ASCII `name` (no `/`, no control, short) is
+/// accepted.
+#[test]
+fn name_valid_printable_ok() {
+    let cfg = base();
+    assert_eq!(
+        validate_sub_tenant_write(&cfg, &st_write("t1", "team-a-1", "AAA_")),
         Ok(())
     );
 }

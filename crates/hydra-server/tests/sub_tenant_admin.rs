@@ -441,6 +441,134 @@ async fn sub_tenant_quota_exceeded() {
     assert_eq!(r.status(), 400, "quota exceeded must be 400");
 }
 
+/// A-2 finding 1 — the quota counts **all** DB rows (including disabled), not
+/// just the enabled snapshot. Here the tenant has `MAX` sub-tenants, ALL
+/// disabled (so the enabled-only `cfg.sub_tenants` snapshot is empty for t1).
+/// The in-transaction all-rows quota must still reject the next create.
+#[tokio::test]
+async fn sub_tenant_quota_counts_disabled_rows() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    seed_base(&state).await;
+
+    // Seed the tenant up to the cap, ALL DISABLED (invisible to the enabled-only
+    // snapshot, visible to the all-rows DB read).
+    let db = state.db();
+    for i in 0..hydra_core::sub_tenant::MAX_SUB_TENANTS_PER_TENANT {
+        let mut st = sub_tenant(&format!("st{i}"), &format!("st{i}"), &format!("ST{i:02}_"));
+        st.enabled = false;
+        repo::insert_sub_tenant(db, &st)
+            .await
+            .expect("seed disabled sub-tenant");
+    }
+    state
+        .store
+        .reload_all()
+        .await
+        .expect("reload disabled quota");
+
+    // The enabled-only snapshot has 0 rows for t1, but the DB has MAX rows. The
+    // all-rows quota must reject this create (v1's enabled-only count would let
+    // it through — the bug being fixed).
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/sub-tenants",
+        Some(r#"{"tenant_id":"t1","name":"overflow","key_prefix":"ST64_"}"#),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "all-rows quota must reject when only disabled rows exist"
+    );
+}
+
+/// A-2 finding 2 — the prefix-overlap check runs against **all** rows
+/// (including disabled), not just the enabled snapshot. Create A, disable it
+/// (so it leaves the enabled-only snapshot), then create B with an overlapping
+/// prefix: B must be rejected 400.
+#[tokio::test]
+async fn sub_tenant_overlap_with_disabled_row_rejected() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    seed_base(&state).await;
+
+    // Create A with prefix QQCX_.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/sub-tenants",
+        Some(r#"{"tenant_id":"t1","name":"team-a","key_prefix":"QQCX_"}"#),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let st: serde_json::Value = r.json().await.expect("json");
+    let st_id = st["id"].as_str().expect("id").to_string();
+
+    // Disable A (it now leaves the enabled-only snapshot).
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        &format!("/api/v1/sub-tenants/{st_id}"),
+        Some(r#"{"tenant_id":"t1","name":"team-a","key_prefix":"QQCX_","enabled":false}"#),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    // B's prefix QQCX_WXYZ overlaps A's QQCX_ (starts_with). Must be rejected
+    // 400 — the overlap check sees the disabled A row (all-rows), which the
+    // enabled-only snapshot would not.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/sub-tenants",
+        Some(r#"{"tenant_id":"t1","name":"team-b","key_prefix":"QQCX_WXYZ"}"#),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "overlap with a disabled row must be rejected (all-rows)"
+    );
+}
+
+/// A-2 finding 2 — a sequential overlapping (non-equal) prefix is rejected by
+/// the in-transaction check. The DB `UNIQUE(tenant_id, key_prefix)` constraint
+/// only catches EXACT equality, not overlap, so this proves the in-transaction
+/// all-rows overlap validation is the line of defence.
+#[tokio::test]
+async fn sub_tenant_sequential_overlap_rejected() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+    seed_base(&state).await;
+
+    // Create A.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/sub-tenants",
+        Some(r#"{"tenant_id":"t1","name":"team-a","key_prefix":"QQCX_"}"#),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+
+    // B's prefix QQCX_MORE overlaps A's QQCX_ (starts_with, non-equal). Must be
+    // rejected 400 by the in-transaction overlap check.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/sub-tenants",
+        Some(r#"{"tenant_id":"t1","name":"team-b","key_prefix":"QQCX_MORE"}"#),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "overlapping (non-equal) prefix must be rejected in-tx"
+    );
+}
+
 /// CRUD lifecycle: 200 list, 200 PUT, 404, 204 delete — and the hot snapshot
 /// tracks each mutation after reload.
 #[tokio::test]

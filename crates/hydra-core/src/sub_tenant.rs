@@ -1,35 +1,54 @@
 //! Sub-tenant write validation (design-sub-tenant.md §3.3) — pure, error-level
 //! fail-closed.
 //!
-//! The admin write path (T6) calls [`validate_sub_tenant_write`] before every
-//! sub-tenant / sub-tenant-route insert or update; a rejected write is never
-//! persisted. This is the **error-level** gate for tenant input — distinct from
-//! [`crate::config::validate`], which is a snapshot-side, **Warn-only** orphan
-//! backstop and explicitly *not* the sole line of defence (design §3.3, §10.9).
+//! The write path calls [`validate_sub_tenant_write`] (or
+//! [`validate_sub_tenant_write_against`], which the transactional write core
+//! uses) before every sub-tenant / sub-tenant-route insert or update; a
+//! rejected write is never persisted. This is the **error-level** gate for
+//! tenant input — distinct from [`crate::config::validate`], which is a
+//! snapshot-side, **Warn-only** orphan backstop and explicitly *not* the sole
+//! line of defence (design §3.3, §10.9).
 //!
-//! Pure: reads a [`ConfigData`] snapshot, no I/O.
+//! Pure: reads a [`ConfigData`] snapshot plus a caller-supplied snapshot of
+//! ALL sub-tenant / route rows ([`SubTenantRows`], including disabled), no I/O.
+//! Provider / model / tenant membership and enabled operator key-prefix
+//! bindings come from the [`ConfigData`]; the row-level checks (name / prefix
+//! collisions, overlap, quota) run against the supplied rows, so the quota
+//! counts **all** rows (not just the enabled snapshot) and the overlap check
+//! closes the validate-then-insert TOCTOU (A-2 prerequisites 1/2).
 //!
 //! ## Rules (design §3.3)
 //!
 //! 1. A route's `provider_id` must be a known provider AND be in the tenant's
-//!    `tenant_providers`.
+//!    `tenant_providers` (from the [`ConfigData`]).
 //! 2. If a route's `model_key` is set, it must be in the tenant's
 //!    `tenant_models` (default-open when the tenant has no mapping) AND be
-//!    served by that provider (`models_by_key`).
-//! 3. A sub-tenant's `key_prefix` must be non-empty, ASCII, contain a separator
+//!    served by that provider (`models_by_key`, from the [`ConfigData`]).
+//! 3. A sub-tenant's `name` must be non-empty, printable ASCII (no control
+//!    chars), contain no `/`, and be at most [`MAX_SUB_TENANT_NAME_LEN`] bytes
+//!    (D9). Its `key_prefix` must be non-empty, ASCII, contain a separator
 //!    (`_` or `-`), and must not overlap (either `starts_with` direction) any
 //!    same-tenant existing `key_prefix` or any enabled operator
-//!    `key_prefix_binding`.
+//!    `key_prefix_binding` (operator bindings from the [`ConfigData`],
+//!    same-tenant prefixes from the supplied rows).
 //! 4. Per-tenant / per-sub-tenant quotas ([`MAX_SUB_TENANTS_PER_TENANT`],
-//!    [`MAX_ROUTES_PER_SUB_TENANT`]) guard against config-DoS via the API.
+//!    [`MAX_ROUTES_PER_SUB_TENANT`]) guard against config-DoS via the API and
+//!    count **all** rows in the supplied snapshot (including disabled).
 
 use crate::config::ConfigData;
+use crate::model::{SubTenant, SubTenantRoute};
 
 /// Per-tenant cap on the number of sub-tenants (config-DoS guard, design §7.5).
 pub const MAX_SUB_TENANTS_PER_TENANT: usize = 64;
 
 /// Per-sub-tenant cap on the number of routes (config-DoS guard, design §7.5).
 pub const MAX_ROUTES_PER_SUB_TENANT: usize = 32;
+
+/// D9 — cap on a sub-tenant `name` length, in bytes. A `name` is URL-keyed in
+/// v2 (`PUT /sub-tenants/{name}`), so it must stay addressable; capping the
+/// length (and forbidding `/`, see [`SubTenantWriteError::NameInvalid`]) keeps
+/// it well-formed as a path segment.
+pub const MAX_SUB_TENANT_NAME_LEN: usize = 128;
 
 /// A rejected sub-tenant / sub-tenant-route write (design §3.3). One variant
 /// per rule so the admin handler can map it to a precise 400/409 response.
@@ -46,6 +65,9 @@ pub enum SubTenantWriteError {
     /// The route's `provider_id` does not serve `model_key` (absent from
     /// `cfg.models_by_key[model_key]`).
     ModelNotServedByProvider,
+    /// `name` violates the D9 charset rule: empty, non-ASCII, a control char,
+    /// a `/`, or over [`MAX_SUB_TENANT_NAME_LEN`] bytes.
+    NameInvalid,
     /// `key_prefix` is empty.
     PrefixEmpty,
     /// `key_prefix` contains a non-ASCII byte.
@@ -75,6 +97,10 @@ impl std::fmt::Display for SubTenantWriteError {
             Self::ProviderNotInTenant => "provider is not authorised for this tenant",
             Self::ModelNotInTenant => "model is not in the tenant's allowed models",
             Self::ModelNotServedByProvider => "provider does not serve this model",
+            Self::NameInvalid => {
+                "name is invalid (must be non-empty printable ASCII, no '/', \
+                 and at most {MAX_SUB_TENANT_NAME_LEN} bytes)"
+            }
             Self::PrefixEmpty => "key_prefix must not be empty",
             Self::PrefixNonAscii => "key_prefix must be ASCII",
             Self::PrefixNoSeparator => "key_prefix must contain a separator ('_' or '-')",
@@ -113,7 +139,38 @@ pub enum SubTenantWrite {
     },
 }
 
-/// Validate a sub-tenant / sub-tenant-route write against a config snapshot.
+/// A caller-supplied snapshot of ALL sub-tenant / route rows (including
+/// disabled) that the write validator checks name / prefix collisions, overlap
+/// and quota against.
+///
+/// This is the v2 tightening (A-2 prerequisites 1/2): the write core reads the
+/// live DB rows **inside the write transaction** and passes them here, so the
+/// quota counts every row (not just the enabled [`ConfigData`] snapshot) and
+/// the overlap check runs against what is actually in the DB (closing the
+/// validate-then-insert TOCTOU). Provider / model / tenant membership and
+/// enabled operator key-prefix bindings still come from the [`ConfigData`]
+/// snapshot, which is the authoritative source for those.
+#[derive(Clone, Copy, Debug)]
+pub struct SubTenantRows<'a> {
+    /// All sub-tenant rows for every tenant (including disabled).
+    pub sub_tenants: &'a [SubTenant],
+    /// All sub-tenant-route rows for every sub-tenant (including disabled).
+    pub routes: &'a [SubTenantRoute],
+}
+
+/// Validate a sub-tenant / sub-tenant-route write against a config snapshot,
+/// using the sub-tenant / route rows **already carried by** `cfg` as the row
+/// snapshot.
+///
+/// ⚠️ **Test / convenience only — NOT the production write path.** It builds a
+/// [`SubTenantRows`] from `cfg.sub_tenants` / `cfg.sub_tenant_routes` (the
+/// **enabled-only** snapshot), so the quota and overlap checks here see only
+/// enabled rows. The production transactional write core
+/// (`hydra-server` `admin::sub_tenant_write`) reads the FULL DB rows inside the
+/// write transaction and calls [`validate_sub_tenant_write_against`] directly,
+/// so it counts **all** rows (including disabled) and closes the
+/// validate-then-insert TOCTOU (A-2 prerequisites 1/2). Do not use this
+/// enabled-only wrapper for a production write.
 ///
 /// Returns `Ok(())` when the write satisfies every rule (design §3.3); `Err`
 /// with a single [`SubTenantWriteError`] naming the first violated rule. The
@@ -123,13 +180,47 @@ pub fn validate_sub_tenant_write(
     cfg: &ConfigData,
     write: &SubTenantWrite,
 ) -> Result<(), SubTenantWriteError> {
+    let rows = SubTenantRows {
+        sub_tenants: &cfg.sub_tenants,
+        routes: &cfg.sub_tenant_routes,
+    };
+    validate_sub_tenant_write_against(cfg, &rows, write)
+}
+
+/// Validate a sub-tenant / sub-tenant-route write against a [`ConfigData`]
+/// snapshot (for provider / model / tenant membership and enabled operator
+/// key-prefix bindings) AND a caller-supplied [`SubTenantRows`] snapshot of ALL
+/// sub-tenant / route rows (for name / prefix collisions, overlap and quota,
+/// including disabled rows).
+///
+/// This is the function the **transactional write core** calls: it runs the
+/// row-level checks against the live DB rows read inside the write transaction,
+/// so the quota counts every row and the overlap check closes the
+/// validate-then-insert TOCTOU (A-2 prerequisites 1/2).
+///
+/// Returns `Ok(())` when the write satisfies every rule (design §3.3); `Err`
+/// with a single [`SubTenantWriteError`] naming the first violated rule. The
+/// checks are **fail-closed**: any violation is an error (never a silent
+/// accept), and the caller must not persist the write.
+pub fn validate_sub_tenant_write_against(
+    cfg: &ConfigData,
+    rows: &SubTenantRows<'_>,
+    write: &SubTenantWrite,
+) -> Result<(), SubTenantWriteError> {
     match write {
         SubTenantWrite::SubTenant {
             tenant_id,
             name,
             key_prefix,
             sub_tenant_id,
-        } => validate_sub_tenant(cfg, tenant_id, name, key_prefix, sub_tenant_id.as_deref()),
+        } => validate_sub_tenant(
+            cfg,
+            rows,
+            tenant_id,
+            name,
+            key_prefix,
+            sub_tenant_id.as_deref(),
+        ),
         SubTenantWrite::Route {
             tenant_id,
             sub_tenant_id,
@@ -138,6 +229,7 @@ pub fn validate_sub_tenant_write(
             route_id,
         } => validate_route(
             cfg,
+            rows,
             tenant_id,
             sub_tenant_id,
             provider_id,
@@ -153,14 +245,23 @@ fn prefix_overlap(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }
 
-/// Rule 3 (prefix shape + name/prefix collisions) + rule 4 (sub-tenant quota).
+/// Rule 3 (name charset + prefix shape + name/prefix collisions) + rule 4
+/// (sub-tenant quota). Name / prefix collisions and the quota run against the
+/// supplied [`SubTenantRows`] (ALL rows, incl. disabled); operator-binding
+/// overlap comes from the [`ConfigData`].
 fn validate_sub_tenant(
     cfg: &ConfigData,
+    rows: &SubTenantRows<'_>,
     tenant_id: &str,
     name: &str,
     key_prefix: &str,
     self_id: Option<&str>,
 ) -> Result<(), SubTenantWriteError> {
+    // D9 — `name` charset rule (see [`valid_name`]).
+    if !valid_name(name) {
+        return Err(SubTenantWriteError::NameInvalid);
+    }
+
     // Rule 3 — prefix shape.
     if key_prefix.is_empty() {
         return Err(SubTenantWriteError::PrefixEmpty);
@@ -173,9 +274,10 @@ fn validate_sub_tenant(
     }
 
     // Rule 3 — same-tenant name / prefix collisions (duplicate → 409, overlap
-    // → 400). The row being updated (`self_id`) is excluded so an update that
-    // keeps its own name/prefix is not self-rejected.
-    for st in cfg
+    // → 400) against ALL rows (incl. disabled). The row being updated
+    // (`self_id`) is excluded so an update that keeps its own name/prefix is
+    // not self-rejected.
+    for st in rows
         .sub_tenants
         .iter()
         .filter(|s| s.tenant_id == tenant_id && self_id.is_none_or(|sid| s.id != sid))
@@ -192,17 +294,18 @@ fn validate_sub_tenant(
     }
 
     // Rule 3 — overlap with enabled operator key_prefix_bindings (a global
-    // namespace). `ConfigData` carries enabled rows only, but the filter keeps
-    // the "enabled only" intent explicit and robust to a future full-row load.
+    // namespace, from the authoritative `ConfigData` snapshot).
     for b in cfg.key_prefix_bindings.iter().filter(|b| b.enabled) {
         if prefix_overlap(&b.key_prefix, key_prefix) {
             return Err(SubTenantWriteError::PrefixOverlap);
         }
     }
 
-    // Rule 4 — per-tenant quota (create only: an update does not add a row).
+    // Rule 4 — per-tenant quota over ALL rows (create only: an update does not
+    // add a row). Counting every row (not just enabled) is what stops
+    // disable-then-recreate from growing the DB past the cap (A-2 finding 1).
     if self_id.is_none() {
-        let count = cfg
+        let count = rows
             .sub_tenants
             .iter()
             .filter(|s| s.tenant_id == tenant_id)
@@ -215,17 +318,33 @@ fn validate_sub_tenant(
     Ok(())
 }
 
-/// Rule 1 (provider membership) + rule 2 (model membership / service) + rule 4
-/// (route quota).
+/// D9 — the `name` charset rule: non-empty, at most [`MAX_SUB_TENANT_NAME_LEN`]
+/// bytes, printable ASCII (no control bytes), and no `/`.
+///
+/// Mirrors the `key_prefix` ASCII style. A `/` would make the v2 URL-keyed
+/// `PUT /sub-tenants/{name}` unaddressable (a name containing a path
+/// separator), so it is rejected up front; the length cap keeps names
+/// well-formed as a single path segment.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SUB_TENANT_NAME_LEN
+        && !name.contains('/')
+        && name.bytes().all(|b| b.is_ascii() && !b.is_ascii_control())
+}
+
+/// Rule 1 (provider membership, from `cfg`) + rule 2 (model membership /
+/// service, from `cfg`) + rule 4 (route quota, over the supplied rows).
 fn validate_route(
     cfg: &ConfigData,
+    rows: &SubTenantRows<'_>,
     tenant_id: &str,
     sub_tenant_id: &str,
     provider_id: &str,
     model_key: Option<&str>,
     self_route_id: Option<&str>,
 ) -> Result<(), SubTenantWriteError> {
-    // Rule 1 — provider exists and is authorised for the tenant.
+    // Rule 1 — provider exists and is authorised for the tenant (from the
+    // authoritative `ConfigData` snapshot).
     if !cfg.providers.contains_key(provider_id) {
         return Err(SubTenantWriteError::ProviderNotFound);
     }
@@ -254,11 +373,12 @@ fn validate_route(
         }
     }
 
-    // Rule 4 — per-sub-tenant route quota (create only: an update does not add
-    // a row).
+    // Rule 4 — per-sub-tenant route quota over ALL rows (create only: an update
+    // does not add a row). Counting every row (not just enabled) is what stops
+    // disable-then-recreate from growing the DB past the cap (A-2 finding 1).
     if self_route_id.is_none() {
-        let count = cfg
-            .sub_tenant_routes
+        let count = rows
+            .routes
             .iter()
             .filter(|r| r.sub_tenant_id == sub_tenant_id)
             .count();

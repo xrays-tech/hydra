@@ -1495,6 +1495,14 @@ where
 /// Update a sub-tenant's mutable fields (name / key_prefix / enabled).
 /// `updated_at` is set server-side to `datetime('now')`.
 pub async fn update_sub_tenant(pool: &SqlitePool, st: &SubTenant) -> Result<(), sqlx::Error> {
+    update_sub_tenant_on(pool, st).await
+}
+
+/// [`update_sub_tenant`] on an arbitrary executor (one-transaction write).
+pub(crate) async fn update_sub_tenant_on<'e, E>(exec: E, st: &SubTenant) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE sub_tenant SET name = ?, key_prefix = ?, enabled = ?, \
          updated_at = datetime('now') WHERE id = ?",
@@ -1503,15 +1511,23 @@ pub async fn update_sub_tenant(pool: &SqlitePool, st: &SubTenant) -> Result<(), 
     .bind(&st.key_prefix)
     .bind(st.enabled)
     .bind(&st.id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
 }
 
 pub async fn delete_sub_tenant(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    delete_sub_tenant_on(pool, id).await
+}
+
+/// [`delete_sub_tenant`] on an arbitrary executor (one-transaction write).
+pub(crate) async fn delete_sub_tenant_on<'e, E>(exec: E, id: &str) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query("DELETE FROM sub_tenant WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(exec)
         .await?;
     Ok(())
 }
@@ -1579,6 +1595,18 @@ pub async fn update_sub_tenant_route(
     pool: &SqlitePool,
     r: &SubTenantRoute,
 ) -> Result<(), sqlx::Error> {
+    update_sub_tenant_route_on(pool, r).await
+}
+
+/// [`update_sub_tenant_route`] on an arbitrary executor (one-transaction
+/// write).
+pub(crate) async fn update_sub_tenant_route_on<'e, E>(
+    exec: E,
+    r: &SubTenantRoute,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE sub_tenant_route SET model_key = ?, provider_id = ?, enabled = ?, \
          updated_at = datetime('now') WHERE id = ?",
@@ -1587,17 +1615,199 @@ pub async fn update_sub_tenant_route(
     .bind(&r.provider_id)
     .bind(r.enabled)
     .bind(&r.id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
 }
 
 pub async fn delete_sub_tenant_route(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    delete_sub_tenant_route_on(pool, id).await
+}
+
+/// [`delete_sub_tenant_route`] on an arbitrary executor (one-transaction
+/// write).
+pub(crate) async fn delete_sub_tenant_route_on<'e, E>(exec: E, id: &str) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query("DELETE FROM sub_tenant_route WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(exec)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sub-tenant / route write helpers (sub-tenant v2, D4/D5)
+//
+// Executor-generic so the transactional write core can call them inside a
+// `pool.begin()` transaction (passing `&mut *tx`). All use **runtime**
+// `sqlx::query` / `query_as` (no `.sqlx/` refresh).
+// ---------------------------------------------------------------------------
+
+/// Count ALL sub-tenants for a tenant (ignoring `enabled`), on an executor
+/// (e.g. `&mut *tx` inside the write transaction). Supports the all-rows quota
+/// (A-2 finding 1) without loading every row.
+pub async fn count_sub_tenants_by_tenant_on<'e, E>(
+    exec: E,
+    tenant_id: &str,
+) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sub_tenant WHERE tenant_id = ?")
+        .bind(tenant_id)
+        .fetch_one(exec)
+        .await?;
+    Ok(count)
+}
+
+/// Count ALL routes for a sub-tenant (ignoring `enabled`), on an executor.
+pub async fn count_sub_tenant_routes_by_sub_tenant_on<'e, E>(
+    exec: E,
+    sub_tenant_id: &str,
+) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sub_tenant_route WHERE sub_tenant_id = ?")
+            .bind(sub_tenant_id)
+            .fetch_one(exec)
+            .await?;
+    Ok(count)
+}
+
+/// Upsert a sub-tenant keyed on its natural key `UNIQUE(tenant_id, name)`.
+///
+/// On a `(tenant_id, name)` conflict the row's `key_prefix` / `enabled` /
+/// `updated_at` are updated and the EXISTING `id` is kept (idempotent `PUT` by
+/// name, A-2 prerequisite 4). A `key_prefix` that collides with a DIFFERENT
+/// row's prefix (the separate `UNIQUE(tenant_id, key_prefix)` constraint) is
+/// NOT swallowed: the `ON CONFLICT (tenant_id, name)` target only resolves the
+/// name conflict, so the key-prefix violation surfaces as a sqlx UNIQUE
+/// violation for the caller to map to 409.
+///
+/// `id` is the row id to use when a NEW row is inserted; on conflict the
+/// existing id is retained.
+///
+/// Takes the transaction's **connection** (`&mut *tx`, where `tx` is the owned
+/// `sqlx::Transaction`) so the statements run inside the caller's transaction.
+pub async fn upsert_sub_tenant_by_name(
+    tx: &mut sqlx::sqlite::SqliteConnection,
+    id: &str,
+    tenant_id: &str,
+    name: &str,
+    key_prefix: &str,
+    enabled: bool,
+) -> Result<SubTenant, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sub_tenant (id, tenant_id, name, key_prefix, enabled, created_at, \
+         updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now')) \
+         ON CONFLICT (tenant_id, name) DO UPDATE SET \
+             key_prefix = excluded.key_prefix, \
+             enabled = excluded.enabled, \
+             updated_at = datetime('now')",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(key_prefix)
+    .bind(enabled)
+    .execute(&mut *tx)
+    .await?;
+
+    let row: SubTenantRow = sqlx::query_as(
+        "SELECT id, tenant_id, name, key_prefix, enabled, created_at, updated_at \
+         FROM sub_tenant WHERE tenant_id = ? AND name = ?",
+    )
+    .bind(tenant_id)
+    .bind(name)
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok(row.into())
+}
+
+/// Upsert a sub-tenant route keyed on its natural key `(sub_tenant_id,
+/// model_key)`, handling BOTH partial unique indexes:
+/// - `model_key = Some(m)` → `ON CONFLICT (sub_tenant_id, model_key) WHERE
+///   (model_key IS NOT NULL)` (the model-specific index);
+/// - `model_key = None` → `ON CONFLICT (sub_tenant_id) WHERE (model_key IS
+///   NULL)` (the default-route index).
+///
+/// On conflict the existing `id` is kept (idempotent `PUT` by key). `id` is the
+/// row id to use when a NEW row is inserted.
+///
+/// Takes the transaction's **connection** (`&mut *tx`, where `tx` is the owned
+/// `sqlx::Transaction`) so the statements run inside the caller's transaction.
+pub async fn upsert_sub_tenant_route_by_key(
+    tx: &mut sqlx::sqlite::SqliteConnection,
+    id: &str,
+    sub_tenant_id: &str,
+    model_key: Option<&str>,
+    provider_id: &str,
+    enabled: bool,
+) -> Result<SubTenantRoute, sqlx::Error> {
+    match model_key {
+        Some(model_key) => {
+            sqlx::query(
+                "INSERT INTO sub_tenant_route (id, sub_tenant_id, model_key, provider_id, \
+                 enabled, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now')) \
+                 ON CONFLICT (sub_tenant_id, model_key) WHERE (model_key IS NOT NULL) DO UPDATE SET \
+                     provider_id = excluded.provider_id, \
+                     enabled = excluded.enabled, \
+                     updated_at = datetime('now')",
+            )
+            .bind(id)
+            .bind(sub_tenant_id)
+            .bind(model_key)
+            .bind(provider_id)
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO sub_tenant_route (id, sub_tenant_id, model_key, provider_id, \
+                 enabled, created_at, updated_at) \
+                 VALUES (?, ?, NULL, ?, ?, datetime('now'), datetime('now')) \
+                 ON CONFLICT (sub_tenant_id) WHERE (model_key IS NULL) DO UPDATE SET \
+                     provider_id = excluded.provider_id, \
+                     enabled = excluded.enabled, \
+                     updated_at = datetime('now')",
+            )
+            .bind(id)
+            .bind(sub_tenant_id)
+            .bind(provider_id)
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    let row: SubTenantRouteRow = match model_key {
+        Some(model_key) => {
+            sqlx::query_as(
+                "SELECT id, sub_tenant_id, model_key, provider_id, enabled, created_at, \
+                 updated_at FROM sub_tenant_route WHERE sub_tenant_id = ? AND model_key = ?",
+            )
+            .bind(sub_tenant_id)
+            .bind(model_key)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, sub_tenant_id, model_key, provider_id, enabled, created_at, \
+                 updated_at FROM sub_tenant_route WHERE sub_tenant_id = ? AND model_key IS NULL",
+            )
+            .bind(sub_tenant_id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
+    Ok(row.into())
 }
 
 // ---------------------------------------------------------------------------

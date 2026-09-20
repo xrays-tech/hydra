@@ -46,6 +46,15 @@ pub mod cluster_api;
 pub mod handlers;
 pub mod metrics;
 mod static_files;
+/// Shared transactional sub-tenant / route write core (sub-tenant v2, D5). The
+/// single write path used by the v1 admin handlers now and the v2 leader
+/// internal handler later; not HTTP-specific (typed results, not `Resp`).
+pub mod sub_tenant_write;
+/// Leader internal tenant-config write endpoint (sub-tenant v2, D3/D5/D6/D7):
+/// the A-2 receiver-side gates (lease assertion, tenant re-auth, authorization
+/// binding) plus the write + audit for the `/api/v1/internal/tenant-config/...`
+/// family. Cluster-token gated in `AdminService::response`.
+pub mod tenant_config_api;
 
 // Re-export the metrics module publicly so the proxy / breaker / tls can reach
 // the `record_*` call-sites and the `/metrics` renderer.
@@ -55,6 +64,17 @@ use handlers::Resp;
 
 /// Shared state for the admin service (design §13.1: a subset of `AppState`).
 /// Cheap to `Arc`-clone so tests can inspect it after requests.
+/// Read `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (v2 D6). A missing, unparseable or
+/// zero value falls back to the default: 0 would reject every write, i.e. a
+/// denial of service triggered by a typo.
+fn config_write_per_min_from_env() -> u32 {
+    std::env::var("HYDRA_TENANT_CONFIG_WRITE_PER_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60)
+}
+
 pub struct AdminState {
     /// Leader-mode SQLite pool. `None` on edge nodes (no local DB, cluster
     /// P0b) — edge routes only serve `/metrics` `/healthz` `/readyz`, so no
@@ -102,6 +122,22 @@ pub struct AdminState {
     /// ⇒ forward to the active, P3) and `/healthz/leader`. `None` on
     /// single-node (`all`) and edge.
     pub leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+
+    /// Per-tenant config-write throttle (v2 D6): a fixed-window, process-local
+    /// limiter keyed on the authenticated tenant id, applied by the leader's
+    /// internal tenant-config write endpoint. In a cluster all config writes
+    /// land on the leader, so one in-process window covers the cluster.
+    /// **Anti-DoS only**: the window is in-process and therefore resets when
+    /// leadership moves (a bounded burst after failover — the same accepted
+    /// class as the E2 allow-TTL bound). On a single node the data-plane local
+    /// write path is not the internal endpoint and is bounded by the general
+    /// tenant-API per-tenant request budget instead.
+    pub config_write_throttle: Arc<crate::tenant_api::throttle::Throttle>,
+    /// The per-tenant, per-minute config-write budget (v2 D6). Defaults to 60;
+    /// override with `HYDRA_TENANT_CONFIG_WRITE_PER_MIN`. A missing / zero /
+    /// unparseable value falls back to the default (never to 0, which would
+    /// reject every write).
+    pub config_write_per_min: u32,
     /// Invalidation-stream publisher (cluster P4): `DELETE /api/v1/auth/cache`
     /// broadcasts the invalidation cluster-wide instead of clearing only the
     /// local cache. `None` off-cluster / on the single-node build.
@@ -168,6 +204,8 @@ impl AdminState {
             edge_mode,
             cluster_token,
             leader_ready,
+            config_write_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
+            config_write_per_min: config_write_per_min_from_env(),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
@@ -372,6 +410,18 @@ impl AdminService {
         // Internal control plane (cluster P1): snapshot distribution.
         if parts == ["internal", "control"] && method == "GET" {
             return cluster_api::internal_control(&self.state, query, trace_id).await;
+        }
+        // Tenant-config writes (sub-tenant v2, D3/D5/D6/D7): the leader's
+        // internal write endpoint for sub-tenants / routes. Registered BEFORE the
+        // deep-path rejection below (this family is 3–4 segments, like the
+        // `/internal/control` precedent). Cluster-token gated (handled in
+        // `AdminService::response` above) and NOT routed through the admin token
+        // or `maybe_forward_mutation` — the edge already forwarded here carrying
+        // the cluster token. The lease assertion (A-2 7), tenant re-auth (A-2 4),
+        // authorization binding (A-2 4), audit (A-2 6) and the reserved per-tenant
+        // rate-limit seam (V6/D6) live in `tenant_config_api`.
+        if parts.len() >= 2 && parts[0] == "internal" && parts[1] == "tenant-config" {
+            return tenant_config_api::route(&self.state, method, &parts, session, trace_id).await;
         }
         // Cluster status (cluster P4): whole-fleet view for the Health page.
         if parts == ["cluster", "status"] && method == "GET" {
