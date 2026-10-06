@@ -323,6 +323,23 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_arachne_control_plane.py
 
+      # ACCEPTANCE 2 (ADR-0001): the DATA PLANE under load across a raft failover. The plan's
+      # acceptance list has five rows and this is the one that was never executed — its old driver
+      # (`test_cluster_ha.py`) drove the retired leader/edge topology, so it could only report
+      # CANNOT VERIFY. The claim is D-1/D-2's: the control plane moved to Arachne and the data plane
+      # deliberately did not, so killing the raft leader must be invisible to a request that is not
+      # a management write. 20 rps for 60 s against a FOLLOWER's data port, `kill -9` the leader 15 s
+      # in, and ZERO non-200 responses is the criterion (plus the ±3 s window around the kill, which
+      # a 60-second average would hide). Same build recipe as the acceptance drill above, for the
+      # same reason: without `arachne` a node with a member list refuses to boot.
+      - name: data plane under load across a failover (acceptance 2, 20 rps / 60 s)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          python3 integration/test_data_plane_failover_load.py
+
       # STARTUP KNOBS on the real binary — two operator-facing promises that used to be prose only:
       # `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster node** (round 191
       # measured `HYDRA_REDIS_MODE=clustr` booting as `single`, i.e. a topology switch silently

@@ -801,7 +801,7 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | 验收 | 结果 |
 | --- | --- |
 | 1 切换 + 任意节点写 | **PASS**：三个真进程，写到任意节点都 201；`kill -9` leader 后新 leader **1.2–1.3 s**（预算 3 s）；在**非 leader 的存活节点**上写也成功 |
-| 2 故障切换期数据面 20 rps / 60 s | **未移植**：`test_cluster_ha.py` 驱动已退役拓扑（CANNOT VERIFY），旧口径属 T4.3 |
+| 2 故障切换期数据面 20 rps / 60 s | **PASS（2026-10-05 补上，T4.3）**：`integration/test_data_plane_failover_load.py` —— 三个真进程 + 真 mock upstream，**20 rps 压一个跟随者的数据口 60 s**，在第 15 s `kill -9` 掉 leader。实测 **1200 次请求全部 200**（p50 2 ms / p99 3 ms / max 3 ms），杀掉的那个节点确实是当时的 leader、之后由另一台接任，被杀窗口 **±3 s 内的 120 次请求全部 200**。**证伪**：把负载改成打在**将被杀死的那台**上 ⇒ C/D/F 立刻红（139 次失败，第一次就在 t+0.0s，HTTP 0 = 连接被拒），所以"零非 200"不是一条无论如何都会通过的判据 |
 | 3 双写不可能 | **PASS**：静止时恰好一台 200；切换**全过程**连续轮询从未出现两台同时 200 |
 | 4 配置收敛 | **PASS（内容层）**：三次写后三个节点服务同一份配置。**哈希层**由 `tests/arachne_three_nodes.rs`（三个真 raft 节点 + `materialized() == head`）断言 |
 | 5 失多数派 | **PASS**：多数派死后写 **0.0 s 返回 503 `config_not_published`**（不挂起、不静默接受）；`/healthz/leader` 503；存活节点继续服务其已物化配置；**真实代理请求**（闸门→路由→mock upstream）仍 200 |
@@ -857,7 +857,7 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
 | **T4.0 清单半边** | ✅ 已完成 | `docker-compose.cluster.yml` 改为**三个同构成员**（同一 environment 锚点，只有 node id / raft 地址 / 发布端口 / 卷不同）；`docker-compose.local.yml` 去掉 `HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL`、补上 `HYDRA_CLUSTER_PEERS` + `HYDRA_ARACHNE_LISTEN`；`scripts/check_compose_health.cjs` 的角色分支删除（一条规则：每个节点都用 `Authorization: Bearer` 探 `/api/v1/health`）；`scripts/compose_static.cjs` 的三条角色拒绝规则删除；`admin-ui` 的 `alive` 改为三态渲染；`environment/{build.sh,release.sh}` 的特征集补齐 |
 | **T4.2 环境变量** | ✅ 已完成（代码/文档/清单） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单里残留的三处已清除**（见下） |
-| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。✅ **集群可观测面已落地**：见下节"退役后的可观测面"。**尚未做**：验收 2（20 rps / 60 s）；`cluster.md` / `design.md` 逐条改写（`cluster.md` 只加了"该段描述已退役拓扑"的横幅）；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
+| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **验收 2 已执行**（见上表行 2，20 rps / 60 s / 1200 次全 200，含证伪）。 ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。✅ **集群可观测面已落地**：见下节"退役后的可观测面"。**尚未做**：`cluster.md` / `design.md` 逐条改写（`cluster.md` 只加了"该段描述已退役拓扑"的横幅）；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
 
 ### 清单半边实际改出来的三个缺陷（都不是"文案问题"）
 
