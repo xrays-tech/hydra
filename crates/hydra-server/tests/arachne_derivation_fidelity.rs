@@ -38,9 +38,7 @@ use hydra_core::config::ConfigData;
 use hydra_core::model::{
     LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant,
 };
-use hydra_server::cluster::arachne_entities::{
-    build_config, split_config, tree_of, SealedMaterial,
-};
+use hydra_server::cluster::arachne_entities::{build_config, split_config, tree_of};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
 
@@ -179,8 +177,7 @@ fn ids<E: std::fmt::Debug>(v: &[E], f: impl Fn(&E) -> String) -> Vec<String> {
 /// Publish the leader's config through the tree and hand back what a replica would decode.
 async fn round_trip(leader: &ConfigData, key_provider: &dyn KeyProvider) -> ConfigData {
     let rows = hydra_server::cluster::content::FidelityRows::default();
-    let sealed = SealedMaterial::seal_plaintext(leader, &rows, key_provider).expect("seal");
-    let tree = tree_of(&split_config(leader, &rows, sealed).expect("split")).expect("tree");
+    let tree = tree_of(&split_config(leader, &rows, key_provider).expect("split")).expect("tree");
     build_config(&tree, key_provider).expect("rebuild")
 }
 

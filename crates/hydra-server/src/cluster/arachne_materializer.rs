@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 
-use super::arachne_entities::{build_config_with_fidelity, split_config, tree_of, SealedMaterial};
+use super::arachne_entities::{build_config_with_fidelity, split_config, tree_of};
 use super::arachne_materialize::{MaterializeGate, Plan};
 use super::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome, StoreError};
 use super::content::FidelityRows;
@@ -317,15 +317,18 @@ impl MaterializeTarget for ReplicaTarget {
 /// Encoding only: committing is `ArachneConfigStore::publish`, which is the single writer of the
 /// head. Splitting the two keeps "what bytes describe this config" testable without a cluster.
 ///
+/// `kp` seals the secret-bearing entities. Deterministically, so the tree's name depends on the
+/// LOGICAL config and not on which node published it — see `arachne_entities`'s module docs.
+///
 /// # Errors
-/// [`StoreError::Arachne`] when the codec refuses the config (an unkeyable id, a missing sealed
-/// row, a seal that fails). All of them must stop the publish rather than degrade.
+/// [`StoreError::Arachne`] when the codec refuses the config (an unkeyable id, a seal that fails).
+/// All of them must stop the publish rather than degrade.
 pub fn encode_config(
     cfg: &ConfigData,
     fidelity: &crate::cluster::content::FidelityRows,
-    sealed: SealedMaterial,
+    kp: &dyn KeyProvider,
 ) -> Result<ConfigTree, StoreError> {
-    let blobs = split_config(cfg, fidelity, sealed)
+    let blobs = split_config(cfg, fidelity, kp)
         .map_err(|e| StoreError::Arachne(format!("cannot encode the config tree: {e}")))?;
     tree_of(&blobs).map_err(|e| StoreError::Arachne(format!("cannot build the config tree: {e}")))
 }
@@ -444,29 +447,12 @@ mod tests {
     /// Encode and commit `cfg`: the two steps a publisher performs, so the tests read as
     /// "publish a config" instead of spelling the split out at every call site.
     async fn publish(store: &ArachneConfigStore, cfg: &ConfigData) -> String {
-        let tree = encode_config(cfg, &fidelity(), sealed_fixture()).expect("encode");
+        let tree = encode_config(cfg, &fidelity(), &kp()).expect("encode");
         store.publish(&tree).await.expect("commit the config tree")
     }
 
     fn kp() -> crate::crypto::StaticKeyProvider {
         crate::crypto::StaticKeyProvider::new([7u8; 32], 1)
-    }
-
-    /// Sealed ONCE and reused: the tree name must not move between publishes of the same rows
-    /// (a fresh AES-GCM seal would use a new nonce and rename the tree every time).
-    fn sealed_fixture() -> SealedMaterial {
-        use std::sync::OnceLock;
-        static SEALED: OnceLock<SealedMaterial> = OnceLock::new();
-        SEALED
-            .get_or_init(|| {
-                SealedMaterial::seal_plaintext(
-                    &config(&[("t1", "acme.example")]),
-                    &fidelity(),
-                    &kp(),
-                )
-                .expect("seal fixture")
-            })
-            .clone()
     }
 
     /// Fidelity rows with one DISABLED row: the shape a replica must be able to rebuild, and
@@ -818,9 +804,9 @@ mod tests {
         let cfg = rich_config();
         let rows = rich_fidelity();
         let key_provider = Arc::new(kp());
-        let sealed = SealedMaterial::seal_plaintext(&cfg, &rows, key_provider.as_ref())
-            .expect("seal the publish material");
-        let tree = encode_config(&cfg, &rows, sealed).expect("encode");
+        // What a publisher does: encode (which SEALS the secrets deterministically, so this is
+        // the same tree on every node) and then commit it.
+        let tree = encode_config(&cfg, &rows, key_provider.as_ref()).expect("encode");
         let hash = store.publish(&tree).await.expect("commit the tree");
 
         // The node that will serve it: a fresh database, and a store over it. `ConfigStore::load`

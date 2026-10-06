@@ -68,14 +68,73 @@ pub struct Sealed {
 ///
 /// TODO(kms): implement `KmsKeyProvider` backed by AWS KMS / HashiCorp Vault.
 pub trait KeyProvider: Send + Sync {
-    /// Encrypt under the provider's CURRENT key version.
+    /// Encrypt under the provider's CURRENT key version, with a FRESH RANDOM nonce.
+    ///
+    /// This is the right choice for anything persisted at rest (a `provider_key` row, a tenant's
+    /// cert key): nothing depends on those bytes being reproducible, and a random nonce hides even
+    /// the fact that two rows hold the same secret. Use [`Self::seal_deterministic`] only where the
+    /// ciphertext is part of a VALUE'S IDENTITY.
     fn seal(&self, plaintext: &[u8]) -> Result<Sealed, CryptoError>;
+    /// Encrypt under the provider's CURRENT key version, with a nonce DERIVED from the key and the
+    /// plaintext — so the same plaintext always seals to the same bytes.
+    ///
+    /// ## Why this exists
+    ///
+    /// The Arachne config tree is content-addressed: its name is the hash of its bytes. A secret
+    /// sealed with a random nonce therefore gives ONE UNCHANGED CONFIG a new name on every publish
+    /// — the head advances, and every node re-materializes the whole config for nothing. (Measured
+    /// while building it: the first version sealed during encoding and named two different trees
+    /// for one config.) Deterministic sealing is what makes the tree's name a function of the
+    /// LOGICAL config, on any node.
+    ///
+    /// ## What it costs, stated plainly
+    ///
+    /// * **Equality is visible.** The same plaintext under the same key version seals to the same
+    ///   ciphertext, so a holder of the store can tell that two secrets are equal. For this use
+    ///   case the tree is content-addressed anyway — the toc already publishes a content hash per
+    ///   entity, so a reader can already tell that two TENANTS are identical; this extends that to
+    ///   the secrets inside them.
+    /// * **Not SIV, and not misuse-resistant.** This derives a nonce, it does not authenticate the
+    ///   message with a synthetic IV. What it does guarantee is the property that matters for
+    ///   GCM's catastrophic failure mode: two DIFFERENT plaintexts cannot share a nonce (the nonce
+    ///   is a keyed function of the plaintext, so that would need an HMAC collision), and the key
+    ///   version is part of the nonce input, so a rotation changes every nonce.
+    /// * It is only as strong as the master key, like everything else here.
+    ///
+    /// A plaintext-derived nonce must be KEYED — an unkeyed hash would let anyone who guesses a
+    /// plaintext compute the nonce — which is why this is HMAC-SHA256
+    /// ([`hydra_core::auth::hmac_sha256`], RFC-4231-vector-checked) and not a bare digest.
+    fn seal_deterministic(&self, plaintext: &[u8]) -> Result<Sealed, CryptoError>;
     /// Decrypt a stored secret. Fail-closed: a version outside the provider's
     /// ring is an error, never a guess.
     fn open(&self, sealed: &Sealed) -> Result<Vec<u8>, CryptoError>;
     /// The version `seal` writes — the target of a re-seal
     /// ([`crate::db::reseal_secrets`]).
     fn version(&self) -> u32;
+}
+
+/// Domain separator for [`KeyProvider::seal_deterministic`]'s nonce.
+///
+/// A literal tag so this derivation can never collide with any other use of the same master key,
+/// and a version number inside it so a future change to the derivation is a new tag rather than a
+/// silent reinterpretation of existing ciphertext.
+const NONCE_DOMAIN: &[u8] = b"hydra/config-tree/v1";
+
+/// The deterministic nonce: `HMAC-SHA256(key, domain ‖ key_version ‖ plaintext)[..12]`.
+///
+/// Twelve bytes because that is AES-GCM's nonce length; truncating a MAC is safe here because the
+/// nonce needs to be UNIQUE per (key, plaintext) and unpredictable without the key, not
+/// collision-resistant at 256 bits (a truncated-MAC collision would need 2^48 work, and its only
+/// consequence is the equality leak this design already accepts).
+fn deterministic_nonce(key: &[u8], version: u32, plaintext: &[u8]) -> [u8; NONCE_LEN] {
+    let mut message = Vec::with_capacity(NONCE_DOMAIN.len() + 4 + plaintext.len());
+    message.extend_from_slice(NONCE_DOMAIN);
+    message.extend_from_slice(&version.to_le_bytes());
+    message.extend_from_slice(plaintext);
+    let mac = hydra_core::auth::hmac_sha256(key, &message);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&mac[..NONCE_LEN]);
+    nonce
 }
 
 /// Master key from `HYDRA_ENCRYPTION_KEY` (base64, 32 bytes) or
@@ -241,6 +300,35 @@ impl KeyProvider for StaticKeyProvider {
         let cipher = Aes256Gcm::new(key.into());
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &self.current.to_le_bytes(),
+                },
+            )
+            .map_err(|_| CryptoError::Decrypt)?;
+        Ok(Sealed {
+            ciphertext: ct,
+            nonce: nonce_bytes,
+            key_version: self.current,
+        })
+    }
+
+    fn seal_deterministic(&self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+        let key = self
+            .keys
+            .get(&self.current)
+            .ok_or(CryptoError::KeyVersionMismatch {
+                stored: self.current,
+                provider: self.current,
+            })?;
+        let cipher = Aes256Gcm::new(key.into());
+        // Same AAD as `seal`: `key_version` is authenticated, so a ciphertext moved to another
+        // version fails to open rather than being silently accepted.
+        let nonce_bytes = deterministic_nonce(key.as_slice(), self.current, plaintext);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher
             .encrypt(
@@ -424,5 +512,72 @@ mod tests {
             open_kp.open(&sealed),
             Err(CryptoError::KeyVersionMismatch { .. })
         ));
+    }
+
+    /// `seal` must stay RANDOM, `seal_deterministic` must not be.
+    ///
+    /// These two are easy to "unify" — one of them looks redundant next to the other — and the
+    /// consequence differs by direction:
+    ///
+    /// * making `seal` deterministic would make at-rest ciphertexts comparable across rows and
+    ///   across backups, for no benefit (nothing hashes those bytes);
+    /// * making `seal_deterministic` random renames the config tree on every publish, so every node
+    ///   re-materializes the whole config for nothing — the failure the tree's content-addressing
+    ///   cannot tolerate.
+    ///
+    /// Falsification: call `seal` from `seal_deterministic` and the first pair of assertions fails;
+    /// route both through `deterministic_nonce` and the second pair fails.
+    #[test]
+    fn random_sealing_stays_random_and_deterministic_sealing_does_not() {
+        let kp = kp();
+        let a = kp.seal(b"sk-one").expect("seal");
+        let b = kp.seal(b"sk-one").expect("seal");
+        assert_ne!(
+            a, b,
+            "`seal` must use a fresh random nonce: two seals of the same secret must differ"
+        );
+
+        let c = kp.seal_deterministic(b"sk-one").expect("seal");
+        let d = kp.seal_deterministic(b"sk-one").expect("seal");
+        assert_eq!(
+            c, d,
+            "the same plaintext must seal to the same bytes, nonce included"
+        );
+        assert_ne!(
+            c,
+            kp.seal_deterministic(b"sk-two").expect("seal"),
+            "a different plaintext must produce a different ciphertext (and nonce)"
+        );
+
+        // A separate instance of the SAME key must agree — that is what lets any node publish the
+        // same tree. Two providers built from one key material, as two processes would be.
+        let other = StaticKeyProvider::new([7u8; KEY_LEN], 1);
+        assert_eq!(
+            c,
+            other.seal_deterministic(b"sk-one").expect("seal"),
+            "determinism must survive a new process, not just a second call"
+        );
+
+        // The version is part of the nonce input, so a rotation re-seals everything.
+        let rotated = StaticKeyProvider::with_previous([7u8; KEY_LEN], 2, [7u8; KEY_LEN], 1);
+        let e = rotated.seal_deterministic(b"sk-one").expect("seal");
+        assert_ne!(
+            c.nonce, e.nonce,
+            "the nonce must change with the key version, or a rotation would reuse it"
+        );
+
+        // ...and every one of them still opens, with the version they were sealed under.
+        for sealed in [&c, &e] {
+            let open_kp = if sealed.key_version == 2 {
+                &rotated
+            } else {
+                &kp
+            };
+            assert_eq!(
+                open_kp.open(sealed).expect("open"),
+                b"sk-one",
+                "a deterministically sealed value must open like any other"
+            );
+        }
     }
 }

@@ -30,7 +30,7 @@ mod common;
 use std::sync::Arc;
 
 use hydra_core::model::Tenant;
-use hydra_server::cluster::arachne_entities::{build_config_with_fidelity, SealedMaterial};
+use hydra_server::cluster::arachne_entities::build_config_with_fidelity;
 use hydra_server::cluster::arachne_materializer::encode_config;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
@@ -106,12 +106,10 @@ async fn a_replica_materialized_from_the_tree_keeps_the_cert_private_key() {
         "fixture: the leader's in-memory config holds the plaintext private key"
     );
 
-    // Publish the tree the way a manager write will: one sealed material, taken
-    // once (a fresh AES-GCM seal per call would rename the tree on every publish).
-    let sealed =
-        SealedMaterial::seal_plaintext(&content.cfg, content.fidelity(), key_provider.as_ref())
-            .expect("seal the publish material");
-    let tree = encode_config(&content.cfg, content.fidelity(), sealed).expect("encode the tree");
+    // Publish the tree the way a management write will: `encode_config` seals the secrets itself,
+    // deterministically, so this is the tree ANY node produces for this config.
+    let tree = encode_config(&content.cfg, content.fidelity(), key_provider.as_ref())
+        .expect("encode the tree");
 
     // ...and materialize it on a node that has never seen this config.
     let (cfg, fidelity) =
@@ -170,10 +168,8 @@ async fn the_cert_entity_carries_no_plaintext_private_key() {
         .cloned()
         .expect("replication content");
 
-    let sealed =
-        SealedMaterial::seal_plaintext(&content.cfg, content.fidelity(), key_provider.as_ref())
-            .expect("seal");
-    let tree = encode_config(&content.cfg, content.fidelity(), sealed).expect("encode");
+    let tree =
+        encode_config(&content.cfg, content.fidelity(), key_provider.as_ref()).expect("encode");
 
     for (path, bytes) in &tree {
         let text = String::from_utf8_lossy(bytes);
