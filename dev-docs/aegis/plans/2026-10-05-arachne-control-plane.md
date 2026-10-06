@@ -788,6 +788,31 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **记账（已写进 `ops.md` §5.5a）**：① **无新鲜度闸**（入口节点按自己持有的快照鉴权，可能略滞后于 head；事务内仍会对活的 DB 行重校）；② **入口节点被攻破可冒充任意租户**（并说明这不是新增能力：任何节点本来就持主密钥与全量快照）；③ 写限流总量上界 = **N × 单窗口**。
 
+#### 验收 1–5 的执行结果（2026-10-05，T4.1 的前置门）
+
+前置门原文：「T4.0/T4.1 是不可回滚点，**执行前必须先过验收 1–5**」。但验收门禁点名的两个脚本**此前并不存在**：
+`integration/test_arachne_control_plane.py`（验收 1/3/4/5）与 `test_admin_write_redirect.py`（验收 1 + UI
+重试）。第二个**已作废**（乙裁定没有 409/重试层），第一个**本次补上并跑通**：
+
+| 验收 | 结果 |
+| --- | --- |
+| 1 切换 + 任意节点写 | **PASS**：三个真进程，写到任意节点都 201；`kill -9` leader 后新 leader **1.2–1.3 s**（预算 3 s）；在**非 leader 的存活节点**上写也成功 |
+| 2 故障切换期数据面 20 rps / 60 s | **未移植**：`test_cluster_ha.py` 驱动已退役拓扑（CANNOT VERIFY），旧口径属 T4.3 |
+| 3 双写不可能 | **PASS**：静止时恰好一台 200；切换**全过程**连续轮询从未出现两台同时 200 |
+| 4 配置收敛 | **PASS（内容层）**：三次写后三个节点服务同一份配置。**哈希层**由 `tests/arachne_three_nodes.rs`（三个真 raft 节点 + `materialized() == head`）断言 |
+| 5 失多数派 | **PASS**：多数派死后写 **0.0 s 返回 503 `config_not_published`**（不挂起、不静默接受）；`/healthz/leader` 503；存活节点继续服务其已物化配置；**真实代理请求**（闸门→路由→mock upstream）仍 200 |
+| 6 单节点回归 | 既有全量测试（纯 `server` 792 通过） |
+| 7 退役 grep | T3.3/T3.5 已执行的 grep 断言；`LeaseStore`/`NodeRegistry` 等属 T4.1 |
+
+**这次执行抓出两个此前不可能被发现的缺陷（都已修，见下）**，因此前置门从「无凭据」变成「1/3/4/5 有凭据、2 未移植」。
+
+**缺陷 A：一个 raft 成员竟然必须先配一个已退役的变量才能启动。** `HYDRA_CLUSTER_PEERS` 已配、`HYDRA_CONTROL_URL` 未配时，三个节点**全部**以
+`leader mode requires HYDRA_CONTROL_URL` 退出 ⇒ **验收 1/3/4/5 根本无法执行**。修法（T4.1 的启动半边）：Redis 控制路径（租约选举 / 快照轮询客户端 / 备用物化器）**仅当 Arachne 控制面没有在承载领导权时**才启动，其变量也仅在那时被要求。
+
+**缺陷 B：默认 cluster id 按**每个节点自己的数据目录**派生，导致多节点集群根本起不来。** 于是每个成员算出的身份互不相同：第一个抢占 `hydra/ctl/cluster_id` 的取胜，其余两个拒绝加入（`belongs to a different cluster`）。**不显式设 `HYDRA_CLUSTER_ID` 的三节点集群 100% 无法启动**，而四个 in-process 三节点用例都没走到这条路径（它们直接构造 `ClusterConfig::member`）。修法：默认改为对**成员表**取哈希——它是每个成员唯一共享的东西，且 ADR-0001 本来就把它称为集群身份（**顺序属于身份**；用例同时钉住「空白不影响、重排则改变」）。`cluster_id_env()` 成为唯一派生点，raft 组名与握手共用它。
+
+**`integration/test_cluster_ha.py` 已退役**（连 CI 步骤一起）：它驱动 `HYDRA_ROLE=leader|edge` + `HYDRA_CONTROL_URL`，只能报 CANNOT VERIFY。新步骤取代它；演练文档里写明旧覆盖里**如今无人覆盖**的两项（standby 转发管理写——已被乙裁定取代；edge 透明性——edge 角色随 T4.0 退役，且已无轮询可重新指向）。
+
 ### Phase 4 — 同构收口、退役与验收
 
 **T4.0 节点同构收口（删除 edge 分支）**
