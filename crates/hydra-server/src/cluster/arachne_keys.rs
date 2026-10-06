@@ -58,7 +58,12 @@ use std::hash::{Hash, Hasher};
 /// The `format` this module speaks. A toc carrying any other value is refused
 /// rather than guessed at: a mixed-version cluster must fail loudly, because the
 /// alternative is one node writing a tree the others decode differently.
-pub const TOC_FORMAT: u32 = 1;
+///
+/// **2** — the `cert` entity's payload became `CertTreeEntity` (`{meta, sealed_key}`)
+/// instead of a bare `CertMeta`, so this build and a build speaking 1 decode the
+/// same bytes differently. A node from either side now refuses the other's toc by
+/// name instead of failing later on a serde error.
+pub const TOC_FORMAT: u32 = 2;
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";

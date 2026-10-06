@@ -52,8 +52,8 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | **D-4** | 配置 = key-path（版本化目录 + 每实体一键 + head 单一提交点）；`head` 是**内容哈希**不是版本号 | ① 整体 blob + 字节分片（删一个实体导致后续分片全部移位 ⇒ 近乎全量重写）；② 每实体一键但用版本号做提交点（`get_stale` 不保证单调 ⇒ 可能拼出从未存在过的配置） | 用户要求重新设计后定稿 |
 | **D-5** | 集群 HA 前提 = **至少 3 台奇数同构节点** | ① 保持 2 台（raft 下无容错）；② 引入外部协调服务 | 用户裁定 |
 | **D-6** | 租户自助写：身份闸唯一在入口节点，不重复鉴权，收口到那 4 个端点 | ① 保留三道闸（含 leader 重鉴权）；② 请上游在转发协议里带调用方上下文；③ 乙-lite 先删身份保留转发作过渡（用户否决） | 用户裁定（乙-full） |
-| **D-7** | 配置树的**内容范围**：除 `ConfigData` 外，还包含它推导时丢弃的行（新增 `EntityPath::Fidelity` 实体） | ① 只复制 `ConfigData`（原计划的字面做法）：副本重建不出同一份 SQLite —— 丢 `enabled=0` 的 `limit_role`、`status != 1` 的 `provider_model`，且 provider key 的 `id`/`created_at` 会**被重铸**；② 副本"尽力而为"重建、缺的行当不存在：节点间表内容合法地不同，而 `head` 只声明"配置是这一份" | 实现期裁定（用户选 A） |
-| **D-8** | **密封必须在编码之外**：发布方传入已封好的材料（`SealedMaterial`），编码器不持有主密钥 | ① 由编码器在 `split_config` 里现封：树是内容寻址的，AES-GCM 每次新 nonce ⇒ **同一个没变的配置每次发布都换一个树名**，head 前进、全集群无限重新物化（第一版就是这样，被 `the_same_inputs_name_the_same_tree` 抓出） | 实测强制（非可选） |
+| **D-7** | 配置树的**内容范围**：除 `ConfigData` 外，还包含（a）它推导时丢弃的行（`EntityPath::Fidelity`）与（b）`skip_serializing` 丢掉的**秘密**（cert 私钥，随 `cert` 实体密封；此前只有 provider key 与令牌哈希） | ① 只复制 `ConfigData`（原计划的字面做法）：副本重建不出同一份 SQLite —— 丢 `enabled=0` 的 `limit_role`、`status != 1` 的 `provider_model`，且 provider key 的 `id`/`created_at` 会**被重铸**；② 副本"尽力而为"重建、缺的行当不存在：节点间表内容合法地不同，而 `head` 只声明"配置是这一份"；③ cert 私钥不进树（第一版的真实状态，被 `tests/arachne_cert_fidelity.rs` 判红）：`restore_config` 不是"少写一个字段"而是**往 `cert_key_ciphertext` 写 NULL** ⇒ 物化一次就**删掉**该节点已有的租户 TLS 私钥 | 实现期裁定（用户选 A）；cert 部分是**实测抓出的缺陷修复**，非新增选项 |
+| **D-8** | **密封必须在编码之外**：发布方传入已封好的材料（`SealedMaterial`），编码器不持有主密钥。推论（同一类，各自实测抓出一处）：**编码结果只能依赖逻辑内容，不能依赖进程状态** —— ② `HashSet` 按迭代序序列化（`RandomState` 每实例随机）同样让"没变的配置"换树名 | ① 由编码器在 `split_config` 里现封：AES-GCM 每次新 nonce ⇒ **同一个没变的配置每次发布都换一个树名**（第一版就是这样，被 `the_same_inputs_name_the_same_tree` 抓出）；② 直接 `encode(&path, &HashSet)`：同一逻辑集合两次读库得到不同字节序（被 `two_independent_builds_of_the_same_config_name_the_same_tree` 抓出；该用例**故意分两次构建配置**——单元素 fixture 与"同一对象切两次"都抓不到） | 实测强制（非可选） |
 
 ## 4. 「为什么引入共识层」的论证
 
@@ -154,14 +154,21 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | 集群装配与同构启动 | `a421580`、`0dca1c6`…`c41185d`、`4ca5ee5` | `arachne` feature 下挂载 `cluster::arachne_*`；`Arachne::start` 在自己的运行时里引导（F-1 的直接后果）；`leader_ready` 由写探测回答（F-3） |
 | 成员表取代 `HYDRA_ROLE` | `b87c289` | 集群判定 = 有没有配 `HYDRA_CLUSTER_PEERS`；`NodeRole::Edge` 退役 |
 | 物化循环端到端 | `2176f14` | 真 raft + 真 store：`head` → toc → 逐实体 → 解码 → 安装 → **成功后才推水位**；退避 1s→2s→…→60s；未物化 = 不可当选 |
-| fidelity 实体（D-7）与编码期密封（D-8） | 本轮 | `EntityPath::Fidelity`；`SealedMaterial` 由调用方传入 |
+| fidelity 实体（D-7）与编码期密封（D-8） | `8ef3692` | `EntityPath::Fidelity`；`SealedMaterial` 由调用方传入 |
+| cert 私钥随树走（D-7 的 (b)） | 本轮 | `cert` 实体改为 `CertTreeEntity{meta, sealed_key}`；解码时回填 `cert_key_pem`；缺少密封材料**拒绝发布**而不是丢掉密钥；`TOC_FORMAT` 1→2（同一批字节两种解法的版本必须互相拒绝） |
+| 集合的编码序（D-8 推论②） | 本轮 | `tenant_providers` / `tenant_models` 是 `HashSet`，改为**排序后**编码（`sorted_members`），否则同一配置每次读库换树名 |
+
+**实现期抓出的一个缺陷（如实记账）**：`8ef3692` 的提交信息写「树携带副本所需的、`ConfigData` 推导时丢掉的行」，**这句话当时是过强的**——它漏掉了 cert 私钥。`CertMeta::cert_key_pem` 带 `skip_serializing`，Redis 时代的 wire 用一个**单独的**密封字段（`SnapshotWire::sealed_certs`）补偿这个 skip，而树没有对应字段。后果不是"少一个字段"：`restore_config` 见到 `cert_key_pem == None` 会往 `cert_key_ciphertext` 写 NULL，于是**物化一次就删掉该节点已有的租户 TLS 私钥**（与 G1 丢禁用行、G3 重铸 provider-key 主键同一类）。已由 `tests/arachne_cert_fidelity.rs` 判红后修复。
+
+**`SealedMaterial` 的构造来源（一处必须说清的现状）**：目前唯一的构造函数是 `seal_plaintext`（**现封**，因此不可复现，只适合测试与一次性发布）。生产用的"读库里**已存的密文**（`provider_key.api_key_ciphertext`、`tenant.cert_key_ciphertext`）"这一路径**还没写**，属 T3.2 的发布切换；现在**没有任何 `db` 读取函数返回已存密文**（`list_provider_keys` 等一律解密后返回）。顺带纠正 `8ef3692` 提交信息里的第二处措辞：`SnapshotWire::build` **不是**"已存密文的来源"，它每次 build 都用 `kp.seal(..)` 重新封——这对"版本号命名"的 wire 是对的，对**内容寻址**的树是致命的。
 
 **尚未落地（引用本 ADR 时不得当作已完成）**：
 
 1. `MaterializeTarget` 的真实实现（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）**未接**；发布侧仍走 `SnapshotWire`（属 T3.2）。**因此节点目前还不能从 Arachne 服务配置** —— T3.1 的「真实 3 节点」验收未执行，已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值/确定性/保密用例。
-2. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
-3. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。
-4. §9 基线同步未做：`dev-docs/cluster.md` / `ops.md` 仍描述 Redis 租约世界。
+2. `SealedMaterial` 缺"从已存密文构造"的入口（见上），发布切换时必须先补 `db` 侧的读取函数。
+3. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
+4. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。
+5. §9 基线同步未做：`dev-docs/cluster.md` / `ops.md` 仍描述 Redis 租约世界。
 
 ## 11. 可逆性（Reversibility）
 

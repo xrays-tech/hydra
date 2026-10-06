@@ -84,9 +84,18 @@ Redis（只是数据面的加速器与近似计数器，不是任何权威）
 | `hydra/cfg/<toc-hash>/key_binding/<id>` | 同上 | 同上 |
 | `hydra/cfg/<toc-hash>/sub_tenant/<id>` · `.../sub_tenant_route/<id>` | 同上 | 同上 |
 | `hydra/cfg/<toc-hash>/token/<tenant_id>` | 同上（租户访问令牌哈希索引） | 同上 |
-| `hydra/cfg/<toc-hash>/cert/<tenant_id>` | 同上（密封证书） | 同上 |
+| `hydra/cfg/e/cert/<domain>` | `CertTreeEntity`：`CertMeta` + **密封的私钥**（`skip_serializing` 的那个字段必须有人补） | 同上 |
 | `hydra/cfg/<toc-hash>/meta` | 单例：`config_version`、`writer_node`、`created_ms`、`entity_count` | 每次提交 |
 | `hydra/ctl/node/<node_id>` | `{listen_addr, raft_id, admin_addr, heartbeat_ms}` | 每节点每 10 s（**仅诊断 / 管理 UI 展示**，不是发现权威 —— 地址的权威是 `HYDRA_CLUSTER_PEERS`） |
+
+> **键布局在 T2.2 改过一次，以上表格是方案定稿时的写法**：实际落地为
+> **toc 按哈希取名**（`hydra/cfg/toc/<toc-hash>`）、**实体按路径稳定寻址**（`hydra/cfg/e/<path>`），
+> 因为实体只在内容变化时才写——「没变的实体」留在旧树哈希下，新树就找不到它（实测报错
+> `tree <h> is missing entity tenant/acme`）。`EntityPath` 段名见 `arachne_keys.rs`。
+> 另外 `meta` 与 `token` 两个实体**至今没有生产者**（`grep EntityPath::Meta|EntityPath::Token` 在
+> `arachne_keys.rs` 之外零命中）：`config_version` 的权威在 T3.2 才切换，令牌哈希则走了 fidelity 实体。
+> 二者在解码侧是**拒绝**而不是忽略（未知路径 ⇒ 报错），所以树里一旦出现它们就说明读到了别的版本的树。
+> 表里未逐行改写以免掩盖差异，改的是上面这两处注释与下方 T3.1 记录。
 
 **读取顺序**：`get_stale(head)` → `get_stale(<hash>/toc)` → 逐个 `get_stale(<hash>/<path>)` 并**按目录里的 content-hash 校验**；任何一项对不上 ⇒ 整轮重试（**不**使用 `get`，见 F-2）。
 
@@ -593,8 +602,18 @@ Plan Pressure Test:
 - **问题**：`ConfigData` 是从 SQLite 表**推导**出来的视图，推导过程是有损的：`limit_role` 里 `enabled=0` 的行、`provider_model` 里 `status != 1` 的行、以及所有行的**主键 `id` 与 `created_at`**，都不在 `ConfigData` 里。只复制 `ConfigData` 的副本无法重建出同一张表（会丢掉禁用行，并且重建时会给 provider key **重新生成 id**）。
 - **做法**：树里多一个 `Fidelity` 实体，携带这些「推导丢掉的行」。键按**路径**而不是按树哈希（`hydra/cfg/e/fidelity`），与其它实体同一规则，所以配置没变时它不会被重写。
 - **秘密怎么走**：`provider_keys`（API key）与 `tenant_token_hashes`（租户令牌哈希）**必须是密文**。旧的 snapshot 线就封了这两样，树里若走明文等于把已有的保护悄悄撤掉。所以：非秘密的行走普通 JSON，这两样走 `Sealed`，只有持主密钥的一方能打开（`FidelityTreeEntity::rows`）。有针对性用例 `the_fidelity_entity_carries_no_plaintext_secrets`（含「换一把主密钥必须被拒绝，而不是交出垃圾」）。
-- **一个被实测逼出来的约束（重要）**：树是**内容寻址**的——名字就是字节的哈希。而 AES-GCM 每次封都用**新的随机 nonce**，所以**在编码过程里封密文 = 同一个逻辑配置每次发布都换一个树名**，于是 head 前进、所有节点无限重新物化。因此密封被移到编码**之外**：发布方把已封好的材料作为参数传进来（`SealedMaterial`），来源是它自己库里**已经存着的密文**（`provider_key` 行），与 `SnapshotWire::build` 的取值口径一致。守卫用例：`the_same_inputs_name_the_same_tree`（这条用例是红的抓出来的：第一版把密封写在 `split_config` 里，一个没变的配置命名出了两棵不同的树）。
+- **一个被实测逼出来的约束（重要）**：树是**内容寻址**的——名字就是字节的哈希。而 AES-GCM 每次封都用**新的随机 nonce**，所以**在编码过程里封密文 = 同一个逻辑配置每次发布都换一个树名**，于是 head 前进、所有节点无限重新物化。因此密封被移到编码**之外**：发布方把已封好的材料作为参数传进来（`SealedMaterial`）。守卫用例：`the_same_inputs_name_the_same_tree`（这条用例是红的抓出来的：第一版把密封写在 `split_config` 里，一个没变的配置命名出了两棵不同的树）。
+  - **现状要说清**：目前唯一的构造函数是 `seal_plaintext`（**现封**，因此不可复现，只适合测试/一次性发布）。生产用的「读库里**已存的密文**」这一路径**还没写**，属 T3.2；现在**没有任何 `db` 读取函数返回已存密文**（`list_provider_keys` 等都解密后返回）。原文写的「与 `SnapshotWire::build` 的取值口径一致」是**错的**：`SnapshotWire::build` 每次 build 都用 `kp.seal(..)` 重新封（对版本号命名的 wire 正确，对内容寻址的树致命）。已回写在 ADR §10。
 - **不是「顺便加的」**：这是本轮唯一一处**扩大**树的内容的地方，理由不是「将来可能有用」，而是「不加就重建不出同一份副本」。
+
+**同一批工作里抓出的第二个缺陷：cert 私钥根本没进树（已修）。**
+
+- `CertMeta::cert_key_pem` 带 `#[serde(skip_serializing)]`（私钥不进任何序列化形式），而 `Cert` 实体直接序列化 `CertMeta` ⇒ **私钥不在树里**。Redis 时代的 wire 用**单独的**密封字段 `SnapshotWire::sealed_certs` 补偿这个 skip，树没有对应字段。
+- 后果不是「少一个字段」：`restore_config` 见到 `cert_key_pem == None` 会**往 `cert_key_ciphertext` 写 NULL** ⇒ 物化一次就**删掉**该节点已有的租户 TLS 私钥。与 G1（丢禁用行）、G3（重铸 provider-key 主键）同一类。
+- 修法：`Cert` 实体的值改成 `CertTreeEntity{meta, sealed_key}`，密钥**随该租户自己的 cert 实体**走（不放进 fidelity 单例：按域一实体才能让"这个租户的证书变了"不重写其它证书）；解码时回填 `cert_key_pem`；`cert_key_pem` 存在但密封材料缺失 ⇒ **拒绝发布**（不是丢掉）。`TOC_FORMAT` 1→2：同一批字节两种解法的版本必须互相拒绝。
+- 守卫：`tests/arachne_cert_fidelity.rs`（先红后绿，含「树里不得出现明文 `PRIVATE KEY`」）、`a_cert_key_without_sealed_material_is_refused`。
+
+**同一轮里的第三处：集合按迭代序编码（已修）。** `cfg.tenant_providers` / `cfg.tenant_models` 是 `HashSet<String>`，而 serde 按**迭代序**序列化集合、`RandomState` 每实例随机 ⇒ 同样的行两次读库（= 两次发布）得到**不同字节** ⇒ 树名变化、head 前进、全节点重新物化。这是 D-8 的同一失效模式换了个来源（那边是随机 nonce，这边是随机哈希种子）。修法：`sorted_members()` 排序后编码（解码侧仍是集合，顺序不影响相等性）。守卫：`two_independent_builds_of_the_same_config_name_the_same_tree`——它**故意分两次构建配置**，因为原有那条 `the_same_inputs_name_the_same_tree` 对同一个对象切两次、且 fixture 的集合只有一个元素，两种情况下顺序都不构成问题（这就是它一直绿的原因）。
 
 **T3.1 明确没做完的部分（如实记账，不算完成）**：
 

@@ -42,7 +42,7 @@
 
 use std::collections::HashSet;
 
-use hydra_core::config::ConfigData;
+use hydra_core::config::{CertMeta, ConfigData};
 use hydra_core::model::{
     LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
     TenantModel, TenantProvider,
@@ -54,6 +54,31 @@ use super::arachne_keys::{
 use super::arachne_store::ConfigTree;
 use crate::cluster::content::FidelityRows;
 use crate::crypto::{KeyProvider, Sealed};
+
+/// One `Cert` entity: the domain's certificate, with its private key SEALED.
+///
+/// ## Why this is not just `CertMeta`
+///
+/// `CertMeta::cert_key_pem` is `#[serde(skip_serializing)]`, and rightly so: a
+/// private key must not reach ANY serialised form, and `db::restore_config`
+/// re-seals it at the DB boundary from the in-memory value. The Redis-era wire
+/// compensates with a separate sealed field (`SnapshotWire::sealed_certs`); the
+/// tree needs the same thing, for a sharper reason — `restore_config` does not
+/// merely OMIT a missing key, it writes NULL into `cert_key_ciphertext`, so a tree
+/// without the sealed key DELETES the private key a materializing node already
+/// had. Caught by `tests/arachne_cert_fidelity.rs`.
+///
+/// The key rides the cert's OWN entity rather than a singleton: one entity per
+/// domain is what keeps "this tenant's cert changed" from rewriting every cert.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CertTreeEntity {
+    /// The certificate as `CertMeta` serialises it (`cert_key_pem` absent by the
+    /// skip; it is re-supplied from [`Self::sealed_key`] on decode).
+    pub meta: CertMeta,
+    /// The private key PEM, sealed. `None` when the tenant has no key content (a
+    /// legacy `cert_file`/`cert_key` path pair, or no certificate at all).
+    pub sealed_key: Option<Sealed>,
+}
 
 /// The rows a replica needs beyond `ConfigData`, as it travels in the tree.
 ///
@@ -237,10 +262,26 @@ impl SealedMaterial {
                 })?;
             tenant_token_hashes.push((tenant_id.clone(), sealed));
         }
+        // The cert private keys, sealed per domain. Sealed HERE rather than at the DB
+        // boundary the way `restore_config` does it, because the tree must carry them:
+        // `CertMeta::cert_key_pem` is `skip_serializing`, so the entity cannot.
+        let mut cert_keys = std::collections::BTreeMap::new();
+        for (domain, meta) in &cfg.certs {
+            let Some(pem) = &meta.cert_key_pem else {
+                continue;
+            };
+            let sealed = kp
+                .seal(pem.as_bytes())
+                .map_err(|e| EntityCodecError::Unsupported {
+                    reason: format!("cannot seal the private key of the cert for {domain}: {e}"),
+                })?;
+            cert_keys.insert(domain.clone(), sealed);
+        }
         Ok(Self {
             provider_keys,
             fidelity_provider_keys,
             tenant_token_hashes,
+            cert_keys,
         })
     }
 }
@@ -331,7 +372,7 @@ pub fn split_config(
     fidelity: &FidelityRows,
     sealed: SealedMaterial,
 ) -> Result<Vec<EntityBlob>, EntityCodecError> {
-    let mut out = config_entities(cfg, &sealed.provider_keys)?;
+    let mut out = config_entities(cfg, &sealed.provider_keys, &sealed.cert_keys)?;
     out.push(encode(
         &EntityPath::Fidelity,
         &FidelityTreeEntity::from_sealed(
@@ -354,8 +395,16 @@ pub fn split_config(
 /// encoding is not reproducible — measured twice while writing this module, first for the
 /// fidelity rows and then for the config's own `provider_keys`.
 ///
-/// So sealing happens ONCE, outside, against the stored ciphertext (`provider_key` rows) or a
-/// stable fixture, and this struct carries the result in.
+/// So sealing happens ONCE, outside, against a stable representation — the ciphertext a node
+/// already stores, or a fixture sealed once — and this struct carries the result in.
+///
+/// **Honest scope note**: the only constructor today is [`Self::seal_plaintext`], which seals
+/// afresh and is therefore NOT reproducible across calls; it exists for tests and one-shot
+/// publishes. The production constructor, which reads each row's STORED ciphertext
+/// (`provider_key.api_key_ciphertext`, `tenant.cert_key_ciphertext`) instead of sealing again,
+/// belongs to the publish cutover (plan T3.2). `SnapshotWire::build` could not be reused for
+/// this: it re-seals every secret with `kp.seal(..)` on each build, which is correct for a
+/// version-labelled wire and fatal for a content-addressed tree.
 ///
 /// A struct rather than positional arguments: the fields are several `Vec`s of different element
 /// types, and swapping two of them would compile.
@@ -370,6 +419,13 @@ pub struct SealedMaterial {
     pub fidelity_provider_keys: Vec<SealedProviderKey>,
     /// `tenant_id` → the stored (stable) sealed token hash.
     pub tenant_token_hashes: Vec<(String, Sealed)>,
+    /// `domain` → the sealed certificate PRIVATE KEY, for the cert's own entity.
+    ///
+    /// A domain with no key content is simply absent — the entity then carries
+    /// `sealed_key: None`, which is the truthful description of "no private key here".
+    /// A `cert_key_pem` that IS present but has no entry here is an ERROR, not an
+    /// omission: the tree would otherwise drop a key the leader holds.
+    pub cert_keys: std::collections::BTreeMap<String, Sealed>,
 }
 
 /// Build the CONFIG entities (no fidelity). Private: sealing is not optional, so there is no
@@ -381,6 +437,7 @@ pub struct SealedMaterial {
 fn config_entities(
     cfg: &ConfigData,
     sealed_provider_keys: &std::collections::BTreeMap<String, Sealed>,
+    sealed_cert_keys: &std::collections::BTreeMap<String, Sealed>,
 ) -> Result<Vec<EntityBlob>, EntityCodecError> {
     let mut out: Vec<EntityBlob> = Vec::new();
 
@@ -435,12 +492,12 @@ fn config_entities(
     for (tenant_id, providers) in &cfg.tenant_providers {
         let path = EntityPath::TenantProvider(tenant_id.clone());
         check(&path)?;
-        out.push(encode(&path, providers)?);
+        out.push(encode(&path, &sorted_members(providers))?);
     }
     for (tenant_id, models) in &cfg.tenant_models {
         let path = EntityPath::TenantModel(tenant_id.clone());
         check(&path)?;
-        out.push(encode(&path, models)?);
+        out.push(encode(&path, &sorted_members(models))?);
     }
     for role in &cfg.limit_roles {
         let path = EntityPath::LimitRole(role.id.clone());
@@ -465,11 +522,54 @@ fn config_entities(
     for (domain, cert) in &cfg.certs {
         let path = EntityPath::Cert(domain.clone());
         check(&path)?;
-        out.push(encode(&path, cert)?);
+        // The private key is `skip_serializing` on `CertMeta`, so it MUST come from the sealed
+        // material. A key that is present in memory but absent here is refused rather than
+        // dropped: `restore_config` writes NULL over the replica's `cert_key_ciphertext` when the
+        // decoded config has no key, so "dropped" means "deleted the node's private key".
+        let sealed_key = match (&cert.cert_key_pem, sealed_cert_keys.get(domain)) {
+            (None, _) => None,
+            (Some(_), Some(sealed)) => Some(sealed.clone()),
+            (Some(_), None) => {
+                return Err(EntityCodecError::Unsupported {
+                    reason: format!(
+                        "no sealed material was supplied for the private key of the cert for \
+                         {domain}; sealing during encoding would make the tree name \
+                         non-reproducible, and omitting it would delete the key on every node \
+                         that materializes this tree"
+                    ),
+                })
+            }
+        };
+        out.push(encode(
+            &path,
+            &CertTreeEntity {
+                meta: cert.clone(),
+                sealed_key,
+            },
+        )?);
     }
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// A set's members in a FIXED order, for encoding.
+///
+/// ## Why the set is not encoded directly
+///
+/// `HashSet` iterates in an order decided by its own random seed, and serde serialises a set in
+/// ITERATION order — so encoding `&HashSet<String>` makes the entity's bytes depend on the
+/// process, not on the config. Two loader runs of the same unchanged rows then produce two
+/// different trees: the head advances for nothing and every node re-materializes. It is the D-8
+/// failure mode from a second direction (there: a random nonce; here: a random hash seed), and it
+/// is invisible in a fixture whose sets hold one element, where order is not a question.
+///
+/// Caught by `two_independent_builds_of_the_same_config_name_the_same_tree`, which builds the
+/// config twice on purpose. Do NOT "simplify" this back to `encode(&path, providers)?`.
+fn sorted_members(set: &HashSet<String>) -> Vec<&String> {
+    let mut members: Vec<&String> = set.iter().collect();
+    members.sort();
+    members
 }
 
 /// The tree these blobs form, ready for [`crate::cluster::arachne_store`].
@@ -568,12 +668,14 @@ pub fn build_config_with_fidelity(
                 cfg.provider_keys.insert(id.clone(), keys);
             }
             EntityPath::TenantProvider(id) => {
-                let providers: HashSet<String> = decode(path, bytes)?;
-                cfg.tenant_providers.insert(id.clone(), providers);
+                let members: Vec<String> = decode(path, bytes)?;
+                cfg.tenant_providers
+                    .insert(id.clone(), members.into_iter().collect());
             }
             EntityPath::TenantModel(id) => {
-                let models: HashSet<String> = decode(path, bytes)?;
-                cfg.tenant_models.insert(id.clone(), models);
+                let members: Vec<String> = decode(path, bytes)?;
+                cfg.tenant_models
+                    .insert(id.clone(), members.into_iter().collect());
             }
             EntityPath::LimitRole(_) => {
                 let role = decode::<LimitRole>(path, bytes)?;
@@ -592,8 +694,28 @@ pub fn build_config_with_fidelity(
                 cfg.sub_tenant_routes.push(route);
             }
             EntityPath::Cert(domain) => {
-                let cert = decode(path, bytes)?;
-                cfg.certs.insert(domain.clone(), cert);
+                let entity = decode::<CertTreeEntity>(path, bytes)?;
+                let mut meta = entity.meta;
+                // Re-supply the private key the `skip_serializing` on `CertMeta` removed. A
+                // sealed value that will not open is REFUSED, never downgraded to "no key":
+                // `restore_config` would then write NULL over the node's key columns.
+                if let Some(sealed) = &entity.sealed_key {
+                    let pem = kp.open(sealed).map_err(|e| EntityCodecError::Crypto {
+                        path: path.to_key_segment(),
+                        reason: format!(
+                            "cannot open the private key of the cert for {domain}: {e}"
+                        ),
+                    })?;
+                    let pem = String::from_utf8(pem).map_err(|_| EntityCodecError::Crypto {
+                        path: path.to_key_segment(),
+                        reason: format!(
+                            "the private key of the cert for {domain} is not valid UTF-8 after \
+                                 unsealing"
+                        ),
+                    })?;
+                    meta.cert_key_pem = Some(pem);
+                }
+                cfg.certs.insert(domain.clone(), meta);
             }
             EntityPath::Fidelity => {
                 let entity = decode::<FidelityTreeEntity>(path, bytes)?;
@@ -834,14 +956,20 @@ mod tests {
         let (rebuilt_cfg, rebuilt_rows) =
             build_config_with_fidelity(&tree, &kp()).expect("rebuild");
 
-        // `CertMeta::cert_key_pem` is `skip_serializing` on purpose (plaintext private keys
-        // never enter any serialized form). The sealed path is what re-supplies it — the
-        // dedicated test below asserts the omission rather than assuming it.
-        let mut expected_cfg = cfg.clone();
-        for cert in expected_cfg.certs.values_mut() {
-            cert.cert_key_pem = None;
-        }
-        assert_eq!(rebuilt_cfg, expected_cfg, "the config must round trip");
+        // The config must come back WHOLE, cert private keys included: `CertMeta::cert_key_pem`
+        // is `skip_serializing` (a private key never enters a serialised form), so the entity
+        // carries it SEALED and the decode re-supplies it. Asserting the key is back is the point
+        // — an equality that had zeroed it would have accepted a tree that loses the key.
+        assert_eq!(rebuilt_cfg, cfg, "the config must round trip");
+        assert_eq!(
+            rebuilt_cfg
+                .certs
+                .get("acme.example")
+                .and_then(|c| c.cert_key_pem.as_deref()),
+            Some("-----BEGIN PRIVATE KEY-----"),
+            "the cert private key must survive the round trip, or `restore_config` writes NULL \
+             over the key a node already had"
+        );
         assert_eq!(
             rebuilt_rows, rows,
             "the fidelity rows must round trip, disabled and offline rows included"
@@ -982,5 +1110,84 @@ mod tests {
             toc_of(&b).expect("toc").hash(),
             "and therefore the same name"
         );
+    }
+
+    /// The same property for the SET-valued entities, across two INDEPENDENT reads.
+    ///
+    /// `cfg.tenant_providers` / `cfg.tenant_models` are `HashMap<String, HashSet<String>>`, and
+    /// serde serialises a `HashSet` in ITERATION order. `RandomState` is seeded per instance, so
+    /// two `HashSet`s built from the SAME rows (one per loader run, i.e. one per publish) iterate
+    /// in different orders and encode to different BYTES — a spurious rename, which is the D-8
+    /// failure mode arriving from an entirely different direction: the head advances although
+    /// nothing logical changed, and every node re-materializes.
+    ///
+    /// The sibling test above cannot catch this: it splits ONE config object twice, so both calls
+    /// see the very same `HashSet` instances, and its fixture sets hold one element each, where
+    /// order is not a question. This test builds the config twice and uses sets large enough for
+    /// order to matter.
+    ///
+    /// Falsification: encode the `HashSet` directly (as the first version did) and this fails.
+    #[tokio::test]
+    async fn two_independent_builds_of_the_same_config_name_the_same_tree() {
+        // Two INDEPENDENT constructions, the way two loader runs would produce them.
+        fn build() -> ConfigData {
+            let mut cfg = config();
+            cfg.tenant_models.insert(
+                "t1".to_string(),
+                (0..64).map(|i| format!("model-{i:02}")).collect(),
+            );
+            cfg.tenant_providers.insert(
+                "t1".to_string(),
+                (0..64).map(|i| format!("provider-{i:02}")).collect(),
+            );
+            cfg
+        }
+
+        let rows = fidelity();
+        let first = tree_of(&split_config(&build(), &rows, sealed_fixture()).expect("split"))
+            .expect("tree");
+        let second = tree_of(&split_config(&build(), &rows, sealed_fixture()).expect("split"))
+            .expect("tree");
+
+        assert_eq!(
+            first, second,
+            "two independent builds of the same logical config must name the same tree; a set \
+             serialised in iteration order makes the name depend on the process's hash seed, so \
+             every publish renames the tree even when nothing changed"
+        );
+    }
+
+    /// A cert private key with no sealed material is REFUSED, not dropped.
+    ///
+    /// The distinction matters because the failure is silent on the other side: a tree that
+    /// omitted the key decodes to a config with `cert_key_pem == None`, and `restore_config`
+    /// then writes NULL into `cert_key_ciphertext` — deleting the private key of every node that
+    /// materializes it. So the encoder must not have a "just leave it out" path.
+    ///
+    /// Falsification: drop the `(Some(_), None)` arm and this returns `Ok`.
+    #[tokio::test]
+    async fn a_cert_key_without_sealed_material_is_refused() {
+        let cfg = config();
+        let rows = fidelity();
+        // Same fixture, but with the cert keys stripped: everything else is intact, so the
+        // refusal can only come from the cert branch.
+        let mut sealed = sealed_fixture();
+        sealed.cert_keys.clear();
+
+        let got = split_config(&cfg, &rows, sealed);
+        match got {
+            Err(EntityCodecError::Unsupported { reason }) => {
+                assert!(
+                    reason.contains("acme.example"),
+                    "the refusal must name the cert it is about, or an operator cannot tell which \
+                     tenant to look at: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a refusal naming the missing cert key, got {other:?}"),
+            Ok(_) => panic!(
+                "a cert private key present in memory but absent from the sealed material must be \
+                 refused; encoding it anyway silently deletes the key on every replica"
+            ),
+        }
     }
 }
