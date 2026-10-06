@@ -1,5 +1,8 @@
-//! Cluster / control-plane admin API — whole-fleet status, the internal control
-//! channel, leader health and the reload endpoint.
+//! Cluster admin API — whole-fleet status, leader health and the reload endpoint.
+//!
+//! The "internal control channel" that used to head this list is retired: both halves of
+//! `/api/v1/internal/*` went with the snapshot channel (ADR-0001 T4.1) and the forwarded
+//! management write (D-6 / T3.5).
 //!
 //! Moved out of `handlers.rs` verbatim (plan T0.2, Phase 0) — no logic change.
 //! Only the module imports are new: the moved DTOs derive `Serialize`, and the
@@ -131,11 +134,16 @@ struct ReloadBody {
 }
 
 // ===========================================================================
-// Internal control plane (cluster P1) — snapshot distribution
+// Leader health (cluster P2)
 // ===========================================================================
 
-/// `GET /healthz/leader` (cluster P2): 200 while this node holds the leader
-/// lease, 503 on standby, 404 on non-candidate nodes (`all` / edge).
+/// `GET /healthz/leader`: 200 while this node is a leader it may write on, 503 when it has the
+/// gate and the gate says no, 404 when there is no gate at all (single-node / no control plane).
+///
+/// The gate is a raft **write probe**, not a lease and not a `leader_hint` comparison — the Redis
+/// lease is retired, and roles (`all` / `edge`) no longer exist to be "non-candidates". A node in
+/// a minority therefore answers 503, which is the point: it cannot commit, so it must not claim
+/// leadership.
 pub(super) fn leader_health(state: &AdminState, trace_id: &str) -> Resp {
     match &state.leader_ready {
         Some(f) if f() => ok_json(200, &LeaderHealth { leader: true }),
@@ -148,7 +156,7 @@ pub(super) fn leader_health(state: &AdminState, trace_id: &str) -> Resp {
         None => err_json(
             404,
             "not_found",
-            "leader health is only available on leader-candidate nodes",
+            "leader health is only available on a cluster node (this node has no control plane)",
             trace_id,
         ),
     }

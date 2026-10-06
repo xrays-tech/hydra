@@ -245,14 +245,21 @@ pub struct AdminState {
     /// documented that way on purpose.
     pub snapshot_stale: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`): gates the internal
-    /// `/api/v1/internal/*` endpoints (cluster P1). `None` ⇒ internal
-    /// endpoints are denied (fail-closed).
+    /// Shared cluster token (`HYDRA_CLUSTER_TOKEN`), compared against the Bearer header on the
+    /// `/api/v1/internal/*` prefix. `None` ⇒ those requests are denied (fail-closed).
+    ///
+    /// That prefix now has **no routes at all**: `GET /api/v1/internal/control` went with the
+    /// snapshot channel (ADR-0001 T4.1) and `/api/v1/internal/tenant-config/*` with the forwarded
+    /// management write (D-6 / T3.5). What remains is only this gate, so the token is currently a
+    /// BOOT requirement with no consumer — recorded in ADR-0001 §7.1 and deliberately NOT removed,
+    /// because deleting it changes the deployment contract (manifests, `CLUSTER_ONLY_ENV`, the
+    /// startup refusal) and needs its own decision.
     pub cluster_token: Option<String>,
-    /// Whether this node currently holds the leader lease (cluster P2).
-    /// `Some(f)` on leader-candidate nodes: gates admin mutations (non-leader
-    /// ⇒ forward to the active, P3) and `/healthz/leader`. `None` on
-    /// single-node (`all`) and edge.
+    /// Whether this node is a leader it may accept writes on. `Some(f)` on a cluster node,
+    /// `None` on single-node. Backed by the Arachne **write probe** — not by `leader_hint` (a
+    /// fresh leader's hint does not point at itself) and not by any lease: the Redis lease is
+    /// retired, and so is the `P3` forwarding this used to gate. Gates admin mutations and
+    /// `/healthz/leader`.
     pub leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 
     /// Per-tenant config-write throttle (v2 D6): a fixed-window, process-local

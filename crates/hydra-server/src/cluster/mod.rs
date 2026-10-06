@@ -94,17 +94,18 @@ impl NodeRole {
         );
         match &decision.notice {
             ClusterNotice::Quiet => {}
-            ClusterNotice::WiringWithoutMembers { ignored } => tracing::error!(
-                ignored = %ignored,
-                "cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set; this node is \
-                 standalone — the wiring listed in `ignored` is NOT used (no raft membership, no \
-                 shared L2 cache, and tenant writes land in the LOCAL database)"
-            ),
-            ClusterNotice::RetiredIgnored { ignored } => tracing::error!(
-                ignored = %ignored,
-                "these variables were retired by the Arachne control plane (ADR-0001) and are \
-                 IGNORED; remove them from the deployment so nobody believes they still do \
-                 something"
+            // ONE line, with each group also a structured field: an operator (or a grep) reading
+            // a single line gets the whole story, and the drill can assert on the names without
+            // parsing prose. `None` for an empty group records no field at all.
+            ClusterNotice::Dropped {
+                wiring_without_members,
+                retired,
+            } => tracing::error!(
+                wiring_without_members =
+                    (!wiring_without_members.is_empty()).then_some(wiring_without_members.as_str()),
+                retired = (!retired.is_empty()).then_some(retired.as_str()),
+                "{}",
+                dropped_notice_text(wiring_without_members, retired)
             ),
         }
         decision.role
@@ -130,9 +131,14 @@ impl fmt::Display for NodeRole {
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub role: NodeRole,
-    /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`), required in cluster mode
-    /// (fail-closed). It is what gates the internal endpoints that remain — the health and status
-    /// surfaces — and what identifies a peer.
+    /// Shared cluster token (`HYDRA_CLUSTER_TOKEN`), required in cluster mode (fail-closed).
+    ///
+    /// It is compared against the Bearer header on the `/api/v1/internal/*` prefix only — NOT on
+    /// the health or status surfaces, which go through the ADMIN token like every other admin route
+    /// (`admin/mod.rs`: `check_auth` runs before `route`). That prefix has had no routes since
+    /// T3.5/T4.1 retired both of its members, so today the token guards nothing at all; it is still
+    /// REQUIRED at boot, and removing that requirement is a deployment-contract change rather than a
+    /// cleanup (ADR-0001 §7.1).
     pub cluster_token: Option<String>,
     /// Stable node identity (`HYDRA_NODE_ID`, else `node-<random hex>`). This is a raft member's
     /// name, and its POSITION in `HYDRA_CLUSTER_PEERS` is its numeric raft id.
@@ -260,12 +266,18 @@ pub enum ClusterNotice {
     /// Nothing to say: either this IS a cluster node, or nothing cluster-shaped is set —
     /// which is the documented single-node default.
     Quiet,
-    /// Cluster settings are configured while the member list is missing: an ERROR naming
-    /// every variable that will be ignored. This is the mistake that used to be SILENT
-    /// (measured 2026-10-01) and that leaves a node serving from its OWN database.
-    WiringWithoutMembers { ignored: String },
-    /// Retired variables are set: an ERROR naming them, on any node.
-    RetiredIgnored { ignored: String },
+    /// Something the operator configured is NOT in effect, named. ONE variant for both classes
+    /// of problem, because both are usually true at once on a node mid-migration and a message
+    /// that reports only one of them reads as the whole story (measured 2026-10-05: a node with
+    /// `HYDRA_ROLE` still set AND no member list heard only "remove HYDRA_ROLE" — it was never
+    /// told it had stopped being a cluster node at all).
+    Dropped {
+        /// Live cluster wiring that does nothing because there is no member list. Empty when the
+        /// member list IS set (the wiring is then in use).
+        wiring_without_members: String,
+        /// Variables this plan retired, ignored by the product. Empty when none is set.
+        retired: String,
+    },
 }
 
 /// The decision about this process's cluster role, plus what to say about it.
@@ -304,44 +316,59 @@ pub fn cluster_decision_with(
     retired_table: &[&str],
 ) -> ClusterDecision {
     let clustered = matches!(peers, Some(v) if !v.trim().is_empty());
-    let retired = retired_present(retired, retired_table);
-
-    if !retired.is_empty() {
-        // Retirement outranks the standalone diagnostic: it applies to a healthy cluster
-        // node too, and telling an operator about a dropped setting matters more than
-        // telling them about their role.
-        return ClusterDecision {
-            role: if clustered {
-                NodeRole::Cluster
-            } else {
-                NodeRole::All
-            },
-            notice: ClusterNotice::RetiredIgnored {
-                ignored: retired.join(", "),
-            },
-        };
-    }
-
-    if clustered {
-        return ClusterDecision {
-            role: NodeRole::Cluster,
-            notice: ClusterNotice::Quiet,
-        };
-    }
-
-    if live_wiring.is_empty() {
-        ClusterDecision {
-            role: NodeRole::All,
-            notice: ClusterNotice::Quiet,
-        }
+    // Retirement applies to a healthy cluster node too (the setting does nothing either way),
+    // while "wiring without members" is by definition only true on a node that is NOT clustered.
+    // Both are collected before deciding what to say: see `ClusterNotice::Dropped`.
+    let retired = retired_present(retired, retired_table).join(", ");
+    let wiring_without_members = if clustered {
+        String::new()
     } else {
-        ClusterDecision {
-            role: NodeRole::All,
-            notice: ClusterNotice::WiringWithoutMembers {
-                ignored: live_wiring.join(", "),
-            },
+        live_wiring.join(", ")
+    };
+
+    let role = if clustered {
+        NodeRole::Cluster
+    } else {
+        NodeRole::All
+    };
+    let notice = if retired.is_empty() && wiring_without_members.is_empty() {
+        ClusterNotice::Quiet
+    } else {
+        ClusterNotice::Dropped {
+            wiring_without_members,
+            retired,
         }
+    };
+    ClusterDecision { role, notice }
+}
+
+/// The operator-facing text for [`ClusterNotice::Dropped`], ONE sentence per non-empty group.
+///
+/// Pure and unit-tested because the two sentences are contract: the drill
+/// (`integration/test_startup_knobs.py` K4/K10) greps the wiring sentence verbatim, and the
+/// retirement sentence is what tells an operator which names to delete. Joining them into one
+/// message — rather than returning early on either — is the whole point: a node that is BOTH
+/// standalone and carrying retired names must hear both, in a single line, so neither mistake
+/// can be mistaken for the whole story.
+#[must_use]
+pub fn dropped_notice_text(wiring_without_members: &str, retired: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !wiring_without_members.is_empty() {
+        parts.push(
+            "cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set; this node is \
+             standalone — the wiring listed in `wiring_without_members` is NOT used (no raft \
+             membership, no shared L2 cache, and tenant writes land in the LOCAL database)"
+                .to_string(),
+        );
     }
+    if !retired.is_empty() {
+        parts.push(
+            "these variables were retired by the Arachne control plane (ADR-0001) and are IGNORED; \
+             remove them from the deployment so nobody believes they still do something"
+                .to_string(),
+        );
+    }
+    parts.join(" — AND, at the same time: ")
 }
 
 #[cfg(test)]
@@ -534,8 +561,12 @@ mod tests {
     ///   2. a RETIRED variable set — the node may be clustered, but that setting does
     ///      nothing now.
     ///
+    /// The two are DIFFERENT mistakes with different fixes, and both can be true at once — which
+    /// is why they share one notice instead of one of them returning early.
+    ///
     /// Falsification: make the missing-peers branch `Quiet` and rows 1 fail; drop the
-    /// retirement arm and row 2 fails.
+    /// retirement arm and row 2 fails; restore the early return on retirement and the
+    /// "both at once" row fails.
     #[test]
     fn the_cluster_decision_covers_every_way_to_be_standalone() {
         let wiring = || {
@@ -567,17 +598,17 @@ mod tests {
             assert_eq!(d.role, NodeRole::All, "peers={peers:?}");
             assert_eq!(
                 d.notice,
-                ClusterNotice::WiringWithoutMembers {
-                    ignored: "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN".to_string()
+                ClusterNotice::Dropped {
+                    wiring_without_members: "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN".to_string(),
+                    retired: String::new(),
                 },
                 "peers={peers:?}: configured cluster settings must be named, not dropped in silence"
             );
         }
 
         // Mistake 2: a retired variable. Reported whether or not the node is clustered,
-        // because either way the setting does nothing. The retirement table is empty today,
-        // so the mechanism is exercised through the explicit-table entry point with the name
-        // that is first in line to move in.
+        // because either way the setting does nothing. An explicit table is passed so this
+        // exercises the MECHANISM; the real table's exact contents are pinned separately.
         let retired = cluster_decision_with(
             Some("a=1.1.1.1:7001,b=1.1.1.1:7002,c=1.1.1.1:7003"),
             &[],
@@ -586,13 +617,67 @@ mod tests {
         );
         assert_eq!(
             retired.notice,
-            ClusterNotice::RetiredIgnored {
-                ignored: "HYDRA_ROLE".to_string()
+            ClusterNotice::Dropped {
+                wiring_without_members: String::new(),
+                retired: "HYDRA_ROLE".to_string(),
             },
             "a retired variable must be named even on a healthy cluster node"
         );
         // ...and it must not change the decision.
         assert_eq!(retired.role, NodeRole::Cluster);
+
+        // Mistake 1 AND mistake 2 at once — the state a deployment is in DURING this migration
+        // (the member list has not been added yet, the old role variable is still there). This is
+        // the row that used to be impossible to express: retirement returned early, so the node
+        // heard "remove HYDRA_ROLE" and was never told it had stopped being a cluster node.
+        let both = cluster_decision(None, &wiring(), &["HYDRA_ROLE".to_string()]);
+        assert_eq!(both.role, NodeRole::All);
+        assert_eq!(
+            both.notice,
+            ClusterNotice::Dropped {
+                wiring_without_members: "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN".to_string(),
+                retired: "HYDRA_ROLE".to_string(),
+            },
+            "both mistakes must reach the operator, in one notice"
+        );
+    }
+
+    /// The two sentences of [`ClusterNotice::Dropped`] are contract, and BOTH must appear when
+    /// both groups are non-empty.
+    ///
+    /// Falsification: return early on the retirement group (the pre-2026-10-05 behaviour) and the
+    /// "both" row loses the wiring sentence; drop the wiring sentence and
+    /// `integration/test_startup_knobs.py` K4/K10 lose the line they grep for.
+    #[test]
+    fn the_dropped_notice_text_names_every_group_that_is_present() {
+        let wiring = "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN";
+        let retired = "HYDRA_ROLE, HYDRA_LEADER_LEASE_MS";
+
+        let only_wiring = dropped_notice_text(wiring, "");
+        assert!(
+            only_wiring.contains("cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set")
+        );
+        assert!(
+            !only_wiring.contains("were retired"),
+            "no retirement sentence was earned"
+        );
+
+        let only_retired = dropped_notice_text("", retired);
+        assert!(only_retired.contains("were retired by the Arachne control plane"));
+        assert!(
+            !only_retired.contains("cluster wiring is configured"),
+            "a cluster node with a retired variable is not standalone — saying so would be a lie"
+        );
+
+        let both = dropped_notice_text(wiring, retired);
+        assert!(
+            both.contains("cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set")
+                && both.contains("were retired by the Arachne control plane"),
+            "one message, both mistakes: {both}"
+        );
+        // The names themselves are carried as structured fields on the log record, not in this
+        // text — but the text must not read as if only one mistake exists.
+        assert!(both.len() > only_wiring.len() && both.len() > only_retired.len());
     }
 
     /// A retired variable must be detectable from the environment table alone, and the
