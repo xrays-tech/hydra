@@ -858,17 +858,53 @@ async fn local_write(
     let cfg = std::sync::Arc::clone(&*state.store.snapshot());
     match apply_config_write(pool, &cfg, tenant_id, write).await {
         Ok(outcome) => {
-            // Write-after consistency: reload so the snapshot (and
-            // `config_version`) reflects the committed write. Best-effort: a
-            // failure is logged, not fatal (the write committed; the next reload
-            // recovers).
+            // Write-after consistency: reload so the snapshot (and `config_version`) reflects the
+            // committed write. This is ALSO the publish step (ADR-0001 T3.2: the local swap happens
+            // first, then the tree is committed to the control plane), so its failure is not
+            // cosmetic and the two cases must NOT share one answer:
+            //
+            //   * `NotPublished` — the SQLite transaction committed and THIS node serves the new
+            //     config, but the cluster does not have it. Answering 200 here told the tenant "it
+            //     worked, here is your new `config_version`" while no other node would ever see it:
+            //     measured 2026-10-05 with 2 of 3 members killed, a `PUT /sub-tenants/...` answered
+            //     `200 {"config_version":3,...}` with the head uncommittable. The admin path has
+            //     answered `503 config_not_published` for this exact failure since T3.2; the tenant
+            //     path was left behind when D-6 moved the write to the entry node. Mirrored here.
+            //   * anything else — the reload itself failed, so the runtime keeps serving the
+            //     PREVIOUS snapshot: the write DID commit locally, every later write will also lack
+            //     runtime effect, and that is the `hydra_config_snapshot_stale` case (its gauge is
+            //     owned by `AdminState`, so this path logs at the same ERROR severity and says so).
             if let Err(e) = state.store.reload_all().await {
-                tracing::warn!(
+                if let crate::store::StoreError::NotPublished { reason } = &e {
+                    tracing::error!(
+                        target: "hydra::tenant_api",
+                        tenant = %tenant_id,
+                        trace_id = %trace_id,
+                        %reason,
+                        "post-write PUBLISH FAILED: the local SQLite transaction committed and this \
+                         node serves the new config, but the cluster does not have it"
+                    );
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        503,
+                        "config_not_published",
+                        &format!(
+                            "the change was committed to this node's database but could NOT be \
+                             published to the cluster, so no other node will see it: {reason} — \
+                             retry the same request once the cluster has a majority; the write is \
+                             idempotent and the retry is what publishes it"
+                        ),
+                    )
+                    .await;
+                }
+                tracing::error!(
                     target: "hydra::tenant_api",
                     tenant = %tenant_id,
                     trace_id = %trace_id,
                     error = %e,
-                    "post-write reload_all failed; the in-memory snapshot is now stale"
+                    "post-write reload_all FAILED: the in-memory config snapshot is now STALE (the \
+                     write committed locally with no runtime effect until a reload succeeds)"
                 );
             }
             let version = state.store.version();

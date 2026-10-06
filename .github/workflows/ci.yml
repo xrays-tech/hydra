@@ -323,6 +323,23 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_arachne_control_plane.py
 
+      # A TENANT write that cannot be PUBLISHED must not answer 200. Since D-6 the entry node
+      # applies a tenant self-service write itself and the publish rides on the post-write reload;
+      # when the control plane has no majority the local transaction has ALREADY committed, so the
+      # node serves the new config while the cluster does not have it. Measured 2026-10-05: with 2 of
+      # 3 members killed the write answered `200 {"config_version":3,…}` — and a tenant reads
+      # `config_version` as its reconciliation baseline, so nothing about that answer was true from
+      # the cluster's point of view. The admin path has answered 503 `config_not_published` for the
+      # same failure since T3.2; the tenant path now mirrors it, and this drill pins the answer plus
+      # the recovery (an idempotent retry once quorum returns is what publishes it).
+      - name: tenant write that cannot be published is refused (503 config_not_published)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          python3 integration/test_tenant_write_publish_failure.py
+
       # ACCEPTANCE 2 (ADR-0001): the DATA PLANE under load across a raft failover. The plan's
       # acceptance list has five rows and this is the one that was never executed — its old driver
       # (`test_cluster_ha.py`) drove the retired leader/edge topology, so it could only report

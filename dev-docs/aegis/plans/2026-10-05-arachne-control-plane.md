@@ -857,7 +857,8 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
 | **T4.0 清单半边** | ✅ 已完成 | `docker-compose.cluster.yml` 改为**三个同构成员**（同一 environment 锚点，只有 node id / raft 地址 / 发布端口 / 卷不同）；`docker-compose.local.yml` 去掉 `HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL`、补上 `HYDRA_CLUSTER_PEERS` + `HYDRA_ARACHNE_LISTEN`；`scripts/check_compose_health.cjs` 的角色分支删除（一条规则：每个节点都用 `Authorization: Bearer` 探 `/api/v1/health`）；`scripts/compose_static.cjs` 的三条角色拒绝规则删除；`admin-ui` 的 `alive` 改为三态渲染；`environment/{build.sh,release.sh}` 的特征集补齐 |
 | **T4.2 环境变量** | ✅ 已完成（代码/文档/清单） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单里残留的三处已清除**（见下） |
-| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **验收 2 已执行**（见上表行 2，20 rps / 60 s / 1200 次全 200，含证伪）。 ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。✅ **集群可观测面已落地**：见下节"退役后的可观测面"。**尚未做**：`cluster.md` / `design.md` 逐条改写（`cluster.md` 只加了"该段描述已退役拓扑"的横幅）；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
+| **T4.3 验收与运维文档** | ✅ 基本完成 | ✅ 验收 2 已执行；✅ 集群文档逐条改写（`cluster.md` 全量重写、`design.md` §20 改为指针、`ops.md` §13 与 §5/§9 的角色残留、`deployment.md` §3–§5、`jiqun-deploy.md` 全量重写）；✅ 集群可观测面（死指标退役 + `hydra_arachne_*` 五族 + 四条告警行）；✅ 租户写失败契约对齐（见下）。**剩余**：无已知未做项（`cluster.md` 的成员变更 SOP 已是文字流程，未包成命令——记录在"已知限制"） |
+| ~~**T4.3 验收与运维文档**~~ | ⏳ 进行中 | ✅ **验收 2 已执行**（见上表行 2，20 rps / 60 s / 1200 次全 200，含证伪）。 ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。✅ **集群可观测面已落地**：见下节"退役后的可观测面"。**尚未做**：`cluster.md` / `design.md` 逐条改写（`cluster.md` 只加了"该段描述已退役拓扑"的横幅）；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
 
 ### 清单半边实际改出来的三个缺陷（都不是"文案问题"）
 
@@ -906,6 +907,7 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
   3. 失败信息只说了"没人认领你的目录"，**没说"让多数派一起起来"**——可操作性可以更好。
   **为什么不在本轮改行为**：那条检查正是"目录属于别的集群就拒绝加入"的守卫，放宽它需要独立裁定；
   本轮只把**事实、两个后果、以及演练已按此改写**记录在案。
+* **租户自助写曾经把"没发布"报成 `200`（已修，T4.3 第 3 项）**：D-6 把写搬到入口节点之后，发布这一步挂在写后的 `reload_all` 上，而那条路径只 `warn!` 一句就继续 ⇒ **失去多数派时**本地事务已提交、节点已在用新配置，而集群永远看不到它，租户却收到 `200 {"config_version":3,…}`。**实测 2026-10-05（三节点杀两台）**就是这个结果，而 `config_version` 正是文档让租户用来对账的基线 ⇒ 这个回答**从集群的角度看没有一句是真的**。管理面从 T3.2 起对同一种失败答 `503 config_not_published`；本轮把租户面**对齐**（同一句文案、同一个 code），并补了新演练 `integration/test_tenant_write_publish_failure.py`（6 条判据：健康时 200 / 无多数派 503+code / 文案说明"仅本节点" / 存活节点仍健康 / 恢复多数派后重发同一请求 200 / **另一节点随后确实列出了它** ⇒ 证明"重发即发布"）。**证伪**：把 503 分支改成死代码 ⇒ B/C 两条立刻红且逐字复现 `HTTP 200 code=None`。
 * **`scripts/check_tenant_error_codes.cjs` 也是红的，而且从 T3.5 起就红**（CI 的 `scripts` 作业跑它）。
   它不是本地噪声：那 4 条被记为 DRIFT 的错误码正是**随转发层一起消失的对外契约**——
   `too_many_requests`(429)、`no_leader`(503)、`forward_result_unknown`(504)、`forward_failed`(502)；
@@ -914,9 +916,11 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
   所以真正的问题不是守卫，而是**那张表仍在告诉集成方去按 `code` 重试**：`504 forward_result_unknown`
   ⇒ "先重读再重试"、`503 no_leader` ⇒ "必须换边缘节点"——**这两个码再也不会出现**，而
   §"传输语义"的 OC-4 例外（"写端点必须经由边缘，leader 自己返回 503"）描述的是已经删掉的转发世界。
-  集成方照它实现的**重试逻辑会永远等不到那个分支**（不是崩溃，是静默失效）。**本轮未改**：这是
-  **对外契约**的退役，需要独立裁定（改 §6 表 + §5.6 + OC-4 + 那张 retry 表），且要与
-  `tenant-api-integration.md` 的其他读者一起看。
+  集成方照它实现的**重试逻辑会永远等不到那个分支**（不是崩溃，是静默失效）。**已修（T4.3 第 3 项）**：
+  §6 总表与 §5.6 的三条转发错误码退役、`too_many_requests` 退役（写端点的额度随内部端点一起没了，
+  通用预算给的是 `rate_limited`）、`config_not_published` 补进两张表与排障表，**§5.6 的 OC-4 例外明确
+  标注"不再是约束"**（任何节点都接受并执行租户写——这是**撤销**一条集成方可能已经据此做过路由的约束，
+  必须写出来）。守卫现在绿：`27 documented error code(s) match the emitted status`。
 
 * **`integration/test_startup_knobs.py` 是红的：11 条失败**（实测 2026-10-05，`.github/workflows/ci.yml` 有它的步骤）。这份演练整份是围绕 `HYDRA_ROLE` 写的：K1/K2/K3 用 `HYDRA_ROLE=edge` 造"集群节点"、K4/K5/K6/K11 断言"角色写错但配了 wiring ⇒ 报出被丢弃的变量"、K8 用 `" edge "`。角色退役后这些前提到处不成立。**它自己的 K9/K12 仍绿，K7 的一半仍绿**——也就是说：不是整份作废，是**地基换了**。移植方案与 `test_cluster_limits.py` / `test_auth_cache_layers.py` 同一批（T4.3 的"移植"项），口径都是 `HYDRA_CLUSTER_PEERS`。
 * **`HYDRA_CLUSTER_TOKEN` 现在是一个没有消费者的启动要求**：`/api/v1/internal/*` 这个路由族已经**一条都不存在**（随快照通道与转发的管理写一起退役），闸门代码还在（`admin/mod.rs:717`，任何该前缀的请求现在得到 401 而不是 404），而 `main.rs` 仍**要求**它存在且够强，三个清单也都用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它。也就是说：运维必须为一件没人读的东西准备一个秘密，而删掉它是**部署契约变化**（要连同清单、`CLUSTER_ONLY_ENV`、启动拒绝、`test_startup_knobs.py` K10 一起动），所以本轮只把它**写进启动点注释**（`main.rs` 那段契约里）并登记在此，**不改行为**。
