@@ -63,7 +63,12 @@ use std::hash::{Hash, Hasher};
 /// instead of a bare `CertMeta`, so this build and a build speaking 1 decode the
 /// same bytes differently. A node from either side now refuses the other's toc by
 /// name instead of failing later on a serde error.
-pub const TOC_FORMAT: u32 = 2;
+///
+/// **3** — entity keys gained their content hash (`hydra/cfg/e/<path>/<hash>`,
+/// [`cfg_entity`]). Same toc bytes, different KEYS: a build speaking 2 would look for entities
+/// where this one does not put them, so the two must refuse each other rather than half-read a
+/// tree.
+pub const TOC_FORMAT: u32 = 3;
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";
@@ -94,12 +99,28 @@ pub fn cfg_toc(toc_hash: &str) -> String {
     format!("{CFG_PREFIX}toc/{toc_hash}")
 }
 
-/// One entity, keyed by its own path — **not** by the tree it currently belongs
-/// to, because an unchanged entity is not rewritten and therefore outlives the
-/// tree that introduced it (see the module docs).
+/// One entity, keyed by its PATH and its CONTENT HASH.
+///
+/// ## Why the content hash is in the key
+///
+/// The path half is what makes an entity findable and greppable, and it is what let an unchanged
+/// entity outlive the tree that introduced it (keying by the TREE hash was tried and broke: a new
+/// tree could not find entities nobody had rewritten). The hash half is what makes CONCURRENT
+/// PUBLISHERS safe.
+///
+/// Without it, two nodes publishing at the same time write the same key with different bytes: the
+/// head ends up naming one tree, but a path can hold the OTHER publisher's bytes, so the toc's
+/// content hash and the stored value disagree and every reader refuses the tree — the whole
+/// cluster serves last-known-good until somebody publishes again. Measured, not theorised: with
+/// path-only keys, three real nodes showed it (see `arachne_store::publish`'s KNOWN RISK note,
+/// now resolved by this function).
+///
+/// With the hash in the key, two versions of one entity simply coexist, the winner's tree names
+/// exactly the keys it wrote, and any interleaving leaves a COMPLETE, consistent tree named by the
+/// head. The loser's entities are unreferenced (GC is still an open task, so they accumulate).
 #[must_use]
-pub fn cfg_entity(path: &EntityPath) -> String {
-    format!("{CFG_PREFIX}e/{}", path.to_key_segment())
+pub fn cfg_entity(path: &EntityPath, content_hash: &str) -> String {
+    format!("{CFG_PREFIX}e/{}/{}", path.to_key_segment(), content_hash)
 }
 
 /// Where one entity lives inside a config tree.
@@ -316,6 +337,16 @@ pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[..8].copy_from_slice(&hasher.finish().to_be_bytes());
     out
+}
+
+/// Lower-case hex of a content hash: the spelling used in [`cfg_entity`] keys and in `ctl/head`.
+///
+/// One function rather than the inline `format!("{b:02x}")` loop that used to live in
+/// [`Toc::hash`] alone: the key spelling and the head spelling must be the SAME string, or a
+/// reader would look for an entity under a name the writer never used.
+#[must_use]
+pub fn hex_hash(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The kind name used in error messages, so an operator learns WHICH identifier
@@ -556,8 +587,7 @@ impl Toc {
     /// names it.
     #[must_use]
     pub fn hash(&self) -> String {
-        let digest = content_hash(&self.encode());
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        hex_hash(&content_hash(&self.encode()))
     }
 }
 
@@ -594,8 +624,16 @@ mod tests {
         assert_eq!(ctl_cluster_id(), "hydra/ctl/cluster_id");
         assert_eq!(ctl_format(), "hydra/ctl/format");
         assert_eq!(cfg_toc("abc123"), "hydra/cfg/toc/abc123");
-        assert_eq!(cfg_entity(&target("acme")), "hydra/cfg/e/tenant/acme");
-        assert_eq!(cfg_entity(&EntityPath::Meta), "hydra/cfg/e/meta");
+        // The entity key carries BOTH halves: the path (what an operator greps for) and the
+        // content hash (what makes two concurrent publishers unable to collide).
+        assert_eq!(
+            cfg_entity(&target("acme"), "deadbeef"),
+            "hydra/cfg/e/tenant/acme/deadbeef"
+        );
+        assert_eq!(
+            cfg_entity(&EntityPath::Meta, "deadbeef"),
+            "hydra/cfg/e/meta/deadbeef"
+        );
     }
 
     /// ONE list of every `EntityPath` variant, for the tests that must cover all of them.

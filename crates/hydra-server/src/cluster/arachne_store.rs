@@ -34,8 +34,8 @@ use std::sync::Arc;
 use arachne_kv::client::{ArachneError, Handle};
 
 use super::arachne_keys::{
-    cfg_entity, cfg_toc, content_hash, ctl_head, validate_entities, EntityPath, KeysError, Toc,
-    TocEntry, TOC_FORMAT,
+    cfg_entity, cfg_toc, content_hash, ctl_head, hex_hash, validate_entities, EntityPath,
+    KeysError, Toc, TocEntry, TOC_FORMAT,
 };
 
 /// The entities of one config tree: path → encoded bytes.
@@ -93,27 +93,25 @@ fn map_err(e: ArachneError) -> StoreError {
     }
 }
 
-/// What one publish must write, decided **without** touching the cluster.
+/// The toc describing `next`, validated — the one thing a publish must decide up front.
 ///
-/// Split out because this decision is the part that can be wrong in a way no
-/// integration test would localize: writing nothing extra is a performance
-/// property, but writing the WRONG entity is a correctness one.
-#[derive(Debug, PartialEq, Eq)]
-pub struct PublishPlan {
-    /// Entities to write: those whose path is new, or whose bytes changed.
-    pub write: Vec<(EntityPath, Vec<u8>)>,
-    /// The toc describing the new tree.
-    pub toc: Toc,
-}
-
-/// Decide what to write for `next` given the `previous` tree (if any).
+/// ## What used to be here
+///
+/// `plan_publish(previous_toc, next) -> {write, toc}`: it compared the new tree against the
+/// committed one and listed the entities whose bytes had changed. That comparison was how
+/// "unchanged entities are not rewritten" was decided — and it needed a BASELINE (the committed
+/// toc) that a lagging node cannot supply reliably, which is why it went away with the
+/// content-addressed keys: the key `hydra/cfg/e/<path>/<hash>` answers "is this already stored?"
+/// about itself, checked against this node's own replica
+/// ([`ArachneConfigStore::publish`]).
+///
+/// Validation stays, and it stays FIRST: an id carrying a separator would write into another
+/// entity's namespace, so it has to be refused before a single byte reaches the cluster.
 ///
 /// # Errors
-/// [`KeysError`] when an entity id cannot be carried by a key or the toc.
-pub fn plan_publish(previous: Option<&Toc>, next: &ConfigTree) -> Result<PublishPlan, KeysError> {
-    // Build the toc first: it validates every id, so an unkeyable entity is
-    // refused before a single byte is sent to the cluster.
-    let entries: Vec<TocEntry> = next
+/// [`KeysError`] when an entity id cannot be carried by a key, or the toc cannot be built.
+pub fn toc_for(tree: &ConfigTree) -> Result<Toc, KeysError> {
+    let entries: Vec<TocEntry> = tree
         .iter()
         .map(|(path, bytes)| TocEntry {
             path: path.clone(),
@@ -122,26 +120,7 @@ pub fn plan_publish(previous: Option<&Toc>, next: &ConfigTree) -> Result<Publish
         })
         .collect();
     validate_entities(&entries)?;
-    let toc = Toc::new(TOC_FORMAT, entries)?;
-
-    // A previous toc, when there is one, is what makes "unchanged" decidable:
-    // same path AND same content hash means the stored value is already the
-    // right one, whichever tree names it.
-    let previously_stored = |path: &EntityPath, hash: &[u8; 32]| -> bool {
-        previous.is_some_and(|prev| {
-            prev.entities
-                .iter()
-                .any(|e| &e.path == path && &e.content_hash == hash)
-        })
-    };
-
-    let write = next
-        .iter()
-        .filter(|(path, bytes)| !previously_stored(path, &content_hash(bytes)))
-        .map(|(path, bytes)| (path.clone(), bytes.clone()))
-        .collect();
-
-    Ok(PublishPlan { write, toc })
+    Toc::new(TOC_FORMAT, entries)
 }
 
 /// The commit point for the config tree.
@@ -184,7 +163,10 @@ impl ArachneConfigStore {
 
         let mut tree = ConfigTree::new();
         for entry in &toc.entities {
-            let key = cfg_entity(&entry.path);
+            // The key carries the hash, so asking for an entity asks for EXACTLY the bytes the toc
+            // describes — a concurrent publisher writing a different version of the same entity
+            // writes a different key and cannot be picked up here by mistake.
+            let key = cfg_entity(&entry.path, &hex_hash(&entry.content_hash));
             let bytes = match self.handle.get_stale(key.as_bytes()).await {
                 Ok(Some(v)) => v,
                 Ok(None) => {
@@ -195,8 +177,9 @@ impl ArachneConfigStore {
                 }
                 Err(e) => return Err(map_err(e)),
             };
-            // The check that makes a torn read impossible to serve: the bytes
-            // must be the bytes the toc describes.
+            // Still verified, although the key already commits to the hash: this is what catches a
+            // store that returned the wrong value (or bytes that rotted), and it is the check that
+            // makes a torn read impossible to SERVE.
             if bytes.len() != entry.len as usize || content_hash(&bytes) != entry.content_hash {
                 return Err(StoreError::Arachne(format!(
                     "entity {} in tree {hash} does not match the hash its table of contents \
@@ -228,22 +211,10 @@ impl ArachneConfigStore {
     /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Arachne`] for a
     /// transport or quorum failure.
     pub async fn publish(&self, tree: &ConfigTree) -> Result<String, StoreError> {
-        // What is currently committed decides what has to be written. A read
-        // failure here is fatal to the publish: publishing against an unknown
-        // baseline would rewrite everything (correct but wasteful) or, worse,
-        // the caller could mistake it for "nothing changed".
-        let previous = match self.read().await {
-            Ok(ReadOutcome::Empty) => None,
-            Ok(ReadOutcome::Tree(t)) => Some(t),
-            Err(e) => return Err(e),
-        };
-        let previous_toc = match previous.as_ref() {
-            None => None,
-            Some(t) => Some(toc_for(t)?),
-        };
-
-        let plan = plan_publish(previous_toc.as_ref(), tree)?;
-        let toc_hash = plan.toc.hash();
+        // The toc first: it validates every id, so an unkeyable entity is refused before a single
+        // byte is sent to the cluster.
+        let toc = toc_for(tree)?;
+        let toc_hash = toc.hash();
         // THE REDIRECTING HANDLE, on purpose (2026-10-05, user ruling).
         //
         // This used to be `without_redirect()`, chosen in T2.2 when `put` on a follower returned
@@ -259,29 +230,32 @@ impl ArachneConfigStore {
         // but see `KNOWN RISK` below: the sequence is not atomic.
         let writer = &self.handle;
 
-        // KNOWN RISK (documented, not fixed here): with the redirecting handle, two nodes can
-        // publish CONCURRENTLY, and entity keys are addressed by PATH (`hydra/cfg/e/<path>`) while
-        // their content is verified by HASH from the toc. If two publishes interleave, the loser's
-        // entity write can land under a path the winner's toc then describes with a different
-        // hash, and readers reject the tree ("a mismatch is a retry") for as long as that head
-        // stands — every node serves its last-known-good config and materialization keeps failing
-        // until the next publish. It is loud and recoverable, and it is the price of "any node may
-        // publish"; the clean fix is CONTENT-ADDRESSED entity keys
-        // (`hydra/cfg/e/<path>/<content-hash>`), which makes an interleaving harmless — the loser's
-        // tree is simply unreferenced. Tracked in the ADR's residual-risk table.
+        // Why no baseline read: with content-addressed entity keys, "is this entity already
+        // stored?" is answered by the KEY ITSELF (`hydra/cfg/e/<path>/<hash>`), and can be checked
+        // against this node's own replica without a round trip and without trusting a possibly
+        // stale view of the head. The earlier design read the committed toc and compared hashes
+        // against it; that needed a baseline that a lagging node cannot always supply, and a stale
+        // baseline could make it SKIP writing an entity whose key had been collected.
         //
+        // The check costs one LOCAL read per entity and saves a raft log entry per unchanged
+        // entity — the property the key-path design was chosen for.
         // 1. entities — a failure here leaves the old tree committed and the new
         //    one unreachable, because nothing names it yet.
-        for (path, bytes) in &plan.write {
-            writer
-                .put(cfg_entity(path).as_bytes(), bytes)
-                .await
-                .map_err(map_err)?;
+        //
+        // `get_stale` on our own replica: a "missing" answer from a lagging node only costs a
+        // redundant, idempotent put, while a "present" answer cannot be wrong about the CONTENT
+        // (the key it answered for is derived from that content's hash).
+        for (path, bytes) in tree.iter() {
+            let key = cfg_entity(path, &hex_hash(&content_hash(bytes)));
+            if matches!(self.handle.get_stale(key.as_bytes()).await, Ok(Some(_))) {
+                continue;
+            }
+            writer.put(key.as_bytes(), bytes).await.map_err(map_err)?;
         }
 
         // 2. the toc
         writer
-            .put(cfg_toc(&toc_hash).as_bytes(), &plan.toc.encode())
+            .put(cfg_toc(&toc_hash).as_bytes(), &toc.encode())
             .await
             .map_err(map_err)?;
 
@@ -295,21 +269,6 @@ impl ArachneConfigStore {
     }
 }
 
-/// The toc for an already-materialized tree, used to compare a publish against
-/// what is committed.
-fn toc_for(tree: &ConfigTree) -> Result<Toc, KeysError> {
-    Toc::new(
-        TOC_FORMAT,
-        tree.iter()
-            .map(|(path, bytes)| TocEntry {
-                path: path.clone(),
-                content_hash: content_hash(bytes),
-                len: bytes.len() as u32,
-            })
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,110 +280,16 @@ mod tests {
             .collect()
     }
 
-    /// The previous toc for a tree, as a publisher would have written it.
-    fn toc_of(t: &ConfigTree) -> Toc {
-        Toc::new(
-            TOC_FORMAT,
-            t.iter()
-                .map(|(path, bytes)| TocEntry {
-                    path: path.clone(),
-                    content_hash: content_hash(bytes),
-                    len: bytes.len() as u32,
-                })
-                .collect(),
-        )
-        .expect("fixture toc")
-    }
-
     /// The first publish has nothing to compare against, so everything is new.
     ///
-    /// Falsification: treat "no previous toc" as "nothing changed" and this
-    /// fails with an empty write set — a cluster that publishes an empty config.
+    /// The toc describes exactly the tree it is built from, and the toc is what the reader
+    /// verifies against — so an entry that does not describe its own bytes would make every read
+    /// fail.
     #[test]
-    fn the_first_publish_writes_every_entity() {
-        let next = tree(&[("a", b"one"), ("b", b"two")]);
-        let plan = plan_publish(None, &next).expect("plan");
-        assert_eq!(
-            plan.write.len(),
-            2,
-            "with no previous tree every entity must be written"
-        );
-        assert_eq!(plan.toc.entities.len(), 2);
-    }
-
-    /// The property that makes this a tree and not a blob: an edit writes THAT
-    /// entity and nothing else.
-    ///
-    /// Falsification: compare paths instead of content hashes and the
-    /// "unchanged" assertion fails, because the path of `a` is present in both
-    /// trees.
-    #[test]
-    fn an_edit_rewrites_only_the_entities_that_changed() {
-        let before = tree(&[("a", b"one"), ("b", b"two"), ("c", b"three")]);
-        let mut after = before.clone();
-        after.insert(EntityPath::Tenant("b".into()), b"TWO".to_vec());
-
-        let plan = plan_publish(Some(&toc_of(&before)), &after).expect("plan");
-        assert_eq!(
-            plan.write,
-            vec![(EntityPath::Tenant("b".into()), b"TWO".to_vec())],
-            "only the edited entity may be written"
-        );
-        assert_eq!(
-            plan.toc.entities.len(),
-            3,
-            "the new tree still names all three"
-        );
-    }
-
-    /// An untouched config plans no writes at all: publishing is idempotent, and
-    /// a no-op publish must not churn the log.
-    ///
-    /// Falsification: rebuild every entry unconditionally and this fails.
-    #[test]
-    fn an_unchanged_tree_plans_no_writes() {
+    fn the_toc_describes_exactly_the_tree_it_names() {
         let t = tree(&[("a", b"one"), ("b", b"two")]);
-        let plan = plan_publish(Some(&toc_of(&t)), &t).expect("plan");
-        assert!(
-            plan.write.is_empty(),
-            "an unchanged tree must write nothing, got {:?}",
-            plan.write
-        );
-    }
-
-    /// Addition and removal are both expressed by the toc alone: a removal needs
-    /// no write, and the removed entity is simply absent from the new tree.
-    ///
-    /// Falsification: carry the entity set from the PREVIOUS toc and the
-    /// removal assertion fails — a deleted tenant would keep serving.
-    #[test]
-    fn additions_and_removals_are_expressed_by_the_toc() {
-        let before = tree(&[("a", b"one"), ("b", b"two")]);
-        let mut after = before.clone();
-        after.remove(&EntityPath::Tenant("b".into()));
-        after.insert(EntityPath::Tenant("c".into()), b"three".to_vec());
-
-        let plan = plan_publish(Some(&toc_of(&before)), &after).expect("plan");
-        assert_eq!(
-            plan.write,
-            vec![(EntityPath::Tenant("c".into()), b"three".to_vec())],
-            "only the addition is written; the removal is expressed by the toc"
-        );
-        let paths: Vec<&EntityPath> = plan.toc.entities.iter().map(|e| &e.path).collect();
-        assert!(
-            !paths.contains(&&EntityPath::Tenant("b".into())),
-            "the removed entity must not appear in the new toc"
-        );
-        assert!(paths.contains(&&EntityPath::Tenant("c".into())));
-    }
-
-    /// The toc a plan carries must hash exactly like the tree it describes, or
-    /// the head would name a tree whose contents differ from what was planned.
-    #[test]
-    fn the_planned_toc_describes_exactly_the_planned_tree() {
-        let t = tree(&[("a", b"one"), ("b", b"two")]);
-        let plan = plan_publish(None, &t).expect("plan");
-        for entry in &plan.toc.entities {
+        let toc = toc_for(&t).expect("toc");
+        for entry in &toc.entities {
             let bytes = t.get(&entry.path).expect("every entity is in the tree");
             assert_eq!(
                 entry.content_hash,
@@ -434,18 +299,47 @@ mod tests {
             );
             assert_eq!(entry.len as usize, bytes.len());
         }
-        assert_eq!(plan.toc.entities.len(), t.len());
+        assert_eq!(toc.entities.len(), t.len());
     }
 
-    /// An id that cannot be keyed must be refused at plan time — before anything
-    /// reaches the cluster — because a `/` would write into another entity's
-    /// namespace.
+    /// One entity's key contains its own content hash, so two versions of it coexist.
     ///
-    /// Falsification: drop the validation and this returns `Ok`.
+    /// THIS IS THE PROPERTY THAT MAKES CONCURRENT PUBLISHING SAFE. Two nodes publishing at the
+    /// same time write different keys for the same entity when their content differs, so whichever
+    /// head lands last names a tree whose entities are all present and all match their recorded
+    /// hashes. With the previous path-only keys the loser's write landed on the winner's key and
+    /// every reader refused the tree.
+    #[test]
+    fn two_versions_of_one_entity_get_two_keys() {
+        let v1 = tree(&[("a", b"one")]);
+        let v2 = tree(&[("a", b"TWO")]);
+        let key = |t: &ConfigTree| {
+            cfg_entity(
+                &EntityPath::Tenant("a".into()),
+                &hex_hash(&content_hash(
+                    t.get(&EntityPath::Tenant("a".into())).expect("entity"),
+                )),
+            )
+        };
+        assert_ne!(
+            key(&v1),
+            key(&v2),
+            "two different contents for one path must not share a key, or an interleaved \
+             publish would leave the winner's toc describing bytes that are no longer there"
+        );
+        // ...and the SAME content keeps one key, which is what makes "already stored" decidable
+        // and an unchanged entity un-rewritten.
+        assert_eq!(key(&v1), key(&tree(&[("a", b"one")])));
+    }
+
+    /// An id that cannot be keyed must be refused BEFORE anything reaches the cluster, because a
+    /// `/` would write into another entity's namespace.
+    ///
+    /// Falsification: drop `validate_entities` from `toc_for` and this returns `Ok`.
     #[test]
     fn an_unkeyable_entity_id_is_refused_before_any_write() {
         let bad = tree(&[("../../ctl/head", b"x")]);
-        let got = plan_publish(None, &bad);
+        let got = toc_for(&bad);
         assert!(
             matches!(got, Err(KeysError::IdHasSeparator { .. })),
             "a path-bearing id must be refused, got {got:?}"

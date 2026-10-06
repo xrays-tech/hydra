@@ -89,7 +89,7 @@ Redis（只是数据面的加速器与近似计数器，不是任何权威）
 | `hydra/ctl/node/<node_id>` | `{listen_addr, raft_id, admin_addr, heartbeat_ms}` | 每节点每 10 s（**仅诊断 / 管理 UI 展示**，不是发现权威 —— 地址的权威是 `HYDRA_CLUSTER_PEERS`） |
 
 > **键布局在 T2.2 改过一次，以上表格是方案定稿时的写法**：实际落地为
-> **toc 按哈希取名**（`hydra/cfg/toc/<toc-hash>`）、**实体按路径稳定寻址**（`hydra/cfg/e/<path>`），
+> **toc 按哈希取名**（`hydra/cfg/toc/<toc-hash>`）、**实体按「路径 + 内容哈希」寻址**（`hydra/cfg/e/<path>/<content-hash>`；2026-10-05 从纯路径改成这样，理由见下方 T3.2 记录），
 > 因为实体只在内容变化时才写——「没变的实体」留在旧树哈希下，新树就找不到它（实测报错
 > `tree <h> is missing entity tenant/acme`）。`EntityPath` 段名见 `arachne_keys.rs`。
 > 另外 `meta` 与 `token` 两个实体**至今没有生产者**（`grep EntityPath::Meta|EntityPath::Token` 在
@@ -643,6 +643,15 @@ Plan Pressure Test:
 - **Verification**：`cargo test -p hydra-server --features "server,arachne"`；故障注入用例 ②③④ 各一次。
 - **Retirement Track**：`config_meta` 的「版本权威」语义退役（表与列保留）。
 
+#### 残留风险已消除：实体键改为内容寻址（2026-10-05，用户裁定 A）
+
+`cfg_entity(path, content_hash)` ⇒ `hydra/cfg/e/<path>/<content-hash>`（原来是 `hydra/cfg/e/<path>`）。`TOC_FORMAT` 2→3（toc 字节没变，但**键**变了，说 2 的 build 会去错误的位置找实体，两者必须互相拒绝）。
+
+- **为什么**：路径寻址下，两个并发发布者写**同一个键**；head 最终只指向一棵树，但那个路径上可能是**另一个发布者的字节** ⇒ toc 的 content-hash 与实存不符 ⇒ 读侧拒绝（「a mismatch is a retry」）⇒ **全集群停在 last-known-good，直到有人再发布一次**。内容寻址后两个版本各自成键、互不覆盖，head 指向哪棵树，那棵树就是完整的。
+- **连带简化**：`plan_publish`/`PublishPlan` **删掉**了。它靠「读已提交的 toc 做基线」来决定哪些实体不用重写，而**滞后的节点拿不到可靠基线**（而且拿旧基线跳过写入时，那个键可能已经被回收）。现在「是否已存」由**键本身**回答（键就是内容哈希），对着**本节点自己的副本**查一次即可，不需要基线、不需要 round trip。`toc_for(tree)` 保留（校验必须发生在任何写入之前）。
+- **守卫**：`tests/arachne_store.rs::an_interleaved_publish_cannot_tear_the_tree_named_by_the_head`——**确定性地**构造交错（A 发布 → B 发布 → 把 head 写回 A → 读；再写回 B → 读）。**已反向证伪**：把 `cfg_entity` 临时改回路径寻址，这条用例立刻变红，报错正是 `entity tenant/acme in tree <h> does not match the hash its table of contents records; refusing to serve a mixed tree`。
+- **未做**：旧键的 **GC 仍未实现**（内容寻址后旧版本会累积）。计划里 GC 本来就是独立任务；在 GC 落地前，「跳过写入」是安全的（键不会被删），一旦实现 GC 必须保证：**只回收不被任何 live toc 引用的键**，且要考虑滞后发布者可能引用旧 toc。
+
 #### T3.1 的验收：真实 3 节点已执行（2026-10-05）
 
 `crates/hydra-server/tests/arachne_three_nodes.rs`——三个真 raft 成员（真端口）、三个 `ConfigStore`（三个 SQLite）、三个发布者与三个物化器，即 `main.rs` 的那套装配。两条用例：
@@ -656,7 +665,7 @@ Plan Pressure Test:
 - 但**上游 0.1.2 把这个前提改掉了**（探针 p11：follower 的 `put` 会被转发），而你本轮的裁定（乙：任意节点就地执行 + 就地发布）正建立在这个前提上。保留 `without_redirect()` 的后果是**发布退化成 leader 独占**：三个真节点上一跑，3 次写里有 2 次直接 `NotPublished{NotLeader}`。
 - 改法：`publish` 改用**可重定向的 handle**，让库把逐条 `put`（实体 → toc → head）转发给 leader。改完两条用例都过。
 
-**由此产生的一条残留风险（已记入 ADR，未在本轮修）**：实体键是**按路径**寻址（`hydra/cfg/e/<path>`）而内容按**哈希**校验，所以两个节点**并发**发布时可能交错，输者的实体写落在赢者 toc 用另一个哈希描述的那个路径上 ⇒ 读侧哈希不匹配、**每个节点都拒绝这棵树**（退化为继续服务 last-known-good，直到下一次发布）。彻底的做法是把实体键改成**内容寻址**（`hydra/cfg/e/<path>/<content-hash>`），交错就变得无害（输者的树只是无人引用）。**待用户裁定是否现在做。**
+**由此产生的残留风险（用户裁定 A 后已消除，见上节）**：实体键是**按路径**寻址（`hydra/cfg/e/<path>`）而内容按**哈希**校验，所以两个节点**并发**发布时可能交错，输者的实体写落在赢者 toc 用另一个哈希描述的那个路径上 ⇒ 读侧哈希不匹配、**每个节点都拒绝这棵树**（退化为继续服务 last-known-good，直到下一次发布）。彻底的做法是把实体键改成**内容寻址**（`hydra/cfg/e/<path>/<content-hash>`），交错就变得无害（输者的树只是无人引用）。**待用户裁定是否现在做。**
 
 #### T3.2 实现记录（2026-10-05；与上面的 Steps 不一致处以这里为准）
 

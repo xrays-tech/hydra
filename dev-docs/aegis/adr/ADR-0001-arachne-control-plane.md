@@ -160,6 +160,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | cert 私钥随树走（D-7 的 (b)） | 本轮 | `cert` 实体改为 `CertTreeEntity{meta, sealed_key}`；解码时回填 `cert_key_pem`；缺少密封材料**拒绝发布**而不是丢掉密钥；`TOC_FORMAT` 1→2（同一批字节两种解法的版本必须互相拒绝） |
 | 集合的编码序（D-8 推论②） | 本轮 | `tenant_providers` / `tenant_models` 是 `HashSet`，改为**排序后**编码（`sorted_members`），否则同一配置每次读库换树名 |
 | 解码必须复现 loader 的**推导规则** | 本轮 | ① 四个 `Vec` 的排序原先一律按 `id`，而 loader 用的是 SQL `ORDER BY`（`limit_role.created_at,id` / `binding.key_prefix` / `sub_tenant.tenant_id,name` / `route.sub_tenant_id,model_key`）⇒ 副本持有的顺序与 leader 不同；② `tenants_by_domain` 的键在 loader 侧是**小写域**，解码侧却拿值里的原样域名当键 ⇒ 存储域名为混合大小写时，副本上的租户落在**没人会去查的键**下（`proxy::resolve_tenant` 用小写 `Host` 查表），于是同一租户在 leader 上解析得到、在副本上解析不到。守卫：`tests/arachne_derivation_fidelity.rs`（两处都先红后绿，fixture 让"loader 序"与"id 序"反向、让域名非小写） |
+| 实体键内容寻址（消除并发发布撕裂） | 本轮 | `hydra/cfg/e/<path>/<content-hash>`；`read` 按 (path,hash) 取、`publish` 用键自身判断「是否已存」（对本节点副本查一次，不要基线），`plan_publish` 删除。`TOC_FORMAT` 2→3 |
 | 3 节点验收执行（T3.1 Verification） | 本轮 | `tests/arachne_three_nodes.rs`：三个真 raft 成员 + 三个真 store/库。① 一个写入 ⇒ 三者物化同一个 toc-hash、都服务、都落盘；② 写到**非 leader** 节点同样发布成功、三者收敛。顺带抓出并修掉一处与裁定冲突的代码：`publish` 原用 `without_redirect()`（T2.2 时代把「follower 写被拒」当写保护原语），在 0.1.2 转发可用后它把发布退化成 leader 独占 —— 改回可重定向 handle |
 | 发布切换 + 物化循环落地（T3.2 主体） | 本轮 | `ConfigPublisher` + `ConfigStore::reload_all_with` 里的发布（内容变化才发、本地置换之后）⇒ 本地提交成功但发布失败返回 `StoreError::NotPublished`，admin 层答 503 `config_not_published`（文案是「已提交到本节点库、未发布到集群」）；`main.rs` bootstrap 挂上发布者并**同时**按 1 s 周期拉起物化循环（只发布不物化 = head 没人读，集群静默分叉）。守卫：`a_local_change_is_published_and_another_node_materializes_it`（两个真 store + 一个真 raft 节点：A 写库 → 发布 → B 物化并落盘）、`a_failed_publish_names_itself_and_keeps_serving_locally`（超 1 MiB 单值上限触发） |
 | 真实 target（`ReplicaTarget`） | 本轮 | 先 `db::restore_config`（一个事务重建本地 SQLite）**再** `ConfigStore::apply_snapshot`（换入内存态）：反了会让节点服务一份自己库里没有的配置；`MaterializeTarget` 相应改为 `async`。守卫用例连"把副本自己的库用 loader 读回来 == 发布的那份配置"都钉住了 |
@@ -173,7 +174,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 1. **T3.2 的两条残余**（主体已落地）：① 版本权威仍是自增计数器 `config_meta.config_version`，**没有**换成 head 哈希（权威事实上已是 head，但那个整数水位还没降级）；② `leader_ready` 仍是 Arachne 写探测，**没有**把物化门接上去（「未物化 = 不可当选」尚未生效）。两条都不影响「发布 → 物化」这条链本身。
 2. ~~T3.1 的「真实 3 节点」验收仍未执行~~ → **已执行（2026-10-05）**，见上表。
-3. **残留风险：并发发布可能撕裂树**（已记档，未修）。实体键按**路径**寻址而内容按**哈希**校验，两个节点同时发布时可能交错，使赢者 toc 描述的哈希与某路径上的实际字节不符 ⇒ 读侧哈希不匹配，**所有节点都拒绝该 head**（继续服务 last-known-good，直到下一次发布）。触发条件是「两个节点同时写」，属乙模型自带暴露面。彻底修法 = 实体键**内容寻址**（`hydra/cfg/e/<path>/<content-hash>`），交错即无害。**待裁定是否现在做。**
+3. ~~残留风险：并发发布可能撕裂树~~ → **已消除（2026-10-05）**：实体键从 `<path>` 改为 `<path>/<content-hash>`，两个版本各自成键、互不覆盖；连带删掉 `plan_publish`（它靠「已提交 toc 做基线」，而滞后节点拿不到可靠基线）。`TOC_FORMAT` 2→3。守卫 `an_interleaved_publish_cannot_tear_the_tree_named_by_the_head` 已反向证伪（改回路径寻址即变红，报错就是「refusing to serve a mixed tree」）。**未做**：旧键的 GC——实现时必须只回收不被任何 live toc 引用的键。
 3. ~~`SealedMaterial` 缺"从已存密文构造"的入口~~ → **该条已作废**：D-9 用确定性密封取代了整条思路，`SealedMaterial` 已删除。
 3. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
 4. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。

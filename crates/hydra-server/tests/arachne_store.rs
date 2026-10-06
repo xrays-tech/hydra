@@ -24,14 +24,16 @@ use std::path::PathBuf;
 
 use arachne_kv::server::{assemble_cluster, ClusterConfig};
 use arachne_kv::{NodeId, Profile};
-use hydra_server::cluster::arachne_keys::{cfg_entity, content_hash, ctl_head, EntityPath};
+use hydra_server::cluster::arachne_keys::{
+    cfg_entity, content_hash, ctl_head, hex_hash, EntityPath,
+};
 use hydra_server::cluster::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome};
 
 /// A raft member must be dialable at the address its peers were told about, so
 /// these cannot be OS-assigned — and cargo runs the tests in this file
 /// concurrently, so they cannot share one either (measured: a shared port fails
 /// with "Address already in use").
-const PORTS: [u16; 5] = [18211, 18212, 18213, 18214, 18215];
+const PORTS: [u16; 6] = [18211, 18212, 18213, 18214, 18215, 18216];
 
 fn data_dir(tag: &str) -> PathBuf {
     let dir =
@@ -182,7 +184,12 @@ async fn an_unchanged_publish_does_not_rewrite_entities() {
     // And the stored entity under the new hash is readable and correct — i.e.
     // skipping the write did not leave a hole.
     for (id, bytes) in [("acme", b"one"), ("globex", b"two")] {
-        let key = cfg_entity(&EntityPath::Tenant(id.to_string()));
+        // The key carries the content hash, so this asks for exactly the bytes the committed toc
+        // describes.
+        let key = cfg_entity(
+            &EntityPath::Tenant(id.to_string()),
+            &hex_hash(&content_hash(bytes)),
+        );
         let got = node
             .handle
             .get_stale(key.as_bytes())
@@ -213,8 +220,13 @@ async fn a_tampered_entity_is_refused_rather_than_served() {
     let t = tree(&[("acme", b"the real config")]);
     let _hash = store.publish(&t).await.expect("publish");
 
-    // Rewrite the entity's value behind the store's back, keeping the same key.
-    let key = cfg_entity(&EntityPath::Tenant("acme".into()));
+    // Rewrite the entity's value behind the store's back, under the key the committed toc names:
+    // with content-addressed keys the key IS the claim about the bytes, so writing different bytes
+    // there is exactly the corruption this check exists for (a store that returns the wrong value).
+    let key = cfg_entity(
+        &EntityPath::Tenant("acme".into()),
+        &hex_hash(&content_hash(b"the real config")),
+    );
     node.handle
         .without_redirect()
         .put(key.as_bytes(), b"a different config")
@@ -295,6 +307,69 @@ async fn the_store_commits_to_the_documented_head_key() {
         String::from_utf8_lossy(&stored),
         hash,
         "the value under ctl_head must be the published tree's hash"
+    );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// CONCURRENT PUBLISHERS MUST NOT BE ABLE TO TEAR A TREE.
+///
+/// The scenario, made deterministic instead of hoped-for: two nodes publish two versions of the
+/// same entity, and the FIRST publisher's head write lands LAST. The head then names a tree whose
+/// entity must still be the bytes its toc records.
+///
+/// This is why entity keys carry their content hash. With the previous path-only keys
+/// (`hydra/cfg/e/<path>`), publisher B's write for the same path landed on publisher A's key, so
+/// after A's head write won, the toc described bytes that were no longer stored — and every reader
+/// refused the tree ("a mismatch is a retry"), leaving the whole cluster on last-known-good until
+/// somebody published again. Measured on three real nodes, not theorised.
+///
+/// Falsification: drop the hash from `cfg_entity` and this fails on the final read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interleaved_publish_cannot_tear_the_tree_named_by_the_head() {
+    let node = start_node("interleave", PORTS[5]).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    // Publisher A: entity `acme` = "one".
+    let a = tree(&[("acme", b"one")]);
+    let head_a = store.publish(&a).await.expect("A publishes");
+
+    // Publisher B: the SAME path with different bytes, plus a new entity `globex`.
+    let b = tree(&[("acme", b"TWO"), ("globex", b"two")]);
+    let head_b = store.publish(&b).await.expect("B publishes");
+    assert_ne!(
+        head_a, head_b,
+        "different content must name different trees"
+    );
+
+    // The interleave: A's head write reaches the log LAST. Its entities and its toc were written
+    // before B's, which is exactly what an interleaved pair of publishes leaves behind.
+    node.handle
+        .put(ctl_head().as_bytes(), head_a.as_bytes())
+        .await
+        .expect("re-commit A's head");
+
+    // The tree the head now names must be complete AND consistent — that is the property.
+    let read = expect_tree(store.read().await.expect(
+        "the tree named by the head must be readable: an interleaved publish may not leave the \
+         head naming bytes that are not there",
+    ));
+    assert_eq!(
+        read, a,
+        "the head names A's tree, so A's bytes must be what a reader gets"
+    );
+
+    // ...and B's version is still stored under its OWN key, so flipping the head back to B is
+    // equally readable: neither publisher destroyed the other's data.
+    node.handle
+        .put(ctl_head().as_bytes(), head_b.as_bytes())
+        .await
+        .expect("commit B's head");
+    assert_eq!(
+        expect_tree(store.read().await.expect("B's tree must be readable too")),
+        b
     );
 
     node.tonic.shutdown().await;
