@@ -205,6 +205,17 @@ kubectl -n $NS delete pod hydra-<writer> --grace-period=0 --force
 
 更多演练、实测数字与成员变更 SOP 见 [`dev-docs/cluster.md`](cluster.md) §6。
 
+#### 从"全停"恢复（**先读这一条再动手**）
+
+- **目录已被认领过**（`/app/data/arachne` 里有内容，即集群跑过一次）⇒ 正常起，**顺序起也没问题**
+  （每台低头读自己那份，实测单台 ~500 ms 不需要多数派）。
+- **目录全新**（首次安装，或 PVC 被清掉）⇒ 必须让**多数派同时可用**：`podManagementPolicy: Parallel`
+  就是为这一步设的。只起一台时它会在 **10 秒**后退出并打印
+  `no member adopted this node's Arachne data directory within 10s …`（错误里已写明该怎么做）；
+  **反复重启那台没有用**——缺的是多数派，不是重试。
+- 如果报的是 `belongs to a different cluster` / `cluster_id mismatch`，那是**配置问题**（成员表被改过、
+  或卷挂错），不是启动顺序问题，见 §5 的警告。
+
 ---
 
 ## 8. 相关文档

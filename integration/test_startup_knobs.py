@@ -71,6 +71,12 @@ Every leg observes the REAL binary (process exit code + log text), never a helpe
   K12 the BOUNDARY of K1/K2: on the single-node default the misspelt mode is never validated, so an
       operator gets no signal at all. Read the qualifier above before quoting K1/K2 as an
       unconditional promise.
+  K13 a data directory that has never been claimed, with NO majority up, refuses to start AFTER the
+      10 s deadline — and the ERROR says what to DO about it (start a majority together /
+      `podManagementPolicy: Parallel`). Measured 2026-10-05: the message named only the symptom, and
+      the two actions took an afternoon of reading source to find; this leg is what keeps the
+      guidance in the message. It runs BEFORE the trio starts, because the directory must still be
+      unclaimed — and it is also the leg that proves the deadline is real.
 
 Run: python3 integration/test_startup_knobs.py        # needs target/debug/hydra + a Redis
      HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_startup_knobs.py
@@ -79,6 +85,7 @@ Exit 0 pass · 1 an assertion failed · 2 could not verify (no binary / no Redis
 import base64
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -405,6 +412,34 @@ def line_about(log, needle):
     return ""
 
 
+def adoption_leg(node):
+    """K13: an unclaimed data directory + no majority ⇒ refuse, and say what to do.
+
+    Run BEFORE the trio starts: the victim's directory must still carry no cluster identity, which is
+    exactly the state a first install is in. The budget is 16 s because the deadline itself is 10 s —
+    the leg measures the refusal AND the wait, so an implementation that failed instantly for some
+    other reason would not pass it.
+    """
+    fresh = os.path.join(DIR, "k13-fresh-raft")
+    shutil.rmtree(fresh, ignore_errors=True)
+    state, rc, log = observe(
+        "k13_unclaimed_directory_no_majority",
+        node_env(node, {"HYDRA_ARACHNE_DATA_DIR": fresh}),
+        budget=16.0,
+        admin=node[1],
+    )
+    line = line_about(log, "no member adopted this node's Arachne data directory")
+    check("K13: an unclaimed data directory with no majority up refuses to start (after the 10 s "
+          "deadline, not instantly)",
+          state == "exited" and rc not in (0, None) and bool(line),
+          f"state={state} exit={rc} src={line[:150] or '<SILENT: no adoption error>'}")
+    check("K13: ...and the ERROR says what to DO (a majority together / podManagementPolicy: "
+          "Parallel), not only what happened",
+          "MAJORITY" in line and "start the members together" in line
+          and "podManagementPolicy: Parallel" in line,
+          f"src={line[-240:] or '<no line>'}")
+
+
 def bring_up_cluster():
     """Three real members, one leader, adopted data directories — or an honest refusal.
 
@@ -472,6 +507,12 @@ def main():
     if not os.path.exists(BIN):
         print(f"[startup-knobs] CANNOT VERIFY: {BIN} is not built", file=sys.stderr)
         return 2
+    # WIPE the working directory first. It holds each member's Arachne data directory, and a
+    # directory that was ADOPTED by a previous run turns K13 (unclaimed + no majority ⇒ refuse) into
+    # a node that starts in ~500 ms on its local read — measured: leaving it stale made K13 fail with
+    # `state=up`, which is the RIGHT behaviour for an adopted directory and the wrong fixture.
+    # (The other multi-process drills wipe theirs for the same reason.)
+    shutil.rmtree(DIR, ignore_errors=True)
     os.makedirs(DIR, exist_ok=True)
     if not redis_reachable():
         print(f"[startup-knobs] CANNOT VERIFY: no Redis at {REDIS_BASE} "
@@ -489,6 +530,9 @@ def main():
         return 2
     print(f"   ....  isolation: {flush_redis_db()}; ports {ports[0]}-{ports[-1]} free")
 
+    # K13 FIRST: it needs the victim's data directory to be UNCLAIMED, which is only true before the
+    # trio has ever been up (the bring-up below claims it).
+    adoption_leg(CLUSTER_NODES[2])
     victim = bring_up_cluster()
     if victim is None:
         return 2

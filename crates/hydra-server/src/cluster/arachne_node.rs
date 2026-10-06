@@ -912,6 +912,29 @@ pub const PENDING_ADOPTION: &str = "cluster identity not adopted yet";
 /// enough that a genuinely stuck cluster still fails a rollout quickly.
 pub const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(10);
 
+/// What to DO about it, appended to the deadline error.
+///
+/// The first version of that error said only "no member adopted this node's
+/// Arachne data directory within 10s", and the operator reading it is usually
+/// staring at a CrashLoopBackOff, not at `cluster.md`. Measured 2026-10-05: the
+/// failure needs a MAJORITY to be up at the same moment, which is a fact about
+/// START-UP ORDER — and the default Kubernetes StatefulSet policy
+/// (`OrderedReady`) cannot produce that order on a first install, because it
+/// waits for a pod that itself cannot become ready. An error that states the
+/// fact and not the action costs an afternoon of reading source code.
+///
+/// Kept as a constant so a test can assert the two actions are still named
+/// (`start them together`, `Parallel`): the guidance is the whole point of the
+/// message, and prose inside a `format!` is the kind of thing a refactor drops
+/// without noticing.
+pub const ADOPTION_GUIDANCE: &str = "a data directory that has NEVER been claimed needs a \
+     MAJORITY of the member list to be up at the same time, because the claim is a raft write and \
+     only the leader can make it: start the members together. On Kubernetes, a StatefulSet needs \
+     `podManagementPolicy: Parallel` for that — the DEFAULT ordered startup waits for the first pod \
+     to become ready, which cannot happen until a majority exists, so a first install would never \
+     come up. Once a directory has been claimed, this node restarts on a LOCAL read and needs no \
+     majority at all";
+
 /// Poll [`preflight_cluster_id`] until the directory is adopted or the deadline
 /// passes.
 ///
@@ -930,7 +953,8 @@ pub async fn await_cluster_preflight(
         };
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "no member adopted this node's Arachne data directory within {:?}: {pending}",
+                "no member adopted this node's Arachne data directory within {:?}: {pending} — \
+                 {ADOPTION_GUIDANCE}",
                 PREFLIGHT_DEADLINE
             ));
         }
@@ -944,6 +968,39 @@ mod tests {
 
     /// A three-member LAN list, the minimum the parser accepts.
     const THREE: &str = "a=10.0.0.1:7001,b=10.0.0.2:7001,c=10.0.0.3:7001";
+
+    /// The deadline error has to say what to DO, not only what happened.
+    ///
+    /// Whoever reads it is usually looking at a CrashLoopBackOff, not at `cluster.md`, and the fix
+    /// (start a majority together / `podManagementPolicy: Parallel`) is a fact about START-UP ORDER
+    /// that nothing else in the message hints at. Measured 2026-10-05: the message named the
+    /// symptom only, and the two actions below took an afternoon of reading source to find.
+    ///
+    /// Falsification: delete either action from `ADOPTION_GUIDANCE` (or let a refactor fold the
+    /// constant back into the `format!` and drop a line of it) and this fails.
+    #[test]
+    fn the_adoption_deadline_explains_what_to_do() {
+        // The deadline error is `... {PENDING_ADOPTION} — {ADOPTION_GUIDANCE}`, so asserting on the
+        // constant is asserting on the message the operator sees.
+        assert!(
+            ADOPTION_GUIDANCE.contains("MAJORITY"),
+            "the message must name the requirement: {ADOPTION_GUIDANCE}"
+        );
+        assert!(
+            ADOPTION_GUIDANCE.contains("start the members together"),
+            "the message must name the action: {ADOPTION_GUIDANCE}"
+        );
+        assert!(
+            ADOPTION_GUIDANCE.contains("podManagementPolicy: Parallel"),
+            "the Kubernetes half is the one an operator cannot guess: {ADOPTION_GUIDANCE}"
+        );
+        // ...and it must not read as if EVERY restart needs a quorum, which is the opposite mistake
+        // (measured 2026-10-05: an already-claimed directory restarts on a local read in ~500 ms).
+        assert!(
+            ADOPTION_GUIDANCE.contains("LOCAL read"),
+            "the message must not imply that every restart needs a majority: {ADOPTION_GUIDANCE}"
+        );
+    }
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("test fixture address")

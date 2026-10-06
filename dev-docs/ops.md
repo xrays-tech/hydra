@@ -1689,6 +1689,24 @@ is the configured list); only liveness is unknowable. The retired registry, its 
 series (`hydra_registry_nodes`, `hydra_registry_reaped_total`) are gone — see §9.1's RETIRED rows —
 and `HYDRA_REGISTRY_STALE_GRACE_SECS` is in §13.3b's retired list.
 
+### 13.6b Recovery from a full stop (every member down)
+
+The one thing to know before restarting anything: **a data directory that was never claimed needs a
+MAJORITY up at the same time**, because the claim is a raft write and only the leader can make it.
+A directory is claimed exactly once, so this is a fact about the FIRST start (or about PVCs that were
+replaced), not about ordinary restarts.
+
+| State of `/app/data/arachne` on the members | What to do |
+|---|---|
+| **Present** (the cluster has run before) | start normally; ORDER DOES NOT MATTER — each node reads its own directory locally (measured: ~500 ms with no peer up at all) |
+| **Empty** (first install, or volumes wiped) | bring a MAJORITY up **together**: `docker compose up -d`; on Kubernetes `podManagementPolicy: Parallel`; on bare metal start two/three within the same 10-second window |
+| One node up, the others cannot start yet | it exits after **10 s** with `no member adopted this node's Arachne data directory within 10s …`. **Restarting it does not help** — the missing thing is a majority, not a retry. Bring up a second member and start this one again |
+
+The error message names both actions (`cluster.md` §5.6), and `integration/test_startup_knobs.py`
+K13 asserts on the wire that it keeps doing so. A **different** error — `belongs to a different
+cluster` / `cluster_id mismatch` — is a CONFIGURATION problem, not a start-order one: see §13.6
+item 3.
+
 ### 13.7 Known limitations (as of this revision)
 
 - ~~Disabled `limit_role` / `provider_key_binding` rows are not carried in

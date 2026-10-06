@@ -316,6 +316,11 @@ for n in 0 1 2; do echo -n "hydra-$n: "; kubectl -n hydra exec hydra-$n -- sh -c
 kubectl -n hydra delete pod hydra-<writer> --grace-period=0 --force
 ```
 
+> **从"全停"恢复**：`/app/data/arachne` **有内容**（跑过一次）⇒ 正常起、顺序起都行。
+> **目录全新**（首次安装 / PVC 被清）⇒ 一个从未被认领的数据目录要等**多数派同时在场**，所以
+> `podManagementPolicy: Parallel` 是必须的；只起一台时它会在 10 s 后退出，并在错误里写明该怎么做
+> （`cluster.md` §5.6）。
+
 ---
 
 ## 5. 环境变量速查
