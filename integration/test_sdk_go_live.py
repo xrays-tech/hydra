@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""The tenant Go SDK (`tools/hydra-go`) against a LIVE node — and a THREE-WAY parity leg.
+
+`tools/hydra-go` documents the same tenant contract as `tools/hydra-py` (round 80) and
+`tools/hydra-ts` (round 83): `200 applied` / `200 single_node` = done, `202 pending` is
+NOT done, `503 unavailable` = the fleet was never told, the trace id survives to the
+caller, and the endpoint lives on the DATA plane. Its own suite (`go test ./...`, CI
+`sdks` job) runs against mocks; it had never been pointed at a gateway.
+
+This drill compiles a small Go driver against the local SDK (`replace` in the sidecar
+`go.mod`, so the SDK is exercised as a package, exactly as a consumer would use it),
+runs the same legs as the other two SDK drills, and then asks **all three SDKs** about
+the same node and requires them to agree.
+
+Legs (server feature set, no Redis):
+  G1 the documented usage         -> 200 single_node, State.Done(), trace id, counts
+  G2 the call really CLEARS       -> allow, flip to deny (still served = cached), Go SDK
+                                     invalidate -> 401
+  G3 another tenant's token       -> *HTTPError, not a "done" state
+  G4 the management path is gone  -> 404 on the admin port
+With `--cluster` (cluster feature set + `HYDRA_TEST_REDIS_URL`):
+  C1 wait=converged on a live bus -> 200 applied (2/2 with an edge registered)
+  C2 WaitNone                     -> 202 pending => *InvalidatePendingError
+  C3 a bus cut under the node     -> 503 unavailable => *InvalidateUnavailableError
+  P3 THREE-WAY parity: Go == Python == TypeScript for one node (state + node counts)
+
+Run: python3 integration/test_sdk_go_live.py [--cluster]
+Exit 0 pass · 1 an assertion failed · 2 could not verify.
+"""
+import json
+import os
+import shutil
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR = os.path.join(ROOT, ".acceptance", "sdk-go-live")
+BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
+GO_SDK = os.path.join(ROOT, "tools", "hydra-go")
+DRIVER_DIR = os.path.join(DIR, "driver")
+TS_SDK = os.path.join(ROOT, "tools", "hydra-ts")
+TS_CLIENT = os.path.join(TS_SDK, "dist", "client.js")
+
+ADMIN, DATA = 18770, 18771
+ADMIN_C, DATA_C = 18772, 18773
+ADMIN_X, DATA_X = 18774, 18775
+UPSTREAM = 18779
+TOKEN = "hydra-sdk-go-admin-2026"
+TENANT_TOKEN = "tenant-go-self-service-2026"
+OTHER_TOKEN = "another-tenants-token-20260930"
+CLUSTER_TOKEN = "hydra-sdk-go-cluster-2026"
+REDIS = os.environ.get("HYDRA_TEST_REDIS_URL", "redis://127.0.0.1:6380")
+REDIS_DB = int(os.environ.get("HYDRA_SDK_GO_REDIS_DB", "50"))
+
+failures = []
+
+
+def check(label, ok, detail=""):
+    print(f"   {'PASS' if ok else 'FAIL'}  {label}{'  — ' + detail if detail else ''}")
+    if not ok:
+        failures.append(label)
+
+
+def announce(label, detail):
+    print(f"   ....  {label}{'  — ' + detail if detail else ''}")
+
+
+def call(method, url, token=None, body=None, timeout=30):
+    data = None if body is None else json.dumps(body).encode()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+    except Exception as e:
+        return 0, str(e)
+
+
+class AuthUpstream(BaseHTTPRequestHandler):
+    allowed = True
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        body = json.dumps({"allowed": AuthUpstream.allowed, "reason": "sdk-go",
+                           "expires_in": 300}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class RedisRelay:
+    def __init__(self, upstream_host, upstream_port):
+        self.upstream = (upstream_host, upstream_port)
+        self.server = None
+        self.sockets = []
+
+    def start(self):
+        relay = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    up = socket.create_connection(relay.upstream, timeout=5)
+                except OSError:
+                    return
+                relay.sockets.extend([self.request, up])
+                threading.Thread(target=relay._pump, args=(self.request, up), daemon=True).start()
+                relay._pump(up, self.request)
+
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return port
+
+    @staticmethod
+    def _pump(src, dst):
+        try:
+            while True:
+                chunk = src.recv(65536)
+                if not chunk:
+                    break
+                dst.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            for s in (src, dst):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def cut(self):
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except Exception:
+            pass
+        for s in self.sockets:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def redis_endpoint():
+    host = REDIS.split("://", 1)[-1].split("/")[0]
+    if ":" in host:
+        h, p = host.split(":", 1)
+        return h, int(p)
+    return host, 6379
+
+
+def redis_cmd(sock, *parts):
+    payload = ("*%d\r\n" % len(parts)).encode()
+    for part in parts:
+        b = str(part).encode()
+        payload += b"$%d\r\n" % len(b) + b + b"\r\n"
+    sock.sendall(payload)
+    return sock.recv(256)
+
+
+def flush_db():
+    host, port = redis_endpoint()
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+    except OSError as e:
+        return None, f"{host}:{port} unreachable ({e})"
+    redis_cmd(sock, "SELECT", REDIS_DB)
+    before = redis_cmd(sock, "DBSIZE").decode(errors="replace").strip().splitlines()[-1]
+    redis_cmd(sock, "FLUSHDB")
+    after = redis_cmd(sock, "DBSIZE").decode(errors="replace").strip().splitlines()[-1]
+    sock.close()
+    return f"redis://{host}:{port}/{REDIS_DB}", f"db {REDIS_DB}: keys {before} -> {after}"
+
+
+GO_MAIN = '''// Generated by integration/test_sdk_go_live.py — drives the LOCAL Go SDK as a consumer.
+package main
+
+import (
+\t"context"
+\t"encoding/json"
+\t"errors"
+\t"fmt"
+\t"os"
+\t"time"
+
+\thydra "github.com/ipconfiger/hydra/tools/hydra-go"
+)
+
+type shape struct {
+\tOK         bool   `json:"ok"`
+\tError      string `json:"error,omitempty"`
+\tRaised     string `json:"raised,omitempty"`
+\tMessage    string `json:"message,omitempty"`
+\tHTTPStatus int    `json:"httpStatus,omitempty"`
+\tState      string `json:"state,omitempty"`
+\tDone       bool   `json:"done,omitempty"`
+\tNodesApplied int64 `json:"nodesApplied,omitempty"`
+\tNodesTotal   int64 `json:"nodesTotal,omitempty"`
+\tLagging    []string `json:"lagging,omitempty"`
+\tEventID    string `json:"eventId,omitempty"`
+\tWaitedMS   int64  `json:"waitedMs,omitempty"`
+\tTraceID    string `json:"traceId,omitempty"`
+\tNode       string `json:"node,omitempty"`
+\tHasResult  bool   `json:"hasResult,omitempty"`
+}
+
+func emit(s shape) {
+\tb, _ := json.Marshal(s)
+\tfmt.Print(string(b))
+}
+
+func main() {
+\tmode, base, token, tenant := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+\tcfg := hydra.Config{
+\t\tToken:                    token,
+\t\tNodes:                    []string{base},
+\t\tProbeTimeout:             2 * time.Second,
+\t\tRequestTimeout:           10 * time.Second,
+\t\tDisableBackgroundRecheck: true,
+\t}
+\tif mode == "none-result" || mode == "none-raise" {
+\t\tcfg.WaitMode = hydra.WaitNone
+\t}
+\tc, err := hydra.New(cfg)
+\tif err != nil {
+\t\temit(shape{OK: false, Error: err.Error()})
+\t\treturn
+\t}
+\tdefer c.Close()
+\tctx := context.Background()
+
+\tif mode == "result" || mode == "none-result" {
+\t\tres, err := c.InvalidateTenantAuthCacheResult(ctx, tenant, nil)
+\t\tif err != nil {
+\t\t\temit(shape{OK: false, Error: err.Error()})
+\t\t\treturn
+\t\t}
+\t\temit(shape{
+\t\t\tOK: true, HTTPStatus: res.HTTPStatus, State: string(res.State), Done: res.State.Done(),
+\t\t\tNodesApplied: res.NodesApplied, NodesTotal: res.NodesTotal, Lagging: res.Lagging,
+\t\t\tEventID: res.EventID, WaitedMS: res.WaitedMS, TraceID: res.TraceID, Node: res.Node,
+\t\t})
+\t\treturn
+\t}
+
+\t// the raising API: report which error type came back, and its attached result
+\terr = c.InvalidateTenantAuthCache(ctx, tenant)
+\tif err == nil {
+\t\temit(shape{OK: true})
+\t\treturn
+\t}
+\ts := shape{OK: true, Raised: fmt.Sprintf("%T", err), Message: err.Error()}
+\tvar pending *hydra.InvalidatePendingError
+\tif errors.As(err, &pending) {
+\t\ts.HasResult = true
+\t\ts.HTTPStatus, s.State = pending.Result.HTTPStatus, string(pending.Result.State)
+\t\ts.NodesApplied, s.NodesTotal = pending.Result.NodesApplied, pending.Result.NodesTotal
+\t}
+\tvar unavailable *hydra.InvalidateUnavailableError
+\tif errors.As(err, &unavailable) {
+\t\ts.HasResult = true
+\t\ts.HTTPStatus, s.State = unavailable.Result.HTTPStatus, string(unavailable.Result.State)
+\t}
+\temit(s)
+}
+'''
+
+
+def write_driver():
+    os.makedirs(DRIVER_DIR, exist_ok=True)
+    with open(os.path.join(DRIVER_DIR, "go.mod"), "w", encoding="utf-8") as f:
+        f.write(
+            "module sdklive\n\ngo 1.21\n\n"
+            "require github.com/ipconfiger/hydra/tools/hydra-go v0.0.0\n\n"
+            f"replace github.com/ipconfiger/hydra/tools/hydra-go => {GO_SDK}\n"
+        )
+    with open(os.path.join(DRIVER_DIR, "main.go"), "w", encoding="utf-8") as f:
+        f.write(GO_MAIN)
+
+
+def go_env():
+    """The repo has a `go.work` at its root (`use ./tools/hydra-go`), and a driver inside
+    the repo would be dragged into that workspace — where its own `replace` directive is
+    rejected ("-mod may only be set to readonly or vendor when in workspace mode"). The
+    driver therefore builds with GOWORK=off: an ordinary consumer module that pulls the
+    SDK in by path. GOPROXY=off keeps it offline (the SDK has no dependencies)."""
+    env = dict(os.environ)
+    env.update({
+        "GOWORK": "off", "GOFLAGS": "", "GOPROXY": "off",
+        # The harness sandbox has a READ-ONLY `/`, so the default `~/.cache/go-build`
+        # cannot be written: the first version failed with "package context is not in
+        # std (/usr/lib/golang/src/context)" plus an unopenable cache file — a stdlib
+        # that is plainly present, reported missing because the build cache was not
+        # usable. Keep every Go scratch dir inside the writable workspace.
+        "GOCACHE": os.path.join(DIR, "go-build"),
+        "GOPATH": os.path.join(DIR, "gopath"),
+        "GOMODCACHE": os.path.join(DIR, "gopath", "pkg", "mod"),
+    })
+    return env
+
+
+def go_build():
+    p = subprocess.run(["go", "build", "-o", os.path.join(DRIVER_DIR, "driver"), "."],
+                       cwd=DRIVER_DIR, capture_output=True, text=True, timeout=300,
+                       env=go_env())
+    return p.returncode, (p.stdout + p.stderr)[:400]
+
+
+def go(mode, base, token, tenant="t1", timeout=60):
+    p = subprocess.run([os.path.join(DRIVER_DIR, "driver"), mode, base, token, tenant],
+                       capture_output=True, text=True, timeout=timeout, env=go_env())
+    try:
+        return json.loads(p.stdout), p.returncode, p.stderr
+    except Exception:
+        return None, p.returncode, (p.stdout + p.stderr)[:300]
+
+
+TS_DRIVER_SOURCE = """\
+import { HydraClient, isDoneState } from %(client)s;
+const [mode, base, token, tenant] = process.argv.slice(2);
+const client = new HydraClient({ token, nodes: [base], disableBackgroundRecheck: true });
+const res = await client.invalidateWithResult(tenant);
+process.stdout.write(JSON.stringify({ result: {
+  httpStatus: res.httpStatus, state: res.state, done: isDoneState(res.state),
+  nodesApplied: res.nodesApplied, nodesTotal: res.nodesTotal, traceId: res.traceId ?? null } }));
+client.close();
+"""
+
+
+def write_ts_driver():
+    """The parity leg needs the TypeScript SDK too, and it must not depend on another
+    drill having run first (test order is not a contract). This writes its own driver."""
+    with open(os.path.join(DIR, "ts_driver.mjs"), "w", encoding="utf-8") as f:
+        f.write(TS_DRIVER_SOURCE % {"client": json.dumps("file://" + TS_CLIENT)})
+
+
+def ts(mode, base, token, tenant="t1"):
+    """The TypeScript SDK, for the three-way parity leg."""
+    driver = os.path.join(DIR, "ts_driver.mjs")
+    if not os.path.exists(driver):
+        return None
+    p = subprocess.run(["node", driver, mode, base, token, tenant],
+                       capture_output=True, text=True, timeout=60)
+    try:
+        return (json.loads(p.stdout) or {}).get("result")
+    except Exception:
+        return None
+
+
+def py_result(base, token, tenant="t1"):
+    sys.path.insert(0, os.path.join(ROOT, "tools", "hydra-py"))
+    from hydra_sdk import HydraClient  # noqa: E402
+    client = HydraClient(token=token, nodes=[base], disable_background_recheck=True)
+    try:
+        return client.invalidate_with_result(tenant)
+    finally:
+        client.close()
+
+
+def node_env(admin, data, label, extra=None):
+    env = dict(os.environ)
+    env.update({
+        "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin}",
+        "HYDRA_LISTEN": f"127.0.0.1:{data}",
+        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, label)}.db?mode=rwc",
+        "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        "RUST_LOG": "warn",
+    })
+    if extra:
+        env.update(extra)
+    return env
+
+
+def start(admin, data, label, extra=None):
+    log = open(os.path.join(DIR, f"{label}.log"), "w")
+    return subprocess.Popen([BIN], env=node_env(admin, data, label, extra),
+                            stdout=log, stderr=subprocess.STDOUT)
+
+
+def wait_healthy(admin, token=TOKEN, budget=25.0):
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        if call("GET", f"http://127.0.0.1:{admin}/api/v1/health", token=token)[0] == 200:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def wait_healthz(admin, budget=25.0):
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        if call("GET", f"http://127.0.0.1:{admin}/healthz")[0] == 200:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def wait_leader(admin, budget=25.0):
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        if call("GET", f"http://127.0.0.1:{admin}/healthz/leader")[0] == 200:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def stop(proc):
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+
+
+def seed_core(admin):
+    for path, payload in [
+        ("providers", {"id": "p1", "key": "p1", "name": "P", "endpoint": f"http://127.0.0.1:{UPSTREAM}",
+                       "weight": 1, "created_at": "", "updated_at": ""}),
+        ("provider-models", {"id": "pm1", "key": "echo", "name": "E", "provider_id": "p1",
+                             "status": 1, "created_at": "", "updated_at": ""}),
+        ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up", "created_at": ""}),
+    ]:
+        st, out = call("POST", f"http://127.0.0.1:{admin}/api/v1/{path}", token=TOKEN, body=payload)
+        if st not in (200, 201):
+            raise SystemExit(f"[sdk-go] CANNOT VERIFY: seeding {path} -> {st} {out[:160]}")
+
+
+def seed_tenant(admin, tenant_id, tenant_token, domain):
+    for path, payload in [
+        ("tenants", {"id": tenant_id, "name": "T", "domain": domain,
+                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
+                     "access_token": tenant_token,
+                     "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
+        ("tenant-providers", {"id": f"tp-{tenant_id}", "tenant_id": tenant_id, "provider_id": "p1",
+                              "created_at": "", "updated_at": ""}),
+        ("tenant-models", {"id": f"tm-{tenant_id}", "tenant_id": tenant_id, "model_key": "echo",
+                           "created_at": "", "updated_at": ""}),
+    ]:
+        st, out = call("POST", f"http://127.0.0.1:{admin}/api/v1/{path}", token=TOKEN, body=payload)
+        if st not in (200, 201):
+            raise SystemExit(f"[sdk-go] CANNOT VERIFY: seeding {path} -> {st} {out[:160]}")
+    call("POST", f"http://127.0.0.1:{admin}/api/v1/reload", token=TOKEN, body={})
+    time.sleep(0.3)
+
+
+def proxied(data_port, api_key="sk-tenant-1"):
+    body = {"model": "echo", "messages": [{"role": "user", "content": "hi"}]}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{data_port}/v1/chat/completions",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "Host": "load.local",
+                 "Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+    except Exception as e:
+        return 0, str(e)
+
+
+def leg_single_node():
+    node = start(ADMIN, DATA, "single")
+    try:
+        if not wait_healthy(ADMIN):
+            print("[sdk-go] CANNOT VERIFY: the node never became healthy", file=sys.stderr)
+            print(open(os.path.join(DIR, "single.log")).read()[-600:], file=sys.stderr)
+            return 2
+        seed_core(ADMIN)
+        seed_tenant(ADMIN, "t1", TENANT_TOKEN, "load.local")
+        seed_tenant(ADMIN, "t2", OTHER_TOKEN, "other.local")
+        base = f"http://127.0.0.1:{DATA}"
+
+        got, rc, err = go("result", base, TENANT_TOKEN)
+        check("G1: the Go SDK's documented call returns a result", bool(got and got.get("ok")),
+              f"rc={rc} out={got} err={err[:120]}")
+        if got and got.get("ok"):
+            announce("G1 the Go SDK's documented call", f"{got}")
+            check("G1: a single data-plane node answers 200 single_node",
+                  got.get("httpStatus") == 200 and got.get("state") == "single_node", f"{got}")
+            check("G1: ...which `State.Done()` reports as done", got.get("done") is True)
+            check("G1: the X-Hydra-Trace-Id survives to the caller", bool(got.get("traceId")),
+                  f"traceId={got.get('traceId')!r}")
+            check("G1: node counts are filled in (not invented)",
+                  got.get("nodesTotal", 0) >= 1, f"nodesTotal={got.get('nodesTotal')}")
+
+        # G2: the cache really is cleared
+        AuthUpstream.allowed = True
+        st_allow, _ = proxied(DATA)
+        AuthUpstream.allowed = False
+        st_cached, _ = proxied(DATA)
+        got, rc, err = go("raise", base, TENANT_TOKEN)
+        st_after, body_after = proxied(DATA)
+        announce("G2 requests", f"allow={st_allow} after-flip={st_cached} after-invalidate={st_after}")
+        check("G2: the verdict is cached (the flip alone does not change the answer)",
+              st_allow == 200 and st_cached == 200, f"{st_allow}/{st_cached}")
+        check("G2: after the Go SDK's invalidate the cached allow is GONE",
+              st_after == 401, f"HTTP {st_after} {body_after[:60]}")
+        AuthUpstream.allowed = True
+
+        # G3: another tenant's token
+        got, rc, err = go("raise", base, OTHER_TOKEN)
+        check("G3: another tenant's token is refused as *HTTPError (not a 'done' state)",
+              (got or {}).get("raised", "").endswith("HTTPError"), f"raised={(got or {}).get('raised')}")
+
+        # G4: the management path is gone
+        for path in ("/api/v1/tenants/t1/auth/cache/invalidate",
+                     "/api/v1/tenant/t1/api/v1/auth/cache/invalidate"):
+            st, body = call("POST", f"http://127.0.0.1:{ADMIN}{path}", token=TOKEN, body={})
+            check(f"G4: the old management path {path} does not exist", st == 404,
+                  f"HTTP {st} {body[:60]}")
+    finally:
+        stop(node)
+    return 0
+
+
+def leg_cluster():
+    redis_db, note = flush_db()
+    if redis_db is None:
+        print(f"[sdk-go] CANNOT VERIFY: {note}", file=sys.stderr)
+        return 2
+    announce("redis for the cluster leg", f"{redis_db} ({note})")
+    common = {
+        "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN, "HYDRA_REDIS_MODE": "single",
+        "HYDRA_LEADER_LEASE_MS": "3000", "HYDRA_CONTROL_POLL_MS": "250",
+        "HYDRA_USAGE_SINK": "clickhouse", "HYDRA_CLICKHOUSE_URL": "http://127.0.0.1:18999",
+    }
+    live = start(ADMIN_C, DATA_C, "cluster-live", dict(common, **{
+        "HYDRA_ROLE": "leader", "HYDRA_NODE_ID": "sdk-go-a",
+        "HYDRA_REDIS_URL": redis_db, "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_C}",
+        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
+    }))
+    host, port = redis_endpoint()
+    relay = RedisRelay(host, port)
+    relay_port = relay.start()
+    edge = start(ADMIN_X, DATA_X, "cluster-edge", dict(common, **{
+        "HYDRA_ROLE": "edge", "HYDRA_NODE_ID": "sdk-go-edge",
+        "HYDRA_REDIS_URL": f"redis://127.0.0.1:{relay_port}/{REDIS_DB}",
+        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
+        "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_X}",
+    }))
+    try:
+        if not wait_healthy(ADMIN_C) or not wait_leader(ADMIN_C):
+            print("[sdk-go] CANNOT VERIFY: the cluster node never became healthy/leader", file=sys.stderr)
+            print(open(os.path.join(DIR, "cluster-live.log")).read()[-700:], file=sys.stderr)
+            return 2
+        check("C0: the edge node behind the relay is up (role-correct probe /healthz)",
+              wait_healthz(ADMIN_X), "healthz not ready")
+        seed_core(ADMIN_C)
+        seed_tenant(ADMIN_C, "t1", TENANT_TOKEN, "load.local")
+        base = f"http://127.0.0.1:{DATA_C}"
+
+        got, rc, err = go("result", base, TENANT_TOKEN)
+        announce("C1 wait=converged on a live bus", f"{got}")
+        check("C1: a node with a live bus reports 200 applied",
+              (got or {}).get("httpStatus") == 200 and (got or {}).get("state") == "applied", f"{got}")
+        check("C1: ...with the LIVE node counts (the edge is registered too)",
+              (got or {}).get("nodesApplied") == (got or {}).get("nodesTotal")
+              and (got or {}).get("nodesTotal", 0) >= 1, f"{got}")
+        check("C1: ...and an event id to reconcile against later", bool((got or {}).get("eventId")),
+              f"eventId={(got or {}).get('eventId')!r}")
+
+        got, rc, err = go("none-result", base, TENANT_TOKEN)
+        announce("C2 WaitNone (returning API)", f"{got}")
+        check("C2: WaitNone publishes without waiting -> 202 pending",
+              (got or {}).get("httpStatus") == 202 and (got or {}).get("state") == "pending", f"{got}")
+        check("C2: ...`Done()` is false for it", (got or {}).get("done") in (False, None),
+              f"done={(got or {}).get('done')}")
+        got, rc, err = go("none-raise", base, TENANT_TOKEN)
+        check("C2: the RAISING api returns *InvalidatePendingError for that 202",
+              (got or {}).get("raised", "").endswith("InvalidatePendingError")
+              and (got or {}).get("hasResult") is True, f"{got}")
+
+        # ---- P3: THREE-WAY parity on the same node -----------------------------
+        go_res = go("result", base, TENANT_TOKEN)[0] or {}
+        py_res = py_result(base, TENANT_TOKEN, "t1")
+        ts_res = ts("result", base, TENANT_TOKEN) or {}
+        announce("P3 the three SDKs on the same node",
+                 f"go {go_res.get('state')} {go_res.get('nodesApplied')}/{go_res.get('nodesTotal')} | "
+                 f"py {py_res.state} {py_res.nodes_applied}/{py_res.nodes_total} | "
+                 f"ts {ts_res.get('state')} {ts_res.get('nodesApplied')}/{ts_res.get('nodesTotal')}")
+        check("P3: all three SDKs report the SAME fleet state",
+              go_res.get("state") == py_res.state == ts_res.get("state"),
+              f"go={go_res.get('state')} py={py_res.state} ts={ts_res.get('state')}")
+        check("P3: ...and the same node counts",
+              (go_res.get("nodesApplied"), go_res.get("nodesTotal"))
+              == (py_res.nodes_applied, py_res.nodes_total)
+              == (ts_res.get("nodesApplied"), ts_res.get("nodesTotal")),
+              f"go={go_res.get('nodesApplied')}/{go_res.get('nodesTotal')} "
+              f"py={py_res.nodes_applied}/{py_res.nodes_total} "
+              f"ts={ts_res.get('nodesApplied')}/{ts_res.get('nodesTotal')}")
+
+        # ---- C3: a bus cut under the node -> 503 unavailable -------------------
+        relay.cut()
+        time.sleep(0.5)
+        got, rc, err = go("none-result", f"http://127.0.0.1:{DATA_X}", TENANT_TOKEN)
+        announce("C3 cut bus on the edge", f"{got}")
+        check("C3: a bus that cannot answer is 503 `unavailable`, not a success",
+              (got or {}).get("httpStatus") == 503 and (got or {}).get("state") == "unavailable", f"{got}")
+        check("C3: ...and NOT reported as `pending` (a different failure)",
+              (got or {}).get("state") != "pending", f"state={(got or {}).get('state')}")
+        got, rc, err = go("none-raise", f"http://127.0.0.1:{DATA_X}", TENANT_TOKEN)
+        check("C3: the RAISING api returns *InvalidateUnavailableError for that 503",
+              (got or {}).get("raised", "").endswith("InvalidateUnavailableError"), f"{got}")
+    finally:
+        stop(live)
+        stop(edge)
+        relay.cut()
+    return 0
+
+
+def main():
+    if not os.path.exists(BIN):
+        print(f"[sdk-go] CANNOT VERIFY: {BIN} is not built", file=sys.stderr)
+        return 2
+    if not os.path.isdir(GO_SDK):
+        print(f"[sdk-go] CANNOT VERIFY: {GO_SDK} is missing", file=sys.stderr)
+        return 2
+    cluster_mode = "--cluster" in sys.argv
+    shutil.rmtree(DIR, ignore_errors=True)
+    os.makedirs(DIR, exist_ok=True)
+    write_driver()
+    write_ts_driver()
+    rc, out = go_build()
+    if rc != 0:
+        print(f"[sdk-go] CANNOT VERIFY: the Go driver did not build: {out}", file=sys.stderr)
+        return 2
+    if cluster_mode and not os.path.exists(TS_CLIENT):
+        print(f"[sdk-go] CANNOT VERIFY: the TS SDK is not built (needed for the three-way "
+              f"parity leg): {TS_CLIENT}", file=sys.stderr)
+        return 2
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", UPSTREAM), AuthUpstream)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    try:
+        rc = leg_cluster() if cluster_mode else leg_single_node()
+        if rc:
+            return rc
+    finally:
+        upstream.shutdown()
+
+    print()
+    if failures:
+        print(f"SDK-GO LIVE: FAILED ({len(failures)}): " + "; ".join(failures))
+        return 1
+    if cluster_mode:
+        print("SDK-GO LIVE (cluster): PASSED (200 applied, 202 pending → InvalidatePendingError, "
+              "503 unavailable → InvalidateUnavailableError, three-way parity)")
+    else:
+        print("SDK-GO LIVE: PASSED (documented usage, single_node, cache really cleared, other "
+              "tenant refused, management-API path gone)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

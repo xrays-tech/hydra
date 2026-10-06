@@ -26,7 +26,16 @@ IMAGE="${HYDRA_IT_IMAGE:-hydra:latest}"
 CONTAINER="${HYDRA_IT_CONTAINER:-hydra-it}"
 VOLUME="${HYDRA_IT_VOLUME:-hydra-it-data}"
 PORT="${HYDRA_IT_PORT:-8081}"
-TOKEN="${HYDRA_IT_TOKEN:-hydra-it-token}"
+# >= 16 chars: the server fail-closes on a shorter admin token
+# (AdminService::MIN_ADMIN_TOKEN_LEN, main.rs "HYDRA_ADMIN_TOKEN is too short").
+# The previous default here was 14 chars ("hydra-it-token"), so this gate could
+# never boot — it reported "boot failed" for a configuration error.
+TOKEN="${HYDRA_IT_TOKEN:-hydra-it-token-2026}"
+if [[ ${#TOKEN} -lt 16 ]]; then
+    echo "[config] !! HYDRA_IT_TOKEN is ${#TOKEN} chars; the server requires >= 16" >&2
+    echo "[config]    (main.rs refuses to start: 'HYDRA_ADMIN_TOKEN is too short')." >&2
+    exit 1
+fi
 KEEP="${HYDRA_IT_KEEP:-}"   # non-empty => skip teardown
 HEALTH_TIMEOUT="${HYDRA_IT_HEALTH_TIMEOUT:-30}"   # seconds to wait for boot
 

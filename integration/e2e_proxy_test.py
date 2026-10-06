@@ -10,14 +10,21 @@ Usage:
 
 Prerequisites: python3 (stdlib only). The Hydra binary is started via cargo run.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, urllib.error
+import base64, json, os, signal, subprocess, sys, time, urllib.request, urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MOCK_LLM_PORT = 9090
-MOCK_AUTH_PORT = 9091
-HYDRA_PROXY_PORT = 8080
-HYDRA_ADMIN_PORT = 8081
-ADMIN_TOKEN = "e2e-test-token"
+# Env-overridable: the defaults collide with a running dev stack (or with another
+# check on the same box), and a harness that cannot run next to a stack is a
+# harness nobody runs — which is exactly what happened to this file (nothing in CI
+# invoked it, and a local run failed on the first bind).
+MOCK_LLM_PORT = int(os.environ.get("MOCK_LLM_PORT", "9090"))
+MOCK_AUTH_PORT = int(os.environ.get("MOCK_AUTH_PORT", "9091"))
+HYDRA_PROXY_PORT = int(os.environ.get("HYDRA_PROXY_PORT", "8080"))
+HYDRA_ADMIN_PORT = int(os.environ.get("HYDRA_ADMIN_PORT", "8081"))
+# Must be >= 16 chars: main.rs fails closed on a shorter admin token
+# (AdminService::MIN_ADMIN_TOKEN_LEN). Was "e2e-test-token" (14) — the server
+# refused to start and this harness reported only "did not become healthy".
+ADMIN_TOKEN = "e2e-test-token-2026"
 CLIENT_KEY = "e2e-client-key"
 PROVIDER_KEY = "sk-mock-llm-key"
 MODEL = "gpt-4o"
@@ -35,6 +42,16 @@ def _cleanup():
             except Exception: pass
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
+
+def _master_key():
+    """A throwaway 32-byte base64 master key for this run.
+
+    `HYDRA_ENCRYPTION_KEY` is required unconditionally (crypto.rs fails closed
+    with `KeyMissing`), and this harness uses a fresh throwaway DB each run, so
+    a per-run random key is correct and hermetic (same approach as
+    `integration/run.sh`).
+    """
+    return base64.b64encode(os.urandom(32)).decode()
 
 def _start(name, cmd, env=None, cwd=None):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -76,6 +93,12 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: (_cleanup(), sys.exit(130)))
     signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(143)))
 
+    # Fail fast on a configuration error the server would otherwise report as a
+    # boot failure 40 seconds later.
+    if len(ADMIN_TOKEN) < 16:
+        print(f"[e2e] FAIL: ADMIN_TOKEN is {len(ADMIN_TOKEN)} chars; the server requires >= 16")
+        sys.exit(1)
+
     try:
         # ── 1. start mocks ──
         _start("mock-llm", [sys.executable, os.path.join(ROOT, "integration", "mock_llm.py")])
@@ -83,8 +106,13 @@ def main():
         time.sleep(0.5)
 
         # ── 2. start Hydra ──
+        # The admin token must be >= 16 chars and the master key is REQUIRED
+        # (unconditional fail-closed, crypto.rs `KeyMissing` -> main.rs). The
+        # old token here was 14 chars and the key was not set at all, so this
+        # harness could never boot the server it was meant to exercise.
         env = {**os.environ,
                "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
+               "HYDRA_ENCRYPTION_KEY": _master_key(),
                "HYDRA_DB_URL": f"sqlite:{DB_FILE}?mode=rwc",
                "HYDRA_LISTEN": f"0.0.0.0:{HYDRA_PROXY_PORT}",
                "HYDRA_ADMIN_ADDR": f"0.0.0.0:{HYDRA_ADMIN_PORT}",

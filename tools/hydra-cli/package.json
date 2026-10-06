@@ -13,7 +13,7 @@
     "build": "tsup",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/client.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
   },
   "keywords": [
     "hydra",

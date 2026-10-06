@@ -3,7 +3,8 @@
 Returns OpenAI-compatible chat completions on POST /v1/chat/completions.
 Listens on :9090. Stdlib only — no pip deps.
 """
-import json, sys
+import json
+import os, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,6 +50,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[mock-llm] {args[0] if args else ''}", file=sys.stderr, flush=True)
 
+# Env-overridable: the default collides with a running dev stack (or with a
+# second copy of this mock), and a mock that cannot bind is a harness that
+# nobody can run.
+MOCK_LLM_PORT = int(os.environ.get("MOCK_LLM_PORT", "9090"))
+
 if __name__ == "__main__":
-    print("[mock-llm] listening on 0.0.0.0:9090", flush=True)
-    HTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    print(f"[mock-llm] listening on 0.0.0.0:{MOCK_LLM_PORT}", flush=True)
+    HTTPServer(("0.0.0.0", MOCK_LLM_PORT), Handler).serve_forever()

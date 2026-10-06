@@ -64,7 +64,7 @@ Exit code is the test suite's exit code (`0` = all passed, `1` = ≥1 failure).
 | Variable | Default | Purpose |
 |---|---|---|
 | `HYDRA_IT_PORT` | `8081` | Host port mapped to the container's admin listener |
-| `HYDRA_IT_TOKEN` | `hydra-it-token` | Admin bearer token passed to both the container and the test |
+| `HYDRA_IT_TOKEN` | `hydra-it-token-2026` | Admin bearer token passed to both the container and the test. **Must be >= 16 characters** — the server refuses to start on a shorter admin token (`main.rs`), and `run.sh` now checks the length up front instead of reporting a boot failure |
 | `HYDRA_IT_KEEP` | _(unset)_ | Set to any non-empty value to **keep** the container + volume running after the test (for debugging) |
 | `HYDRA_IT_HEALTH_TIMEOUT` | `30` | Seconds to wait for the server to become healthy |
 | `HYDRA_IT_IMAGE` | `hydra:latest` | Image to run |

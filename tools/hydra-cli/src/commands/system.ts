@@ -198,11 +198,21 @@ export function buildClusterCommand(): Command {
   return cmd;
 }
 
-/** Build the `tenants auth-test` subcommand. */
+/** Build the `tenants auth-test` subcommand.
+ *
+ *  The name and the argument must be declared SEPARATELY: `new Command('auth-test
+ *  <auth-url>')` registers a subcommand literally NAMED `auth-test <auth-url>`, which
+ *  can never be matched by typing `auth-test`. The group's default subcommand (`list`,
+ *  `isDefault: true`) then swallows the tokens, so the documented
+ *  `hydra-admin tenants auth-test <url>` silently printed a TENANT LIST and exited 0 —
+ *  and `--tenant-id` failed with "unknown option" because the option belongs to a
+ *  command that never ran. Measured 2026-09-30; `.command('get <id>')` (the factory's
+ *  style) does parse the arguments, only the constructor does not. */
 export function buildTenantAuthTestCommand(): Command {
   const cmd = addGlobalOptions(
-    new Command('auth-test <auth-url>')
-      .description('Probe a tenant auth URL with a fake api-key.'),
+    new Command('auth-test')
+      .description('Probe a tenant auth URL with a fake api-key.')
+      .argument('<auth-url>', 'Tenant auth URL to probe with a simulated api-key'),
   );
   cmd.option('--tenant-id <id>', 'Tenant id sent with the simulated auth request');
   cmd.action(

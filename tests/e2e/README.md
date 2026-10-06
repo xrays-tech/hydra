@@ -24,7 +24,23 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
   prefix→provider binding via UI → row appears → `/api` confirms persistence
   → edit (disable) → delete → 404 via `/api`.
 
-## Prerequisites
+## Easiest path: one command, no preparation
+
+```bash
+scripts/e2e-local.sh                 # whole suite against a disposable instance
+scripts/e2e-local.sh -g "T2.2c"      # any `playwright test` argument
+KEEP=1 scripts/e2e-local.sh          # keep the scratch dir (instance log, DB)
+```
+
+It starts a **throwaway** hydra (scratch SQLite under `.acceptance/`, ports
+18080/18081 so a running dev stack is untouched), seeds it, runs the suite and kills
+it. It installs the JS runner into the gitignored `.acceptance/tmp-pw` (reused after
+the first run) and prefers the pair CI pins — `@playwright/test@1.55.0` + the
+Chromium 1187 build this checkout already carries in `.acceptance/pw-browsers` — so
+nothing is downloaded and the local run matches CI. No root `package.json` is
+created: the repo deliberately ships none (the UI has zero JS build step).
+
+## Manual prerequisites
 
 1. **Node + Playwright** (only needed for the E2E run, not for the Rust build):
    ```bash

@@ -261,3 +261,40 @@ npm pack --dry-run # inspect the published tarball
 ## License
 
 MIT © 2026 ipconfiger
+
+## Two documented behaviours that did NOT work (fixed 2026-09-30)
+
+Both were found by running the documented commands against a real node, and both are now
+pinned by `integration/test_cli_live.py` (CI `integration` job + the local gate):
+
+- **`providers update <id> --max-concurrency null` did not clear anything.** The option
+  parser returned a JS `null`; commander stores `''` for that, so the request body carried
+  `"max_concurrency": ""` and the server answered
+  `400 invalid_json: invalid type: string "", expected u32`. The intent is now carried as a
+  sentinel and converted to a real JSON `null` when the body is built (same for
+  `--max-queue-depth`, `--queue-wait-timeout-ms`, and limit-roles'
+  `--limit-count` / `--limit-token`). A non-numeric value is still refused locally.
+- **`tenants auth-test <url>` never ran the probe.** `new Command('auth-test <auth-url>')`
+  registers a subcommand literally *named* `auth-test <auth-url>`, which can never be
+  matched; the group's default subcommand (`list`) then swallowed the arguments, so the
+  documented probe **printed a tenant list and exited 0** — a silent wrong answer — and
+  `--tenant-id` failed with `unknown option`. The command now declares its argument with
+  `.argument('<auth-url>')`.
+
+## How this CLI is verified against a REAL node
+
+`integration/test_cli_live.py` starts a throwaway gateway and drives the documented
+surface with the documented configuration (`HYDRA_BASE_URL` / `HYDRA_ADMIN_TOKEN`, and
+global options both **before** and **after** the subcommand):
+
+- every service command (`health`, `reload`, `metrics`, `concurrency`, `breaker`,
+  `stats usage`, `cluster status`, `auth-cache invalidate`, `tenants auth-test`) exits 0,
+  with `metrics` printing raw Prometheus text and the rest printing parseable JSON under
+  `--json`;
+- a full create → list → get → update → delete cycle for **all eight** entity groups, each
+  step verified **independently through the REST API** (a CLI exit code alone is not
+  evidence), including that the two mapping-only groups refuse `update`; and that
+  `delete -y` really removes a row that existed a moment earlier (the admin DELETE is
+  idempotent, so "gone afterwards" alone would also be true of a row that never existed);
+- failure paths: a wrong token (`401`), an unknown id (`404`) and an unknown command all
+  exit non-zero.

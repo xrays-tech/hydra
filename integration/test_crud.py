@@ -14,7 +14,10 @@ edge cases and non-CRUD endpoints covered by the Rust suite:
    endpoint — mirrors admin_api.rs / handlers.rs — so their PUT step is skipped.)
 
   Edge cases:
-    - provider-key masking (list masks → first4…last4; ?reveal=1 → plaintext)
+    - provider-key masking (ALWAYS masked: `first10…last4` for keys >= 20 chars,
+      `first2…last2` for >= 6 — `?reveal=1` is accepted and is a NO-OP since
+      P1-5: the admin API never returns plaintext. The old wording here said
+      "first4…last4; ?reveal=1 → plaintext", which the body below contradicts.)
     - tenant auth_url mandatory (POST without → 400)
     - UNIQUE conflict → 409 (provider key, provider-model (key,provider_id),
       tenant domain, tenant-provider (tenant_id,provider_id),
@@ -33,7 +36,9 @@ edge cases and non-CRUD endpoints covered by the Rust suite:
 
 Configuration:
     HYDRA_BASE_URL   (default http://localhost:8081)  — admin listener origin
-    HYDRA_ADMIN_TOKEN(default hydra-it-token)         — bearer token
+    HYDRA_ADMIN_TOKEN(default hydra-it-token-2026)    — bearer token (>= 16 chars:
+                                                       the server fails closed on
+                                                       a shorter one, main.rs)
 
 Exit code: 0 if every assertion passed, 1 otherwise. Prints a per-assertion
 PASS/FAIL line and a final ``=== N/N passed ===`` summary.
@@ -51,7 +56,7 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 BASE = os.environ.get("HYDRA_BASE_URL", "http://localhost:8081").rstrip("/")
-TOKEN = os.environ.get("HYDRA_ADMIN_TOKEN", "hydra-it-token")
+TOKEN = os.environ.get("HYDRA_ADMIN_TOKEN", "hydra-it-token-2026")
 TIMEOUT = 10  # seconds per HTTP request
 
 # Assertion counters.
