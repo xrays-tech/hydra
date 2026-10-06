@@ -39,7 +39,7 @@
 | S5 | reason→status 映射放 **hydra-core::auth 纯函数**（表驱动 + 单测）；http.rs 只做「读 reason / 调映射 / 决定缓存否」 | 延续 `http.rs` 模块头铁律（判定语义可单测、可复用，admin test 与 proxy 共用同一口径的映射） |
 | S6 | 影响面收敛：只改**拒绝分支**；allow 路径、cache Hit(allow)、路由、catalog、fail_mode（503）一律不变；上游 403 仍压平为 401（403→403 透传属另案，本次不展开） | 单一行为面 = 「欠费类拒绝 401→402」；全量回归兜底 |
 | S7 | admin `tenant_auth_test`（admin/handlers.rs:1567-1631）：HTTP 402 从 `other`（Fail）改为**拒绝 PASS**；2xx 拒绝带欠费 reason 时 `verdict` 细分为 `insufficient_balance` | 诊断工具与代理语义一致；fake-key 探测 402 = 端点可用（它拒绝了一切 key） |
-| S8 | metrics：`hydra_auth_decision_total{verdict="denied"}` 自然涵盖 402；如需按 status 维度区分属 P2 | 观测面已存在，无需新计数器 |
+| S8 | metrics：`hydra_auth_decisions_total{verdict="denied"}`（**更正**：本文件原文写成单数 `hydra_auth_decision_total`，注册名是复数 `hydra_auth_decisions_total`）自然涵盖 402；如需按 status 维度区分属 P2 | 观测面已存在，无需新计数器 |
 
 ## 3. 代码改动清单
 
@@ -110,7 +110,7 @@ pub fn denial_status_for_reason(reason: Option<&str>) -> u16
 | # | 风险 / 决策 | 处理 |
 |---|---|---|
 | R1 | 缓存降级：402 若写 deny 缓存，30s 内被降级成 401，客户端误判 key 无效 | **S3 决策**：402 拒绝不缓存（含 L2）；同 key 每次回源实时判定 |
-| R2 | 欠费期每请求回源 auth_url | 有界成本（一次 POST/key）；AuthCache 不缓存属有意取舍，auth 服务侧通常有余额缓存/高可用；以 `hydra_auth_decision_total` / `hydra_auth_upstream_error_total` 观测；如需按 key 短时去重属后续项（P2） |
+| R2 | 欠费期每请求回源 auth_url | 有界成本（一次 POST/key）；AuthCache 不缓存属有意取舍，auth 服务侧通常有余额缓存/高可用；以 `hydra_auth_decisions_total`（同上更正） / `hydra_auth_upstream_error_total` 观测；如需按 key 短时去重属后续项（P2） |
 | R3 | reason 契约漂移（值变化 / 第三方语义） | S2 大小写不敏感（`eq_ignore_ascii_case`）+ 未知 reason ⇒ 401 兜底（fail-safe，宁可保守不误判 402）；上游 `internal_error` 维持 401 现状不变；契约变更需显式更新 §11.3 与映射表 |
 | R4 | 402 对 OpenAI 兼容客户端的影响 | 非 2xx 即报错路径；401→402 变化仅发生在欠费期且语义更准确（客户端可提示充值而非换 key）；`type:"insufficient_quota"` 与主流网关一致 |
 | R5 | 影响面扩散 | S6 收敛：仅拒绝分支；403 透传 / 其它 reason 特判等明确列为另案或 P2，避免连带改动 |

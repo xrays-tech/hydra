@@ -14,12 +14,18 @@
 |---|---|---|---|---|
 | 未设置 / `all` | 单节点（默认） | ✅ | ✅ 全部 | 现状零变化 |
 | `leader` | leader 候选（租约竞争） | ✅（副本随快照重建） | ✅ 读本地 + **变更转发给 active**（P3） | 持有租约者 = active（唯一写者） |
-| `edge` | 无状态数据面 | ❌ | ❌（仅 `/metrics` `/healthz` `/readyz`） | 配置随快照分发，可任意扩缩 |
+| `edge` | 无状态数据面 | ❌ | ❌（**无 token 时 `/metrics` 也是 401**；仅 `/healthz` `/readyz` 免鉴权） | 配置随快照分发，可任意扩缩。`/metrics` 走的是与别处**同一条** token 门禁（早期它在这里免鉴权，于是「指标暴露面取决于角色」——而官方拓扑把 edge 的管理口绑在 `0.0.0.0`，那正是唯一要紧的部署）。官方 compose 的 `hydra-edge` 只注入 `HYDRA_CLUSTER_TOKEN`，**没有** `HYDRA_ADMIN_TOKEN`，所以按现状抓取必然 401；要让抓取器拿到指标，必须先做一次取舍（给 edge 注入 admin token / 把 edge 管理口绑到私有地址后另行免鉴权 / 新增仅抓取用的 token），见 `ops.md` §9 |
 
 **自维持**（集群在任何编排环境下自我管理）：
 1. **自举**：节点只需 `HYDRA_REDIS_URL` + `HYDRA_CLUSTER_TOKEN` → 注册表发现 leader → 拉全量快照（含证书）→ 开始服务；
 2. **自动选举**：leader 候选经 Redis 租约竞争，恰一个 active；
 3. **自动故障切换**：active 死亡 → 租约过期 → 合格候选提升（实测 ≤ 租约 15s + 选举 tick 5s，约 11–18s），edge 数据面与控制面均无感（edge 轮询失败自动经注册表旋转到新 active；standby 也按**租约持有者**轮换 —— 即使它的静态 `HYDRA_CONTROL_URL` 指向自己，见 §5.1）；**管理变更同样按租约持有者转发**：standby 的管理写入目标在转发时从注册表实时解析（绝不使用静态 `HYDRA_CONTROL_URL`，它可能指向节点自身），且每个转发请求带 once 标记，任何自转发/互转循环都会立即 fail-closed 503 而不是超时递归（见 §5.2）；
+
+   **复核（2026-09-29，两节点 + edge 实测）**：
+   - **提升耗时 17.7 s / 18.2 s**（两次独立运行，硬杀 `SIGKILL` 口径）——正好落在上面那个 11–18s 带的上沿；粒度为 `HYDRA_LEADER_LEASE_MS` 15s + 选举 tick。
+   - **edge 数据面确实"无感"**：整个故障切换期间以 20 rps 持续压 edge 的数据面（`Host:` 指向真实租户）⇒ **355/355 全是 200，0 次连接被拒、0 个非 200**；旧 active 死亡后新 active 就位、`standby` 被提升，edge 侧没有任何一次失败。
+   - **edge 控制面会自己旋转到新 active**（即使它的静态 `HYDRA_CONTROL_URL` 指向已被杀死的节点）：在新 active 上改一次配置后，edge 自己的 `hydra_control_snapshot_version` 从 **6 → 7** 前进，`hydra_control_poll_total{result="ok"}` 从 **2 → 17** —— 即"按租约持有者从注册表实时解析"这条链路是活的。
+   - **实测夹具的坑（值得写下来）**：跑这套 drill 必须**显式清空自己用的 Redis DB**。共享的测试 Redis 不是私有的：上一次运行（或别的进程）留下的租约/注册表条目会让新的 leader 候选"忠实地"把控制轮询目标旋转到那个**已经不存在的节点**上并 fail-closed —— 我第一次运行就是这样得到一支从未被正确初始化的集群（所有请求 404、主节点从未当选），却看起来像产品缺陷。两个 drill 现在都先用 RESP 显式 `SELECT`+`FLUSHDB`（本机没有 `redis-cli`）。
 4. **自动加入/退出**：edge 无状态任意增删；leader 候选可加可减；
 5. **自愈**：租约时间栅栏杜绝双写、快照版本冲突由胜方覆盖、熔断投票 TTL 自清理、失效事件流跨故障切换不丢（幂等重放）。
 
@@ -29,9 +35,9 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `HYDRA_ROLE` | `all` | `leader` / `edge` 进入集群 |
+| `HYDRA_ROLE` | `all` | `leader` / `edge` 进入集群。**未设/空白/`all`** 就是单节点（默认，不报警）；**拼错的值不会阻止节点启动**（拼错不得让节点无法代理），但绝不静默 —— 只要配了**任何一个 cluster-only 变量**，就记一条 **ERROR 并用 `ignored=` 点名每一个**（**不是其中一部分**）（无注册表、无租约、无 L2 缓存、租户写入落在**本地** SQLite）；**角色未设**时同样报（第一百九十二轮实测：这条路径此前**完全静默**）。清单是 `cluster/mod.rs` 的 `CLUSTER_ONLY_ENV`（**10 个**：`HYDRA_REDIS_URL`、`HYDRA_REDIS_MODE`、`HYDRA_CLUSTER_TOKEN`、`HYDRA_CONTROL_URL`、`HYDRA_PUBLIC_URL`、`HYDRA_NODE_ID`、`HYDRA_CONTROL_POLL_MS`、`HYDRA_LEADER_LEASE_MS`、`HYDRA_REGISTRY_STALE_GRACE_SECS`、`HYDRA_FORWARD_TIMEOUT_SECS`）—— 第一百九十三轮实测：此前只点名前三个，**其余七个被静默丢弃**。首尾空白会被去掉（`" leader "` 就是 leader）；由 `scripts/check_cluster_env.cjs` 双向检查 |
 | `HYDRA_REDIS_URL` | — | **集群必填**（fail-closed）；如 `redis://redis:6379` |
-| `HYDRA_REDIS_MODE` | `single` | `single`（默认）/ `sentinel` / `cluster`（后两者接线中，fail-fast） |
+| `HYDRA_REDIS_MODE` | `single` | `single`（默认，大小写不敏感）/ `sentinel` / `cluster`（后两者接线中，**fail-fast**）；**其它任何值也 fail-fast**（拼错不得静默降级为 `single`）。**限定**：该开关**只在集群角色分支里被读取**（`if role.is_cluster()`，`main.rs`）⇒ `HYDRA_ROLE` 未设/`all` 时**根本不校验**，此时最多只会被那条 "cluster wiring is configured but …" 的 ERROR 提到**变量名**、**不会**出现拼错的值（第一百九十四轮实测，由 drill 的 K12 钉住） |
 | `HYDRA_CLUSTER_TOKEN` | — | **集群必填**：控制通道共享 token（leader 服务、edge/standby 调用） |
 | `HYDRA_CONTROL_URL` | — | leader/edge 必填：**控制面快照轮询**端点（active leader 的管理端点，如 `http://hydra-control:8081`）。注意它不是管理变更的转发目标 —— 转发目标在转发时按**租约持有者**从注册表实时解析（见 §5.2），因此候选节点把该变量指向自己也是安全的 |
 | `HYDRA_PUBLIC_URL` | — | 本节点注册到注册表的可达管理端点（如 `http://hydra-control-a:8081`）；leader 建议必填 |
@@ -58,6 +64,16 @@
 | leader 租约 | `hydra:{lease:leader}` | `SET NX PX` + Lua 原子续约（只续自己的） |
 | 节点注册表 | `hydra:{nodes}` + `hydra:{node:hb}:<id>` + `hydra:{node:seen}:<id>` | 注册/心跳（TTL 30s）/leader 发现；第三个键是**回收见证**（TTL = grace，见 §3.1） |
 | 失效总线 | `hydra:{ctl:events}` + `hydra:{ctl:gen}` | Streams 持久可重放 + generation 兜底 |
+
+### 5.1a 失效事件流的裁剪语义（2026-09-29 修正）
+
+**旧行为（缺陷）**：裁剪固定用 `XTRIM MAXLEN 10000`（每 30 s 一次），且**只要删掉了条目就 bump generation** ⇒ 超过 `10000 / 30 ≈ 333 事件/秒` 时**每一次裁剪都会删条目**，于是**每个节点每 30 s 清空整个 L1+L2 认证缓存**——与消费者是否落后无关。一个租户每分钟 2 次 invalidation 就能把全集群缓存永久维持在冷态（节流只限速率、不限后果）。
+
+**现行为**：裁剪仍按 `MAXLEN` 执行（内存上界不变），但 bump 只在**删掉的条目中有人尚未应用**时才发生。判定依据是"最慢存活消费者的 applied watermark"（`hydra:{ctl:inv:applied}:<node>`，`InvalidationStream::slowest_live_watermark`）：只有当**每一个存活节点都有 watermark**、且被删的最新条目 ≤ 最慢 watermark 时，才证明"这些条目所有人都已应用"⇒ 不 bump、不清缓存。任何一环无法证明（没有存活视图、某个存活节点从未发布 watermark、watermark 不可解析）都退回旧行为（bump），所以安全方向不变。
+
+**指标**（原先整条链路零指标）：
+- `hydra_invalidation_trimmed_total` —— 裁剪掉的条目数（无论是否需要 bump）；
+- `hydra_invalidation_generation_bumps_total` —— 真正"丢了没人读过的条目"的次数；**非零表示真实的收敛损失**（或事件速率超过 `maxlen / 裁剪间隔` 且有消费者跟不上）。
 | 共享限流 | `hydra:{rl:role:bucket}:count|tokens` | Lua 滑动窗口（同 `{rl:...}` tag 同槽） |
 | 共享熔断 | `hydra:{br}:dead:{p}` + `hydra:{br}:alldead` | 投票 + 心跳 TTL + 本地 1s 同步 |
 | 认证缓存 L2 | `hydra:{auth}:{tenant}:{keyhash}` + 索引 | L1 miss 才访问；租户索引免 SCAN |
@@ -68,10 +84,20 @@
 | 子系统 | Redis 宕机行为 |
 |---|---|
 | 配置快照 | 暂停更新（快照走 leader HTTP） |
-| 限流 | fail-open（`HYDRA_RATE_LIMIT_FAIL_MODE` 可配 closed）+ 告警指标 |
+| 限流 | fail-open（**硬编码，NOT configurable**：`HYDRA_RATE_LIMIT_FAIL_MODE` 从未实现 —— `grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空）+ 告警指标（`hydra_control_poll_total{result="rate_limit_error"}`） |
 | 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
 | 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
 | 选举 | 续约失败 → **立即降级停写**（fail-closed）；无切换直至 Redis 恢复 |
+
+> **2026-09-30 实测修正（P1，已修）**：上表最后一行原先并不成立。连接池是用
+> `Pool::new(…, policy: None, …)` 建的 —— **fred 根本没有重连策略**（策略不是 `Config` 的字段，
+> 别处也补不上），所以"连接被切断"之后**一次都不会重拨**：实测切断 ~2s 再恢复后，**90 秒内新建连接
+> 数 = 0**，每条命令都撞 500ms 命令超时，`/healthz/leader` **整整 90 秒 503**（租约永远拿不回来 ⇒
+> 集群长期没有 leader），限流的 fail-open 从"临时"变成"永久"，**只有重启能恢复**。fred 自己的
+> debug 日志点名了原因：`Checking reconnect state. Has policy: false`。修法：`redis::reconnect_policy()`
+> （`max_attempts = 0` = 永久重试，间隔 1s、带 jitter）交给 `Pool::new`，单测 + 集成 drill
+> `integration/test_cluster_limits.py` 双侧钉住；修复后切断期间每秒重拨、恢复后 ~3s 重新当上 leader、
+> `hydra_control_poll_total{result="rate_limit_error"}` 立刻停止增长。运维侧说明见 `ops.md` §13.5 / §9.1。
 
 ### 3.1 注册表：值格式、回收判据与身份前提
 
@@ -233,6 +259,17 @@ leader 用 `HYDRA_NODE_ID` 固定标识。
 
 ---
 
+### 4.x Liveness supervision (added 2026-09-29)
+
+每个 hydra 服务都带 **按角色** 的 container healthcheck，且路径必须随角色而变：
+
+| 角色 | 探针 | 原因（2026-09-29 在真实两节点集群上实测） |
+|---|---|---|
+| `leader`（control-a/b） | `curl -fsS -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://127.0.0.1:8081/api/v1/health` | 管理口需 token；不带 token 会 401 而永远 unhealthy |
+| `edge` | `curl -fsS http://127.0.0.1:8081/healthz` | **edge 不提供管理 API**：`/api/v1/health` 返回 **404**（实测），`/healthz`/`/readyz` 免鉴权 200；`/metrics` 无 token 401、带 token 200 |
+
+官方 `environment/docker-compose.cluster.yml` 此前**三个服务都没有 healthcheck**（单机与本地栈都有）—— 现已补上，并由 `scripts/check_compose_health.cjs`（CI `scripts` 作业 + 本机门禁）守住"角色 ↔ 探针路径"的匹配。
+
 ## 5. 故障切换演练
 
 ```bash
@@ -274,8 +311,9 @@ docker compose -f docker-compose.cluster.yml start hydra-control-a
 
 **已知限制**（未在本轮修复）：
 - 禁用的 `limit_role`/`provider_key_binding` 只存在于 active 本地 DB，**不进快照**（`build_config` 只带 enabled 行，契约见 T5.7）—— 故障切换后该行在副本/新 active 上丢失，需重新创建。修复方向：快照单独携带禁用行。
+- **物化失败的重试不再有次数上限（2026-09-29）**：`MaterializationGuard` 曾对每个快照只重试 **3 次**，用尽后**永久**不再尝试——而控制客户端不会重投"内存水位已越过"的版本，于是节点只有两条回头路：一次**更新的配置写入**（需要一个能工作的 leader，恰恰是"没有可当选节点"的集群给不出的）或重启。现在改为**次数不限、速率受限**：失败后按 1s→2s→4s…（上限 60s）退避，新快照立即重置退避与失败计数；`materialize` 本身幂等且被版本闸门与 `in_flight` 串行保护，所以重试是安全的。可观测：`hydra_replica_materialize_retries_total{outcome="attempt|succeeded|failed|throttled"}`——`failed` 持续增长说明节点物化不了（因而不能当选），这个状态以前既**永久**又**不可见**。
 - 新鲜度闸门基于"最近一次轮询成功"：重启后立刻提升的极端场景（active 同时死亡）仍可能以旧副本上任（租约感知轮换只覆盖"active 存活时回归"的常规路径）。
-- `HYDRA_FAILOVER_GRACE_MS` 已文档化但未接线；`HYDRA_BREAKER_QUORUM`/`HYDRA_RATE_LIMIT_FAIL_MODE` 为代码内默认值。
+- `HYDRA_FAILOVER_GRACE_MS` 已文档化但未接线（`grep -rn HYDRA_FAILOVER_GRACE_MS crates/` 为空）；`HYDRA_RATE_LIMIT_FAIL_MODE` **代码里根本不存在**（`grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空），Redis 宕机时限流是**硬编码 fail-open、NOT configurable**（`crates/hydra-server/src/redis/rate_limit.rs` 的 `warn!("redis rate-limit check failed; failing open")` + 注释 "there is NO env override"）。`HYDRA_BREAKER_QUORUM` 有代码内默认值 `1`，且**确实被读取**（`crates/hydra-server/src/main.rs` 的 `std::env::var("HYDRA_BREAKER_QUORUM")`）。
 
 ### 5.2 管理变更转发（standby → active）与循环防护
 

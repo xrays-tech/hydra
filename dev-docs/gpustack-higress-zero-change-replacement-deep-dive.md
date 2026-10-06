@@ -217,7 +217,7 @@ GPUStack 语义（Envoy custom_response RedirectPolicy）：
 
 ## 7. 收益复述（相对现状）
 
-- **资源**：移除 envoy gateway + pilot + controller（+apiserver）四进程，控制节点内存/镜像大幅下降（Higress 全家桶数百 MB~GB 级 vs Hydra 65 MiB）。
+- **资源**：移除 envoy gateway + pilot + controller（+apiserver）四进程，控制节点内存/镜像大幅下降（Higress 全家桶数百 MB~GB 级 vs Hydra 单二进制 31 MiB、满载 RSS 65 MiB；RSS 为 2026-08-09 基准，2026-09-29 Linux 复测为 21→30 MiB）。
 - **性能**：~0.3ms 网关开销、11k RPS；无 Wasm 解释层；SSE 流式回写可控。
 - **稳定性原生化**：熔断/限流/故障转移/回退是 Rust 内建逻辑，不再依赖 wasm 插件链的 phase/priority 编排。
 - **可运维**：管理 REST + UI、Prometheus 指标、单二进制；集群模式（leader/edge + Redis）可作为多 GPUStack 实例的统一入口。

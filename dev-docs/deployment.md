@@ -15,6 +15,13 @@ cargo build --release --features server,cluster-redis,usage-clickhouse
 # Docker 镜像（一键：cross-compile + 打入 bin/hydra + docker build）
 ./environment/build.sh
 #   → hydra:latest（单节点与集群模式共用同一镜像；HYDRA_ROLE 未设置 = 单节点，行为零变化）
+#
+# ⚠ 不要直接 `docker build`：`environment/Dockerfile` 是
+#   `COPY bin/hydra /usr/local/bin/hydra` —— 它**原样打包** `bin/hydra`，
+#   而这个文件由 `build.sh` 第 [2/3] 步从 `~/.cargo/global-target/…/release/hydra`
+#   拷过来。谁在几周前跑过一次构建、今天直接 docker build，就会**把那个旧二进制
+#   打进镜像**（本机实测：`bin/hydra` 还是 9 月 15 日的 32MB 产物，而源码早已前进）。
+#   `build.sh` 每次都会重新 cross-compile 并覆盖它，所以走它就是安全的。
 ```
 
 ---

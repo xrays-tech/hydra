@@ -976,7 +976,11 @@ pub struct UsageRecord {
 
 ### 9.5 脱敏
 
-客户端 api-key **仅取前 4 + 后 4 字符**存档（`sk-abcd…wxyz`），原始 key 不落用量表，避免泄露。
+客户端 api-key 按 `mask_key`（`crates/hydra-core/src/rewrite.rs:238`）脱敏后存档，原始 key 不落用量表。
+   ⚠️ **2026-09-30 按代码更正**：本文原先写"仅取前 4 + 后 4 字符（`sk-abcd…wxyz`）"，而实际规则是
+   **长度 ≥ 20 ⇒ 前 10 + 后 4**（中间替换为 `*`，即 22 字符的 key 会保留 14 个字符，而不是 8 个）、
+   **长度 6–19 ⇒ 前 2 + 后 2**、**长度 < 6 ⇒ 全星**。这条差异影响"用掩码就安全"的判断：掩码形式写进
+   `limit_role.matching_key` 时，一段长 key 的 14 个字符会被存下来。
 
 ---
 
@@ -986,7 +990,18 @@ pub struct UsageRecord {
 
 对每个请求，从 `ConfigData.limit_roles`（仅 `enabled=1`）中找出所有匹配项：
 
-- `matching_key` 为 NULL **或** 等于客户端 api-key；
+- `matching_key` 为 NULL **或** 等于客户端 api-key（**原始形式或掩码形式均可**；**推荐写掩码**）；
+  ⚠️ **2026-09-30 实测并已修复。** 限流门原先只把上下文建成 `MatchCtx { api_key:
+  Some(&mask_key(&api_key)) }`（`proxy.rs`，**掩码**形式），所以写**原始** key 的角色**永不触发**
+  （leader/edge 实测全 200 —— 一个看起来配好、实则不生效的配额）。修复后 `MatchCtx` 同时携带
+  `api_key_raw`，`key_dim_matches` 接受**两种形式**（实测原始形式 `[200,200,429,429]`，掩码形式不变）；
+  **计数桶仍用掩码**，故原始 key 不会进入 Redis key 名或指标标签。遗留后果：掩码只留首/尾 ⇒
+  **两个不同 key 掩码相同即共用一个配额**（实测仍成立）。
+  ⚠️ **为什么推荐掩码而不是原始 key**：`limit_role.matching_key` 是**明文**列（`db.rs:1288/1311`，与
+  provider api-key 的 `kp.seal` 不同），随 `cluster/snapshot.rs:119` 的**明文** `LimitRole` 载荷发往每个
+  节点、由 `db/restore.rs:242` 原样落库，并经 `GET /api/v1/limit-roles` 与管理 UI 回显 —— 写原始 key
+  等于把**活凭据**明文放进每个节点的库、每份备份与每次管理面响应。详见 `ops.md` §4 与决策项
+  **D-15**（桶是否按原始 key 计）、**D-16**（该列是否封存）。
 - `matching_model` 为 NULL **或** 等于请求 model_key；
 - `matching_tenant` 为 NULL **或** 等于租户 id；
 - `matching_provider` 为 NULL **或** 等于选中 provider id（注：provider 在路由后确定，故 provider 维度的 token 限流在 `logging` 阶段二次检查/记账）。
@@ -1121,6 +1136,12 @@ X-Hydra-Trace-Id: <trace_id>
 > **客户端错误透出（2026-09-09）**：欠费拒绝 → HTTP **402**，body `{"error":{"message":"insufficient_balance","type":"insufficient_quota"}}`（type 与主流 OpenAI 兼容网关对齐）；其余拒绝维持 401 + `type:"auth_error"`。
 
 ### 11.4 `auth_url` 不可用 / 超时的策略
+
+> ⚠️ **2026-09-30 实测：这个配置项没有接线。** `AuthConfig.fail_mode` 在 `main.rs` 里取的是
+> `..AuthConfig::default()`（`Closed`），全仓**没有**读它的 env，也**没有**配置文件 loader；
+> `FailMode::Open` 已实现且默认值保持 `Closed`，但**无法被选中**（实测 `HYDRA_AUTH_FAIL_MODE=open` /
+> `HYDRA_FAIL_MODE=open` / `HYDRA_AUTH_FAILMODE=open` 三者在 auth 上游不可达时都仍返回 503）。
+> 详见 `ops.md` §5.x 与 §13 的"文档化但未接线"清单。
 
 认证服务故障时的处理由配置 `[auth] fail_mode` 决定：
 
@@ -1343,6 +1364,8 @@ Admin 端口仅绑内网 + 单一 Admin Token（`Authorization: Bearer <ADMIN_TO
 
 ### 15.1 `hydra.toml`
 
+> **状态（2026-09-29 复核）：未实现。** 本仓库没有配置文件加载器 —— 任何 `Cargo.toml` 里都没有 `toml` 依赖，`grep -rn 'hydra\.toml' crates/` 为空；配置**只走环境变量**（见 `dev-docs/ops.md` §1.1，那里原本也把 `hydra.toml` 画进了部署目录树，已一并改正）。本节保留为**目标 schema**：下面的示例把每个 toml 键映射到它对应的环境变量，照此实现的文件今天**不会被读取**。
+
 ```toml
 [server]
 proxy_tls_addr = "0.0.0.0:443"     # → env HYDRA_TLS_LISTEN（可选；设置它才启用 HTTPS）
@@ -1365,6 +1388,9 @@ retry_after_connect = false        # 默认 false（安全）；true 接受重�
 [breaker]
 threshold       = 5               # 连续失败阈值
 probe_interval  = "10s"           # dead provider 探活间隔
+# ⚠️ 这两个键**同样没有接线**：全仓没有配置文件 loader，也没有读它们的 env 变量，实际值就是
+# hydra-server/src/proxy/config.rs::BreakerPolicy::default() 里的常量（5 / 10s）。实测见
+# ops.md §6.3；唯一可用的杠杆是 DELETE /api/v1/breaker/{id}。
 
 [database]
 url = "sqlite://./data/hydra.db?mode=rwc"
@@ -1443,7 +1469,7 @@ PRAGMA mmap_size = 134217728;
 
 - `AuthCache` 仅存 `sha256(api_key)`，内存无明文；
 - 认证回源请求携带明文 key（租户侧已信任，且 auth_url 应为租户自有 HTTPS 端点）；
-- 用量记录、访问日志一律脱敏（前 4 + 后 4），永不记录完整 key。
+- 用量记录、访问日志一律脱敏（`mask_key`：长度 ≥ 20 取前 10 + 后 4，6–19 取前 2 + 后 2，见 §9.5），永不记录完整 key。
 
 ### 16.5 内部逻辑禁 Mock
 
@@ -1673,7 +1699,7 @@ PRAGMA mmap_size = 134217728;
 | 子系统 | Redis 宕机行为 |
 |---|---|
 | 配置快照 | 暂停更新（快照走 leader HTTP，edge 持 last-known-good） |
-| 限流 | fail-open（`HYDRA_RATE_LIMIT_FAIL_MODE` 可配 closed）+ 告警指标 |
+| 限流 | fail-open（**硬编码，NOT configurable**：`HYDRA_RATE_LIMIT_FAIL_MODE` 从未实现 —— `grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空）+ 告警指标（`hydra_control_poll_total{result="rate_limit_error"}`） |
 | 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
 | 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
 | 选举 | 续约失败 → 立即降级停写（fail-closed）；无切换直至 Redis 恢复 |

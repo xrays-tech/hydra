@@ -340,7 +340,7 @@ cargo fmt --all -- --check                                  # ok
 RUSTFLAGS=-D warnings cargo clippy ... --all-targets        # ok
 cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'   # 空
 ```
-> 2 例 `admin_api`（`empty_body_delete_invalidates_all_local`、`too_many_invalidation_keys_are_refused_and_publish_nothing`）为 **v1 阶段已证实的既有基线失败**（HEAD worktree 复现），非 v2 回归。
+> 2 例 `admin_api`（`empty_body_delete_invalidates_all_local`、`too_many_invalidation_keys_are_refused_and_publish_nothing`）：**更正（2026-09-29）——不是"既有基线失败"，而是由 `c3eaa6f` 引入的回归**。该提交把 `crates/hydra-server/src/cluster/events.rs` 的空存活集分支从 `Applied`（→200）翻成 `Pending`（→202），症状（expected 200, got 202）与之一致。原先的"HEAD worktree 复现 ⇒ 非回归"论证不成立：`git merge-base --is-ancestor c3eaa6f 692655d` = YES，那份"干净 HEAD worktree" `692655d` 本身就在 `c3eaa6f` 之后。**语义决定仍 OPEN**（给测试注入 fleet 视图断言 200，或承认 202 并同步改断言 + 文档），本计划不裁定、也不改测试。
 
 ### 新增测试
 - core：`TenantWriteRoute`/`parse_write_route` 正负例（V5）；`SubTenantRows` 全量行配额/重叠/`NameInvalid`（V4）。

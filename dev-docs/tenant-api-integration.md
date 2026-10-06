@@ -101,7 +101,19 @@ Authorization: Bearer <tenant access token>
 
 ### 4.4 方法约定
 
-**只读端点**方法固定：`whoami`/`usage`/`sub-tenants`/`sub-tenant-routes` 只认 `GET`、`invalidate` 只认 `POST`；用错方法 → `405 method_not_allowed`。**写端点**（§5.6）按 `(方法, 路径)` 解析：`PUT`/`DELETE` 各走各的路径形状，用错方法（例如 `GET`/`POST` 打到写路径）→ `404 not_found`（**不是** 405——写路由是方法敏感的）。保留前缀下**任何**不是这九条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
+**只读端点**方法固定：`whoami`/`usage`/`sub-tenants`/`sub-tenant-routes` 只认 `GET`、`invalidate` 只认 `POST`；用错方法 → `405 method_not_allowed`。**写端点**（§5.6）按 `(方法, 路径)` 解析：`PUT`/`DELETE` 各走各的**路径形状**，形状对不上的组合 → `404 not_found`。保留前缀下**任何**不是这九条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
+
+> **405 还是 404 的判定（2026-09-30 逐格实测，此前这一段的例子是错的）**：先看**路径**能不能对上那五条只读路由，再看方法 —— 对上了但方法不对就是 **405**；对不上任何 `(方法, 路径)` 组合就是 **404**。所以同一个"用错方法"会得到两种答案，取决于**该路径形状是否也是一条只读路由**：
+>
+> | 请求 | 结果 | 原因 |
+> |---|---|---|
+> | `POST /tenant/{tid}/api/v1/sub-tenant-routes` | **405** | 该路径**也是**只读路由 `sub-tenant-routes`（只认 `GET`）⇒ 方法检查先命中 |
+> | `GET /tenant/{tid}/api/v1/sub-tenants/QQ` | **404** | `/sub-tenants/{name}` 这个**形状**只有写路由（`PUT`），`GET` 对不上任何组合 |
+> | `PUT` / `DELETE /tenant/{tid}/api/v1/sub-tenants` | **404** | 该路径的写路由是 `/sub-tenants/{name}`，没有"不带 name"的写形状 |
+> | `DELETE /tenant/{tid}/api/v1/sub-tenant-routes` | **404** | 删除的写形状是 `/sub-tenant-routes/{id}` |
+> | `GET /tenant/{tid}/api/v1/auth/cache/invalidate` | **405** | 该路径是只读路由，只认 `POST` |
+>
+> 换句话说：**旧文档里"`GET`/`POST` 打到写路径一律 404"的例子是错的** —— `POST .../sub-tenant-routes` 恰好打在一条**同时是只读路由**的路径上，实测是 **405**。按 `code` 分支处理（两者都在 §6 里）不会踩坑，但别按 404/405 去猜"路径存不存在"。
 
 ### 4.5 幂等性
 
@@ -164,10 +176,16 @@ Content-Type: application/json
 
 | 查询参数 | 取值 | 默认 | 说明 |
 |---|---|---|---|
-| `wait` | `converged` \| `none` | `converged` | `none` = 发出去就立刻返回 `202`，不等集群确认（适合批量脚本）。给了别的值 → `400 invalid_wait` |
+| `wait` | `converged` \| `none` | `converged` | `none` = 发出去就立刻返回 `202`，不等集群确认（适合批量脚本）。给了别的值 → `400 invalid_wait`。**例外：没有 `cluster-redis` 特性的构建**里不存在 fleet，本节点自己清完就是全部答案 ⇒ 此时**无视** `wait` 与 `timeout_ms`，一律返回 `200 single_node` |
 | `timeout_ms` | `1`..`60000` | 服务端配置（默认 2000） | 本次请求等待全集群确认的预算。越界/非数字 → `400 invalid_timeout_ms` |
 
-> 这两个参数是**校验**而不是"忽略"：写错了会明确报错，不会静默按默认值执行 —— 否则你会以为自己要了（或跳过了）一次等待。
+> 这两个参数**不是同等强度地"校验"**，别以为它们对称：
+> - `timeout_ms` 会先 `trim()` 再 `parse::<u64>()`（`crates/hydra-server/src/tenant_api/handlers.rs`，`invalidate()` 里的 `param("timeout_ms")` 分支），所以 `?timeout_ms=%202000%20`（带尾随空格）**被接受**；
+> - `wait` 是**逐字节比较**（同函数的 `match param("wait")`：`None | Some("converged")` / `Some("none")` / `Some(other)`），所以 `?wait=none%20` 是 **400 `invalid_wait`**，不会被当成 `none`。
+>
+> 百分号解码本身是正常的（`tenant_api::time_bound::query_params` 先 `percent_decode` 再取值），所以 `%20` 确实变成了那个空格 —— 差别只在**比较前有没有 `trim()`**。
+>
+> 也就是说：写错了**不会**静默按默认值执行（这点是真的），但"能容忍空白"这件事只对 `timeout_ms` 成立。
 
 #### 为什么要"等集群确认"
 
@@ -199,9 +217,9 @@ Content-Type: application/json
 | `scope` | `keys`（按 key 清）或 `tenant`（清空） |
 | `fleet.state` | 见下表 —— **这才是"到底清干净没有"** |
 | `fleet.nodes_applied` / `nodes_total` | 已确认 / 存活节点数 |
-| `fleet.lagging` | 未确认的节点名。仅当 `state=pending` **且确实检查过节点并发现落后**时非空；`nodes_total=0`（无人可查）时为空。运维可以直接拿它去查 |
-| `fleet.event_id` | 本次失效在内部总线上的事件 ID。用 `wait=none` 时拿它做后续对账 |
-| `fleet.waited_ms` | 本次真正等待的毫秒数 |
+| `fleet.lagging` | **未确认的节点名 —— 一律读作"没确认"，绝不要读作"已证实落后"**。三种来源：① `state=pending` 且确实检查过节点、发现它们的水位落后；② `wait=none`：**没人被检查**，此处就是**全部存活节点**（服务端自己的集群测试就是这么断言的：*"nobody was checked, so nobody confirmed"*）；③ `nodes_total=0` 的 `pending`（枚举不出 fleet）时才为空。运维可以直接拿它去查 |
+| `fleet.event_id` | 本次失效在内部总线上的事件 ID。用 `wait=none` 时拿它做后续对账。**可为 `null`**：`single_node`（无总线）与 **publish 失败**的 `unavailable`（什么都没入队）都是 `null` —— 此时没有可对账的 ID |
+| `fleet.waited_ms` | 本次真正等待的毫秒数。**`single_node` 路径上恒为 `0`**（硬编码，不走计时），别把它当"等了多久"的度量 |
 
 #### 状态码与 `fleet.state` 的对应（**必须按这个判断，不要只看 HTTP 200**）
 
@@ -209,8 +227,14 @@ Content-Type: application/json
 |---|---|---|---|
 | `200` | `applied` | **所有存活节点都已生效** | 完成 |
 | `200` | `single_node` | 本节点就是全部数据面（单节点部署） | 完成 |
-| `202` | `pending` | 已发布，但**没有全部确认** | **不是错误，也还不是"完成"**。可重试（幂等），或把 `lagging` 交给运维。用 `wait=none` 时这里**不代表**那些节点落后 —— 只是没人去看。若 `nodes_total=0`，说明本节点此刻**枚举不出存活节点集**（启动窗口 / 注册表行过期），`lagging` 因此为空、与"有具体落后节点"不是一回事 —— 请重试或交运维 |
-| `503` | `unavailable` | 失效通道存在但**不可用**（发布或水位读取失败） | **集群没有被通知**。必须重试或找运维。响应体仍是上面的正常结构，**没有** `error.code` |
+| `202` | `pending` | 已发布，但**没有全部确认** | **不是错误，也还不是"完成"**。可重试（幂等），或把 `lagging` 交给运维。`lagging` 的语义是**"没确认的节点"**，不是"已证实落后"：用 `wait=none` 时它等于**全部存活节点**（没人被检查），**不代表**那些节点落后。若 `nodes_total=0`，说明本节点此刻**枚举不出存活节点集**（启动窗口 / 注册表行过期），此时 `lagging` 为空、与"有具体未确认节点"不是一回事 —— 请重试或交运维 |
+| `503` | `unavailable` | 失效通道存在但**不可用**（**发布**或**水位读取**失败） | **集群没有被通知**。必须重试或找运维。响应体仍是上面的正常结构，**没有** `error.code`。注意两条 `unavailable` 路径的字段不同：**水位读取失败**时 `lagging` = 全部存活节点、`event_id` 有值（事件已入队但读不到水位）；**发布失败**时 `lagging` 为空、`event_id` 为 `null`（什么都没入队） |
+
+> **没有 `cluster-redis` 特性的构建（真正的单节点）：`wait` / `timeout_ms` 完全不生效。**
+> 此时根本没有 fleet，本节点自己清完就是全部答案，实现直接返回 **`200` + `single_node`**
+> （无论 `wait=none` 还是 `timeout_ms=1`）—— 所以"`wait=none` ⇒ 立刻 `202`"这条**只对带
+> `cluster-redis` 的构建成立**。拿 `202`/`event_id` 做对账的脚本请在 `single_node` 下退回
+> "本地已完成"分支。判据是响应里的 `fleet.state`，不是你有没有传 `wait`。
 
 #### 请求限制
 
@@ -414,9 +438,10 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 
 #### 传输语义（为什么你看到的是"正常响应"）
 
-- 请求在**边缘**（你连的那个数据面节点）用**你的令牌**鉴权；集群部署下该节点把写**透明转发**到持有 leader 租约的节点执行，单节点部署下该节点**本地执行**。两种形态你拿到的响应形状完全一致（`200` 带资源 + `config_version`，或 `204`）。你**无需也不应**感知它在哪个节点落地。
-- 你的令牌 Bearer 在转发时走**专用头 `x-hydra-tenant-token`**（**不进 body、不进日志**）；转发用节点级 cluster token 认"这是我方节点"，leader 再用**你的令牌重鉴权**并做**授权绑定**（写目标必须是你自己）。这层对你是透明的。
-- **分区 / 无 leader 时写 fail-closed**：`503`（读不到 leader / 本节点还没配置）时写**没有执行**，可重试；读继续用旧快照。
+- 请求在**边缘**（你连的那个数据面节点）用**你的令牌**鉴权；集群部署下该节点把写**透明转发**到持有 leader 租约的节点执行，单节点部署下该节点**本地执行**。两种形态你拿到的响应形状完全一致（`200` 带资源 + `config_version`，或 `204`）。正常情况下你**无需**感知它在哪个节点落地。
+  > ⚠ **一个必须知道的例外（OC-4）**：写端点**必须经由边缘**。集群**leader 自己的数据面没有转发目标**（自转发守卫解析为 `None`，`crates/hydra-server/src/tenant_config/forward.rs` 的 `NoLeader`），对写请求**确定性**返回 `503 no_leader` 且**不会本地执行**——leader 仍然持有权威库，只是它的数据面不服务写。所以如果你的 LB 把租户流量也打到 leader 的 `:8080`，那个节点上的**读**一切正常、**写**恒定 `503`，而且**重试同一个节点永远不会成功**（换到边缘节点即可）。官方示例拓扑（`ops.md`「Cluster topology constraint」）是 LB → edge:8080、不把租户流量打到 leader，因此该约束在示例里是潜伏的；自己搭拓扑时必须保证写路径只落到边缘节点。
+- 你的令牌 Bearer 在转发时走**专用头 `x-hydra-tenant-token`**（**不进 body、不进日志**）；转发用节点级 cluster token 认"这是我方节点"，leader 再用**你的令牌重鉴权**并做**授权绑定**（写目标必须是你自己）。这层对你是透明的。转发时还会带上 `x-hydra-trace-id`：**leader 会采用这个 id**，所以 leader 的审计记录、错误响应体里的 `trace_id` 与你收到的 `X-Hydra-Trace-Id` 响应头**是同一个字符串**，报障时可以直接拿它去查 leader 的审计日志。
+- **分区 / 无 leader 时写 fail-closed**：`503`（读不到 leader / 本节点还没配置）时写**没有执行**；读继续用旧快照。重试要看 code：`not_ready`（本节点还没配置快照）**稍等或换节点**即可；`no_leader` 则是**换节点**，同节点必然再失败（见上条例外）。
 
 #### 错误码（写端点）
 
@@ -432,7 +457,8 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 | `404` | `not_found` | 资源不存在，**或**属于别的租户（二者刻意不可区分） | 否（核对 id / `sub_tenant_id`） |
 | `409` | `name_duplicate` / `prefix_duplicate` | 名字 / 前缀与同租户既有子租户冲突 | 否（换个 name/prefix） |
 | `429` | `too_many_requests` / `rate_limited` | 触发每租户**配置写**预算（默认 60/分钟，带 `Retry-After`），或通用每租户请求预算（§7.2） | **是**（等 `Retry-After`） |
-| `503` | `not_ready` / `no_leader` | 本节点还没有配置快照 / 集群下解析不到 leader（写未执行） | **是** |
+| `503` | `not_ready` | 本节点还没有配置快照（写未执行） | **是**（稍等或换节点） |
+| `503` | `no_leader` | 解析不到 leader（写未执行）。**leader 自己的数据面会确定性返回它**（见"传输语义"的例外），此时重试同一节点永远无效 | **是**（**必须换边缘节点**） |
 | `504` | `forward_result_unknown` | leader 未按时应答（结果未知）——**先重读再重试**（见上） | **是**（重读后） |
 
 #### 边界（**必读**，与 §7.6 同义）
@@ -465,8 +491,9 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 | `window_too_large` | 400 | 窗口超过上限（默认 31 天） | 否（缩小窗口） |
 | `usage_store_unavailable` | 503 | 计量存储读不到或无法解析 | **是** |
 | `too_many_requests` | 429 | 每租户**配置写**预算超限（写端点，默认 60/分钟，§5.6），带 `Retry-After` | **是**（等 `Retry-After`） |
-| `no_leader` | 503 | 集群下解析不到 leader，写未执行（写端点，§5.6） | **是** |
+| `no_leader` | 503 | 解析不到 leader，写未执行（写端点，§5.6）。**leader 自己的数据面会确定性返回它** | **是**（**必须换边缘节点**；同节点必然再失败） |
 | `forward_result_unknown` | 504 | leader 未按时应答，结果未知（写端点，§5.6）——**先重读再重试** | **是**（重读后） |
+| `forward_failed` | 502 | 到达 leader 的转发失败（连接层），请求**未**执行（写端点，§5.6） | **是** |
 | `invalid_name` | 400 | 子租户名字非法（写端点，§5.6） | 否 |
 | `empty_key_prefix` / `invalid_key_prefix` / `key_prefix_overlap` | 400 | 前缀为空 / 非 ASCII / 无分隔符 / 与同租户前缀或启用中的 operator binding 重叠（写端点，§5.6） | 否 |
 | `provider_not_found` / `provider_not_in_tenant` / `model_not_in_tenant` / `model_not_served_by_provider` | 400 | 路由的 provider/model 不在你的授权范围内（写端点，§5.6） | 否 |
@@ -494,6 +521,19 @@ curl -s $HYDRA/tenant/$TID/api/v1/whoami -H "Authorization: Bearer $TOK" | grep 
 curl -s -X POST $HYDRA/tenant/$TID/api/v1/auth/cache/invalidate \
   -H "Authorization: Bearer $TOK" -H "content-type: application/json" -d '{}'
 ```
+
+#### 停用后你的**客户端**看到什么（2026-09-30 实测）
+
+| 请求 | 响应 |
+|---|---|
+| 客户端请求（`/v1/*`）打到**被停用**的租户 | **403**，体 `{"error":{"message":"tenant_disabled","type":"proxy_error"}}` |
+| 同一租户的**租户 API**（本文档其余部分） | 全部照常可用（上表九条路由，含写端点） |
+
+> ⚠ **数据面 `/v1/*` 的错误信封与本文档 §4.3 的**不是同一个**。数据面（`proxy.rs::short_circuit`）只有
+> `message`（原因串）与 `type`（恒为 `proxy_error`）—— **没有 `code`，也没有 `trace_id`**。实测四个：
+> `401 missing_api_key`、`403 model_not_allowed`、`404 unknown_domain`、`403 tenant_disabled`。
+> 所以**不要**在客户端错误处理里按 `error.code` 分支：那个字段只存在于租户 API 的信封里；
+> 数据面请按 **HTTP 状态 + `error.message`** 判定。（本文档 §4.3/§6 描述的是租户 API。）
 
 ### 7.2 限流与锁定
 

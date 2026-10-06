@@ -317,6 +317,7 @@ registration, `metrics.rs:49-67`):
 | `hydra_queue_wait_seconds`        | histogram | `provider`                                              | admission module, on permit-acquired (reuse `LATENCY_BUCKETS`, `metrics.rs:43-45`)      |
 | `hydra_queue_drops_total`         | counter   | `provider`, `reason` (`full`, `timeout`, `client_gone`) | admission module, on denied acquire                                                   |
 | `hydra_admission_decisions_total` | counter   | `provider`, `outcome` (`acquired`, `queued`, `dropped`) | admission module                                                                      |
+| `hydra_admission_limits_stale_total` | counter | `provider`                                            | admission module, on acquire while the gate's limits differ from the live configuration (gates are not resized on hot-reload — shipped 2026-09-29, plan §2bi / D-14) |
 
 Follow the existing `Option<&Metrics>` no-op-on-failure discipline (`metrics.rs:74-164`) so
 instrumentation never breaks the hot path.

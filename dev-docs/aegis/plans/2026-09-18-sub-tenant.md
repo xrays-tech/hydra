@@ -672,12 +672,14 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'   # 空（依�
 - server `tenant_api.rs`：6（T7 只读 + 跨租户隔离 + edge 快照）
 - server `terminate_mode.rs`：2（T5 passthrough 收窄 + fail-closed 503）
 
-### 已知既有失败（**非本次回归，已证**）
+### `cluster-redis` 下 2 例 `admin_api` 失败（**已更正：是 `c3eaa6f` 引入的回归，不是既有基线**）
 `--features server,cluster-redis --test admin_api` 中 2 例失败（期望 200，实得 202）：
 - `empty_body_delete_invalidates_all_local`
 - `too_many_invalidation_keys_are_refused_and_publish_nothing`
 
-二者均为 E2 收敛屏障 `broadcast_and_confirm` 的 `Pending(202)` 路径，与子租户无关；在**干净 HEAD worktree（692655d）**上同样 2 失败，故为既有基线/环境问题。`--features server` 下不受影响（全绿）。证据命令：`git worktree add --detach <tmp> HEAD` 后原样复跑，`37 passed; 2 failed`。
+二者都命中 E2 收敛屏障的 `Pending(202)` 路径，**症状（expected 200, got 202）与 `c3eaa6f` 的改动完全一致**：该提交把 `crates/hydra-server/src/cluster/events.rs` 的空存活集分支从 `Applied`（→200）翻成 `Pending`（→202）。**更正（2026-09-29）**：本节原先写"**非本次回归，已证**……在干净 HEAD worktree（692655d）上同样 2 失败，故为既有基线/环境问题"——**这个论证不成立**：`git merge-base --is-ancestor c3eaa6f 692655d` = **YES**，即那份"干净 HEAD worktree" `692655d` **本身就是 `c3eaa6f` 的后代**，它当然会复现同一行为。用"某个后代 commit 也失败"证明"不是回归"是循环论证。归因改为：**回归由 `c3eaa6f` 引入**。`--features server`（无 `cluster-redis`）下不受影响（全绿），所以只有集群特性门禁看得到。
+
+**语义决定仍然 OPEN**（本计划不做裁定，也不改测试）：要么给这两个测试注入一个 fleet 视图、恢复断言 200；要么承认空 fleet 下 202 是正确语义，改测试断言 + `admin-ui/api-docs.js` + `tenant-api-integration.md` + 运维告警。两种解法**都没有被选择**。
 
 ### 执行期修正 / 偏离
 - **WIRE_VERSION 2→3 强制**（oracle F1），升级顺序：先 reader/standby，再由 leader 发新格式。

@@ -4,7 +4,7 @@
 
 > **受够了 Python LLM 网关——闲置就吃掉 20GB 内存，还在 OpenAI↔Anthropic 的有损转换里默默吞掉你的工具调用？**
 >
-> **Hydra 是基于 Rust + Pingora 的 LLM 路由网关，OpenAI 与 Anthropic 双协议原生直通——零转换、按租户 TLS、计量级用量分解（缓存 token + TTFT）——65 MiB 单体二进制，零 `unsafe` / `unwrap` / `panic`。**
+> **Hydra 是基于 Rust + Pingora 的 LLM 路由网关，OpenAI 与 Anthropic 双协议原生直通——零转换、按租户 TLS、计量级用量分解（缓存 token + TTFT）——65 MiB 单体二进制，零 `unsafe`、零生产 `unwrap`/`panic!`；唯一的 panic 来源是 6 处断言不可达不变量的 `expect()`。**
 
 **高性能 LLM 路由网关。** 同时支持 **OpenAI（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）** 两种客户端协议，格式同构直通（按客户端路径端到端保持同一格式，不做 OpenAI↔Anthropic 转换），路由到上游模型供应商，提供按租户鉴权、加权负载均衡、故障转移、熔断、限流、细粒度用量计量（输入/缓存/输出 token + TTFT）、按租户 TLS。基于 Rust + [Pingora](https://github.com/cloudflare/pingora)。
 
@@ -17,7 +17,7 @@
 | ⚡ | **11,056 RPS** 峰值吞吐 | c=25，p99 = 4.39ms |
 | 🪶 | **65 MiB** 满载内存 (RSS) | 18.6 → 65.4 MiB；占 16G 机器 < 0.4% |
 | ⏱️ | **~0.3 ms** 单请求网关开销 | 相对 LLM 延迟可忽略 |
-| 🛡️ | **0** 处生产 `unwrap`/`panic`/`unsafe` | 两个 crate 均 `#![forbid(unsafe_code)]` |
+| 🛡️ | **0** 处生产 `unwrap`/`panic!`，**6** 处 `expect()` 不变量断言 | 两个 crate 均 `#![forbid(unsafe_code)]`；6 处 panic 来源均为「不可达不变量」断言——`main.rs`（cert store）、`admin/mod.rs`（leader 模式 SQLite pool）、`cluster/control_client.rs` ×4 |
 | 🔐 | provider 密钥 **AES-256-GCM** 落库加密 | fail-closed 启动；管理面永不返回明文 |
 | 🧪 | **core 114 + server 173** 测试，`clippy -D warnings` 干净 | CI 硬门禁 |
 

@@ -1,6 +1,6 @@
 # 子租户（Sub-Tenant）与 api-key 前缀路由 — 设计文档
 
-> 状态：**设计评审通过（oracle v1 评审 + 事实核查）。v1 已实现并提交（`da07610~1..1007dea`）；v2（租户自助写 / A′）已实现（V1–V6 全绿，V8 门禁待跑；计划 `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`）**
+> 状态：**设计评审通过（oracle v1 评审 + 事实核查）。v1 已实现并提交（`da07610~1..1007dea`）；v2（租户自助写 / A′）已实现、门禁已跑、复审通过并提交（`9adbea1..d799756`；实现到 `b283b74` + 复审跟进提交，V8 门禁全绿，实现后 oracle 对抗式复审 第一轮 FAIL → 修复 → 复验 PASS；计划 `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`）**。（2026-09-29 更正：原文写「V1–V6 全绿，V8 门禁待跑」，与 `dev-docs/aegis/INDEX.md` 记录的"已提交 + 复审 PASS"矛盾，已改。）
 > 日期：2026-09-18
 > 相关：`design.md` §7.1（路由/白名单）、§7.1b（key-prefix binding）、`design-tenant-api.md`（数据面自助 API 与 A-1 决策）、`cluster.md`（LEADER/EDGE 拓扑）
 

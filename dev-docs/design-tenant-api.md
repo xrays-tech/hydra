@@ -971,7 +971,7 @@ v1 需要转发，是因为"写配置"必须落到**持有租约的权威节点*
 | **铁律 1 TDD 优先**：先红后绿；`hydra-core` 覆盖率 ≥90%、`hydra-server` ≥60% | `dev-plan.md:19-24` | 纯函数（归一化/解析/聚合）先写穷举单测；handler 由集成测试驱动 |
 | **铁律 2 本体零 Mock/零桩**：唯一允许 mock 的是**真实外部边界**，且优先**进程级真实 double**（HTTP → wiremock 真 server；SQLite → `:memory:` 真引擎） | `dev-plan.md:26-37` | 不得为租户 API mock `ConfigStore`/`AuthCache`/DB；`auth_url` 用 wiremock |
 | **铁律 2 补充**：Redis 必须连**真实实例**，未设 `HYDRA_TEST_REDIS_URL` 时必须**明确失败**、绝不静默跳过 | `dev-plan.md:39-48`、`tests/common/mod.rs:45-52` | §10.3 集群用例用真实 Redis |
-| 生产代码不得出现 `unwrap/expect/panic/unimplemented/todo`、mock/stub、`#[cfg(test)]` 分支 | `dev-plan.md:197-206`、`dev-docs/waves/wave-6-ui-hardening.md:64/90` | E3 的 `UsageQuery` 两个实现的**每一个解析失败路径**都必须显式返回错误，绝不 `unwrap_or(0)`（那正是"假 0"的成因） |
+| 生产代码不得出现 `unwrap/expect/panic/unimplemented/todo`、mock/stub、`#[cfg(test)]` 分支 | `dev-plan.md:197-206`、`dev-docs/waves/wave-6-ui-hardening.md:64/90` | E3 的 `UsageQuery` 两个实现的**每一个解析失败路径**都必须显式返回错误，绝不 `unwrap_or(0)`（那正是"假 0"的成因）。**2026-09-29 复核**：`unwrap`/`panic`/`unsafe` 在生产代码确为 0，`expect` 仍有 8 处（均为"不可达不变量"式断言），即本行对 `expect` 的禁令目前未被满足 —— 见本文档末尾门禁表「生产代码 grep 门禁」行 |
 | CI 全程 `RUSTFLAGS="-D warnings"` + `SQLX_OFFLINE=true` | `.github/workflows/ci.yml:8-16` | 本地门禁带同样环境变量 |
 
 ### 10.1 单元（`cargo test -p hydra-core`，无 I/O、无特性、无网络）
@@ -1082,6 +1082,7 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 |---|---|---|
 | 浏览器腿（**强制**） | 起 release 二进制 → `./tests/e2e/seed.sh` → `npx playwright test --config=playwright.config.cjs` | 本设计改 `admin-ui/app.js` 与 `api-docs.js`；仓库纪律：Web 应用必须经 Playwright 端到端验证（`dev-docs/waves/wave-6-ui-hardening.md:5/86`），CI 的 `ui-e2e` job 即如此（`ci.yml:188-253`） |
 | 生产代码 grep 门禁 | `rg 'unwrap\(\)\|expect\(|panic!\|unimplemented!\|todo!' crates/hydra-server/src` 必须为空；人工确认无 mock/stub/`#[cfg(test)]` 分支 | `dev-plan.md:197-206` |
+| 生产代码 grep 门禁（**2026-09-29 复核：上一行命令从未可执行**） | 不加 `#[cfg(test)]` 过滤时实测 **489 行命中 / 34 个文件**（绝大多数是测试）。按生产代码实测（剥掉 `#[cfg(test)]`、`#[cfg(all(test, feature = "…"))]`、注释与字符串内部）：`unwrap()` **0**、`panic!/unreachable!/todo!/unimplemented!` **0**、`unsafe` **0**，但 `expect(` **8 处** —— 所以"必须为空"只对前者成立，对 `expect` 不成立。现由 `scripts/check_source_purity.cjs` 自动执行（CI `scripts` job），并同时断言每个 crate **根**（`src/lib.rs` 与每个 `[[bin]]`）带 `#![forbid(unsafe_code)]`；`expect` 8 处逐行打印但不判违规，是否也禁 `expect` 为待定事项（计划 D-13） | 复核命令：`node scripts/check_source_purity.cjs`；489 行由 `rg -c … \| awk` 固定实测 |
 | 反熵核对 | 三个 handler **只有一份实现**（旧路由按 M1 删除，不是保留别名）；`tenant_id_for_token` 旧实现删除、不留双实现；管理口的租户令牌路由块整块消失（C16 断言 404 而非 401）；v1 的域名/URL 校验模块**不存在**（不是留着不用）；`usage_backend` 枚举**不存在**（被 `UsageQuery` 注入取代） | §2.3、§3.0 规则 1/3、§8.1 |
 | `.sqlx/` | 本设计用运行时 `sqlx::query` → **无需重生成**。若改用 `query!`/`query_as!` 宏则必须按 `dev-docs/HANDOFF.md:167-190` 重生成并提交（三个坑：`--features db` 不能单独编译、特性要放在 `--` **之后**、`prepare` 写到 crate 目录必须搬回仓库根） | `SQLX_OFFLINE=true` 是全局编译前提（`ci.yml:11`） |
 | **CH 传输提取的零行为差异**（Q14=T1 的回归门禁） | 提取 `clickhouse.rs` 的那一次 commit **必须**让既有 4 条 `clickhouse_sink` 测试（含 `#[ignore]` 的那条在本机活实例上手工跑）**全部原样通过**；该 commit 只做搬迁，不夹带读路径代码 | 这是本次唯一触碰生产写通道的改动；把"搬迁"与"新增"分成两个 commit，是为了让回归失败时能立刻定位到"是搬迁搬错了"而不是"新代码有问题" |

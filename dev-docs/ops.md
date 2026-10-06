@@ -15,13 +15,15 @@ behaviour.
 ## 1. Deployment shape (design §15.3)
 
 Hydra ships as a **single static binary** + a `data/` directory (SQLite file +
-WAL) + an optional `hydra.toml`. No external database, queue, or cache is
-required for v1 (single instance).
+WAL). No external database, queue, or cache is required for v1 (single instance).
+**Configuration is environment-only**: there is no config-file loader — no `toml`
+dependency in any `Cargo.toml`, and `grep -rn 'hydra\.toml' crates/` is empty
+(re-verified 2026-09-29). The `hydra.toml` schema in design §15.1 is a **target**,
+and anything you put in such a file today is ignored.
 
 ```
 /opt/hydra/
 ├── hydra                  # the release binary (self-contained: UI embedded)
-├── hydra.toml             # config (NO secrets — token from env)
 └── data/
     ├── hydra.db           # SQLite (chmod 0600, §16.2)
     ├── hydra.db-wal
@@ -31,9 +33,15 @@ required for v1 (single instance).
 Build the release binary:
 
 ```bash
-cargo build --release --features server
+# `usage-clickhouse` is REQUIRED here: the compose file this section points at
+# (`environment/docker-compose.yml`) sets `HYDRA_USAGE_SINK: clickhouse`, and the
+# binary answers `BuildSinkError::ClickHouseFeatureDisabled` and exits 1 when the
+# feature is absent. `server` alone does not include it (they are independent
+# features), so `--features server` looked right and could never start.
+cargo build --release --features server,usage-clickhouse
 # → target/release/hydra
 ```
+（`dev-docs/deployment.md` 的构建命令一直是含 `usage-clickhouse` 的；此处与它对齐。）
 
 The binary embeds the admin UI at compile time (`include_dir!`), so the
 `admin-ui/{index.html,app.js,api-docs.js,style.css}` files are **not** needed on
@@ -44,14 +52,17 @@ disk at runtime. The release binary is the only artefact you ship.
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HYDRA_ADMIN_TOKEN` | *(unset)* | **Required.** Admin bearer token (design §13.3). Unset ⇒ admin API denies everything (fail-closed). **Never put this in `hydra.toml`.** |
-| `HYDRA_ENCRYPTION_KEY` | *(unset)* | **Required.** Base64 of 32 bytes; AES-256-GCM master key encrypting provider api-keys at rest. Unset ⇒ the binary refuses to start (fail-closed). Generate with `openssl rand 32 \| base64`. Load from an `EnvironmentFile=` (see §1.2); never inline. A matching `HYDRA_ENCRYPTION_KEY_FILE` (raw 32-byte file) is also accepted. |
+| `HYDRA_ENCRYPTION_KEY` | *(unset)* | **Required.** Base64 of 32 bytes; AES-256-GCM master key encrypting provider api-keys at rest. Unset ⇒ the binary refuses to start (fail-closed). Generate with `openssl rand 32 \| base64`. Load from an `EnvironmentFile=` (see §1.2); never inline. A matching `HYDRA_ENCRYPTION_KEY_FILE` (**raw 32-byte file**) is also accepted, and **the file wins when both are set**. Measured 2026-09-30 (`integration/test_master_key_sources.py`): the two forms are the **same keystream** — rows sealed through one open through the other, in both directions; a trailing `\n` or `\r\n` in the file is trimmed (so `openssl rand 32 > key` and a Kubernetes secret volume both work), while a trailing **space** is not (only line endings are trimmed, and the error counts the bytes); a file holding **base64** text fails with `master key must be 32 bytes, got 44: HYDRA_ENCRYPTION_KEY holds the BASE64 … while HYDRA_ENCRYPTION_KEY_FILE holds the RAW bytes …`; and with neither variable set the binary refuses to start naming both. |
+| `HYDRA_ENCRYPTION_KEY_VERSION` | master-key version tag written to new ciphertext (default 1). A rotation sets the NEW version here (positive integer; `0`/garbage is refused at startup rather than silently defaulted). |
+| `HYDRA_ENCRYPTION_KEY_PREVIOUS` (+ `_PREVIOUS_VERSION`) | the OLD master key during a rotation window: with it set, the provider keeps a key ring so existing ciphertext still opens while `HYDRA_RESEAL_SECRETS=1` rewrites every row. Drop both after a clean re-seal report. |
+| `HYDRA_RESEAL_SECRETS` | *(unset)* | **One-shot maintenance switch**: set to `1`, `true`, `yes` or `on` (case-insensitive) to re-seal every stored secret under `HYDRA_ENCRYPTION_KEY`/`_VERSION` and EXIT — the process does not serve traffic in this mode. Run it once during a rotation, with the old key still present in `HYDRA_ENCRYPTION_KEY_PREVIOUS`; the report (`provider_keys=… tenant_certs=… already_current=… failed=…`) decides the exit code, and `failed` non-empty means **do not delete the previous key**. A row whose version already equals the current one is re-verified by actually opening it, so "already current" means "opens under the current key" — measured live 2026-09-30 with a row *labelled* current but sealed with other material: it is reported as `reseal FAILED: … labelled key_version 2 (the CURRENT version) but it does NOT open under the current key …`, exit 1. `0`/`false`/`no`/`off` (and unset) mean "serve normally" as you would expect. **Any other value is REFUSED at startup** (`exit 1`, with the offending value echoed): before 2026-09-30 every unrecognised value — `YES`, `on`, `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally", so a typo in this one-shot command left the operator with a healthy-looking node and **no indication that the rotation never ran** (measured in `integration/test_key_rotation_live.py`). See §3. |
 | `HYDRA_DB_URL` | `sqlite:hydra.db?mode=rwc` | SQLite path. Use `sqlite://./data/hydra.db?mode=rwc` in production. |
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy **plaintext** listener. Always bound — the listener topology is derived from configuration only, never from whether tenants have certs (see `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`). |
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
 | `HYDRA_USAGE_SINK` | `sqlite` | `sqlite` or `clickhouse`. **Runtime switch — one binary contains BOTH sinks** when built with `--features server,usage-clickhouse` (the release scripts do this), so flipping the sink needs no rebuild. |
-| `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. |
-| `RUST_LOG` / `HYDRA_LOG` | `info` | `tracing` env filter. |
+| `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. **Do not put a path in this URL** — the sink always POSTs to `/`; a path is *trimmed* rather than used (measured 2026-09-30: before that fix `http://host:8123/clickhouse` failed at connect with `invalid port value`, because the path was still glued to the port when it was parsed). **What the sink actually puts on the wire** (measured 2026-09-30 against a mock ClickHouse, `integration/test_clickhouse_sink_wire.py`): `POST /?<your params>&query=INSERT%20INTO%20usage_record%20(…)%20SETTINGS%20…%20FORMAT%20JSONEachRow`, with the usage **row values in the request BODY** as one JSON object per line — **not** as `param_*` query parameters (that binding form belongs to the usage *reader*, `usage_query.rs`). Useful when diagnosing from a network capture: the SQL appears percent-encoded in the URL, the row values do not, and `client_api_key` in the body is **masked** (`sk*******-1`), never the tenant's real key. |
+| `RUST_LOG` | `info` (set by the image + every compose file) | `tracing` env filter — `main.rs:172` uses `EnvFilter::from_default_env()`. **`HYDRA_LOG` is NOT read**: it was listed here as an alias until 2026-09-29 and has never existed in code (`grep -rn HYDRA_LOG crates/ scripts/ tools/ environment/` is empty). Measured 2026-09-29 on a live instance: started with **only** `HYDRA_LOG=debug` it logs **0 lines** (while `/health` and the API still answer 200), with `RUST_LOG=debug` it logs ~130 lines — so an operator reaching for the documented alias during an incident gets no extra logging. Also note `info` is a **deployment** default, not a binary default: with neither variable set the same instance logs **0 lines** (`from_default_env()` defaults to ERROR-level), and the shipped `Dockerfile`/compose files are what set `RUST_LOG=info`. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
 | `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
 | `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on AUTHORISED requests (429 beyond it) — counts every authenticated request the node accepts for the tenant, including ones it then rejects with 4xx/5xx (only the 403 URL-tenant mismatch is exempt). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
@@ -63,6 +74,24 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` | `60` | Per-tenant cap on **tenant self-service config writes** (sub-tenant / route CRUD, §5.5 v2), enforced on the **leader** (`429 too_many_requests` beyond it). A missing / zero / unparseable value falls back to 60 (never 0, which would refuse every write). Anti-DoS only; see the failover-reset note in §5.5. |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
 | `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
+
+> **Known listener limitation (recorded here, not hidden in a test):** the startup
+> planner compares listener addresses as **strings**, so the *same port on different
+> bind addresses* (`HYDRA_LISTEN=0.0.0.0:8080` together with
+> `HYDRA_TLS_LISTEN=127.0.0.1:8080`) is **NOT** rejected statically — only *identical*
+> addresses are caught (the fatal `HYDRA_LISTEN and HYDRA_TLS_LISTEN both point at …`
+> check). The case is left to the runtime: `probe_bind` plus Pingora's all-or-nothing
+> service build decide at startup. Do **not** deepen the static check casually: "same
+> port on different interfaces" is a legitimate configuration on some hosts, so a
+> stricter check would reject valid setups. The limitation is pinned by an explicit
+> `#[ignore]`d test —
+> `crates/hydra-server/tests/boot_listeners.rs::same_port_on_different_addresses_is_not_detected_statically`
+> — and CI **does** now run it: the `optional-features` job runs
+> `cargo test -p hydra-server --test boot_listeners -- --ignored` (`ci.yml`), and the
+> `live-deps` job runs the ClickHouse ones. (This note used to say CI "never" ran
+> `--ignored`, with a `grep -c` of 0 as evidence; that was true before the fix that
+> added those two steps.) `scripts/check_ci_wiring.cjs` asserts this stays true: every
+> file with a real `#[ignore]` must be run by a step passing `--ignored`.
 
 > The current binary reads the proxy/admin addresses and DB URL from env (the
 > `hydra.toml` shape in design §15.1 is the *target* schema; env vars are the
@@ -121,9 +150,136 @@ install -m 0600 /dev/null /opt/hydra/data/hydra.db  # before first start
 chown hydra:hydra /opt/hydra/data/hydra.db
 ```
 
+#### Rotating the master key (`HYDRA_ENCRYPTION_KEY`) — supported procedure
+
+**Do not simply replace the key.** Everything at rest is sealed under it
+(provider api-keys and tenant certificate private keys), so with only a new key
+configured the boot-time decrypt fails and the process refuses to start — and the
+admin API that could re-enter those keys runs in that same process, so there is
+no way back in. The supported path is a two-key window plus a one-shot re-seal:
+
+```bash
+# 1. Generate the new key and pick its version (a positive integer greater than
+#    every version currently in use; never 0). List what is in use with:
+#      # `HYDRA_DB_URL` is a URL, NOT a path: strip the scheme and the ?query first.
+#      # (Verified 2026-09-29: handing the URL itself to a sqlite client fails with
+#      # "unable to open database file" — this section used to do exactly that.)
+#      DB_PATH="${HYDRA_DB_URL#sqlite://}"; DB_PATH="${DB_PATH%%\?*}"
+#      sqlite3 "$DB_PATH" \
+#        'SELECT key_version, COUNT(*) FROM provider_key GROUP BY key_version;'
+#      sqlite3 "$DB_PATH" \
+#        'SELECT cert_key_version, COUNT(*) FROM tenant WHERE cert_key_version IS NOT NULL GROUP BY 1;'
+NEW_KEY="$(openssl rand 32 | base64)"
+NEW_VERSION=2        # e.g. current is 1 (the default)
+OLD_VERSION=1
+
+# 2. Run ONCE with the new key as current and the old key as previous.
+#    The process re-seals every row, prints a report and EXITS (it does not serve).
+docker run --rm \
+  -e HYDRA_DB_URL="$HYDRA_DB_URL" \
+  -e HYDRA_ENCRYPTION_KEY="$NEW_KEY" -e HYDRA_ENCRYPTION_KEY_VERSION="$NEW_VERSION" \
+  -e HYDRA_ENCRYPTION_KEY_PREVIOUS="$OLD_KEY" -e HYDRA_ENCRYPTION_KEY_PREVIOUS_VERSION="$OLD_VERSION" \
+  -e HYDRA_RESEAL_SECRETS=1 \
+  hydra:latest
+# → `reseal: provider_keys=N tenant_certs=M already_current=K failed=0`
+#   exit code 0 = every secret now opens under the new version.
+#   Any `reseal FAILED: ...` line + exit code 1 = that row was left UNTOUCHED;
+#   do not drop the old key until the report is clean.
+
+# 3. Restart the fleet with the NEW key only (drop both PREVIOUS variables).
+```
+
+Notes, deliberately explicit:
+
+- **The window is a window.** While `HYDRA_ENCRYPTION_KEY_PREVIOUS` is set, the
+  ring holds both keys: new writes use the new version, old ciphertext still
+  opens. Leaving the previous key in place keeps the old key's blast radius
+  alive, so drop it as soon as the report is clean.
+- **A row nobody can open is reported, never rewritten.** The tool needs the key
+  that sealed it; if you have lost that key, that row is unrecoverable and the
+  report says so by name instead of silently counting it as rotated.
+- **Run it against a stopped fleet** (or accept that a live process keeps its
+  in-memory plaintext until its next restart): writes are one transaction per
+  table, but a live node's config snapshot is not re-read by the tool.
+- The re-seal reads and writes inside ONE transaction, so a crash halfway leaves
+  the DB entirely before or entirely after — never a mix.
+
 For higher assurance use SQLCipher or full-disk encryption (design §16.2). The
 admin API always returns masked provider keys; `?reveal=1` is accepted as a
 no-op for backward-compat but never reveals plaintext (§16.2).
+
+---
+
+### 1.4 Backup & restore (added 2026-09-29 — this section did not exist)
+
+Everything the node needs to come back — providers, **sealed** provider keys,
+tenants, their certificates, limit roles, sub-tenants — lives in ONE SQLite file,
+in **WAL mode** (`db.rs:55` `journal_mode(WAL)`). Two consequences for a backup and
+one for a restore, all measured against a live node — and all three are now pinned by
+`integration/test_backup_restore.py` (CI `integration` job + the local gate), so this
+section is executed, not just documented:
+
+```bash
+# ❌ WRONG: copying the database file alone while the node runs.
+cp /opt/hydra/data/hydra.db /backup/hydra-$(date +%F).db
+#    Committed-but-not-yet-checkpointed transactions live in `hydra.db-wal`, so the
+#    copy can be structurally EMPTY. Measured: the copy was 4096 bytes and every
+#    table was unreadable, while the live DB held 1 provider + 1 provider key +
+#    1 tenant + 2 associations (the 560 KB of recent writes sat in `-wal`).
+#    RE-MEASURED 2026-09-30 (integration/test_backup_restore.py, 300-provider burst
+#    with a 4.1 MB WAL): the copy was 221 184 bytes — a perfectly normal-LOOKING
+#    file — and silently held 215 of 301 providers. Nothing about it looks wrong,
+#    which makes this shape MORE dangerous than the empty-file one: a restore from
+#    it boots fine and quietly loses the newest configuration.
+
+# ✅ RIGHT: let SQLite produce a consistent snapshot of a LIVE database.
+DB_PATH=/opt/hydra/data/hydra.db
+sqlite3 "$DB_PATH" "VACUUM INTO '/backup/hydra-$(date +%F).db'"
+#    Measured: while the node kept serving, the snapshot held every row
+#    (provider=1 provider_key=1 tenant=1 tenant_provider=1 tenant_model=1), and a
+#    SECOND node booted from that file served a proxied request with HTTP 200 —
+#    i.e. both the configuration and the sealed provider key survived.
+#    `VACUUM INTO` needs no downtime; stop the node first only if you prefer.
+#    Re-measured 2026-09-30 with 301 providers: snapshot 237 568 bytes, row-for-row
+#    equal to the live database, `/api/v1/health` 200 before and after, and the
+#    restored node served 200.
+```
+
+**Restore**: stop the node, put the snapshot in place as `data/hydra.db` (delete any
+stale `hydra.db-wal` / `hydra.db-shm` beside it), then start with **the same
+`HYDRA_ENCRYPTION_KEY` / `HYDRA_ENCRYPTION_KEY_VERSION`** that was current when the
+snapshot was taken.
+
+> ⚠️ **Deleting the sibling `-wal` / `-shm` is not a tidiness step — without it the
+> restore does not boot.** Measured 2026-09-30: put a `VACUUM INTO` snapshot in place
+> while the previous database's `-wal`/`-shm` were still next to it, and
+> `sqlite3` reports `database disk image is malformed` and the node exits with
+> `ERROR hydra: fatal startup error error=error returned from database:
+> (code: 11) database disk image is malformed` — the stale log describes a state
+> that belongs to a DIFFERENT file. Delete both files (or restore into an empty
+> directory) and the very same snapshot is readable and serves 200.
+>
+> ...and you WILL meet a leftover `-wal`: **every stop leaves one**, including a
+> graceful `SIGTERM`. Measured: after `SIGTERM` + drain, `hydra.db-wal` and
+> `hydra.db-shm` are still there, because the process ends in Pingora's
+> `process::exit(0)` and the SQLite pool is never closed. That is harmless on its own
+> — restarting on the SAME database replays the WAL (measured: a row written just
+> before the stop was still readable afterwards) — it is only fatal when the
+> database file underneath it is REPLACED, i.e. exactly during a restore.
+
+
+> ⚠️ **The backup is useless without that key.** Provider keys and certificate
+> private keys are sealed at rest, and a node pointed at a restored database under a
+> different master key **refuses to serve** (measured: `fatal startup error … error
+> occurred while decoding …`; pinned by case D of `integration/test_backup_restore.py`,
+> which reads the exit code and the log line). Keep the key separate from the database
+> and from the host: a backup strategy that stores both in the same bucket protects
+> against neither theft nor loss.
+
+**Deliberately not covered here**: usage records live in ClickHouse when
+`HYDRA_USAGE_SINK=clickhouse` (back it up with ClickHouse's own tooling); a cluster
+replica rebuilds from the leader rather than from a backup (`db::restore_config`,
+design §11); `data/` permissions are §1.3.
 
 ---
 
@@ -133,6 +289,25 @@ Pingora has built-in socket handover via `SIGQUIT` (graceful shutdown of the old
 process) + `hydra -u` (the new process inherits the listening socket from the
 old). In-flight requests on the old process finish; new connections go to the
 new process.
+
+**Measured 2026-09-29 (round 68): this now works, and until then it could never
+work.** Two independent causes, both fixed:
+
+1. `-u` never reached Pingora — the binary passed `Opt::default()` and never read
+   argv, so the new process never asked for the old one's sockets and died with
+   `cannot bind … Address already in use … refusing to start` (the old process
+   logged `Trying to send socks` into a socket nobody was listening on);
+2. even with the flag, hydra's three pre-flight bind probes (plaintext, TLS, admin)
+   aborted the handover, because during an upgrade those addresses are *legitimately*
+   held by the predecessor and Pingora inherits them (`listen(fds)` looks the address
+   up in the transferred FD table) — so the probes now stand down in upgrade mode.
+
+End-to-end result with both fixes: a client hammering the data port every 50 ms saw
+**0 refused connections and 0 non-listener answers across 624 attempts** spanning the
+`SIGQUIT`, the handover and the old process's full drain+exit, and the port was still
+served afterwards. Without `-u` the new process still refuses loudly — that refusal is
+the guard against a silent split-brain bind, not a bug. The whole procedure is
+asserted by `scripts/handover.test.sh` (CI `integration` job + local gate).
 
 ```text
         ┌──────────────────────────────────────────────┐
@@ -172,13 +347,32 @@ then chain `ExecStartPost`/`ExecReload` as appropriate for your wrapper.
 
 ### 2.2 Caveats
 
-- **Upgrade socket path**: Pingora's upgrade socket (`upgrade_sock`) must be on
-  a path writable by both old and new processes. In containers with a read-only
-  rootfs, mount a small tmpfs at the upgrade-sock path (design wave-6 §6 risk
-  note). If the path is not writable, the new process will fail to take over
-  the port with `address already in use`.
-- **Config drift across upgrade**: the new process re-reads `hydra.toml`/env on
-  boot. If you changed env vars, set them before step 2.
+- **Upgrade socket path**: Pingora's upgrade socket (`upgrade_sock`, default
+  `/tmp/pingora_upgrade.sock`) must be on a path shared by both old and new
+  processes and writable by both. In containers with a read-only rootfs, mount a
+  small tmpfs at that path (design wave-6 §6 risk note). If the path is not shared,
+  the handover cannot happen and the new process fails to take the port over with
+  `address already in use` — the same message the round-68 bug produced, so read the
+  old process's log: `listener sockets sent` means the transfer happened, its absence
+  means it did not.
+- **Start the new process promptly.** The old process sends its sockets when it
+  receives `SIGQUIT` and waits ~1 s for a receiver (measured: with the new process
+  started 0.3 s later, the send completed 1.0 s after the signal). If nothing ever
+  listens on the upgrade socket, the send fails and the old process simply continues
+  draining — and its data listener is closed when the graceful shutdown starts
+  (~5 s in), so the port goes dead for the remainder of the drain.
+- **`systemctl restart` is NOT a zero-downtime upgrade** (measured 2026-09-29): a
+  restart stops first and starts afterwards, and the old process closes its data
+  listener the moment graceful shutdown begins. So the port REFUSES connections for
+  roughly `HYDRA_SHUTDOWN_DRAIN_SECS` + 5 s — measured 125 refusals out of 313 probes
+  with the drain set to 2 s (a 6.25 s window; the 20 s default therefore costs ≈25 s),
+  against 0 refusals in 624 probes for the §2.1 handover. `KillSignal=SIGQUIT` (§1.2)
+  only makes the drain graceful; it does not create a handover. To get one under
+  systemd, have a wrapper run the §2.1 sequence (start `hydra -u` while the old pid is
+  still draining), or accept the gap and upgrade at low traffic.
+- **Config drift across upgrade**: the new process re-reads **env** on boot
+  (`hydra.toml` is not read — see §1.1). If you changed env vars, set them before
+  step 2.
 - **DB schema**: SQLite migrations run on boot. A forward-only migration is
   safe during upgrade (the old process keeps its connection; the new process
   opens a fresh pool and runs migrations). A backward-incompatible migration
@@ -191,9 +385,20 @@ then chain `ExecStartPost`/`ExecReload` as appropriate for your wrapper.
 hey -z 60s -c 4 https://acme.example.com/v1/chat/completions ...
 
 # During: run the upgrade. The probe must show zero non-2xx from connection
-# resets and a brief (sub-second) pause as the new process binds.
+# resets — and with the handover there is NO rebind at all (measured: 0 refusals in
+# 624 attempts; the new process inherits the listening socket, it does not bind it).
+# `scripts/handover.test.sh` is exactly this probe, run in CI.
 
-# After: GET /api/v1/health → 200, /metrics → counter continuity.
+# After: GET /api/v1/health → 200, and /metrics still answers with the hydra_*
+# families. NOTE that the counters RESTART AT ZERO: a handover ends in a NEW process
+# with a fresh Prometheus registry (measured 2026-09-29: hydra_requests_total read 31
+# before the switch and 0 after it). There is no counter "continuity" to verify, and
+# `rate()`/`increase()` handle the reset — reading the reset as lost traffic is a
+# false alarm. What IS worth asserting after an upgrade: /health 200, the metrics
+# endpoint reachable, and the config snapshot unchanged — measured 2026-09-29 with a
+# provider in the database: POST /api/v1/reload reported `version 1 / providers 1`
+# both before and after the handover (both processes read the same database; only the
+# PROCESS state, like the counters, starts fresh).
 ```
 
 ---
@@ -224,6 +429,22 @@ re-resolves every cert path from the fresh snapshot. **New** TLS handshakes use
 the new cert; **existing** connections are unaffected (they keep the cert they
 negotiated).
 
+**Measured 2026-09-29** (`integration/test_cert_reload.py`, run in CI): with three
+self-signed certs told apart by subject and validity, `PUT` alone (no `/reload`, no
+restart, same pid) switched a new handshake from `O=OLD-CERT` to `O=NEW-CERT` while a
+session opened *before* the rotation still reported `OLD-CERT` — claims 2 and 3 hold
+exactly as written. The mechanism is the one named above: disabling the post-write
+`reload_all()` (falsification probe) made every handshake fail with no certificate at
+all. Two operational details worth having in advance:
+* an SNI that matches **no** tenant is **refused at the handshake** — there is no
+  default certificate (`hydra::tls` logs `no cert matched SNI and no default
+  configured`). Load-balancer health checks that speak TLS to the data port must send
+  a real tenant `server_name`, or they will mark the node down while it is healthy;
+  probing `/healthz` (token-free) instead avoids the issue entirely.
+* starting with `HYDRA_TLS_LISTEN` set and **no** tenant cert yet is fine: the node
+  logs `HYDRA_TLS_LISTEN is set but no tenant cert is loaded yet; TLS handshakes will
+  fail until a certificate is written. No restart is needed once one is written.`
+
 ### 3.2 Verifying
 
 ```bash
@@ -248,6 +469,37 @@ error the old snapshot + old certs are retained and the endpoint returns 400
 
 ## 4. Rate-limit tuning (design §10, §15.1 `[limit]`)
 
+
+> **Per-provider admission limits are applied ONCE per provider, at its first request**
+> (measured 2026-09-29). `max_concurrency`, `max_queue_depth` and
+> `queue_wait_timeout_ms` are read when a provider's gate is created — i.e. the first time
+> it passes admission — and the gate is **not resized afterwards** (the code says so in
+> `proxy/admission.rs`: "once created, a gate's semaphore is NOT resized if a later call
+> passes a different max_concurrency — the first policy wins"). Concretely:
+> `PUT /api/v1/providers/{id}` with the new limits returns 200 and the row in the database
+> really does change (`GET /api/v1/providers/{id}` shows the new value), but a provider
+> that has ALREADY served traffic keeps enforcing the OLD limits until the process
+> restarts. Measured with a 1.2 s upstream: cap 2 → two concurrent requests reached
+> in-flight 2; after `PUT …max_concurrency: 1` + `POST /api/v1/reload`, two concurrent
+> requests STILL reached in-flight 2. Workaround today: restart the node after changing any
+> admission limit (a provider that has not served yet picks the new values up on its first
+> request). Implementing the resize is tracked as a decision item (D-14).
+>
+> **The mismatch is visible, not silent.** `GET /api/v1/concurrency` reports both sides:
+> `max_concurrency` / `max_queue_depth` / `queue_wait_timeout_ms` are what the RUNTIME gate
+> is enforcing, while `configured_max_concurrency` / `configured_max_queue_depth` /
+> `configured_queue_wait_timeout_ms` are what the LIVE configuration snapshot asks for right
+> now (resolved through `hydra_core::config::resolve_policy`, i.e. provider row → process
+> default — not a value some earlier request happened to observe). `limits_stale: true`
+> means the two disagree: the row changed and the gate did not. The same condition
+> increments `hydra_admission_limits_stale_total{provider}` once per request admitted while
+> the two sides differ, and the node logs one `WARN` per distinct policy (not per request).
+> Measured end-to-end: `PUT max_concurrency=1` (row 2 → 1) + reload, then three requests →
+> `configured_max_concurrency=1` next to `max_concurrency=2`, `limits_stale=true`,
+> `hydra_admission_limits_stale_total{provider="p1"} 3`. So "accepted but not applied" is an
+> alertable state instead of something to discover by hand (rule in §9.1). A node whose
+> configured and enforced values agree reports `limits_stale: false` and never increments
+> the counter.
 Limits are configured as **roles** in the `limit_roles` table. Each role carries
 `matching_*` dimensions (any `NULL` = match-all on that dimension), a
 `limit_count` and/or `limit_token` ceiling, and a `window` (`m` / `h` / `d`).
@@ -279,6 +531,60 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 - **`limit_token`** only applies when the upstream returns a `usage` object
   (streaming needs `stream_options.include_usage` for OpenAI; design §9.4).
 - **Soft-disable a role**: `enabled=false` (still listed but not matched).
+
+> **`matching_key` accepts the RAW client key OR its mask — fixed 2026-09-30, re-measured. USE THE
+> MASK.** (`integration/test_replica_fidelity.py`). This section used to say nothing about the form
+> while `design.md` said "NULL **or equal to** the client api-key" (the raw key), and the code
+> silently compared only the mask. Now:
+> * **Write the MASK form** (see below how to get it) — it is the form to use, because
+>   `matching_key` is stored and shipped **in plaintext**: `limit_role.matching_key` is a plain
+>   column (`db.rs:1288` insert / `db.rs:1311` select — no `kp.seal`, unlike provider api-keys at
+>   `db.rs:568`), it travels in the cluster snapshot payload as a plain `LimitRole`
+>   (`cluster/snapshot.rs:119`), and the edge re-inserts it verbatim (`db/restore.rs:242`). It is
+>   also returned by `GET /api/v1/limit-roles` and rendered in the admin UI. **A raw key written
+>   there is a live credential sitting in plaintext in every node's database, every backup, and
+>   every admin API response.**
+> * the **raw** form also fires (measured on the leader: `[200, 200, 429, 429]` for
+>   `sk-raw-only-probe-77`; before the fix the same leg measured `[200, 200, 200, 200]`, i.e. a
+>   quota that looked configured and enforced nothing) — use it only when you accept the exposure
+>   above, e.g. a throwaway key;
+> * the **mask** form (`mask_key`: for a key of length ≥ 20 the first 10 and last 4 characters with
+>   the middle replaced by `*`; for length 6–19 the first 2 and last 2) is what you can read out of
+>   the `client_api_key` column of the usage rows — that is how to obtain it;
+> * the **counting bucket still uses the mask** (unchanged), so the raw key never becomes part of a
+>   Redis key name or a metric label — but the consequence is unchanged: **two different client keys
+>   whose masks coincide share ONE quota** — measured: `sk-fidelity-limited` and
+>   `skzzzzzzzzzzzzzzzed` mask identically, and once the first key's window was spent the second key's
+>   very first request was refused (`429`). Use one key per role if that matters.
+> * **the node warns about what the VALUE costs** (added 2026-09-30). A `matching_key` that is **not**
+>   a mask is a raw client key: that column is kept and replicated in **plaintext** (unlike provider
+>   api-keys, which are sealed) and is returned by `GET /api/v1/limit-roles`, so a live credential ends
+>   up in every node's database, every backup and every admin response — the node says so by name at
+>   config load. The **mask** form has the opposite cost and also warns: the window is
+>   `(role_id, mask(key))` **regardless of tenant**, so any other key whose mask is that same string
+>   silently shares the budget, even inside one tenant.
+> * **where those config warnings appear** (measured 2026-09-30, `integration/test_limit_roles_enforcement.py` L9):
+>   at **startup**, on **every config load**, and — because the admin write path reloads — **immediately
+>   when you write the role** (`POST`/`PUT /api/v1/limit-roles` answers `201`/`200` and the warning is in
+>   the node log right after it; no explicit `POST /reload` needed). They are **not** in the HTTP
+>   response body, and an **edge never re-validates** a snapshot it receives (`apply_snapshot` loads
+>   without validation, by design: the leader owns config validation) — so scripts that create roles
+>   should check the leader's log, not assume a clean `201` means a sound role.
+> * **always set `matching_tenant` on a key-scoped role.** The window belongs to
+>   `(role_id, mask(key))` and nothing else, so a role with `matching_key` set and
+>   `matching_tenant` NULL is a **cross-tenant** budget: two tenants whose auth backends both accept
+>   the same key string share it, and one tenant's traffic can refuse the other's very first request.
+>   Startup validation now warns by name (`limit_role 'r-x' scopes on matching_key but has
+>   matching_tenant NULL: its window is shared by EVERY tenant that accepts that key`) — the same
+>   treatment the inert `matching_provider` dimension already had (D-11), a warning rather than an
+>   error because a deliberately shared budget is legitimate, it just must not be accidental.
+>
+> `matching_model`, `matching_tenant` and `matching_provider` are **exact** matches (not prefixes
+> like the sub-tenant and operator key-prefix mechanisms), and `matching_provider` is inert because
+> the pre-routing gate runs before a provider is chosen (recorded as decision item D-11). Whether the
+> counting bucket should also key on the raw key (hash-first, since it becomes a Redis key name in
+> cluster mode) is recorded as **D-15**, and sealing the `matching_key` column (so the raw form stops
+> being a plaintext credential) as **D-16**; this note describes what the code does today.
 - **Multi-instance limitation (v1)**: counters are per-process. Multi-instance
   deployments need Redis-backed counters (v2 candidate, §16.6).
 
@@ -313,9 +619,44 @@ Response (2026-09-17): the flat `invalidated`/`tenant_id` body gained
 ```
 
 `fleet.state` is **`applied`** (200 — every live node confirmed), **`pending`**
-(202 — published, not all confirmed; `lagging` names the laggards, or is **empty** when `nodes_total=0` because the node could not enumerate the live fleet), **`single_node`**
+(202 — published, not all confirmed; `lagging` **names the nodes that did not confirm**, or is **empty** when the node could not enumerate the live fleet — see the three-state note below), **`single_node`**
 (200 — this node is the whole data plane) or **`unavailable`** (503 — the channel
 exists but did not answer; **the fleet was NOT told**).
+
+> **This admin endpoint's three states — `202` is NOT "failure".** `DELETE
+> /api/v1/auth/cache` answers `200` / `202` / `503`, and only `200` means "done":
+>
+> | HTTP | `fleet.state` | when | what it means |
+> |---|---|---|---|
+> | `200` | `applied` | every live node confirmed | done |
+> | `200` | `single_node` | no `cluster-redis` feature (the local clear IS the whole answer — `main` refuses `leader\|edge` without it) | done |
+> | `202` | `pending` | published, not confirmed everywhere — **including the deterministic empty-fleet case below** | **in flight, not a failure**; retry (idempotent) or check `lagging` |
+> | `503` | `unavailable` | no invalidation stream **or** publish failed, or the watermark read failed | the fleet was **not** told — retry / escalate |
+>
+> **The deterministic `202`: an empty live-fleet view.** The handler always *waits* on
+> the convergence barrier — the admin endpoint has **no** `wait=` parameter (that
+> switch exists only on the tenant plane), so the handler passes
+> `Some(converge_timeout)` unconditionally (the `let report = { … }` block in the
+> `DELETE /api/v1/auth/cache` handler in `crates/hydra-server/src/admin/handlers.rs`).
+> With `nodes_total == 0` — i.e. the live-node closure returned an empty set,
+> which is the normal state during the boot window before the registry refresh ticker
+> first populates it, and after registry rows expire while Redis is still reachable —
+> `await_applied` takes its empty-live-set arm and returns `Pending { nodes_applied: 0,
+> nodes_total: 0, lagging: [] }` (`crates/hydra-server/src/cluster/events.rs`, the
+> `if live_nodes.is_empty()` arm), which maps to **`202`**. It is deliberately *not*
+> `Applied`: nothing was checked, so "converged" must not be asserted (fail-closed —
+> this is the `Applied(200) → Pending(202)` flip from commit `c3eaa6f`). So on a
+> healthy single-node-ish deployment you can see a **steady `202` with `nodes_total:
+> 0`**: that is the honest "nobody was checked" answer, **not** an error and **not** a
+> sign the invalidation failed. Watch `hydra_tenant_api_invalidate_pending_total` /
+> the `fleet.lagging` list, not the status code alone. The tenant-plane equivalent
+> (`POST /tenant/{tid}/api/v1/auth/cache/invalidate`) documents the same three states
+> in `dev-docs/tenant-api-integration.md` §5.2.
+>
+> `event_id` is **`null`** for `single_node` and for the *publish-failure* variant of
+> `unavailable` (nothing was enqueued), and `waited_ms` is hard-coded `0` on the
+> `single_node` path (`FleetReport::single_node()` never calls `.measured()`), so
+> neither field is a reliable convergence signal on its own.
 
 `published` was removed because it could not be false when there was no
 invalidation stream: it defaulted to `true` and only flipped on a publish error, so
@@ -405,7 +746,8 @@ depends on.
 > **`HYDRA_TRUSTED_PROXIES` deployment checklist (read before setting it):**
 > - **Confirm the LB both appends and strips.** It must **append** the real client IP to `X-Forwarded-For` **and** **strip/override any inbound `X-Forwarded-For`** from the client. Trusting a proxy that forwards a client-supplied XFF unmodified lets clients forge the header and rotate limiter buckets — the per-IP budget is **silently defeated**.
 > - **Multiple header lines are handled.** The node reads **all** `X-Forwarded-For` header lines (in order) and walks right-to-left skipping trusted proxies, so both the merged-single-header form and the separate-line append form (common in HAProxy) resolve correctly.
-> - **Catch-all disables the per-IP dimension.** A `0.0.0.0/0` or `::/0` entry trusts XFF from **any** peer and therefore defeats the per-IP dimension; the node **warns loudly at startup** but does not refuse to start.
+> - **Catch-all does NOT make the dimension forgeable — it makes every client SHARE one bucket** (corrected 2026-09-29 after measuring; the old wording here said the opposite). A `0.0.0.0/0` or `::/0` entry trusts *every* candidate, and the resolver then falls back to the peer address (`resolve_client_ip`; its unit test is literally named `an_all_trusted_or_absent_xff_falls_back_to_the_peer`). So the per-IP dimension keys on the **peer** — behind an LB that means the LB's address for everyone. Measured with a catch-all: 14 requests carrying 14 different XFF values (and 14 different bad tokens, so the per-token dimension could not be what tripped) still hit `429` at the 11th, and a **fresh XFF + fresh token** was refused as well ⇒ every client shares the peer's bucket, and a handful of bad tokens locks the tenant API for **all** of them for `HYDRA_TENANT_API_LOCKOUT_SECS` (900 s by default). The node **warns loudly at startup** but does not refuse to start.
+> - **The forgeable case is the narrow allowlist + a non-stripping LB** (the first bullet above): with `HYDRA_TRUSTED_PROXIES=127.0.0.1` — a *trusted* peer whose LB passes an attacker-supplied header through — 14 requests with 14 different `X-Forwarded-For` values produced **no** `429` at all, i.e. the caller rotated its own bucket. Skipping/overriding inbound XFF at the LB is what makes the allowlist safe.
 > - **Observability.** Watch `hydra_tenant_api_auth_failures_total{reason}`: many **distinct IPs accelerating in unison** is the signature of a misconfigured (non-stripping) trusted proxy, not a single-source guesser.
 
 `503 not_ready` means this node has no configuration snapshot yet — retry.
@@ -414,6 +756,8 @@ minute (default 10) because each one fans out to every node and re-hits the
 tenant's `auth_url` from all of them.
 
 > **Known limitation (no fix promised):** when a tenant-API request body exceeds the 1 MiB cap, the node replies `413` and closes the connection **without draining the rest of the body** — a client still uploading a large body may observe a connection reset before it reads the `413` body.
+>
+> **Measured 2026-09-30** (`integration/test_body_cap_drain.py`), which sharpens the wording in both directions: the node answered after consuming **1 081 344 of the 2 097 147 bytes** it was sent — i.e. it stops reading right at the cap and leaves ~1 MiB on the wire, which is the fact behind "does not drain" — while a client that **stops pushing as soon as the response becomes readable reads its `413 payload_too_large` normally** (`write_error=None`). The reset the note warns about therefore needs a client that **keeps pushing** after the response; the DATA plane behaves differently: it drains the rest of the upload first (**all 131 125 bytes consumed**, `413 request_body_too_large` always readable). If you are writing a client, stop writing when the connection becomes readable.
 
 ### 5.2 How long can a revoked key keep working? (`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`)
 
@@ -434,7 +778,24 @@ The honest answer, in order:
 3. **Watch `hydra_invalidation_consumer_stalled_seconds`**: it measures how long
    a node's applied watermark has not advanced. **Alert above 60 s** — that is the
    signal that case 2 is happening, and before this metric existed the condition
-   was completely invisible.
+   was completely invisible. The series is emitted by the cluster events consumer,
+   so it appears in **cluster mode only**: on a single-node instance there is no
+   consumer, the gauge vector has no children, and the family is absent from
+   `/metrics` (verified 2026-09-29 — an alert rule on a series that never appears
+   is a silent monitoring gap, so it must be deployed with the cluster topology).
+
+Measured 2026-09-29 (single node, a switchable auth service, tenant asking for
+`expires_in=3600`):
+
+| Case | Measured | Note |
+|------|----------|------|
+| allow cached, tenant asks 3600 s, `HYDRA_AUTH_ALLOW_TTL_MAX_SECS=2` | the gateway kept allowing for **2.07 s**, then refused — and re-asked the auth service exactly once | the knob bounds what a tenant may ask for |
+| same flow with `…=3600` | still allowing 4 s later | control: the cap is what bounded the row above |
+| explicit invalidation (`DELETE /api/v1/auth/cache`, `tenant_id`) with the allow cached for an hour | **refused on the very next request**; body `{"invalidated":1,…,"fleet":{"state":"single_node",…}}` | invalidation is the lever, not the TTL |
+| a cached **DENY**, then the auth service starts allowing again | the node kept refusing for **30.41 s** (2 auth calls in total) | i.e. the fixed `deny_ttl` below — "denies are already short" is exactly 30 s, and this knob does not touch it |
+
+So for an incident: **an explicit invalidation is immediate; without one, an allow
+lives at most `min(tenant expires_in, cap)` and a deny at most the fixed `deny_ttl`.
 
 ### 5.3 Usage accounting: two rates that legitimately disagree
 
@@ -483,6 +844,25 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 > names the column, and ClickHouse rejects an insert naming a column that does not exist
 > (`NO_SUCH_COLUMN_IN_TABLE`, verified against the bundled instance on a throwaway table),
 > so usage flushes for that instance fail until the `ALTER` is applied.
+
+> **Retry-idempotency migration — `non_replicated_deduplication_window` (2026-09-29).**
+> The sink now sends a **stable `insert_deduplication_token` per flush**, so a batch
+> whose response was lost *after* the insert committed is re-sent as a no-op instead
+> of double-counting usage/quota/billing. That token is **only effective if the table
+> carries the dedup window**: a plain `MergeTree` accepts the token and **silently
+> ignores it** (verified on 24.3 — no error, just no deduplication).
+> **Fresh** instances get it from `environment/clickhouse/init.sql` (and from the
+> inline DDL in `environment/docker-compose.local.yml`); an **already-initialised**
+> instance needs a one-off
+> `ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000`
+> (verified on the bundled instance: without it a re-sent batch produced a second row,
+> with it the second insert is a no-op).
+> **Residual, stated plainly:** this deduplicates a re-sent *batch*. A batch that
+> outlives the retry window is re-flushed later under a **new** token, and a batch
+> whose composition changed between attempts also gets a new token — so a lost ack
+> spanning either boundary can still duplicate rows. Closing that needs **row-level**
+> idempotency (a stable per-row key + `ReplacingMergeTree`, with the read path
+> deduplicating), i.e. a schema migration; it is recorded, not silently assumed.
 
 ### 5.5 Sub-tenant configuration (admin API)
 
@@ -646,6 +1026,34 @@ flowing through normal routing and are revoked only by the tenant's `auth_url` (
 
 ---
 
+### 5.x When the tenant's `auth_url` cannot be reached (measured 2026-09-30)
+
+`integration/test_auth_hop_failmode.py` runs this hop against a black-holed route (TEST-NET-1, so
+nothing on the network is contacted) and against a refused port:
+
+| Situation | What the tenant sees | Cost |
+|---|---|---|
+| `auth_url` unreachable (SYN dropped: dead route, firewalled peer) | `503 auth_upstream_unavailable` (`error.type: auth_error`) | **~2 s per request** — the documented 2000 ms round-trip timeout — and the provider is **never** called |
+| `auth_url` refusing (nothing listening) | the same `503` | **~1 ms** |
+| the auth service answers again | the **very next** request is served | — |
+| auth service answers 401/403 | `401 denied` | cached, with the deny TTL (30 s) |
+| auth service answers 5xx / unparseable 2xx | `503 auth_upstream_unavailable` | **never cached** |
+
+Two operational consequences. **A dead auth route costs its timeout on EVERY request** (the outage
+is deliberately not cached — measured: three requests in a row each paid 2 s; caching it would be
+worse, because the tenant would stay blocked for the deny TTL *after* the service recovered — that
+regression was planted and it turned the next requests into instant `401`s, including after
+recovery). And **attribution is available**: `hydra_auth_upstream_error_total{tenant}` plus
+`hydra_auth_decisions_total{tenant,verdict="denied",source="miss"}`.
+
+> **`fail_mode` is not selectable (recorded, not fixed).** `design.md` §11.4 presents
+> `[auth] fail_mode` as configuration and `http.rs` implements `FailMode::Open`
+> ("availability-first": serve without a verdict when the auth service is down) — but `main.rs`
+> takes `AuthConfig { ..AuthConfig::default() }`, whose default is `Closed`, and **no environment
+> variable selects the open mode** (measured: `HYDRA_AUTH_FAIL_MODE=open`, `HYDRA_FAIL_MODE=open`
+> and `HYDRA_AUTH_FAILMODE=open` all still answer `503`). Turning it on is a security decision
+> (unauthenticated traffic during an auth outage), so it is recorded here rather than wired.
+
 ## 6. Circuit-breaker operations (design §8.4)
 
 A provider enters the **dead-set** after `threshold` (default 5) **consecutive**
@@ -679,15 +1087,26 @@ authoritative "live" view, and `status` as a human override.
 
 ### 6.3 Probe strategy & tuning
 
-- The HTTP probe considers **any HTTP response** (even a 401/429) as "host
-  alive" — only connection-level failures count as "still dead". This is
-  intentional: a 401 from `/v1/models` means the upstream is up, just
-  unauthenticated for that path.
-- A bare TCP connect is the fallback when the HTTP probe itself errors (DNS,
-  TLS, timeout). Use this when you can't expose `/v1/models`.
-- Tune `[breaker] threshold` lower (e.g. 3) for aggressive failover; raise it
-  (e.g. 10) if your upstream has bursty errors. `probe_interval` shorter than
-  your mean-time-to-recover shortens the dead window at the cost of probe load.
+Measured end-to-end 2026-09-30 (`integration/test_breaker_probe_revival.py`) — the revival
+promise in the paragraph above is real, and so are its two sharp edges:
+
+| Situation | Measured |
+|---|---|
+| A provider that **genuinely recovers** (its probe path answers again) | leaves the dead-set **on its own in 9.5 s** (probe interval 10 s) — **no traffic and no manual reset needed**, and it serves immediately after |
+| A provider whose **chat** path is 100 % broken but whose `GET /v1/models` answers **404** | **revived anyway** after 10.0 s, so the next requests fail again: trip → revive → trip, i.e. **flapping**. This is the blind spot §9.1 records: the probe path is not a path a real inference request uses, and any status **`< 500` counts as healthy** |
+| A provider answering **5xx** on the probe path | **stays dead** (deliberately: reviving on any response made a 500-ing provider flap). Note this is what the code does — the earlier version of this section said "any HTTP response (even a 401/429) is alive", which was wrong above 4xx |
+
+- The HTTP probe treats **any status `< 500`** as "host alive" — a 401/429/404 means the host
+  answered (unauthenticated, throttled, or without that route), while a 5xx means it is still
+  failing. A bare TCP connect is the fallback when the HTTP probe itself errors (DNS, TLS,
+  timeout).
+- **There are no breaker knobs to tune.** `threshold` (**5**) and `probe_interval` (**10 s**)
+  are compiled-in defaults (`hydra-server/src/proxy/config.rs::BreakerPolicy::default()`): no
+  environment variable reads them and this project ships **no config file at all** (there is no
+  loader), even though `design.md`'s `[breaker]` sketch and earlier revisions of this section
+  read as if there were. An operator who wants a provider back sooner than the probe does has
+  exactly one lever: `DELETE /api/v1/breaker/{id}` (§6.1). In cluster mode `HYDRA_BREAKER_QUORUM`
+  is the one breaker setting that IS read (see §13).
 
 ---
 
@@ -755,9 +1174,11 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
 | Cap | Default | Effect when exceeded |
 |-----|---------|----------------------|
 | ~~`max_request_body` (soft)~~ | ~~8 MiB~~ | **已删除（terminate-mode 不使用）**：terminate-mode 读全 body，故障转移用 `Bytes::clone` O(1) 重放，无"软上限禁用重放"机制。 |
-| `max_request_body_hard` | 32 MiB | **413 Payload Too Large** immediately, connection closed (`set_keepalive(None)`, §6.7). 在 `request_filter` 全 body 读取循环中检测。 |
+| `HYDRA_MAX_REQUEST_BODY_HARD` | 32 MiB (= 33554432 **bytes**) | **413 Payload Too Large**（体为 `{"error":{"message":"request_body_too_large","type":"proxy_error"}}`）立即返回并关闭连接（`set_keepalive(None)`，§6.7）。在 `request_filter` 的全 body 读取循环中检测。**值按字节给**（例：`4194304` = 4 MiB）；`0`/非法值被拒绝并回落默认。2026-09-29 起可配置 —— 此前该值只来自 `ProxyConfig::default()`，本表下面那句"调低它降内存"的建议**根本无法执行**（实测：`HYDRA_MAX_REQUEST_BODY_HARD=1048576` 时 2 MiB 的体被 413，未设置时同一请求正常通过）。 |
+| `HYDRA_REQUEST_BODY_TIMEOUT_SECS` | 60 s | **408 Request Timeout** + 关闭连接（不排空——这个客户端本来就不在发送）。这是**整个 body** 的总期限，不是空闲期限：pingora 对 HTTP/1 的 body 读取只有 per-read 期限（每个字节都会重置它），HTTP/2 则完全没有读超时，所以只有总期限挡得住"发一半就不发了"的客户端。**可达性（2026-09-29 实测修正）**：body 读取发生在**租户解析与认证跳之后**（`proxy.rs`：`resolve_tenant` → 认证 → 读全 body），所以这个洞**不是**任意匿名客户端都能触发 —— 认证跳拒绝的请求会在大体上传之前就被答复（实测：认证上游不可达时，33 MiB 的客户端拿到 `503 auth_upstream_unavailable` 且 `size_upload=0`）。但只要该租户的 `auth_url` 对**任意** key 都放行（开发/宽松鉴权很常见，也可能是有意设计），任何知道租户域名的调用者都能走到这一步；且认证缓存会给**已放行过**的 key 续命（TLL 内即使 auth 服务已挂，仍能到达读 body 阶段）。因此这条仍是**跨租户可用性**风险，只是前提写清楚：它成立的条件是"该租户的鉴权服务放行这次请求"。默认值按 `max_request_body_hard`（32 MiB）标定：60 s ≈ 0.5 MB/s 传满上限，慢链路请显式调大。`0` 被拒绝（那会 408 掉所有带 body 的请求）。 |
+| body 读取出错 | — | **400 `request_body_read_error`** + 关闭。读取错误曾被当作"body 正常结束"，把**截断的** body 当完整请求转发给上游（静默损坏路径）；现在 fail-closed。 |
 
-**Trade-off**（terminate-mode）：~~更大的软上限意味着更多请求可以安全故障转移（有利于可用性）~~ **不再适用**——全 body 已缓存，所有候选都能 O(1) 重放。内存占用 = 并发请求数 × 平均 body 大小（500 并发 × 2MB avg ≈ 1GB）。如需降低内存峰值，调低 `max_request_body_hard`（超过即 413）。
+**Trade-off**（terminate-mode）：~~更大的软上限意味着更多请求可以安全故障转移（有利于可用性）~~ **不再适用**——全 body 已缓存，所有候选都能 O(1) 重放。内存占用 = 并发请求数 × 平均 body 大小（500 并发 × 2MB avg ≈ 1GB）。如需降低内存峰值，调低 **`HYDRA_MAX_REQUEST_BODY_HARD`**（字节；超过即 413——设置它需要重启进程）。
 
 > ~~H2 paths are truly zero-copy on the forward leg; H1 paths incur one kernel copy per chunk (Pingora core limitation, design §8.5).~~ **（已废弃）** Terminate-mode 放弃 kernel-level 零拷贝（body 经 userspace buffer 传给 reqwest），但保留"零 JSON 往返"（body 字节未被 serde 处理）。详见 `dev-docs/design-change-terminate-mode.md` §5。
 
@@ -766,12 +1187,35 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
 ## 9. Observability (design §17, implemented W5)
 
 - **`/metrics`** (self-hosted, no sidecar): Prometheus exposition on the admin
-  port. Key series: `hydra_requests_total`, `hydra_request_duration_seconds`,
+  port, **gated by the admin bearer token on every role** (leader, all and edge —
+  an edge used to serve it token-free, which made the exposure depend on the
+  node's ROLE while the shipped cluster topology binds the edge admin port to
+  `0.0.0.0`). The series carry `tenant`/`provider`/`model` labels, i.e. customer
+  identifiers, so this is not public data.
+  **Scrape configuration:** send `Authorization: Bearer <admin token>`
+  (Prometheus: `authorization: {type: Bearer, credentials_file: ...}` with the
+  file readable only by the scraper). The trade-off is explicit: the scraper
+  holds the inventory-wide credential. If that is unacceptable, scrape the admin
+  port over loopback (the default bind) or through a sidecar proxy that injects
+  the header, rather than opening the port. `/healthz` and `/readyz` stay
+  token-free on purpose — a load balancer must be able to probe without a secret.
+  Key series: `hydra_requests_total`, `hydra_request_duration_seconds`,
   `hydra_upstream_duration_seconds`, `hydra_retries_total`,
   `hydra_tokens_total`, `hydra_auth_decisions_total`, `hydra_auth_cache_size`,
   `hydra_breaker_dead`, `hydra_breaker_state_transitions_total`,
   `hydra_limit_rejected_total`, `hydra_sni_host_mismatch_total`,
-  `hydra_route_errors_total`, `hydra_mid_stream_errors_total`.
+  `hydra_route_errors_total`, `hydra_mid_stream_errors_total`,
+  **`hydra_usage_records_dropped_total{reason}`** — the one series that says you are
+  **under-billing**: usage rows the sink could not deliver. Its reasons are `channel_full`
+  (the bounded channel is full because the flush loop is retrying a backend that is down),
+  `channel_closed`, `retention_cap` (the buffer hit `MAX_RETAINED` = 10 000) and
+  `shutdown_unflushed` (the final drain at shutdown failed). Measured 2026-09-30
+  (`integration/test_usage_drop_accounting.py`): with a dead ClickHouse and the shipped
+  defaults, the FIRST drop appears after ~600 requests — the sink buffers a full 256-record
+  batch and starts its backoff before the channel can overflow, so `channel_full` is the
+  reason an operator will actually see first, and the 10 000-record `retention_cap` is much
+  harder to reach. Every drop is also logged with `dropped_trace_id` (per-row diagnosis),
+  and the counter STOPS growing as soon as the backend answers again.
 - **Tracing**: structured logs via `tracing` (`RUST_LOG`). Every request carries
   an `X-Hydra-Trace-Id` echoed to the client and logged end-to-end.
 - **Admin UI**: `http://<admin_addr>/admin/` — same-origin (the token is kept
@@ -789,14 +1233,20 @@ name and label that really exists in this codebase (`/metrics`).
 
 | Alert | Expression | Meaning |
 |---|---|---|
-| Certs configured, no TLS listener bound | `hydra_listener_tenant_certs > 0 and hydra_listener_bound{protocol="tls"} == 0` | Tenant SNI is silently not served (the 2026-09-16 outage shape) |
+| Certs configured, no TLS listener bound | `hydra_listener_tenant_certs > 0 and hydra_listener_bound{protocol="tls"} == 0` | Tenant SNI is silently not served (the 2026-09-16 outage shape). **Read the two protocols differently**: `protocol="plain"` is LIVENESS (a startup self-check dials the port and rewrites it to 0 if the data plane never came up), while `protocol="tls"` is CONFIGURATION (it is published from the config decision and never revised). Both listeners live in ONE Pingora service whose bind is all-or-nothing, so a bind failure of either address shows up as `plain == 0` — a `tls == 1` therefore means "TLS was configured", not "TLS is accepting" |
 | TLS listener configured, no certs | `hydra_listener_bound{protocol="tls"} == 1 and hydra_listener_tenant_certs == 0` | Handshakes will fail until a certificate is written |
 | Invalid listener configuration | `increase(hydra_listener_misconfig_total[10m]) > 0` | Startup-time configuration problem (certs without a port / port without certs) |
 | Registry rows piling up | `hydra_registry_nodes{state="dead"} > 5` | Reaping is failing, or node identities drift |
 | Registry reaping churn | `increase(hydra_registry_reaped_total[1h]) > 20` | Nodes keep being recreated (unstable identity — see §13.6) |
-| Config snapshot stale | `hydra_config_snapshot_stale == 1` | A post-write reload failed; the in-memory snapshot is behind the DB |
-| Upstream first-byte timeouts | `increase(hydra_upstream_first_byte_timeout_total[10m]) > 0` | The upstream accepted the connection and then sent no response headers; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s) instead of burning the 300s exchange timeout. **Do not use `hydra_retries_total{stage="connect"}`** — nothing emits that label value (retries are recorded with `stage="terminate_loop"`), so such a rule could never fire |
+| Config snapshot stale | `hydra_config_snapshot_stale == 1` | A reload failed (post-write **or** the explicit `POST /api/v1/reload`); the in-memory snapshot is behind the DB. The state is nastier than it looks, and it was measured 2026-09-30 (`integration/test_snapshot_stale.py`) by putting a provider row the LOADER rejects directly into SQLite (the admin write boundary refuses such a row, so a hand-edited database or a restore is how this happens): the node **keeps serving** on the old snapshot, `POST /api/v1/reload` answers **400 `reload_failed`** ("old snapshot retained"), the gauge goes to 1, and — the trap the code documents in capitals — **every later admin write still answers 2xx while having no runtime effect**: a `PUT` that disables a tenant returned 200 and the tenant kept being served until a reload succeeded. Each tenant view carries `snapshot_stale: true` while this holds. **Recovery:** remove/fix the offending row and reload — the gauge returns to 0 and the pending write takes effect (measured: the disabled tenant then answered `403 tenant_disabled`). Until 2026-09-30 the explicit endpoint recorded **nothing**: a failing `/reload` left the gauge at 0 while a later successful `/reload` left an earlier 1 in place, so this alert could neither fire on the failure nor clear on the documented recovery |
+| Admission limits accepted but not enforced | `increase(hydra_admission_limits_stale_total[10m]) > 0` | A provider is being admitted under limits the live configuration no longer asks for: the `PUT /api/v1/providers/{id}` row change was accepted but the gate was never resized (see §4, decision item D-14). Firing means traffic is still flowing through the OLD cap; `GET /api/v1/concurrency` shows both sides for the affected provider (`max_concurrency` vs `configured_max_concurrency`) plus `limits_stale: true`. Restart the node to converge. The counter is per admitted request while the two sides differ, so `rate()` answers "how much traffic is affected" |
+| Upstream first-byte timeouts | `increase(hydra_upstream_first_byte_timeout_total[10m]) > 0` | The upstream **accepted the connection** and then sent no response headers; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s). Because the request WAS written, this is a post-send failure: the client gets `502 upstream_transport_error` **without failover** (replaying it could double-bill). A route that never completes the connect is a *different* case since 2026-09-30 — `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` (default 10s) fails it as a connect error, which **does** fail over and does **not** land in this counter. Before that bound existed it was misreported here *and* did not fail over: measured with a black-holed route, `codes=[502,200,502,200,502,200]` over six requests with `retries=0`. **Do not use `hydra_retries_total{stage="connect"}`** — nothing emits that label value (retries are recorded with `stage="terminate_loop"`), so such a rule could never fire |
+| Failed credential attempts (either gate) | `increase(hydra_admin_auth_failures_total{result=~".+_throttled"}[10m]) > 0` | A peer exceeded `HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN` failed attempts on the admin port. `result` is `<gate>_denied` (401) or `<gate>_throttled` (429), and `gate` is **`admin`** (the operator token that gates every provider key) or **`cluster`** (the internal control-plane token, which also authorises cross-tenant sub-tenant/route writes). Both gates share ONE per-peer budget. Both used to be unmetered: the admin gate had no limit, no counter and only a `debug!` line (filtered out at the shipped `RUST_LOG=info`), and the cluster gate had not even that — a brute-force run against either was free and invisible. The budget is per-process, so N reachable admin ports mean N times the budget; and IPv6 peers are bucketed by /64 (an unbounded address space inside one /64 cannot be used to rotate buckets) |
+| Upstream streams wedged mid-answer | `increase(hydra_upstream_stream_idle_timeout_total[10m]) > 0` | The upstream sent response headers (and maybe some body) and then no byte for `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` (default 120s). The client has already received a `200` plus whatever arrived, so this is a **truncated** answer, not a retryable failure — and this path also feeds the circuit breaker |
+| Provider quietly left the rotation | `increase(hydra_candidate_skipped_total{reason=~"no_key|breaker_dead"}[10m]) > 0` | A provider that WOULD have served the request was dropped while the candidate set was built: `no_key` (its api-keys are gone), `breaker_dead` (open breaker), `breaker_dead` (open breaker). **`invalid_weight` is deliberately NOT in the expression**: `weight < 0` cannot reach a running process — `migrations/0001_init.sql` declares `weight INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 0)`, and every in-memory provider comes from those rows (`ConfigStore::load`), so the reason exists only for hand-built `ConfigData` (it is kept and unit-tested as defensive vocabulary, and this is the same honesty rule as the `stage="connect"` note below: do not write a rule for a series that cannot occur). The failover loop's own reasons (`missing_config`, `bad_endpoint`, `no_usable_key`) are unreachable with a valid config for the same reason and are likewise not in the expression. This is the ONLY per-provider signal for "it stopped being chosen": the request still SUCCEEDS through another provider, so nothing fails and `hydra_route_errors_total` (failures only, tenant-labelled) stays flat. **Deliberately absent: `soft_disabled`** (`weight == 0`) — that is an intentional act (§10.4 step 7), so it is not counted at all; a rule on it could never fire. The series exists only after the first drop (`IntCounterVec`), so an `== 0` rule is meaningless |
 | Replication stalled (upgrade window) | `changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0` | Fail-closed mixed-version signal. **Only polling nodes publish these** — scope the rule by role |
+| **Billing data is being LOST** | `increase(hydra_usage_records_dropped_total[10m]) > 0` | Usage rows the sink could not deliver — the gateway is **under-counting usage, quota and billing** for every drop. `reason="channel_full"` means the sink's backend is down and the bounded channel (batch size, 256) filled while the flush loop was backing off; `retention_cap` means 10 000 rows are already buffered; `channel_closed` means the sink was shut down; `shutdown_unflushed` means the final drain at shutdown failed. Every drop also logs `dropped_trace_id`, so a lost row can be traced to its request. Requests are still served normally (losing telemetry never breaks the proxy path — measured), which is exactly why this needs an alert rather than a symptom |
+| Shared limits are OFF (Redis unreachable) | `increase(hydra_control_poll_total{result="rate_limit_error"}[10m]) > 0` | A cluster rate-limit check could not reach Redis, so that role was **failed open** — the request was admitted without its window being consulted (hard-coded direction, `HYDRA_RATE_LIMIT_FAIL_MODE` does not exist). One increment per matched role per affected request, so this is also the "how much traffic is unprotected" signal. Before 2026-09-30 this counter could grow **forever**: the pool was built without a reconnect policy, so a severed connection was never re-dialled and the limits stayed off until a restart (`ops.md` §13.5; measured 90 s with zero reconnect attempts). A flat line at a fixed total is stale, not healthy — check that it stops growing within seconds of Redis returning |
 
 The label is `protocol`, never `transport` (`hydra_listener_bound` is registered
 with `&["protocol"]`). Note the metric-name family: listener signals live under
@@ -814,14 +1264,44 @@ two names for one signal would mean two owners.
 > adding switches whose defaults preserve the blind spot.
 >
 > What IS fixed: the per-attempt **first-byte bound** (`HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`,
-> default 30s). Without it a "connected but silent" upstream consumed the full
-> 300s exchange timeout on every attempt and every failover hop.
+> default 30s), which bounds response HEADERS. Without it a "connected but silent"
+> upstream burned the whole exchange on every attempt and every failover hop.
+>
+> The **body** has its own bound since 2026-09-29:
+> `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` (default **120s**) is the maximum gap
+> between two body chunks of one streamed response. It replaced the upstream
+> client's former 300s *total* deadline — `ClientBuilder::timeout` runs until the
+> response body has FINISHED, so it truncated every generation longer than 300s
+> (the client got HTTP 200 plus half an SSE body and was billed in full). An idle
+> window cannot do that: a stream that keeps producing tokens resets it, while a
+> wedged upstream is cut after the window and counted in
+> `hydra_upstream_stream_idle_timeout_total{provider}`. There is deliberately **no
+> total-exchange cap** — a legitimately long generation must not be truncated.
 
 > **Mid-stream failures are not retried.** Streaming responses that fail AFTER
 > the `200` + first byte are sent cannot be retried (sent bytes cannot be
-> unsent); the connection is closed, the failure is counted in
-> `hydra_mid_stream_errors_total{provider}`, and it still feeds the circuit
-> breaker.
+> unsent); the connection is closed and the failure is counted in
+> `hydra_mid_stream_errors_total{provider}`.
+>
+> On the breaker: the **idle-bound** case (upstream went silent mid-answer) also
+> feeds the circuit breaker — it is unambiguous provider-side evidence. The other
+> mid-stream causes (a failing downstream write, i.e. usually the CLIENT going
+> away) deliberately do **not**, because counting those would let a client's own
+> disconnects mark a healthy provider dead. Distinguishing every remaining cause
+> (and the half-open probe semantics) is still the recorded product decision
+> §7-1.
+
+> **Measured 2026-09-30** (`integration/test_client_disconnect.py`, a client that reads the first
+> chunk and then resets the connection with `SO_LINGER 0`): the gateway **stops pulling** from the
+> upstream — the mock delivered **3 of its 8 chunks** and no more — and the request is **still
+> metered**: a usage row exists carrying the tokens the upstream had already reported
+> (`tokens_in=5 tokens_out=8`). Two consequences worth knowing before you reconcile:
+> the row is **indistinguishable from a complete answer** (`status_code=200`, `error` NULL — the
+> store records the usage, not the truncation), and this event **does** land in
+> `hydra_mid_stream_errors_total{provider}` while the provider stays **out of the dead-set** — i.e.
+> the metric and the breaker deliberately disagree about the same event (the series covers every
+> mid-stream cause; only the upstream-silent one is provider evidence). If you need to know how
+> many answers your clients abandoned, that is still the open decision §7-1.
 
 ---
 
@@ -879,7 +1359,10 @@ Check, in order:
    out.
 
 The admin UI surfaces all of these; `hydra_route_errors_total{reason=…}` tells
-you which gate is firing in aggregate.
+you which gate is firing in aggregate. A **successful** request can still have
+dropped providers on the way (§9.1 `hydra_candidate_skipped_total`) — a provider
+with no usable key stops being chosen silently, because the tenant's other
+providers keep serving.
 
 ### 10.5 SQLite is locked / busy
 
@@ -1018,9 +1501,9 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 
 | Variable | Notes |
 |---|---|
-| `HYDRA_ROLE` | `leader` / `edge`; unset = single-node (unchanged behavior) |
-| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired, sentinel/cluster fail-fast |
-| `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes) |
+| `HYDRA_ROLE` | `leader` / `edge`; unset or `all` = single-node (unchanged behavior). A value that is neither **does not stop the node** (a typo must not leave a node unable to proxy) but is never quiet: if **any cluster-only variable** is configured the node logs an **ERROR naming `ignored=` — every one of them, not a subset** (no registry, no lease, no L2 cache, tenant writes to its **local** SQLite), and the same ERROR is logged when the role is **unset** or blank while that wiring is present. The list is `CLUSTER_ONLY_ENV` in `cluster/mod.rs` (10 names: `HYDRA_REDIS_URL`, `HYDRA_REDIS_MODE`, `HYDRA_CLUSTER_TOKEN`, `HYDRA_CONTROL_URL`, `HYDRA_PUBLIC_URL`, `HYDRA_NODE_ID`, `HYDRA_CONTROL_POLL_MS`, `HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS`, `HYDRA_FORWARD_TIMEOUT_SECS`) — before round 193 it named only the first three and dropped the other seven in silence. Surrounding whitespace is trimmed (`" leader "` is the leader). Pinned by `integration/test_startup_knobs.py` (K4–K8) and K10 (all ten named), plus `scripts/check_cluster_env.cjs`. |
+| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with `HYDRA_ROLE` unset/`all` the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
+| `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes)  **Minimum 16 characters AND it must be random** (`openssl rand -hex 32`) — the length is a floor, not a guarantee: the startup check cannot tell `aaaaaaaaaaaaaaaa` from a real token, and this is the token that authorises the internal control plane and the cross-tenant write endpoints. |
 | `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `dev-docs/cluster.md` §5.2) |
 | `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
@@ -1028,7 +1511,12 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
 | `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
 | `HYDRA_FORWARD_TIMEOUT_SECS` | standby→leader admin-forward timeout (default 5). It bounds the CONNECT phase; the total deadline is that value + 2s so a connect-phase failure is reported as the definite failure it is (see `forward.rs`) |
-| `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected. See the alert row in §9.1 |
+| `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` | bound on **establishing** the TCP/TLS connection to a provider (default **10**); `0`/garbage falls back to the default. **Must be strictly below `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`** — the node refuses to start otherwise, because the first-byte bound wraps the whole send (connect included) and would always fire first. What it buys (measured 2026-09-30 against a black-holed route, `integration/test_upstream_connect_bound.py`): without it a provider whose SYN goes nowhere burned the whole first-byte bound and was classified as a *post-send* failure, so the request returned `502 upstream_transport_error` **instead of failing over** to a healthy provider (`codes=[502,200,502,200,502,200]`, `retries=0`); with it the attempt fails in ≤10s as a connect error and the request **fails over** (`codes=[200×6]`, `retries=4`, and `hydra_upstream_first_byte_timeout_total` stays 0 for that provider). A healthy provider on a normal RTT establishes in milliseconds, so this bound only ever fires on a dead route. **What a dead route costs, measured 2026-09-30** (`integration/test_dead_route_cost.py`, shipped defaults 10s/30s, dead route = a dropped SYN): every affected request pays ~**10s** and is then served by a healthy peer (`10.0s, 0.0s, 10.0s, …` — one penalty per time the dead provider is chosen), the provider is taken out of the rotation after exactly **5** such failures (`hydra_candidate_skipped_total{reason="breaker_dead"}` starts at 1 per skipped request), and the penalties then **stop** (all later requests < 1s). Worst case for a two-provider SWRR rotation: ~5 × 10s of user-visible latency spread over the first ~9 requests. `DELETE /api/v1/breaker/{id}` clears the dead-set, so resetting **without fixing the route** buys those 10s penalties again — fix the route first |
+| `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected (it falls back to the default rather than meaning 'instant'). Covers the response HEADERS only — a connect that never completes is bounded by `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` above, and the response BODY by `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`. See the alert row in §9.1 |
+| `HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN` | per-PEER budget for FAILED credential attempts on the admin port — **shared by BOTH gates** (the `admin` token and the internal `cluster` token) (default 10; `0`/garbage falls back). Past it the peer gets `429 too_many_failed_attempts` + `Retry-After` for the rest of the minute; a VALID token is always accepted, so this cannot lock an operator out. Watch `hydra_admin_auth_failures_total{result=~".+_throttled"}` — the label is `<gate>_denied` \| `<gate>_throttled` (gate = `admin` \| `cluster`), so a rule written against the old bare `denied`/`throttled` values would never match |
+| `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | max gap between two body chunks of one streamed upstream response (default 120); `0` is rejected. Replaced the removed 300s total exchange timeout — see §9.1 and §10.2 |
+| `HYDRA_MAX_REQUEST_BODY_HARD` | hard cap on ONE downstream request body, in **bytes** (default 33554432 = 32 MiB); `0`/garbage falls back to the default. Exceeding it is `413 request_body_too_large` + close. Lower it to cut peak memory (memory ≈ concurrency × average body); raise it for bigger payloads. The **admin** API and the tenant API have their own 1 MiB caps, which are compile-time constants and NOT tunable (`MAX_ADMIN_BODY_BYTES`, `tenant_api/mod.rs` `MAX_BODY`) — both answer `413 request_body_too_large` / `413 payload_too_large` |
+| `HYDRA_REQUEST_BODY_TIMEOUT_SECS` | TOTAL deadline for reading one downstream request body (default 60); `0` is rejected. Exceeding it is `408 request_body_timeout` — see the body-cap table in §6.7 |
 | `HYDRA_SHUTDOWN_DRAIN_SECS` | seconds Pingora drains in-flight requests after SIGTERM (default 20); size `terminationGracePeriodSeconds` from it (see §13.5b) |
 | `HYDRA_REGISTRY_STALE_GRACE_SECS` | TTL of the registry "last seen" witness (default 120). Only `> 0` values are accepted; a small value narrows the grace window in which a merely-silent node is protected from reaping |
 
@@ -1054,6 +1542,26 @@ Data plane keeps serving (last-known-good snapshot + local caches). Election is
 **fail-closed**: a leader that cannot renew demotes immediately (writes stop)
 until Redis recovers. See `dev-docs/cluster.md` §3 for the full matrix.
 
+**"Until Redis recovers" only held after 2026-09-30.** The pool was built with fred's
+`Pool::new(…, policy: None, …)`, i.e. **no reconnect policy at all** — and a policy is not
+part of fred's `Config`, so nothing else supplied one. Measured on a real leader whose Redis
+link was severed for ~2 s and then restored:
+
+| | before the fix | after |
+|---|---|---|
+| New TCP connections to Redis in the 90 s after the link returned | **0** | retried every 1 s while down, 2 up immediately |
+| `/healthz/leader` | **503 for the whole 90 s** (lease never re-acquired ⇒ the fleet had no leader) | **200 within ~3 s** |
+| Every Redis command (lease renew, registry, breaker sync, limit check) | `Timeout Error: Request timed out` on the 500 ms command timeout, forever | resumes as soon as the connection is back |
+| Cluster rate limits | fail-open became **permanent** (see below) | fail-open lasts exactly as long as the outage |
+
+fred's own debug log named the cause — `Checking reconnect state. Has policy: false` — and
+the fix is `redis::reconnect_policy()` (retry forever, 1 s, jittered), now handed to
+`Pool::new` and pinned by a unit test plus the drill `integration/test_cluster_limits.py`.
+**A restart was the only recovery before this**, so a Redis blip silently demoted the fleet's
+leader for good. Watch `hydra_control_poll_total{result="rate_limit_error"}`: it counts
+fail-open decisions, and after the fix it *stops* growing once Redis is back (before, it
+grew by one per matched request for the life of the process).
+
 ### 13.5b Shutdown drain vs `terminationGracePeriodSeconds`
 
 `HYDRA_SHUTDOWN_DRAIN_SECS` (default **20**) is how long Pingora may spend
@@ -1069,11 +1577,57 @@ terminationGracePeriodSeconds  >=  HYDRA_SHUTDOWN_DRAIN_SECS (20)
                                  =  35  (default)
 ```
 
+**What the drain window actually does (measured 2026-09-30, `integration/test_shutdown_drain.py`,
+`HYDRA_SHUTDOWN_DRAIN_SECS=10` and `=1`):**
+
+| Observation | Measured |
+|---|---|
+| A request IN FLIGHT when `SIGTERM` arrives | still receives a **complete `200`** — the drain finishes what was already accepted |
+| The process's exit | **`drain + 5 s`**: 15.0 s with drain=10, 6.0 s with drain=1 (the +5 is Pingora's `graceful_shutdown_timeout_seconds`, the final runtime step). This is the arithmetic above, now with numbers behind it |
+| The budget is a real bound | with drain=1 s a request needing 3 s is **cut at ~1.5 s**, not at 3 s |
+| **NEW connections during the drain** | **refused — on the data plane AND on the admin port.** Within ~0.2 s of `SIGTERM`, `/healthz`, `/readyz` and `/metrics` stop answering entirely (measured: connection refused), and so does `/v1/…`. So the drain is **in-flight-only**: it does **not** keep accepting for the window, and there is **no probe and no scrape** for up to `drain + 5` s |
+| A usage row still in the sink's batch at `SIGTERM` | persisted after the process is gone (the buffered batch is flushed) |
+
+**Operational consequence of that table:** do **not** rely on the drain to serve traffic that
+arrives after the signal. In Kubernetes the endpoint removal is asynchronous, so any request that
+reaches the pod in that gap is **refused** — gate readiness (or use a `preStop` delay) *before*
+`SIGTERM`, and expect a metrics scrape gap of up to `drain + 5` s. The grace period still matters,
+for the opposite reason: it is what stops the `SIGKILL` from landing while an in-flight request is
+still being finished.
+
 **Why this must be set explicitly:** Pingora's DEFAULT `grace_period_seconds` is
 `None` ⇒ 300s, far beyond a typical 30s Kubernetes grace period. The pod would be
 `SIGKILL`ed while still draining, losing both the usage-sink flush and the
 registry de-registration. The deployment manifests are owned by the operations
 repository; this repository only reads the environment variable.
+
+**Which signals flush the usage sink:** `SIGTERM`, `SIGINT` **and `SIGQUIT`**.
+`SIGQUIT` is the one that matters in this repository's own deployments: the
+systemd unit in §1.2 sets `KillSignal=SIGQUIT` (so a plain `systemctl restart`
+sends it) and the rolling upgrade in §3 step 1 is `kill -SIGQUIT <pid>`. Pingora
+handles `SIGQUIT` itself for socket handover and then exits through
+`process::exit(0)`, which runs **no destructors** — so the flush and the registry
+de-registration each need an explicit signal hook
+(`main.rs::spawn_sink_flush_on_shutdown` / `spawn_registry_unregister_on_shutdown`).
+
+**Measured 2026-09-30, and the earlier wording here was an overclaim.** Removing the hook and
+re-running `integration/test_shutdown_drain.py` did NOT lose a buffered row: the periodic sink
+flush (5 s) fires inside every exit window (`drain + 5 s ≥ 6 s`), so the row landed anyway — and
+with a sink that cannot flush at all (a dead ClickHouse) the batch was still reported as
+`usage sink is shutting down with an un-flushable batch … LOST`, because the sink loop reacts to
+its channel closing during teardown too. What the hook uniquely owns is doing the flush **before**
+that teardown races it, plus the explicit `SIGTERM: flushing usage sinks` / `usage sinks flushed`
+log record — and note that the `shutdown_unflushed` **counter dies with the process**, so the LOG
+is the only post-mortem evidence that the shutdown drain ran at all. The hook is defence in depth,
+not the sole line of defence the previous sentence claimed.
+
+**The same `process::exit(0)` also means SQLite is never closed**, so
+`hydra.db-wal` and `hydra.db-shm` stay next to the database after EVERY stop —
+`SIGTERM` and `SIGQUIT` alike (measured 2026-09-30, case E of
+`integration/test_backup_restore.py`). Harmless while the database file itself stays
+in place (the next start replays the WAL), but it is why the restore step in §1.4
+insists on deleting those two files: replacing `hydra.db` under a leftover `-wal`
+makes the node refuse to boot (`database disk image is malformed`).
 
 ### 13.6 Registry identity: `HYDRA_NODE_ID`, `HOSTNAME`, and why they matter
 
@@ -1110,9 +1664,39 @@ used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
   the snapshot contract carries the full fidelity rows (including disabled ones,
   `provider_key` identity and tenant access-token hashes), so a promoted replica
   is byte-faithful. See `dev-docs/cluster.md` and the snapshot wire v2 notes.
-- `HYDRA_FAILOVER_GRACE_MS` is documented but not wired; `HYDRA_BREAKER_QUORUM`
-  and `HYDRA_RATE_LIMIT_FAIL_MODE` use in-code defaults.
-- Redis sentinel/cluster deployment modes fail fast (single mode wired).
+- `[auth] fail_mode` (`FailMode::Open`, design §11.4) is **implemented but not selectable**: no env var and no config file reaches `AuthConfig.fail_mode`, so the "availability-first" mode cannot be turned on (see §5.x). The default `Closed` is what ships.
+- Breaker `threshold` (5) and `probe_interval` (10s) are **not configurable at all**: no env var and no config file exists (measured 2026-09-30: `grep -rn BREAKER_THRESHOLD crates/` and `grep -rn PROBE_INTERVAL crates/` are both empty, and the tree has no config-file loader) — `design.md`'s `[breaker]` sketch and `ops.md` §6.3's earlier "tune `threshold`" advice are therefore about knobs that do not exist. §6.3 now says so; the lever that works is `DELETE /api/v1/breaker/{id}`.
+- `HYDRA_FAILOVER_GRACE_MS` is documented but not wired. `HYDRA_BREAKER_QUORUM` uses
+  an in-code default (`1`) **and is read** (`main.rs`). `HYDRA_RATE_LIMIT_FAIL_MODE`
+  **does not exist at all** (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty): the
+  Redis rate-limit path is *hard-coded* fail-open and **not configurable** — see
+  `crates/hydra-server/src/redis/rate_limit.rs` (`failing open`) and its note
+  "there is NO env override".
+- Redis sentinel/cluster deployment modes fail fast (single mode wired), and so does **any other
+  value** of `HYDRA_REDIS_MODE` — including a typo: `clustr` used to fall through to `single` (measured
+  2026-10-01 on the wire: the node started and registered), which is the opposite of this section's
+  promise. `HYDRA_REDIS_MODE=single`/`SINGLE`/unset are accepted; anything else stops the process with
+  `unsupported HYDRA_REDIS_MODE '<what you wrote>' (supported: single)` — **on a cluster-role node**:
+  the mode is read inside `if role.is_cluster()` (`main.rs`), so with `HYDRA_ROLE` unset or `all` the
+  value is not validated at all (measured 2026-10-01: the node serves, and the only line that can
+  mention the variable is the "cluster wiring is configured but …" ERROR, which never quotes the
+  value). Pinned by `integration/test_startup_knobs.py` K1/K2 and K12.
+- **A replica that cannot materialize is retried forever, at a decreasing rate**
+  (1 s, 2 s, 4 s … capped at 60 s; a newer config snapshot resets it). It used to
+  give up after three attempts *per snapshot* — and since the control client never
+  re-delivers a version its memory watermark has passed, the node stayed unable to
+  lead until a newer config write (which needs a working leader) or a restart.
+  Watch `hydra_replica_materialize_retries_total{outcome="failed"}`: a sustained
+  non-zero rate means a node cannot materialize its replica and therefore cannot
+  take the lease — alert on it.
+- The invalidation stream is trimmed by `MAXLEN` (10 000) every 30 s, and the
+  generation is bumped — every node clears its whole auth cache (L1+L2) — **only
+  when a dropped entry had not been applied by every live node**. Watch
+  `hydra_invalidation_generation_bumps_total`: a sustained non-zero rate means a
+  consumer is behind (or the event rate exceeds `maxlen / 30 s ≈ 333 events/s`
+  with a consumer that cannot keep up). `hydra_invalidation_trimmed_total` counts
+  the drops themselves, so "busy but converged" is distinguishable from "losing
+  events". Both were previously invisible: the only signal was a log line.
 ---
 
 ## 14. GitHub pull fails: `GnuTLS recv error (-110)` (HTTPS over unstable links)

@@ -72,7 +72,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `HYDRA_CONTROL_POLL_MS` | `500` | 控制面快照轮询间隔（代码默认 `1000`）。standby/edge 用它同步配置与证书；越小故障切换后收敛越快，越大越省 Redis/网络。 |
 | `HYDRA_ENCRYPTION_KEY` | `<base64-32B>` | 32 字节的 base64（`openssl rand 32 \| base64`），AES-256-GCM 主密钥：provider api-key 与证书私钥落库/快照密封共用。**全集群必须一致**（任一节点不同则解密失败、fail-closed）。缺失即拒启动；丢失则库不可读。 |
 | `HYDRA_LEADER_LEASE_MS` | `15000` | leader 租约时长（代码默认 `15000`，续约每 lease/3 ≈ 5s）。决定故障切换窗口上限（实测 ~11–18s）。 |
-| `HYDRA_REDIS_MODE` | `single` | Redis 部署模式：`single`（默认，已接线）；`sentinel`/`cluster` 接线中，遇到即 fail-fast。 |
+| `HYDRA_REDIS_MODE` | `single` | Redis 部署模式：`single`（默认，已接线）；`sentinel`/`cluster` 接线中，遇到即 fail-fast。**仅当本节点是集群角色**（`HYDRA_ROLE=leader|edge`）时才校验 —— 单节点默认下该值不被读取（第一百九十四轮实测：节点照常服务，且没有任何一行报出拼错的值）。 |
 | `HYDRA_REDIS_URL` | `redis://:<pass>@redis:6379/0` | Redis 地址（集群**唯一必选外置依赖**，fail-closed）。按此 URL 必须可连：服务名 `redis`、端口 `6379`、`requirepass`/ACL 与 URL 密码一致。所有集群功能共用这一个 Redis。 |
 | `HYDRA_USAGE_SINK` | `clickhouse` | 用量 sink：`sqlite`（单节点默认）或 `clickhouse`。**集群必须 `clickhouse`**（fail-closed，逐节点 sqlite 用量无意义）。单二进制同时编入两种 sink，切值无需重编。 |
 | `RUST_LOG` | `info` | `tracing` 日志过滤级别（镜像默认已置 `info`，此项与镜像默认一致即可）。 |
@@ -88,7 +88,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 
 | 配置项 | 默认 | 适用 | 说明 |
 |---|---|---|---|
-| `HYDRA_ROLE` | `all`（单节点） | 每个集群节点 | 集群开关：`leader`（候选，竞争租约、本地 SQLite 随快照重建、写操作转发给 active）或 `edge`（无状态数据面，无本地库，仅 `/metrics` `/healthz` `/readyz`）。拼写错误会 WARN 后回落单节点，不会静默关代理——但会**退出集群**，务必核对。 |
+| `HYDRA_ROLE` | `all`（单节点） | 每个集群节点 | 集群开关：`leader`（候选，竞争租约、本地 SQLite 随快照重建、写操作转发给 active）或 `edge`（无状态数据面，无本地库，仅 `/healthz` `/readyz` `/metrics` —— 注意 `/healthz`/`/readyz` **免鉴权**，而 `/metrics` 走**与别处同一条 admin token 门禁**；官方编排**不给 edge 注入 `HYDRA_ADMIN_TOKEN`**，所以按现状抓取 edge 的 `/metrics` 恒 **401**，取舍见 `ops.md` §9）。拼写错误**不会**静默关代理，但会**退出集群**：节点照常启动为单节点，并记一条 **ERROR** —— 只要配了**任何一个 cluster-only 变量**（清单见 `ops.md` §13.3 的 `HYDRA_ROLE` 行，共 **10 个**），日志会用 `ignored=` **逐个点名**那些不会被使用的变量（第一百九十三轮实测：此前只点名 3 个，另外 7 个被静默丢弃）；**`HYDRA_ROLE` 忘配（未设）时同样报这一条**（第一百九十二轮实测：此前这条路径完全静默，也就是"最像忘记设变量"的那种情况没有任何提示）。首尾空白会被去掉（`" leader "` 就是 leader）。务必核对日志。 |
 | `HYDRA_CONTROL_URL` | — | leader、edge **必填** | active leader 的**控制面快照轮询**端点（如 `http://hydra-control-0.hydra-control:8081`）。注意它**不是**管理变更的转发目标——转发按实际租约持有者从注册表实时解析，故把候选指向自己（或都指向 `sts-0`）都安全。 |
 | `HYDRA_PUBLIC_URL` | — | leader 建议必填 | 本节点注册进注册表的**可达管理端点**（K8s 里用 `http://$(POD_NAME).hydra-control:8081` / `http://$(POD_NAME):8081`）。leader 不设则注册为“不可轮询”，edge 无法经注册表发现它。 |
 | `HYDRA_NODE_ID` | `node-<随机hex>` | 建议固定 | 节点标识（租约持有者 / 熔断投票者 / 注册表条目）。StatefulSet 场景建议固定为 `hydra-control-0` / `hydra-control-1` 便于排查。 |
@@ -108,8 +108,8 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | 配置项 | 状态 | 说明 |
 |---|---|---|
 | `HYDRA_FAILOVER_GRACE_MS` | 预留，**未接线** | 文档里描述过宽限窗口；实测故障切换 = 租约过期 + 轮换 + 选举 tick，不依赖本项。 |
-| `HYDRA_BREAKER_QUORUM` | 代码内默认 `1` | 熔断投票法定数（任一存活投票即生效），暂未提供 env 覆盖。 |
-| `HYDRA_RATE_LIMIT_FAIL_MODE` | 代码内默认 `open` | Redis 宕机时限流 fail-open（可配 closed），暂未提供 env 覆盖。 |
+| `HYDRA_BREAKER_QUORUM` | 代码内默认 `1` | 熔断投票法定数（任一存活投票即生效），**确实被读取**（`crates/hydra-server/src/main.rs` 的 `std::env::var("HYDRA_BREAKER_QUORUM")`）。 |
+| `HYDRA_RATE_LIMIT_FAIL_MODE` | **不存在该开关** | Redis 宕机时限流**硬编码 fail-open，NOT configurable**（`grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空）。此前写作"代码内默认 `open`（可配 closed）"是错的：代码里没有读取它的地方，也没有 closed 分支。 |
 | ~~`HYDRA_EDGE_TLS`~~ | **从未实现，已删除** | 这个开关只存在于文档里，代码从未读取过它（`grep HYDRA_EDGE_TLS crates/` 为空）。edge TLS 请用上表的 `HYDRA_TLS_LISTEN`。 |
 
 ---
@@ -153,7 +153,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `leader` / `edge` 缺 `HYDRA_CONTROL_URL` | 拒绝启动 |
 | 集群模式 `HYDRA_USAGE_SINK ≠ clickhouse` | 拒绝启动 |
 | 任何角色缺 `HYDRA_ENCRYPTION_KEY[_FILE]` | 拒绝启动（库不可读保护） |
-| `HYDRA_REDIS_MODE` 为 `sentinel`/`cluster` | fail-fast（接线中） |
+| `HYDRA_REDIS_MODE` 为 `sentinel`/`cluster`（或任何未识别的值）**且本节点是集群角色** | fail-fast（接线中）；单节点默认下该值不被读取，因此不会拒绝启动 |
 
 ---
 

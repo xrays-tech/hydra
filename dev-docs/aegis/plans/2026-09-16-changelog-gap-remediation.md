@@ -4051,7 +4051,7 @@ git show HEAD:crates/hydra-server/src/cluster/registry.rs | sed -n '111,124p'
 | release build：`--features server` / 三特性 | ✅ 均 Finished |
 | `cargo test -p hydra-core` | ✅ 15 套件 |
 | `cargo test -p hydra-server --features server` **连跑 3 次** | ✅ **每次 367 passed / 0 failed**（端口竞态修复后不再出现评审期间那种偶发 `ConnectionRefused`） |
-| 三特性全量 | ✅ **441 passed / 2 ignored / 0 failed**（2 个 ignored 为：T10.3 的已知限制用例、需真实 ClickHouse 的用例） |
+| 三特性全量 | ✅ **441 passed / 2 ignored / 0 failed**（当时 2 个 ignored 为：T10.3 的已知限制用例、需真实 ClickHouse 的用例）。**2026-09-29 更正：这个计数已过期** —— `grep -rn '#\[ignore' crates/ --include=*.rs` 现为 **3 处**：`boot_listeners.rs`（T10.3 已知限制）、`clickhouse_sink.rs`（需真实 CH）、`usage_query.rs`（需活 CH）。CI 从不跑 `--ignored` |
 | 脚本门禁 | ✅ `check_i18n` OK（334 keys/4 locales）、`node --test` `# fail 0`、`ask_llm.test.sh` ALL PASSED |
 | Playwright（真实二进制 + 真实 Chromium） | ✅ **15 passed** |
 | `.sqlx/` | ✅ 复核用配方重生成后与已提交缓存**逐文件一致**（`git status .sqlx/` 为空） |

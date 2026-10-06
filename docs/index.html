@@ -4,7 +4,7 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Hydra — LLM Gateway · Rust + Pingora</title>
-<meta name="description" content="Hydra: a Rust + Pingora LLM API gateway — native OpenAI & Anthropic passthrough, per-tenant auth, weighted routing, failover, rate limiting, usage metering. 65 MiB, zero unsafe."/>
+<meta name="description" content="Hydra: a Rust + Pingora LLM API gateway — native OpenAI & Anthropic passthrough, per-tenant auth, weighted routing, failover, rate limiting, usage metering. ~30 MiB binary, zero unsafe."/>
 <meta name="color-scheme" content="dark"/>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23FF5A1F' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 7c3 0 4 5 7 5s4-5 7-5' opacity='.8'/%3E%3Cpath d='M3 12c3 0 4 5 7 5s4-5 7-5'/%3E%3Ccircle cx='20' cy='12' r='1.6' fill='%23FF5A1F' stroke='none'/%3E%3C/svg%3E"/>
 <style>
@@ -408,10 +408,10 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
         <span data-l="en">One gateway for<br><span class="hl">every model.</span></span>
       </h1>
       <p class="hero-sub" data-l="zh">
-        Hydra 是 <strong>Rust + Pingora</strong> 构建的 LLM 网关：原生透传 OpenAI 与 Anthropic 协议、租户级认证、加权路由、故障转移、熔断、限流与用量计量——打包进一个 <strong>65 MiB</strong> 的二进制，<strong>零 unsafe</strong>。
+        Hydra 是 <strong>Rust + Pingora</strong> 构建的 LLM 网关：原生透传 OpenAI 与 Anthropic 协议、租户级认证、加权路由、故障转移、熔断、限流与用量计量——打包进单个 <strong>约 30 MiB</strong> 的二进制（随镜像发布的 Linux release 构建实测 31 MiB），<strong>零 unsafe</strong>。
       </p>
       <p class="hero-sub" data-l="en">
-        Hydra is an <strong>LLM gateway in Rust + Pingora</strong>: native OpenAI &amp; Anthropic passthrough, per-tenant auth, weighted routing, failover, rate limiting and usage metering — packed into a <strong>65 MiB</strong> binary with <strong>zero unsafe</strong>.
+        Hydra is an <strong>LLM gateway in Rust + Pingora</strong>: native OpenAI &amp; Anthropic passthrough, per-tenant auth, weighted routing, failover, rate limiting and usage metering — packed into a single <strong>~30 MiB</strong> binary (the Linux release build shipped in the image measures 31 MiB), with <strong>zero unsafe</strong>.
       </p>
       <div class="hero-cta">
         <a class="btn primary" href="https://github.com/xrays-tech/hydra" target="_blank" rel="noopener">
@@ -516,9 +516,13 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <div class="num"><span data-count="0" data-fmt="int">0</span><span class="unit">unsafe</span></div>
       <div class="lab" data-l="zh">生产代码无 unwrap / panic / unsafe</div>
       <div class="lab" data-l="en">unsafe / unwrap / panic in production code</div>
-      <div class="note" data-l="zh">287 项测试 · clippy -D warnings 硬门禁</div>
-      <div class="note" data-l="en">287 tests · clippy -D warnings gate</div>
+      <div class="note" data-l="zh">814 项 Rust 测试 · 浏览器 / SDK / JS 套件 · clippy -D warnings 硬门禁（2026-10-01）</div>
+      <div class="note" data-l="en">814 Rust tests · browser / SDK / JS suites · clippy -D warnings gate (2026-10-01)</div>
     </div>
+  </div>
+  <div class="wrap">
+    <p class="note" data-l="zh" style="margin-top:18px;text-align:center">上方数字的原始测量条件（10 核 Apple Silicon、线程化 mock 上游、<code>oha</code>、release 构建、未触达付费上游）见下方「测量方法」与评测报告。<strong>2026-09-29 另作一次跨平台独立复测</strong>（Linux/x86 · 14 核 Intel Ultra 5 235 · <code>cargo build --release</code> · 8 秒 · 并发 Go echo 上游 · 未触达付费上游）：<strong>25,047 RPS @ c=25</strong>（p99 1.55 ms）、网关开销 <strong>≈0.09 ms</strong>、RSS <strong>21 MiB 空闲 → 30 MiB 满载</strong>，即页面数字在该机器上是保守值；复现见 <code>scripts/load_test.sh</code> 头部（须用 release 构建；仓库自带的 <code>integration/mock_llm.py</code> 是单线程 Python，当作上游只会测出那个 mock 的上限）。</p>
+    <p class="note" data-l="en" style="margin-top:18px;text-align:center">The original measurement conditions for the figures above (10-core Apple Silicon, threaded mock upstream, <code>oha</code>, release build, no paid provider) are in the Methodology note below and the evaluation report. <strong>Replicated independently and cross-platform on 2026-09-29</strong> (Linux/x86, 14-core Intel Ultra 5 235, <code>cargo build --release</code>, 8-second run, concurrent Go echo upstream, no paid provider): <strong>25,047 RPS @ c=25</strong> (p99 1.55 ms), <strong>≈0.09 ms</strong> gateway overhead, RSS <strong>21 MiB idle → 30 MiB under load</strong> — i.e. the published figures are conservative on that machine. To reproduce, see the notes at the top of <code>scripts/load_test.sh</code> (use a release build; the bundled <code>integration/mock_llm.py</code> is single-threaded Python, so using it as the upstream measures that mock's ceiling, not the gateway's).</p>
   </div>
 </section>
 
@@ -737,12 +741,12 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
     </div>
     <div class="perf-side reveal" data-d="1">
       <div class="note">
-        <span data-l="zh">测量方法：<code>10 核机器</code> + 线程化 mock 上游，未触达任何真实付费上游。完整方法与 8C16G VPS 容量推算见<a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">评测报告</a>。</span>
-        <span data-l="en">Methodology: <code>10-core machine</code> + threaded mock upstream, no real paid provider hit. Full methodology + 8C16G VPS extrapolation in the <a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">evaluation report</a>.</span>
+        <span data-l="zh">测量方法：<code>10 核机器</code> + 线程化 mock 上游，未触达任何真实付费上游。完整方法与 8C16G VPS 容量推算见<a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">评测报告</a>（评测日期 2026-08-09 · v0.1.0 · macOS 10 核 / 24GB），上游为线程化 Python mock、未触达真实付费上游。</span>
+        <span data-l="en">Methodology: <code>10-core machine</code> + threaded mock upstream, no real paid provider hit. Full methodology + 8C16G VPS extrapolation in the <a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">evaluation report</a> (dated 2026-08-09 · v0.1.0 · macOS 10-core / 24 GB), threaded Python mock upstream, no real paid provider.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid">
-        <span data-l="zh">正确性门禁：<code>114 core + 173 server</code> 测试、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
-        <span data-l="en">Correctness gates: <code>114 core + 173 server</code> tests, <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
+        <span data-l="zh">正确性门禁：<code>258 core + 556 server</code> 测试（2026-10-01 计数）、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
+        <span data-l="en">Correctness gates: <code>258 core + 556 server</code> tests (counted 2026-10-01), <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid;border-color:var(--accent);background:rgba(255,90,31,.05)">
         <span data-l="zh"><b style="color:var(--accent)">横向扩展 ∝ N：</b>数据面无状态，吞吐随节点数近似线性增长——K8s HPA 就绪，加副本就是加吞吐。集群 ≈ 单节点 × N（受上游与网络约束）。</span>
@@ -801,8 +805,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)"><path d="M3 7c3 0 4 5 7 5s4-5 7-5" opacity=".8"/><path d="M3 12c3 0 4 5 7 5s4-5 7-5"/><circle cx="20" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>
           Hydra
         </a>
-        <p data-l="zh">Rust + Pingora 构建的 LLM API 网关。零 unsafe，65 MiB，多租户，可观测。</p>
-        <p data-l="en">An LLM API gateway in Rust + Pingora. Zero unsafe. 65 MiB. Multi-tenant. Observable.</p>
+        <p data-l="zh">Rust + Pingora 构建的 LLM API 网关。零 unsafe，约 30 MiB 二进制，多租户，可观测。</p>
+        <p data-l="en">An LLM API gateway in Rust + Pingora. Zero unsafe. ~30 MiB binary. Multi-tenant. Observable.</p>
       </div>
       <div class="foot-col">
         <h4 data-l="zh">资源</h4><h4 data-l="en">Resources</h4>

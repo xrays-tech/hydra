@@ -94,7 +94,7 @@ client → envoy gateway(80/443)
 | 按租户 TLS | 单证书（Ingress TLS） | 按 SNI 多租户证书、热更新 | 更强 ✅ |
 | 管理面 | GPUStack UI（网关配置需 CRD/annotations） | 管理 REST + UI + Prometheus /metrics | 直接替代 ✅ |
 | 通用 Ingress / K8s 生态 | 完整（MCP server、其他 wasm 插件、云原生生态） | 无（LLM 网关定位） | **失去** ⚠️ |
-| 资源占用 | 4 进程 + Istio，数百 MB~GB 级 | 65 MiB 单二进制 | ✅ |
+| 资源占用 | 4 进程 + Istio，数百 MB~GB 级 | 单二进制 **31 MiB** + 满载 RSS 65 MiB（2026-08-09 基准；2026-09-29 Linux 复测见 `dev-docs/aegis/plans/2026-09-29-oracle-remediation.md` §2au，实测 21→30 MiB） | ✅ |
 
 ---
 

@@ -600,7 +600,7 @@ curl -s --data-binary "SELECT count() FROM usage_record" 'http://127.0.0.1:8123/
       | `tenant_api` | `TenantApiConfig` | `enabled`（`HYDRA_TENANT_API`）、限流参数、**T6 的存活节点列表闭包** |
 
       **`for_tests` 必须能表达新测试所需的值**（P1-12）：`pub fn for_tests(pool, store, auth, breaker, limiter, sink, proxy, usage: Arc<dyn UsageQuery>, invalidation: Option<InvalidationStream>, tenant_api: TenantApiConfig) -> Arc<AppState>`。四个新增参数都**必填**而不是默认值 —— 因为 C1/C4/C6/C7 需要 `invalidation: Some(stream)`、C4/C5/C9/C10 需要真实的存活节点闭包、T10 需要 `enabled: false`；若给它们默认值，这些测试就得改回结构体字面量，`for_tests()` 的收敛意义就没了。**新测试同样只能用 `for_tests()`**（禁止新增 `AppState { .. }` 字面量，否则 §7.2 的计数校验失去意义）。
-   b. 迁移 **12 处**测试构造点到 `for_tests()`：`tests/terminate_mode.rs:206-233` 的 helper（**它内含 `:224`，不要重复计**）＋ `:600/:718/:1089/:1320/:2871`、`tests/streaming_usage_persistence.rs:271`、`tests/tls.rs:166`、`tests/anthropic_passthrough.rs:302/392/506`、`tests/metrics.rs:282`。**计数校验（命令已按 T4 实测修正）**：`grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" | wc -l` —— 迁移前 **14**（1 定义 + 1 生产 + 12 测试），T4 之后应为 **2**（只剩定义与 `main.rs` 的生产构造）。**注意**：裸的 `grep -c "AppState {"` 在 T4 之后会数到 `impl AppState {` 而给出 3，所以必须排除它；
+   b. 迁移 **12 处**测试构造点到 `for_tests()`：`tests/terminate_mode.rs:206-233` 的 helper（**它内含 `:224`，不要重复计**）＋ `:600/:718/:1089/:1320/:2871`、`tests/streaming_usage_persistence.rs:271`、`tests/tls.rs:166`、`tests/anthropic_passthrough.rs:302/392/506`、`tests/metrics.rs:282`。**计数校验（命令已按 T4 实测修正）**：`grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" | wc -l` —— 迁移前 **14**（1 定义 + 1 生产 + 12 测试），T4 之后应为 **2**（只剩定义与 `main.rs` 的生产构造）。**注意**：裸的 `grep -c "AppState {"` 在 T4 之后会数到 `impl AppState {` 而给出 3，所以必须排除它；**⚠ 2026-09-29 更正：现在实测是 3，不是 2** —— 见下条 `T4 计数订正`，第 3 处是 v2 新增的一个**测试**构造，不是生产构造；
    c. `main.rs`：把 `AppState` 构造**移到 `invalidation_stream` 之后**（`:621-644` 之后）；`:594` 的 `state.sink.clone()` 改为先克隆 `sink`；
    d. `tenant_api/mod.rs`：`pub async fn dispatch(state: &AppState, session, ctx) -> PingoraResult<bool>`；轻量段匹配（形制照 `admin/mod.rs:277-419`）；`respond_json`（形制照 `respond_catalog`，`proxy.rs:1280-1297`）；`TenantApiConfig::from_env()`（`HYDRA_TENANT_API=on|off`，默认 on）；
    e. `tenant_api/auth.rs`：`pub fn tenant_from_token(store: &ConfigStore, bearer: &str) -> Option<String>`。**必须在同一次 `replication()` guard 内**同时取令牌摘要表与 `tenants_by_id`（设计 §3.3 规则 4）；常数时间比较；`replication()` 为 `None` → `NotReady`（503）；
@@ -946,7 +946,7 @@ curl -s --data-binary "SELECT tenant_id, count() FROM usage_record GROUP BY tena
 
    | 残留位置 | 性质 | 处置 |
    |---|---|---|
-   | `crates/hydra-server/src/cluster/content.rs:28` | **注释**里提到旧路径 | 改成指向新路径或删掉该句 |
+   | `crates/hydra-server/src/cluster/content.rs`（模块注释） | **注释**里提到旧路径 | 改成指向新路径或删掉该句 |
    | `crates/hydra-server/tests/cluster.rs:799` | **测试注释** | 同上 |
    | `crates/hydra-server/tests/tenant_cache.rs:2,131` | 本任务步骤 0 已删 | 步骤 0 完成后自然消失 |
 
@@ -1010,14 +1010,19 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 
 # 生产代码 grep 门禁 —— 必须限定到本次新增/改动的文件（P1-10）
 # 实测：对 crates/hydra-server/src + crates/hydra-core/src 全量跑该模式，**今日即命中 358 行**
-# （含 main.rs:909 一处真实的生产 expect，以及大量位于 src/ 内联 #[cfg(test)] 模块里的断言）。
+# （含 `main.rs` 里 `cert_store` 的生产 `expect` 一处，以及大量位于 src/ 内联 #[cfg(test)] 模块里的断言）。
 # 全量要求"为空"是**永远无法变绿**的门禁，会逼开发者删掉合法断言或干脆不再信任它。
 rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' \
    crates/hydra-core/src/tenant_api.rs crates/hydra-server/src/tenant_api/ \
    crates/hydra-server/src/usage_query.rs crates/hydra-server/src/clickhouse.rs
-# 期望为空。**基线例外（已记录）**：main.rs:909 的
+# 期望为空。**基线例外（已记录）**：`crates/hydra-server/src/main.rs` 里 `cert_store` 的
 #   .expect("the cert store is built whenever a TLS listener is configured")
 # 是既有生产代码、不属本次改动，**不得**为过门禁而改它。
+#
+# 引用约定：**行号会随提交漂移，一律用符号名**（函数名/字面量），不要写 `file:line`。
+# `main.rs:909` 与 `content.rs:28` 两处旧坐标就是这样失效的 —— 而
+# `.acceptance/findings-disposition.py` 曾把它们当作"已处置"的证据（同一串失效字面量
+# 同时出现在计划与门禁脚本里，互相背书）。
 # 对本次改动的既有文件另用 diff 复核新增行：
 #   git diff -U0 <base> -- crates/hydra-server/src/proxy.rs crates/hydra-server/src/main.rs \
 #       crates/hydra-server/src/http.rs crates/hydra-server/src/sink.rs \
@@ -1127,7 +1132,7 @@ PY
 | **allow TTL 封顶抬高租户认证压力** | 中 | 默认 = 现状（零变化）；`hydra_auth_allow_ttl_capped_total{tenant}` 量化影响面；`ops.md` 给出调参建议 | 调大 `ALLOW_TTL_MAX_SECS`（代价是封禁生效变慢，二者只能取一） |
 | E2 返回 202 被误读为成功 | 中 | 用 202 而非 200；`state`/`lagging` 显式；`invalidate_pending_total` 可告警；文档给处置流程 | 无（语义即如此） |
 | 消费者停摆节点上的陈旧 allow | 中 | T7 的硬上界 + `consumer_stalled_seconds>60s` 告警 | 调小上限 |
-| `AppState` 加字段打断 **12 处**测试编译（另 1 处是 `main.rs` 的生产构造） | 低 | `for_tests()` 同批收敛；**校验命令（唯一有效形态）**：`grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` → 期望 **2**（结构体定义 + `main.rs` 生产构造）。裸 `grep -c "AppState {"` 会数到 `impl AppState {` 给出 3；**14 是改造前的历史值**，不是任何阶段的期望终态 | 无（纯机械） |
+| `AppState` 加字段打断 **12 处**测试编译（另 1 处是 `main.rs` 的生产构造） | 低 | `for_tests()` 同批收敛；**校验命令（唯一有效形态）**：`grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` → **2026-09-29 更正：现在期望 `3`，不是 `2`**（结构体定义 + `main.rs` 生产构造 + `tests/sub_tenant_data_plane_write.rs:258` 的测试构造，v2 新增）。裸 `grep -c "AppState {"` 会数到 `impl AppState {` 而给出 4；**14 是改造前的历史值**，不是任何阶段的期望终态 | 无（纯机械） |
 | 前缀保留改变既有透传行为 | 低 | T22 断言业务路径逐字节不变；`HYDRA_TENANT_API=off` 完全回基线 | 总开关 |
 | CH 宽窗口扫描代价 | 中 | 窗口上限（默认 31 天）+ `usage_query_seconds` | 调小上限；规模化需求走设计 Q15 |
 
@@ -1328,7 +1333,7 @@ done
 | **Playwright（Chromium，真 release 二进制 + 真 SQLite + `tests/e2e/seed.sh`）** | **15/15 passed**，含 **T2.4 auth-cache invalidate**（真实走到改写后的 `app.js` 与新的 `fleet` 响应体） |
 | **findings 处置核对** | **24/24 通过**（可重跑 `.acceptance/findings-disposition.py`） |
 | **设计用例覆盖矩阵** | **44/44 已分配**（矩阵内嵌脚本重跑：`用例总数 44 未分配 []`） |
-| **`AppState` 字面量计数** | **2**（定义 + `main.rs` 生产构造；命令 `grep -rn "AppState {" crates/ --include=*.rs | grep -v "impl AppState" \| wc -l`） |
+| **`AppState` 字面量计数** | **3**（定义 + `main.rs` 生产构造 + **1 处测试**；命令 `grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l`）。**2026-09-29 更正：本表原先写 2，已过期** —— 第 3 处是 `crates/hydra-server/tests/sub_tenant_data_plane_write.rs:258`（`fn edge_state(leader_url, token) -> Arc<AppState>` 里手搓的 `Arc::new(AppState { … })`），它是 **v2**（子租户租户自助写）新增的，**不是生产构造**：`for_tests()` 表达不了它要的 `tenant_config_forwarder: Some(Arc::new(TenantConfigForwarder::new(...)))`，所以 v2 绕过 `for_tests()` 直接建了字面量。它不是第二条选择路径（只是测试装配），但"计数=2"这条校验从此必须读作 3 |
 | **指标交付核对（本轮新增）** | **12/12 指标已注册、9/9 环境变量被读取** —— 这一轮查出并补掉了前述 9 个未实现指标 + 3 个幽灵开关（提交 `6023661`） |
 | **限流窗口 GC（本轮新增）** | 交付核对还查出 `TenantApiLimiter::gc` / `Throttle::gc` **在生产代码里从未被调用**：失败维度按**源 IP**（调用方可选）建键 ⇒ 无界内存增长，限流器自己成了它要防的那种攻击面。已按既有 `spawn_gc_task` 形制接线（提交 `e99eca4`） |
 
@@ -1348,7 +1353,7 @@ done
 | 4 | `crates/hydra-server/tests/zz_adv_probe.rs` 被 git 跟踪，首行自述"用完即删" | **真** | 见"流程事故"。**已删除**（`7aea6e1`）；其中**有价值的断言被保留下来**（见第 8 条） |
 | 5 | 5 处指标标签枚举与代码不符（`too_large`/`tenant_gone` 不可达；`unrouted`/`locked`/`single_node`/`unavailable` 缺失） | **真** | 四处改文档 + **一处补代码**：`led` 不应删而应可达 → 被锁定拒绝时记 `reason="locked"`；E2 的 429 补记 `throttled{scope="invalidate"}`（原本是个没有生产者的文档化维度） |
 | 6 | `--test tenant_cache` 实测 **4 passed**，计划两处写 3 | **真** | 改计划：注明 **3 是步骤 0 的中间态、4 是终态**（3 条令牌生命周期 + C16），避免下一个人把 4 当回归 |
-| 7 | `grep -c "AppState {"` 应为 14 已失效（裸命令 3、排除 impl 后 2） | **真** | 改两处：统一为排除 `impl AppState {` 的形态、期望 **2**，并注明 **14 是改造前的历史值** |
+| 7 | `grep -c "AppState {"` 应为 14 已失效（裸命令 3、排除 impl 后 2） | **真（但"排除 impl 后 2"这一半已再次过期）** | 改两处：统一为排除 `impl AppState {` 的形态、期望 **2**，并注明 **14 是改造前的历史值**。**2026-09-29 再更正**：v2 新增了 `tests/sub_tenant_data_plane_write.rs:258` 这处测试构造，故"排除 impl 后"现为 **3**（裸命令 4） |
 | 8 | （由被删探针留下）413/读失败的 body **不含** `trace_id` | **真，且原实现确有此缺陷** | **改实现**：两处静态字节串改由同一个 `error_body` 构造（带 `trace_id`）。新增测试断言 header 与 body 的 trace id 一致，并**用回退注入验证其判别力**（回退后该测试失败并打印无 trace_id 的 body）。这两条路径（1 MiB 上限、读体失败）此前**完全没有测试** |
 
 ### 流程事故（必须记录，不是粉饰）
@@ -1398,7 +1403,7 @@ done
 | 3 | `grep -n "state\` 四态" dev-docs/design-tenant-api.md` | 已改为四态并写明"无流归 single_node"的理由 |
 | 4 | `grep -n 'record_tenant_api_throttled("invalidate")\|record_tenant_api_auth_failure("locked"'` | 两个此前不可达的标签现在都有生产者 |
 | 5 | `cargo test … --test tenant_cache` | **4 passed**（计划已改为 4，并注明 3 是中间态） |
-| 6 | `grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` | **2**（两文档已改用这条命令） |
+| 6 | `grep -rn "AppState {" crates/ --include=*.rs \| grep -v "impl AppState" \| wc -l` | **3**（两文档已改用这条命令）—— 2026-09-29 更正：原先记 **2**，v2 的 `tests/sub_tenant_data_plane_write.rs:258` 使它变成 3 |
 | 7 | `grep -n 'error_body("payload_too_large"'` | 413 body 经统一构造器，带 `trace_id`；测试注入验证过判别力 |
 
 ### 修复后的回归复验（不是"修了就算"）

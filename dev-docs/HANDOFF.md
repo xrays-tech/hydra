@@ -41,8 +41,25 @@ traffic to upstream providers. Two crates, strict layering:
   metrics, external auth cache, **provider-key encryption (crypto module)**, **per-provider bounded
   admission queue (admission module)**.
 
-Both crates: `#![forbid(unsafe_code)]`, **zero** `unwrap`/`panic`/`unsafe` in production `src/`
-(all confined to `#[cfg(test)]`).
+Both crates: `#![forbid(unsafe_code)]`; in production `src/` there is **zero** `unwrap()`,
+**zero** `panic!()`, and **8** `expect()` calls, every one asserting an unreachable invariant
+(the reachable checks are all `match`/`?` on a typed error). The eight
+(re-measured 2026-09-29 by `scripts/check_source_purity.cjs`):
+`crates/hydra-server/src/main.rs` (cert store built whenever a TLS listener is configured),
+`crates/hydra-server/src/admin/mod.rs` (admin SQLite pool, leader mode only),
+`crates/hydra-server/src/cluster/control_client.rs` ×4 (reqwest build once, `url` mutex ×3),
+and — added by the P1-1 redirect fixes after this list was written, which is why the count
+here used to say 6 — `crates/hydra-server/src/cluster/forward.rs` and
+`crates/hydra-server/src/proxy/provider_client.rs` (one reqwest build each, retried via
+`or_else` before the `expect`).
+Check with: `node scripts/check_source_purity.cjs` (wired into CI). Do **not** hand-grep:
+a recipe like "text before each file's first `#[cfg(test)]`" misses
+`#[cfg(all(test, feature = "..."))]` modules, and the literal
+`rg 'unwrap\(\)|expect\(|panic!' crates/hydra-server/src` matches 489 lines — nearly all of
+them tests. The script strips both gating forms, blanks comments and string interiors, and
+also asserts the lint attribute is present on every crate **root** (`src/lib.rs` *and* each
+`[[bin]]`; a `[[bin]]` is its own compilation unit, so `lib.rs`'s inner attribute does not
+cover `src/main.rs` — it did not until 2026-09-29).
 
 ---
 
@@ -52,7 +69,7 @@ Both crates: `#![forbid(unsafe_code)]`, **zero** `unwrap`/`panic`/`unsafe` in pr
 crates/hydra-core/src/    (pure)
   model.rs     domain types incl. Provider{ max_concurrency, max_queue_depth, queue_wait_timeout_ms }  ← NEW
   config.rs    ConcurrencyPolicy + resolve_policy + validate (admission policy resolution)             ← NEW
-  router.rs / swrr.rs / breaker.rs / limit.rs / sse.rs / rewrite.rs (mask_key: 前十+中星+后四) / auth.rs   ← mask format NEW
+  router.rs / swrr.rs / breaker.rs / limit.rs / sse.rs / rewrite.rs (mask_key: L>=20 前十+中星+后四；6<=L<20 前二+中星+后二；L<6 全星) / auth.rs
 
 crates/hydra-server/src/
   main.rs        bootstrap: load master key (fail-closed), build AdmissionControl, wire AppState + AdminState
@@ -95,8 +112,11 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
    **`dev-docs/design-admission-queue.md`** (the authoritative design).
 3. **sqlx compile-time SQL checking** (P1-6) — all compile-time queries are `query!`/`query_as!`;
     `.sqlx/` offline cache; `SQLX_OFFLINE=true` in CI (SQL drift fails the build).
-4. **Admin API no longer returns plaintext keys** (P1-5) — always masked (`前十 + 中星 + 后四`);
-   `?reveal=1` is now a no-op.
+4. **Admin API no longer returns plaintext keys** (P1-5) — always masked. The format has a
+   **minimum hidden middle**: `L >= 20` ⇒ 前十 + 中星 + 后四; `6 <= L < 20` ⇒ 前二 + 中星 + 后二;
+   `L < 6` ⇒ 全星。 (The original `L >= 14` long tier returned a 14-char key **verbatim** — 0 stars —
+   and leaked all but 1–3 chars up to `L == 17`; see `hydra-core/src/rewrite.rs::mask_key` and the
+   length-sweep guard in `crates/hydra-core/tests/rewrite.rs`.) `?reveal=1` is a no-op.
 5. **Mid-stream error observability** (P2-9) — `hydra_mid_stream_errors_total{provider}`; doc note
    that mid-stream failures don't retry (inherent to streaming).
 6. **Ops hardening** (P0) — docker-compose healthchecks (hydra/clickhouse/mock-tenant) +
@@ -189,6 +209,15 @@ queue_wait_timeout_ms # 1000-5000
     disabled — D5 tightening; prefix overlap re-validated in-tx).
   - the tenant Bearer is carried to the leader in the dedicated **`x-hydra-tenant-token`** header
     (`cluster/forward.rs`), never in `Authorization` and never in the body.
+  - `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (default **60**) — per-tenant config-write budget, enforced
+    on the leader (`429 too_many_requests`); the in-process window **resets on leader failover**
+    (bounded burst, anti-DoS only).
+  **Status: v2 is COMMITTED** — `9adbea1..b283b74` (implementation) plus the review follow-ups to
+  `d799756`, which records the verdict. The V8 gate ran green (core 17/17, `--features server`
+  0 failed, build/fmt/clippy/dependency-firewall clean); the post-implementation adversarial oracle
+  review came back **GATE: FAIL** (route quota-boundary idempotency) on the first pass, then
+  **GATE: PASS** after the fix. `dev-docs/aegis/INDEX.md` (2026-09-18 plan row) is the record of
+  that verdict. See `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`.
 - **Sub-tenant v3 (usage attribution, 2026-09-18):** `UsageRecord.sub_tenant_id`
   (`hydra-core/model.rs`) is derived at the `logging` record site from the **RAW** api-key prefix
   via `router::sub_tenant_id_for_key` (model-free/binding-free, enabled-only; `None` when no prefix
@@ -199,11 +228,6 @@ queue_wait_timeout_ms # 1000-5000
   `sub_tenant_id` to `''`, so unattributed rows bucket under the empty key instead of reaching the
   rows decoder as a JSON `null` key — which failed the **whole window** as 503 `decode_error`
   (fixed in `b3a57d7`). Plan: `aegis/plans/2026-09-18-sub-tenant-v3.md`.
-  - `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (default **60**) — per-tenant config-write budget, enforced
-    on the leader (`429 too_many_requests`); the in-process window **resets on leader failover**
-    (bounded burst, anti-DoS only).
-  V1–V6 implemented (green); V8 gate pending. See
-  `dev-docs/aegis/plans/2026-09-18-sub-tenant-v2.md`.
 - **The admission queue is fully wired and opt-in** — to use it, set the 3 fields on a `provider` row;
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,
