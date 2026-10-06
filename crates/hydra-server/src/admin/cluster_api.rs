@@ -276,14 +276,21 @@ pub(super) async fn reload(state: &AdminState, force: bool, trace_id: &str) -> R
     let changed = match result {
         Ok(changed) => changed,
         Err(e) => {
+            // Record it through the SAME owner as the post-write path: the snapshot IS stale after
+            // this, and `ops.md` §9.1 tells operators to alert on `hydra_config_snapshot_stale`.
+            // This endpoint used to report the 400 to the caller and leave the gauge at 0.
+            super::handlers::note_reload_outcome(state, true);
             return err_json(
                 400,
                 "reload_failed",
                 &format!("config reload failed (old snapshot retained): {e}"),
                 trace_id,
-            )
+            );
         }
     };
+    // ...and clear it on success: without this, a gauge set by an earlier failing WRITE kept the
+    // documented alert firing after the documented recovery (a successful reload).
+    super::handlers::note_reload_outcome(state, false);
     let snap = state.store.snapshot();
     ok_json(
         200,

@@ -123,13 +123,40 @@ impl RedisAuthL2 {
     /// bump that compensates for a trimmed invalidation) actually effective:
     /// with the L2 left in place, the next L1 miss re-hydrates the very verdict
     /// the clear was supposed to drop.
-    pub async fn del_all_tenants(&self) -> Result<usize, RedisError> {
+    /// Delete the L2 entries of EVERY tenant (the whole-cache clear).
+    ///
+    /// One tenant's failure does NOT abort the rest: the old `?` inside the loop
+    /// returned at the first error, leaving every remaining tenant's verdicts in
+    /// Redis while the caller — which had already dropped this node's L1 — only
+    /// logged a warning. The next L1 miss then re-hydrated the very verdicts the
+    /// clear existed to remove, for the rest of their TTL. Failures are now
+    /// collected, the rest are still deleted, and the count of failures is
+    /// returned so the caller can report it truthfully.
+    pub async fn del_all_tenants(&self) -> Result<(usize, usize), RedisError> {
         let tenants: Vec<String> = self.pool.smembers(GLOBAL_IDX_KEY).await?;
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
         for t in &tenants {
-            self.del_tenant(t).await?;
+            match self.del_tenant(t).await {
+                Ok(_) => deleted += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        tenant = %t,
+                        error = %e,
+                        "L2 clear failed for ONE tenant; continuing with the rest"
+                    );
+                }
+            }
         }
-        let _: i64 = self.pool.del(GLOBAL_IDX_KEY).await?;
-        Ok(tenants.len())
+        // The index is dropped even when some tenants failed: it is how the NEXT
+        // clear finds them, and keeping a stale member list would be worse than
+        // losing it (a missed tenant is caught by the per-key allow TTL).
+        if let Err(e) = self.pool.del::<i64, _>(GLOBAL_IDX_KEY).await {
+            tracing::warn!(error = %e, "L2 tenant index could not be dropped after a clear");
+            failed += 1;
+        }
+        Ok((deleted, failed))
     }
 }
 
@@ -469,9 +496,49 @@ mod tests {
         l2.set("t2", "k2", true, Duration::from_secs(60))
             .await
             .expect("k2");
-        let cleared = l2.del_all_tenants().await.expect("clear fleet");
+        let (cleared, failed) = l2.del_all_tenants().await.expect("clear fleet");
         assert_eq!(cleared, 2, "two tenants cleared");
+        assert_eq!(failed, 0, "no per-tenant failure");
         assert!(l2.get("t1", "k1").await.expect("a").is_none());
         assert!(l2.get("t2", "k2").await.expect("b").is_none());
+    }
+
+    /// One tenant's failure must NOT abort the clear for the others.
+    ///
+    /// The old `?` inside the loop returned at the FIRST error, leaving every
+    /// remaining tenant's verdicts in Redis while the caller (which had already
+    /// dropped its L1) merely logged a warning — so the next L1 miss re-hydrated
+    /// exactly the verdicts the clear existed to remove.
+    ///
+    /// Failure injection is real, not simulated: `del_tenant` starts with
+    /// `SMEMBERS <idx>`, so overwriting ONE tenant's index key with a string makes
+    /// that tenant's clear fail with WRONGTYPE while the others stay healthy.
+    #[tokio::test]
+    async fn a_failing_tenant_does_not_abort_the_whole_cache_clear() {
+        let l2 = l2().await;
+        for (t, k) in [("t1", "k1"), ("t2", "k2"), ("t3", "k3")] {
+            l2.set(t, k, true, Duration::from_secs(60))
+                .await
+                .expect("set");
+        }
+        // Corrupt ONE tenant's index: `SMEMBERS` on a string is a WRONGTYPE error.
+        let _: () = l2
+            .pool
+            .set(super::idx_key("t2"), "not-a-set", None, None, false)
+            .await
+            .expect("corrupt t2 index");
+
+        let (cleared, failed) = l2.del_all_tenants().await.expect("clear fleet");
+        assert_eq!(failed, 1, "exactly the corrupted tenant failed");
+        assert_eq!(
+            cleared, 2,
+            "the OTHER tenants are still cleared — the old code returned at the first error"
+        );
+        for (t, k) in [("t1", "k1"), ("t3", "k3")] {
+            assert!(
+                l2.get(t, k).await.expect("get").is_none(),
+                "{t}/{k} must be cleared even though t2 failed"
+            );
+        }
     }
 }

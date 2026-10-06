@@ -15,7 +15,7 @@ use hydra_core::breaker::{Breaker, BreakerConfig};
 use hydra_core::config::{ConfigData, ModelProvider};
 use hydra_core::model::{Provider, RouteError, Tenant};
 use hydra_core::router::CatalogEntry;
-use hydra_core::router::{accessible_models, resolve};
+use hydra_core::router::{accessible_models, resolve, resolve_detailed};
 
 fn provider(id: &str, weight: i32) -> Provider {
     Provider {
@@ -1012,5 +1012,119 @@ fn catalog_sub_tenant_fail_closed_drops_model() {
     assert!(
         entries.is_empty(),
         "gpt-4o's routed provider does not serve it → dropped (fail-closed)"
+    );
+}
+
+/// Round 46 (plan §2r) — the three step-4 drops are attributed PER PROVIDER and
+/// per reason, not just as "the set came out empty".
+///
+/// T2.7–T2.9 above assert the same drops happen; this asserts the filter also
+/// says WHO and WHY, which is what the proxy records as
+/// `hydra_candidate_skipped_total{provider,reason}`. Without it, a provider whose
+/// last api-key was deleted left rotation silently: while other providers kept
+/// serving, nothing failed and `hydra_route_errors_total` (tenant-labelled,
+/// failures only) stayed flat.
+///
+/// Note the contract: an empty candidate set is `Ok` here, so the attribution
+/// survives exactly the case where it matters most — `resolve()` restores the
+/// historical `Err(NoAvailableProvider)` for everyone else.
+#[test]
+fn resolve_detailed_attributes_every_exclusion() {
+    let mut cfg = base_cfg();
+    cfg.provider_keys.remove("p_a"); // → no_key
+    cfg.providers.insert("p_b".into(), provider("p_b", 0)); // → soft_disabled
+    let tenant = tenant();
+    let b = breaker_with_dead("p_c"); // → breaker_dead
+
+    let out = resolve_detailed(&cfg, &b, &tenant, "gpt-4o", None)
+        .expect("gates 0-3 pass; attribution is data, not an error");
+    assert!(
+        out.candidates.is_empty(),
+        "all three were dropped: {:?}",
+        out.candidates
+    );
+    let got = excluded_reasons(&out);
+    assert_eq!(
+        got,
+        vec![
+            ("p_a".to_string(), "no_key"),
+            ("p_b".to_string(), "soft_disabled"),
+            ("p_c".to_string(), "breaker_dead"),
+        ],
+        "one entry per dropped provider, in provider_id order, with the reason"
+    );
+
+    // The thin wrapper keeps the historical contract for callers (and tests) that
+    // only want the candidate set.
+    assert_eq!(
+        resolve(&cfg, &b, &tenant, "gpt-4o", None).unwrap_err(),
+        RouteError::NoAvailableProvider
+    );
+}
+
+/// The other half of the contract: nothing dropped ⇒ nothing attributed. A
+/// counter that fires on healthy requests would be noise, not a signal.
+#[test]
+fn resolve_detailed_attributes_nothing_when_all_providers_are_usable() {
+    let cfg = base_cfg();
+    let out =
+        resolve_detailed(&cfg, &alive_breaker(), &tenant(), "gpt-4o", None).expect("resolves");
+    assert!(
+        out.excluded.is_empty(),
+        "no drops ⇒ no attribution, got {:?}",
+        out.excluded
+    );
+    assert_eq!(
+        resolve_set(&out.candidates),
+        HashSet::from(["p_a".into(), "p_b".into(), "p_c".into()])
+    );
+}
+
+/// `(provider_id, reason label)` for each exclusion, in reported order.
+fn excluded_reasons(out: &hydra_core::model::ResolveOutcome) -> Vec<(String, &'static str)> {
+    out.excluded
+        .iter()
+        .map(|e| (e.provider_id.clone(), e.reason.as_str()))
+        .collect()
+}
+
+/// Round 48 (review) — `weight == 0` and `weight < 0` mean OPPOSITE things and
+/// must be told apart:
+///
+/// * `weight == 0` is a SUPPORTED, deliberate soft-disable (`ops.md`), so the
+///   proxy does not count it at all: a per-request counter for an intentional
+///   state would track traffic, and an `increase(...) > 0` alert rule would fire
+///   forever on a fleet configured exactly as intended;
+/// * `weight < 0` is a configuration ERROR (`config::validate` warns the provider
+///   "can never be selected"), so it is counted as the fault it is.
+///
+/// The routing outcome is identical (both are dropped from `candidates`); only the
+/// reported reason differs.
+#[test]
+fn resolve_detailed_separates_a_deliberate_disable_from_a_bad_weight() {
+    let tenant = tenant();
+    let b = alive_breaker();
+
+    let mut soft = base_cfg();
+    soft.providers.insert("p_b".into(), provider("p_b", 0));
+    let out = resolve_detailed(&soft, &b, &tenant, "gpt-4o", None).expect("resolves");
+    assert_eq!(
+        excluded_reasons(&out),
+        vec![("p_b".to_string(), "soft_disabled")],
+        "a deliberate disable is still reported — just named as a choice"
+    );
+    assert_eq!(
+        resolve_set(&out.candidates),
+        HashSet::from(["p_a".to_string(), "p_c".to_string()]),
+        "and it is still not a candidate"
+    );
+
+    let mut bad = base_cfg();
+    bad.providers.insert("p_b".into(), provider("p_b", -3));
+    let out = resolve_detailed(&bad, &b, &tenant, "gpt-4o", None).expect("resolves");
+    assert_eq!(
+        excluded_reasons(&out),
+        vec![("p_b".to_string(), "invalid_weight")],
+        "a negative weight is a fault, not a choice"
     );
 }

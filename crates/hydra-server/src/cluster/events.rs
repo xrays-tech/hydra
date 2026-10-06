@@ -577,8 +577,8 @@ impl InvalidationStream {
         Ok(g.unwrap_or(0))
     }
 
-    /// One trim pass (F-6): trim to `maxlen`, and if entries were removed, bump
-    /// the generation so lagging consumers re-hydrate. Returns
+    /// One trim pass (F-6): trim to `maxlen`, and bump the generation **only if
+    /// the drop removed something a live consumer had not applied**. Returns
     /// `(removed, bumped)`.
     ///
     /// **One atomic script** (review B3a). The trim and its compensating bump
@@ -593,17 +593,78 @@ impl InvalidationStream {
     /// corrupt counter value would make `INCR` raise *after* the trim had
     /// already been applied (a Lua error does not roll back earlier writes in
     /// the same script), which is the very loss this fix removes.
-    pub async fn trim_and_maybe_bump(&self, maxlen: u64) -> Result<(i64, bool), RedisError> {
-        let removed: i64 = self
+    ///
+    /// `min_applied` is the SLOWEST live consumer's applied watermark (see
+    /// [`InvalidationStream::slowest_live_watermark`]). When it covers every
+    /// dropped id, the trim removed only events every live node had already
+    /// applied, so there is nothing to compensate for. Without this, a fleet
+    /// that is keeping up perfectly still got every node's auth cache wiped on
+    /// each trim once the event rate passed `maxlen / interval` (≈333 events/s
+    /// at the shipped constants) — a cross-tenant availability hole one tenant
+    /// could hold open with a couple of invalidations per minute.
+    pub async fn trim_and_maybe_bump(
+        &self,
+        maxlen: u64,
+        min_applied: Option<&str>,
+    ) -> Result<(i64, bool), RedisError> {
+        // fred returns a multi-bulk reply as `Vec<i64>`; `{removed, bumped}`.
+        let reply: Vec<i64> = self
             .pool
             .eval(
                 TRIM_AND_MAYBE_BUMP_SCRIPT,
                 vec![EVENTS_KEY, GENERATION_KEY],
-                vec![maxlen.to_string()],
+                vec![maxlen.to_string(), min_applied.unwrap_or("").to_string()],
             )
             .await?;
-        Ok((removed, removed > 0))
+        let removed = reply.first().copied().unwrap_or(0);
+        let bumped = reply
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| i64::from(removed > 0))
+            > 0;
+        Ok((removed, bumped))
     }
+
+    /// The applied watermark of the SLOWEST live consumer, or `None` when that
+    /// cannot be established (no live node, or some live node has no watermark
+    /// at all — a node whose consumer has not applied anything yet must not have
+    /// events dropped from under it).
+    ///
+    /// Only watermarks that parse as a stream id participate; an unparseable one
+    /// disables the optimisation for this pass (conservative: bump as before).
+    pub async fn slowest_live_watermark(&self, live_nodes: &[String]) -> Option<String> {
+        if live_nodes.is_empty() {
+            return None;
+        }
+        let marks = self.applied_watermarks(live_nodes).await.ok()?;
+        // EVERY live node must have a watermark: one without it has applied
+        // nothing (or its watermark key expired), and its position is unknown.
+        if marks.len() != live_nodes.len() {
+            return None;
+        }
+        let mut slowest: Option<(u64, u64)> = None;
+        for id in marks.values() {
+            let (ms, seq) = parse_stream_id(id)?;
+            let cand = (ms, seq);
+            slowest = Some(match slowest {
+                Some(cur) if cur <= cand => cur,
+                _ => cand,
+            });
+        }
+        let (ms, seq) = slowest?;
+        Some(format!("{ms}-{seq}"))
+    }
+}
+
+/// Parse a Redis stream id (`<ms>-<seq>`) into comparable numbers.
+///
+/// The ids are NOT zero-padded, so comparing them as strings is wrong in general
+/// (`"9-1" > "10-0"` lexicographically). Redis' own `MINID`/`XRANGE` take ids,
+/// but the comparison this module needs (is the slowest consumer behind the last
+/// dropped id?) happens before the trim, in Rust.
+fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = id.trim().split_once('-')?;
+    Some((ms.trim().parse().ok()?, seq.trim().parse().ok()?))
 }
 
 /// Trim the invalidation stream and bump the generation in ONE atomic step.
@@ -613,12 +674,45 @@ impl InvalidationStream {
 /// only touched when something was actually removed — a spurious bump would
 /// clear every node's auth cache for nothing.
 pub const TRIM_AND_MAYBE_BUMP_SCRIPT: &str = r#"
-local removed = redis.call('XTRIM', KEYS[1], 'MAXLEN', ARGV[1])
-if removed > 0 then
-  local current = tonumber(redis.call('GET', KEYS[2])) or 0
-  redis.call('SET', KEYS[2], current + 1)
+local function gt(a, b)
+  local am, as = string.match(a, '^(%d+)-(%d+)$')
+  local bm, bs = string.match(b, '^(%d+)-(%d+)$')
+  if not am or not bm then return true end  -- unparseable ⇒ assume the worst
+  am, as, bm, bs = tonumber(am), tonumber(as), tonumber(bm), tonumber(bs)
+  if am ~= bm then return am > bm end
+  return as > bs
 end
-return removed
+
+-- The NEWEST entry this trim is about to drop, read BEFORE trimming: XTRIM drops
+-- the OLDEST (len - maxlen) entries, so the boundary is the (len - maxlen)-th
+-- one. Comparing the stream's LAST id instead (as a first cut did) compares the
+-- newest SURVIVOR against the watermark and therefore bumps almost every time.
+local maxlen = tonumber(ARGV[1])
+local wm = ARGV[2]
+local len = redis.call('XLEN', KEYS[1])
+local drop = len - maxlen
+local newest_dropped = ''
+if drop > 0 then
+  local head = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', drop)
+  if head[#head] then newest_dropped = head[#head][1] end
+end
+
+local removed = redis.call('XTRIM', KEYS[1], 'MAXLEN', ARGV[1])
+local bump = 0
+if removed > 0 then
+  bump = 1
+  -- ARGV[2] = the slowest live consumer's applied watermark ('' when unknown).
+  -- If the newest DROPPED id is at or below it, every live consumer had already
+  -- applied everything we dropped ⇒ nothing to compensate.
+  if wm ~= '' and newest_dropped ~= '' and not gt(newest_dropped, wm) then
+    bump = 0
+  end
+  if bump == 1 then
+    local current = tonumber(redis.call('GET', KEYS[2])) or 0
+    redis.call('SET', KEYS[2], current + 1)
+  end
+end
+return {removed, bump}
 "#;
 
 /// Apply one invalidation to a local auth cache (idempotent).
@@ -773,7 +867,12 @@ pub fn spawn_invalidation_consumer(
                             // next `check` re-hydrate the very verdict this
                             // clear exists to drop, for the rest of its TTL.
                             auth.cache().clear_all().await;
-                            crate::admin::metrics::record_auth_cache_size(0);
+                            // NO `record_auth_cache_size(0)` here: that gauge counts the
+                            // L1, and writing 0 while a PARTIAL L2 clear left verdicts
+                            // in Redis made the dashboard claim an empty cache. The L1
+                            // length is recorded by the next `check()`, and the L2's own
+                            // outcome is reported by
+                            // `hydra_auth_cache_clear_total{layer="l2",result=...}`.
                         }
                         _ => {}
                     }
@@ -790,11 +889,25 @@ pub fn spawn_invalidation_consumer(
 }
 
 /// Spawn the periodic stream trim task (F-6): keeps the invalidation stream
-/// bounded to `maxlen`. When a trim removes entries, the generation is bumped
-/// (via [`InvalidationStream::trim_and_maybe_bump`]) so every node re-hydrates
-/// its auth cache — a removed event may not have reached a lagging consumer,
-/// and a full local clear is the safe, idempotent response.
-pub fn spawn_trim_task(stream: InvalidationStream, maxlen: u64, interval: std::time::Duration) {
+/// bounded to `maxlen`.
+///
+/// When a trim removes entries that some live consumer had NOT yet applied, the
+/// generation is bumped (via [`InvalidationStream::trim_and_maybe_bump`]) so
+/// every node re-hydrates its auth cache — a removed event may not have reached
+/// a lagging consumer, and a full local clear is the safe, idempotent response.
+///
+/// When the `live_nodes` view proves that every dropped id was already applied
+/// by every live node, no bump happens: there is nothing to compensate for, and
+/// bumping would wipe the whole fleet's auth cache for nothing. That distinction
+/// is what stops a fleet that is keeping up from clearing every cache on each
+/// trim once the event rate passes `maxlen / interval`. Pass `None` when no live
+/// view exists (single-node build): the task then behaves as before.
+pub fn spawn_trim_task(
+    stream: InvalidationStream,
+    maxlen: u64,
+    interval: std::time::Duration,
+    live_nodes: Option<std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // The first `tick()` completes immediately; drop it so the first trim
@@ -802,15 +915,40 @@ pub fn spawn_trim_task(stream: InvalidationStream, maxlen: u64, interval: std::t
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match stream.trim_and_maybe_bump(maxlen).await {
+            let min_applied = match &live_nodes {
+                Some(live) => {
+                    let nodes = live();
+                    stream.slowest_live_watermark(&nodes).await
+                }
+                None => None,
+            };
+            match stream
+                .trim_and_maybe_bump(maxlen, min_applied.as_deref())
+                .await
+            {
                 Ok((removed, true)) => {
+                    crate::admin::metrics::record_invalidation_generation_bump();
+                    if removed > 0 {
+                        crate::admin::metrics::record_invalidation_trimmed(removed);
+                    }
                     tracing::info!(
                         removed = removed,
-                        "invalidation stream trimmed past maxlen; generation bumped"
+                        "invalidation stream trimmed; entries a live consumer had not applied \
+                         were dropped, so the generation was bumped"
                     );
                 }
-                Ok(_) => {}
+                Ok((removed, false)) => {
+                    if removed > 0 {
+                        crate::admin::metrics::record_invalidation_trimmed(removed);
+                        tracing::debug!(
+                            removed = removed,
+                            "invalidation stream trimmed; every dropped entry was already \
+                             applied by all live nodes, so no bump (no cache clear)"
+                        );
+                    }
+                }
                 Err(e) => {
+                    crate::admin::metrics::record_control_poll("invalidation_trim_error");
                     tracing::warn!(error = %e, "invalidation stream trim failed; retrying");
                 }
             }
@@ -1135,15 +1273,124 @@ mod tests {
         }
         assert_eq!(s.generation().await.expect("gen pre"), 0);
         // Under maxlen → nothing removed → no bump.
-        let (removed, bumped) = s.trim_and_maybe_bump(10).await.expect("trim ok");
+        let (removed, bumped) = s.trim_and_maybe_bump(10, None).await.expect("trim ok");
         assert_eq!(removed, 0);
         assert!(!bumped, "no removal → no generation bump");
         assert_eq!(s.generation().await.expect("gen still"), 0);
         // Over maxlen → entries removed → generation bumped.
-        let (removed, bumped) = s.trim_and_maybe_bump(2).await.expect("trim remove");
+        let (removed, bumped) = s.trim_and_maybe_bump(2, None).await.expect("trim remove");
         assert!(removed > 0, "trim removed {removed} entries");
         assert!(bumped, "removal → generation bump");
         assert_eq!(s.generation().await.expect("gen post"), 1);
+    }
+
+    /// A trim that drops ONLY entries every live consumer had already applied
+    /// must NOT bump: a bump makes the whole fleet clear its auth cache, and
+    /// doing that on every trim is the cross-tenant availability hole this
+    /// watermark check closes (a fleet that keeps up above `maxlen / interval`
+    /// events/s used to wipe every cache every interval).
+    #[tokio::test]
+    async fn a_trim_of_applied_entries_does_not_bump() {
+        let s = InvalidationStream::new(pool().await);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                s.publish(Some("t1".into()), vec![format!("sk-{i}")])
+                    .await
+                    .expect("publish"),
+            );
+        }
+        // n1 is fully caught up; n2 applied up to the THIRD event.
+        s.mark_applied("n1", &ids[4]).await.expect("mark n1");
+        s.mark_applied("n2", &ids[2]).await.expect("mark n2");
+        let live = vec!["n1".to_string(), "n2".to_string()];
+        let slowest = s
+            .slowest_live_watermark(&live)
+            .await
+            .expect("both live nodes published a watermark");
+        assert_eq!(
+            slowest, ids[2],
+            "the SLOWEST live consumer's watermark is the safe trim point"
+        );
+
+        // maxlen 2 drops ids[0..=2]; the slowest consumer had applied all three.
+        let (removed, bumped) = s
+            .trim_and_maybe_bump(2, Some(&slowest))
+            .await
+            .expect("trim");
+        assert_eq!(removed, 3, "three entries dropped");
+        assert!(
+            !bumped,
+            "every dropped entry was already applied by every live node ⇒ nothing to \
+             compensate for, so no fleet-wide cache clear"
+        );
+        assert_eq!(
+            s.generation().await.expect("gen"),
+            0,
+            "generation untouched"
+        );
+    }
+
+    /// …and the moment ONE live consumer is behind, the bump is back: the drop
+    /// really did remove something nobody had read.
+    #[tokio::test]
+    async fn a_trim_that_drops_an_unapplied_entry_still_bumps() {
+        let s = InvalidationStream::new(pool().await);
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                s.publish(Some("t1".into()), vec![format!("sk-{i}")])
+                    .await
+                    .expect("publish"),
+            );
+        }
+        // n2 is BEHIND: it applied only the first event.
+        s.mark_applied("n1", &ids[4]).await.expect("mark n1");
+        s.mark_applied("n2", &ids[0]).await.expect("mark n2");
+        let live = vec!["n1".to_string(), "n2".to_string()];
+        let slowest = s.slowest_live_watermark(&live).await.expect("watermark");
+
+        let (removed, bumped) = s
+            .trim_and_maybe_bump(2, Some(&slowest))
+            .await
+            .expect("trim");
+        assert_eq!(removed, 3);
+        assert!(
+            bumped,
+            "ids[1] and ids[2] were dropped while n2 had not applied them ⇒ the bump \
+             (and the fleet-wide clear) is required"
+        );
+        assert_eq!(s.generation().await.expect("gen"), 1);
+    }
+
+    /// The safe trim point exists only when it can be PROVEN: no live nodes, or
+    /// a live node that never published a watermark, disables the optimisation
+    /// (the trim then compensates exactly as it did before).
+    #[tokio::test]
+    async fn an_unprovable_trim_point_disables_the_optimisation() {
+        let s = InvalidationStream::new(pool().await);
+        let id = s
+            .publish(Some("t1".into()), vec!["sk-a".into()])
+            .await
+            .expect("publish");
+        s.mark_applied("n1", &id).await.expect("mark");
+
+        assert!(
+            s.slowest_live_watermark(&[]).await.is_none(),
+            "no live view ⇒ no proof ⇒ no optimisation"
+        );
+        assert!(
+            s.slowest_live_watermark(&["n1".to_string(), "stranger".to_string()])
+                .await
+                .is_none(),
+            "a live node with NO watermark has applied nothing ⇒ its position is unknown"
+        );
+        assert_eq!(
+            s.slowest_live_watermark(&["n1".to_string()])
+                .await
+                .as_deref(),
+            Some(id.as_str())
+        );
     }
 
     /// REVIEW B3a — the trim and its compensating bump are ONE atomic step.
@@ -1172,7 +1419,7 @@ mod tests {
             .expect("seed corrupt counter");
 
         let (removed, bumped) = s
-            .trim_and_maybe_bump(2)
+            .trim_and_maybe_bump(2, None)
             .await
             .expect("trim + bump must be one step, not a partial failure");
         assert_eq!(removed, 3, "three entries were dropped");
@@ -1188,7 +1435,7 @@ mod tests {
 
         // A trim that removes nothing must NOT bump: a spurious bump clears
         // every node's auth cache for nothing.
-        let (removed, bumped) = s.trim_and_maybe_bump(2).await.expect("second pass");
+        let (removed, bumped) = s.trim_and_maybe_bump(2, None).await.expect("second pass");
         assert_eq!(removed, 0);
         assert!(!bumped, "nothing dropped ⇒ no bump");
         assert_eq!(s.generation().await.expect("gen"), 1, "unchanged");
@@ -1287,7 +1534,7 @@ mod tests {
         );
 
         spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
-        spawn_trim_task(stream.clone(), 2, Duration::from_millis(20));
+        spawn_trim_task(stream.clone(), 2, Duration::from_millis(20), None);
 
         // Publish past maxlen (2) → the trim task removes 3 → bumps.
         for i in 0..5 {

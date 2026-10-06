@@ -182,11 +182,25 @@ const CONNECT_SLACK_SECS: u64 = 2;
 /// rare admin mutation: a false "the write may have been applied" costs far more
 /// than one extra handshake.
 fn client_for(secs: u64) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(secs))
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
+    let builder = || {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(secs))
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            // These forwards carry credentials: the admin path relays the
+            // operator's `Authorization` (the admin token), and the tenant-config
+            // path sends the CLUSTER token in `Authorization` plus the tenant's
+            // Bearer in the dedicated `x-hydra-tenant-token` header. reqwest keeps
+            // custom headers across a cross-host redirect, so following one would
+            // hand both to whatever host the `Location` header names. The leader
+            // URL comes from the registry, which stores it unvalidated. Same
+            // reasoning as `proxy::provider_client` (P1-1), applied to the control
+            // plane the first fix missed.
+            .redirect(reqwest::redirect::Policy::none())
+    };
+    builder()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .or_else(|_| builder().build())
+        .expect("a reqwest client with constant settings and no redirects must build")
 }
 
 /// Forward one admin request to the active leader's admin endpoint,

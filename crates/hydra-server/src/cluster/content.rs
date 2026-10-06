@@ -138,6 +138,18 @@ impl ReplicationContent {
         // again. (No data loss — the rebuild is atomic and keeps last-known-good —
         // but the replica silently goes stale, which is the failure mode this
         // whole module exists to remove.)
+        // PLAIN `BEGIN` ON PURPOSE — do NOT "fix" this to `db::begin_write`.
+        //
+        // This transaction is READ-ONLY: its whole job is one consistent
+        // snapshot of ten row-sets. `BEGIN IMMEDIATE` would take the write lock
+        // for the whole read, so a writer on another connection (an admin write
+        // or a usage-sink flush) would block for `busy_timeout` and then fail —
+        // and an admin write must not be starved by a snapshot read. A
+        // read-then-WRITE transaction is the opposite case and does use
+        // `db::begin_write`; the distinction is asserted by
+        // `load_does_not_block_on_a_concurrent_writer_holding_the_write_lock`
+        // (NOT by `a_read_transaction_is_not_torn_by_a_concurrent_writer`, which
+        // opens its own transaction and would stay green either way).
         let mut tx = pool.begin().await?;
         let provider_keys = crate::db::list_provider_keys_on(&mut *tx, kp).await?;
         let mut cfg = cfg;
@@ -439,6 +451,66 @@ mod tests {
         }
     }
 
+    /// The choice `load` makes — plain `BEGIN` (DEFERRED) rather than
+    /// `db::begin_write` (`BEGIN IMMEDIATE`) — is what this test guards.
+    ///
+    /// The sibling test below reproduces the SQLite ENGINE property (one snapshot
+    /// per read transaction) by opening its own transaction; it never calls
+    /// `load`, so it cannot tell whether `load` still uses a read transaction.
+    /// Swapping `load`'s `pool.begin()` for `begin_write` left that test green —
+    /// a "guard" for a boundary it had no ability to guard. This one drives the
+    /// REAL entry point while another connection HOLDS THE WRITE LOCK: a read
+    /// transaction proceeds from its snapshot (WAL readers never block on a
+    /// writer), while `BEGIN IMMEDIATE` would sit in `busy_timeout` and then fail.
+    ///
+    /// Falsification: change `load` to `db::begin_write(&pool)` and the `timeout`
+    /// below fires ("must not block on a concurrent writer").
+    #[tokio::test]
+    async fn load_does_not_block_on_a_concurrent_writer_holding_the_write_lock() {
+        let dir = std::env::temp_dir().join(format!("hydra-c3w-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let url = format!("sqlite://{}/writer.db?mode=rwc", dir.display());
+        let pool = crate::db::init_pool(&url).await.expect("init file pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+        let kp = kp();
+        seed(&pool, &kp).await;
+        let cfg = crate::store::build_config(&pool, &kp)
+            .await
+            .expect("build_config");
+
+        // A second connection takes the WRITE lock and deletes a key without
+        // committing. `begin_write` is `BEGIN IMMEDIATE`, so the lock is held from
+        // this line on.
+        let mut writer = crate::db::begin_write(&pool).await.expect("writer begins");
+        sqlx::query("DELETE FROM provider_key WHERE id = ?")
+            .bind("k-a")
+            .execute(&mut *writer)
+            .await
+            .expect("the writer holds the lock");
+
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ReplicationContent::load(&pool, &kp, cfg, 7),
+        )
+        .await
+        .expect(
+            "`ReplicationContent::load` must not block on a concurrent writer: it is a \
+             READ transaction (plain BEGIN). Taking the write lock would park it in \
+             `busy_timeout` and then fail the whole reload — and the node would keep \
+             serving the previous snapshot for no reason",
+        )
+        .expect("load succeeds from its snapshot while a writer holds the lock");
+
+        assert_eq!(
+            loaded.fidelity().provider_keys.len(),
+            2,
+            "the uncommitted DELETE must be invisible: the load reads the committed \
+             revision"
+        );
+
+        writer.rollback().await.expect("rollback");
+    }
+
     /// The engine property [`ReplicationContent::load`] relies on.
     ///
     /// Reads inside ONE transaction are served from a single snapshot, so a
@@ -457,6 +529,7 @@ mod tests {
         seed(&pool, &kp).await;
 
         // Two keys are seeded; open a read transaction and look at them.
+        // Read-only snapshot ⇒ plain `BEGIN`; see `ReplicationContent::load`.
         let mut tx = pool.begin().await.expect("begin");
         let before = crate::db::list_provider_keys_on(&mut *tx, &kp)
             .await

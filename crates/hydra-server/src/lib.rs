@@ -31,6 +31,23 @@
 /// At-rest encryption for persisted secrets (provider upstream api-keys).
 /// Gated on `db` (the encrypt-on-write / decrypt-on-read boundary is `db.rs`).
 #[cfg(feature = "db")]
+/// Lock a mutex, recovering from poisoning instead of panicking.
+///
+/// SINGLE OWNER (round 201): this started as a private helper in `proxy::admission` after a review
+/// pointed out that a panic in an UNRELATED thread must not turn every later request through a shared
+/// gate into a panic — the values behind those locks are plain copies recorded for reporting, with no
+/// invariant a half-finished writer could break. The cluster control client still had three
+/// `lock().expect("control url mutex")` sites for a value of exactly the same kind (a cached control
+/// URL, replaced wholesale), so the same policy now applies through this one function rather than a
+/// private copy per module. `admission.rs`'s test module pins the behaviour (a poisoned lock is
+/// recovered, not fatal).
+///
+/// Use it whenever the guarded value is a plain snapshot; keep `.expect(...)` where a poisoned lock
+/// really does mean an invariant was broken mid-update.
+pub(crate) fn lock_gate<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub mod crypto;
 /// sqlx pool, migrations, and the repo layer.
 #[cfg(feature = "db")]

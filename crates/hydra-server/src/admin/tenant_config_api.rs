@@ -761,24 +761,16 @@ fn validation_err_resp(e: &SubTenantWriteError, trace_id: &str) -> Resp {
     err_json(status, code, &e.to_string(), trace_id)
 }
 
-/// Classify a sqlx error into (HTTP status, stable code) — the same mapping as
-/// the admin face (`handlers::classify_db_err`).
+/// Answer a sqlx error using the ONE classifier (`handlers::classify_db_err`).
+///
+/// This used to be a hand-copied twin of that function, and the copy had drifted:
+/// it was missing the SQLITE_BUSY (`5` / `517`) → **503 `storage_busy`** branch, so
+/// a `BEGIN IMMEDIATE` timeout on the write core reached the caller as
+/// **500 `database_error`** — an "internal bug" — while the admin face promised the
+/// same operation was a retryable 503. That is the whole reason the mapping lives
+/// in exactly one place.
 fn db_err_resp(e: &sqlx::Error, trace_id: &str) -> Resp {
-    let (status, code) = if let sqlx::Error::Database(db) = e {
-        if db.is_unique_violation() {
-            (409, "conflict")
-        } else if db.is_foreign_key_violation() {
-            (400, "foreign_key_violation")
-        } else if db.is_check_violation() {
-            (400, "check_violation")
-        } else if matches!(db.kind(), sqlx::error::ErrorKind::NotNullViolation) {
-            (400, "missing_required_field")
-        } else {
-            (500, "database_error")
-        }
-    } else {
-        (500, "database_error")
-    };
+    let (status, code) = super::handlers::classify_db_err(e);
     err_json(status, code, &e.to_string(), trace_id)
 }
 

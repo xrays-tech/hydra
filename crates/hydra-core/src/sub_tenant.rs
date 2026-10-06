@@ -245,6 +245,70 @@ fn prefix_overlap(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }
 
+/// True when `key_prefix` and `binding_prefix` can both match the same api-key.
+///
+/// Public because the operator-facing write boundary and `config::validate`
+/// need the same predicate the sub-tenant validator uses: two prefixes in one
+/// namespace collide exactly when one is a prefix of the other (the empty
+/// prefix matches everything, so it overlaps every non-empty prefix).
+#[must_use]
+pub fn prefixes_collide(key_prefix: &str, binding_prefix: &str) -> bool {
+    if key_prefix.is_empty() || binding_prefix.is_empty() {
+        // An empty prefix matches EVERY key, so it collides with all of them.
+        return key_prefix.is_empty() || binding_prefix.is_empty();
+    }
+    prefix_overlap(key_prefix, binding_prefix)
+}
+
+/// Why an api-key prefix has an unusable SHAPE.
+///
+/// Shared by sub-tenant prefixes and operator key-prefix bindings: a bare
+/// prefix (`"s"`, `"sk-"`) silently swallows unrelated keys, which for a
+/// binding means rewriting routing for every tenant rather than one group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixShapeError {
+    /// Empty prefix.
+    Empty,
+    /// Contains a non-ASCII byte.
+    NonAscii,
+    /// No separator (`_` or `-`).
+    NoSeparator,
+}
+
+impl std::fmt::Display for PrefixShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "key_prefix is empty",
+            Self::NonAscii => "key_prefix must be ASCII",
+            Self::NoSeparator => "key_prefix must contain a separator ('_' or '-')",
+        })
+    }
+}
+
+/// The ONE prefix-shape rule for the whole system.
+///
+/// Extracted so the operator binding path cannot drift from the sub-tenant path
+/// again: the sub-tenant write boundary enforced all three rules while
+/// `POST/PUT /api/v1/provider-key-bindings` checked only "trim() is not empty",
+/// so a binding like `"s"` was accepted and — because a binding match is global
+/// and wins over the sub-tenant gate — silently re-routed (or 503'd) every
+/// tenant whose key started with `s`.
+///
+/// # Errors
+/// [`PrefixShapeError`] naming the violated rule.
+pub fn validate_prefix_shape(key_prefix: &str) -> Result<(), PrefixShapeError> {
+    if key_prefix.is_empty() {
+        return Err(PrefixShapeError::Empty);
+    }
+    if !key_prefix.bytes().all(|b| b.is_ascii()) {
+        return Err(PrefixShapeError::NonAscii);
+    }
+    if !key_prefix.contains(['_', '-']) {
+        return Err(PrefixShapeError::NoSeparator);
+    }
+    Ok(())
+}
+
 /// Rule 3 (name charset + prefix shape + name/prefix collisions) + rule 4
 /// (sub-tenant quota). Name / prefix collisions and the quota run against the
 /// supplied [`SubTenantRows`] (ALL rows, incl. disabled); operator-binding
@@ -262,15 +326,12 @@ fn validate_sub_tenant(
         return Err(SubTenantWriteError::NameInvalid);
     }
 
-    // Rule 3 — prefix shape.
-    if key_prefix.is_empty() {
-        return Err(SubTenantWriteError::PrefixEmpty);
-    }
-    if !key_prefix.bytes().all(|b| b.is_ascii()) {
-        return Err(SubTenantWriteError::PrefixNonAscii);
-    }
-    if !key_prefix.contains(['_', '-']) {
-        return Err(SubTenantWriteError::PrefixNoSeparator);
+    // Rule 3 — prefix shape (the shared rule; see `validate_prefix_shape`).
+    match validate_prefix_shape(key_prefix) {
+        Ok(()) => {}
+        Err(PrefixShapeError::Empty) => return Err(SubTenantWriteError::PrefixEmpty),
+        Err(PrefixShapeError::NonAscii) => return Err(SubTenantWriteError::PrefixNonAscii),
+        Err(PrefixShapeError::NoSeparator) => return Err(SubTenantWriteError::PrefixNoSeparator),
     }
 
     // Rule 3 — same-tenant name / prefix collisions (duplicate → 409, overlap

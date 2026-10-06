@@ -139,7 +139,7 @@ impl ControlClient {
         let Ok(urls) = reg.leader_control_urls().await else {
             return false;
         };
-        let mut guard = self.url.lock().expect("control url mutex");
+        let mut guard = crate::lock_gate(&self.url);
         let current = guard.clone();
         let new_url = urls
             .iter()
@@ -173,7 +173,7 @@ impl ControlClient {
         let Ok(Some(url)) = reg.active_leader_url().await else {
             return false;
         };
-        let mut guard = self.url.lock().expect("control url mutex");
+        let mut guard = crate::lock_gate(&self.url);
         if *guard != url {
             tracing::info!(from = %*guard, to = %url, "control poll target rotated to lease holder");
             *guard = url;
@@ -240,7 +240,7 @@ impl ControlClient {
             Err(msg)
         };
         let since = self.store.version();
-        let base = self.url.lock().expect("control url mutex").clone();
+        let base = crate::lock_gate(&self.url).clone();
         let url = format!(
             "{}/api/v1/internal/control?since={since}",
             base.trim_end_matches('/')

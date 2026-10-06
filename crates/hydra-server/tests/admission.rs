@@ -24,6 +24,67 @@ fn policy(max_concurrency: u32, max_queue_depth: u32, wait_ms: u64) -> Concurren
     }
 }
 
+/// `max_queue_depth` must be a real BOUND, not a hint.
+///
+/// The check was `queue_depth.load()` in `acquire` and the reservation was a
+/// `fetch_add(1)` inside `WaitGuard::new`, so a simultaneous burst that all read
+/// the same depth slipped past the limit TOGETHER: with `max_queue_depth = 1` the
+/// real waiter count reached the size of the burst, and `hydra_queue_depth` and
+/// the `Retry-After` derived from it described a bound the gate never enforced.
+/// One CAS now covers check-and-reserve, so the count is exact.
+///
+/// The only permit is HELD for the whole test, so any request that gets past the
+/// check must genuinely queue: the bounded wait then expires and reports `Timeout`.
+/// That makes the assertion exact rather than timing-dependent — admitted
+/// (`Ok` or `Timeout`) must be exactly 1, and everything else is `QueueFull`.
+///
+/// Falsification: restore `load()` + `fetch_add` and the burst admits more than
+/// one waiter (the assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_queue_depth_bound_holds_under_a_simultaneous_burst() {
+    const BURST: usize = 32;
+    let ac = AdmissionControl::new();
+    let p = policy(1, 1, 100); // one permit, room for a single waiter, 100 ms wait
+
+    // Hold the only permit so a queued waiter cannot finish early.
+    let held: Permit = ac.acquire("pBurst", p).await.expect("the only permit");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(BURST));
+    let mut handles = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        let ac = ac.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await; // release them all as close together as tokio can
+            ac.acquire("pBurst", p).await
+        }));
+    }
+
+    let (mut admitted, mut full, mut other) = (0usize, 0usize, 0usize);
+    for h in handles {
+        match h.await.expect("task") {
+            // Passed the queue check (whether it then got a permit or timed out
+            // waiting for the one we are holding).
+            Ok(_) | Err(AdmissionError::WaitTimeout) => admitted += 1,
+            Err(AdmissionError::QueueFull) => full += 1,
+            Err(e) => {
+                other += 1;
+                eprintln!("unexpected admission error: {e:?}");
+            }
+        }
+    }
+
+    assert_eq!(other, 0, "only QueueFull/Timeout are expected here");
+    assert_eq!(
+        admitted, 1,
+        "max_queue_depth = 1 must admit EXACTLY one waiter, no matter how many \
+         requests arrive together (admitted={admitted}, full={full})"
+    );
+    assert_eq!(full, BURST - 1, "every other request must fail fast");
+
+    drop(held);
+}
+
 /// `max_concurrency == 0` ⇒ unlimited: acquire never blocks, 100 concurrent
 /// acquires all succeed instantly, and the permits are `Passthrough` (no gate
 /// created).
@@ -330,4 +391,67 @@ async fn per_provider_isolation() {
     );
     drop(b1);
     assert_eq!(ac.len(), 2, "two independent gates");
+}
+
+/// A configuration change that gates CANNOT apply must be visible, not silent.
+///
+/// Gates are created on a provider's first request and never resized (`ops.md` §4,
+/// decision item D-14), so a `PUT /api/v1/providers/{id}` that lowers or raises the
+/// limits returns 200, changes the row, and yet leaves the runtime enforcing the OLD
+/// values — while `/api/v1/concurrency` used to report the (stale) enforced cap as if it
+/// were the configured one. `snapshot()` now carries both sides plus `limits_stale`, so
+/// an operator (or an alert on `hydra_admission_limits_stale_total`) can tell.
+///
+/// Falsification: delete the `observe_configured_limits` call in `acquire` and the
+/// configured fields keep the creation-time values, so `limits_stale` stays false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_limit_change_is_reported_as_stale() {
+    let admission = AdmissionControl::new();
+
+    // First request creates the gate with these limits.
+    let permit = admission
+        .acquire("p1", policy(4, 8, 1_000))
+        .await
+        .expect("the first acquire must succeed");
+    drop(permit);
+
+    let fresh = admission.snapshot();
+    let entry = fresh
+        .iter()
+        .find(|e| e.provider_id == "p1")
+        .expect("p1 in snapshot");
+    assert_eq!(
+        entry.max_concurrency, 4,
+        "the gate enforces what it was created with"
+    );
+    assert!(
+        !entry.limits_stale,
+        "nothing changed yet: the configured limits match the enforced ones"
+    );
+
+    // The configuration now asks for 50 concurrent and a 2s wait budget.
+    let permit = admission
+        .acquire("p1", policy(50, 8, 2_000))
+        .await
+        .expect("acquire still works under the new configuration");
+    drop(permit);
+
+    let after = admission.snapshot();
+    let entry = after
+        .iter()
+        .find(|e| e.provider_id == "p1")
+        .expect("p1 in snapshot");
+    assert_eq!(
+        entry.max_concurrency, 4,
+        "the ENFORCED cap is still the creation-time one — gates are not resized"
+    );
+    assert_eq!(
+        entry.configured_max_concurrency, 50,
+        "the configured cap is reported separately"
+    );
+    assert_eq!(entry.configured_queue_wait_timeout_ms, 2_000);
+    assert!(
+        entry.limits_stale,
+        "the mismatch must be flagged, never presented as the configured cap"
+    );
 }

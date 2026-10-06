@@ -140,12 +140,29 @@ impl UsageScanner {
                 let Ok(u) = serde_json::from_slice::<OpenAiUsageFields>(json) else {
                     return false;
                 };
-                self.usage.tokens_in = u.prompt_tokens.or(u.input_tokens);
-                self.usage.tokens_out = u.completion_tokens.or(u.output_tokens);
-                self.usage.cache_hit_tokens = u
+                // Both families' spellings, and — like the Anthropic branch below
+                // — only `Some` values assign. Unconditional assignment looked
+                // equivalent because these providers send one authoritative
+                // object, but a stream CAN carry a second usage object that omits
+                // fields (`{"usage":{"completion_tokens":5}}`, `{"usage":{}}`, or a
+                // gateway's `{"usage":{"total_tokens":…}}`). Assigning that
+                // overwrote `tokens_in`/`tokens_out` with `None`, erasing the
+                // values already read, so the totals came out too LOW: quota and
+                // billing silently under-counted (the fail-open direction).
+                if let Some(v) = u.prompt_tokens.or(u.input_tokens) {
+                    self.usage.tokens_in = Some(v);
+                }
+                if let Some(v) = u.completion_tokens.or(u.output_tokens) {
+                    self.usage.tokens_out = Some(v);
+                }
+                if let Some(v) = u
                     .prompt_tokens_details
                     .and_then(|d| d.cached_tokens)
-                    .or(u.cached_tokens);
+                    .or(u.cached_tokens)
+                    .or(u.cache_read_input_tokens)
+                {
+                    self.usage.cache_hit_tokens = Some(v);
+                }
                 self.seen_any = true;
                 true
             }
@@ -159,13 +176,16 @@ impl UsageScanner {
                 let Ok(u) = serde_json::from_slice::<AnthropicUsageFields>(json) else {
                     return false;
                 };
-                if let Some(v) = u.input_tokens {
+                // Both families' spellings, mirroring the OpenAI branch. Only
+                // `Some` values assign, so a field absent from this event cannot
+                // erase a value an earlier one carried.
+                if let Some(v) = u.input_tokens.or(u.prompt_tokens) {
                     self.usage.tokens_in = Some(v);
                 }
-                if let Some(v) = u.output_tokens {
+                if let Some(v) = u.output_tokens.or(u.completion_tokens) {
                     self.usage.tokens_out = Some(v);
                 }
-                if let Some(v) = u.cache_read_input_tokens {
+                if let Some(v) = u.cache_read_input_tokens.or(u.cached_tokens) {
                     self.usage.cache_hit_tokens = Some(v);
                 }
                 self.seen_any = true;
@@ -173,6 +193,20 @@ impl UsageScanner {
             }
         }
     }
+
+    /// Upper bound on a retained incomplete-JSON tail.
+    ///
+    /// The tail exists so a usage object (or `data:` line) split across two reads
+    /// is reassembled; without a cap a large body would let the tail grow to the
+    /// body size, and every `scan_chunk` re-scans the accumulated buffer (the
+    /// brace-match is linear), i.e. quadratic work in the number of reads. 64 KiB
+    /// is far above any provider's usage envelope.
+    ///
+    /// It applies to BOTH framing paths. It used to be checked only on the
+    /// non-SSE path, so a single unterminated `data:` line longer than the cap
+    /// was carried in full and re-scanned on every read — the cap was advertised
+    /// as bounding the tail while the streaming path had no bound at all.
+    const MAX_JSON_TAIL: usize = 64 * 1024;
 
     /// Carry an incomplete trailing `data:` line into the next chunk. Only
     /// activates when the buffer is not newline-terminated and the trailing
@@ -189,6 +223,24 @@ impl UsageScanner {
         let start = memrchr(b'\n', buf).map(|i| i + 1).unwrap_or(0);
         let trailing = &buf[start..];
         if memmem::find(trailing, b"data:").is_none() {
+            // NOT SSE framing: a non-streaming `application/json` response (or a
+            // provider that answers a stream request with one body). This path
+            // used to return here, so a usage object split across two reads was
+            // never seen again — the second read does not contain `"usage"` at
+            // all, so nothing absorbed it and the tokens were recorded as NULL
+            // for a perfectly successful 200.
+            //
+            // Keep the tail from the START of the incomplete usage object
+            // onwards, so the next chunk completes it. A complete object needs no
+            // tail (it was absorbed already).
+            if let Some(at) = memmem::find(buf, b"\"usage\"") {
+                let candidate = &buf[at..];
+                if candidate.len() <= Self::MAX_JSON_TAIL
+                    && extract_usage_object(candidate).is_none()
+                {
+                    self.tail.extend_from_slice(candidate);
+                }
+            }
             return;
         }
         // A complete, already-absorbed usage object on the trailing line must
@@ -197,6 +249,14 @@ impl UsageScanner {
         if memmem::find(trailing, b"\"usage\"").is_some()
             && extract_usage_object(trailing).is_some()
         {
+            return;
+        }
+        // `self.tail` was taken at the top of `scan_chunk`, so what is retained is
+        // exactly this `trailing` slice: bounding it here bounds the buffer. An
+        // over-cap tail is DROPPED rather than accumulated — a `data:` line that
+        // long is not a usage envelope, and re-scanning it on every read is the
+        // quadratic path the cap exists to prevent.
+        if trailing.len() > Self::MAX_JSON_TAIL {
             return;
         }
         self.tail.extend_from_slice(trailing);
@@ -322,6 +382,13 @@ struct OpenAiUsageFields {
     /// OpenAI-compatible gateways surface it outside the details sub-object).
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// The Anthropic spelling, accepted here for the same reason the Anthropic
+    /// struct accepts OpenAI's: the schema is chosen by the REQUEST path, but the
+    /// field names come from whichever upstream answered. Without this, an
+    /// Anthropic-shaped upstream behind an OpenAI-shaped route reported cached
+    /// tokens as NULL.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
 }
 
 /// OpenAI `usage.prompt_tokens_details` — currently only `cached_tokens` is
@@ -340,4 +407,24 @@ struct AnthropicUsageFields {
     /// Anthropic prompt-cache read hits (mirrors OpenAI `cached_tokens`).
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    /// OpenAI-family fallback names, accepted for the SAME reason the OpenAI
+    /// branch accepts the Anthropic ones: the scanner's job is to extract usage,
+    /// not to enforce which family produced it.
+    ///
+    /// The scanner is chosen by the REQUEST PATH (`protocol_for_path`: a client
+    /// POSTing `/v1/messages` gets the Anthropic schema, and that path also
+    /// decides the credential header), while the field names come from the
+    /// UPSTREAM's response. A `/v1/messages` request routed to an
+    /// OpenAI-compatible upstream therefore matched the Anthropic schema, parsed
+    /// the usage object successfully, found none of its three fields, and
+    /// recorded `Some(Usage { all None })` — i.e. a 200 with tokens silently
+    /// NULL in the metering store, invisible to every test that only checked the
+    /// status.
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    /// Generic-provider spelling of the cache-hit count.
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }

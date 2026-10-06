@@ -155,6 +155,130 @@ fn usage_non_stream_json() {
     );
 }
 
+/// A non-SSE `application/json` response whose usage object is split across two
+/// reads must still be accounted.
+///
+/// The scanner's tail only activated for `data:`-framed lines, so for a plain
+/// JSON body the first chunk held `"usage"` (but no closing brace) and the second
+/// chunk held the rest — with no `"usage"` in it — so nothing ever absorbed the
+/// object and the tokens were NULL for a successful request.
+#[test]
+fn non_sse_usage_split_across_reads_is_reassembled() {
+    let mut s = UsageScanner::new(ProviderKind::OpenAi);
+    // Split INSIDE the usage object, and — crucially — so that the second read
+    // contains no `"usage"` key at all.
+    assert_eq!(
+        s.scan_chunk(b"{\"id\":\"x\",\"usage\":{\"prompt_tokens\":123"),
+        ScanResult::Skip,
+        "nothing complete yet"
+    );
+    s.scan_chunk(b"4,\"completion_tokens\":5}}");
+    assert_eq!(
+        s.finalize(),
+        Some(Usage {
+            tokens_in: Some(1234),
+            tokens_out: Some(5),
+            cache_hit_tokens: None,
+        }),
+        "the split usage object must be reassembled, not silently dropped"
+    );
+}
+
+/// The tail is BOUNDED: a huge non-streaming body must not make the scanner hold
+/// (and re-scan) an unbounded buffer.
+#[test]
+fn a_huge_incomplete_json_usage_is_not_buffered_forever() {
+    let mut s = UsageScanner::new(ProviderKind::OpenAi);
+    // `"usage"` early, then MORE THAN the cap with no closing brace: the tail
+    // candidate is the rest of the buffer, i.e. over the cap, so it is dropped.
+    let mut body = Vec::from(&b"{\"usage\":{\"prompt_tokens\":1"[..]);
+    body.extend(std::iter::repeat_n(b'a', 200 * 1024));
+    s.scan_chunk(&body);
+    s.scan_chunk(b"2,\"completion_tokens\":3}}");
+    assert_eq!(
+        s.finalize(),
+        None,
+        "an over-cap tail must be dropped, not accumulated"
+    );
+}
+
+/// The `MAX_JSON_TAIL` bound must apply to the SSE path too, not just to a
+/// non-streaming JSON body.
+///
+/// The cap was checked only on the non-SSE branch, so a single unterminated
+/// `data:` line longer than 64 KiB was retained **in full** and re-scanned by
+/// every subsequent `scan_chunk` — the quadratic work the cap exists to prevent,
+/// advertised as bounded. An over-cap tail is now dropped.
+///
+/// Falsification: delete the `trailing.len() > MAX_JSON_TAIL` check in
+/// `buffer_incomplete_tail` and this returns `Some(12/5)` instead of `None`.
+#[test]
+fn an_oversized_unterminated_sse_tail_is_dropped_rather_than_retained() {
+    let mut s = UsageScanner::new(ProviderKind::OpenAi);
+    // The padding sits INSIDE a JSON string so the completed object stays
+    // parseable: padding a bare number (`1aaaa…`) would make the JSON invalid and
+    // the test would pass for the wrong reason — it must fail *because* the tail
+    // was dropped, not because the payload was unparseable.
+    let mut first = Vec::from(&b"data: {\"usage\":{\"prompt_tokens\":1,\"pad\":\""[..]);
+    first.extend(std::iter::repeat_n(b'a', 200 * 1024));
+    s.scan_chunk(&first);
+    // The rest of the object arrives on the next read. If the tail had been
+    // retained, the reassembly would succeed; dropping it is the point.
+    s.scan_chunk(b"\",\"completion_tokens\":5}}\n\n");
+    assert_eq!(
+        s.finalize(),
+        None,
+        "an over-cap SSE tail must be dropped, not carried and re-scanned forever"
+    );
+}
+
+/// A SECOND usage object that omits fields must not erase the values an earlier
+/// one carried.
+///
+/// The Anthropic branch only assigns `Some`; the OpenAI/Generic branch assigned
+/// unconditionally, so `{"usage":{"completion_tokens":5}}` (or `{"usage":{}}`, or
+/// a gateway's `{"usage":{"total_tokens":…}}`) reset `tokens_in` to `None`. The
+/// totals then came out too LOW, i.e. quota and billing under-counted — the
+/// fail-open direction — with no metric to notice it.
+///
+/// Falsification: restore the unconditional assignments and `tokens_in` is `None`.
+#[test]
+fn a_later_partial_usage_object_does_not_erase_earlier_values() {
+    let mut s = UsageScanner::new(ProviderKind::OpenAi);
+    s.scan_chunk(b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n");
+    s.scan_chunk(b"data: {\"usage\":{\"completion_tokens\":33}}\n\n");
+    assert_eq!(
+        s.finalize(),
+        Some(Usage {
+            tokens_in: Some(11),
+            tokens_out: Some(33),
+            cache_hit_tokens: None,
+        }),
+        "the second object must update what it carries and leave the rest alone"
+    );
+}
+
+/// The schema is chosen by the REQUEST path but the field names come from
+/// whichever upstream answered, so the OpenAI struct must also accept
+/// Anthropic's cache spelling — otherwise cached tokens on such a route are
+/// silently NULL.
+#[test]
+fn the_openai_schema_also_reads_the_anthropic_cache_field() {
+    let mut s = UsageScanner::new(ProviderKind::OpenAi);
+    s.scan_chunk(
+        b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"cache_read_input_tokens\":7}}\n\n",
+    );
+    assert_eq!(
+        s.finalize(),
+        Some(Usage {
+            tokens_in: Some(1),
+            tokens_out: Some(2),
+            cache_hit_tokens: Some(7),
+        }),
+        "an Anthropic-styled upstream behind an OpenAI route must still report cache hits"
+    );
+}
+
 // T5.17 — schema dispatch by ProviderKind from the same payload.
 #[test]
 fn usage_schema_dispatch_by_provider() {
@@ -174,6 +298,32 @@ fn usage_schema_dispatch_by_provider() {
     // Anthropic reads input_tokens/output_tokens.
     assert_eq!(ant_usage.tokens_in, Some(99));
     assert_eq!(ant_usage.tokens_out, Some(5));
+
+    // A SCHEMA MISMATCH must not silently record NULL tokens. The scanner is
+    // picked by the request path (a client POSTing `/v1/messages` gets the
+    // Anthropic schema, which also decides the credential header), while the field
+    // names come from the upstream. A `/v1/messages` request routed to an
+    // OpenAI-compatible upstream used to parse the usage object, find none of the
+    // three Anthropic fields, and still report `Some(Usage { all None })` — a 200
+    // with tokens silently NULL in the meter.
+    let openai_only = b"data: {\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":56}}\n";
+    let mut mismatched = UsageScanner::new(ProviderKind::Anthropic);
+    mismatched.scan_chunk(openai_only);
+    let u = mismatched.finalize().expect("usage located");
+    assert_eq!(
+        u.tokens_in,
+        Some(1234),
+        "an Anthropic-path request answered by an OpenAI-field upstream must still \
+         account its prompt tokens"
+    );
+    assert_eq!(u.tokens_out, Some(56));
+    // …and the mirror image: an OpenAI-path request answered with Anthropic names.
+    let anthropic_only = b"data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n";
+    let mut mismatched2 = UsageScanner::new(ProviderKind::OpenAi);
+    mismatched2.scan_chunk(anthropic_only);
+    let u2 = mismatched2.finalize().expect("usage located");
+    assert_eq!(u2.tokens_in, Some(11));
+    assert_eq!(u2.tokens_out, Some(22));
 
     // Generic falls back to OpenAI-style field names.
     let mut generic = UsageScanner::new(ProviderKind::Generic);

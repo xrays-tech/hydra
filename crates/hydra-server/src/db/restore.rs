@@ -74,7 +74,7 @@ pub async fn restore_config(
     fidelity: &crate::cluster::content::FidelityRows,
     version: u64,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     // Wipe children before parents (static table names, no `format!`).
     //

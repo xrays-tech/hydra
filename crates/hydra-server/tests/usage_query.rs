@@ -1458,6 +1458,18 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
     };
     println!("reader totals={:?}", agg.totals);
     println!("hand-run: count={} tokens_in={}", expected.0, expected.1);
+    // The hand-run and the reader are both reading the SAME table, so if that
+    // table is empty the comparison is 0 == 0 and the test passes without having
+    // measured anything. That is exactly what happened in CI: the `live-deps` job
+    // creates the schema from `environment/clickhouse/init.sql` and inserts
+    // NOTHING, so this "end-to-end evidence for the aggregate read" was vacuous
+    // there (it only looked real on a developer machine that had data). Fail loudly
+    // instead, so an empty fixture is a broken test rather than a green one.
+    assert!(
+        expected.0 > 0,
+        "the fixture is EMPTY: comparing two zero counts proves nothing. \\
+         Seed rows for tenant '{tenant}' in this window, or this test is vacuous"
+    );
     assert_eq!(
         agg.totals.requests, expected.0 as u64,
         "the reader must agree with the same query run by hand"

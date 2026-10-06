@@ -117,7 +117,7 @@ fn mask_key_short_input() {
     assert!(!masked.contains(secret));
 }
 
-/// Mid-length keys (6..14) use first2 + stars + last2.
+/// Mid-length keys (6..20) use first2 + stars + last2.
 #[test]
 fn mask_key_mid_length() {
     // 10-char key: first 2 + 6 stars + last 2.
@@ -133,17 +133,27 @@ fn mask_key_mid_length() {
     let k13 = "1234567890abc";
     let m13 = mask_key(k13);
     assert_eq!(m13, "12*********bc");
+    // 14 chars — the old long-tier boundary — must still hide a middle.
+    // Regression: this used to return the key verbatim (0 stars).
+    let k14 = "1234567890abcd";
+    assert_eq!(mask_key(k14), "12**********cd");
+    assert_ne!(mask_key(k14), k14);
 }
 
-/// Long keys (>= 14) use first10 + stars + last4.
+/// Long keys (>= 20) use first10 + stars + last4.
 #[test]
 fn mask_key_long() {
-    // 14-char boundary: first 10 + 0 stars + last 4 (no middle to hide).
-    let k14 = "1234567890abcd";
-    assert_eq!(mask_key(k14), "1234567890abcd");
-    // 15-char: first 10 + 1 star + last 4.
-    let k15 = "1234567890abcde";
-    assert_eq!(mask_key(k15), "1234567890*bcde");
+    // 20-char boundary: first 10 + 6 stars + last 4 — the first length whose
+    // hidden middle is at least 30% of the key.
+    let k20 = "1234567890abcdefghij";
+    assert_eq!(mask_key(k20), "1234567890******ghij");
+    // 19 chars still takes the conservative tier: first 2 + 15 stars + last 2.
+    let k19 = "1234567890abcdefghi";
+    assert_eq!(
+        mask_key(k19),
+        format!("12{}hi", "*".repeat(k19.len() - 4)),
+        "19-char key must use first2 + stars + last2, not the long tier"
+    );
 
     // Realistic 50-char key: first 10 + 36 stars + last 4.
     let key = "01234567890123456789012345678901234567890123456789";
@@ -166,6 +176,46 @@ fn mask_key_long() {
 #[test]
 fn mask_key_four_chars() {
     assert_eq!(mask_key("1234"), "****");
+}
+
+/// The property that matters on every surface `mask_key` feeds: for NO length
+/// does the "masked" form equal the input, and every form hides a middle.
+///
+/// Regression guard for the `L == 14` hole (first10 + 0 stars + last4 ⇒ the
+/// key verbatim), which shipped because the boundary case had an assertion
+/// pinning the leak instead of forbidding it.
+#[test]
+fn mask_key_never_round_trips_at_any_length() {
+    // Distinct characters so a leak cannot hide behind repetition.
+    let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        .chars()
+        .collect();
+    for len in 1..=72 {
+        let key: String = (0..len).map(|i| alphabet[i % alphabet.len()]).collect();
+        let masked = mask_key(&key);
+        assert_ne!(masked, key, "len {len}: mask returned the plaintext key");
+        assert_eq!(
+            masked.chars().count(),
+            len,
+            "len {len}: mask must preserve length (identification depends on it)"
+        );
+        // The hidden middle must scale with the key, not vanish at a boundary.
+        let hidden = masked.chars().filter(|&c| c == '*').count();
+        let min_hidden = if len < 6 { len } else { 2 };
+        assert!(
+            hidden >= min_hidden,
+            "len {len}: only {hidden} hidden chars (want >= {min_hidden})"
+        );
+    }
+    // Long keys hide a substantial middle, not one character.
+    for len in [20usize, 21, 32, 51, 100] {
+        let key: String = (0..len).map(|i| alphabet[i % alphabet.len()]).collect();
+        let hidden = mask_key(&key).chars().filter(|&c| c == '*').count();
+        assert!(
+            hidden * 10 >= len * 3,
+            "len {len}: hidden {hidden} is under 30% of the key"
+        );
+    }
 }
 
 // ===========================================================================

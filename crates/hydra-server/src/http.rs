@@ -366,15 +366,33 @@ impl AuthCache {
         self.map.clear();
         #[cfg(feature = "cluster-redis")]
         if let Some(l2) = &self.l2 {
-            if let Err(e) = l2.del_all_tenants().await {
-                // Best effort, but loud: the L1 is already gone, and whatever
-                // the L2 still holds can be resurrected by the next L1 miss.
-                warn!(
-                    error = %e,
-                    "L2 clear failed after a whole-cache invalidation; stale verdicts may be re-served"
-                );
+            match l2.del_all_tenants().await {
+                Ok((deleted, 0)) => {
+                    crate::admin::metrics::record_auth_cache_clear("l2", "ok");
+                    debug!(tenants = deleted, "L2 cleared for every tenant");
+                }
+                Ok((deleted, failed)) => {
+                    // PARTIAL: some tenants keep their verdicts until their own
+                    // allow TTL expires. Report it as such — this is the state the
+                    // old code logged as a warning while the gauge claimed 0.
+                    crate::admin::metrics::record_auth_cache_clear("l2", "partial");
+                    warn!(
+                        tenants_deleted = deleted,
+                        tenants_failed = failed,
+                        "L2 clear was PARTIAL: those tenants keep their verdicts until their \
+                         allow TTL expires"
+                    );
+                }
+                Err(e) => {
+                    crate::admin::metrics::record_auth_cache_clear("l2", "error");
+                    warn!(
+                        error = %e,
+                        "L2 clear failed after a whole-cache invalidation; stale verdicts may be re-served"
+                    );
+                }
             }
         }
+        crate::admin::metrics::record_auth_cache_clear("l1", "ok");
         cleared
     }
 
@@ -526,9 +544,22 @@ impl HttpAuthChecker {
     /// init failure); rustls essentially never fails here, so callers
     /// typically fail-fast at startup with `?`.
     pub fn new(cache: AuthCache, config: AuthConfig) -> Result<Self, reqwest::Error> {
+        // `timeout` here is the CLIENT-level total deadline, and it is the one
+        // that matters: reqwest resolves `send()` as soon as the response HEADERS
+        // arrive, so the `tokio::time::timeout(.., send)` at the call site bounds
+        // only the headers. The body read used to sit outside every deadline, so a
+        // tenant `auth_url` that answers `200` and then never finishes its body (a
+        // wedged auth service, or a WAF/LB returning a 200 error page) held the
+        // worker, the connection and the request context FOREVER — and since the
+        // body is what decides the verdict, that path is always taken.
+        // `read_timeout` covers a body that trickles instead of stalling. Both are
+        // bounded by `AuthConfig::timeout`, documented as the "per-call timeout for
+        // the `auth_url` round-trip" — a round trip includes the body.
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(90)))
             .tcp_nodelay(true)
+            .timeout(config.timeout)
+            .read_timeout(config.timeout)
             .build()?;
         Ok(Self {
             cache,
@@ -663,7 +694,15 @@ impl AuthChecker for HttpAuthChecker {
                     // denials as `{"status":false}`; design §11.3 likewise
                     // allows `{"allowed":false}`. An explicit false flag is a
                     // denial (cached with deny_ttl).
-                    let text = resp.text().await.unwrap_or_default();
+                    // Bounded read: unbounded `resp.text()` let the UPSTREAM pick
+                    // this process's memory growth for as long as it kept the socket
+                    // open. `body_says_denied` only looks for a flag in a small JSON
+                    // object, so a 64 KiB ceiling is far above any legitimate auth
+                    // response. A read that fails, stalls or crosses the ceiling
+                    // yields the bytes read so far — the same "no explicit denial
+                    // found" outcome the old `unwrap_or_default()` produced, minus
+                    // the unbounded wait and allocation.
+                    let text = read_auth_body(resp).await;
                     if body_says_denied(&text) {
                         // Reason-aware denial (design §11.3 / Dogress
                         // AuthApiKeyResponse): an insufficient_balance reason
@@ -851,6 +890,35 @@ fn parse_expires_in(body: &str) -> Option<u64> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// Hard ceiling on an auth response body.
+///
+/// The verdict may live in the body (`{"status":false}` / `{"allowed":false}`),
+/// and those objects are tiny; 64 KiB is orders of magnitude above any real
+/// response while still bounding what one hostile or broken `auth_url` can make
+/// this process allocate.
+const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
+
+/// Read an auth response body with a hard size ceiling.
+///
+/// Returns the bytes read so far when the stream ends, stalls or errors — the
+/// caller only looks for an explicit denial flag, so a truncated/absent body must
+/// not panic or block, and "no flag found" is already the allowed path of design
+/// §11.3. The DEADLINE is enforced by the client (`HttpAuthChecker::new` sets a
+/// total `timeout`), which is what makes this terminate against an upstream that
+/// never finishes its body.
+async fn read_auth_body(mut resp: reqwest::Response) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    // `Ok(None)` is the clean end of body; `Err(_)` is a transport error or the
+    // client deadline firing. Either way we stop and keep what we have.
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if out.len() + chunk.len() > MAX_AUTH_BODY_BYTES {
+            break;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Read the TOP-LEVEL boolean verdict flag `key` ("status" or "allowed") from a

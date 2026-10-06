@@ -32,6 +32,13 @@ pub async fn setup_pool() -> SqlitePool {
 /// Databases are partitioned so parallel test BINARIES cannot collide: lib unit
 /// tests own 1..=40 (`redis::test_redis::isolated_pool`), integration tests
 /// hand-assign 41..=63 here. Each call flushes its database.
+///
+/// Hand-assigning means two files CAN claim the same number, and then each one
+/// `FLUSHDB`s the other's keys mid-assertion: a flaky failure whose cause is
+/// invisible from the failing test (`registry_reaping.rs` and
+/// `sub_tenant_data_plane_write.rs` both used 47 until round 10). That rule is
+/// enforced now by `tests/redis_db_partition.rs`, which scans the sibling test
+/// sources and fails when a number is claimed twice.
 // Each test target compiles this module on its own, so a helper used by one
 // target is "dead code" in all the others.
 #[allow(dead_code)]
@@ -51,8 +58,9 @@ pub async fn real_redis_pool(db: u8) -> fred::clients::Pool {
         )
     });
     let url = format!("{}/{}", base.trim_end_matches('/'), db);
-    let config = Config::from_url(&url).expect("HYDRA_TEST_REDIS_URL must parse");
-    let pool = Pool::new(config, None, None, None, 1).expect("test pool builds");
+    // Through the single owner (production's command timeout, watchdog and reconnect
+    // policy): fred's defaults here were `0` (wait forever) and no reconnect at all.
+    let pool = hydra_server::redis::build_pool(&url, 1).expect("test pool builds");
     pool.init()
         .await
         .unwrap_or_else(|e| panic!("cannot reach the test Redis at {url}: {e}"));

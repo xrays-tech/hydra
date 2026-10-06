@@ -280,9 +280,25 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
         }
     }
 
-    // online providers (weight != 0) → must have ≥1 api_key.
+    // Online providers → must have ≥1 api_key. "Online" is `weight > 0`, which is
+    // what `router::resolve` and `router::accessible_models` filter on (`<= 0` is
+    // dropped). This test used `weight == 0`, so a NEGATIVE weight — accepted by
+    // the DB (`CHECK (weight >= 0)` only forbids... nothing negative is enforced
+    // elsewhere) — skipped validation while being silently discarded at routing
+    // time: a provider that can never serve, with a clean bill of health.
     for provider in cfg.providers.values() {
-        if provider.weight == 0 {
+        if provider.weight < 0 {
+            // Negative weights are dropped by the router (`weight > 0`), so such
+            // a provider can never serve — say so, instead of passing it as
+            // "online" and leaving the operator with a provider that is quietly
+            // never selected.
+            issues.push(ValidationIssue::warn(format!(
+                "provider '{}' has weight {}; the router requires weight > 0, so it can never \
+                 be selected",
+                provider.id, provider.weight
+            )));
+        }
+        if provider.weight <= 0 {
             continue;
         }
         let has_keys = cfg
@@ -305,21 +321,110 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
                 role.id
             )));
         }
+        // `matching_provider` can never match: the pre-gate builds its `MatchCtx`
+        // BEFORE routing, so `provider` is always `None` there, while
+        // `limit::dim_matches` requires equality with the configured value. A role
+        // that declares this dimension is therefore skipped by BOTH checks — it is
+        // listed, persisted and shown in the admin UI, and it enforces nothing.
+        // (The accounting path DOES pass a provider, so such a role also produces a
+        // window that is written and never read.) This is a WARNING rather than a
+        // hard error on purpose: existing configs must not stop validating, but the
+        // trap must stop being silent. Whether the dimension should instead be
+        // implemented (per-candidate checks) or rejected at the admin write boundary
+        // is a product decision — see the plan's D-11.
+        if role.matching_provider.is_some() {
+            issues.push(ValidationIssue::warn(format!(
+                "limit_role '{}' declares matching_provider '{}', which CANNOT match: the                  limit pre-gate runs before routing, so no provider is known yet and this                  role is skipped entirely (its limits never apply)",
+                role.id,
+                role.matching_provider.as_deref().unwrap_or_default()
+            )));
+        }
+        // A key-scoped role with NO tenant scope is a CROSS-TENANT quota.
+        //
+        // Measured 2026-09-30 (round 116 made the raw-key form match, so roles that used to be
+        // inert went live): `matching_key` alone constrains nothing else, so the window belongs to
+        // `(role_id, mask(key))` regardless of which tenant presented the key — two tenants whose
+        // auth backends both accept the same key string share ONE budget, and the second tenant's
+        // very first request can be refused by the first tenant's usage. The bucket has always
+        // behaved this way; what changed is that the documented form now actually matches, and
+        // `config::validate` warned about the inert `matching_provider` dimension while saying
+        // nothing about this one. A WARNING, not an error: a deliberately shared quota between two
+        // tenants is legitimate, it just must not be accidental or silent.
+        if role.matching_key.is_some() && role.matching_tenant.is_none() {
+            issues.push(ValidationIssue::warn(format!(
+                "limit_role '{}' scopes on matching_key but has matching_tenant NULL: its window is \
+                 shared by EVERY tenant that accepts that key (the bucket is (role_id, mask(key))), \
+                 so one tenant's traffic can exhaust another's budget",
+                role.id
+            )));
+        }
+        // What the VALUE of `matching_key` costs — one warning per role, because the two forms have
+        // opposite costs and the documentation alone was the only place either was mentioned.
+        if let Some(key) = role.matching_key.as_deref() {
+            if !key.is_empty() && crate::rewrite::mask_key(key) != key {
+                // A non-mask value is (by the matching rules) a raw client key.
+                issues.push(ValidationIssue::warn(format!(
+                    "limit_role '{}' stores what looks like a RAW client key in `matching_key`: that \
+                     column is kept and replicated in PLAINTEXT (unlike provider api-keys, which are \
+                     sealed with the master key) and is returned by `GET /api/v1/limit-roles`, so a \
+                     live credential ends up in every node's database, in every backup and in every \
+                     admin response. The MASK form matches the same key without storing it (the mask \
+                     is what the usage rows carry); whether the column should be sealed is plan item \
+                     D-16",
+                    role.id
+                )));
+            } else if !key.is_empty() {
+                // ...and the masked form has the opposite cost: the mask is not a unique identity.
+                issues.push(ValidationIssue::warn(format!(
+                    "limit_role '{}' matches on the MASKED form '{}': any OTHER client key whose \
+                     mask is that same string shares this window (the window is (role_id, mask(key)), \
+                     regardless of tenant), so unrelated keys silently share one budget",
+                    role.id, key
+                )));
+            }
+        }
     }
 
-    // provider_key_bindings → prefix non-empty + provider must exist.
+    // provider_key_bindings → prefix must be USABLE (the shared shape rule; the
+    // admin write boundary enforces the same one) + provider must exist +
+    // the prefix must not swallow a sub-tenant prefix.
     for b in &cfg.key_prefix_bindings {
-        if b.key_prefix.is_empty() {
-            issues.push(ValidationIssue::warn(format!(
-                "provider_key_binding '{}' has an empty key_prefix; it can never match",
-                b.id
-            )));
+        match crate::sub_tenant::validate_prefix_shape(&b.key_prefix) {
+            Ok(()) => {}
+            // Keep the original wording: runbooks and the alert text quote it.
+            Err(crate::sub_tenant::PrefixShapeError::Empty) => {
+                issues.push(ValidationIssue::warn(format!(
+                    "provider_key_binding '{}' has an empty key_prefix; it can never match",
+                    b.id
+                )));
+            }
+            Err(e) => issues.push(ValidationIssue::warn(format!(
+                "provider_key_binding '{}' has an unusable key_prefix '{}': {e}; a binding \
+                 match is GLOBAL and wins over the sub-tenant routing gate, so a bare prefix \
+                 re-routes every tenant whose key starts with it",
+                b.id, b.key_prefix
+            ))),
         }
         if !cfg.providers.contains_key(&b.provider_id) {
             issues.push(ValidationIssue::warn(format!(
                 "provider_key_binding '{}' references unknown provider_id '{}'",
                 b.id, b.provider_id
             )));
+        }
+        // Cross-namespace collision: a binding that overlaps a sub-tenant prefix
+        // silently disables that sub-tenant's steering (the binding wins), so it
+        // is exactly the kind of overlap the sub-tenant write path rejects — but
+        // a binding can be created AFTER the sub-tenant exists, which no write
+        // boundary can see. Surface it here instead of at request time.
+        for st in &cfg.sub_tenants {
+            if crate::sub_tenant::prefixes_collide(&st.key_prefix, &b.key_prefix) {
+                issues.push(ValidationIssue::warn(format!(
+                    "provider_key_binding '{}' (key_prefix '{}') overlaps sub_tenant '{}' \
+                     (key_prefix '{}'); the binding wins, so that sub-tenant's routing is \
+                     silently bypassed",
+                    b.id, b.key_prefix, st.id, st.key_prefix
+                )));
+            }
         }
     }
 

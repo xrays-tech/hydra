@@ -2280,6 +2280,52 @@ async fn write_with_no_token_is_401() {
     assert_eq!(v["error"]["code"], "unauthorized", "got {v}");
 }
 
+/// OC-5 — a WRITE refused by the token gate must be attributed to its ROUTE, not
+/// to `unrouted`.
+///
+/// The write path assigned `ctx.tenant_api_endpoint` AFTER `run_gate`, but the
+/// gate is exactly what writes the 401/403/429/503 refusal: every refused write
+/// was therefore counted under `endpoint="unrouted"` — the label reserved for
+/// "this path is not one of our routes" — for a request that had hit a perfectly
+/// well-known one. An operator alerting on refusals per endpoint saw write
+/// refusals nowhere, and a spike in `unrouted` (which is supposed to mean a path
+/// drift, i.e. a code/config bug) was actually credential guessing against the
+/// write endpoints. The READ path always set the label before its gate.
+///
+/// `sub-tenant-route-delete` is the low-cardinality label for
+/// `DELETE /sub-tenant-routes/{id}`; no other test in this binary rejects that
+/// route, so the exact `+1` is safe under a parallel test run.
+///
+/// Falsification: move the assignment back below `run_gate` and this fails with
+/// no increase at all (`before == after`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_write_is_attributed_to_its_route_not_to_unrouted() {
+    use hydra_server::admin::metrics;
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let before = metrics::tenant_api_requests_total("sub-tenant-route-delete", 401);
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        "/tenant/t1/api/v1/sub-tenant-routes/rt-never-seeded",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 401, "got {v}");
+    assert_eq!(v["error"]["code"], "unauthorized", "got {v}");
+    let after = metrics::tenant_api_requests_total("sub-tenant-route-delete", 401);
+    assert_eq!(
+        after,
+        before + 1.0,
+        "a refused write must be counted under its own route label, not `unrouted` \
+         (before={before}, after={after})"
+    );
+}
+
 /// The URL's tenant id is a cross-check: a token for `t1` against a `t2` URL is
 /// 403 `tenant_id_mismatch` (never 200, never a silent write to the other
 /// tenant).

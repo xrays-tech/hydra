@@ -109,25 +109,30 @@ impl RateLimiter {
             if let Some(limit) = role.limit_count {
                 let limit_u64 = u64::try_from(limit.max(0)).unwrap_or(0);
                 if limit_u64 == 0 {
-                    // limit_count == 0 ⇒ deny unconditionally.
+                    // limit_count == 0 ⇒ deny unconditionally (no window involved, so
+                    // there is no window remainder to promise).
                     return CountVerdict::Denied {
                         role_id: role.id.clone(),
+                        retry_after: None,
                     };
                 }
                 let key = LimitKey {
                     role_id: role.id.clone(),
                     bucket: bucket_for(role, ctx),
                 };
-                // check_and_inc under the DashMap entry guard.
+                // check_and_inc under the DashMap entry guard. The key is cloned for the
+                // retry-after lookup below (the entry API consumes it).
                 let admitted = self
                     .windows
-                    .entry(key)
+                    .entry(key.clone())
                     .or_insert_with(|| SlidingWindow::new(window_len(role)))
                     .check_and_inc(now, limit_u64);
                 if !admitted {
                     debug!(role = %role.id, limit = limit, "rate limit denied (count)");
+                    let retry_after = self.windows.get(&key).and_then(|w| w.retry_after(now));
                     return CountVerdict::Denied {
                         role_id: role.id.clone(),
+                        retry_after,
                     };
                 }
             }
@@ -163,8 +168,10 @@ impl RateLimiter {
             // `limit_count == 0`.
             if limit == 0 || used >= limit {
                 debug!(role = %role.id, used, limit, "token quota exhausted");
+                let retry_after = self.windows.get(&key).and_then(|w| w.retry_after(now));
                 return CountVerdict::Denied {
                     role_id: role.id.clone(),
+                    retry_after,
                 };
             }
         }
@@ -261,8 +268,16 @@ impl Limiter for RateLimiter {
 pub enum CountVerdict {
     /// Under all matched limits — admit (each window has been incremented).
     Admitted,
-    /// Over at least one matched `limit_count` — deny with 429 (§10.3).
-    Denied { role_id: String },
+    /// Over at least one matched `limit_count`/`limit_token` — deny with 429 (§10.3).
+    ///
+    /// `retry_after` is how long the DENYING window needs to start draining; the shell
+    /// puts it in `Retry-After`, which `ops.md` §4.2 promises on exactly this 429
+    /// ("reflecting the remainder of the current window"). `None` only when the window
+    /// is already empty (nothing to wait for).
+    Denied {
+        role_id: String,
+        retry_after: Option<Duration>,
+    },
 }
 
 /// Window length for a role's `window` field (design §10.2: m=60s, h=3600s,
@@ -283,15 +298,17 @@ fn window_len(role: &LimitRole) -> Duration {
 fn bucket_for(role: &LimitRole, ctx: &MatchCtx<'_>) -> String {
     // Only include the dimensions the role actually constrains; this keeps the
     // bucket keyspace tight (one shared window for wildcard roles).
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    let mut parts: Vec<String> = Vec::with_capacity(3);
     if role.matching_key.is_some() {
-        parts.push(ctx.api_key.unwrap_or(""));
+        // `hydra_core::limit::bucket_key` (single owner): the masked key, or the raw key masked
+        // here — never `""`, which would give every client of this role one shared window.
+        parts.push(hydra_core::limit::bucket_key(ctx));
     }
     if role.matching_model.is_some() {
-        parts.push(ctx.model.unwrap_or(""));
+        parts.push(ctx.model.unwrap_or("").to_string());
     }
     if role.matching_tenant.is_some() {
-        parts.push(ctx.tenant.unwrap_or(""));
+        parts.push(ctx.tenant.unwrap_or("").to_string());
     }
     parts.join("\x1f") // ASCII unit separator — cannot appear in real values.
 }
@@ -328,12 +345,89 @@ mod tests {
         }
     }
 
+    /// The key dimension must actually separate CLIENTS.
+    ///
+    /// Reviewer finding F5: all seven fixtures here built key-LESS contexts, so `bucket_for`'s
+    /// `matching_key.is_some()` branch had no coverage at all — which is how the F3 defect (a
+    /// raw-only context collapsing the bucket to `""`, i.e. one shared window for every client of
+    /// the role) stayed invisible. Two clients, one key-scoped role, limit 1: each must get its own
+    /// window.
+    #[test]
+    fn a_key_scoped_role_keeps_one_window_per_client() {
+        let rl = RateLimiter::new();
+        let mut scoped = role("r-key", Some(1), "m");
+        scoped.matching_key = Some("sk-client-one-aaaaaaaa".to_string());
+        let roles = vec![scoped];
+        let client_one = MatchCtx {
+            api_key: None,
+            api_key_raw: Some("sk-client-one-aaaaaaaa"),
+            model: None,
+            tenant: Some("t1"),
+            provider: None,
+        };
+        let client_two = MatchCtx {
+            api_key_raw: Some("sk-client-two-bbbbbbbb"),
+            ..client_one
+        };
+        let now = Instant::now();
+        // The role matches only client one (exact equality on the raw form).
+        assert!(matches!(
+            rl.check_count(&roles, &client_one, now),
+            CountVerdict::Admitted
+        ));
+        assert!(matches!(
+            rl.check_count(&roles, &client_one, now),
+            CountVerdict::Denied { .. }
+        ));
+        // ...and the OTHER client is untouched: it matched no role, so it is admitted even though
+        // the role's window is spent. Before `bucket_key` this path was unreachable in production
+        // only because every caller passed a mask; the invariant is now asserted.
+        assert!(matches!(
+            rl.check_count(&roles, &client_two, now),
+            CountVerdict::Admitted
+        ));
+    }
+
+    /// A raw-only context for the SAME client is bucketed by its mask, so the window is the same
+    /// one a masked context would use — no split, and no shared/empty bucket.
+    #[test]
+    fn a_raw_only_context_shares_the_window_with_the_masked_form() {
+        let rl = RateLimiter::new();
+        let mut scoped = role("r-both", Some(1), "m");
+        scoped.matching_key = Some("sk-raw-form-9999999999".to_string());
+        let roles = vec![scoped];
+        let raw_only = MatchCtx {
+            api_key: None,
+            api_key_raw: Some("sk-raw-form-9999999999"),
+            model: None,
+            tenant: Some("t1"),
+            provider: None,
+        };
+        let masked = MatchCtx {
+            api_key: Some(&hydra_core::rewrite::mask_key("sk-raw-form-9999999999")),
+            ..raw_only
+        };
+        let now = Instant::now();
+        assert!(matches!(
+            rl.check_count(&roles, &raw_only, now),
+            CountVerdict::Admitted
+        ));
+        assert!(
+            matches!(
+                rl.check_count(&roles, &masked, now),
+                CountVerdict::Denied { .. }
+            ),
+            "the masked form must land in the same window as the raw form"
+        );
+    }
+
     #[test]
     fn admits_under_limit() {
         let rl = RateLimiter::new();
         let roles = vec![role("r1", Some(3), "m")];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: Some("t1"),
             provider: None,
@@ -343,12 +437,23 @@ mod tests {
         assert_eq!(rl.check_count(&roles, &ctx, now), CountVerdict::Admitted);
         assert_eq!(rl.check_count(&roles, &ctx, now), CountVerdict::Admitted);
         // 4th within the window → denied.
-        assert_eq!(
-            rl.check_count(&roles, &ctx, now),
+        // `retry_after` is the remainder of the denying window (~60s here): asserting it
+        // is what turns "the header exists" into "it carries the right number".
+        match rl.check_count(&roles, &ctx, now) {
             CountVerdict::Denied {
-                role_id: "r1".into()
+                role_id,
+                retry_after,
+            } => {
+                assert_eq!(role_id, "r1");
+                let wait =
+                    retry_after.expect("the denying window has samples, so it has a remainder");
+                assert!(
+                    wait > Duration::from_secs(59) && wait <= Duration::from_secs(60),
+                    "expected the remainder of a 60s window, got {wait:?}"
+                );
             }
-        );
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]
@@ -357,18 +462,26 @@ mod tests {
         let roles = vec![role("r1", Some(1), "m")];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: Some("t1"),
             provider: None,
         };
         let t0 = Instant::now();
         assert_eq!(rl.check_count(&roles, &ctx, t0), CountVerdict::Admitted);
-        assert_eq!(
-            rl.check_count(&roles, &ctx, t0),
+        match rl.check_count(&roles, &ctx, t0) {
             CountVerdict::Denied {
-                role_id: "r1".into()
+                role_id,
+                retry_after,
+            } => {
+                assert_eq!(role_id, "r1");
+                assert!(
+                    retry_after.is_some(),
+                    "a count denial from a non-empty window must report the remainder"
+                );
             }
-        );
+            other => panic!("expected Denied, got {other:?}"),
+        }
         // Advance past the 60s window.
         let t1 = t0 + Duration::from_secs(61);
         assert_eq!(rl.check_count(&roles, &ctx, t1), CountVerdict::Admitted);
@@ -380,6 +493,7 @@ mod tests {
         let roles = vec![role("block", Some(0), "m")];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: Some("t1"),
             provider: None,
@@ -387,7 +501,10 @@ mod tests {
         assert_eq!(
             rl.check_count(&roles, &ctx, Instant::now()),
             CountVerdict::Denied {
-                role_id: "block".into()
+                role_id: "block".into(),
+                // `limit_count = 0` denies unconditionally: no window is involved, so
+                // there is no window remainder to promise (the shell then sends 1s).
+                retry_after: None,
             }
         );
     }
@@ -400,6 +517,7 @@ mod tests {
         let roles = vec![r];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: Some("t1"),
             provider: None,
@@ -424,6 +542,7 @@ mod tests {
         let roles = vec![r];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: None,
             provider: None,
@@ -448,7 +567,8 @@ mod tests {
         assert_eq!(
             limiter.check_tokens(&roles, &ctx, t0),
             CountVerdict::Denied {
-                role_id: "r-tok".to_string()
+                role_id: "r-tok".to_string(),
+                retry_after: Some(Duration::from_secs(60)),
             },
             "a token quota must reject once the window is over it"
         );
@@ -472,6 +592,7 @@ mod tests {
         let roles = vec![count_only];
         let ctx = MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: None,
             provider: None,

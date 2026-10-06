@@ -321,19 +321,41 @@ impl ConfigStore {
         // snapshot is newer (accepted live: failover-then-rejoin regressed
         // the config). Monotonicity across restarts is what makes the
         // control channel's `?since=` watermark meaningful.
-        let persisted = db::get_config_version(&pool).await.ok().flatten();
-        // A missing marker means one of two very different things, and the
-        // freshness gate depends on telling them apart:
-        // - a brand-new DB (no config at all) → version 0: this node holds
-        //   NOTHING, so an `UpToDate` poll must not count as "synced" (a node
-        //   with an empty replica must not be eligible to lead — F-4);
-        // - a DB with config but no marker (predates migration 0008, or was
-        //   imported) → version 1: the cluster really does have config, so
-        //   peers polling with `since = 0` are sent a full snapshot.
+        let persisted = match db::get_config_version(&pool).await {
+            Ok(v) => v,
+            Err(e) => {
+                // A read FAILURE is not "no marker": keep the loud path.
+                tracing::warn!(target: "hydra::store", error = %e, "could not read the persisted config version");
+                db::ConfigVersion::Absent
+            }
+        };
+        // Three states, three different meanings — the freshness gate depends on
+        // telling them apart:
+        // - a parsed watermark → use it;
+        // - no marker (predates migration 0008, or was imported) → version 1 if
+        //   config content exists: the cluster really does have config, so peers
+        //   polling with `since = 0` are sent a full snapshot;
+        // - no marker AND no content (a brand-new DB) → version 0: this node
+        //   holds NOTHING, so an `UpToDate` poll must not count as "synced" (an
+        //   empty replica must not be eligible to lead — F-4);
+        // - a CORRUPT marker → cannot be used as a watermark, but must not stop
+        //   the data plane from serving valid config (that would turn metadata
+        //   corruption into an outage). Fall back to the "content but no marker"
+        //   value, loudly: `replica_is_current` already fails closed on Corrupt,
+        //   so this node cannot lead until a materialization rewrites the marker.
+        let has_content = db::config_content_exists(&pool).await.unwrap_or(false);
         let version = match persisted {
-            Some(v) => v,
-            None if db::config_content_exists(&pool).await.unwrap_or(false) => 1,
-            None => 0,
+            db::ConfigVersion::Value(v) => v,
+            db::ConfigVersion::Absent => u64::from(has_content),
+            db::ConfigVersion::Corrupt(raw) => {
+                tracing::warn!(
+                    target: "hydra::store",
+                    raw = %raw,
+                    "config_meta.config_version is not a number; serving with the conservative \
+                     watermark and refusing leader eligibility until it is rewritten"
+                );
+                u64::from(has_content)
+            }
         };
         // The replication content is built at construction (not lazily): a
         // leader that served a wire with EMPTY fidelity rows would instruct
@@ -682,7 +704,7 @@ mod tests {
             crate::db::get_config_version(&pool)
                 .await
                 .expect("read marker"),
-            Some(before + 1),
+            crate::db::ConfigVersion::Value(before + 1),
             "marker and memory agree"
         );
     }

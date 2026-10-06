@@ -57,6 +57,65 @@ pub(super) fn err_json(status: u16, code: &str, message: &str, trace_id: &str) -
     json_response(status, to_json(&body))
 }
 
+/// Shape-check an operator `key_prefix_binding` prefix, returning the 400 to
+/// send when it is unusable.
+///
+/// A binding prefix is a GLOBAL namespace match that wins over the sub-tenant
+/// routing gate (`router::match_key_binding`), so a bare prefix like `"s"` or
+/// `"sk-"` silently re-routes — or 503s — every tenant whose key happens to
+/// start with it. The sub-tenant write path has always enforced the shape rules
+/// (`hydra_core::sub_tenant::validate_prefix_shape`); this boundary checked only
+/// "not empty", so the same mistake was accepted here with far wider blast
+/// radius. Both now call the one shared rule.
+fn key_prefix_shape_error(prefix: &str, trace_id: &str) -> Option<Resp> {
+    let err = match hydra_core::sub_tenant::validate_prefix_shape(prefix) {
+        Ok(()) => return None,
+        Err(e) => e,
+    };
+    let (code, message) = match err {
+        hydra_core::sub_tenant::PrefixShapeError::Empty => (
+            "empty_key_prefix",
+            "key_prefix must be a non-empty string".to_string(),
+        ),
+        hydra_core::sub_tenant::PrefixShapeError::NonAscii => {
+            ("invalid_key_prefix", err.to_string())
+        }
+        hydra_core::sub_tenant::PrefixShapeError::NoSeparator => (
+            "invalid_key_prefix",
+            format!(
+                "{err}; a bare prefix would match unrelated keys across EVERY tenant, so it \
+                 must carry its separator (e.g. \"acme_\")"
+            ),
+        ),
+    };
+    Some(err_json(400, code, &message, trace_id))
+}
+
+/// `err_json` plus `Retry-After`, for a rate-limited answer (the admin-plane
+/// counterpart of the tenant API's `respond_json_with_retry_after`).
+pub(super) fn err_json_throttled(
+    status: u16,
+    code: &str,
+    message: &str,
+    retry_after_secs: u64,
+    trace_id: &str,
+) -> Resp {
+    let body = ErrorBody {
+        error: ErrorDetail {
+            code: code.to_string(),
+            message: message.to_string(),
+            trace_id: trace_id.to_string(),
+        },
+    };
+    let mut resp = json_response(status, to_json(&body));
+    resp.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_str(&retry_after_secs.to_string())
+            .unwrap_or_else(|_| http::HeaderValue::from_static("60")),
+    );
+    resp
+}
+
 /// Build a JSON success response from any `Serialize` value.
 pub(super) fn ok_json<T: Serialize>(status: u16, value: &T) -> Resp {
     json_response(status, to_json(value))
@@ -99,7 +158,11 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
 /// - UNIQUE violation → 409
 /// - CHECK / NOT NULL / FK violation → 400 (FK e.g. model→provider, §13.2)
 /// - everything else → 500
-fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
+///
+/// `pub(super)` because the tenant-config write core answers through it too: this
+/// mapping must have exactly one owner, and a hand-copied twin had already drifted
+/// (it lost the SQLITE_BUSY → 503 `storage_busy` branch).
+pub(crate) fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
     if let sqlx::Error::Database(db) = e {
         if db.is_unique_violation() {
             return (409, "conflict");
@@ -112,6 +175,17 @@ fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
         }
         if matches!(db.kind(), sqlx::error::ErrorKind::NotNullViolation) {
             return (400, "missing_required_field");
+        }
+        // SQLite lock contention (SQLITE_BUSY = 5, SQLITE_BUSY_SNAPSHOT = 517):
+        // the writer could not get or keep the write lock inside `busy_timeout`.
+        // This is TRANSIENT — the same request usually succeeds immediately — so
+        // reporting it as 500 (an internal error) told clients "there is a bug"
+        // and made them retry at human speed, when what they need is a short
+        // backoff. All write transactions now take the lock up front via
+        // `db::begin_write`, so this path is the residual case (a lock held past
+        // the timeout by a long transaction).
+        if matches!(db.code().as_deref(), Some("5") | Some("517")) {
+            return (503, "storage_busy");
         }
     }
     (500, "database_error")
@@ -146,16 +220,28 @@ async fn reload_best_effort(state: &AdminState, trace_id: &str) {
             trace_id, error = %e,
             "post-write reload_all FAILED: the in-memory config snapshot is now STALE              (design §5.3 keeps the old snapshot; admin writes will keep returning              2xx while having no runtime effect until a reload succeeds)"
         );
-        metrics::record_config_snapshot_stale(true);
-        state
-            .snapshot_stale
-            .store(true, std::sync::atomic::Ordering::Release);
+        note_reload_outcome(state, true);
         return;
     }
-    metrics::record_config_snapshot_stale(false);
+    note_reload_outcome(state, false);
+}
+
+/// Record the outcome of a config reload — **the single owner** of
+/// `hydra_config_snapshot_stale` and of `AdminState::snapshot_stale`.
+///
+/// Why it exists: the post-write path ([`reload_best_effort`]) recorded the outcome, and the
+/// explicit `POST /api/v1/reload` endpoint (`admin::cluster_api::reload`) did **not** — it shared
+/// the loading but not the recording. Measured 2026-09-30 (`integration/test_snapshot_stale.py`):
+/// a failing explicit reload answered `400 reload_failed` ("old snapshot retained") while the
+/// documented gauge stayed **0**, so the alert the docs point operators at never fired for it; and
+/// after a later successful explicit reload the gauge stayed **1**, so the alert kept firing after
+/// the documented recovery — while `ops.md` §9.1 tells an operator to alert on exactly that gauge
+/// and §5.3 to recover by reloading.
+pub(super) fn note_reload_outcome(state: &AdminState, stale: bool) {
+    metrics::record_config_snapshot_stale(stale);
     state
         .snapshot_stale
-        .store(false, std::sync::atomic::Ordering::Release);
+        .store(stale, std::sync::atomic::Ordering::Release);
 }
 
 /// Write-boundary mirror of the loader's **fatal** endpoint check
@@ -1309,6 +1395,8 @@ pub(super) async fn tenant_model_catalog(
             // keyless providers stay listed (for diagnosis) with online=false.
             // weight is read from the provider snapshot reference obtained by
             // the existence guard above (Provider.weight), never bare-indexed.
+            // `weight > 0` = routable by weight (0 = deliberate soft-disable,
+            // < 0 = invalid; both are "not online" for the catalog).
             let online = !state.breaker.is_dead(pid)
                 && p.weight > 0
                 && snap
@@ -1452,13 +1540,8 @@ pub(super) async fn provider_key_binding_collection(
             Ok(b) => b,
             Err(r) => return r,
         };
-        if b.key_prefix.trim().is_empty() {
-            return err_json(
-                400,
-                "empty_key_prefix",
-                "key_prefix must be a non-empty string",
-                trace_id,
-            );
+        if let Some(resp) = key_prefix_shape_error(&b.key_prefix, trace_id) {
+            return resp;
         }
         if b.id.is_empty() {
             b.id = gen_id();
@@ -1505,13 +1588,8 @@ pub(super) async fn provider_key_binding_item(
                 Ok(b) => b,
                 Err(resp) => return resp,
             };
-            if b.key_prefix.trim().is_empty() {
-                return err_json(
-                    400,
-                    "empty_key_prefix",
-                    "key_prefix must be a non-empty string",
-                    trace_id,
-                );
+            if let Some(resp) = key_prefix_shape_error(&b.key_prefix, trace_id) {
+                return resp;
             }
             b.id = id.to_string();
             b.updated_at = now_ts();
@@ -2379,12 +2457,24 @@ struct ConcurrencyList {
 }
 
 pub(super) fn concurrency_collection(state: &AdminState) -> Resp {
-    ok_json(
-        200,
-        &ConcurrencyList {
-            providers: state.admission.snapshot(),
-        },
-    )
+    // The configured side comes from the LIVE snapshot (not from what the last request
+    // happened to observe), so the response always contrasts "what the configuration asks
+    // for" with "what this gate is enforcing" — gates are not resized on hot-reload
+    // (ops.md §4 / decision item D-14), and reporting only the enforced value made a
+    // configuration change look applied.
+    let cfg = state.store.snapshot();
+    let providers = state.admission.snapshot_with_configured(|provider_id| {
+        // `cfg.providers` is keyed by provider id.
+        cfg.providers.get(provider_id).map(|p| {
+            hydra_core::config::resolve_policy(
+                p.max_concurrency,
+                p.max_queue_depth,
+                p.queue_wait_timeout_ms,
+                state.default_concurrency_policy,
+            )
+        })
+    });
+    ok_json(200, &ConcurrencyList { providers })
 }
 
 // ===========================================================================

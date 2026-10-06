@@ -1,7 +1,9 @@
 //! Router — candidate resolution (pure).
 //!
-//! This module re-exports the shared routing types ([`Candidate`], [`RouteError`])
-//! and implements the pure [`resolve`] function.
+//! This module re-exports the shared routing types ([`Candidate`], [`RouteError`],
+//! [`ResolveOutcome`], [`ExcludedCandidate`], [`ExclusionReason`]) and implements
+//! the pure [`resolve_detailed`] function, plus [`resolve`] — the same pipeline
+//! reduced to the candidate set, for callers that do not need the attribution.
 //!
 //! ## Contract
 //! `resolve(&ConfigData, &dyn BreakerView, &Tenant, model_key) ->
@@ -31,7 +33,14 @@
 //!      restricted to that route's provider (model-specific route wins over the
 //!      default; fail-closed); no match ⇒ the set is unchanged (opt-in steering).
 //! 4. **Filter** — drop dead (`breaker.is_dead`), keyless (no api-keys), and
-//!    soft-disabled (`weight <= 0`); empty ⇒ [`RouteError::NoAvailableProvider`].
+//!    soft-disabled (`weight == 0` = a deliberate action, `weight < 0` = a
+//!    configuration error). Every drop is reported in
+//!    [`ResolveOutcome::excluded`] with its reason.
+//!    - [`resolve_detailed`]: an empty set is **`Ok`** with the attribution
+//!      attached — returning `Err` here would throw away exactly the case where
+//!      naming the losers matters most.
+//!    - [`resolve`]: an empty set ⇒ [`RouteError::NoAvailableProvider`] (the
+//!      historical contract, preserved for every other caller).
 //! 5. **Order** — the returned candidates are sorted by `provider_id` for a
 //!    deterministic set. SWRR ordering is a *subsequent* step applied by the
 //!    caller, which owns the per-`(tenant, model)` [`SwrrState`] (T2.11: only
@@ -58,7 +67,7 @@ use crate::breaker::BreakerView;
 use crate::config::ConfigData;
 use crate::model::{ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 
-pub use crate::model::{Candidate, RouteError};
+pub use crate::model::{Candidate, ExcludedCandidate, ExclusionReason, ResolveOutcome, RouteError};
 
 /// Longest-prefix match of a client api-key against the enabled prefix
 /// bindings (design §7.1b). Returns the binding with the longest `key_prefix`
@@ -151,6 +160,27 @@ pub fn match_sub_tenant_route<'a>(
         .and_then(|st| select_sub_tenant_route(&cfg.sub_tenant_routes, &st.id, model_key))
 }
 
+/// [`resolve_detailed`], candidates only.
+///
+/// Kept because most callers (and most tests) only care about the candidate set;
+/// the attribution is what the proxy records, and it has a second field. One
+/// implementation, two views — not two code paths.
+pub fn resolve(
+    cfg: &ConfigData,
+    breaker: &dyn BreakerView,
+    tenant: &Tenant,
+    model_key: &str,
+    client_api_key: Option<&str>,
+) -> Result<Vec<Candidate>, RouteError> {
+    let outcome = resolve_detailed(cfg, breaker, tenant, model_key, client_api_key)?;
+    if outcome.candidates.is_empty() {
+        // Every candidate was dropped in step 4 — the same failure this function
+        // has always reported (and what `route_error_status` maps to 503).
+        return Err(RouteError::NoAvailableProvider);
+    }
+    Ok(outcome.candidates)
+}
+
 /// Resolve the candidate set for one `(tenant, model_key)` request.
 ///
 /// See the module docs for the full pipeline. The returned `Vec` is sorted by
@@ -162,13 +192,13 @@ pub fn match_sub_tenant_route<'a>(
 /// when no operator binding matches, the sub-tenant route gate (3.6,
 /// design-sub-tenant.md §4.1); `None` (or no match for either) leaves the
 /// candidate set unrestricted.
-pub fn resolve(
+pub fn resolve_detailed(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
     tenant: &Tenant,
     model_key: &str,
     client_api_key: Option<&str>,
-) -> Result<Vec<Candidate>, RouteError> {
+) -> Result<ResolveOutcome, RouteError> {
     // (0) TenantModel access gate (design §7.1, revised — default-open): a
     // tenant with NO `tenant_models` mapping is unrestricted (all models
     // allowed); once any mapping exists it is a whitelist — a model outside
@@ -234,28 +264,70 @@ pub fn resolve(
     }
 
     // (4) Filter: not dead, has ≥1 api-key, weight > 0.
-    let mut candidates: Vec<Candidate> = intersection
-        .into_iter()
-        .filter(|pid| !breaker.is_dead(pid))
-        .filter(|pid| cfg.provider_keys.get(pid).is_some_and(|k| !k.is_empty()))
-        .filter_map(|pid| {
-            let p = cfg.providers.get(&pid)?;
-            Some(Candidate {
+    //
+    // Each drop is recorded WITH the provider and the reason (`excluded`), not
+    // just as "some provider was missing": a provider whose last api-key was
+    // deleted used to disappear from rotation with no per-provider signal
+    // anywhere, so an operator could not tell WHICH one had gone quiet — see
+    // `ExclusionReason`.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut excluded: Vec<ExcludedCandidate> = Vec::new();
+    for pid in intersection {
+        if breaker.is_dead(&pid) {
+            excluded.push(ExcludedCandidate {
                 provider_id: pid,
-                endpoint: p.endpoint.clone(),
-                weight: p.weight,
-            })
-        })
-        .filter(|c| c.weight > 0)
-        .collect();
-
-    if candidates.is_empty() {
-        return Err(RouteError::NoAvailableProvider);
+                reason: ExclusionReason::BreakerDead,
+            });
+            continue;
+        }
+        if !cfg.provider_keys.get(&pid).is_some_and(|k| !k.is_empty()) {
+            excluded.push(ExcludedCandidate {
+                provider_id: pid,
+                reason: ExclusionReason::NoKey,
+            });
+            continue;
+        }
+        let Some(p) = cfg.providers.get(&pid) else {
+            // Unknown provider row (the intersection came from `models_by_key`
+            // and `tenant_providers`, so this is a data-graph inconsistency, not
+            // a configuration the operator wrote). Not a candidate, and not
+            // attributable either: nothing here says what the operator did.
+            continue;
+        };
+        // Two different weights, two different meanings — see `ExclusionReason`.
+        if p.weight == 0 {
+            excluded.push(ExcludedCandidate {
+                provider_id: pid,
+                reason: ExclusionReason::SoftDisabled,
+            });
+            continue;
+        }
+        if p.weight < 0 {
+            excluded.push(ExcludedCandidate {
+                provider_id: pid,
+                reason: ExclusionReason::InvalidWeight,
+            });
+            continue;
+        }
+        candidates.push(Candidate {
+            provider_id: pid,
+            endpoint: p.endpoint.clone(),
+            weight: p.weight,
+        });
     }
 
+    // An empty candidate set is NOT an error here, deliberately: returning `Err`
+    // would discard `excluded` exactly when the attribution matters most (every
+    // candidate was dropped, so the caller can say WHO rather than only "nothing
+    // available"). [`resolve`] restores the historical error for its callers.
+    //
     // (5) Deterministic order (set only — SWRR ordering is the caller's step).
     candidates.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
-    Ok(candidates)
+    excluded.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+    Ok(ResolveOutcome {
+        candidates,
+        excluded,
+    })
 }
 
 /// One catalog entry: a model key plus the providers that can currently route
@@ -363,8 +435,10 @@ pub fn accessible_models(
 
         // (4) Runtime filter — existence guard first (never a bare index into
         // cfg.providers): drop orphan references, breaker-dead providers,
-        // soft-disabled (weight ≤ 0, read from the provider snapshot), and
-        // keyless providers.
+        // not routable by weight (`<= 0` — a deliberate `0` or an invalid `< 0`;
+        // this catalog reports the union, so it does not need to tell them apart —
+        // see `ExclusionReason` for where the data plane does), and keyless
+        // providers.
         let mut routable: Vec<String> = providers
             .into_iter()
             .filter_map(|pid| {

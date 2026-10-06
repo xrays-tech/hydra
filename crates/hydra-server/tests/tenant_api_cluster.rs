@@ -132,8 +132,9 @@ async fn barrier_reports_unavailable_when_the_bus_cannot_be_read() {
     drop(l);
 
     let url = format!("redis://{addr}");
-    let cfg = fred::types::config::Config::from_url(&url).expect("config");
-    let pool = fred::clients::Pool::new(cfg, None, None, None, 1).expect("pool");
+    // Through the single owner: fred's defaults were a wait-forever command timeout
+    // (`0`) and no reconnect policy at all.
+    let pool = hydra_server::redis::build_pool(&url, 1).expect("pool");
     // Deliberately NOT connected: the barrier must fail rather than hang or lie.
     let stream = InvalidationStream::new(pool);
 
@@ -189,8 +190,9 @@ async fn barrier_reports_pending_not_applied_when_the_live_set_is_empty() {
     let addr = l.local_addr().expect("addr");
     drop(l);
     let url = format!("redis://{addr}");
-    let cfg = fred::types::config::Config::from_url(&url).expect("config");
-    let pool = fred::clients::Pool::new(cfg, None, None, None, 1).expect("pool");
+    // Through the single owner: fred's defaults were a wait-forever command timeout
+    // (`0`) and no reconnect policy at all.
+    let pool = hydra_server::redis::build_pool(&url, 1).expect("pool");
     let stream = InvalidationStream::new(pool);
 
     let outcome = stream
@@ -336,17 +338,19 @@ async fn a_failed_publish_reports_unavailable_not_applied() {
     let addr = l.local_addr().expect("addr");
     drop(l);
     let url = format!("redis://{addr}");
-    let cfg = fred::types::config::Config::from_url(&url).expect("config");
-    // fred's default `default_command_timeout` is `0` (wait forever), so an
-    // `XADD` against a dead port would block until the process is killed. A
-    // short command timeout (matching the production pool's intent in
-    // `redis/mod.rs`) turns the dead bus into a fast, ordinary error, which is
-    // the condition the publish-failure arm exists to report.
-    let perf = fred::types::config::PerformanceConfig {
-        default_command_timeout: Duration::from_millis(200),
-        ..fred::types::config::PerformanceConfig::default()
-    };
-    let pool = fred::clients::Pool::new(cfg, Some(perf), None, None, 1).expect("pool");
+    // fred's default `default_command_timeout` is `0` (wait forever), so an `XADD` against
+    // a dead port would block until the process is killed. The shared owner keeps that
+    // timeout non-zero AND now also supplies the watchdog and the reconnect policy; this
+    // site only shortens it, because the publish-failure arm exists to report a FAST error.
+    let pool = hydra_server::redis::build_pool_with(
+        &url,
+        1,
+        fred::types::config::PerformanceConfig {
+            default_command_timeout: Duration::from_millis(200),
+            ..fred::types::config::PerformanceConfig::default()
+        },
+    )
+    .expect("pool");
     // Deliberately NOT connected: publish must fail rather than hang or lie.
     let stream = InvalidationStream::new(pool);
 

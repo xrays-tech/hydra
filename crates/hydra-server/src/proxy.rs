@@ -51,6 +51,7 @@
 //!   "no JSON encode/decode on the hot path" claim is preserved).
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -59,7 +60,9 @@ use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::{extract_model_field, ModelField};
 use hydra_core::limit::MatchCtx;
-use hydra_core::model::{Candidate, RouteError, SubTenantRoute};
+use hydra_core::model::{
+    Candidate, ExcludedCandidate, ExclusionReason, RouteError, SubTenantRoute,
+};
 use hydra_core::rewrite::mask_key;
 use hydra_core::router;
 use hydra_core::swrr;
@@ -300,9 +303,10 @@ impl HydraProxy {
     /// here (infallible — see [`ProviderClient::new`]).
     #[must_use]
     pub fn new(state: Arc<AppState>) -> Self {
+        let connect_timeout_secs = state.proxy.upstream_connect_timeout_secs;
         Self {
             state,
-            provider_client: ProviderClient::new(),
+            provider_client: ProviderClient::with_connect_timeout(connect_timeout_secs),
         }
     }
 
@@ -552,6 +556,10 @@ impl ProxyHttp for HydraProxy {
 
         let cfg_guard = self.state.store.snapshot();
         let cfg: &ConfigData = &cfg_guard;
+        // Pin this request to ONE configuration generation: the usage-accounting gate runs in the
+        // `logging` hook, after the upstream answered, and must match the roles/windows the gates
+        // above used (see `RequestContext::cfg`).
+        ctx.cfg = Some(Arc::clone(&cfg_guard));
 
         // (1) Domain → tenant (§6.3 §1). Missing/localhost → "localhost".
         let host = Self::request_host(session.req_header());
@@ -682,19 +690,75 @@ impl ProxyHttp for HydraProxy {
         let original_header = req_header.clone();
 
         let body_bytes: Bytes = if has_body {
+            // Read the whole body under ONE total deadline
+            // (`HYDRA_REQUEST_BODY_TIMEOUT_SECS`). Without it a client could hold
+            // this worker task (and its buffered body) open indefinitely:
+            // Pingora bounds HTTP/1 body reads only per-read — each byte resets
+            // that — and HTTP/2 has no read timeout at all, so neither an idle
+            // timeout nor a per-read one bounds a dribbling client. It costs
+            // nothing to reach this point (no valid api-key required), which is
+            // what made it a cross-tenant availability hole.
+            //
+            // A read ERROR is also handled explicitly now: the old
+            // `while let Ok(Some(chunk))` treated an error exactly like a clean
+            // end-of-body, so a truncated body was forwarded upstream as if the
+            // client had sent it. That is a silent-corruption path — fail closed
+            // instead.
+            enum BodyOutcome {
+                Done,
+                TooLarge,
+                ReadError,
+            }
             let mut buf = Vec::new();
-            while let Ok(Some(chunk)) = session.as_downstream_mut().read_request_body().await {
-                buf.extend_from_slice(&chunk);
-                // Hard cap (§8.5): a body over the hard cap returns 413. The
-                // soft cap is gone (no replay buffer to disable), but the hard
-                // cap still protects the gateway from unbounded buffering.
-                if buf.len() as u64 > self.state.proxy.max_request_body_hard {
+            let budget = Duration::from_secs(self.state.proxy.request_body_timeout_secs);
+            let read = async {
+                loop {
+                    match session.as_downstream_mut().read_request_body().await {
+                        Ok(Some(chunk)) => {
+                            buf.extend_from_slice(&chunk);
+                            // Hard cap (§8.5): a body over the hard cap returns
+                            // 413. The soft cap is gone (no replay buffer to
+                            // disable), but the hard cap still protects the
+                            // gateway from unbounded buffering.
+                            if buf.len() as u64 > self.state.proxy.max_request_body_hard {
+                                return BodyOutcome::TooLarge;
+                            }
+                        }
+                        Ok(None) => return BodyOutcome::Done,
+                        Err(_) => return BodyOutcome::ReadError,
+                    }
+                }
+            };
+            // Binding the result first ends the future's borrow of `session` and
+            // `buf` at this statement, so the arms below may move `buf`.
+            let read_result = tokio::time::timeout(budget, read).await;
+            match read_result {
+                Err(_elapsed) => {
+                    // Do NOT try to drain: the whole point is that this client is
+                    // not sending. Close.
+                    session.set_keepalive(None);
+                    warn!(
+                        tenant = %tenant_id,
+                        timeout_secs = self.state.proxy.request_body_timeout_secs,
+                        "downstream request body did not finish within the deadline; 408 + close"
+                    );
+                    return short_circuit(session, 408, "request_body_timeout").await;
+                }
+                Ok(BodyOutcome::Done) => Bytes::from(buf),
+                Ok(BodyOutcome::TooLarge) => {
                     session.set_keepalive(None);
                     let _ = session.as_downstream_mut().drain_request_body().await;
                     return short_circuit(session, 413, "request_body_too_large").await;
                 }
+                Ok(BodyOutcome::ReadError) => {
+                    session.set_keepalive(None);
+                    warn!(
+                        tenant = %tenant_id,
+                        "downstream request body read failed; refusing to forward a truncated body"
+                    );
+                    return short_circuit(session, 400, "request_body_read_error").await;
+                }
             }
-            Bytes::from(buf)
         } else {
             Bytes::new()
         };
@@ -772,13 +836,19 @@ impl ProxyHttp for HydraProxy {
         //     what routing sets); provider is unknown until routing → `None`.
         let masked = mask_key(&api_key);
         let match_ctx = MatchCtx {
+            // `api_key` (masked) drives the bucket; `api_key_raw` lets a role written with the
+            // documented RAW client key match too (see `MatchCtx::api_key_raw`).
             api_key: Some(&masked),
+            api_key_raw: Some(&api_key),
             model: model_opt.as_deref(),
             tenant: Some(&tenant_id),
             provider: None,
         };
         let now = Instant::now();
-        if let CountVerdict::Denied { role_id } = self
+        if let CountVerdict::Denied {
+            role_id,
+            retry_after,
+        } = self
             .state
             .limiter
             .check_count(&cfg.limit_roles, &match_ctx, now)
@@ -786,7 +856,13 @@ impl ProxyHttp for HydraProxy {
         {
             debug!(role = %role_id, tenant = %tenant_id, "rate-limited (count)");
             crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
-            return short_circuit(session, 429, "rate_limited").await;
+            return short_circuit_rate_limited(
+                session,
+                "rate_limited",
+                retry_after,
+                &ctx.trace_id.clone(),
+            )
+            .await;
         }
         // (7b) Pre-limit TOKEN gate (§10.3). `limit_token` used to be
         //      write-only: `add_tokens` recorded the usage in the logging phase
@@ -795,7 +871,10 @@ impl ProxyHttp for HydraProxy {
         //      only known after the response, so this is the documented
         //      next-request semantics: the request that would exceed the quota
         //      is the one that gets the 429.
-        if let CountVerdict::Denied { role_id } = self
+        if let CountVerdict::Denied {
+            role_id,
+            retry_after,
+        } = self
             .state
             .limiter
             .check_tokens(&cfg.limit_roles, &match_ctx, now)
@@ -803,21 +882,27 @@ impl ProxyHttp for HydraProxy {
         {
             debug!(role = %role_id, tenant = %tenant_id, "rate-limited (tokens)");
             crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "tokens");
-            return short_circuit(session, 429, "rate_limited").await;
+            return short_circuit_rate_limited(
+                session,
+                "rate_limited",
+                retry_after,
+                &ctx.trace_id.clone(),
+            )
+            .await;
         }
 
         // (8) Route (§6.3 §6 / §7): pure resolve + swrr.order, OR passthrough.
         let (candidates, model_for_route) = match model_opt {
             Some(m) => {
                 let model_key = m;
-                let cands = match router::resolve(
+                let outcome = match router::resolve_detailed(
                     cfg,
                     self.state.breaker.as_ref(),
                     &tenant,
                     &model_key,
                     Some(api_key.as_str()),
                 ) {
-                    Ok(c) => c,
+                    Ok(o) => o,
                     Err(e) => {
                         ctx.route_error = Some(e);
                         ctx.model_key = Some(model_key.clone());
@@ -827,7 +912,34 @@ impl ProxyHttp for HydraProxy {
                         return short_circuit(session, status, reason).await;
                     }
                 };
-                (cands, Some(model_key))
+                // Name the providers that WOULD have served this request but were
+                // dropped while the candidate set was built (`breaker_dead` /
+                // `no_key` / `invalid_weight`; a deliberate `soft_disabled` is
+                // reported by `resolve_detailed` but not counted — see
+                // `record_excluded_candidates`). Recorded on SUCCESSFUL requests too,
+                // deliberately: that is the case that used to leave no trace — a
+                // provider whose last api-key was deleted stops being chosen while
+                // the tenant's other providers keep serving, so nothing fails and
+                // `hydra_route_errors_total` (failures only, tenant-labelled) stays
+                // flat. The request's own outcome is untouched by this.
+                //
+                // NOT recorded on the model-less passthrough path: it stops at the
+                // first eligible provider, so "who else was excluded" is never
+                // computed there and a partial answer would mislead.
+                record_excluded_candidates(&outcome.excluded);
+                if outcome.candidates.is_empty() {
+                    // Every candidate was dropped in step 4. Same answer as the
+                    // historical `Err(NoAvailableProvider)` — but the counter above
+                    // now names the providers that emptied the set.
+                    let e = RouteError::NoAvailableProvider;
+                    ctx.route_error = Some(e);
+                    ctx.model_key = Some(model_key.clone());
+                    let status = route_error_status(e);
+                    let reason = route_error_reason(e);
+                    crate::admin::metrics::record_route_error(&tenant_id, reason);
+                    return short_circuit(session, status, reason).await;
+                }
+                (outcome.candidates, Some(model_key))
             }
             None => {
                 // Non-routable: no `model` field. Apply the configured strategy
@@ -890,24 +1002,31 @@ impl ProxyHttp for HydraProxy {
         let mut min_admission_wait_ms: Option<u64> = None;
         for cand in &candidates {
             let Some(provider) = cfg.providers.get(&cand.provider_id) else {
+                crate::admin::metrics::record_candidate_skipped(
+                    &cand.provider_id,
+                    "missing_config",
+                );
                 warn!(provider_id = %cand.provider_id, "candidate provider missing from config");
                 last_error = Some(format!("provider {} missing", cand.provider_id));
                 last_failure_was_admission = false;
                 continue;
             };
             let Some(endpoint) = parse_endpoint(&provider.endpoint) else {
+                crate::admin::metrics::record_candidate_skipped(&cand.provider_id, "bad_endpoint");
                 warn!(provider_id = %cand.provider_id, "candidate endpoint unparseable");
                 last_error = Some(format!("provider {} bad endpoint", cand.provider_id));
                 last_failure_was_admission = false;
                 continue;
             };
             let Some(keys) = cfg.provider_keys.get(&cand.provider_id) else {
+                crate::admin::metrics::record_candidate_skipped(&cand.provider_id, "no_key");
                 warn!(provider_id = %cand.provider_id, "candidate has no api keys");
                 last_error = Some(format!("provider {} no key", cand.provider_id));
                 last_failure_was_admission = false;
                 continue;
             };
             let Some(upstream_key) = keys.choose(&mut rand::thread_rng()) else {
+                crate::admin::metrics::record_candidate_skipped(&cand.provider_id, "no_usable_key");
                 last_failure_was_admission = false;
                 continue;
             };
@@ -1019,8 +1138,19 @@ impl ProxyHttp for HydraProxy {
                                 );
                             }
                         }
-                        self.state.breaker.on_success(&cand.provider_id);
-
+                        // `on_success` is deliberately NOT called here, at the point
+                        // the 2xx HEADERS arrive. The breaker counts CONSECUTIVE
+                        // failures and a single success clears the counter (see
+                        // `hydra_core::breaker`), so a success recorded at this line
+                        // reset the count immediately before `stream_response`
+                        // recorded the idle-cut failure a moment later — pinning the
+                        // count at 1 forever. A provider that answered `200` and then
+                        // went silent could therefore NEVER enter the dead-set, no
+                        // matter how many truncated answers it produced, even though
+                        // the idle bound exists for exactly that pathology and both
+                        // `stream_response` and `ops.md` promise it feeds the breaker.
+                        // 2026-09-29 (round 11): the evidence of health is a
+                        // COMPLETED response, so the success is recorded below.
                         if let Err(e) = self
                             .stream_response(session, ctx, resp, &tenant_id, &cand.provider_id)
                             .await
@@ -1029,6 +1159,12 @@ impl ProxyHttp for HydraProxy {
                             // already written: failover is impossible (client saw
                             // 200 + partial body). Log + close. Do NOT retry.
                             // P2-9: count it for observability.
+                            //
+                            // No `on_success` here: a failure — whether the upstream
+                            // went silent (counted inside `stream_response`) or the
+                            // CLIENT went away (deliberately not counted, so a client's
+                            // own disconnect cannot mark a provider unhealthy) — never
+                            // resets the provider's failure streak.
                             crate::admin::metrics::record_mid_stream_error(&cand.provider_id);
                             warn!(
                                 trace_id = %ctx.trace_id,
@@ -1038,6 +1174,9 @@ impl ProxyHttp for HydraProxy {
                             );
                             return Ok(true);
                         }
+                        // The body was delivered to the client in full: this is the
+                        // provider-side health evidence the breaker wants.
+                        self.state.breaker.on_success(&cand.provider_id);
                         return Ok(true);
                     } else {
                         // Non-2xx from the provider. Failover to the next
@@ -1080,8 +1219,12 @@ impl ProxyHttp for HydraProxy {
                     // proves the upstream never saw the request; anything else
                     // (a timeout, or a connection dropped after the request was
                     // written) requires the documented opt-in
-                    // (`FailoverConfig::retry_after_connect`, which was declared
-                    // and documented but read by nothing).
+                    // (`FailoverConfig::retry_after_connect`). It IS read — see the
+                    // `never_reached_upstream` branch below — and today nothing wires
+                    // it to an env var, so it holds its documented default of `false`.
+                    // If it is ever wired, `true` means "fail over even when the
+                    // request was already written", i.e. the double-billing case the
+                    // comment below describes.
                     // A connect error is the ONLY proof the upstream never saw
                     // the request. A FIRST-BYTE timeout is the opposite: the
                     // request was written, so replaying it may double-bill — it
@@ -1119,8 +1262,16 @@ impl ProxyHttp for HydraProxy {
                 }
             }
 
-            // Record a failover retry for every candidate we fall through from
-            // (Oracle correction #5). Preserves `hydra_retries_total`.
+            // Record a failover retry for the candidates we fall through from
+            // HERE (Oracle correction #5). NOT every one: the five early `continue`
+            // paths above (provider missing its config, unparseable endpoint, no
+            // api-key, `keys.choose` returning None) leave the loop without reaching
+            // this line, and so does the 502 short-circuit. Those are "skipped
+            // candidates", not "retried the request", which is why they are not
+            // counted here — but the counter's documented meaning ("failover
+            // retries") is therefore narrower than a reader would assume, and
+            // whether the skips deserve their own counter is an open question
+            // (batch 6).
             if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
                 crate::admin::metrics::record_retry(&t.id, m, "terminate_loop");
             } else if let Some(t) = ctx.tenant.as_ref() {
@@ -1318,8 +1469,13 @@ impl ProxyHttp for HydraProxy {
                 tokens_out: usage.as_ref().and_then(|u| u.tokens_out),
                 cache_hit_tokens: usage.as_ref().and_then(|u| u.cache_hit_tokens),
                 latency_ms,
-                forward_latency_ms: Some(ctx.forward_latency_ms.unwrap_or(0)),
-                ttft_ms: Some(ctx.ttft_ms.unwrap_or(0)),
+                // Passed through as `Option`: "not measured" must stay NULL. The token
+                // fields below already follow that rule ("a provider that does not
+                // report a dimension must not masquerade as a zero count"), and writing
+                // 0 here made a NON-streaming 2xx indistinguishable from a first byte
+                // that arrived in under a millisecond.
+                forward_latency_ms: ctx.forward_latency_ms,
+                ttft_ms: ctx.ttft_ms,
                 upstream_host: ctx.upstream_host.clone(),
                 error: _e.map(|e| e.to_string()),
                 trace_id: ctx.trace_id.clone(),
@@ -1332,9 +1488,21 @@ impl ProxyHttp for HydraProxy {
         // Token-window accounting in the logging phase (§10.3). The limiter
         // needs a single total-token quantity; derive it locally from the
         // neutral fields (the metering record stores no derived total).
+        // `saturating_add`, not `+`: both operands are u64 straight out of the
+        // upstream's own JSON, and there is no `[profile]` setting
+        // `overflow-checks` in this workspace, so a release build WRAPS. An
+        // upstream (or a rewritten OpenAI-compatible gateway) reporting
+        // `tokens_in: u64::MAX` would then make the total come out near zero and
+        // the request would consume almost no token budget — quota and billing
+        // bypassed, in the fail-open direction. Saturation instead charges the
+        // whole budget, which is the safe side.
         let total = usage
             .as_ref()
-            .map(|u| u.tokens_in.unwrap_or(0) + u.tokens_out.unwrap_or(0))
+            .map(|u| {
+                u.tokens_in
+                    .unwrap_or(0)
+                    .saturating_add(u.tokens_out.unwrap_or(0))
+            })
             .unwrap_or(0);
         if total > 0 {
             if let (Some(tenant), Some(sel), Some(model)) = (
@@ -1345,14 +1513,24 @@ impl ProxyHttp for HydraProxy {
                 let masked = ctx.client_api_key.as_ref().map(|k| mask_key(k));
                 let match_ctx = MatchCtx {
                     api_key: masked.as_deref(),
+                    api_key_raw: ctx.client_api_key.as_deref(),
                     model: Some(model),
                     tenant: Some(&tenant.id),
                     provider: Some(&sel.provider_id),
                 };
-                let cfg = self.state.store.snapshot();
+                // The generation the GATES used, not whatever is current now. Falls back to the
+                // fresh snapshot only for callers that never pinned one (none in the request path).
+                let cfg_now;
+                let roles: &[hydra_core::model::LimitRole] = match ctx.cfg.as_deref() {
+                    Some(pinned) => &pinned.limit_roles,
+                    None => {
+                        cfg_now = self.state.store.snapshot();
+                        &cfg_now.limit_roles
+                    }
+                };
                 self.state
                     .limiter
-                    .add_tokens(&cfg.limit_roles, &match_ctx, total, Instant::now())
+                    .add_tokens(roles, &match_ctx, total, Instant::now())
                     .await;
             }
         }
@@ -1377,7 +1555,7 @@ impl HydraProxy {
         ctx: &mut RequestContext,
         mut resp: reqwest::Response,
         _tenant_id: &str,
-        _provider_id: &str,
+        provider_id: &str,
     ) -> PingoraResult<()> {
         // Build the downstream response header from the upstream status.
         let status = resp.status().as_u16();
@@ -1423,12 +1601,39 @@ impl HydraProxy {
         // TTFT (Time To First Token): elapsed from request start → the first
         // response chunk received from the provider. Captured once on the first
         // chunk (design §9.1).
+        //
+        // Every read is wrapped in the body IDLE bound. This is the replacement
+        // for the upstream client's former 300 s *total* deadline, which cut
+        // every generation longer than 300 s in half (HTTP 200 + partial SSE,
+        // billed in full). An idle window cannot do that: a stream that keeps
+        // producing tokens resets it on each chunk, while an upstream that goes
+        // silent mid-answer is cut after the window instead of holding a worker
+        // forever.
+        let idle = Duration::from_secs(self.state.proxy.upstream_stream_idle_timeout_secs);
         let mut first_chunk = true;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| pingora_err(format!("upstream stream read error: {e}")))?
-        {
+        loop {
+            let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                // Clean end of body.
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    return Err(pingora_err(format!("upstream stream read error: {e}")));
+                }
+                Err(_elapsed) => {
+                    crate::admin::metrics::record_upstream_stream_idle_timeout(provider_id);
+                    // This IS provider-side evidence: the upstream accepted the
+                    // request, started answering and then went silent for the whole
+                    // window. (The generic mid-stream path below deliberately does
+                    // NOT feed the breaker — a downstream write failure usually
+                    // means the CLIENT went away, which must not mark a provider
+                    // unhealthy. Silence from the upstream has no such ambiguity.)
+                    self.state.breaker.on_failure(provider_id);
+                    return Err(pingora_err(format!(
+                        "upstream sent no body byte for {}s mid-stream; closing",
+                        self.state.proxy.upstream_stream_idle_timeout_secs
+                    )));
+                }
+            };
             if first_chunk {
                 first_chunk = false;
                 ctx.ttft_ms = Some(ctx.started_at.elapsed().as_millis() as u64);
@@ -1510,6 +1715,35 @@ async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> Ping
     Ok(true)
 }
 
+/// Like [`short_circuit`], but with the `Retry-After` header `ops.md` §4.2 promises on a
+/// `limit_roles` 429: "A `429` returns `Retry-After` reflecting the remainder of the
+/// current window". Measured 2026-09-30: the header was missing entirely, so a client
+/// following the document had nothing to sleep on and would retry straight into another
+/// 429. `wait` is the denying window's remaining time (already computed by the limiter).
+async fn short_circuit_rate_limited(
+    session: &mut Session,
+    reason: &str,
+    wait: Option<Duration>,
+    trace_id: &str,
+) -> PingoraResult<bool> {
+    let body = Bytes::from(format!(
+        "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"proxy_error\"}}}}"
+    ));
+    session.set_keepalive(None);
+    // Round UP to whole seconds and never send 0: `Retry-After: 0` invites an immediate
+    // retry, which is exactly the stampede the window exists to stop.
+    let secs = wait.map(|w| w.as_secs().max(1)).unwrap_or(1);
+    let mut resp_header = ResponseHeader::build(429, Some(3))?;
+    resp_header.insert_header("Content-Type", "application/json")?;
+    resp_header.insert_header("Retry-After", secs.to_string())?;
+    resp_header.insert_header("X-Hydra-Trace-Id", trace_id)?;
+    session
+        .write_response_header(Box::new(resp_header), false)
+        .await?;
+    session.write_response_body(Some(body), true).await?;
+    Ok(true)
+}
+
 /// Build a degenerate single-candidate list for **passthrough** requests (no
 /// `model` field, `NonRouteStrategy::Passthrough`): the tenant's first live,
 /// non-dead provider with weight > 0 and at least one api-key. In terminate
@@ -1559,6 +1793,9 @@ fn passthrough_candidates(
         let Some(provider) = cfg.providers.get(pid) else {
             continue;
         };
+        // `<= 0`: a deliberate soft-disable (`0`) or an invalid weight (`< 0`) —
+        // both unroutable; this path stops at the first eligible provider and does
+        // not attribute the drops (see `record_excluded_candidates`).
         if provider.weight <= 0 {
             continue;
         }
@@ -1575,6 +1812,29 @@ fn passthrough_candidates(
         }]);
     }
     None
+}
+
+/// Record one `hydra_candidate_skipped_total` per provider that candidate
+/// resolution dropped, so "which provider went quiet" is answerable.
+///
+/// The reasons are the selection family (`breaker_dead` | `no_key` |
+/// `invalid_weight` — `soft_disabled` is deliberately skipped, below); the
+/// failover loop records its own, defensive reasons on the same counter (see
+/// `admin::metrics::record_candidate_skipped`).
+fn record_excluded_candidates(excluded: &[ExcludedCandidate]) {
+    for ex in excluded {
+        // `soft_disabled` (weight == 0) is a SUPPORTED, deliberate action — the
+        // configuration is kept and routing is stopped on purpose (`ops.md`
+        // documents it). Counting it per request would make this series track
+        // TRAFFIC rather than degradation, and an `increase(...) > 0` rule would
+        // fire forever on a fleet configured exactly as intended. So it is
+        // deliberately not counted; `invalid_weight` (weight < 0), which
+        // `config::validate` already warns can never be selected, is.
+        if ex.reason == ExclusionReason::SoftDisabled {
+            continue;
+        }
+        crate::admin::metrics::record_candidate_skipped(&ex.provider_id, ex.reason.as_str());
+    }
 }
 
 /// Map a [`RouteError`] to its HTTP status (design §7.3).
@@ -1762,6 +2022,11 @@ mod tests {
     /// wiring regression: if the first argument were switched to the RESOLVED
     /// host (`request_host`, which returns `Host` whenever it is present), the
     /// counter would never increment and a copy-based test would still pass.
+    // Gated exactly like the test it serves: without a TLS backend there is no
+    // `tls.rs` counter to drive, so this helper would be dead code — and under
+    // the CI style (`-D warnings`) dead code is an ERROR. Gating the test but not
+    // its helper made `--features hydra-server/proxy` fail to lint.
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
     fn note_for(host: Option<&str>, uri: Option<&str>) {
         HydraProxy::note_host_authority(&header(host, uri));
     }

@@ -329,7 +329,7 @@ async fn send_write(
 /// leader's verdict.
 #[tokio::test]
 async fn edge_write_forwards_to_lease_holding_leader_and_lands() {
-    let pool = common::real_redis_pool(47).await;
+    let pool = common::real_redis_pool(57).await;
 
     // The leader: a real AdminService holding the lease, seeded for `t1`.
     let leader = leader_state().await;

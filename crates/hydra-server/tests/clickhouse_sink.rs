@@ -169,15 +169,105 @@ fn clickhouse_json_row_escapes_special_chars() {
 // ---------------------------------------------------------------------------
 
 /// Constructs the sink, pushes a batch (batch_size=2 → immediate flush), and
-/// drops it. Verify manually with:
-///   `clickhouse-client -q "SELECT count(), sum(latency_ms) FROM usage_record"`
+/// drops it — then DOES query ClickHouse and assert the rows landed.
+///
+/// The previous version asserted only "no panic + graceful drop", so it could
+/// not fail for the reason it exists: a sink that silently wrote nothing passed.
+///
+/// It also pins the retry-idempotency fix: the sink sends a stable
+/// `insert_deduplication_token` per batch, and the table carries
+/// `non_replicated_deduplication_window`, so re-sending a batch IS a no-op. The
+/// second half of the test proves that end to end on the live instance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a real ClickHouse at CH_URL (e.g. http://127.0.0.1:8123)"]
 async fn clickhouse_sink_writes_batch() {
     let url = std::env::var("CH_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".to_string());
+    let client = reqwest::Client::new();
+
+    let count = |client: reqwest::Client, url: String| async move {
+        let body = client
+            .post(&url)
+            .body("SELECT count() FROM usage_record")
+            .send()
+            .await
+            .expect("count query")
+            .text()
+            .await
+            .expect("count body");
+        body.trim().parse::<u64>().expect("count is a number")
+    };
+
+    let before = count(client.clone(), url.clone()).await;
+
     let sink = ClickHouseSink::new(&url, 2, 1);
     sink.record(sample()).await;
     sink.record(sample()).await;
+    // Drop flushes; give the one-shot flush a moment to finish.
     drop(sink);
-    // No ClickHouse query client available here; assert no panic + graceful drop.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let after = count(client.clone(), url.clone()).await;
+    assert_eq!(
+        after,
+        before + 2,
+        "the sink must actually INSERT both records (was {before}, now {after})"
+    );
+
+    // Retry idempotency: one batch re-sent verbatim (same dedup token) must not
+    // add rows. This is the shape of "the response was lost after the insert
+    // committed" — the case that used to double-count usage and billing.
+    // UNIQUE per run. A fixed token would make the SECOND run of this test see
+    // the first run's rows (the dedup window is exactly what makes re-sending a
+    // no-op), so the assertion would fail on a re-run — an acceptance test that
+    // can only pass once is worse than none.
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tenant = format!("dedup_probe_{run_id}");
+    let stmt = format!(
+        "INSERT INTO usage_record (tenant_id, provider_id, model_key, \
+         status_code, tokens_in, tokens_out, latency_ms, created_at) \
+         SETTINGS insert_deduplication_token='hydra-dedup-{run_id}' FORMAT JSONEachRow"
+    );
+    let row = format!(
+        r#"{{"tenant_id":"{tenant}","provider_id":"p","model_key":"m","status_code":200,"tokens_in":1,"tokens_out":1,"latency_ms":1,"created_at":"2026-09-29T00:00:00Z"}}"#
+    );
+    let payload = format!("{stmt}\n{row}\n");
+    for attempt in 1..=2 {
+        let status = client
+            .post(&url)
+            .body(payload.clone())
+            .send()
+            .await
+            .expect("dedup insert")
+            .status();
+        assert!(
+            status.is_success(),
+            "attempt {attempt} must be accepted by ClickHouse, got {status}"
+        );
+    }
+    let probe = client
+        .post(&url)
+        .body(format!(
+            "SELECT count() FROM usage_record WHERE tenant_id = '{tenant}'"
+        ))
+        .send()
+        .await
+        .expect("probe count")
+        .text()
+        .await
+        .expect("probe body");
+    assert_eq!(
+        probe.trim(),
+        "1",
+        "a batch re-sent with the SAME insert_deduplication_token must not add a \
+         second row; a `2` here means the table is missing \
+         `non_replicated_deduplication_window` (fresh installs get it from \
+         environment/clickhouse/init.sql; existing ones need the ALTER in ops.md)"
+    );
 }

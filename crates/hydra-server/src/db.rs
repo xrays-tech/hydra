@@ -71,6 +71,31 @@ pub async fn run_migrate(pool: &SqlitePool) -> Result<(), MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
 }
 
+/// Begin a transaction that takes SQLite's **write lock immediately**
+/// (`BEGIN IMMEDIATE`) — use this for EVERY transaction that reads before it
+/// writes, which is all of them here.
+///
+/// Why this exists: SQLite's plain `BEGIN` is DEFERRED. The transaction starts as
+/// a reader and upgrades to a writer on its first write. Under WAL, if any other
+/// connection commits between this transaction's first read and that upgrade,
+/// the upgrade fails immediately with `SQLITE_BUSY` **without consulting
+/// `busy_timeout`** — the reader's snapshot is stale, so waiting cannot help.
+/// `init_pool` sets `busy_timeout(5000)`, but for a read-then-write transaction
+/// that timeout never got a chance to apply: a perfectly ordinary concurrent
+/// write (a usage-sink flush, another admin write) turned one of the two into a
+/// `500 database_error`, and the "PUT-upsert converges at the quota boundary"
+/// contract in `admin::sub_tenant_write` into a coin flip.
+///
+/// `BEGIN IMMEDIATE` asks for the write lock up front, where `busy_timeout` DOES
+/// apply, so concurrent writers queue instead of colliding. The cost is that
+/// writers serialize a little earlier; for a config-plane workload (a handful of
+/// admin writes against a pool of 8) that is the correct trade.
+pub async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 // ---------------------------------------------------------------------------
 // Row structs (mirror SQLite types) + conversions to core entities.
 // ---------------------------------------------------------------------------
@@ -578,7 +603,7 @@ pub async fn upsert_provider_key(
 ) -> Result<(), sqlx::Error> {
     let sealed = kp.seal(k.api_key.as_bytes()).map_err(crypto_to_sqlx)?;
     let nonce: &[u8] = &sealed.nonce;
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
     sqlx::query!("DELETE FROM provider_key WHERE id = ?", k.id)
         .execute(&mut *tx)
         .await?;
@@ -795,7 +820,7 @@ pub async fn write_tenant(
     let t = w.tenant;
     let cert_key = non_empty_path(t.cert_key.as_deref());
     let cert_file = non_empty_path(t.cert_file.as_deref());
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
 
     if w.is_create {
         sqlx::query!(
@@ -1641,7 +1666,8 @@ where
 // Sub-tenant / route write helpers (sub-tenant v2, D4/D5)
 //
 // Executor-generic so the transactional write core can call them inside a
-// `pool.begin()` transaction (passing `&mut *tx`). All use **runtime**
+// `begin_write` transaction (passing `&mut *tx`) — see [`begin_write`] for why
+// every transaction in this crate is `BEGIN IMMEDIATE`. All use **runtime**
 // `sqlx::query` / `query_as` (no `.sqlx/` refresh).
 // ---------------------------------------------------------------------------
 
@@ -1821,13 +1847,43 @@ pub async fn upsert_sub_tenant_route_by_key(
 // half-config. It uses runtime-checked `sqlx::query` (like the sinks): the
 // statements run against a live migration-pinned DB and the tables are tiny.
 
-/// The stored last-applied config version (`None` when never set).
-pub async fn get_config_version(pool: &SqlitePool) -> Result<Option<u64>, sqlx::Error> {
+/// The stored last-applied config version, in three states — see
+/// [`ConfigVersion`] (this replaced an `Option<u64>` that could not tell
+/// "never set" from "corrupt").
+///
+/// `Absent` (no row) and `Corrupt` (a row whose value is not a number) are
+/// different facts that call for different safe responses. Collapsing them —
+/// which a bare `value.parse().ok()` did — turned a corrupted watermark into
+/// "never set", and "never set" plus an empty replica evaluates to
+/// `replica_is_current(.., 0) == true`: a node that cannot prove it holds the
+/// current config could be judged fresh and win the leader lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigVersion {
+    /// No marker row at all: a brand-new DB, or one predating migration 0008.
+    Absent,
+    /// A parsed watermark.
+    Value(u64),
+    /// A row exists but its value is not a `u64` (hand edit, partial import,
+    /// truncated restore). Carries the raw text so the warning can quote what an
+    /// operator has to look at.
+    Corrupt(String),
+}
+
+/// Read the config watermark ([`ConfigVersion`] — see why it is three-state).
+pub async fn get_config_version(pool: &SqlitePool) -> Result<ConfigVersion, sqlx::Error> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT value FROM config_meta WHERE key = 'config_version'")
             .fetch_optional(pool)
             .await?;
-    Ok(row.and_then(|(v,)| v.parse().ok()))
+    Ok(match row {
+        None => ConfigVersion::Absent,
+        // Surrounding whitespace is tolerated (a `sqlite3` hand-edit almost
+        // always adds a newline); anything else unparseable is Corrupt.
+        Some((v,)) => match v.trim().parse::<u64>() {
+            Ok(n) => ConfigVersion::Value(n),
+            Err(_) => ConfigVersion::Corrupt(v),
+        },
+    })
 }
 
 /// Whether the config tables hold ANY row.
@@ -1852,6 +1908,224 @@ pub async fn config_content_exists(pool: &SqlitePool) -> Result<bool, sqlx::Erro
     .fetch_one(pool)
     .await?;
     Ok(row.0 != 0)
+}
+
+/// What a re-seal pass did (see [`reseal_secrets`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResealReport {
+    /// Provider api-keys rewritten under the current key version.
+    pub provider_keys_resealed: usize,
+    /// Tenant certificate private keys rewritten under the current key version.
+    pub tenant_certs_resealed: usize,
+    /// Rows already at the current version (nothing to do).
+    pub already_current: usize,
+    /// Rows that could NOT be opened (unknown version / wrong key), left
+    /// untouched. Non-empty means the rotation is INCOMPLETE.
+    pub failed: Vec<String>,
+}
+
+impl ResealReport {
+    /// True when every stored secret now opens under the current key version.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Re-encrypt every stored secret under the provider's CURRENT key version.
+///
+/// This is the missing half of master-key rotation. Before it existed, changing
+/// `HYDRA_ENCRYPTION_KEY` made every ciphertext unopenable, so
+/// `ConfigStore::load` failed and the process refused to start — and the admin
+/// API that could have re-entered the keys needs that same process, so there was
+/// no way back in short of editing the database by hand.
+///
+/// The procedure is: start once with the new key as
+/// `HYDRA_ENCRYPTION_KEY` (+ `HYDRA_ENCRYPTION_KEY_VERSION`), the old key as
+/// `HYDRA_ENCRYPTION_KEY_PREVIOUS` (+ `..._PREVIOUS_VERSION`) and
+/// `HYDRA_RESEAL_SECRETS=1`. Every row is read AND rewritten inside ONE write
+/// transaction, then the previous key can be dropped. Rows that cannot be opened
+/// are REPORTED and left alone (never silently rewritten with garbage), and the
+/// caller must exit non-zero so nobody believes an incomplete rotation succeeded.
+///
+/// Reads happen through the transaction on purpose: reading them from the pool
+/// first would (a) read a different snapshot than the one being written and
+/// (b) deadlock on a single-connection pool (`:memory:` in tests), which is how
+/// this was caught.
+pub async fn reseal_secrets(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<ResealReport, sqlx::Error> {
+    let mut report = ResealReport::default();
+    let current = kp.version();
+
+    let mut tx = begin_write(pool).await?;
+
+    // ---- provider api-keys -------------------------------------------------
+    let rows: Vec<(String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT id, api_key_ciphertext, api_key_nonce, key_version FROM provider_key ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, ct, nonce, version) in rows {
+        // A row whose version already equals the current one is NOT automatically
+        // "already current". The version is an INDEPENDENT knob from the key
+        // MATERIAL: rotate the key and forget to bump
+        // `HYDRA_ENCRYPTION_KEY_VERSION` and every row still carries the old
+        // number while the ring's slot for that number now holds different bytes.
+        // Counting such a row as fine (and exiting 0) is the worst outcome in this
+        // file, because the operator's next step is to delete the only key that can
+        // open it — after which the process refuses to start with no way back. So
+        // the claim is VERIFIED: the row must actually open under the current key,
+        // which is what "already current" is supposed to mean.
+        let version = version as u32;
+        if version == current {
+            match <[u8; crypto::NONCE_LEN]>::try_from(nonce.as_slice()) {
+                Ok(nonce) => {
+                    let sealed = Sealed {
+                        ciphertext: ct,
+                        nonce,
+                        key_version: version,
+                    };
+                    if kp.open(&sealed).is_ok() {
+                        report.already_current += 1;
+                        continue;
+                    }
+                    report.failed.push(format!(
+                        "provider_key {id}: labelled key_version {version} (the CURRENT \
+                         version) but it does NOT open under the current key — the key was \
+                         most likely rotated without bumping HYDRA_ENCRYPTION_KEY_VERSION. \
+                         Do NOT delete the previous key until this is resolved"
+                    ));
+                }
+                Err(_) => report
+                    .failed
+                    .push(format!("provider_key {id}: nonce has the wrong length")),
+            }
+            continue;
+        }
+        let Ok(nonce) = <[u8; crypto::NONCE_LEN]>::try_from(nonce.as_slice()) else {
+            report
+                .failed
+                .push(format!("provider_key {id}: nonce has the wrong length"));
+            continue;
+        };
+        let sealed = Sealed {
+            ciphertext: ct,
+            nonce,
+            key_version: version,
+        };
+        match kp.open(&sealed) {
+            Ok(plaintext) => match kp.seal(&plaintext) {
+                Ok(fresh) => {
+                    sqlx::query(
+                        "UPDATE provider_key SET api_key_ciphertext = ?, api_key_nonce = ?, \
+                         key_version = ? WHERE id = ?",
+                    )
+                    .bind(&fresh.ciphertext)
+                    .bind(fresh.nonce.to_vec())
+                    .bind(i64::from(fresh.key_version))
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                    report.provider_keys_resealed += 1;
+                }
+                Err(e) => report
+                    .failed
+                    .push(format!("provider_key {id}: seal failed: {e}")),
+            },
+            Err(e) => report.failed.push(format!(
+                "provider_key {id}: cannot open key_version {version}: {e}"
+            )),
+        }
+    }
+
+    // ---- tenant certificate private keys ----------------------------------
+    let cert_rows: Vec<(String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT id, cert_key_ciphertext, cert_key_nonce, cert_key_version FROM tenant \
+         WHERE cert_key_ciphertext IS NOT NULL AND cert_key_nonce IS NOT NULL \
+           AND cert_key_version IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, ct, nonce, version) in cert_rows {
+        // A row whose version already equals the current one is NOT automatically
+        // "already current". The version is an INDEPENDENT knob from the key
+        // MATERIAL: rotate the key and forget to bump
+        // `HYDRA_ENCRYPTION_KEY_VERSION` and every row still carries the old
+        // number while the ring's slot for that number now holds different bytes.
+        // Counting such a row as fine (and exiting 0) is the worst outcome in this
+        // file, because the operator's next step is to delete the only key that can
+        // open it — after which the process refuses to start with no way back. So
+        // the claim is VERIFIED: the row must actually open under the current key,
+        // which is what "already current" is supposed to mean.
+        let version = version as u32;
+        if version == current {
+            match <[u8; crypto::NONCE_LEN]>::try_from(nonce.as_slice()) {
+                Ok(nonce) => {
+                    let sealed = Sealed {
+                        ciphertext: ct,
+                        nonce,
+                        key_version: version,
+                    };
+                    if kp.open(&sealed).is_ok() {
+                        report.already_current += 1;
+                        continue;
+                    }
+                    report.failed.push(format!(
+                        "tenant {id} cert: labelled key_version {version} (the CURRENT \
+                         version) but it does NOT open under the current key — the key was \
+                         most likely rotated without bumping HYDRA_ENCRYPTION_KEY_VERSION. \
+                         Do NOT delete the previous key until this is resolved"
+                    ));
+                }
+                Err(_) => report
+                    .failed
+                    .push(format!("tenant {id} cert: nonce has the wrong length")),
+            }
+            continue;
+        }
+        let Ok(nonce) = <[u8; crypto::NONCE_LEN]>::try_from(nonce.as_slice()) else {
+            report
+                .failed
+                .push(format!("tenant {id} cert: nonce has the wrong length"));
+            continue;
+        };
+        let sealed = Sealed {
+            ciphertext: ct,
+            nonce,
+            key_version: version,
+        };
+        match kp.open(&sealed) {
+            Ok(plaintext) => match kp.seal(&plaintext) {
+                Ok(fresh) => {
+                    sqlx::query(
+                        "UPDATE tenant SET cert_key_ciphertext = ?, cert_key_nonce = ?, \
+                         cert_key_version = ? WHERE id = ?",
+                    )
+                    .bind(&fresh.ciphertext)
+                    .bind(fresh.nonce.to_vec())
+                    .bind(i64::from(fresh.key_version))
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                    report.tenant_certs_resealed += 1;
+                }
+                Err(e) => report
+                    .failed
+                    .push(format!("tenant {id} cert: seal failed: {e}")),
+            },
+            Err(e) => report.failed.push(format!(
+                "tenant {id} cert: cannot open key_version {version}: {e}"
+            )),
+        }
+    }
+
+    // One commit for both tables: a re-seal that failed halfway would leave the
+    // rotation in a state where neither "before" nor "after" is true of the whole
+    // DB, which is exactly what an operator cannot reason about.
+    tx.commit().await?;
+    Ok(report)
 }
 
 /// Persist the last-applied config version (upsert).

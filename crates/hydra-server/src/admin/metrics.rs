@@ -32,7 +32,7 @@
 //! | `hydra_auth_cache_size` | gauge | — | proxy `request_filter` |
 //! | `hydra_breaker_dead` | gauge | provider | breaker transitions |
 //! | `hydra_breaker_state_transitions_total` | counter | provider, to | breaker `on_failure`/`on_success` |
-//! | `hydra_limit_rejected_total` | counter | tenant, role, dim | proxy `request_filter` (429) |
+//! | `hydra_limit_rejected_total` | counter | tenant, role, dim | proxy `request_filter` (429). **`dim` is `count` or `tokens`** (measured 2026-09-30: the plural is the real value, so a rule written on `dim="token"` would never fire) |
 //! | `hydra_sni_host_mismatch_total` | counter | — | `tls::note_sni_host_mismatch` (W4b) |
 //! | `hydra_route_errors_total` | counter | tenant, reason | proxy `request_filter` (route err) |
 //! | `hydra_ttft_seconds` | histogram | tenant, provider, model | proxy `logging` (time to first token) |
@@ -43,15 +43,23 @@
 //! | `hydra_queue_wait_seconds` | histogram | provider | admission module (permit-acquired) |
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
+//! | `hydra_admission_limits_stale_total` | counter | provider | admission module (requests admitted under limits a configuration change has not applied — restart needed, plan §2bi / D-14) |
 //! | `hydra_config_snapshot_stale` | gauge | — | `admin::reload_best_effort` (1 = last reload failed, snapshot stale) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
+//! | `hydra_candidate_skipped_total` | counter | provider, reason | candidates dropped before any attempt — SELECTION (breaker_dead \| no_key; deliberate soft-disables are NOT counted, invalid_weight cannot occur) and the defensive failover-loop set (missing_config \| bad_endpoint \| no_key \| no_usable_key) |
 //! | `hydra_registry_nodes` | gauge | state | node registry reaper (alive\|dead rows) |
 //! | `hydra_registry_reaped_total` | counter | — | node registry reaper (stale rows removed) |
 //! | `hydra_listener_tenant_certs` | gauge | — | `tls::follow_snapshot` (certs in the current snapshot) |
 //! | `hydra_upstream_first_byte_timeout_total` | counter | provider | proxy send path (upstream accepted, then sent no headers within the bound) |
+//! | `hydra_upstream_stream_idle_timeout_total` | counter | provider | proxy stream path (upstream sent headers, then no body byte within the idle bound) |
+//! | `hydra_invalidation_trimmed_total` | counter | — | invalidation stream trim task (entries dropped; whether or not a bump was needed) |
+//! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ every node clears its auth cache) |
+//! | `hydra_replica_materialize_retries_total` | counter | outcome | replica materialization retries (attempt|succeeded|failed|throttled) |
+//! | `hydra_auth_cache_clear_total` | counter | layer,result | whole-cache clears (layer=l1|l2, result=ok|partial|error) |
+//! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -137,12 +145,16 @@ struct Metrics {
     queue_wait: HistogramVec,
     /// Queue drops (denied acquire) by reason.
     queue_drops: IntCounterVec,
+    /// Requests admitted under a gate whose limits are stale (config changed, restart
+    /// needed) — see `record_admission_limits_stale` and plan §2bi / D-14.
+    admission_limits_stale: IntCounterVec,
     /// Admission decisions by outcome.
     admission_decisions: IntCounterVec,
     // ── Mid-stream observability (P2-9) ─────────────────────────────────
     /// Mid-stream errors: a chunk read/write failed AFTER the 200 + first
     /// chunk was already sent to the client (failover impossible).
     mid_stream_errors: IntCounterVec,
+    candidate_skipped: IntCounterVec,
     /// 1 = the last post-write `reload_all` failed and the in-memory
     /// snapshot is stale (later admin writes may have silently not taken
     /// effect). Alert on this (audit §3.14).
@@ -154,6 +166,33 @@ struct Metrics {
     /// Control-channel poll outcomes (result=ok|error).
     control_poll: IntCounterVec,
     /// Last config snapshot version applied (edge/standby).
+    /// Entries dropped from the invalidation stream by the trim task, whether or
+    /// not a generation bump was needed.
+    ///
+    /// With `invalidation_generation_bumps_total` this separates "we are trimming
+    /// steadily because the fleet is busy" from "we are dropping events somebody
+    /// had not read" — the two used to be the same event, and the whole chain was
+    /// invisible.
+    /// Replica materialization retries by outcome. `failed` non-zero with
+    /// `throttled` growing means a node that cannot materialize (and therefore
+    /// cannot lead) — the state that used to be both permanent and invisible.
+    /// Whole-cache auth-cache clears, by layer and result. A `partial`/`error`
+    /// on the L2 is the state that leaves revoked keys served until their allow
+    /// TTL expires — previously only a `warn!` line, while
+    /// `hydra_auth_cache_size` was set to 0 and claimed the cache was empty.
+    /// Failed admin-token attempts by outcome. Before this existed the admin
+    /// gate had no counter at all and logged at `debug!` (filtered out at the
+    /// shipped `RUST_LOG=info`), so a brute-force run against the single secret
+    /// gating every provider key was completely invisible.
+    admin_auth_failures: IntCounterVec,
+    auth_cache_clears: IntCounterVec,
+    replica_materialize_retries: IntCounterVec,
+    invalidation_trimmed: IntCounter,
+    /// Trims that dropped an entry a LIVE consumer had not applied. Each one
+    /// makes every node clear its whole auth cache (L1+L2), so a non-zero rate
+    /// here means real convergence loss — or an event rate above
+    /// `maxlen / trim_interval` with a consumer that cannot keep up.
+    invalidation_generation_bumps: IntCounter,
     control_snapshot_version: IntGauge,
     // ── Downstream listener topology (审核四 P4) ─────────────────────────
     /// 1 = the configured listener was verified to accept connections at
@@ -169,6 +208,15 @@ struct Metrics {
     /// Without this, the first-byte path returned before any counter was
     /// incremented, so an alert row written against it could never fire.
     upstream_first_byte_timeouts: IntCounterVec,
+    /// Upstream streaming responses whose BODY stalled mid-stream: headers (or
+    /// earlier chunks) arrived, then no byte for the whole
+    /// `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` window.
+    ///
+    /// This is the bound on the body now that the client-level total timeout is
+    /// gone (it used to truncate every generation longer than 300 s), so it
+    /// needs its own series: otherwise a wedged upstream is indistinguishable
+    /// from one that simply closed early.
+    upstream_stream_idle_timeouts: IntCounterVec,
     /// Tenant certificates currently in the config snapshot. Together with
     /// `hydra_listener_bound{protocol="tls"}` this makes "certificates are
     /// configured but no TLS listener is bound" ALERTABLE instead of a log line.
@@ -379,6 +427,14 @@ fn metrics() -> Option<&'static Metrics> {
                 LATENCY_BUCKETS.to_vec()
             )
             .ok()?,
+            admission_limits_stale: register_int_counter_vec!(
+                "hydra_admission_limits_stale_total",
+                "Requests admitted while a provider's admission limits were STALE (the gate \
+                 is not resized on hot-reload; the configured limits take effect after a \
+                 restart)",
+                &["provider"]
+            )
+            .ok()?,
             queue_drops: register_int_counter_vec!(
                 "hydra_queue_drops_total",
                 "Admission denials (queue full / timeout / closed)",
@@ -398,6 +454,12 @@ fn metrics() -> Option<&'static Metrics> {
                 &["provider"]
             )
             .ok()?,
+            candidate_skipped: register_int_counter_vec!(
+                "hydra_candidate_skipped_total",
+                "Candidates dropped before any attempt, per provider: selection (breaker_dead|no_key; deliberate weight-0 soft-disables are not counted, and invalid_weight cannot occur: the schema forbids weight < 0) or the defensive failover-loop set (missing_config|bad_endpoint|no_key|no_usable_key)",
+                &["provider", "reason"]
+            )
+            .ok()?,
             usage_dropped: register_int_counter_vec!(
                 "hydra_usage_records_dropped_total",
                 "Usage records dropped by the sink (reason=channel_full|channel_closed|retention_cap)",
@@ -414,6 +476,34 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_control_poll_total",
                 "Control-channel poll outcomes (result=ok|error)",
                 &["result"]
+            )
+            .ok()?,
+            admin_auth_failures: register_int_counter_vec!(
+                "hydra_admin_auth_failures_total",
+                "Failed credential attempts on the admin port, by gate and outcome (admin|cluster _denied|_throttled)",
+                &["result"]
+            )
+            .ok()?,
+            auth_cache_clears: register_int_counter_vec!(
+                "hydra_auth_cache_clear_total",
+                "Whole-cache auth-cache clears (layer=l1|l2, result=ok|partial|error)",
+                &["layer", "result"]
+            )
+            .ok()?,
+            replica_materialize_retries: register_int_counter_vec!(
+                "hydra_replica_materialize_retries_total",
+                "Replica materialization retries by outcome (attempt|succeeded|failed|throttled)",
+                &["outcome"]
+            )
+            .ok()?,
+            invalidation_trimmed: register_int_counter!(
+                "hydra_invalidation_trimmed_total",
+                "Invalidation stream entries dropped by the trim task"
+            )
+            .ok()?,
+            invalidation_generation_bumps: register_int_counter!(
+                "hydra_invalidation_generation_bumps_total",
+                "Trims that dropped an entry a live consumer had not applied (whole-fleet cache clear)"
             )
             .ok()?,
             control_snapshot_version: register_int_gauge!(
@@ -437,6 +527,12 @@ fn metrics() -> Option<&'static Metrics> {
             upstream_first_byte_timeouts: register_int_counter_vec!(
                 "hydra_upstream_first_byte_timeout_total",
                 "Upstream attempts that connected but sent no response headers within the bound",
+                &["provider"]
+            )
+            .ok()?,
+            upstream_stream_idle_timeouts: register_int_counter_vec!(
+                "hydra_upstream_stream_idle_timeout_total",
+                "Upstream streaming responses that sent no body byte within the idle bound",
                 &["provider"]
             )
             .ok()?,
@@ -565,6 +661,24 @@ pub fn record_tenant_api_request(endpoint: &str, status: u16) {
         m.tenant_api_requests
             .with_label_values(&[endpoint, &status.to_string()])
             .inc();
+    }
+}
+
+/// Current value of `hydra_tenant_api_requests_total{endpoint,status}` (tests).
+///
+/// `endpoint` is the low-cardinality route label (`whoami`, `invalidate`,
+/// `usage`, `sub-tenants`, `sub-tenant-routes`) or `unrouted` for a path under
+/// the reserved prefix that is not one of the five routes. A request refused by
+/// the token gate is still attributed to its ROUTE, on both the read and the
+/// write path.
+#[must_use]
+pub fn tenant_api_requests_total(endpoint: &str, status: u16) -> f64 {
+    match metrics() {
+        Some(m) => m
+            .tenant_api_requests
+            .with_label_values(&[endpoint, &status.to_string()])
+            .get() as f64,
+        None => 0.0,
     }
 }
 
@@ -717,6 +831,20 @@ pub fn allow_ttl_capped_total(tenant: &str) -> f64 {
 ///
 /// Usage records are billing data: the audit (§3.9) found them dropped with only
 /// a WARN, so a silently degrading metering pipeline was invisible to operators.
+/// Current value of `hydra_usage_dropped_total{reason}` (tests).
+///
+/// The whole point of the shutdown/retention drop reporting is that a lost usage
+/// record is NEVER silent, so the counters are part of the contract and need to be
+/// assertable — this is what makes "the final drain reported its loss" a checked
+/// property instead of a claim.
+#[must_use]
+pub fn usage_dropped_total(reason: &str) -> u64 {
+    match metrics() {
+        Some(m) => m.usage_dropped.with_label_values(&[reason]).get(),
+        None => 0,
+    }
+}
+
 pub fn record_usage_drop(reason: &str, n: u64) {
     if let Some(m) = metrics() {
         m.usage_dropped.with_label_values(&[reason]).inc_by(n);
@@ -780,6 +908,8 @@ pub fn record_breaker_transition(provider: &str, to: &str) {
 
 /// Increment a rate-limit rejection (`dim` = "count" | "token").
 #[allow(dead_code)]
+/// `dim` is `"count"` or `"tokens"` — the exact label values, because the two gates record
+/// different dimensions and a rule written against the wrong spelling can never match.
 pub fn record_limit_rejected(tenant: &str, role: &str, dim: &str) {
     if let Some(m) = metrics() {
         m.limit_rejected
@@ -829,6 +959,67 @@ pub fn record_control_poll(result: &str) {
     }
 }
 
+/// Count a failed credential attempt on either gate of the admin port.
+///
+/// `result` is `<gate>_denied` (answered 401) or `<gate>_throttled` (answered 429
+/// after the per-peer budget), where `<gate>` is `admin` (the operator token) or
+/// `cluster` (the internal control-plane token). The gate is part of the label so
+/// either can be alerted on independently — the cluster gate had NO counter at all
+/// before it shared this path, which is why nobody could see it being guessed at.
+pub fn record_admin_auth_failure(result: &str) {
+    if let Some(m) = metrics() {
+        m.admin_auth_failures.with_label_values(&[result]).inc();
+    }
+}
+
+/// Current value of `hydra_admin_auth_failures_total{result}` (tests).
+///
+/// `result` is `<gate>_denied` or `<gate>_throttled` with `gate` = `admin` |
+/// `cluster`. Kept here so a test can assert that BOTH gates are metered — the
+/// cluster gate's absence of any counter was the whole defect.
+#[must_use]
+pub fn admin_auth_failures_total(result: &str) -> f64 {
+    match metrics() {
+        Some(m) => m.admin_auth_failures.with_label_values(&[result]).get() as f64,
+        None => 0.0,
+    }
+}
+
+/// Count a whole-cache auth-cache clear by `layer` (`l1`/`l2`) and `result`
+/// (`ok`/`partial`/`error`).
+pub fn record_auth_cache_clear(layer: &str, result: &str) {
+    if let Some(m) = metrics() {
+        m.auth_cache_clears
+            .with_label_values(&[layer, result])
+            .inc();
+    }
+}
+
+/// Count a replica materialization retry by `outcome`
+/// (`attempt`/`succeeded`/`failed`/`throttled`).
+pub fn record_replica_materialize_retry(outcome: &str) {
+    if let Some(m) = metrics() {
+        m.replica_materialize_retries
+            .with_label_values(&[outcome])
+            .inc();
+    }
+}
+
+/// Count entries the invalidation trim dropped.
+pub fn record_invalidation_trimmed(entries: i64) {
+    if let Some(m) = metrics() {
+        m.invalidation_trimmed.inc_by(entries.max(0) as u64);
+    }
+}
+
+/// Count an invalidation-stream generation bump (every node clears its auth
+/// cache in response).
+pub fn record_invalidation_generation_bump() {
+    if let Some(m) = metrics() {
+        m.invalidation_generation_bumps.inc();
+    }
+}
+
 /// Set the last applied config snapshot version (edge/standby).
 #[allow(dead_code)]
 pub fn record_control_snapshot_version(version: u64) {
@@ -841,6 +1032,16 @@ pub fn record_control_snapshot_version(version: u64) {
 pub fn record_upstream_first_byte_timeout(provider: &str) {
     if let Some(m) = metrics() {
         m.upstream_first_byte_timeouts
+            .with_label_values(&[provider])
+            .inc();
+    }
+}
+
+/// Count an upstream stream that stalled mid-body for `provider`
+/// (`HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`; see the field docs).
+pub fn record_upstream_stream_idle_timeout(provider: &str) {
+    if let Some(m) = metrics() {
+        m.upstream_stream_idle_timeouts
             .with_label_values(&[provider])
             .inc();
     }
@@ -907,6 +1108,21 @@ pub fn record_queue_wait(provider: &str, secs: f64) {
     }
 }
 
+/// Count requests admitted while a provider's gate enforces STALE limits (a configuration
+/// change that has not taken effect because gates are not resized — plan §2bi / D-14).
+///
+/// A counter rather than a gauge on purpose: what an operator wants to know is "is traffic
+/// still being admitted under the old limits?", and `rate()` on this answers that
+/// unambiguously. The gate also logs a WARN the first time it sees a given configuration.
+#[allow(dead_code)]
+pub fn record_admission_limits_stale(provider: &str) {
+    if let Some(m) = metrics() {
+        m.admission_limits_stale
+            .with_label_values(&[provider])
+            .inc();
+    }
+}
+
 /// Increment a queue drop (`reason` = "full" | "timeout" | "closed" | "client_gone").
 #[allow(dead_code)]
 pub fn record_queue_drop(provider: &str, reason: &str) {
@@ -929,10 +1145,70 @@ pub fn record_admission_decision(provider: &str, outcome: &str) {
 // Mid-stream observability (P2-9)
 // ---------------------------------------------------------------------------
 
+/// Current value of `hydra_candidate_skipped_total{provider,reason}` (tests).
+#[must_use]
+pub fn candidate_skipped_total(provider: &str, reason: &str) -> u64 {
+    match metrics() {
+        Some(m) => m
+            .candidate_skipped
+            .with_label_values(&[provider, reason])
+            .get(),
+        None => 0,
+    }
+}
+
+/// Record a candidate that was skipped BEFORE any upstream attempt, with a
+/// low-cardinality `reason`.
+///
+/// Two families share this counter. The first one produces series today; the
+/// second is defensive and, as measured, unreachable with a valid config:
+///
+/// 1. **Candidate SELECTION** (`breaker_dead` | `no_key` | `invalid_weight`) —
+///    the drops `router::resolve_detailed` reports in its `excluded` list; the
+///    proxy records them right after a successful resolve. This is the family
+///    that answers "which provider went quiet": a provider whose last api-key was
+///    deleted simply stopped being chosen, and because the tenant's other
+///    providers kept serving, neither the response nor
+///    `hydra_route_errors_total{tenant}` (which only counts FAILED requests)
+///    showed anything at all.
+///
+///    NOT included, deliberately: `soft_disabled` (`weight == 0`). That is a
+///    supported, intentional action (`ops.md` documents weight 0 as
+///    soft-disabled), so counting it per request would make the series track
+///    traffic and an `increase(...) > 0` rule fire forever on a healthy fleet.
+///    `invalid_weight` (`weight < 0`) IS counted and is defensive vocabulary: the
+///    schema forbids it (`migrations/0001_init.sql` has `CHECK (weight >= 0)`) and
+///    every provider in memory comes from those rows, so no running process can
+///    produce this series — a review measured that, which is why `ops.md` §9.1
+///    leaves it out of the alert expression. It stays because hand-built
+///    `ConfigData` (unit tests, future loaders) can carry it.
+/// 2. **Per-candidate failover loop** (`missing_config` | `bad_endpoint` |
+///    `no_key` | `no_usable_key`) — defensive; expect no series from it.
+///    **Measured on 2026-09-29:** with a VALID config those four branches are
+///    UNREACHABLE — deleting every `provider_key` row and reloading makes the
+///    request fail with "no candidates" rather than entering the loop, and an
+///    unparseable endpoint makes `ConfigStore::reload_all` return
+///    `FatalValidation`. (That path leaves the snapshot unpublished; the replica
+///    hydrate path `ConfigStore::apply_snapshot` does not re-validate, so
+///    "never published" rests on the upstream invariant that only a validated
+///    leader snapshot is shipped — see `store.rs`.) Those branches fire only if a
+///    future change lets such a candidate reach the loop.
+///
+/// `no_key` is deliberately the SAME string in both families: an operator
+/// alerting on "a provider has no usable key" should not have to know which
+/// code path noticed.
+pub fn record_candidate_skipped(provider: &str, reason: &str) {
+    if let Some(m) = metrics() {
+        m.candidate_skipped
+            .with_label_values(&[provider, reason])
+            .inc();
+    }
+}
+
 /// Increment `hydra_mid_stream_errors_total{provider}` — a streaming response
-/// failed AFTER the 200 + first chunk was already sent to the client (the
-/// point of no failover). Observability only; the existing close-connection
-/// behavior stays.
+/// failed AFTER the 200 + first chunk was already sent to the client (the point
+/// of no failover). Observability only; the existing close-connection behavior
+/// stays.
 #[allow(dead_code)]
 pub fn record_mid_stream_error(provider: &str) {
     if let Some(m) = metrics() {

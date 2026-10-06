@@ -4,7 +4,10 @@
 //! Every sub-tenant / route write (create / update / delete) runs in ONE
 //! SQLite transaction:
 //!
-//! 1. `pool.begin()`,
+//! 1. `db::begin_write(pool)` — `BEGIN IMMEDIATE`, so the write lock is held
+//!    before step 2's read. A DEFERRED begin would let the later write fail
+//!    with `SQLITE_BUSY`, bypassing `busy_timeout`, whenever another
+//!    connection committed in between (see [`crate::db::begin_write`]),
 //! 2. read the **full** set of sub-tenant / route rows from the DB **inside**
 //!    the transaction (`db::list_sub_tenants_on` / `db::list_sub_tenant_routes_on`
 //!    — ALL rows, including disabled),
@@ -138,15 +141,26 @@ fn validate_route_in_tx(
 // Sub-tenant operations
 // ---------------------------------------------------------------------------
 
-/// Create a sub-tenant (idempotent upsert by natural key `(tenant_id, name)`,
-/// D4) inside one transaction.
+/// Create a sub-tenant inside one transaction.
+///
+/// **The "idempotent upsert by `(tenant_id, name)`" (D4) guarantee belongs to the
+/// TENANT-facing `PUT /tenant/{tid}/api/v1/sub-tenants/{name}` route**, which looks
+/// the row up first and then calls [`update_sub_tenant`] with `self_id = Some(id)`
+/// (see `tenant_config_api`). THIS function is the CREATE path: both of its
+/// branches pass `self_id = None` (below), so a repeated create — a retry after a
+/// leader failover, an idempotent replay, a double submit — hits the validator's
+/// `NameDuplicate` and answers **409** instead of converging. (The
+/// `ON CONFLICT (tenant_id, name) DO UPDATE` in `db::insert_sub_tenant` is still
+/// reachable, but only for a CONCURRENT pair of creates that both saw no existing
+/// row — it does not make a SEQUENTIAL repeat converge.) This
+/// comment used to promise convergence on this path too, which was wrong; whether
+/// the ADMIN create should also converge is a product decision (see the plan's
+/// D-10), not something to change silently.
 ///
 /// `key_prefix = None` ⇒ auto-generate, retrying (up to [`PREFIX_ATTEMPTS`]) on
 /// BOTH the validator's overlap rejection AND a DB unique conflict.
 /// `key_prefix = Some(p)` ⇒ validate once, no retry. `id` is the row id used
-/// when a NEW row is inserted; on a name conflict the existing row's id is
-/// retained, so a retry after a leader failover converges to the same row
-/// (A-2 prerequisite 4).
+/// when a NEW row is inserted.
 pub async fn create_sub_tenant(
     pool: &SqlitePool,
     cfg: &ConfigData,
@@ -156,7 +170,7 @@ pub async fn create_sub_tenant(
     id: &str,
     enabled: bool,
 ) -> Result<SubTenant, CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     let (sub_tenants, routes) = read_rows(&mut tx).await.map_err(CoreError::Db)?;
     let rows = SubTenantRows {
         sub_tenants: &sub_tenants,
@@ -220,7 +234,7 @@ pub async fn update_sub_tenant(
     key_prefix: &str,
     enabled: bool,
 ) -> Result<SubTenant, CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     let (sub_tenants, routes) = read_rows(&mut tx).await.map_err(CoreError::Db)?;
     let rows = SubTenantRows {
         sub_tenants: &sub_tenants,
@@ -266,7 +280,7 @@ pub async fn update_sub_tenant(
 /// late replay cannot remove a later-created same-name row — A-2 prerequisite
 /// 4).
 pub async fn delete_sub_tenant(pool: &SqlitePool, id: &str) -> Result<(), CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     db::delete_sub_tenant_on(&mut *tx, id)
         .await
         .map_err(CoreError::Db)?;
@@ -292,7 +306,7 @@ pub async fn create_route(
     id: &str,
     enabled: bool,
 ) -> Result<SubTenantRoute, CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     let (sub_tenants, routes) = read_rows(&mut tx).await.map_err(CoreError::Db)?;
     let rows = SubTenantRows {
         sub_tenants: &sub_tenants,
@@ -351,7 +365,7 @@ pub async fn update_route(
     model_key: Option<&str>,
     enabled: bool,
 ) -> Result<SubTenantRoute, CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     let (sub_tenants, routes) = read_rows(&mut tx).await.map_err(CoreError::Db)?;
     let rows = SubTenantRows {
         sub_tenants: &sub_tenants,
@@ -407,7 +421,7 @@ pub async fn update_route(
 /// Delete a route by its immutable `id` inside one transaction. Idempotent:
 /// deleting an absent id is a no-op success.
 pub async fn delete_route(pool: &SqlitePool, id: &str) -> Result<(), CoreError> {
-    let mut tx = pool.begin().await.map_err(CoreError::Db)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(CoreError::Db)?;
     db::delete_sub_tenant_route_on(&mut *tx, id)
         .await
         .map_err(CoreError::Db)?;

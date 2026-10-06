@@ -35,7 +35,12 @@ use crate::model::Candidate;
 /// the server's outer map.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SwrrState {
-    pub current_weights: HashMap<String, i32>,
+    /// `i64`, not `i32`: the running weights are the SUM of the configured
+    /// `weight`s (an `i32` each, with only `weight >= 0` enforced anywhere), so an
+    /// `i32` accumulator could overflow — a panic under `overflow-checks` and, in
+    /// release, a wrap that silently changes which candidate is picked. The public
+    /// type carries that widening so no caller has to guess.
+    pub current_weights: HashMap<String, i64>,
 }
 
 /// Perform one Nginx Smooth Weighted Round-Robin step.
@@ -50,7 +55,11 @@ pub struct SwrrState {
 ///
 /// No-op on an empty slice; never divides by zero.
 pub fn order(candidates: &mut [Candidate], state: &mut SwrrState) {
-    let total: i32 = candidates.iter().map(|c| c.weight).sum();
+    // Sum in i64: two providers at `i32::MAX/2 + 1` (the DB only enforces
+    // `weight >= 0`) overflowed the i32 sum — a panic in debug, and in release a
+    // wrapped negative total, which the guard below reads as "nothing selectable"
+    // and silently stops load-balancing entirely.
+    let total: i64 = candidates.iter().map(|c| i64::from(c.weight)).sum();
     if total <= 0 {
         // Nothing selectable (resolve always supplies weight > 0; guard for
         // direct callers with degenerate input).
@@ -64,7 +73,7 @@ pub fn order(candidates: &mut [Candidate], state: &mut SwrrState) {
             .current_weights
             .entry(c.provider_id.clone())
             .or_insert(0);
-        *entry += c.weight;
+        *entry = entry.saturating_add(i64::from(c.weight));
     }
 
     // Steps 2–3: pick the max current_weight, first wins on ties (Nginx).
@@ -77,12 +86,17 @@ pub fn order(candidates: &mut [Candidate], state: &mut SwrrState) {
         }
     }
 
-    // Step 4: subtract total from the picked candidate.
+    // Step 4: subtract total from the picked candidate. Both operands are i64, so
+    // there is NO i32 clamp anywhere here: `saturating_sub` only engages at the
+    // i64 bounds, which the invariant `|current_weight| <= Σweight` puts out of
+    // reach for any real candidate set (see the note on the field). Saturation
+    // would merely make this candidate less likely to be picked next round —
+    // never a panic, never a wrap back into contention.
     if let Some(cw) = state
         .current_weights
         .get_mut(&candidates[picked].provider_id)
     {
-        *cw -= total;
+        *cw = cw.saturating_sub(total);
     }
 
     // Step 5: move the picked candidate to the front, preserving the relative
@@ -91,6 +105,6 @@ pub fn order(candidates: &mut [Candidate], state: &mut SwrrState) {
 }
 
 /// Read a provider's running weight, defaulting to 0 when unseen.
-fn current_weight(state: &SwrrState, provider_id: &str) -> i32 {
+fn current_weight(state: &SwrrState, provider_id: &str) -> i64 {
     state.current_weights.get(provider_id).copied().unwrap_or(0)
 }

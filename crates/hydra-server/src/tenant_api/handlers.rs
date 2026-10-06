@@ -832,12 +832,14 @@ pub async fn write(
         return forward_write(
             session,
             ctx,
-            fwd,
-            &method,
-            &internal_path,
-            &bearer,
-            body,
-            &trace_id,
+            ForwardedWrite {
+                fwd,
+                method: method.as_str(),
+                internal_path: internal_path.as_str(),
+                tenant_bearer: bearer.as_str(),
+                body,
+                trace_id: trace_id.as_str(),
+            },
         )
         .await;
     }
@@ -978,8 +980,13 @@ async fn local_write(
 }
 
 /// Map the shared write core's [`CoreError`] to (status, code, message) for the
-/// data-plane envelope. The status / code are IDENTICAL to the internal face
-/// (`admin::tenant_config_api::core_err_resp`); only the rendering differs.
+/// data-plane envelope.
+///
+/// The status / code are IDENTICAL to the internal face
+/// (`admin::tenant_config_api::core_err_resp`) — and that is now enforced rather
+/// than asserted: the storage branch CALLS the one classifier
+/// (`admin::handlers::classify_db_err`), because a hand-written copy here had
+/// already drifted (it answered 500 for SQLITE_BUSY). Only the rendering differs.
 fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
     match e {
         CoreError::Validation(v) => {
@@ -1002,7 +1009,30 @@ fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
             };
             (status, code, v.to_string())
         }
-        CoreError::Db(d) => (500, "database_error", d.to_string()),
+        // Delegated, like the internal face: this branch used to be a THIRD
+        // hand-written mapping that returned 500 `database_error` for everything
+        // and put `d.to_string()` — raw SQLite text — into a TENANT-VISIBLE body,
+        // while its comment claimed the statuses were "IDENTICAL to the internal
+        // face". They were not: the write core takes `BEGIN IMMEDIATE`, so lock
+        // contention surfaces as SQLITE_BUSY (code 5), which the single owner maps
+        // to the RETRYABLE 503 `storage_busy`. The same operation therefore
+        // answered "retry in a moment" on the admin face and "this is a bug" on
+        // the data plane. The raw text now goes to the log, where it is useful.
+        CoreError::Db(d) => {
+            let (status, code) = crate::admin::handlers::classify_db_err(d);
+            tracing::warn!(
+                target: "hydra::tenant_api",
+                status,
+                code,
+                error = %d,
+                "tenant config write failed in the storage layer"
+            );
+            (
+                status,
+                code,
+                "the storage layer could not complete the write".to_string(),
+            )
+        }
         CoreError::PrefixGenerationFailed => (
             400,
             "prefix_generation_failed",
@@ -1010,6 +1040,24 @@ fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
         ),
         CoreError::NotFound => (404, "not_found", "not found".to_string()),
     }
+}
+
+/// One data-plane config write on its way to the lease-holding leader.
+///
+/// The parts travel as one value (rather than six positional arguments) so the
+/// A-2 precondition 5 contract — the tenant Bearer goes in the dedicated
+/// `x-hydra-tenant-token` header, NEVER in `Authorization`, never in the body,
+/// never in a log — has a single owner that can be read in one place.
+#[cfg(feature = "cluster-redis")]
+struct ForwardedWrite<'a> {
+    /// Resolves the lease-holding leader and refuses to self-forward.
+    fwd: &'a crate::tenant_config::TenantConfigForwarder,
+    method: &'a str,
+    internal_path: &'a str,
+    /// The tenant Bearer the tenant-API gate already validated (D2).
+    tenant_bearer: &'a str,
+    body: Vec<u8>,
+    trace_id: &'a str,
 }
 
 /// D1/D2: forward the tenant config write to the lease-holding leader's
@@ -1021,13 +1069,16 @@ fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
 async fn forward_write(
     session: &mut Session,
     ctx: &mut RequestContext,
-    fwd: &crate::tenant_config::TenantConfigForwarder,
-    method: &str,
-    internal_path: &str,
-    tenant_bearer: &str,
-    body: Vec<u8>,
-    trace_id: &str,
+    req: ForwardedWrite<'_>,
 ) -> pingora_core::Result<bool> {
+    let ForwardedWrite {
+        fwd,
+        method,
+        internal_path,
+        tenant_bearer,
+        body,
+        trace_id,
+    } = req;
     match fwd
         .forward_config_write(method, internal_path, tenant_bearer, body, trace_id)
         .await
@@ -1078,5 +1129,61 @@ async fn forward_write(
             };
             super::respond_error(session, ctx, status, code, &message).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lock-contended write must be the SAME retryable 503 the internal face
+    /// returns, and the tenant must not see storage internals.
+    ///
+    /// This branch used to be a third hand-written copy of the sqlx-error mapping
+    /// that answered `500 "database_error"` for everything and put `d.to_string()`
+    /// into a tenant-visible body, while its comment claimed the statuses were
+    /// "IDENTICAL to the internal face". They were not: the write core takes
+    /// `BEGIN IMMEDIATE`, so contention surfaces as SQLITE_BUSY (code 5), which the
+    /// one classifier maps to the retryable `503 storage_busy` — "retry in a moment"
+    /// on the admin face versus "this is a bug" on the data plane.
+    ///
+    /// Falsification: restore `(500, "database_error", d.to_string())` and BOTH
+    /// assertions fail.
+    #[tokio::test]
+    async fn a_busy_write_is_a_retryable_503_without_internals_in_the_message() {
+        let dir = std::env::temp_dir().join(format!("hydra-mapcore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let url = format!("sqlite://{}/busy.db?mode=rwc", dir.display());
+        let pool = crate::db::init_pool(&url).await.expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+
+        // Another connection holds the write lock, so a write taken from the POOL
+        // cannot commit and surfaces SQLITE_BUSY once `busy_timeout` (5 s) expires.
+        let mut holder = crate::db::begin_write(&pool).await.expect("begin_write");
+        sqlx::query("INSERT INTO config_meta (key, value) VALUES ('held','1')")
+            .execute(&mut *holder)
+            .await
+            .expect("the holder writes while it owns the lock");
+
+        let err = sqlx::query("INSERT INTO config_meta (key, value) VALUES ('blocked','1')")
+            .execute(&pool)
+            .await
+            .expect_err("a write under a held write lock must fail with SQLITE_BUSY");
+
+        let (status, code, message) = map_core_err(&CoreError::Db(err));
+        assert_eq!(
+            (status, code),
+            (503, "storage_busy"),
+            "lock contention is TRANSIENT and must map exactly like the internal face"
+        );
+        let lowered = message.to_lowercase();
+        assert!(
+            !lowered.contains("sqlite") && !lowered.contains("database is locked"),
+            "the tenant-visible message must not carry storage internals: {message:?}"
+        );
+
+        let _ = holder.rollback().await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -175,6 +175,61 @@ async fn same_plaintext_and_tls_address_is_fatal() {
     );
 }
 
+/// The ADMIN port must be probed before Pingora, exactly like the plaintext data
+/// plane.
+///
+/// A bind failure inside Pingora's service task is invisible from outside, and for
+/// the ADMIN service the shape is inverted: the data plane comes up while the admin
+/// port silently never listens, so every container healthcheck (`/api/v1/health`,
+/// all three compose files) fails and the orchestrator restarts in a loop with no
+/// startup error to read. `ops.md` documented the mirror image of this incident
+/// (process alive, probes answering, no data-plane listener).
+///
+/// Falsification: delete the `probe_bind(&admin_addr)` call in `main.rs` and the
+/// process starts (half-alive) instead of exiting, so the `expect` on `status`
+/// fails.
+#[tokio::test]
+async fn a_taken_admin_port_refuses_startup() {
+    // Occupy a port and KEEP holding it.
+    let squatter = TcpListener::bind("127.0.0.1:0").expect("bind squatter");
+    let taken = squatter.local_addr().expect("addr").port();
+
+    let db = TempDb::new().await;
+    let plain = common::ephemeral_port();
+    // The squatted port is the ADMIN one.
+    let cmd = base_command(&db, plain, taken);
+    let (mut child, log) = spawn_capturing(cmd);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut status = None;
+    while Instant::now() < deadline {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            status = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = status.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!(
+            "a taken ADMIN port must make the process EXIT rather than start half-alive \
+             (data plane serving, admin port never listening). Output:\n{}",
+            log_text(&log)
+        )
+    });
+    assert!(
+        !status.success(),
+        "it must exit non-zero; output:\n{}",
+        log_text(&log)
+    );
+    let text = log_text(&log);
+    assert!(
+        text.contains("HYDRA_ADMIN_ADDR") || text.contains("refusing to start"),
+        "the startup failure must be explicable from the log:\n{text}"
+    );
+    drop(squatter);
+}
+
 /// B. A TLS port that an unrelated process already holds must degrade, not crash:
 /// the process keeps running and the plaintext entry still serves.
 #[tokio::test]

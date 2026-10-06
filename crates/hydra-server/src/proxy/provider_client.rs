@@ -15,7 +15,12 @@
 //! (sub-second to ~1.5 s) because they must fail fast. LLM chat-completion
 //! requests — especially streaming SSE — can take **minutes** to first byte.
 //! Sharing a short-timeout client would abort legitimate long generations, so
-//! `ProviderClient` carries its own long-lived (300 s timeout) connection pool.
+//! `ProviderClient` carries its own long-lived connection pool. It carries **no
+//! client-level total timeout**: the former 300 s deadline truncated every
+//! generation longer than five minutes (HTTP 200 plus half an SSE body), and it was
+//! replaced by two explicit bounds — `upstream_first_byte_timeout_secs` for the
+//! response HEADERS and `upstream_stream_idle_timeout_secs` for the gap between
+//! body chunks (see `proxy::config` and `ops.md` §9.1).
 //!
 //! ## Failover replay is free
 //!
@@ -61,21 +66,69 @@ pub struct ProviderClient {
 
 impl ProviderClient {
     /// Build a client tuned for long-lived LLM/SSE upstream calls: a generous
-    /// per-host idle pool, a long idle timeout, and a 300 s overall timeout so
-    /// slow first-token providers are not aborted. Uses `rustls` (matched by
-    /// the `http-client` feature in `Cargo.toml`).
+    /// per-host idle pool and a long connection idle timeout. Uses `rustls`
+    /// (matched by the `http-client` feature in `Cargo.toml`).
     ///
-    /// Infallible: on the (catastrophic, essentially never happens with rustls)
-    /// case the TLS backend fails to initialise, we fall back to reqwest's
-    /// default client rather than panicking — production code must not `unwrap`.
+    /// **No client-level total timeout.** `ClientBuilder::timeout` is a *total*
+    /// deadline — reqwest applies it "from when the request starts connecting
+    /// until the response body has finished" — so the 300 s it used to carry
+    /// silently truncated every legitimate generation longer than 300 s: the
+    /// client received HTTP 200 plus half an SSE body (no `[DONE]`, no
+    /// `finish_reason`) and was still billed for the tokens the upstream had
+    /// produced. The exchange is bounded by configurable per-phase deadlines
+    /// instead: `send()` below for response HEADERS, and the per-read idle
+    /// deadline in [`crate::proxy::HydraProxy`]'s stream loop for the body.
+    ///
+    /// **Redirects are disabled.** reqwest's default policy follows up to 10
+    /// hops, and its cross-host scrub only removes `Authorization`/`Cookie` —
+    /// but an Anthropic-family upstream credential travels in `x-api-key`
+    /// (see the credential injection below), so a 302 from a compromised or
+    /// misconfigured upstream would replay the real provider key to whatever
+    /// host the `Location` named. `Policy::none()` also puts 3xx back into the
+    /// ordinary non-2xx path (breaker + failover + usage record) instead of
+    /// silently accepting a followed redirect's 200.
+    ///
+    /// Never follows a redirect, whatever it takes.
+    ///
+    /// The policy is set on EVERY fallback, including the last one. That last one
+    /// used to be `.unwrap_or_else(|_| reqwest::Client::new())`, whose DEFAULT
+    /// policy follows up to 10 hops — so in the (catastrophic, essentially never
+    /// with rustls) case where both builders fail, the provider API key would
+    /// again be replayable to whatever host a 302 named. That is exactly the hole
+    /// `Policy::none()` was added to close, and the surrounding comment claimed the
+    /// fallbacks covered it. The builder is only ever fed constant settings, so
+    /// "it failed" means the TLS backend is unusable; a client that cannot be built
+    /// that way genuinely has no safe configuration, and `expect` here is a
+    /// deliberate, documented invariant rather than an oversight.
     #[must_use]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(32)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .timeout(Duration::from_secs(300))
+        Self::with_connect_timeout(
+            crate::proxy::config::ProxyConfig::default().upstream_connect_timeout_secs,
+        )
+    }
+
+    /// [`Self::new`] with an explicit connect bound (see
+    /// [`crate::proxy::config::ProxyConfig::upstream_connect_timeout_secs`]).
+    ///
+    /// Without it, a connect that never completes is indistinguishable from a post-send
+    /// stall: `send()` can only report `FirstByteTimeout`, which `proxy.rs` must treat as
+    /// "the request was written" (no failover, to avoid double billing). With it, the connect
+    /// phase fails as a reqwest connect error, which is the one class that proves the
+    /// upstream never saw the request.
+    #[must_use]
+    pub fn with_connect_timeout(connect_secs: u64) -> Self {
+        let connect = Duration::from_secs(connect_secs.max(1));
+        let builder = || {
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(32)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .connect_timeout(connect)
+                .redirect(reqwest::redirect::Policy::none())
+        };
+        let client = builder()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .or_else(|_| builder().build())
+            .expect("a reqwest client with constant settings and no redirects must build");
         Self { client }
     }
 
@@ -183,11 +236,13 @@ impl ProviderClient {
     /// - `first_byte_secs` wraps `send()` ONLY. `send()` resolves when the
     ///   response HEADERS arrive, so this is a true time-to-first-byte bound: an
     ///   upstream that accepts the connection and then says nothing used to burn
-    ///   the client-level 300s timeout on EVERY attempt (the documented
-    ///   "connected but never answers" symptom).
-    /// - the client-level 300s timeout still covers the whole exchange,
-    ///   including body reads. Setting `RequestBuilder::timeout` instead would
-    ///   cap the streaming body and truncate long SSE responses.
+    ///   the per-attempt first-byte bound (the documented "connected but never
+    ///   answers" symptom).
+    /// - there is no client-level total timeout any more. Setting
+    ///   `RequestBuilder::timeout` here would cap the streaming body and truncate
+    ///   long SSE responses, which is exactly why the 300 s deadline was removed;
+    ///   the body is bounded by the IDLE window instead, so a long generation keeps
+    ///   working as long as it keeps producing bytes.
     pub async fn send(
         &self,
         req: reqwest::RequestBuilder,
@@ -330,6 +385,80 @@ mod tests {
             format!("{first}{second}"),
             "the streamed body must arrive intact — a truncated SSE completion is \
              a silent data loss"
+        );
+    }
+
+    /// An upstream that answers `302` must NOT be followed: the credential we
+    /// injected (`x-api-key` for the Anthropic family) is not in reqwest's
+    /// cross-host scrub list, so following the redirect would hand the real
+    /// provider key to whatever host the `Location` header names.
+    ///
+    /// The test stands up two listeners: the "upstream" (answers 302 pointing at
+    /// the second) and the "collector" (records whether anything ever connects).
+    /// The assertion is that the collector is never contacted and the 3xx comes
+    /// back as a plain response, so it falls into the normal non-2xx handling.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_provider_key_cannot_be_replayed() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // The collector: a redirect target. Touching it at all fails the test.
+        let collector = std::net::TcpListener::bind("127.0.0.1:0").expect("bind collector");
+        let collector_addr = collector.local_addr().expect("addr");
+        let hit = Arc::new(AtomicBool::new(false));
+        let hit2 = hit.clone();
+        std::thread::spawn(move || {
+            for stream in collector.incoming() {
+                let Ok(mut s) = stream else { break };
+                hit2.store(true, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+                );
+            }
+        });
+
+        // The "upstream": always answers 302 toward the collector.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in upstream.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{collector_addr}/v1/messages\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        let client = ProviderClient::new();
+        let req = client
+            .client
+            .post(format!("http://{upstream_addr}/v1/messages"))
+            .header("x-api-key", "sk-ant-SECRET")
+            .body("{}");
+        let resp = client
+            .send(req, 5)
+            .await
+            .expect("a 302 is a response, not a transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "the redirect must be returned as-is, so the failover loop can treat 3xx \
+             as an endpoint misconfiguration"
+        );
+        // Give a would-be redirect hop a moment to be attempted.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "the redirect target was contacted — the provider credential travels in \
+             `x-api-key`, which reqwest does NOT strip on a cross-host hop"
         );
     }
 

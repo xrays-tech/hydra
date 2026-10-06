@@ -665,11 +665,26 @@ async fn breaker_success_clears_failures() {
     let client = test_client();
     let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
     assert_eq!(resp.status(), 200);
-    // on_success fired in the failover loop → fail_count reset to 0.
-    assert_eq!(
-        state.breaker.fail_count("p1"),
-        0,
-        "2xx should reset the breaker streak"
+    // The streak is reset by a COMPLETED response, not by the arrival of the 2xx
+    // HEADERS. Recording the success at the header point (its old home) reset the
+    // streak immediately before `stream_response` recorded an idle-cut failure,
+    // which pinned the counter at 1 and made the idle bound unable to trip the
+    // breaker at all — see `a_provider_that_stalls_after_its_headers_trips_the_breaker`.
+    // So the body has to be consumed before the reset is expected, and the reset
+    // itself happens on the proxy side just after the last write.
+    let _ = resp.text().await;
+    let mut cleared = false;
+    for _ in 0..40 {
+        if state.breaker.fail_count("p1") == 0 {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        cleared,
+        "a COMPLETED 2xx response should reset the breaker streak, fail_count={}",
+        state.breaker.fail_count("p1")
     );
 }
 
@@ -1519,6 +1534,162 @@ async fn admission_capped_provider_does_not_block_second_request() {
     assert!(
         statuses.iter().all(|&s| s == 200),
         "both requests should succeed (concurrent load with capped+unlimited providers): {statuses:?}"
+    );
+}
+
+// ===========================================================================
+// T3.3 (sub-tenant v3) — usage is ATTRIBUTED to a sub-tenant from the raw api-key
+// prefix, at the recording point.
+//
+// The v3 plan promised this integration test and it was never written (the
+// implementation-side derivation existed, the assertion did not), which is why a
+// "T3.1–T3.6 implemented" status line could hide "the recording point writes the
+// wrong id" — exactly the class of defect a status line cannot carry.
+//
+// The property under test: the key prefix that SELECTS a sub-tenant is the same
+// key prefix that ATTRIBUTES the usage row, and attribution is independent of
+// routing (a route can narrow the provider; it cannot change who the key belongs
+// to).
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_is_attributed_to_the_sub_tenant_that_owns_the_key_prefix() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "ok",
+            "usage": { "prompt_tokens": 13, "completion_tokens": 7 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "p1", "openai", "O", &upstream.uri()).await;
+    repo::insert_provider_model(
+        &pool,
+        &ProviderModel {
+            id: "m1".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .unwrap();
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    repo::insert_tenant_provider(
+        &pool,
+        &TenantProvider {
+            id: "tp1".into(),
+            tenant_id: "t1".into(),
+            provider_id: "p1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    repo::insert_tenant_model(
+        &pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-1",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    // The sub-tenant whose prefix matches the test client key
+    // (`test-client-key` starts with `test-client-`).
+    repo::insert_sub_tenant(
+        &pool,
+        &SubTenant {
+            id: "st1".into(),
+            tenant_id: "t1".into(),
+            name: "team-a".into(),
+            key_prefix: "test-client-".into(),
+            enabled: true,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let recording = Arc::new(RecordingSink::default());
+    let key_provider = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("store");
+    // The snapshot the proxy reads must carry the sub-tenant (load reads the DB).
+    assert_eq!(
+        store.snapshot().sub_tenants.len(),
+        1,
+        "fixture: the sub-tenant is in the snapshot"
+    );
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("checker"),
+    );
+    let state = AppState::for_tests(
+        store,
+        auth,
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
+        Arc::new(RateLimiter::new()),
+        recording.clone(),
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await;
+
+    let records = recording.records();
+    assert_eq!(records.len(), 1, "one usage record for one request");
+    assert_eq!(
+        records[0].sub_tenant_id.as_deref(),
+        Some("st1"),
+        "the row must be attributed to the sub-tenant whose prefix owns the key \
+         (this is the assertion T3.3 promised)"
+    );
+    // The masked client key is recorded; the RAW key never is.
+    assert!(
+        !records[0]
+            .client_api_key_masked
+            .as_deref()
+            .unwrap_or_default()
+            .contains("test-client-key"),
+        "the raw api-key must never be persisted: {:?}",
+        records[0].client_api_key_masked
     );
 }
 
@@ -3040,6 +3211,421 @@ async fn post_send_transport_error_is_not_failed_over_by_default() {
 }
 
 // ===========================================================================
+// Upstream BODY bound (replaces the client-level 300 s total timeout).
+//
+// `ProviderClient` used to carry `ClientBuilder::timeout(300s)`, which reqwest
+// applies from connect until the response body has FINISHED — so any generation
+// longer than 300 s was cut mid-answer (HTTP 200 + half an SSE body, billed in
+// full). It was removed and replaced by a per-read IDLE bound
+// (`HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`). These two arms pin both
+// directions of that trade: a wedged upstream must still be cut, and a live
+// (merely slow) stream must NOT be.
+// ===========================================================================
+
+/// An upstream that answers `200 text/event-stream`, streams `chunks` SSE
+/// frames `gap_ms` apart, and then either closes cleanly or — with
+/// `stall = true` — holds the socket open forever without another byte, which
+/// is the "wedged mid-answer" case the idle bound exists for.
+fn spawn_stalling_sse_upstream(chunks: usize, gap_ms: u64, stall: bool) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalling upstream");
+    let addr = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let frames: Vec<String> = (0..chunks)
+                    .map(|i| format!("data: {{\"i\":{i}}}\n\n"))
+                    .collect();
+                let total: usize = frames.iter().map(String::len).sum();
+                let head = if stall {
+                    // No content-length: the body is delimited by the close that
+                    // never comes.
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                         Content-Length: {total}\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                if s.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                for (i, frame) in frames.iter().enumerate() {
+                    if s.write_all(frame.as_bytes()).is_err() || s.flush().is_err() {
+                        return;
+                    }
+                    if gap_ms > 0 && i + 1 < frames.len() {
+                        std::thread::sleep(Duration::from_millis(gap_ms));
+                    }
+                }
+                let _ = s.flush();
+                if stall {
+                    // Hold the connection open, silent, well past the idle bound.
+                    std::thread::sleep(Duration::from_secs(120));
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Seed the full request path (provider + model + tenant + grants + key + role)
+/// against a single upstream.
+///
+/// Returns the auth `MockServer` handle TOGETHER with the state, and every caller
+/// must keep it alive: `MockServer`'s `Drop` SHUTS THE SERVER DOWN, and
+/// wiremock's pooled instances are shared between tests — so dropping the handle
+/// early kills the auth hop (Hydra then answers fail-closed, i.e. 503) and can
+/// take a *concurrent* test's auth hop down with it.
+async fn state_for_one_upstream(
+    pool: &sqlx::SqlitePool,
+    endpoint: &str,
+) -> (MockServer, Arc<AppState>) {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    let auth_url = format!("{}/auth", auth_server.uri());
+
+    seed_provider(pool, "p1", "p1", "P1", endpoint).await;
+    repo::insert_provider_model(
+        pool,
+        &ProviderModel {
+            id: "m1".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .unwrap();
+    seed_tenant(pool, "t1", "localhost", &auth_url).await;
+    repo::insert_tenant_provider(
+        pool,
+        &TenantProvider {
+            id: "tp1".into(),
+            tenant_id: "t1".into(),
+            provider_id: "p1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    repo::insert_tenant_model(
+        pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_key(
+        pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-1",
+    )
+    .await;
+    seed_default_role(pool, "t1").await;
+    let state = build_state_with_proxy_config(
+        pool,
+        ProxyConfig {
+            // 1 s idle window: short enough to assert on, far below the
+            // documented default of 120 s.
+            upstream_stream_idle_timeout_secs: 1,
+            ..ProxyConfig::default()
+        },
+    )
+    .await;
+    (auth_server, state)
+}
+
+/// Send the model request, retrying while the proxy answers something other
+/// than 200.
+///
+/// The tenant auth hop is a live `MockServer`; in a fully parallel suite it can
+/// answer slowly enough that one attempt fails for reasons that have nothing to
+/// do with what these two tests measure. The measured property (the upstream
+/// BODY bound) is asserted after a 200, so retrying to reach the steady state
+/// weakens nothing: if the proxy were actually broken, every attempt would fail.
+async fn send_expecting_200(client: &reqwest::Client, url: &str, body: &str) -> reqwest::Response {
+    let mut last = None;
+    // Small budget: the proxy binds asynchronously, so the very first attempt can
+    // lose a race with `start_proxy`. (A longer budget used to be needed because
+    // the auth mock was being shut down by its own helper — see
+    // `state_for_one_upstream`; the caller now keeps it alive.)
+    for _ in 0..8 {
+        let resp = send_until_ready(client, url, body).await;
+        if resp.status() == 200 {
+            return resp;
+        }
+        last = Some(resp.status());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("expected 200 from the proxy, saw {last:?}");
+}
+
+/// Arm 1: an upstream that sends one chunk and then goes silent must be cut by
+/// the IDLE bound — not held forever, and not left to the client's own timeout.
+///
+/// The test client deliberately has a 30 s timeout (NOT the harness's 15 s), so
+/// "the read settled quickly" can only come from the idle bound firing. The
+/// clock starts AFTER the headers, so proxy start-up latency cannot influence
+/// the measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_stream_is_cut_by_the_idle_bound() {
+    let upstream = spawn_stalling_sse_upstream(1, 0, true);
+    let pool = common::setup_pool().await;
+    // The auth mock must OUTLIVE the request (see the helper docs).
+    let (_auth, state) = state_for_one_upstream(&pool, &upstream).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("client");
+
+    let resp = send_expecting_200(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    // Reading settles when the proxy closes the downstream body.
+    let started = std::time::Instant::now();
+    let _ = resp.text().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a stream that went silent mid-answer must be cut by the 1 s idle bound \
+         (took {elapsed:?}; the client's own timeout was 30 s)"
+    );
+}
+
+/// Arm 2: the idle bound must NOT truncate a live stream that is merely slow.
+/// Frames arrive every 300 ms for ~2.4 s with a 1 s window — every individual
+/// gap is under the bound, so the whole body must arrive intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_but_alive_stream_is_not_cut_by_the_idle_bound() {
+    let frames = 9;
+    let upstream = spawn_stalling_sse_upstream(frames, 300, false);
+    let pool = common::setup_pool().await;
+    // The auth mock must OUTLIVE the request (see the helper docs).
+    let (_auth, state) = state_for_one_upstream(&pool, &upstream).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_expecting_200(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    let body = resp.text().await.expect("body");
+    for i in 0..frames {
+        assert!(
+            body.contains(&format!("data: {{\"i\":{i}}}")),
+            "frame {i} missing from the streamed body — a live stream must not be \
+             cut by the idle bound. body={body:?}"
+        );
+    }
+}
+
+/// The idle cut must actually FEED the breaker — a provider that answers `200`
+/// and then wedges has to end up out of rotation.
+///
+/// `stream_response` records the idle cut as provider-side evidence, and `ops.md`
+/// says this path "also feeds the circuit breaker". It does call
+/// `breaker.on_failure(...)` — but the proxy ALSO called `on_success(...)` the
+/// moment the 2xx HEADERS arrived, and the breaker counts CONSECUTIVE failures
+/// with any success clearing the count. Every stalled request therefore reset the
+/// counter and then added a single failure, so the count could never exceed 1: a
+/// provider that reliably answered and then went silent could NEVER enter the
+/// dead-set, however many truncated answers it returned — and that is precisely
+/// the pathology the idle bound was added for. The success is recorded only after
+/// the body has been delivered in full now.
+///
+/// Falsification: move `on_success` back to its old home (the header point) and
+/// this fails with `fail_count("p1") == 0` and `is_dead("p1") == false`, while all
+/// five requests still return 200 and are still truncated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_that_stalls_after_its_headers_trips_the_breaker() {
+    // One frame, then silence: the headers (and one chunk) reach the client, so
+    // each response is a `200` that gets truncated — never a retryable failure.
+    let upstream = spawn_stalling_sse_upstream(1, 0, true);
+    let pool = common::setup_pool().await;
+    let (_auth, state) = state_for_one_upstream(&pool, &upstream).await;
+    let breaker = state.breaker.clone();
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("client");
+
+    // The harness arms the breaker with a threshold of 5.
+    for i in 0..5 {
+        let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i}: the upstream sent headers, so this must be a 200"
+        );
+        // Settles when the 1 s idle bound cuts the downstream body.
+        let _ = resp.text().await;
+        if i < 4 {
+            assert!(
+                !breaker.is_dead("p1"),
+                "the breaker must not trip before its threshold (after {} stalls)",
+                i + 1
+            );
+        }
+    }
+    assert_eq!(
+        breaker.fail_count("p1"),
+        5,
+        "each stalled stream must be exactly one provider failure"
+    );
+    assert!(
+        breaker.is_dead("p1"),
+        "five consecutive idle cuts must trip the breaker; otherwise a provider \
+         that answers and then wedges keeps receiving every request and every \
+         answer is silently truncated"
+    );
+
+    // A tripped provider is out of rotation: with a single provider there is no
+    // candidate left, so the next request must be refused without reaching the
+    // upstream at all.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(
+        resp.status(),
+        503,
+        "a tripped provider must stop receiving traffic"
+    );
+}
+
+// ===========================================================================
+// Downstream REQUEST-body deadline (`HYDRA_REQUEST_BODY_TIMEOUT_SECS`).
+//
+// The body read is the cheapest place to hold a worker: it is reached without a
+// valid api-key, it buffers, and pingora bounds HTTP/1 body reads only
+// per-read (each byte resets that) and HTTP/2 not at all. So a client that
+// sends headers, half a body, then nothing occupied a task forever.
+// ===========================================================================
+
+/// See [`state_for_one_upstream`] for why the `MockServer` handle is returned.
+async fn state_for_body_read(
+    pool: &sqlx::SqlitePool,
+    body_timeout_secs: u64,
+) -> (MockServer, Arc<AppState>) {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+    seed_tenant(
+        pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    let state = build_state_with_proxy_config(
+        pool,
+        ProxyConfig {
+            request_body_timeout_secs: body_timeout_secs,
+            ..ProxyConfig::default()
+        },
+    )
+    .await;
+    (auth_server, state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_never_finishes_its_body_is_cut_by_the_deadline() {
+    let pool = common::setup_pool().await;
+    let (_auth, state) = state_for_body_read(&pool, 1).await; // 1 s deadline
+    let root = start_proxy(state);
+    let port: u16 = root
+        .rsplit(':')
+        .next()
+        .expect("port in root")
+        .parse()
+        .expect("port parses");
+
+    let (head, elapsed) = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        // The auth hop is a live `MockServer` and this suite runs its tests in
+        // parallel, so an attempt can fail BEFORE reaching the body read (that
+        // answers 401/403/503, not 408). Retry those; a *read timeout* is not a
+        // flake — it means the deadline did not fire — and is reported as such.
+        let mut last_other = None;
+        // Small budget: see `send_expecting_200` (the auth hop is kept alive by
+        // the caller now, so this only absorbs the proxy's async bind).
+        for _attempt in 0..8 {
+            // The proxy binds asynchronously: retry the connect briefly.
+            let mut stream = None;
+            for _ in 0..60 {
+                match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            let mut s = stream.expect("proxy never accepted a connection");
+            s.set_read_timeout(Some(Duration::from_secs(15)))
+                .expect("read timeout");
+            // A complete HEAD with a 1 MB declared body…
+            let head = "POST /v1/chat/completions HTTP/1.1\r\n\
+                        Host: localhost\r\n\
+                        Authorization: Bearer test-client-key\r\n\
+                        content-type: application/json\r\n\
+                        content-length: 1000000\r\n\r\n";
+            s.write_all(head.as_bytes()).expect("write head");
+            // …then only half a body, and silence: the slow-loris shape.
+            s.write_all(b"{\"model\":\"gpt-4\",")
+                .expect("write partial body");
+            s.flush().expect("flush");
+            let started = std::time::Instant::now();
+            let mut buf = [0u8; 4096];
+            let n = match s.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) => panic!(
+                    "the proxy must answer within the 1 s body deadline, not hang (read \
+                     failed after {:?}: {e})",
+                    started.elapsed()
+                ),
+            };
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let elapsed = started.elapsed();
+            if head.contains(" 408 ") {
+                return (head, elapsed);
+            }
+            last_other = Some(head);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("never saw 408; last non-408 answer: {last_other:?}");
+    })
+    .await
+    .expect("join");
+
+    assert!(
+        head.contains(" 408 "),
+        "an unfinished body must get 408 request_body_timeout, got: {head:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the 1 s body deadline must cut it (took {elapsed:?})"
+    );
+}
+
+// ===========================================================================
 // REVIEW A1 — a body Hydra cannot parse must NOT be treated as "no model".
 //
 // `extract_model_field` used to collapse every serde_json error into `Absent`,
@@ -3586,4 +4172,220 @@ async fn passthrough_sub_tenant_default_route_fail_closed_503() {
         "the keyless p1 must not be called: {} hits",
         p1_hits.len()
     );
+}
+
+/// Round 46 (plan §2r) — a provider that dropped out of rotation is NAMED, in the
+/// case that used to leave no trace at all.
+///
+/// `p_gone`'s only api-key row is deleted and a fresh snapshot published, while
+/// `p_live` still serves the tenant — so the request SUCCEEDS. Before this change
+/// nothing recorded it anywhere: the per-candidate counter lives in the failover
+/// loop, which a successful request never enters, and `hydra_route_errors_total`
+/// is tenant-labelled and only counts FAILED requests. The operator could watch a
+/// provider's upstream traffic go to zero with nothing in `/metrics` saying why.
+///
+/// Falsification: remove the `record_excluded_candidates(&outcome.excluded)` call
+/// in `proxy.rs` and the `no_key` assertions below read 0.
+#[tokio::test]
+async fn a_provider_that_lost_its_keys_is_named_in_metrics_while_requests_succeed() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"ok","object":"chat.completion","choices":[]}"#),
+        )
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_provider(&pool, "p_gone", "gone", "Gone", &upstream.uri()).await;
+    seed_provider(&pool, "p_live", "live", "Live", &upstream.uri()).await;
+    for (mid, pid) in [("m_gone", "p_gone"), ("m_live", "p_live")] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: "gpt-4".into(),
+                name: "gpt-4".into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (tpid, pid) in [("tp_gone", "p_gone"), ("tp_live", "p_live")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    repo::insert_tenant_model(
+        &pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // A third provider, soft-disabled ON PURPOSE (`weight = 0`, the documented
+    // action). Routing drops it, and the counter must stay SILENT about it: see
+    // the assertion at the end.
+    seed_provider(&pool, "p_soft", "soft", "Soft", &upstream.uri()).await;
+    repo::update_provider(
+        &pool,
+        &Provider {
+            id: "p_soft".into(),
+            key: "soft".into(),
+            name: "Soft".into(),
+            endpoint: upstream.uri(),
+            weight: 0,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
+        },
+    )
+    .await
+    .expect("soft-disable p_soft");
+    repo::insert_provider_model(
+        &pool,
+        &ProviderModel {
+            id: "m_soft".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p_soft".into(),
+            status: 1,
+        },
+    )
+    .await
+    .unwrap();
+    repo::insert_tenant_provider(
+        &pool,
+        &TenantProvider {
+            id: "tp_soft".into(),
+            tenant_id: "t1".into(),
+            provider_id: "p_soft".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let kp = StaticKeyProvider::new([1u8; 32], 1);
+    seed_key(&pool, &kp, "pk_gone", "p_gone", "sk-gone").await;
+    seed_key(&pool, &kp, "pk_live", "p_live", "sk-live").await;
+    seed_key(&pool, &kp, "pk_soft", "p_soft", "sk-soft").await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state.clone());
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    // Deltas, not absolute values: `metrics()` is ONE process-wide registry shared
+    // by every test in this binary, so "== 1" would silently depend on no other
+    // test ever touching these label pairs.
+    let gone0 = candidate_skipped("p_gone", "no_key");
+    let live0 = candidate_skipped("p_live", "no_key");
+    let soft0 = candidate_skipped("p_soft", "soft_disabled");
+
+    // Baseline: both live providers are usable, so there is nothing to attribute.
+    // (A counter that fires on healthy routing would be noise, not a signal.)
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 200, "both providers have keys");
+    assert_eq!(
+        candidate_skipped("p_gone", "no_key"),
+        gone0,
+        "nothing was dropped, so nothing may be recorded"
+    );
+    // The deliberate soft-disable is dropped from every request, and yet:
+    assert_eq!(
+        candidate_skipped("p_soft", "soft_disabled"),
+        soft0,
+        "a deliberate weight-0 disable must NOT be counted — a per-request counter          for an intentional state would track traffic and alert forever"
+    );
+
+    // The degradation: delete p_gone's ONLY key, then publish a fresh snapshot.
+    repo::delete_provider_key(&pool, "pk_gone")
+        .await
+        .expect("delete provider key");
+    state.store.reload_all().await.expect("reload_all");
+
+    // p_live still serves, so the request succeeds — and p_gone is named.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 200, "p_live still has a key");
+    assert_eq!(
+        candidate_skipped("p_gone", "no_key"),
+        gone0 + 1,
+        "the key-less provider must be named on the request that routed around it"
+    );
+    assert_eq!(
+        candidate_skipped("p_live", "no_key"),
+        live0,
+        "the healthy provider must stay quiet"
+    );
+
+    // It is a counter, not a one-shot flag.
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        candidate_skipped("p_gone", "no_key"),
+        gone0 + 2,
+        "one increment per routed request"
+    );
+
+    // Total loss: p_live's key goes too, so the candidate set empties. The answer
+    // is the SAME 503 the historical `Err(NoAvailableProvider)` produced — and both
+    // providers are still named, which is why `resolve_detailed` returns `Ok` with
+    // an empty `candidates` instead of an error that would discard the attribution.
+    repo::delete_provider_key(&pool, "pk_live")
+        .await
+        .expect("delete provider key");
+    state.store.reload_all().await.expect("reload_all");
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(
+        resp.status(),
+        503,
+        "every candidate dropped ⇒ the documented 503 (unchanged)"
+    );
+    assert_eq!(
+        candidate_skipped("p_gone", "no_key"),
+        gone0 + 3,
+        "the already-keyless provider keeps being named"
+    );
+    assert_eq!(
+        candidate_skipped("p_live", "no_key"),
+        live0 + 1,
+        "and the newly keyless one is named too"
+    );
+}
+
+/// `hydra_candidate_skipped_total{provider,reason}` as the tests read it.
+fn candidate_skipped(provider: &str, reason: &str) -> u64 {
+    hydra_server::admin::metrics::candidate_skipped_total(provider, reason)
 }

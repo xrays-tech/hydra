@@ -259,6 +259,76 @@ async fn auth_upstream_timeout_fail_closed() {
     assert_eq!(checker.cache().len(), 0, "timeout must not be cached");
 }
 
+/// An `auth_url` that answers `200` and then **never finishes its body** must not
+/// hold the request forever, and must not let the upstream decide our memory.
+///
+/// The call site's `tokio::time::timeout(.., send)` bounds only the response
+/// HEADERS — reqwest resolves `send()` as soon as they arrive — so the body read
+/// sat outside every deadline, while being the very thing that decides the
+/// verdict (design §11.3 puts the decision in the body). A wedged auth service, or
+/// a WAF/LB answering `200` with an error page and no end, therefore pinned the
+/// worker, the connection and the request context indefinitely; any caller could
+/// fan out with distinct api-keys (each a cache miss) to exhaust a node. Memory
+/// was unbounded too: `resp.text()` had no ceiling.
+///
+/// A raw socket is required: wiremock's `set_delay` delays the WHOLE response,
+/// which trips the header deadline instead of the body one — a different path
+/// from the one under test.
+///
+/// Falsification: remove `.timeout(..)`/`.read_timeout(..)` from
+/// `HttpAuthChecker::new` and the elapsed assertion fails (the call never returns).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_auth_body_does_not_hold_the_request_forever() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalling auth");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                // Headers, then silence: `content-length` promises a body that
+                // never comes.
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 4096\r\n\
+                      content-type: application/json\r\n\r\n",
+                );
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        }
+    });
+
+    let timeout = Duration::from_millis(200);
+    let checker = HttpAuthChecker::new(
+        cache_with_default_clock(),
+        config(FailMode::Closed, timeout),
+    )
+    .expect("checker");
+    let tenant = tenant_at(&format!("http://{addr}"));
+
+    let started = Instant::now();
+    let v = checker.check(&tenant, "sk-stalled-body").await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a stalled auth BODY must be cut by the client deadline (200 ms configured, 5 s \
+         allowed here); the call took {elapsed:?}, i.e. it was not bounded at all"
+    );
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 503,
+            reason: "auth_upstream_unavailable",
+            source: CacheSource::Local
+        },
+        "an upstream that never finishes its body is unavailable: fail-closed"
+    );
+    assert_eq!(checker.cache().len(), 0, "a failed read must not be cached");
+}
+
 // ---------------------------------------------------------------------------
 // T2.6 — fail-open: 5xx → Allowed{Local}, not cached.
 // ---------------------------------------------------------------------------

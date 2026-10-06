@@ -34,14 +34,27 @@ pub async fn materialize(
     kp: &dyn KeyProvider,
     wire: &SnapshotWire,
 ) -> Result<(), SnapshotError> {
-    if let Some(current) = db::get_config_version(pool).await? {
-        if wire.version <= current {
+    match db::get_config_version(pool).await? {
+        // Out-of-order guard: never let an older snapshot overwrite a newer one.
+        db::ConfigVersion::Value(current) if wire.version <= current => {
             debug!(
                 version = wire.version,
                 current, "replica already at a newer version; skipping stale materialization"
             );
             return Ok(());
         }
+        // A corrupt watermark gives no ordering information, and the incoming
+        // snapshot is the leader's CURRENT state — so applying it is both correct
+        // and the repair path (the rebuild writes content and marker together).
+        db::ConfigVersion::Corrupt(raw) => {
+            warn!(
+                raw = %raw,
+                version = wire.version,
+                "replica config_version is not a number; applying the incoming snapshot to \
+                 repair it"
+            );
+        }
+        db::ConfigVersion::Value(_) | db::ConfigVersion::Absent => {}
     }
     // `hydrate` verifies the wire version and unseals BOTH the config and the
     // fidelity rows, so "unsealing" and "what to rebuild" are one decision.
@@ -95,12 +108,33 @@ pub struct MaterializationGuard {
     /// is bounded so a permanently unusable snapshot (wrong master key) cannot
     /// burn the CPU rebuilding on every poll.
     last_wire: Arc<std::sync::Mutex<Option<Arc<SnapshotWire>>>>,
-    retries_left: Arc<std::sync::atomic::AtomicU32>,
+    /// When the next retry of `last_wire` may run, and how many attempts have
+    /// failed in a row (which sets the backoff).
+    ///
+    /// This replaced a fixed budget of `3 retries per snapshot`. A spent budget
+    /// was PERMANENT: the control client never re-delivers a version its memory
+    /// watermark already passed, so the only two ways back were a NEWER config
+    /// write (which needs a working leader — exactly what a cluster with no
+    /// eligible leader cannot produce) or a process restart. A node whose replica
+    /// failed to materialize three times over a transient cause (a locked SQLite,
+    /// a full disk that was then fixed) stayed unable to lead forever.
+    ///
+    /// Retrying is safe: `materialize` is idempotent, guarded by the out-of-order
+    /// version check, and serialized by `in_flight`. What must be bounded is the
+    /// RATE, not the number of tries — a permanently unusable snapshot (wrong
+    /// master key) must not rebuild once per poll forever, and a transient one
+    /// must recover on its own. Hence exponential backoff up to a cap, and
+    /// unbounded retries.
+    next_attempt_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    fail_streak: Arc<std::sync::atomic::AtomicU32>,
 }
 
-/// How many times a failed materialization is retried before the node gives up
-/// on that snapshot (a new snapshot resets the budget).
-const MAX_MATERIALIZATION_RETRIES: u32 = 3;
+/// First retry delay after a failed materialization.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Ceiling for the backoff (a permanently broken snapshot then costs at most one
+/// attempt a minute, forever, instead of three attempts and permanent
+/// ineligibility).
+const RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for MaterializationGuard {
     fn default() -> Self {
@@ -108,7 +142,8 @@ impl Default for MaterializationGuard {
             last_materialized_version: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(tokio::sync::Mutex::new(())),
             last_wire: Arc::new(std::sync::Mutex::new(None)),
-            retries_left: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            next_attempt_at: Arc::new(std::sync::Mutex::new(None)),
+            fail_streak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
@@ -146,37 +181,73 @@ impl MaterializationGuard {
         self.last_materialized_version.load(Ordering::Acquire)
     }
 
-    /// Remember a snapshot that is being dispatched (and reset the retry budget:
-    /// a newer snapshot deserves its own attempts).
+    /// Remember a snapshot that is being dispatched. A NEWER snapshot is a fresh
+    /// chance, so it resets both the backoff and the failure streak (and may be
+    /// attempted immediately).
     fn remember(&self, wire: &SnapshotWire) {
         *self
             .last_wire
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(wire.clone()));
-        self.retries_left
-            .store(MAX_MATERIALIZATION_RETRIES, Ordering::Release);
+        self.fail_streak.store(0, Ordering::Release);
+        *self
+            .next_attempt_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
-    /// Take one retry of the last dispatched snapshot, if the budget allows and
-    /// there is one to retry. `None` = do not retry.
+    /// The delay before attempt number `streak` (1-based): `RETRY_BASE`
+    /// doubling, capped at `RETRY_CAP`.
+    fn backoff_for(streak: u32) -> std::time::Duration {
+        let shift = streak.saturating_sub(1).min(6);
+        (RETRY_BASE * 2u32.saturating_pow(shift)).min(RETRY_CAP)
+    }
+
+    /// Take one retry of the last dispatched snapshot, if there is one and the
+    /// backoff has elapsed. `None` = do not retry now (the caller keeps the gate
+    /// CLOSED; a later poll will try again).
     fn take_retry(&self) -> Option<Arc<SnapshotWire>> {
-        loop {
-            let left = self.retries_left.load(Ordering::Acquire);
-            if left == 0 {
+        let wire = self
+            .last_wire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let mut next = self
+            .next_attempt_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        if let Some(at) = *next {
+            if now < at {
+                crate::admin::metrics::record_replica_materialize_retry("throttled");
                 return None;
             }
-            if self
-                .retries_left
-                .compare_exchange(left, left - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return self
-                    .last_wire
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-            }
         }
+        let streak = self.fail_streak.fetch_add(1, Ordering::AcqRel) + 1;
+        *next = Some(now + Self::backoff_for(streak));
+        crate::admin::metrics::record_replica_materialize_retry("attempt");
+        Some(wire)
+    }
+
+    /// Test-only: make a pending backoff elapse immediately (the alternative is
+    /// sleeping `RETRY_BASE * 2^n` seconds inside a unit test).
+    #[cfg(test)]
+    fn note_backoff_elapsed_for_tests(&self) {
+        *self
+            .next_attempt_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    }
+
+    /// Record that the current attempt succeeded: clear the streak so the next
+    /// failure starts from the base delay again.
+    pub fn note_attempt_succeeded(&self) {
+        self.fail_streak.store(0, Ordering::Release);
+        *self
+            .next_attempt_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -243,8 +314,22 @@ pub fn on_applied(
 /// node whose replica was never written stays ineligible.
 pub async fn replica_is_current(pool: &SqlitePool, store_version: u64) -> bool {
     match db::get_config_version(pool).await {
-        Ok(Some(v)) => v >= store_version,
-        Ok(None) => store_version == 0,
+        Ok(db::ConfigVersion::Value(v)) => v >= store_version,
+        Ok(db::ConfigVersion::Absent) => store_version == 0,
+        // A watermark that cannot be read is NOT evidence of freshness, so fail
+        // closed. Unlike a spent materialization retry budget this is temporary:
+        // the next successful materialization rewrites content and marker
+        // together, which repairs it. (Collapsing Corrupt into Absent here is
+        // exactly how a node with an empty replica used to be judged synced and
+        // become eligible to lead.)
+        Ok(db::ConfigVersion::Corrupt(raw)) => {
+            warn!(
+                raw = %raw,
+                "replica config_version is not a number; refusing to treat this node as synced \
+                 (fix config_meta.config_version, or let a materialization rewrite it)"
+            );
+            false
+        }
         Err(e) => {
             warn!(error = %e, "could not read the replica version; keeping the gate closed");
             false
@@ -300,10 +385,14 @@ pub fn gate_hook(
                 // write or a restart, because the client never re-delivers a
                 // version its memory watermark already passed.
                 let Some(wire) = guard.take_retry() else {
-                    warn!(
+                    // Either no snapshot was ever dispatched, or the backoff has
+                    // not elapsed. Both keep the gate CLOSED (correct — the node
+                    // cannot prove it is current) and both are retried later by
+                    // the next poll, so this must not read as "given up".
+                    debug!(
                         store_version = store.version(),
-                        "replica is behind the store and there is nothing left to retry; \
-                         keeping the leader-eligibility gate closed"
+                        "replica is behind the store; retry deferred (no snapshot yet or still \
+                         backing off); keeping the leader-eligibility gate closed"
                     );
                     gate(false);
                     return;
@@ -313,6 +402,8 @@ pub fn gate_hook(
                     Ok(()) => {
                         let ok = replica_is_current(&pool, store.version()).await;
                         if ok {
+                            crate::admin::metrics::record_replica_materialize_retry("succeeded");
+                            guard.note_attempt_succeeded();
                             info!(
                                 version = wire.version,
                                 "replica materialization retry succeeded"
@@ -326,10 +417,17 @@ pub fn gate_hook(
                         gate(ok);
                     }
                     Err(e) => {
+                        crate::admin::metrics::record_replica_materialize_retry("failed");
+                        let next = MaterializationGuard::backoff_for(
+                            guard.fail_streak.load(Ordering::Acquire).max(1),
+                        );
                         warn!(
                             version = wire.version,
                             error = %e,
-                            "replica materialization retry failed; keeping the gate closed"
+                            next_retry_secs = next.as_secs(),
+                            "replica materialization retry failed; keeping the gate closed and \
+                             backing off (retries are unbounded — the node recovers on its own \
+                             once the cause clears)"
                         );
                         gate(false);
                     }
@@ -340,8 +438,9 @@ pub fn gate_hook(
     })
 }
 
-/// The last-applied config version stored in the replica (`None` = fresh DB).
-pub async fn replica_version(pool: &SqlitePool) -> Result<Option<u64>, sqlx::Error> {
+/// The last-applied config watermark stored in the replica — three states, so
+/// "corrupt" cannot be mistaken for "fresh DB" (see [`db::ConfigVersion`]).
+pub async fn replica_version(pool: &SqlitePool) -> Result<db::ConfigVersion, sqlx::Error> {
     db::get_config_version(pool).await
 }
 
@@ -395,7 +494,7 @@ mod tests {
 
     async fn wait_for_replica_version(pool: &SqlitePool, want: u64) {
         for _ in 0..100 {
-            if replica_version(pool).await.unwrap() == Some(want) {
+            if replica_version(pool).await.unwrap() == db::ConfigVersion::Value(want) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -488,7 +587,7 @@ mod tests {
         );
         assert_eq!(
             replica_version(&pool).await.expect("version"),
-            None,
+            db::ConfigVersion::Absent,
             "no marker either"
         );
     }
@@ -502,13 +601,45 @@ mod tests {
                 .await
                 .expect("init_pool");
             crate::db::run_migrate(&pool).await.expect("migrate");
-            assert_eq!(replica_version(&pool).await.unwrap(), None);
+            assert_eq!(
+                replica_version(&pool).await.unwrap(),
+                db::ConfigVersion::Absent
+            );
             crate::db::set_config_version(&pool, 7).await.expect("set");
-            assert_eq!(replica_version(&pool).await.unwrap(), Some(7));
+            assert_eq!(
+                replica_version(&pool).await.unwrap(),
+                db::ConfigVersion::Value(7)
+            );
             crate::db::set_config_version(&pool, 8)
                 .await
                 .expect("update");
-            assert_eq!(replica_version(&pool).await.unwrap(), Some(8));
+            assert_eq!(
+                replica_version(&pool).await.unwrap(),
+                db::ConfigVersion::Value(8)
+            );
+
+            // A marker that is not a number is CORRUPT, not absent — and the
+            // freshness gate must fail closed on it rather than judging a node
+            // with an empty replica "synced" (which is how `store_version == 0`
+            // used to be treated).
+            sqlx::query(
+                "UPDATE config_meta SET value = 'not-a-number' WHERE key = 'config_version'",
+            )
+            .execute(&pool)
+            .await
+            .expect("corrupt the marker");
+            assert_eq!(
+                replica_version(&pool).await.unwrap(),
+                db::ConfigVersion::Corrupt("not-a-number".to_string())
+            );
+            assert!(
+                !replica_is_current(&pool, 0).await,
+                "a corrupt watermark must not count as synced, even against version 0"
+            );
+            assert!(
+                !replica_is_current(&pool, 8).await,
+                "...and certainly not against a real version"
+            );
         });
     }
 
@@ -544,7 +675,7 @@ mod tests {
         on_applied(&guard, &pool, kp.clone(), &wire(5), &gate(&calls));
         assert_eq!(
             replica_version(&pool).await.unwrap(),
-            Some(7),
+            db::ConfigVersion::Value(7),
             "v5 skipped (stale) → final version stays 7"
         );
         assert_eq!(guard.last(), 7);
@@ -572,7 +703,7 @@ mod tests {
         wait_for_gate_calls(&calls, 2).await;
         assert_eq!(
             replica_version(&pool).await.unwrap(),
-            Some(7),
+            db::ConfigVersion::Value(7),
             "the newest version wins even when v5 started first"
         );
         assert_eq!(
@@ -613,8 +744,140 @@ mod tests {
         );
         assert_eq!(
             replica_version(&pool).await.unwrap(),
-            None,
+            db::ConfigVersion::Absent,
             "nothing was written on failure (last-known-good kept)"
+        );
+    }
+
+    /// The invariant that replaced the fixed 3-retry budget: a failed
+    /// materialization is retried UNBOUNDED in count, rate-limited in time.
+    ///
+    /// With the old budget `take_retry` returned `None` forever once three
+    /// attempts had failed — and because the control client never re-delivers a
+    /// version its memory watermark already passed, the node stayed ineligible to
+    /// lead until a NEWER config write (which needs a working leader) or a
+    /// restart.
+    #[test]
+    fn a_failed_materialization_is_always_offered_again_after_a_backoff() {
+        let guard = MaterializationGuard::new();
+        let w = wire(9);
+        guard.remember(&w);
+
+        // Three failures in a row — exactly the budget the old code spent.
+        for attempt in 0..3 {
+            assert!(
+                guard.take_retry().is_some(),
+                "attempt {attempt} must be offered"
+            );
+            assert!(
+                guard.take_retry().is_none(),
+                "attempt {attempt}: a second try inside the backoff must be declined"
+            );
+            guard.note_backoff_elapsed_for_tests();
+        }
+
+        // The fourth attempt is STILL offered; the old code returned None here
+        // forever.
+        assert!(
+            guard.take_retry().is_some(),
+            "after three failures a further retry must still be offered (this is the \
+             permanent-ineligibility fix)"
+        );
+    }
+
+    /// The backoff grows and is capped, so a permanently unusable snapshot (a
+    /// wrong master key) costs a bounded rate instead of a rebuild per poll.
+    #[test]
+    fn the_retry_backoff_grows_and_is_capped() {
+        assert_eq!(MaterializationGuard::backoff_for(1), RETRY_BASE);
+        assert_eq!(MaterializationGuard::backoff_for(2), RETRY_BASE * 2);
+        assert_eq!(MaterializationGuard::backoff_for(3), RETRY_BASE * 4);
+        assert_eq!(
+            MaterializationGuard::backoff_for(60),
+            RETRY_CAP,
+            "the delay saturates at the cap"
+        );
+    }
+
+    /// End-to-end: a TRANSIENT materialization failure must heal on its own —
+    /// fault removed, no new snapshot, no restart — and the gate must reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transient_materialization_failure_heals_without_a_new_snapshot() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
+             BEGIN SELECT RAISE(ABORT, 'oracle: marker write blocked'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install trigger");
+
+        let kp: Arc<dyn KeyProvider> =
+            Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1));
+        let w = wire(7);
+        let guard = Arc::new(MaterializationGuard::new());
+        let calls = Arc::new(Mutex::new(Vec::<bool>::new()));
+        // Memory is at v7 (what the control client's `apply_snapshot` does) while
+        // the replica DB is still empty — the exact state a failed
+        // materialization leaves behind, and the state the freshness gate must
+        // treat as "not synced".
+        let store = crate::store::ConfigStore::from_snapshot(w.cfg.clone(), kp.clone());
+        store.apply_snapshot(w.clone().hydrate(kp.as_ref()).expect("hydrate"));
+        assert_eq!(
+            store.version(),
+            7,
+            "precondition: the store's memory version is ahead of the replica DB"
+        );
+        let hook = gate_hook(guard.clone(), pool.clone(), store, kp.clone(), gate(&calls));
+
+        // Dispatched once, then the poll keeps finding the node behind.
+        on_applied(&guard, &pool, kp.clone(), &w, &gate(&calls));
+        wait_for_gate_calls(&calls, 1).await;
+        for attempt in 0..4 {
+            hook(&PollOutcome::UpToDate);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Fast-forward the backoff so these polls produce REAL attempts
+            // rather than being throttled: without at least three failed
+            // attempts this test would not discriminate the old fixed budget.
+            guard.note_backoff_elapsed_for_tests();
+            let _ = attempt;
+        }
+        assert!(
+            guard.fail_streak.load(Ordering::Acquire) >= 3,
+            "precondition: at least three attempts really failed (streak {})",
+            guard.fail_streak.load(Ordering::Acquire)
+        );
+        assert!(
+            calls.lock().expect("gate calls mutex").iter().all(|c| !*c),
+            "the gate must stay closed while materialization keeps failing"
+        );
+        assert_eq!(
+            replica_version(&pool).await.unwrap(),
+            db::ConfigVersion::Absent,
+            "nothing was written while the fault was in place"
+        );
+
+        // The cause clears. No new snapshot, no restart.
+        sqlx::query("DROP TRIGGER block_marker")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+
+        let recovered = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                hook(&PollOutcome::UpToDate);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if calls.lock().expect("gate calls mutex").iter().any(|c| *c) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "a node whose replica failed over a TRANSIENT cause must reopen its gate on its \
+             own; the old 3-retry budget made this permanent (calls: {:?})",
+            calls.lock().expect("gate calls mutex")
         );
     }
 }

@@ -160,6 +160,14 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
 /// listener is bound" alertable. A boot-time-only gauge would be stale in
 /// exactly that scenario (an operator adds a cert to a running node), so this
 /// drives the real follower: a snapshot change must move the gauge.
+/// GATED ON A TLS BACKEND, and that gate is load-bearing: `hydra_server::tls`
+/// only exists with `tls-boringssl`/`tls-openssl`, while this FILE is gated on
+/// `db`+`http-client`+`proxy` (the documented "no TLS backend" build). Without
+/// this attribute the whole test binary failed to compile under
+/// `--features hydra-server/proxy` — a supported configuration per
+/// `Cargo.toml` — with `cannot find \`tls\` in \`hydra_server\``, so every OTHER
+/// test in this file silently stopped being compiled or run there.
+#[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
 #[tokio::test]
 async fn tenant_cert_gauge_tracks_snapshot_changes() {
     let pool = common::setup_pool().await;

@@ -114,7 +114,7 @@ async fn run_channel_sink<F, Fut>(
     retry_window: Duration,
     inserter: F,
 ) where
-    F: Fn(Vec<UsageRecord>) -> Fut + Send + 'static,
+    F: Fn(&str, Vec<UsageRecord>) -> Fut + Send + 'static,
     Fut: Future<Output = InsertResult> + Send + 'static,
 {
     let batch_size = batch_size.max(1);
@@ -160,8 +160,32 @@ async fn run_channel_sink<F, Fut>(
                     // Channel closed: best-effort final drain + flush, then exit.
                     // A FAILED final flush means this batch is genuinely lost, so
                     // it is counted like every other drop (never silent).
+                    //
+                    // The window is CAPPED BY THE SHUTDOWN BUDGET, and that cap is
+                    // what makes the reporting below reachable at all.
+                    //
+                    // The mechanism, stated correctly (an earlier version of this
+                    // comment blamed a `process::exit` in `main.rs` right after
+                    // `sink.shutdown()`, which does not exist — `main.rs` only logs
+                    // "usage sinks flushed" and returns, see
+                    // `spawn_sink_flush_on_shutdown`): `shutdown()` waits at most
+                    // `MAX_SHUTDOWN_WAIT` and then gives up on the join, and the
+                    // PROCESS is torn down by Pingora's own shutdown sequence —
+                    // `graceful_shutdown_timeout_seconds` (5 s, set in `main.rs`
+                    // next to `grace_period_seconds`) and `run_forever` ending in
+                    // `std::process::exit(0)` (pingora-core 0.8.1
+                    // `src/server/mod.rs:640`), which runs no destructors. So this
+                    // task is cut off wherever it stands, with no chance to react.
+                    //
+                    // The ordinary 30 s retry window therefore outlived the 5 s
+                    // budget by 25 s, and a backend that was down at shutdown lost
+                    // the whole batch with NO `note_usage_drop` and NO log line: the
+                    // two statements below never ran. One second of the budget is
+                    // left for them.
+                    let shutdown_window = retry_window
+                        .min(MAX_SHUTDOWN_WAIT.saturating_sub(Duration::from_secs(1)));
                     if !buffer.is_empty()
-                        && !flush_with_backoff(&mut buffer, &inserter, retry_window).await
+                        && !flush_with_backoff(&mut buffer, &inserter, shutdown_window).await
                     {
                         note_usage_drop("shutdown_unflushed", buffer.len() as u64);
                         tracing::error!(
@@ -185,13 +209,30 @@ async fn run_channel_sink<F, Fut>(
 /// gives up (usage records are best-effort telemetry, but losing them silently
 /// is worse than bounded retry). Never blocks `record()` callers (runs only in
 /// the background task).
+/// A fresh, process-unique batch id (`<pid>-<nanos>-<seq>`).
+///
+/// Used as ClickHouse's `insert_deduplication_token`, so it must be stable for
+/// one batch across retries and different for distinct batches. Built from the
+/// pid, a monotonic nanosecond clock and an atomic counter — no dependency, and
+/// no collision between two nodes' flushes.
+fn new_batch_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}-{seq:x}", std::process::id())
+}
+
 async fn flush_with_backoff<F, Fut>(
     buffer: &mut Vec<UsageRecord>,
     inserter: &F,
     retry_window: Duration,
 ) -> bool
 where
-    F: Fn(Vec<UsageRecord>) -> Fut,
+    F: Fn(&str, Vec<UsageRecord>) -> Fut,
     Fut: Future<Output = InsertResult>,
 {
     const INITIAL: Duration = Duration::from_millis(50);
@@ -199,12 +240,36 @@ where
 
     let started = tokio::time::Instant::now();
     let mut delay = INITIAL;
+    // ONE id per flush, reused by every retry below. ClickHouse's
+    // `insert_deduplication_token` (see `clickhouse_insert_statement`) makes a
+    // re-sent batch a no-op, which is what stops "the response was lost after the
+    // insert committed" — the retry loop's case — from being billed twice. A
+    // fresh id per ATTEMPT would defeat it entirely (the first cut did exactly
+    // that, and the unit test caught it).
+    //
+    // EVERY attempt below re-sends the SAME records, in the same order, and that
+    // is what makes the single token correct: ClickHouse deduplicates on
+    // (token, block), so a retry whose content differed would NOT be recognised
+    // and the rows the first attempt inserted would be written again. The
+    // invariant holds because `buffer` cannot change while this loop awaits — the
+    // select loop in `run_channel_sink` awaits this call inline, so nothing pushes
+    // while a retry is in flight — and because every inserter returns the very
+    // `Vec` it was handed (`Err((batch, msg))`). An earlier version of this comment
+    // claimed "a batch whose composition changed between attempts" as a residual;
+    // that cannot happen, and stating it as a live risk hid the real one below.
+    //
+    // RESIDUAL, stated plainly: a batch that outlives the retry window is put
+    // back in the buffer and re-flushed on a later tick under a NEW id, so a lost
+    // ack spanning that boundary can still duplicate rows. Closing that needs
+    // ROW-level idempotency (a stable per-row key + `ReplacingMergeTree`), which is
+    // a schema migration — see dev-docs/ops.md.
+    let batch_id = new_batch_id();
     loop {
         if buffer.is_empty() {
             return true;
         }
         let batch = std::mem::take(buffer);
-        match inserter(batch).await {
+        match inserter(&batch_id, batch).await {
             Ok(()) => return true,
             Err((returned, msg)) => {
                 tracing::warn!(
@@ -225,7 +290,15 @@ where
                     );
                     return false;
                 }
-                tokio::time::sleep(delay).await;
+                // The sleep is clamped by what is LEFT of the window. Without
+                // this clamp the window bounded only the ATTEMPTS: after the last
+                // one inside the window the loop still slept the full backoff (up
+                // to CAP = 10 s) before noticing, so a "4 s" window could keep the
+                // task busy for 14 s. That overshoot is precisely what made the
+                // shutdown path lose records silently — the final drain has to
+                // finish inside `MAX_SHUTDOWN_WAIT` for its own loss report to run.
+                let remaining = retry_window.saturating_sub(started.elapsed());
+                tokio::time::sleep(delay.min(remaining)).await;
                 delay = delay.saturating_mul(2).min(CAP);
             }
         }
@@ -270,7 +343,7 @@ impl SqliteSink {
         let (tx, rx) = mpsc::channel(capacity);
 
         let pool_for_task = pool.clone();
-        let inserter = move |batch: Vec<UsageRecord>| {
+        let inserter = move |_batch_id: &str, batch: Vec<UsageRecord>| {
             let pool = pool_for_task.clone();
             async move {
                 match insert_batch_sqlite(&pool, &batch).await {
@@ -390,7 +463,7 @@ async fn insert_batch_sqlite(
     if records.is_empty() {
         return Ok(());
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     for r in records {
         sqlx::query(
             "INSERT INTO usage_record \
@@ -469,10 +542,11 @@ impl ClickHouseSink {
         let (tx, rx) = ch_mpsc::channel(capacity);
 
         let cfg = parse_clickhouse_url(url);
-        let inserter = move |batch: Vec<UsageRecord>| {
+        let inserter = move |batch_id: &str, batch: Vec<UsageRecord>| {
             let cfg = cfg.clone();
+            let batch_id = batch_id.to_string();
             async move {
-                match insert_batch_clickhouse_http(&cfg, &batch).await {
+                match insert_batch_clickhouse_http(&cfg, &batch, &batch_id).await {
                     Ok(()) => Ok(()),
                     Err(msg) => Err((batch, msg)),
                 }
@@ -513,12 +587,23 @@ impl UsageSink for ClickHouseSink {
                 }
             };
             if let Err(err) = tx.try_send(record) {
+                // Keep the record's trace id, exactly as the SQLite sink above does: the counter
+                // says HOW MANY rows were lost, and this field is the only thing that says WHICH.
+                // Measured 2026-09-30 (`integration/test_usage_drop_accounting.py`): the
+                // ClickHouse sink used to drop with `error=no available capacity reason=...` and no
+                // trace id at all — while ClickHouse is the sink cluster deployments are REQUIRED
+                // to run (ops.md §12), i.e. the production path was the one without the diagnostic.
+                let dropped_trace = match &err {
+                    ch_mpsc::error::TrySendError::Full(r)
+                    | ch_mpsc::error::TrySendError::Closed(r) => r.trace_id.clone(),
+                };
                 let (reason, dropped) = match &err {
                     ch_mpsc::error::TrySendError::Full(_) => ("channel_full", 1u64),
                     ch_mpsc::error::TrySendError::Closed(_) => ("channel_closed", 1u64),
                 };
                 note_usage_drop(reason, dropped);
                 tracing::warn!(
+                    dropped_trace_id = %dropped_trace,
                     error = %err,
                     reason,
                     "clickhouse usage sink channel full/closed; dropping usage record"
@@ -593,11 +678,43 @@ fn drain_on_drop(tx: Option<mpsc::Sender<UsageRecord>>, join: Option<tokio::task
 /// The `INSERT` statement. Column list matches the ClickHouse `usage_record`
 /// schema (environment/clickhouse/init.sql) — provider-neutral token columns.
 #[cfg(feature = "usage-clickhouse")]
-const CLICKHOUSE_INSERT: &str =
+const CLICKHOUSE_INSERT_PREFIX: &str =
     "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, sub_tenant_id, \
      status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
-     forward_latency_ms, ttft_ms, upstream_host, error, created_at) \
-     FORMAT JSONEachRow";
+     forward_latency_ms, ttft_ms, upstream_host, error, created_at)";
+
+/// The insert statement for one batch, carrying ClickHouse's
+/// `insert_deduplication_token` so a RETRY of the same batch cannot double-count.
+///
+/// Why this exists: an `INSERT` whose response is lost (read timeout, connection
+/// reset while the reply is in flight) is classified as "the batch did not land"
+/// and retried — but the insert may well have COMMITTED, and the table is a plain
+/// `MergeTree`, so every retry added a duplicate set of usage rows. Duplicates
+/// inflate tenant usage/quota/billing and are invisible after the fact.
+///
+/// Two halves are required, and BOTH are verified against ClickHouse 24.3:
+/// 1. the target table must carry `non_replicated_deduplication_window`
+///    (`environment/clickhouse/init.sql`; existing instances need
+///    `ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000`,
+///    documented in `ops.md`). WITHOUT it the token is accepted and silently
+///    ignored — no error, just no deduplication;
+/// 2. this token, stable across the retries of one batch.
+///
+/// `SETTINGS` must precede `FORMAT` (verified: the reverse is a syntax error).
+#[cfg(feature = "usage-clickhouse")]
+fn clickhouse_insert_statement(batch_id: &str) -> String {
+    // The id is generated by `new_batch_id`, but this is a query built by
+    // string formatting, so keep the token to a safe alphabet rather than
+    // trusting the caller (a quote here would rewrite the statement).
+    let token: String = batch_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(128)
+        .collect();
+    format!(
+        "{CLICKHOUSE_INSERT_PREFIX} SETTINGS insert_deduplication_token='{token}' FORMAT JSONEachRow"
+    )
+}
 
 /// Insert a batch into ClickHouse over HTTP. On failure returns the error
 /// message (the batch is retained by the caller for retry).
@@ -610,6 +727,7 @@ const CLICKHOUSE_INSERT: &str =
 async fn insert_batch_clickhouse_http(
     cfg: &ClickHouseConfig,
     records: &[UsageRecord],
+    batch_id: &str,
 ) -> Result<(), String> {
     if records.is_empty() {
         return Ok(());
@@ -622,7 +740,8 @@ async fn insert_batch_clickhouse_http(
         body.push('\n');
     }
 
-    let result = send(cfg, CLICKHOUSE_INSERT, &[], body.as_bytes()).await?;
+    let stmt = clickhouse_insert_statement(batch_id);
+    let result = send(cfg, &stmt, &[], body.as_bytes()).await?;
 
     // ClickHouse returns HTTP 200 + empty body on a successful INSERT; any other
     // status carries the error text in the body. The writer does not need to
@@ -749,6 +868,20 @@ pub enum BuildSinkError {
     /// not enabled.
     #[error("sink kind 'clickhouse' requires the 'usage-clickhouse' cargo feature")]
     ClickHouseFeatureDisabled,
+    /// `"clickhouse"` was requested with an `https://` URL, which this transport
+    /// cannot serve (there is no TLS path).
+    ///
+    /// Refused at STARTUP rather than at the first write: the alternative is a
+    /// node that boots, serves traffic, and only then fails every usage flush —
+    /// and the credentials never leave either way, so failing early is strictly
+    /// better than failing late.
+    #[error(
+        "HYDRA_CLICKHOUSE_URL uses https:// but this build has no TLS transport for \
+         ClickHouse; refusing to start rather than send credentials and usage rows in \
+         PLAINTEXT — use http:// on a private network or through a tunnel, or terminate \
+         TLS in front of the database"
+    )]
+    ClickHouseTlsUnsupported,
 }
 
 /// Default batch size for sinks constructed via [`build_sink`].
@@ -788,6 +921,11 @@ pub fn build_sink(
             #[cfg(feature = "usage-clickhouse")]
             {
                 let url = ch_url.ok_or(BuildSinkError::MissingClickHouseUrl)?;
+                // See `ClickHouseConfig::tls_requested`: the scheme used to be
+                // stripped and the connection made in the clear.
+                if url.trim().starts_with("https://") {
+                    return Err(BuildSinkError::ClickHouseTlsUnsupported);
+                }
                 Ok(Box::new(ClickHouseSink::new(
                     url,
                     DEFAULT_BATCH_SIZE,
@@ -810,6 +948,78 @@ pub fn build_sink(
 // Audit §3.9 — the batching engine must never stop draining its channel, and
 // the ClickHouse transport must never await an answer without a deadline.
 // ===========================================================================
+/// `clickhouse_insert_statement` had NO test anywhere in the repo, while it is
+/// the half of the retry-idempotency fix that lives in our own code: the token has
+/// to reach a syntactically valid statement, and `SETTINGS` must come BEFORE
+/// `FORMAT` **or ClickHouse rejects the query**. Neither was guarded, so an edit
+/// here could only ever fail on a live instance — which CI never runs for this
+/// (the end-to-end test is `#[ignore]`d and no job passes `--ignored`).
+///
+/// Falsification: put `FORMAT JSONEachRow` before `SETTINGS` and the ordering
+/// assertion fails; drop the alphabet filter and the sanitisation assertion fails.
+#[cfg(feature = "usage-clickhouse")]
+#[cfg(test)]
+mod clickhouse_statement_tests {
+    use super::*;
+
+    #[test]
+    fn the_insert_statement_carries_the_dedup_token_before_format() {
+        let sql = clickhouse_insert_statement("batch-abc123");
+        assert!(
+            sql.contains("insert_deduplication_token='batch-abc123'"),
+            "the token must reach the statement: {sql}"
+        );
+        let settings = sql.find("SETTINGS").expect("SETTINGS present");
+        let format = sql.find("FORMAT JSONEachRow").expect("FORMAT present");
+        assert!(
+            settings < format,
+            "`SETTINGS` must precede `FORMAT` (ClickHouse rejects the query otherwise), \
+             got SETTINGS at {settings} and FORMAT at {format}: {sql}"
+        );
+        assert!(
+            sql.starts_with("INSERT INTO usage_record"),
+            "the prefix must stay the table's insert: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_batch_id_cannot_rewrite_the_statement() {
+        // What matters is STRUCTURE, not vocabulary: letters surviving inside the
+        // literal is the point (the id is a word), while a quote would END the
+        // literal and let a caller append SQL, and a newline would split the
+        // statement. Neither can arrive from `new_batch_id`, but this is a
+        // string-formatted query, so the filter is load-bearing.
+        let sql = clickhouse_insert_statement("a' FORMAT CSV --\ninjected");
+        assert_eq!(
+            sql.matches('\'').count(),
+            2,
+            "exactly one quoted literal: {sql}"
+        );
+        assert!(!sql.contains('\n'), "no newline may survive: {sql}");
+        let token = sql
+            .split("insert_deduplication_token='")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("token literal");
+        assert!(
+            !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "only [A-Za-z0-9_-] may survive into the statement, got {token:?}: {sql}"
+        );
+
+        // And the token is bounded, so no caller can build a huge statement.
+        let long = "x".repeat(500);
+        let sql = clickhouse_insert_statement(&long);
+        assert_eq!(
+            sql.matches('x').count(),
+            128,
+            "the token must be truncated to 128 chars"
+        );
+    }
+}
+
 #[cfg(test)]
 mod audit_3_9_tests {
     use super::*;
@@ -840,10 +1050,307 @@ mod audit_3_9_tests {
     /// flush future waits, `rx.recv()` is never polled: the bounded channel
     /// fills up and `record()` silently drops usage exactly when the sink is
     /// already unhealthy. Pre-fix this test timed out (flush never returned).
+    /// The retry-idempotency invariant: every retry of ONE batch carries the
+    /// SAME `insert_deduplication_token`, and a different batch gets a different
+    /// one. A fresh id per attempt would defeat ClickHouse's deduplication
+    /// entirely (the retry would be a new insert, i.e. double-counted usage).
+    #[tokio::test]
+    async fn one_batch_keeps_its_dedup_token_across_retries() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen_in, attempts_in) = (seen.clone(), attempts.clone());
+        let inserter = move |batch_id: &str, batch: Vec<UsageRecord>| {
+            let seen = seen_in.clone();
+            let attempts = attempts_in.clone();
+            let batch_id = batch_id.to_string();
+            async move {
+                seen.lock().expect("lock").push(batch_id);
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    return Err((batch, "lost the ack".to_string()));
+                }
+                Ok(())
+            }
+        };
+
+        let mut buffer = vec![rec("a")];
+        let flushed = flush_with_backoff(&mut buffer, &inserter, Duration::from_millis(500)).await;
+        assert!(flushed, "the third attempt succeeds");
+        let ids = seen.lock().expect("lock").clone();
+        assert_eq!(ids.len(), 3, "three attempts, one batch");
+        assert!(
+            ids.iter().all(|id| id == &ids[0]),
+            "every retry of one batch must reuse the same dedup token, saw {ids:?}"
+        );
+
+        // A NEW batch must not reuse the token, or its rows would be deduped away.
+        let mut second = vec![rec("b")];
+        let flushed = flush_with_backoff(&mut second, &inserter, Duration::from_millis(500)).await;
+        assert!(flushed);
+        let ids = seen.lock().expect("lock").clone();
+        assert_ne!(
+            ids.last().expect("an id"),
+            &ids[0],
+            "a different batch needs a different token"
+        );
+    }
+
+    /// The single dedup token is only sound if every retry re-sends the SAME
+    /// records in the SAME order: ClickHouse deduplicates on (token, block), so a
+    /// retry whose content differed would not be recognised and the rows the first
+    /// attempt inserted would be written a second time. Nothing tested that
+    /// invariant — the comment above `flush_with_backoff` even listed "a batch
+    /// whose composition changed between attempts" as a live residual, which cannot
+    /// happen: the select loop awaits the flush inline (so nothing pushes while a
+    /// retry is in flight) and every inserter returns the very `Vec` it was handed.
+    ///
+    /// WHAT THIS TEST IS AND IS NOT. It pins the behaviour of the implementation as
+    /// written — `flush_with_backoff` hands the SAME `Vec` back on every attempt —
+    /// which is the invariant the single dedup token depends on. It is NOT a
+    /// detector for the realistic regression: the only place production could break
+    /// the invariant is the `buffer.extend(returned)` that puts a failed batch back,
+    /// and that path cannot be reached from here (nothing else can run while the
+    /// flush awaits, so there is no second source of records to reorder against).
+    /// A test that CAN fail on that would have to drive `run_channel_sink` and
+    /// `tx.send` concurrently during a retry — recorded in the plan as batch 6,
+    /// not claimed here. An earlier version of this comment promised a
+    /// falsification this test is unable to perform.
+    /// An `https://` ClickHouse URL is refused when the SINK IS BUILT, i.e. at
+    /// startup, not on the first flush. `send` refuses it too (see the clickhouse
+    /// module test), so the credential can never leave; this asserts the failure
+    /// is EARLY and loud.
+    #[cfg(feature = "usage-clickhouse")]
+    #[tokio::test]
+    async fn an_https_clickhouse_url_fails_at_build_time() {
+        let err = build_sink(
+            "clickhouse",
+            None,
+            Some("https://user:pass@ch.example.com:8443"),
+        )
+        .err()
+        .expect("https:// must be refused before any traffic is served");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("https://") && msg.contains("PLAINTEXT"),
+            "the refusal must be actionable, got: {msg}"
+        );
+
+        // The plaintext form still builds (this is a scheme check, not a ban).
+        let ok = build_sink("clickhouse", None, Some("http://127.0.0.1:8123"));
+        assert!(
+            ok.is_ok(),
+            "a plain http:// URL must keep working: {:?}",
+            ok.err().map(|e| e.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn every_retry_sends_the_identical_batch_in_the_same_order() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_in = attempts.clone();
+        let inserter = move |_batch_id: &str, batch: Vec<UsageRecord>| {
+            let seen = seen_in.clone();
+            let attempts = attempts_in.clone();
+            async move {
+                seen.lock()
+                    .expect("lock")
+                    .push(batch.iter().map(|r| r.trace_id.clone()).collect());
+                // Fail three times, then succeed: the batch is re-sent unchanged
+                // each time and is still the same batch on the successful attempt.
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
+                    return Err((batch, "lost the ack".to_string()));
+                }
+                Ok(())
+            }
+        };
+
+        let mut buffer = vec![rec("a"), rec("b"), rec("c")];
+        let flushed = flush_with_backoff(&mut buffer, &inserter, Duration::from_millis(500)).await;
+        assert!(flushed, "the fourth attempt succeeds");
+
+        let batches = seen.lock().expect("lock").clone();
+        assert_eq!(batches.len(), 4, "one batch, four attempts");
+        for (i, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                batch,
+                &vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                "attempt {i} must carry the same records in the same order"
+            );
+        }
+    }
+
+    /// A record that arrives WHILE a batch is retrying must join the NEXT batch,
+    /// never the one in flight.
+    ///
+    /// This is the invariant the single dedup token rests on, driven through the
+    /// REAL channel loop — the sibling test
+    /// (`every_retry_sends_the_identical_batch_in_the_same_order`) only feeds
+    /// `flush_with_backoff` a `Vec` and therefore cannot reach the one production
+    /// path that could break it: the `buffer.extend(returned)` that puts a failed
+    /// batch back while the select loop keeps accepting new records. If a late
+    /// record were merged into the in-flight batch, the retry's content would differ
+    /// from the first attempt's, ClickHouse's (token, block) dedup would not
+    /// recognise it, and the rows the first attempt inserted would be billed twice.
+    ///
+    /// Falsification: make `flush_with_backoff` re-take from a shared buffer on each
+    /// attempt (instead of the batch it was handed) and the "mixed" assertion fires.
+    #[tokio::test]
+    async fn a_record_arriving_during_a_retry_joins_the_next_batch_not_this_one() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_in = attempts.clone();
+        let inserter = move |_batch_id: &str, batch: Vec<UsageRecord>| {
+            let seen = seen_in.clone();
+            let attempts = attempts_in.clone();
+            async move {
+                seen.lock()
+                    .expect("lock")
+                    .push(batch.iter().map(|r| r.trace_id.clone()).collect());
+                // Fail twice so the batch is retried while we push a new record.
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    return Err((batch, "backend down".to_string()));
+                }
+                Ok(())
+            }
+        };
+
+        // batch_size 2 ⇒ the first two records start a flush; the hour-long tick
+        // means the ticker cannot flush anything on its own.
+        let task = tokio::spawn(run_channel_sink(
+            rx,
+            2,
+            3600,
+            MAX_FLUSH_RETRY_WINDOW,
+            inserter,
+        ));
+        tx.send(rec("a")).await.expect("send a");
+        tx.send(rec("b")).await.expect("send b");
+        // Let the first attempt fail and the retry backoff begin.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        tx.send(rec("late")).await.expect("send late");
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(20), task).await;
+
+        let batches = seen.lock().expect("lock").clone();
+        assert!(
+            batches
+                .iter()
+                .any(|b| b == &vec!["a".to_string(), "b".to_string()]),
+            "the first batch must be attempted verbatim: {batches:?}"
+        );
+        for b in &batches {
+            let has_late = b.iter().any(|t| t == "late");
+            let has_first = b.iter().any(|t| t == "a" || t == "b");
+            assert!(
+                !(has_late && has_first),
+                "a record that arrived during the retry was MIXED into the in-flight \
+                 batch, which changes its content and defeats the dedup token: {b:?} \
+                 (all attempts: {batches:?})"
+            );
+        }
+        assert!(
+            batches.iter().any(|b| b.iter().any(|t| t == "late")),
+            "the late record must still be flushed in a later batch (not dropped): {batches:?}"
+        );
+    }
+
+    /// A final drain that CANNOT succeed must still be REPORTED.
+    ///
+    /// Round 13 fixed the silent loss (the 30 s drain outlived the 5 s shutdown
+    /// budget, so `note_usage_drop("shutdown_unflushed")` and the `error!` never
+    /// ran), but nothing asserted the reporting itself — only the timing. A
+    /// regression that kept the timing and dropped the reporting would have gone
+    /// unnoticed. The counter is process-global and a sibling test also fails a final
+    /// drain, so assert a strict INCREASE plus the exact count on the last event.
+    ///
+    /// Falsification: delete the `note_usage_drop(..)` call in the `None` arm and
+    /// this fails (the counter does not move).
+    #[tokio::test]
+    async fn a_failed_final_drain_is_reported_not_silent() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inserter = |_batch_id: &str, batch: Vec<UsageRecord>| async move {
+            Err::<(), _>((batch, "backend down".to_string()))
+        };
+        let before = crate::admin::metrics::usage_dropped_total("shutdown_unflushed");
+
+        // Same shape as the timing test: a batch-sized buffer that only the final
+        // drain can flush, and an inserter that always fails.
+        let task = tokio::spawn(run_channel_sink(
+            rx,
+            16,
+            3600,
+            MAX_FLUSH_RETRY_WINDOW,
+            inserter,
+        ));
+        tx.send(rec("lost-1")).await.expect("send");
+        tx.send(rec("lost-2")).await.expect("send");
+        drop(tx);
+        task.await.expect("sink task");
+
+        let after = crate::admin::metrics::usage_dropped_total("shutdown_unflushed");
+        assert!(
+            after > before,
+            "an un-flushable final batch must be COUNTED as a drop (before={before}, \
+             after={after}); losing usage silently is the bug this reporting exists for"
+        );
+    }
+
+    /// The final drain must finish INSIDE the shutdown budget, because that is the
+    /// only way its own loss report can run.
+    ///
+    /// `shutdown()` waits at most `MAX_SHUTDOWN_WAIT` and then stops waiting, and
+    /// Pingora's shutdown sequence then ends the PROCESS (`graceful_shutdown_timeout_seconds`
+    /// in `main.rs` → `run_forever` → `std::process::exit(0)`), cutting the sink
+    /// task off wherever it stands. The final drain used the ordinary 30 s retry
+    /// window, which outlived the 5 s budget by 25 s, so with a backend that was
+    /// down at shutdown the batch was lost with NO `note_usage_drop` and NO log
+    /// line: the reporting statements never ran.
+    ///
+    /// Falsification: pass `retry_window` (30 s) instead of the capped
+    /// `shutdown_window` and the task is still retrying when the budget expires, so
+    /// the join times out and this fails.
+    #[tokio::test]
+    async fn the_final_drain_finishes_inside_the_shutdown_budget() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // Always fails: what is under test is that the drain STOPS in time.
+        let inserter = |_batch_id: &str, batch: Vec<UsageRecord>| async move {
+            Err::<(), _>((batch, "backend down".to_string()))
+        };
+        // A batch size of 16 keeps the record buffered (no inline flush on
+        // arrival), and the hour-long tick means only the FINAL DRAIN can flush.
+        let task = tokio::spawn(run_channel_sink(
+            rx,
+            16,
+            3600,
+            MAX_FLUSH_RETRY_WINDOW,
+            inserter,
+        ));
+        tx.send(rec("a")).await.expect("send");
+        drop(tx); // channel closed ⇒ the None arm runs the final drain
+
+        let joined = tokio::time::timeout(MAX_SHUTDOWN_WAIT, task).await;
+        assert!(
+            joined.is_ok(),
+            "the sink task must finish its final drain within MAX_SHUTDOWN_WAIT \
+             ({MAX_SHUTDOWN_WAIT:?}); otherwise `shutdown()` returns first, \
+             `process::exit` kills the task, and the un-flushed batch is lost with \
+             no counter and no log line"
+        );
+        joined
+            .expect("checked")
+            .expect("the sink task must not panic");
+    }
+
     #[tokio::test]
     async fn flush_gives_up_after_the_retry_window_and_keeps_the_batch() {
         let mut buffer = vec![rec("a"), rec("b")];
-        let inserter = |batch: Vec<UsageRecord>| async move {
+        let inserter = |_batch_id: &str, batch: Vec<UsageRecord>| async move {
             Err::<(), _>((batch, "clickhouse down".to_string()))
         };
         let gave_up = tokio::time::timeout(
@@ -874,7 +1381,7 @@ mod audit_3_9_tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (delivered_in, attempts_in) = (delivered.clone(), attempts.clone());
-        let inserter = move |batch: Vec<UsageRecord>| {
+        let inserter = move |_batch_id: &str, batch: Vec<UsageRecord>| {
             let delivered = delivered_in.clone();
             let attempts = attempts_in.clone();
             async move {
@@ -923,6 +1430,7 @@ mod audit_3_9_tests {
             host_port: addr.to_string(),
             auth: None,
             query_params: String::new(),
+            tls_requested: false,
             connect_timeout: Duration::from_millis(connect_ms),
             io_timeout: Duration::from_millis(io_ms),
         }
@@ -954,7 +1462,7 @@ mod audit_3_9_tests {
             spawn_responder("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await;
         let cfg = cfg_for(addr, 500, 500);
-        insert_batch_clickhouse_http(&cfg, &[rec("a")])
+        insert_batch_clickhouse_http(&cfg, &[rec("a")], "test-batch")
             .await
             .expect("a 200 must be a success");
     }
@@ -968,7 +1476,7 @@ mod audit_3_9_tests {
         )
         .await;
         let cfg = cfg_for(addr, 500, 500);
-        let msg = insert_batch_clickhouse_http(&cfg, &[rec("a")])
+        let msg = insert_batch_clickhouse_http(&cfg, &[rec("a")], "test-batch")
             .await
             .expect_err("5xx must not be treated as success");
         assert!(msg.contains("500"), "{msg}");
@@ -999,7 +1507,7 @@ mod audit_3_9_tests {
         let started = tokio::time::Instant::now();
         let out = tokio::time::timeout(
             Duration::from_secs(5),
-            insert_batch_clickhouse_http(&cfg, &[rec("a")]),
+            insert_batch_clickhouse_http(&cfg, &[rec("a")], "test-batch"),
         )
         .await
         .expect("the insert must give up: one stuck flush pinned ALL usage metering on the node");

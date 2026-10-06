@@ -33,6 +33,14 @@
 //! (see the integration tests in `tests/admin_api.rs` which use the same
 //! `std::thread::spawn(run_forever)` shape to avoid the nesting).
 
+// A `[[bin]]` target is its own compilation unit: the inner attribute in
+// `lib.rs` does NOT apply here, so without this line the binary — the artifact
+// the image ships and the only code that boots the process — was the one place
+// `unsafe` would have compiled silently. `dev-docs/HANDOFF.md` claims
+// "both crates: `#![forbid(unsafe_code)]`"; `scripts/check_source_purity.cjs`
+// now asserts the attribute is present on every crate ROOT, binary included.
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use hydra_core::breaker::BreakerConfig;
@@ -227,12 +235,21 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                     .into(),
             );
         }
-        if cluster.cluster_token.is_none() {
+        let Some(cluster_token) = cluster.cluster_token.as_deref() else {
             return Err(
                 "cluster mode requires HYDRA_CLUSTER_TOKEN (shared control-channel token); \
                  refusing to start"
                     .into(),
             );
+        };
+        // Strength floor, matching the admin token's. Presence alone is not
+        // enough: this token is all that stands in front of the internal control
+        // plane (fleet config snapshots) and the cross-tenant sub-tenant/route
+        // write endpoints, and the gate accepts it over the network.
+        // `.into()` (not `?`) so the error type conversion matches the other
+        // startup refusals in this function exactly.
+        if let Err(too_short) = validate_cluster_token(cluster_token) {
+            return Err(too_short.into());
         }
     }
     if role == hydra_server::cluster::NodeRole::Leader
@@ -241,7 +258,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             .unwrap_or(true)
     {
         return Err(
-            "leader mode requires HYDRA_ADMIN_TOKEN (shared across the cluster — standby              nodes forward admin mutations to the active with it); refusing to start"
+            "leader mode requires HYDRA_ADMIN_TOKEN (shared across the cluster — standby nodes forward admin mutations to the active with it); refusing to start"
                 .into(),
         );
     }
@@ -315,6 +332,56 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         Some(p)
     };
 
+    // (2b) One-shot master-key rotation (`HYDRA_RESEAL_SECRETS=1`).
+    //
+    // Runs BEFORE the config store is loaded, because loading decrypts provider
+    // keys and certificate private keys: with only the new key configured those
+    // reads fail and the process refuses to start — which is exactly the
+    // no-recovery hole this closes. Start once with
+    // `HYDRA_ENCRYPTION_KEY=<new>` + `HYDRA_ENCRYPTION_KEY_VERSION=<new>` +
+    // `HYDRA_ENCRYPTION_KEY_PREVIOUS=<old>` (+ `..._PREVIOUS_VERSION`), and this
+    // re-seals every row in one transaction per table, prints a report and exits
+    // instead of serving. Drop the previous-key variables afterwards.
+    //
+    // A FAILED row is reported and left untouched, and the exit code is non-zero,
+    // so an incomplete rotation cannot be mistaken for a finished one.
+    if let ResealSwitch::Invalid(value) = reseal_switch() {
+        // Fail LOUD: the alternative is a node that serves traffic while the operator believes
+        // the rotation ran (measured: every unrecognised value used to do exactly that).
+        error!(
+            value = %value,
+            "HYDRA_RESEAL_SECRETS is not a value this process understands: use 1/true/yes/on \
+             to re-seal every stored secret and exit, or 0/false/no/off (or unset) to serve \
+             normally; refusing to start rather than silently skipping the rotation"
+        );
+        std::process::exit(1);
+    }
+    if reseal_requested() {
+        let Some(p) = &pool else {
+            error!("HYDRA_RESEAL_SECRETS=1 needs a local database (this is an edge node)");
+            std::process::exit(1);
+        };
+        match db::reseal_secrets(p, key_provider.as_ref()).await {
+            Ok(report) => {
+                println!(
+                    "reseal: provider_keys={} tenant_certs={} already_current={} failed={}",
+                    report.provider_keys_resealed,
+                    report.tenant_certs_resealed,
+                    report.already_current,
+                    report.failed.len()
+                );
+                for f in &report.failed {
+                    println!("reseal FAILED: {f}");
+                }
+                std::process::exit(if report.is_complete() { 0 } else { 1 });
+            }
+            Err(e) => {
+                error!(error = %e, "reseal failed; nothing was rewritten");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // (2c) Config store (initial snapshot).
     let store = match &pool {
         Some(p) => {
@@ -367,7 +434,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 redis_url
                     .as_deref()
                     .ok_or("HYDRA_REDIS_URL must be set in cluster mode (checked above)")?,
-                hydra_server::redis::RedisMode::from_env(),
+                hydra_server::redis::RedisMode::from_env()?,
             )
             .await?,
         )
@@ -489,17 +556,56 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // cluster-wide dead-set via the sync task (P4).
     // C3: the documented non-route strategy is now actually read (it was a
     // ghost switch, so `Reject` could not be configured at all).
+    // Both upstream deadline env vars are read here (the single construction site) or they
+    // are ghosts, and the CONNECT bound is REFUSED unless it sits strictly below the
+    // first-byte bound: the latter wraps the whole `send()` including the connect, so a
+    // connect bound at or above it can never fire — a dead route would keep being reported as
+    // a post-send first-byte timeout (and would keep NOT failing over) with nothing on screen
+    // to explain it.
+    let upstream_first_byte_timeout_secs =
+        hydra_server::proxy::config::parse_upstream_first_byte_timeout_secs(
+            std::env::var("HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        );
+    let upstream_connect_timeout_secs =
+        hydra_server::proxy::config::parse_upstream_connect_timeout_secs(
+            std::env::var("HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        );
+    hydra_server::proxy::config::check_upstream_connect_before_first_byte(
+        upstream_connect_timeout_secs,
+        upstream_first_byte_timeout_secs,
+    )
+    .map_err(Box::<dyn std::error::Error>::from)?;
     let proxy_cfg = ProxyConfig {
         non_route_strategy: non_route_strategy_from_env()
             .map_err(Box::<dyn std::error::Error>::from)?,
-        // Read HERE (the single construction site) or the env var is a ghost:
-        // the value would never reach the request path.
-        upstream_first_byte_timeout_secs:
-            hydra_server::proxy::config::parse_upstream_first_byte_timeout_secs(
-                std::env::var("HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS")
+        upstream_first_byte_timeout_secs,
+        upstream_connect_timeout_secs,
+        // The body's own bound. Required for the removal of the upstream
+        // client's total timeout to be safe: without it a stalled stream would
+        // hold a worker forever.
+        upstream_stream_idle_timeout_secs:
+            hydra_server::proxy::config::parse_upstream_stream_idle_timeout_secs(
+                std::env::var("HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS")
                     .ok()
                     .as_deref(),
             ),
+        // The downstream body's own bound — the only thing standing between a
+        // client that never finishes sending and a permanently occupied worker.
+        request_body_timeout_secs: hydra_server::proxy::config::parse_request_body_timeout_secs(
+            std::env::var("HYDRA_REQUEST_BODY_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        ),
+        // The hard body cap. `ops.md` §8 tells an operator with a small VPS to
+        // LOWER this to cut peak memory (memory ≈ concurrency × average body); that
+        // advice was unactionable while the value only came from the Default impl.
+        max_request_body_hard: hydra_server::proxy::config::parse_max_request_body_hard(
+            std::env::var("HYDRA_MAX_REQUEST_BODY_HARD").ok().as_deref(),
+        ),
         ..ProxyConfig::default()
     };
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
@@ -667,15 +773,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             store.clone(),
             cluster.node_id.clone(),
         );
-        // F-6: keep the invalidation stream bounded. A trim that removes
-        // entries bumps the generation so lagging consumers re-hydrate
-        // (idempotent full clear).
-        hydra_server::cluster::events::spawn_trim_task(
-            stream.clone(),
-            // retain the most recent N invalidation events
-            10_000,
-            std::time::Duration::from_secs(30),
-        );
+        // F-6: the trim task is spawned LATER, once the live-node view exists
+        // (see below) — without it a trim cannot tell "every consumer already
+        // applied this" from "we just dropped an unread event".
         info!("invalidation consumer started");
         Some(stream)
     } else {
@@ -716,10 +816,14 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             "trusting X-Forwarded-For from these peers only; a trusted peer that \
              does not strip inbound X-Forwarded-For lets clients rotate limiter buckets"
         );
-        // Catch-all range footgun: a /0 entry trusts X-Forwarded-For from ANY
-        // peer, which makes the per-IP dimension forgeable and effectively
-        // disables it. Warn loudly but do not fail startup (the operator may
-        // have a reason, e.g. a single-node test rig behind NAT).
+        // Catch-all range footgun. NOT "forgeable" — that was this comment's claim
+        // until 2026-09-29, when measuring `HYDRA_TRUSTED_PROXIES=0.0.0.0/0` showed the
+        // opposite: every candidate counts as "trusted", so `resolve_client_ip` falls
+        // back to the PEER, and every client behind that peer shares ONE failure bucket
+        // (a fresh X-Forwarded-For plus a fresh bad token was still refused once the
+        // budget tripped). The real footgun is bucket SHARING / lockout amplification,
+        // which is what the message below says. Warn loudly but do not fail startup (the
+        // operator may have a reason, e.g. a single-node test rig behind NAT).
         let has_catch_all = tenant_api_cfg
             .trusted_proxies
             .iter()
@@ -727,9 +831,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         if has_catch_all {
             warn!(
                 "HYDRA_TRUSTED_PROXIES contains a catch-all range (0.0.0.0/0 or ::/0); \
-                 this trusts X-Forwarded-For from ANY peer, making the per-IP lockout \
-                 dimension forgeable and effectively disabling it. Remove the /0 entry \
-                 and list only the specific proxy IPs you control."
+                 every X-Forwarded-For candidate is then \"trusted\", so the client IP \
+                 falls back to the PEER and ALL clients behind it share one failure \
+                 bucket — a few bad tokens lock the tenant API out for every one of \
+                 them for the lockout window. Remove the /0 entry and list only the \
+                 proxy IPs you control."
             );
         }
     }
@@ -794,7 +900,23 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         let view: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
             Arc::new(move || live.load().to_vec());
         tenant_api_cfg.live_nodes = Some(view.clone());
-        fleet_live = Some(view);
+        fleet_live = Some(view.clone());
+        // F-6: keep the invalidation stream bounded. A trim that drops an entry
+        // some LIVE consumer had not applied bumps the generation so lagging
+        // consumers re-hydrate (idempotent full clear). When the live view
+        // PROVES every dropped entry was already applied, no bump happens —
+        // otherwise a fleet that is keeping up perfectly still wiped every
+        // node's auth cache on each trim above `maxlen / interval` events/s.
+        if let Some(stream) = &invalidation_stream {
+            hydra_server::cluster::events::spawn_trim_task(
+                stream.clone(),
+                // retain the most recent N invalidation events
+                10_000,
+                std::time::Duration::from_secs(30),
+                Some(view),
+            );
+            info!("invalidation stream trim task started (watermark-aware)");
+        }
     }
 
     #[cfg(feature = "db")]
@@ -1132,10 +1254,36 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         graceful_shutdown_timeout_seconds: Some(5),
         ..Default::default()
     };
+    // `-u` / `--upgrade` — the documented zero-downtime upgrade (`ops.md` §2).
+    //
+    // This flag is consumed by PINGORA's bootstrap, not by `ServerConf`:
+    // `Bootstrap::new` reads `(opt.test, opt.upgrade)` and only then calls
+    // `load_fds(upgrade)` to inherit the running process's listening sockets
+    // (pingora-core 0.8.1 `server/bootstrap_services.rs:148`). Until 2026-09-29 the
+    // binary passed `Opt::default()` and never looked at argv at all, so the
+    // runbook's `hydra -u` was a NO-OP: the new process ignored the old one's
+    // socket handover, tried to bind the same ports itself and died with
+    // `cannot bind … Address already in use … refusing to start` (measured; the old
+    // process logged `Trying to send socks` with nothing listening).
+    //
+    // Argv is sniffed rather than handed to pingora's clap `Opt::parse_args()`,
+    // which would also accept `-c/-d/-t/--log` and exit on unknown arguments:
+    // hydra documents exactly one flag, and unknown arguments stay ignored exactly
+    // as before.
+    let upgrade = upgrade_requested(&std::env::args().skip(1).collect::<Vec<_>>());
+    if upgrade {
+        info!("upgrade mode: inheriting the listening sockets of the running process");
+    }
     // `new_with_opt_and_conf` returns a `Server` (not a `Result`), so there is
     // nothing to map here; the only thing it does not do that `Server::new` did
     // is derive the unused `version` field from `Opt`.
-    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
+    let mut server = Server::new_with_opt_and_conf(
+        Some(Opt {
+            upgrade,
+            ..Opt::default()
+        }),
+        conf,
+    );
     server.bootstrap();
 
     // Clone the admission controller out of AppState BEFORE c.state is moved
@@ -1174,14 +1322,30 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     // is alive with zero data-plane listeners while admin probes answer 200).
     // The plaintext entry is the availability path — if it cannot bind, refuse
     // to start instead of pretending to serve.
-    if let Err(e) = hydra_server::listeners::probe_bind(&plan.plain) {
-        return Err(format!(
-            "{}={}: {e}; refusing to start — the data plane would have no listener while the \
-             process still reported healthy",
-            hydra_server::listeners::LISTEN_ENV,
-            plan.plain
-        )
-        .into());
+    //
+    // EXCEPT in upgrade mode (`-u`): there the address is SUPPOSED to be in use —
+    // the predecessor still holds it, and Pingora's `listen(fds)` reuses the socket
+    // transferred over the upgrade socket (`pingora-core listeners/l4.rs:326`
+    // looks the address up in the inherited FD table). Probing anyway aborted every
+    // handover: measured 2026-09-29, the new process died with `Address already in
+    // use … refusing to start` immediately after Pingora's own `Bootstrap done`, so
+    // the documented `hydra -u` could never take the port over.
+    if !upgrade {
+        if let Err(e) = hydra_server::listeners::probe_bind(&plan.plain) {
+            return Err(format!(
+                "{}={}: {e}; refusing to start — the data plane would have no listener while the \
+                 process still reported healthy",
+                hydra_server::listeners::LISTEN_ENV,
+                plan.plain
+            )
+            .into());
+        }
+    } else {
+        info!(
+            listener = %plan.plain,
+            "upgrade mode: not probing the plaintext listener — the address is held by the \
+             process we are taking it over from"
+        );
     }
     proxy_service.add_tcp(&plan.plain);
 
@@ -1190,7 +1354,12 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     // port that cannot bind used to be fatal for the whole data plane).
     #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
     let tls_bound: Option<String> = match plan.tls.clone() {
-        Some(tls_addr) => match hydra_server::listeners::probe_bind(&tls_addr) {
+        Some(tls_addr) => match if upgrade {
+            // Same reasoning as the plaintext entry above.
+            Ok(())
+        } else {
+            hydra_server::listeners::probe_bind(&tls_addr)
+        } {
             Ok(()) => {
                 let cert_store = c
                     .cert_store
@@ -1245,6 +1414,20 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     // publish it as `hydra_listener_bound{protocol="plain"}`. It is the external
     // evidence the log line above cannot provide (see the function docs).
     spawn_listener_self_check(plan.plain.clone());
+    // READ THIS GAUGE AS CONFIGURATION, NOT LIVENESS.
+    //
+    // `protocol="plain"` is the liveness signal: the self-check above dials the port
+    // and rewrites it to false when the service never came up. `protocol="tls"` is
+    // published here, from `tls_bound` — i.e. from the CONFIG decision — and nothing
+    // ever revises it. That is deliberate rather than a gap: both addresses are
+    // added to the SAME Pingora service (`add_tcp` above, `add_tls_with_settings`
+    // below), and `Listeners::build()` is all-or-nothing per service, so a bind
+    // failure (including the microsecond race between `probe_bind` and Pingora's own
+    // bind) takes BOTH listeners down and is reported by `plain` going false. A
+    // separate TLS dial would therefore be redundant. The pair of alerts in
+    // `ops.md` §9.1 must be read the same way: `bound{plain} == 0` means the data
+    // plane is not listening; `certs > 0 and bound{tls} == 0` means TLS was never
+    // configured. (Its text says exactly that.)
     hydra_server::admin::metrics::record_listener_bound("tls", tls_bound.is_some());
 
     // Startup banner (bug report §5.5): one line that shows the whole protocol
@@ -1304,6 +1487,25 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     };
     let admin_state = Arc::new(admin_state);
     let admin_app = AdminService::new(admin_state);
+    // Same reasoning as the plaintext probe above, and the failure shape is INVERTED
+    // here: a bind failure inside Pingora's admin service task leaves the DATA plane
+    // serving while the admin port silently never listens — every container
+    // healthcheck (`/api/v1/health` on the admin port, in all three compose files)
+    // then fails and the orchestrator restarts the container in a loop, with no
+    // startup error to read anywhere.
+    // Upgrade mode excluded for the same reason as the data listener above: the
+    // predecessor holds this address and Pingora inherits the socket from it.
+    // Measured 2026-09-29: without this exclusion the handover died here instead
+    // (`HYDRA_ADMIN_ADDR=…: cannot bind … Address already in use`).
+    if !upgrade {
+        if let Err(e) = hydra_server::listeners::probe_bind(&admin_addr) {
+            return Err(format!(
+                "HYDRA_ADMIN_ADDR={admin_addr}: {e}; refusing to start — the admin API would \
+                 never listen while the data plane reported healthy"
+            )
+            .into());
+        }
+    }
     let mut admin_service =
         pingora_core::services::listening::Service::new("Hydra admin API".to_string(), admin_app);
     admin_service.add_tcp(&admin_addr);
@@ -1393,6 +1595,14 @@ fn spawn_listener_self_check(plain: String) {
 
 /// Flush the usage sink when the process is asked to terminate.
 /// The only chance to persist buffered usage: see the call site.
+///
+/// SIGQUIT is included on purpose: it is the signal the documented deployments
+/// actually send. `ops.md` §1.2 ships `KillSignal=SIGQUIT` in the systemd unit
+/// (so a plain `systemctl restart` sends it) and §3's rolling upgrade starts
+/// with `kill -SIGQUIT <pid>`. Pingora handles SIGQUIT itself (socket handover,
+/// then drain) and ends in `process::exit(0)`, which runs no destructors — so
+/// without an explicit hook here every routine restart silently discarded the
+/// whole sink buffer.
 fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -1405,13 +1615,88 @@ fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
             tracing::warn!("cannot listen for SIGINT; buffered usage may be lost on shutdown");
             return;
         };
+        // SIGQUIT: the documented systemd `KillSignal` / upgrade signal.
+        let Ok(mut quit) = signal(SignalKind::quit()) else {
+            tracing::warn!("cannot listen for SIGQUIT; buffered usage may be lost on shutdown");
+            return;
+        };
         tokio::select! {
             _ = term.recv() => info!("SIGTERM: flushing usage sinks"),
             _ = interrupt.recv() => info!("SIGINT: flushing usage sinks"),
+            _ = quit.recv() => info!("SIGQUIT: flushing usage sinks"),
         }
         sink.shutdown().await;
         info!("usage sinks flushed");
     });
+}
+
+/// `-u` / `--upgrade`: inherit the running process's listening sockets instead of
+/// binding them (Pingora's zero-downtime upgrade, `ops.md` §2).
+///
+/// Pure so it can be tested without touching the process environment — and so the
+/// documented flag has exactly one definition. Only the exact short/long flags are
+/// accepted (`--upgrade=1` is not, deliberately: an operator who typos the flag gets
+/// the loud "address already in use" refusal instead of a silent non-upgrade).
+#[must_use]
+fn upgrade_requested(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-u" || a == "--upgrade")
+}
+
+/// `HYDRA_RESEAL_SECRETS=1` (or `true`) — run the one-shot re-seal and exit.
+///
+/// Container-friendly on purpose: the alternative (a CLI subcommand) has to fight
+/// the Pingora argument parser, and this is an operation you run with
+/// `docker run --rm -e ... <same image>`.
+fn reseal_requested() -> bool {
+    matches!(reseal_switch(), ResealSwitch::On)
+}
+
+/// The three states of `HYDRA_RESEAL_SECRETS` (see [`reseal_requested`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResealSwitch {
+    /// Serve traffic normally.
+    Off,
+    /// Re-seal every stored secret and exit.
+    On,
+    /// A value this process does not understand — refused at startup.
+    Invalid(String),
+}
+
+/// Parse the one-shot maintenance switch **strictly**.
+///
+/// Measured 2026-09-30 (`integration/test_key_rotation_live.py`, case K8): the previous version
+/// was `matches!(var, Ok("1") | Ok("true") | Ok("yes"))`, so EVERY other value — `YES`, `on`,
+/// `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally". The documented
+/// procedure is "run this once, read the report line and the exit code"; an operator whose
+/// container then came up and served had no signal at all that the rotation never ran, and the
+/// controller in `ops.md` §3 (`docker run --rm -e HYDRA_RESEAL_SECRETS=1 …`) would sit there
+/// serving instead of exiting. `upgrade_requested` is deliberately strict about the same shape
+/// of mistake ("an operator who typos the flag gets the loud refusal instead of a silent
+/// non-upgrade"); this switch now matches that standard. Values are matched case-insensitively
+/// so `TRUE`/`Yes` do what a human means.
+///
+/// `ON_VALUES`/`OFF_VALUES` are documented in `ops.md` §1.2.
+fn reseal_switch() -> ResealSwitch {
+    parse_reseal_switch(std::env::var("HYDRA_RESEAL_SECRETS").ok().as_deref())
+}
+
+/// Pure half of [`reseal_switch`] — free of the process environment so the whole vocabulary can
+/// be tested directly (the same shape as the `parse_*` helpers in `proxy::config`).
+fn parse_reseal_switch(raw: Option<&str>) -> ResealSwitch {
+    const ON_VALUES: [&str; 4] = ["1", "true", "yes", "on"];
+    const OFF_VALUES: [&str; 5] = ["", "0", "false", "no", "off"];
+    let Some(raw) = raw else {
+        // Unset is the ordinary case: serve traffic.
+        return ResealSwitch::Off;
+    };
+    let value = raw.trim().to_ascii_lowercase();
+    if ON_VALUES.contains(&value.as_str()) {
+        ResealSwitch::On
+    } else if OFF_VALUES.contains(&value.as_str()) {
+        ResealSwitch::Off
+    } else {
+        ResealSwitch::Invalid(raw.to_string())
+    }
 }
 
 /// How long a node may go without re-registering before its row becomes
@@ -1445,6 +1730,26 @@ fn shutdown_drain_secs() -> u64 {
     parse_shutdown_drain_secs(std::env::var("HYDRA_SHUTDOWN_DRAIN_SECS").ok().as_deref())
 }
 
+/// Reject a cluster token that is too weak to guard the control plane.
+///
+/// Kept PURE (and next to the other parsers) so it can be unit-tested without
+/// spawning a process. Note what this can and cannot promise: it enforces a
+/// LENGTH, and length is not entropy — `"aaaaaaaaaaaaaaaa"` passes. The message
+/// therefore tells the operator how to generate a real one, and `dev-docs/ops.md`
+/// says "at least `MIN_CLUSTER_TOKEN_LEN` characters AND random" rather than
+/// implying that length alone is enough.
+fn validate_cluster_token(token: &str) -> Result<(), String> {
+    if token.len() < AdminService::MIN_CLUSTER_TOKEN_LEN {
+        return Err(format!(
+            "HYDRA_CLUSTER_TOKEN is too short ({} chars, minimum {}); \
+             generate one with `openssl rand -hex 32`; refusing to start",
+            token.len(),
+            AdminService::MIN_CLUSTER_TOKEN_LEN
+        ));
+    }
+    Ok(())
+}
+
 /// Parse half of [`shutdown_drain_secs`], kept PURE so it can be tested without
 /// touching the process environment (like the other config parsers here).
 ///
@@ -1457,17 +1762,20 @@ fn parse_shutdown_drain_secs(raw: Option<&str>) -> u64 {
 }
 
 /// Best-effort registry de-registration on shutdown. Mirrors
-/// [`spawn_sink_flush_on_shutdown`]: pingora's SIGTERM path ends in
+/// [`spawn_sink_flush_on_shutdown`]: pingora's SIGQUIT/SIGTERM path ends in
 /// `process::exit(0)`, which runs no destructors, so this is the only chance to
 /// remove our row (otherwise a clean restart leaves a row for the reaper).
+/// SIGQUIT is listed because that is what the documented systemd unit sends
+/// (`ops.md` §1.2 `KillSignal=SIGQUIT`).
 #[cfg(feature = "cluster-redis")]
 fn spawn_registry_unregister_on_shutdown(reg: hydra_server::cluster::registry::NodeRegistry) {
     use tokio::signal::unix::{signal, SignalKind};
 
     tokio::spawn(async move {
-        let (Ok(mut term), Ok(mut interrupt)) = (
+        let (Ok(mut term), Ok(mut interrupt), Ok(mut quit)) = (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
+            signal(SignalKind::quit()),
         ) else {
             tracing::warn!("cannot listen for shutdown signals; the registry row stays behind");
             return;
@@ -1475,6 +1783,7 @@ fn spawn_registry_unregister_on_shutdown(reg: hydra_server::cluster::registry::N
         tokio::select! {
             _ = term.recv() => {}
             _ = interrupt.recv() => {}
+            _ = quit.recv() => {}
         }
         if let Err(e) = reg.unregister().await {
             tracing::warn!(error = %e, "node registry: unregister on shutdown failed");
@@ -1512,6 +1821,40 @@ mod drain_tests {
 #[cfg(all(test, feature = "cluster-redis"))]
 mod tests {
     use super::*;
+
+    /// The one-shot rotation switch is parsed STRICTLY and case-insensitively.
+    ///
+    /// Regression (measured 2026-09-30, `integration/test_key_rotation_live.py` K8): the previous
+    /// `matches!(var, Ok("1") | Ok("true") | Ok("yes"))` turned every other value — `YES`, `on`,
+    /// `TRUE`, `reseal`, `2` — into "serve traffic normally", so a typo in the documented one-shot
+    /// command silently skipped the rotation while the node came up looking healthy.
+    #[test]
+    fn the_reseal_switch_is_strict_about_values_it_does_not_know() {
+        use ResealSwitch::{Invalid, Off, On};
+        // The ordinary cases.
+        assert_eq!(parse_reseal_switch(None), Off);
+        for v in ["", "0", "false", "no", "off", "  ", "FALSE", "Off"] {
+            assert_eq!(
+                parse_reseal_switch(Some(v)),
+                Off,
+                "{v:?} must mean 'serve normally'"
+            );
+        }
+        for v in ["1", "true", "yes", "on", "TRUE", "Yes", " on ", "1 "] {
+            assert_eq!(
+                parse_reseal_switch(Some(v)),
+                On,
+                "{v:?} must mean 're-seal and exit'"
+            );
+        }
+        // ...and everything else is REFUSED rather than silently served.
+        for v in ["reseal", "2", "enabled", "y", "1x", "ture", "re-seal"] {
+            match parse_reseal_switch(Some(v)) {
+                Invalid(echoed) => assert_eq!(echoed, v, "the offending value must be echoed"),
+                other => panic!("{v:?} must be Invalid, got {other:?}"),
+            }
+        }
+    }
 
     /// F-5: `HYDRA_BREAKER_QUORUM` must actually be honored (before the fix
     /// it was a ghost env — mentioned in a comment and the docs, never read).
@@ -1557,6 +1900,50 @@ mod tests {
         }
 
         std::env::remove_var("HYDRA_LEADER_LEASE_MS");
+    }
+}
+
+#[cfg(test)]
+mod cluster_token_tests {
+    use super::*;
+
+    /// The cluster token had a PRESENCE-only check until round 12, while the admin
+    /// token refused to boot below `MIN_ADMIN_TOKEN_LEN` — so a one-character token
+    /// booted fine while guarding the internal control plane and the cross-tenant
+    /// sub-tenant/route write endpoints. This pins the floor and the advice.
+    ///
+    /// It also documents the LIMIT of the check: length is not entropy, so
+    /// `"aaaaaaaaaaaaaaaa"` passes — which is why the message names the generator
+    /// instead of implying that 16 characters is "unguessable".
+    #[test]
+    fn the_cluster_token_floor_is_enforced_with_actionable_advice() {
+        let min = AdminService::MIN_CLUSTER_TOKEN_LEN;
+        assert!(
+            min >= 16,
+            "a 16-char floor is what `MIN_ADMIN_TOKEN_LEN` uses"
+        );
+        assert!(validate_cluster_token(&"x".repeat(min)).is_ok());
+        assert!(
+            validate_cluster_token(&"a".repeat(64)).is_ok(),
+            "openssl rand -hex 32"
+        );
+
+        for short in [
+            String::new(),
+            "x".to_string(),
+            "y".repeat(min.saturating_sub(1)),
+        ] {
+            let err = validate_cluster_token(&short).expect_err("must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("HYDRA_CLUSTER_TOKEN"),
+                "the message must name the variable: {msg}"
+            );
+            assert!(
+                msg.contains("openssl rand -hex 32"),
+                "the message must say how to generate a correct one: {msg}"
+            );
+        }
     }
 }
 
@@ -1609,5 +1996,33 @@ mod non_route_strategy_tests {
         }
 
         std::env::remove_var("HYDRA_NON_ROUTE_STRATEGY");
+    }
+}
+
+/// The documented `-u` flag has its own test module so it runs in the default
+/// `--features server` job (the pre-existing module is gated on `cluster-redis`).
+#[cfg(test)]
+mod upgrade_flag_tests {
+    use super::upgrade_requested;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// The regression this pins: `hydra -u` used to be a NO-OP (argv was never
+    /// read), so the runbook's zero-downtime upgrade ended with the new process
+    /// dying on `Address already in use` — measured 2026-09-29.
+    #[test]
+    fn the_upgrade_flag_is_recognised_exactly() {
+        assert!(upgrade_requested(&argv(&["-u"])));
+        assert!(upgrade_requested(&argv(&["--upgrade"])));
+        assert!(upgrade_requested(&argv(&["-u", "--log", "info"])));
+        assert!(!upgrade_requested(&argv(&[])));
+        assert!(!upgrade_requested(&argv(&["--log", "info"])));
+        assert!(
+            !upgrade_requested(&argv(&["--upgrade=1"])),
+            "no value form: the flag is boolean"
+        );
+        assert!(!upgrade_requested(&argv(&["-U"])), "case matters");
     }
 }

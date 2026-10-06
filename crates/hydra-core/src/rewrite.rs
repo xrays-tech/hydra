@@ -216,19 +216,30 @@ pub fn rewrite_path(req_path: &str, endpoint: &EndpointUrl) -> String {
 ///
 /// | key length `L` | mask |
 /// |----------------|------|
-/// | `L >= 14` | first 10 chars + `'*'` × `(L − 14)` + last 4 chars |
-/// | `6 <= L < 14` | first 2 chars + `'*'` × `(L − 4)` + last 2 chars |
+/// | `L >= 20` | first 10 chars + `'*'` × `(L − 14)` + last 4 chars |
+/// | `6 <= L < 20` | first 2 chars + `'*'` × `(L − 4)` + last 2 chars |
 /// | `L < 6` | `'*'` × `L` (fully masked) |
 ///
 /// The three tiers ensure the masked form never reveals enough to reconstruct
 /// the original: long keys expose a recognisable prefix + suffix (for
 /// identification) but hide the entire middle; short keys expose less to avoid
 /// revealing the whole value.
+///
+/// The long tier starts at `L >= 20`, NOT at the `L >= 14` this function used
+/// to use: with that boundary `L == 14` produced `14 − 14 == 0` stars, i.e. the
+/// "masked" form was the key **verbatim**, and `L == 15..17` hid one to three
+/// characters of an otherwise fully disclosed key. Both mattered because this
+/// is the only redaction on the admin provider-key surface
+/// (`hydra-server/src/admin/handlers.rs`) and on the client key stored with
+/// usage records (`hydra-server/src/proxy.rs` → `sink.rs`). At `L >= 20` the
+/// hidden middle is at least 6 characters (≥30% of the key); below that the
+/// conservative tier hides all but 4. See `tests/rewrite.rs` for the
+/// length-sweep guard that pins "no length ever round-trips".
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     let len = chars.len();
 
-    if len >= 14 {
+    if len >= 20 {
         // first 10 + stars(L-14) + last 4
         let star_count = len - 14;
         let mut out = String::with_capacity(len);

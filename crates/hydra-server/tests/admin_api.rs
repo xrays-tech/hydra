@@ -35,6 +35,18 @@ fn ephemeral_port() -> u16 {
 
 /// Build a fresh admin state on a fresh `:memory:` DB.
 async fn admin_state() -> Arc<AdminState> {
+    admin_state_with_fail_limit(10).await
+}
+
+/// Same, with an explicit per-IP failed-token budget (the throttle test needs a
+/// small one; the default is 10/min).
+async fn admin_state_with_fail_limit(auth_fail_per_min: u32) -> Arc<AdminState> {
+    admin_state_with(auth_fail_per_min, None).await
+}
+
+/// Same, with an explicit cluster token (`None` = a single-node deployment, where
+/// the internal control plane is not served at all).
+async fn admin_state_with(auth_fail_per_min: u32, cluster_token: Option<&str>) -> Arc<AdminState> {
     let pool = common::setup_pool().await;
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
@@ -48,7 +60,7 @@ async fn admin_state() -> Arc<AdminState> {
         .expect("HttpAuthChecker"),
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
-    Arc::new(AdminState::new(
+    let mut state = AdminState::new(
         Some(pool),
         store,
         auth,
@@ -57,9 +69,11 @@ async fn admin_state() -> Arc<AdminState> {
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
         false,
-        None, // no cluster token in tests
+        cluster_token.map(str::to_string),
         None, // no leader election in tests
-    ))
+    );
+    state.auth_fail_per_min = auth_fail_per_min;
+    Arc::new(state)
 }
 
 /// Start a real Pingora `Service` hosting `AdminService` on an ephemeral port.
@@ -224,6 +238,149 @@ async fn admin_unknown_path_404() {
         .as_str()
         .unwrap()
         .starts_with("hydra"));
+}
+
+/// The cluster-token gate is metered exactly like the admin-token gate.
+///
+/// It guards the internal control plane and the cross-tenant sub-tenant/route
+/// write endpoints, and it used to compare the token and answer 401 with **no
+/// counter, no budget and no log line** — so guessing that one secret was free and
+/// left no trace at all, which is precisely the hole the admin gate's budget had
+/// been added to close. Both gates now share one per-peer budget and report
+/// through `hydra_admin_auth_failures_total{result="<gate>_denied|_throttled"}`.
+///
+/// Falsification: restore the bare `err_json(401, …)` in the cluster branch and the
+/// 4th attempt is still a 401 (never a 429) and neither counter moves.
+#[tokio::test]
+async fn bad_cluster_tokens_are_throttled_and_counted() {
+    use hydra_server::admin::metrics;
+    let state = admin_state_with(3, Some("cluster-token-16chars")).await;
+    let port = start_admin(state);
+
+    let denied_before = metrics::admin_auth_failures_total("cluster_denied");
+    let throttled_before = metrics::admin_auth_failures_total("cluster_throttled");
+
+    // A path under the internal prefix: the cluster gate answers before routing.
+    let path = "/api/v1/internal/control";
+    let wrong = Some("not-the-cluster-token");
+    for attempt in 0..3 {
+        let r = req(port, reqwest::Method::GET, path, wrong, None).await;
+        assert_eq!(r.status(), 401, "attempt {attempt} must be denied");
+    }
+    let r = req(port, reqwest::Method::GET, path, wrong, None).await;
+    assert_eq!(
+        r.status(),
+        429,
+        "past the per-peer budget the cluster gate must throttle, not keep answering 401"
+    );
+    assert!(
+        r.headers().contains_key("retry-after"),
+        "a 429 must tell the peer when to come back"
+    );
+
+    // The counters are process-global and other tests in this binary also hit the
+    // internal prefix with the admin token, so assert INCREASE, not an exact delta.
+    let denied_after = metrics::admin_auth_failures_total("cluster_denied");
+    let throttled_after = metrics::admin_auth_failures_total("cluster_throttled");
+    assert!(
+        denied_after > denied_before,
+        "cluster-gate denials must be counted (before={denied_before}, after={denied_after})"
+    );
+    assert!(
+        throttled_after > throttled_before,
+        "cluster-gate throttles must be counted (before={throttled_before}, after={throttled_after})"
+    );
+
+    // And a VALID cluster token still works from a throttled peer: the budget is
+    // only consulted on the failure path, so an operator cannot lock themselves out.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        path,
+        Some("cluster-token-16chars"),
+        None,
+    )
+    .await;
+    assert_ne!(
+        r.status(),
+        401,
+        "a correct cluster token must never be refused by the failure budget"
+    );
+    assert_ne!(r.status(), 429, "a successful check must not be throttled");
+}
+
+/// OC-3 — the leader must ADOPT the trace id its peer relayed, so the two sides
+/// of one write carry the same string.
+///
+/// The edge forwards `x-hydra-trace-id` (the id it also returns to the tenant in
+/// `X-Hydra-Trace-Id`). The leader used to mint its own id at the top of
+/// `AdminService::response`, so the leader's audit record and error bodies were
+/// labelled with an id no tenant could ever see: a tenant reporting "my write
+/// failed, trace id X" could not be joined to the leader's audit trail.
+///
+/// The second half is the security half: that header is read BEFORE any gate, so
+/// a value that is oversized or contains anything but `[A-Za-z0-9._:-]` must be
+/// ignored (a local id is minted) rather than echoed into logs and bodies.
+///
+/// Falsification: restore `let trace_id = crate::proxy::new_trace_id();` and the
+/// first assertion fails (got `hydra-…`, expected the relayed id).
+#[tokio::test]
+async fn the_leader_adopts_the_relayed_trace_id_and_sanitises_it() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let url = format!("http://127.0.0.1:{port}/api/v1/nope");
+
+    async fn body_with_trace(
+        client: &reqwest::Client,
+        url: &str,
+        trace: &str,
+    ) -> serde_json::Value {
+        let mut last = None;
+        for _ in 0..50 {
+            match client
+                .get(url)
+                .bearer_auth(TOKEN)
+                .header("x-hydra-trace-id", trace)
+                .send()
+                .await
+            {
+                Ok(r) => return r.json().await.expect("json"),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        panic!("admin server never ready: {last:?}");
+    }
+
+    let relayed = "hydra-edge-17f4a2c9";
+    let body = body_with_trace(&client, &url, relayed).await;
+    assert_eq!(body["error"]["code"], "not_found");
+    assert_eq!(
+        body["error"]["trace_id"], relayed,
+        "the leader must carry the RELAYED trace id, not one it minted: its audit \
+         record and the tenant's header have to be joinable"
+    );
+
+    for junk in [
+        // Oversized: legal HTTP, but not a trace id.
+        "A".repeat(200),
+        // Legal HTTP header value, illegal in a log line we intend to read.
+        "evil; rm -rf / --trace".to_string(),
+    ] {
+        let body = body_with_trace(&client, &url, &junk).await;
+        let got = body["error"]["trace_id"].as_str().expect("trace_id");
+        assert_ne!(got, junk, "a malformed relayed id must not be echoed");
+        assert!(
+            got.starts_with("hydra-") && got.len() <= 64,
+            "expected a freshly minted local id, got {got:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -876,13 +1033,29 @@ async fn edge_admin_probes_only() {
     ));
     let port = start_admin(state);
 
-    // Probe endpoints are token-free.
+    // Health PROBES are token-free: a load balancer must be able to probe
+    // without holding the admin secret.
     let r = req(port, reqwest::Method::GET, "/healthz", None, None).await;
-    assert_eq!(r.status(), 200);
-    let r = req(port, reqwest::Method::GET, "/metrics", None, None).await;
     assert_eq!(r.status(), 200);
     let r = req(port, reqwest::Method::GET, "/readyz", None, None).await;
     assert_eq!(r.status(), 200);
+
+    // `/metrics` is NOT: it is admin-token gated on an edge exactly as on a
+    // leader. Publishing tenant/provider/model-labelled series to anyone who can
+    // reach the port made the exposure depend on the node's ROLE, and the shipped
+    // cluster topology binds the edge admin port to 0.0.0.0.
+    let r = req(port, reqwest::Method::GET, "/metrics", None, None).await;
+    assert_eq!(
+        r.status(),
+        401,
+        "an edge must not publish metrics without the admin token"
+    );
+    let r = req(port, reqwest::Method::GET, "/metrics", Some(TOKEN), None).await;
+    assert_eq!(
+        r.status(),
+        200,
+        "with the token the exposition works on an edge too"
+    );
 
     // Admin API + UI are gone, even with the token.
     let r = req(
@@ -1623,8 +1796,40 @@ async fn empty_body_delete_invalidates_all_local() {
         None,
     )
     .await;
-    assert_eq!(r.status(), 200);
+    // `DELETE /api/v1/auth/cache` is TRI-STATE, and documented as such
+    // (`admin-ui/api-docs.js:43-47`: `200 applied` / `202 pending` with the lagging nodes
+    // named / `503 unavailable`; `ops.md` §5.1 repeats it and warns that only 200 means
+    // "done"). These two assertions used to demand a flat 200 — the answer this endpoint
+    // gave BEFORE the convergence barrier replaced the `published: false` flag that could
+    // never be false without a stream. Against the shipped contract they were simply
+    // stale (tracked as decision item D-2; this is the resolution the documentation
+    // already implies).
+    //
+    // This test injects NO fleet view (`AdminState::live_nodes` stays `None` ⇒ the
+    // handler resolves `live = []`), so the barrier has nobody to confirm and the
+    // documented outcome is exactly `202 pending` with `nodes_total = 0`. What the test
+    // is really about — the LOCAL cache being cleared regardless of the fleet — is
+    // asserted right below, and it is what would break if the local clear were skipped.
+    let status = r.status();
     let v: serde_json::Value = r.json().await.expect("json");
+    let fleet_state = v["fleet"]["state"].as_str().unwrap_or("<no fleet.state>");
+    println!(
+        "[D-2] DELETE /api/v1/auth/cache -> {status} fleet={}",
+        v["fleet"]
+    );
+    assert_eq!(
+        status.as_u16(),
+        202,
+        "with no fleet view injected the barrier cannot confirm anyone, so the documented \
+         answer is `202 pending`: {v}"
+    );
+    assert_eq!(fleet_state, "pending", "{v}");
+    assert_eq!(v["fleet"]["nodes_total"], 0, "{v}");
+    assert_eq!(v["fleet"]["lagging"], serde_json::json!([]), "{v}");
+    assert!(
+        v["fleet"]["event_id"].is_string(),
+        "an accepted invalidation carries the stream entry it published: {v}"
+    );
     assert_eq!(v["invalidated"], 3, "all 3 tenants' entries cleared: {v}");
     assert_eq!(state.auth.cache().len(), 0, "local L1 fully cleared");
 
@@ -1899,6 +2104,34 @@ async fn provider_key_bindings_crud_http() {
     .await;
     assert_eq!(r.status(), 400);
 
+    // A BARE prefix (no separator) → 400. A binding match is global and wins
+    // over the sub-tenant routing gate, so accepting "s" would re-route (or
+    // 503) every tenant whose key starts with "s". The boundary used to check
+    // only "not empty".
+    let bare = r#"{"id":"b3b","key_prefix":"s","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(bare),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "a bare prefix must be refused");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_key_prefix");
+    // ... and with a non-ASCII prefix too.
+    let non_ascii = r#"{"id":"b3c","key_prefix":"café_","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/provider-key-bindings",
+        Some(TOKEN),
+        Some(non_ascii),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "a non-ASCII prefix must be refused");
+
     // Unknown provider → 400 (FK violation).
     let ghost = r#"{"id":"b4","key_prefix":"hk_","provider_id":"ghost","enabled":true,"created_at":"","updated_at":""}"#;
     let r = req(
@@ -1937,6 +2170,26 @@ async fn provider_key_bindings_crud_http() {
     assert_eq!(r.status(), 200);
     let item: serde_json::Value = r.json().await.expect("json");
     assert_eq!(item["enabled"], serde_json::Value::Bool(false));
+
+    // PUT is the OTHER door onto the same prefix namespace: it must enforce the
+    // same shape rule (a bare prefix must not be installable by update either).
+    let bad_upd = r#"{"id":"b1","key_prefix":"sk","provider_id":"p1","enabled":true,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/provider-key-bindings/b1",
+        Some(TOKEN),
+        Some(bad_upd),
+    )
+    .await;
+    assert_eq!(r.status(), 400, "PUT must refuse a bare prefix");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_key_prefix");
+    assert_eq!(
+        state.store.snapshot().key_prefix_bindings.len(),
+        0,
+        "the refused PUT must not have changed the snapshot"
+    );
 
     // Disabled binding leaves the hot snapshot.
     let snap2 = state.store.snapshot();
@@ -2914,7 +3167,83 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
         Some(&body),
     )
     .await;
-    assert_eq!(r.status(), 200, "1000 keys are within the cap");
+    // What this asserts is ACCEPTANCE at the cap: the request must not be refused. The
+    // status itself is the documented tri-state (`api-docs.js:47`): with no fleet view
+    // injected this node reports `202 pending` (see the note in
+    // `empty_body_delete_invalidates_all_local`), and `400`/`503` would be failures.
+    let status = r.status();
+    let v: serde_json::Value = r.json().await.expect("json");
+    println!(
+        "[D-2] DELETE /api/v1/auth/cache (1000 keys) -> {status} fleet={}",
+        v["fleet"]
+    );
+    assert!(
+        matches!(status.as_u16(), 200 | 202),
+        "1000 keys are within the cap, so the invalidation is accepted (200 applied / 202 \
+         pending): {status} {v}"
+    );
+    assert_ne!(
+        status.as_u16(),
+        400,
+        "1000 keys are exactly at the cap: {v}"
+    );
     let len: i64 = pool.xlen("hydra:{ctl:events}").await.expect("xlen");
     assert_eq!(len, 1, "exactly one stream entry");
+}
+
+/// The admin token is the single secret gating every tenant/provider/api-key
+/// mutation. Before this, failed attempts were neither rate-limited nor counted
+/// nor logged above `debug!` (filtered out at the shipped `RUST_LOG=info`), so a
+/// brute-force run was free and invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_bad_admin_tokens_are_throttled_then_a_valid_token_still_works() {
+    let port = start_admin(admin_state_with_fail_limit(3).await);
+
+    // Three failures are answered 401 (counted, logged at warn).
+    for attempt in 0..3 {
+        let r = req(
+            port,
+            reqwest::Method::GET,
+            "/api/v1/health",
+            Some("definitely-wrong"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), 401, "attempt {attempt} is a plain denial");
+    }
+
+    // The fourth trips the per-peer budget: 429 + Retry-After.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/health",
+        Some("definitely-wrong"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        429,
+        "past the budget the peer is throttled, not answered 401 forever"
+    );
+    assert!(
+        r.headers().contains_key("retry-after"),
+        "a 429 must tell the caller when to come back"
+    );
+
+    // A VALID token from the same peer is still accepted: the budget must never
+    // be able to lock an operator out of their own gateway.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/health",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        200,
+        "throttling failed attempts must not block a successful one"
+    );
 }

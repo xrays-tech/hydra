@@ -12,11 +12,67 @@ use hydra_core::config::ConfigData;
 use hydra_core::model::{Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 use hydra_core::router::sub_tenant_id_for_key;
 use hydra_core::sub_tenant::{
-    validate_sub_tenant_write, validate_sub_tenant_write_against, SubTenantRows, SubTenantWrite,
+    prefixes_collide, validate_prefix_shape, validate_sub_tenant_write,
+    validate_sub_tenant_write_against, PrefixShapeError, SubTenantRows, SubTenantWrite,
     SubTenantWriteError, MAX_ROUTES_PER_SUB_TENANT, MAX_SUB_TENANTS_PER_TENANT,
     MAX_SUB_TENANT_NAME_LEN,
 };
 use pretty_assertions::assert_eq;
+
+// ===========================================================================
+// The SHARED prefix-shape rule (`validate_prefix_shape`) and the collision
+// predicate (`prefixes_collide`).
+//
+// Both are used by BOTH namespaces: sub-tenant prefixes (per tenant) and
+// operator `key_prefix_binding`s (global). They were extracted because the
+// binding write boundary had drifted to a bare `trim().is_empty()` check while
+// the sub-tenant path enforced all three rules — and a binding match is global
+// and wins over the sub-tenant gate, so the drift had the larger blast radius.
+// ===========================================================================
+
+#[test]
+fn prefix_shape_rule_is_shared_and_total() {
+    // Separator present ⇒ usable.
+    assert_eq!(validate_prefix_shape("QQCX_"), Ok(()));
+    assert_eq!(validate_prefix_shape("acme-"), Ok(()));
+    assert_eq!(validate_prefix_shape("a_b"), Ok(()));
+    // Each violation, in the order the rule checks them.
+    assert_eq!(validate_prefix_shape(""), Err(PrefixShapeError::Empty));
+    assert_eq!(
+        validate_prefix_shape("acmé_"),
+        Err(PrefixShapeError::NonAscii),
+        "non-ASCII cannot be a prefix"
+    );
+    assert_eq!(
+        validate_prefix_shape("s"),
+        Err(PrefixShapeError::NoSeparator),
+        "a bare prefix swallows unrelated keys"
+    );
+    assert_eq!(
+        validate_prefix_shape("sk-"),
+        Ok(()),
+        "'sk-' carries its separator; the rule is about shape, not vendor prefixes"
+    );
+    // Whitespace is NOT trimmed here: the shape rule does not own trimming, and
+    // silently trimming would change which keys match.
+    assert_eq!(validate_prefix_shape("a _"), Ok(()));
+}
+
+#[test]
+fn prefix_collision_predicate_matches_the_validator() {
+    // Same, or one containing the other ⇒ collide.
+    assert!(prefixes_collide("QQCX_", "QQCX_"));
+    assert!(prefixes_collide("QQCX_", "QQCX_TEAM1_"));
+    assert!(prefixes_collide("QQCX_TEAM1_", "QQCX_"));
+    // Disjoint ⇒ no collision.
+    assert!(!prefixes_collide("QQCX_", "ZZZZ_"));
+    // An EMPTY prefix matches every key, so it collides with everything —
+    // including another empty one. This is the case the old binding boundary
+    // accepted.
+    assert!(prefixes_collide("", "QQCX_"));
+    assert!(prefixes_collide("QQCX_", ""));
+    assert!(prefixes_collide("", ""));
+}
 
 // --- fixtures ----------------------------------------------------------------
 

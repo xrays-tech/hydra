@@ -6,8 +6,9 @@
 
 use std::time::{Duration, Instant};
 
-use hydra_core::limit::{match_roles, MatchCtx, SlidingWindow};
+use hydra_core::limit::{bucket_key, match_roles, MatchCtx, SlidingWindow};
 use hydra_core::model::LimitRole;
+use hydra_core::rewrite::mask_key;
 use pretty_assertions::assert_eq;
 
 /// A role with every `matching_*` dimension `None` (match-all). `enabled` is
@@ -35,6 +36,7 @@ fn ctx<'a>(
     provider: Option<&'a str>,
 ) -> MatchCtx<'a> {
     MatchCtx {
+        api_key_raw: None,
         api_key,
         model,
         tenant,
@@ -204,4 +206,198 @@ fn evict_stale_reclaims_an_expired_window() {
     assert!(!w.evict_stale(t0 + Duration::from_secs(61)));
     assert_eq!(w.count(), 0);
     assert_eq!(w.token_used(t0 + Duration::from_secs(61)), 0);
+}
+
+/// `matching_key` accepts the RAW client key **or** its mask.
+///
+/// Measured 2026-09-30 (`integration/test_replica_fidelity.py`): the context used to carry only
+/// `mask_key(<presented key>)`, so a role written with the raw key — the form `design.md` §10.1
+/// describes ("NULL **or equal to** the client api-key") and the form an operator copies out of
+/// their inventory — **never fired** (four requests, all 200, on a leader and an edge alike).
+/// Matching now takes either form; the bucket is still derived from the masked value, so no window
+/// is split and no Redis key name starts carrying raw client keys.
+#[test]
+fn matching_key_accepts_the_raw_key_or_its_mask() {
+    const RAW: &str = "sk-raw-form-1234567890";
+    // The mask is DERIVED from the production function, never hand-copied: the first version of this
+    // test hard-coded `sk-raw-for********67890` (23 chars, 5 trailing characters kept) while the real
+    // rule for a 22-char key keeps 10 ahead / 4 behind (`sk-raw-for********7890`) — a fixture that
+    // asserted against a string the product would never produce, so it would have kept passing after
+    // any change to the mask rule. `assert_ne!` keeps the fixture discriminating: a mask equal to the
+    // raw key would make the "either form" leg a tautology.
+    let mask = mask_key(RAW);
+    assert_ne!(
+        mask, RAW,
+        "the fixture must use a real mask, not the key itself"
+    );
+    let mask: &str = &mask;
+    let mut role = role_all_null("r-key", true);
+    role.matching_key = Some(RAW.into());
+
+    let ctx_raw = MatchCtx {
+        api_key: Some(mask),
+        api_key_raw: Some(RAW),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    assert_eq!(
+        match_roles(&[role.clone()], &ctx_raw).len(),
+        1,
+        "raw role must match"
+    );
+
+    // The masked form keeps working (nothing that already worked may stop working).
+    let mut masked_role = role_all_null("r-mask", true);
+    masked_role.matching_key = Some(mask.into());
+    assert_eq!(
+        match_roles(&[masked_role.clone()], &ctx_raw).len(),
+        1,
+        "masked role must match"
+    );
+
+    // A different key matches neither role, and a context with no raw key still matches the mask.
+    let ctx_other = MatchCtx {
+        api_key: Some("sk-other******************9999"),
+        api_key_raw: Some("sk-other-key-99999999999999"),
+        ..ctx_raw
+    };
+    assert!(match_roles(&[role.clone()], &ctx_other).is_empty());
+    assert!(match_roles(&[masked_role], &ctx_other).is_empty());
+    let ctx_mask_only = MatchCtx {
+        api_key_raw: None,
+        ..ctx_raw
+    };
+    assert_eq!(
+        match_roles(&[role], &ctx_mask_only).len(),
+        0,
+        "without the raw key a raw-form role cannot match (a context must supply it)"
+    );
+}
+
+/// `Debug` must not print the raw client key.
+///
+/// The context now carries a live credential (`api_key_raw`), so a derived `Debug` would put
+/// customer keys one `debug!(?ctx)` away from the log — and into panic messages. The manual impl
+/// redacts that field; this test is the thing that notices if someone puts `Debug` back into the
+/// `derive` list (a change that would otherwise be invisible: nothing in the tree logs the context
+/// *today*, which is exactly why a silent regression is possible).
+#[test]
+fn debug_never_prints_the_raw_client_key() {
+    const RAW: &str = "sk-raw-form-1234567890";
+    let mask = mask_key(RAW);
+    let ctx = MatchCtx {
+        api_key: Some(&mask),
+        api_key_raw: Some(RAW),
+        model: Some("m1"),
+        tenant: Some("t1"),
+        provider: None,
+    };
+    let rendered = format!("{ctx:?}");
+    assert!(
+        !rendered.contains(RAW),
+        "the raw client key leaked into Debug output: {rendered}"
+    );
+    // The `api_key` field is documented as the MASKED form; a caller that violates that contract
+    // must not turn this into a leak. The round-118 version of this test used a real mask and so
+    // could not see the misuse (reviewer finding F4).
+    let misused = MatchCtx {
+        api_key: Some(RAW),
+        api_key_raw: Some(RAW),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    let misused_rendered = format!("{misused:?}");
+    assert!(
+        !misused_rendered.contains(RAW),
+        "a raw key in `api_key` was printed verbatim: {misused_rendered}"
+    );
+    // An ALL-`*` string is a fixed point of `mask_key` at any length, so "is a fixed point" alone let
+    // a credential that looks like `******` print verbatim (product-review P3-3). The redaction now
+    // also requires a non-`*` character.
+    let all_stars = MatchCtx {
+        api_key: Some("******"),
+        api_key_raw: Some("******"),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    let stars_rendered = format!("{all_stars:?}");
+    assert!(
+        !stars_rendered.contains("******"),
+        "an all-star credential was printed verbatim: {stars_rendered}"
+    );
+    assert!(
+        misused_rendered.contains("<redacted: api_key is not a mask_key value>"),
+        "the misuse is redacted silently (the output must say why): {misused_rendered}"
+    );
+    assert!(
+        rendered.contains("<redacted>"),
+        "the redaction is silent (debug output no longer says the field was withheld): {rendered}"
+    );
+    // The remaining dimensions must stay printable, otherwise the redaction cost us the diagnostics
+    // Debug exists for.
+    assert!(
+        rendered.contains("m1") && rendered.contains("t1"),
+        "model/tenant must remain visible in Debug output: {rendered}"
+    );
+}
+
+/// The KEY-dimension bucket must keep its per-client identity even when the caller supplies only
+/// the raw key — and must never contain the raw key itself.
+///
+/// Reviewer finding F3 / measured 2026-09-30: `bucket_for` built the key component as
+/// `ctx.api_key.unwrap_or("")`, so a raw-only context (a shape `MatchCtx` permits and
+/// `api_key_raw`'s doc comment describes) made EVERY client of a key-scoped role share one window:
+/// the second client would be refused by the first client's spent window, silently — no log, no
+/// metric, and no test (the limiter's seven fixtures all set both fields to `None`, so the key
+/// branch had zero coverage).
+#[test]
+fn the_key_bucket_keeps_its_identity_from_the_raw_key_too() {
+    let raw_a = "sk-bucket-probe-aaaaaaaa";
+    let raw_b = "sk-bucket-probe-bbbbbbbb";
+    let only_raw_a = MatchCtx {
+        api_key: None,
+        api_key_raw: Some(raw_a),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    let only_raw_b = MatchCtx {
+        api_key_raw: Some(raw_b),
+        ..only_raw_a
+    };
+    let a = bucket_key(&only_raw_a);
+    let b = bucket_key(&only_raw_b);
+    assert_eq!(
+        a,
+        mask_key(raw_a),
+        "a raw-only context is bucketed by the mask"
+    );
+    assert_ne!(
+        a, "",
+        "an empty bucket component means one window for every client"
+    );
+    assert!(
+        !a.contains(raw_a),
+        "the raw key must never appear in a bucket: {a}"
+    );
+    assert_ne!(a, b, "two clients must not share a bucket");
+
+    // A context that carries the documented masked form is unchanged (the production shape).
+    let masked = MatchCtx {
+        api_key: Some("sk-bucket********aaaa"),
+        api_key_raw: Some(raw_a),
+        ..only_raw_a
+    };
+    assert_eq!(bucket_key(&masked), "sk-bucket********aaaa");
+    // ...and with neither key present the component is empty, i.e. the old behaviour is preserved
+    // for key-less contexts (only reachable for roles whose `matching_key` is NULL).
+    let neither = MatchCtx {
+        api_key: None,
+        api_key_raw: None,
+        ..only_raw_a
+    };
+    assert_eq!(bucket_key(&neither), "");
 }

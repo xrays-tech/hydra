@@ -40,6 +40,46 @@ async fn migrate_creates_all_tables() {
     }
 }
 
+/// The sub-tenant usage index (migration 0012) must actually exist.
+///
+/// `usage_record`'s original index leads with `(tenant_id, created_at)`, which is
+/// the right shape for a whole-tenant read but not for the per-sub-tenant reads
+/// and aggregations the tenant API serves: those have to re-scan the tenant's
+/// rows in the window. 0012 adds `(tenant_id, sub_tenant_id, created_at)`.
+///
+/// Asserting on `sqlite_master` rather than on the migration file means this
+/// catches the migration being dropped, renamed, or silently not embedded by
+/// `sqlx::migrate!` — "the file is in the repo" is not the claim.
+#[tokio::test]
+async fn the_sub_tenant_usage_index_exists() {
+    let pool = common::setup_pool().await;
+    let rows = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_record' \
+         ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query sqlite_master indexes");
+    let names: Vec<String> = rows.iter().map(|r| r.get::<String, _>(0)).collect();
+    assert!(
+        names.iter().any(|n| n == "idx_usage_record_sub_tenant"),
+        "migration 0012 must create idx_usage_record_sub_tenant, indexes were: {names:?}"
+    );
+
+    // And it must be on the columns the queries actually filter by, in order.
+    let sql: String = sqlx::query(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' \
+         AND name = 'idx_usage_record_sub_tenant'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("index row")
+    .get(0);
+    for col in ["tenant_id", "sub_tenant_id", "created_at"] {
+        assert!(sql.contains(col), "index must cover {col}: {sql}");
+    }
+}
+
 /// T2.1 — `foreign_keys=ON` on the in-memory pool; `journal_mode=WAL` (which
 /// requires a file — `:memory:` silently degrades to `memory`) is verified on
 /// a temp file database (wave-2 §6 note).

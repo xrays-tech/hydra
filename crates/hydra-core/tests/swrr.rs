@@ -142,3 +142,34 @@ fn swrr_unknown_candidate_seeded_at_zero() {
     assert_eq!(state.current_weights.get("a").copied(), Some(-1));
     assert_eq!(state.current_weights.get("b").copied(), Some(1));
 }
+
+/// A weight sum that overflows `i32` must not panic (debug) or silently disable
+/// load balancing (release).
+///
+/// `Provider.weight` is an `i32` whose only DB constraint is `weight >= 0`, so
+/// two providers near `i32::MAX` sum past `i32::MAX`. The old `i32` sum panicked
+/// under `overflow-checks` and, in a release build, wrapped NEGATIVE — which the
+/// `total <= 0` guard reads as "nothing selectable", returning early and leaving
+/// the candidate order untouched forever (weights silently ignored).
+#[test]
+fn a_weight_sum_that_overflows_i32_still_balances() {
+    let mut cands = vec![cand("a", 2_000_000_000), cand("b", 2_000_000_000)];
+    let mut state = SwrrState::default();
+
+    // 8 rounds with equal weights must pick each candidate 4 times.
+    let mut picks = std::collections::HashMap::new();
+    for _ in 0..8 {
+        order(&mut cands, &mut state);
+        *picks.entry(cands[0].provider_id.clone()).or_insert(0) += 1;
+    }
+    assert_eq!(picks.get("a").copied(), Some(4), "picks: {picks:?}");
+    assert_eq!(picks.get("b").copied(), Some(4), "picks: {picks:?}");
+
+    // The state stays inside i32 (the subtraction is clamped, not wrapped).
+    for (id, cw) in &state.current_weights {
+        assert!(
+            cw.abs() <= i64::from(i32::MAX),
+            "{id} current_weight out of range: {cw}"
+        );
+    }
+}

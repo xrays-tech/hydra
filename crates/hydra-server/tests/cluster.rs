@@ -1064,7 +1064,7 @@ async fn standby_materializes_replica() {
         replica::replica_version(&replica_pool)
             .await
             .expect("version"),
-        Some(leader_store.version()),
+        hydra_server::db::ConfigVersion::Value(leader_store.version()),
         "promoted replica continues the version sequence"
     );
 
@@ -1725,7 +1725,7 @@ async fn freshness_gate_needs_a_materialized_replica() {
         replica::replica_version(&replica_pool)
             .await
             .expect("version"),
-        None,
+        hydra_server::db::ConfigVersion::Absent,
         "the replica really is empty in this arm"
     );
 
@@ -1766,7 +1766,7 @@ async fn freshness_gate_needs_a_materialized_replica() {
         replica::replica_version(&replica_pool2)
             .await
             .expect("version"),
-        Some(version),
+        hydra_server::db::ConfigVersion::Value(version),
         "the replica now holds the store's version"
     );
     hook2(&hydra_server::cluster::control_client::PollOutcome::UpToDate);
@@ -1845,7 +1845,7 @@ async fn a_transient_materialization_failure_heals_on_the_next_poll() {
         replica::replica_version(&replica_pool)
             .await
             .expect("version"),
-        Some(version),
+        hydra_server::db::ConfigVersion::Value(version),
         "the replica caught up"
     );
 }
@@ -1868,7 +1868,7 @@ async fn an_empty_replica_is_not_synced_with_a_non_empty_store() {
         replica::replica_version(&replica_pool)
             .await
             .expect("version"),
-        None,
+        hydra_server::db::ConfigVersion::Absent,
         "fresh replica: no version marker"
     );
 

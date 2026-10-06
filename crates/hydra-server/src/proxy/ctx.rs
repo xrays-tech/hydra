@@ -15,9 +15,11 @@
 //! `body_buffer`, `first_chunk`, `upstream_bytes_seen`, `body_too_large`, …)
 //! has been deleted (design-change §4.5).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use hydra_core::auth::AuthVerdict;
+use hydra_core::config::ConfigData;
 use hydra_core::model::{Candidate, RouteError, Tenant, Usage};
 use hydra_core::sse::UsageScanner;
 
@@ -41,6 +43,20 @@ pub struct RequestContext {
     /// The raw client api-key, parsed from any supported credential
     /// transport (see `hydra_core::apikey`).
     pub client_api_key: Option<String>,
+    /// The configuration generation this request was decided against.
+    ///
+    /// ONE REQUEST, ONE GENERATION. The count/token gates read the snapshot taken when the request
+    /// arrived, but the usage-accounting gate runs in the `logging` hook — after the upstream
+    /// answered, which for a streamed response can be seconds or minutes later. That hook used to
+    /// call `store.snapshot()` again, so a config write during the request (any admin write
+    /// publishes a new generation) made the two phases disagree: a role deleted or disabled
+    /// mid-request had its COUNT sample spent but never received the tokens — measured consequence
+    /// of the same shape in `limiter.rs`: "the request is always counted" — and, the other way
+    /// round, tokens were charged to a role that never gated this request. The window length could
+    /// differ between the two phases as well (in-process rebuild; in cluster mode the Redis script
+    /// is given `window_ms` from each generation in turn, so samples could be evicted early or kept
+    /// too long).
+    pub cfg: Option<Arc<ConfigData>>,
     /// The external-auth verdict (carries the HTTP status to write back).
     pub auth_verdict: Option<AuthVerdict>,
     /// `model_key` extracted from the full request body via `memchr` (None ⇒
@@ -97,6 +113,7 @@ impl RequestContext {
             started_at: Instant::now(),
             tenant: None,
             client_api_key: None,
+            cfg: None,
             auth_verdict: None,
             model_key: None,
             candidates: Vec::new(),

@@ -43,6 +43,121 @@ fn provider(id: &str, endpoint: &str, weight: i32) -> Provider {
     }
 }
 
+/// A `limit_role` that declares a PROVIDER dimension can never match, and that
+/// must be reported rather than silently ignored.
+///
+/// The pre-gate builds its `MatchCtx` before routing (`proxy.rs`), so `provider`
+/// is `None` there, while `limit::dim_matches` requires equality with the
+/// configured value — the role is skipped by BOTH the count and the token check.
+/// It is still listed, persisted and editable in the admin API, so a silent skip
+/// means an operator believes a provider is capped when nothing is enforced. (The
+/// accounting path DOES pass a provider, so such a role also creates a window that
+/// is written and never read.)
+///
+/// Falsification: delete the `matching_provider.is_some()` warning in `config.rs`
+/// and this fails.
+#[test]
+fn validate_limit_role_with_a_provider_dimension_is_reported_as_dead() {
+    let mut cfg = clean_config();
+    let mut role = limit_role("r-provider", Some(600), None);
+    role.matching_provider = Some("p1".to_string());
+    cfg.limit_roles.push(role);
+
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns
+            .iter()
+            .any(|m| m.contains("matching_provider") && m.contains("r-provider")),
+        "a role whose provider dimension cannot match must be named, got {warns:?}"
+    );
+}
+
+/// A key-scoped role with no tenant scope is a CROSS-TENANT budget, and it must be named.
+///
+/// Measured 2026-09-30 (round 116 made the raw-key form match, so roles that used to be silently
+/// inert became live): the window belongs to `(role_id, mask(key))`, so two tenants whose auth
+/// backends accept the same key string share one budget — one tenant's traffic can exhaust the
+/// other's. `validate` warned about the dead `matching_provider` dimension and said nothing here.
+///
+/// Falsification: delete the `matching_key.is_some() && matching_tenant.is_none()` warning in
+/// `config.rs` and this fails.
+#[test]
+fn validate_key_scoped_role_without_a_tenant_scope_is_reported_as_cross_tenant() {
+    let mut cfg = clean_config();
+    let mut role = limit_role("r-key", Some(600), None);
+    role.matching_key = Some("sk-shared-probe".to_string());
+    cfg.limit_roles.push(role);
+
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns
+            .iter()
+            .any(|m| m.contains("matching_tenant NULL") && m.contains("r-key")),
+        "a key-scoped role with no tenant scope must be named, got {warns:?}"
+    );
+
+    // CONTROL: adding the tenant scope silences it — otherwise the warning could be firing on
+    // every key-scoped role, including the safe ones.
+    let mut cfg2 = clean_config();
+    let mut scoped = limit_role("r-key", Some(600), None);
+    scoped.matching_key = Some("sk-shared-probe".to_string());
+    scoped.matching_tenant = Some("t1".to_string());
+    cfg2.limit_roles.push(scoped);
+    let warns2 = warn_messages(&validate(&cfg2));
+    assert!(
+        !warns2.iter().any(|m| m.contains("matching_tenant NULL")),
+        "a tenant-scoped role must not warn, got {warns2:?}"
+    );
+}
+
+/// The VALUE of `matching_key` also gets a warning, because the two forms have opposite costs and
+/// only the documentation mentioned either (round 135, product-review P3-4 / P2-2).
+///
+/// Falsification: delete the `mask_key(key) != key` branch in `config.rs` and the first case fails;
+/// delete the `else` branch and the second does.
+#[test]
+fn validate_reports_what_the_matching_key_value_costs() {
+    // (a) a RAW key: stored and replicated in plaintext, returned by the admin API.
+    let mut cfg = clean_config();
+    let mut raw = limit_role("r-raw", Some(600), None);
+    raw.matching_key = Some("sk-live-customer-key-0001".to_string());
+    raw.matching_tenant = Some("t1".to_string());
+    cfg.limit_roles.push(raw);
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns.iter().any(|m| m.contains("r-raw")
+            && m.contains("RAW client key")
+            && m.contains("PLAINTEXT")),
+        "a raw key in `matching_key` must be named, got {warns:?}"
+    );
+
+    // (b) the MASK form: no plaintext, but the mask is not a unique identity.
+    let mut cfg2 = clean_config();
+    let mut masked = limit_role("r-mask", Some(600), None);
+    masked.matching_key = Some("sk***************ed".to_string());
+    masked.matching_tenant = Some("t1".to_string());
+    cfg2.limit_roles.push(masked);
+    let warns2 = warn_messages(&validate(&cfg2));
+    assert!(
+        warns2
+            .iter()
+            .any(|m| m.contains("r-mask") && m.contains("MASKED form") && m.contains("share")),
+        "the masked form must be named as a shared identity, got {warns2:?}"
+    );
+
+    // CONTROL: no `matching_key` ⇒ neither warning (so they fire on the value, not on every role).
+    let mut cfg3 = clean_config();
+    cfg3.limit_roles
+        .push(limit_role("r-plain", Some(600), None));
+    let warns3 = warn_messages(&validate(&cfg3));
+    assert!(
+        !warns3
+            .iter()
+            .any(|m| m.contains("RAW client key") || m.contains("MASKED form")),
+        "a role without `matching_key` must not produce either warning, got {warns3:?}"
+    );
+}
+
 fn limit_role(id: &str, count: Option<i64>, token: Option<i64>) -> LimitRole {
     LimitRole {
         id: id.into(),
@@ -311,6 +426,45 @@ fn validate_binding_unknown_provider() {
             .iter()
             .any(|m| m.contains("ghost") && m.contains("provider_key_binding")),
         "expected a dangling-provider warning, got {warns:?}"
+    );
+}
+
+/// A provider with a NEGATIVE weight is discarded by the router (`weight > 0` is
+/// required) but used to pass validation untouched, because this check skipped
+/// only `weight == 0`. It is exactly the "validated clean, can never serve" case
+/// the validator exists to catch.
+#[test]
+fn validate_negative_weight_provider_is_reported() {
+    let mut cfg = clean_config();
+    if let Some(p) = cfg.providers.values_mut().next() {
+        p.weight = -1;
+    }
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        warns.iter().any(|m| m.contains("weight")),
+        "a provider the router will always drop must be reported, got {warns:?}"
+    );
+}
+
+/// The predicate itself: `weight > 0` is "online" everywhere, so this test uses 0
+/// — the deliberate soft-disable. The ROUTER now distinguishes the two cases in
+/// its attribution (`weight == 0` ⇒ `soft_disabled`, `weight < 0` ⇒
+/// `invalid_weight`, `model.rs`), but both are equally unroutable here, and a
+/// negative weight cannot come from the DB anyway (`CHECK (weight >= 0)`).
+#[test]
+fn validate_soft_disabled_provider_without_key_is_silent() {
+    let mut cfg = clean_config();
+    let ids: Vec<String> = cfg.providers.keys().cloned().collect();
+    for id in &ids {
+        if let Some(p) = cfg.providers.get_mut(id) {
+            p.weight = 0;
+        }
+    }
+    cfg.provider_keys.clear();
+    let warns = warn_messages(&validate(&cfg));
+    assert!(
+        !warns.iter().any(|m| m.contains("api_key")),
+        "a soft-disabled provider needs no key, got {warns:?}"
     );
 }
 

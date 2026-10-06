@@ -34,7 +34,7 @@ use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::warn;
 
 use crate::crypto::KeyProvider;
 use crate::http::HttpAuthChecker;
@@ -67,12 +67,148 @@ use handlers::Resp;
 /// Read `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (v2 D6). A missing, unparseable or
 /// zero value falls back to the default: 0 would reject every write, i.e. a
 /// denial of service triggered by a typo.
+/// Per-IP budget for FAILED admin-token attempts, per minute
+/// (`HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN`, default 10; `0`/garbage falls back).
+///
+/// The admin token is the single secret gating every tenant/provider/api-key
+/// mutation, and the tenant-plane gate next door has had a per-IP failure budget
+/// since 2026-09-17 — the admin gate had none, so a brute-force run was neither
+/// slowed down, nor counted, nor logged above `debug!` (which the shipped
+/// `RUST_LOG=info` filters out).
+fn admin_auth_fail_limit_per_min_from_env() -> u32 {
+    std::env::var("HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10)
+}
+
 fn config_write_per_min_from_env() -> u32 {
     std::env::var("HYDRA_TENANT_CONFIG_WRITE_PER_MIN")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(60)
+}
+/// The peer address of an admin request, with the PORT DROPPED: every request
+/// arrives on a new ephemeral port, so keying a failure budget on the full socket
+/// address would give each connection its own bucket and the limit would never
+/// trip (the same trap the tenant-plane limiter documents).
+///
+/// `X-Forwarded-For` is deliberately NOT consulted: it is caller-controlled, and
+/// honouring it here would let an attacker rotate buckets to brute-force the one
+/// token that gates every provider key. The conservative direction is a shared
+/// bucket behind a load balancer.
+fn peer_ip(session: &ServerSession) -> String {
+    match session.client_addr() {
+        Some(a) => match a.as_inet() {
+            Some(s) => throttle_bucket(s.ip()),
+            None => a.to_string(),
+        },
+        // An in-process harness (or a unix peer) has no IP: one shared bucket.
+        None => "unknown".to_string(),
+    }
+}
+
+/// The failure-budget bucket for one peer address.
+///
+/// IPv6 is folded to its /64: a single client is normally delegated a /64 and
+/// holds 2^64 addresses inside it, so keying the budget on the full address let
+/// it rotate buckets and multiply its budget by 2^64 — the budget became
+/// decorative against the exact attacker it exists for. Folding at /64 throttles
+/// the whole customer instead (the conservative direction: a shared bucket can
+/// only throttle sooner).
+///
+/// An IPv4-MAPPED IPv6 address (`::ffff:a.b.c.d`, what a dual-stack listener
+/// reports for IPv4 peers) must be unwrapped FIRST — otherwise every IPv4 client
+/// on the machine folds into the single `::/64` bucket and ten bad tokens from
+/// one of them would throttle all of them.
+fn throttle_bucket(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let mut seg = v6.segments();
+                for s in seg.iter_mut().skip(4) {
+                    *s = 0;
+                }
+                std::net::Ipv6Addr::from(seg).to_string()
+            }
+        },
+    }
+}
+
+impl AdminService {
+    /// Count, throttle and answer a FAILED credential check on one of this port's
+    /// two gates.
+    ///
+    /// The two gates differ ONLY in the token they compare and the message they
+    /// answer with, so the bookkeeping lives in one place. It did not, once: the
+    /// cluster-token gate compared its token and returned 401 with NO counter, NO
+    /// throttle and NO log line while guarding the control plane (fleet config
+    /// snapshots, cross-tenant sub-tenant/route writes) — one secret, unlimited
+    /// free guesses, and nothing in the metrics or the logs to notice it with.
+    ///
+    /// `gate` qualifies every signal (`admin_denied` / `cluster_throttled` / …) so
+    /// either gate can be alerted on independently.
+    ///
+    /// The peer budget is SHARED between the two gates — one key, one window. A
+    /// peer that burns attempts on one token has spent them on this port, which
+    /// can only throttle sooner, never later. The budget is never consulted for a
+    /// SUCCESSFUL check (callers reach here only after a failed comparison), so
+    /// this cannot lock an operator out of their own gateway. It is a per-process
+    /// counter (`tenant_api::throttle`), so N reachable admin ports still mean N
+    /// times the budget: a speed bump, not a cluster-wide quota.
+    fn refuse_bad_credential(
+        &self,
+        session: &ServerSession,
+        path: &str,
+        trace_id: &str,
+        gate: &str,
+        message: &str,
+    ) -> http::Response<Vec<u8>> {
+        let key = peer_ip(session);
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+        if !self
+            .state
+            .auth_fail_throttle
+            .allow(&key, self.state.auth_fail_per_min, window, now)
+        {
+            let label = format!("{gate}_throttled");
+            crate::admin::metrics::record_admin_auth_failure(&label);
+            let retry_after = self
+                .state
+                .auth_fail_throttle
+                .retry_after_secs(&key, window, now);
+            warn!(
+                target: "hydra::admin",
+                gate = %gate,
+                path = %path,
+                peer = %key,
+                "failed credential attempts from this peer exceed \
+                 HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN; answering 429"
+            );
+            return handlers::err_json_throttled(
+                429,
+                "too_many_failed_attempts",
+                "too many failed attempts from this address",
+                retry_after,
+                trace_id,
+            );
+        }
+        let label = format!("{gate}_denied");
+        crate::admin::metrics::record_admin_auth_failure(&label);
+        warn!(
+            target: "hydra::admin",
+            gate = %gate,
+            path = %path,
+            peer = %key,
+            "credential denied (bad or missing token)"
+        );
+        handlers::err_json(401, "unauthorized", message, trace_id)
+    }
 }
 
 pub struct AdminState {
@@ -99,6 +235,18 @@ pub struct AdminState {
     /// `Arc<DashMap>` backing the proxy's `AppState.admission` — the
     /// `GET /api/v1/concurrency` endpoint reads live gate state from here.
     pub admission: AdmissionControl,
+    /// The default concurrency policy (from `ProxyConfig`), needed to resolve a
+    /// provider's CONFIGURED limits the same way the request path does
+    /// (`hydra_core::config::resolve_policy`) so `GET /api/v1/concurrency` can report
+    /// configured-vs-enforced and flag a change that needs a restart (plan §2bi / D-14).
+    /// Injected via [`Self::with_default_concurrency_policy`]; the zero default keeps
+    /// every existing call site behaving exactly as before, and it IS the value the
+    /// request path uses: `ProxyConfig::default().default_concurrency_policy` is a
+    /// compile-time constant with no environment reader (`main.rs` builds `ProxyConfig`
+    /// as three env-driven timeouts plus `..Default::default()`), so there is nothing to
+    /// thread through. If that ever gains an env knob, wire the real value here — a unit
+    /// test in `admin/mod.rs` asserts the two defaults still agree.
+    pub default_concurrency_policy: hydra_core::config::ConcurrencyPolicy,
     /// Edge data-plane mode (cluster P0b): the admin service serves only
     /// `/metrics` `/healthz` `/readyz`; everything else is 404 (no CRUD, no UI).
     pub edge_mode: bool,
@@ -132,6 +280,14 @@ pub struct AdminState {
     /// class as the E2 allow-TTL bound). On a single node the data-plane local
     /// write path is not the internal endpoint and is bounded by the general
     /// tenant-API per-tenant request budget instead.
+    /// Per-IP budget for FAILED admin-token attempts (fixed window, in-process).
+    /// Keyed on the PEER address only — `X-Forwarded-For` is deliberately not
+    /// consulted here, so a spoofing client cannot rotate buckets; behind a load
+    /// balancer every admin caller shares the LB's bucket, which can only
+    /// throttle more, never less.
+    pub auth_fail_throttle: Arc<crate::tenant_api::throttle::Throttle>,
+    /// See [`admin_auth_fail_limit_per_min_from_env`].
+    pub auth_fail_per_min: u32,
     pub config_write_throttle: Arc<crate::tenant_api::throttle::Throttle>,
     /// The per-tenant, per-minute config-write budget (v2 D6). Defaults to 60;
     /// override with `HYDRA_TENANT_CONFIG_WRITE_PER_MIN`. A missing / zero /
@@ -173,6 +329,19 @@ pub struct AdminState {
     pub cluster_registry: Option<()>,
 }
 
+/// The default admission policy the concurrency endpoint resolves providers against.
+///
+/// It must equal `ProxyConfig::default().default_concurrency_policy` — the value the
+/// REQUEST path uses when a provider sets no limits (all-zero = passthrough, no gate).
+/// `ProxyConfig` builds that field with no environment reader, so the constant is the
+/// single authority for both sides today; the unit test below fails if they ever drift.
+pub const DEFAULT_CONCURRENCY_POLICY: hydra_core::config::ConcurrencyPolicy =
+    hydra_core::config::ConcurrencyPolicy {
+        max_concurrency: 0,
+        max_queue_depth: 0,
+        queue_wait_timeout_ms: 0,
+    };
+
 impl AdminState {
     /// Build admin state from the shared components. Cert re-resolution is not
     /// wired here: `ConfigStore`'s snapshot-change hook notifies the cert store
@@ -201,9 +370,12 @@ impl AdminState {
             reload_lock: Mutex::new(()),
             snapshot_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission,
+            default_concurrency_policy: DEFAULT_CONCURRENCY_POLICY,
             edge_mode,
             cluster_token,
             leader_ready,
+            auth_fail_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
+            auth_fail_per_min: admin_auth_fail_limit_per_min_from_env(),
             config_write_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             config_write_per_min: config_write_per_min_from_env(),
             #[cfg(feature = "cluster-redis")]
@@ -236,6 +408,17 @@ impl AdminState {
     ) -> Self {
         self.live_nodes = Some(live_nodes);
         self.converge_timeout = converge_timeout;
+        self
+    }
+
+    /// Inject the default concurrency policy so the concurrency endpoint can resolve a
+    /// provider's configured limits exactly as the request path does (plan §2bi / D-14).
+    #[must_use]
+    pub fn with_default_concurrency_policy(
+        mut self,
+        policy: hydra_core::config::ConcurrencyPolicy,
+    ) -> Self {
+        self.default_concurrency_policy = policy;
         self
     }
 
@@ -313,6 +496,14 @@ impl AdminService {
     /// a short or human-chosen token is brute-forceable. `main` refuses to boot
     /// with one. Generate with `openssl rand -hex 32`.
     pub const MIN_ADMIN_TOKEN_LEN: usize = 16;
+
+    /// Minimum accepted `HYDRA_CLUSTER_TOKEN` length, the same floor as the admin
+    /// token. The cluster token was only ever checked for PRESENCE (`main.rs`),
+    /// so a 1-character token booted fine while the admin token refused to start
+    /// below 16 — and this is the token that authorises the internal control
+    /// plane and cross-tenant writes. One floor, two tokens that must both be
+    /// unguessable.
+    pub const MIN_CLUSTER_TOKEN_LEN: usize = 16;
     #[must_use]
     pub fn token_from_env() -> Option<String> {
         std::env::var("HYDRA_ADMIN_TOKEN")
@@ -647,25 +838,75 @@ impl AdminService {
     }
 }
 
+/// Longest relayed trace id we accept. Local ids are ~30 chars; 64 leaves room
+/// for a peer's own format without letting a caller push a novel into the logs.
+const MAX_RELAYED_TRACE_ID: usize = 64;
+
+/// The trace id a forwarding peer put in `x-hydra-trace-id`, if it is usable.
+///
+/// Shape-checked on purpose: the value is read before authentication and ends up
+/// in operator-visible logs and response bodies, so only a short
+/// `[A-Za-z0-9._:-]` token is accepted. Anything else (empty, oversized, spaces,
+/// control characters, ANSI escapes) returns `None` and the caller mints a local
+/// id instead. See the call site for why a valid one is adopted rather than
+/// merely recorded.
+fn relayed_trace_id(session: &ServerSession) -> Option<String> {
+    let raw = session
+        .req_header()
+        .headers
+        .get("x-hydra-trace-id")?
+        .to_str()
+        .ok()?;
+    if raw.is_empty() || raw.len() > MAX_RELAYED_TRACE_ID {
+        return None;
+    }
+    raw.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+        .then(|| raw.to_string())
+}
+
 #[async_trait]
 impl ServeHttp for AdminService {
     async fn response(&self, session: &mut ServerSession) -> http::Response<Vec<u8>> {
-        let trace_id = crate::proxy::new_trace_id();
+        // OC-3: the peer that forwarded this request put the TENANT-VISIBLE trace
+        // id in `x-hydra-trace-id` (see `cluster::forward`, which uses the id the
+        // edge also returns to the tenant in `X-Hydra-Trace-Id`). Minting a fresh
+        // id here meant the leader's audit record
+        // (`hydra::tenant_config_write`, see `tenant_config_api::audit`) carried an
+        // id the tenant could never see, so "here is my trace id, what happened to
+        // my write?" could not be answered from the leader's audit trail at all —
+        // the two sides of the same write were labelled with different strings.
+        //
+        // Adopting the inbound value IS the fix: the id in the audit record, in the
+        // leader's error bodies and in the tenant's response header become one
+        // string. The value is shape-checked first — this line runs BEFORE any
+        // gate, so an unauthenticated caller reaching this port could otherwise
+        // push a newline- or ANSI-bearing novel, or an unbounded string, into
+        // operator-visible logs and response bodies.
+        let trace_id = relayed_trace_id(session).unwrap_or_else(crate::proxy::new_trace_id);
         let method = session.req_header().method.as_str().to_string();
         let path = session.req_header().uri.path().to_string();
         let query = session.req_header().uri.query().map(str::to_string);
 
-        // Edge data-plane node (cluster P0b): serve ONLY the probe endpoints
-        // (`/metrics` `/healthz` `/readyz`) — no token (healthchecks), no
-        // admin UI, no CRUD. Everything else is 404.
+        // Edge data-plane node (cluster P0b): serve the health PROBES without a
+        // token (an LB must be able to probe without holding a secret) and
+        // everything else — including `/metrics` — through the ordinary gates.
+        // No admin UI, no CRUD.
+        //
+        // `/metrics` used to be token-free here, which made the metrics exposure
+        // depend on the ROLE: an edge published tenant/provider/model-labelled
+        // series to anyone who could reach the port, while the same series on a
+        // leader required the admin token — and the shipped cluster topology
+        // binds the edge admin port to `0.0.0.0` (`jiqun-deploy.md`), so that was
+        // the one deployment where it mattered. `/metrics` now takes the same
+        // path as everywhere else: admin token required (see ops.md §9).
         if self.state.edge_mode {
-            if path == "/metrics" || path == "/healthz" || path == "/readyz" {
-                return match path.as_str() {
-                    "/metrics" => handlers::metrics_endpoint(),
-                    _ => handlers::health(&self.state, &trace_id).await,
-                };
+            if path == "/healthz" || path == "/readyz" {
+                return handlers::health(&self.state, &trace_id).await;
             }
-            return handlers::err_json(404, "not_found", "edge node: no admin API", &trace_id);
+            if path != "/metrics" {
+                return handlers::err_json(404, "not_found", "edge node: no admin API", &trace_id);
+            }
         }
 
         // Leader-lease probe (cluster P2): 200 while this node holds the
@@ -695,7 +936,17 @@ impl ServeHttp for AdminService {
                 _ => false,
             };
             if !authorized {
-                return handlers::err_json(401, "unauthorized", "invalid cluster token", &trace_id);
+                // Same budget, same counter, same log line as the admin gate: this
+                // one guards the control plane and the cross-tenant write path, so
+                // leaving it unmetered made guessing the cluster token free and
+                // invisible (see `refuse_bad_credential`).
+                return self.refuse_bad_credential(
+                    session,
+                    &path,
+                    &trace_id,
+                    "cluster",
+                    "invalid cluster token",
+                );
             }
             return self
                 .route(&method, &path, query.as_deref(), session, &trace_id)
@@ -714,12 +965,12 @@ impl ServeHttp for AdminService {
 
         // Admin-token gate (design §13.3) — every request to the admin port.
         if !self.check_auth(session) {
-            debug!(target: "hydra::admin", path = %path, "admin auth denied");
-            return handlers::err_json(
-                401,
-                "unauthorized",
-                "missing or invalid admin token",
+            return self.refuse_bad_credential(
+                session,
+                &path,
                 &trace_id,
+                "admin",
+                "missing or invalid admin token",
             );
         }
 
@@ -733,5 +984,72 @@ impl ServeHttp for AdminService {
 
         self.route(&method, &path, query.as_deref(), session, &trace_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The concurrency endpoint resolves a provider's CONFIGURED limits with
+    /// `DEFAULT_CONCURRENCY_POLICY`, while the request path resolves them with
+    /// `ProxyConfig::default().default_concurrency_policy`. If those two ever drift, the
+    /// endpoint would compare the enforced limits against the WRONG configured side and
+    /// `limits_stale` would lie (plan §2bi / D-14).
+    #[test]
+    fn the_endpoint_default_policy_matches_proxyconfig() {
+        assert_eq!(
+            super::DEFAULT_CONCURRENCY_POLICY,
+            crate::proxy::config::ProxyConfig::default().default_concurrency_policy,
+            "AdminState's default admission policy drifted from ProxyConfig's"
+        );
+    }
+
+    use super::throttle_bucket;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// IPv4 peers keep their own bucket. No aggregation is delegated in practice,
+    /// and folding them would let one client throttle every other.
+    #[test]
+    fn an_ipv4_peer_keeps_its_own_bucket() {
+        assert_eq!(
+            throttle_bucket(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "203.0.113.7"
+        );
+    }
+
+    /// Every address inside one /64 shares a bucket. A client delegated a /64 holds
+    /// 2^64 addresses, so keying the failure budget on the full address let it
+    /// rotate buckets and multiply its budget by 2^64 — against the very attacker
+    /// the budget exists for.
+    #[test]
+    fn an_ipv6_peer_is_bucketed_by_its_slash_64() {
+        let a: Ipv6Addr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().expect("addr");
+        let same_64: Ipv6Addr = "2001:db8:1:2:1111:2222:3333:4444".parse().expect("addr");
+        let other_64: Ipv6Addr = "2001:db8:1:3:aaaa:bbbb:cccc:dddd".parse().expect("addr");
+        assert_eq!(
+            throttle_bucket(IpAddr::V6(a)),
+            throttle_bucket(IpAddr::V6(same_64)),
+            "two addresses in one /64 must share a bucket"
+        );
+        assert_ne!(
+            throttle_bucket(IpAddr::V6(a)),
+            throttle_bucket(IpAddr::V6(other_64)),
+            "a different /64 is a different peer"
+        );
+        assert_eq!(throttle_bucket(IpAddr::V6(a)), "2001:db8:1:2::");
+    }
+
+    /// An IPv4-MAPPED address must not fold into `::/64`: a dual-stack listener
+    /// reports IPv4 peers that way, so collapsing them would put EVERY IPv4 caller
+    /// in one bucket — ten bad tokens from one of them would throttle all of them.
+    #[test]
+    fn an_ipv4_mapped_peer_is_unwrapped_instead_of_folded() {
+        let mapped: Ipv6Addr = "::ffff:203.0.113.7".parse().expect("addr");
+        let other: Ipv6Addr = "::ffff:203.0.113.8".parse().expect("addr");
+        assert_eq!(throttle_bucket(IpAddr::V6(mapped)), "203.0.113.7");
+        assert_ne!(
+            throttle_bucket(IpAddr::V6(mapped)),
+            throttle_bucket(IpAddr::V6(other)),
+            "two mapped IPv4 peers are two peers, not one `::/64`"
+        );
     }
 }

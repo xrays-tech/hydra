@@ -72,15 +72,10 @@ pub mod test_redis {
         });
         let db = NEXT_DB.fetch_add(1, Ordering::Relaxed) % UNIT_DB_COUNT + 1; // 1..=40
         let url = format!("{}/{}", base.trim_end_matches('/'), db);
-        let config = Config::from_url(&url).expect("HYDRA_TEST_REDIS_URL must parse");
-        let pool = Pool::new(
-            config,
-            Some(super::performance_config()),
-            Some(super::connection_config()),
-            None,
-            2,
-        )
-        .expect("test pool builds");
+        // The SAME construction as production, through the single owner: a harness pool on
+        // fred's defaults could not time out (0 = wait forever) and could never reconnect,
+        // so it would test a different program than the one that ships.
+        let pool = super::build_pool(&url, 2).expect("test pool builds");
         pool.init()
             .await
             .unwrap_or_else(|e| panic!("cannot reach the test Redis at {url}: {e}"));
@@ -112,6 +107,11 @@ use std::time::Duration;
 
 /// The leader-lease key (single key — topology-safe, plan §6.1).
 pub const LEASE_KEY: &str = "hydra:{lease:leader}";
+
+/// Reconnect delay (ms) for a lost Redis connection. Paired with
+/// `max_attempts = 0` = **retry forever** (fred's own wording: "Use a
+/// `max_attempts` value of `0` to retry forever").
+pub const RECONNECT_DELAY_MS: u32 = 1_000;
 
 /// Default per-command timeout (ms) applied to every Redis command.
 ///
@@ -158,6 +158,25 @@ fn env_millis(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The reconnect policy this process hands fred — **without which fred never
+/// reconnects a connection that closed**.
+///
+/// Measured 2026-09-30 on a real leader whose Redis link was severed for ~2s and then
+/// restored (`.acceptance/round99/reconnect-probe.py`): for the next **90 seconds the node
+/// opened ZERO new connections**, every command kept failing on the 500 ms command timeout,
+/// and `/healthz/leader` stayed `503` — the lease was never re-acquired, so the fleet had no
+/// leader. fred's own debug log named the cause: `Checking reconnect state. Has policy:
+/// false`. `Pool::new(config, perf, connection, policy, size)` takes the policy as its own
+/// argument (it is not part of `Config`), and this process passed `None`, so
+/// `ReconnectPolicy` — whose `max_attempts = 0` means "retry forever, every 1 s" — was never
+/// installed. `ops.md` §13.5 promises the opposite ("until Redis recovers"), and every
+/// fail-open path (cluster rate limits, auth-cache L2, breaker sync, registry) silently
+/// became **permanent** instead of temporary.
+#[must_use]
+pub fn reconnect_policy() -> ReconnectPolicy {
+    ReconnectPolicy::new_constant(0, RECONNECT_DELAY_MS)
+}
+
 /// Per-command timeout for the shared pool (see [`DEFAULT_COMMAND_TIMEOUT_MS`]
 /// for why this must not stay on fred's `0` default).
 fn performance_config() -> PerformanceConfig {
@@ -200,8 +219,11 @@ pub enum RedisError {
 
 /// Redis deployment mode (`HYDRA_REDIS_MODE`). `single` is the default and
 /// the fully-wired mode; sentinel/cluster config parsing lands with the
-/// topology work (P4+) — they currently fail fast at startup rather than
-/// silently misbehaving.
+/// topology work (P4+) — they fail fast at startup rather than silently
+/// misbehaving, and so does **any other value**: a typo in this knob used to
+/// fall through to `Single`, i.e. a topology-critical setting silently became a
+/// different one (measured 2026-10-01 on the wire: `HYDRA_REDIS_MODE=clustr`
+/// started an edge node in single mode, while `=sentinel` was refused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedisMode {
     Single,
@@ -210,14 +232,28 @@ pub enum RedisMode {
 }
 
 impl RedisMode {
-    /// Parse `HYDRA_REDIS_MODE` (default `single`).
-    #[must_use]
-    pub fn from_env() -> Self {
-        match std::env::var("HYDRA_REDIS_MODE").as_deref() {
-            Ok("sentinel") => Self::Sentinel,
-            Ok("cluster") => Self::Cluster,
-            _ => Self::Single,
+    /// Parse a mode value. `None`/empty/`single` ⇒ [`RedisMode::Single`]; `sentinel`/`cluster` and
+    /// **every other non-empty value** ⇒ [`RedisError::UnsupportedMode`].
+    ///
+    /// The catch-all arm is deliberate and is the whole point (round 191): `HYDRA_REDIS_MODE` selects a
+    /// TOPOLOGY, so a typo (`clustr`) must not quietly mean "single" — it must stop the process, which is
+    /// what the module's own contract says ("fail fast rather than silently misbehaving"). Pure, so the
+    /// cases are unit-testable without touching the process environment.
+    pub fn parse(value: Option<&str>) -> Result<Self, RedisError> {
+        // Match case-insensitively (an operator writing `SINGLE` means single) but REPORT what they
+        // actually wrote, so the error message is about their input and not about a folded copy.
+        let trimmed = value.map(str::trim).unwrap_or("");
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "single" => Ok(Self::Single),
+            _ => Err(RedisError::UnsupportedMode {
+                mode: trimmed.to_string(),
+            }),
         }
+    }
+
+    /// Parse `HYDRA_REDIS_MODE` (default `single`) — the environment-facing half of [`Self::parse`].
+    pub fn from_env() -> Result<Self, RedisError> {
+        Self::parse(std::env::var("HYDRA_REDIS_MODE").ok().as_deref())
     }
 }
 
@@ -228,9 +264,82 @@ pub struct RedisBackend {
     pool: Pool,
 }
 
+/// The **single owner of "how a Redis pool is built"** — production and every test.
+///
+/// `Pool::new(config, perf, connection, policy, size)` takes three pieces of configuration
+/// that fred does **not** put in `Config`, and fred's defaults for all three are wrong for
+/// this process:
+///
+/// | argument | fred's default | what it costs here |
+/// |---|---|---|
+/// | `perf.default_command_timeout` | `0` = wait forever | a half-open Redis stalls the data plane (rate-limit `EVAL` runs before routing) |
+/// | `connection.unresponsive` | disabled | a dead socket is never recycled |
+/// | `policy` | `None` = **never reconnect** | measured: a ~2 s outage left the leader demoted and limits failed open for 90 s+ (see [`reconnect_policy`]) |
+///
+/// Five hand-written `Pool::new` calls used to exist in this tree (production, the lib-test
+/// harness, and three integration-test sites) and **four of them passed fred's defaults** —
+/// including the wait-forever command timeout the production comment calls a data-plane
+/// stall. A test pool that cannot time out and cannot reconnect tests a different program
+/// than the one that ships, so every construction site now comes through here
+/// (`scripts/check_redis_pool.cjs` fails the build if a new one appears).
+///
+/// # Errors
+/// When the URL does not parse or fred rejects the configuration.
+pub fn build_pool(url: &str, size: usize) -> Result<Pool, RedisError> {
+    build_pool_with(url, size, performance_config())
+}
+
+/// [`build_pool`] with an explicit command timeout, for tests that must make an
+/// unreachable bus fail **fast** instead of waiting for the production timeout.
+///
+/// The timeout is the only knob a caller may vary: the watchdog and the reconnect policy
+/// stay owned here, so a caller cannot accidentally re-open the hole this module closed.
+///
+/// # Errors
+/// When the URL does not parse or fred rejects the configuration.
+pub fn build_pool_with(
+    url: &str,
+    size: usize,
+    perf: PerformanceConfig,
+) -> Result<Pool, RedisError> {
+    let config = Config::from_url(url).map_err(RedisError::from)?;
+    pool_from_config(config, perf, size)
+}
+
+/// **The only `Pool::new` call in this tree.** Everything that needs a pool — production,
+/// the lib-test harness, the integration tests — reaches fred through here, so the three
+/// non-default settings cannot drift apart again.
+fn pool_from_config(
+    config: Config,
+    perf: PerformanceConfig,
+    size: usize,
+) -> Result<Pool, RedisError> {
+    Pool::new(
+        config,
+        Some(perf),
+        Some(connection_config()),
+        Some(reconnect_policy()),
+        size,
+    )
+    .map_err(RedisError::from)
+}
+
+/// The pool for production: two clients (fred's own recommended minimum for a
+/// non-clustered deployment), all three settings above.
+fn pool_for(config: Config) -> Result<Pool, RedisError> {
+    pool_from_config(config, performance_config(), 2)
+}
+
 impl RedisBackend {
     /// Connect to Redis. `single` mode uses the URL directly; sentinel/cluster
     /// are rejected until wired (fail-fast startup, never silent).
+    ///
+    /// The two arms below are defensive for a DIRECT caller of this public API: no path through the
+    /// environment can produce those variants any more, because [`RedisMode::parse`] refuses every
+    /// value except `single` before a mode is ever constructed (round 191). Saying they are simply
+    /// "unreachable" would be wrong — they are reachable by anyone constructing the enum by hand,
+    /// which is exactly why they must keep returning an error instead of falling through. (Round 195
+    /// corrected this comment: it used to claim more than the type system enforces.)
     pub async fn connect(url: &str, mode: RedisMode) -> Result<Self, RedisError> {
         let config = match mode {
             RedisMode::Single => Config::from_url(url).map_err(RedisError::from)?,
@@ -247,15 +356,12 @@ impl RedisBackend {
         };
         // Never leave the pool on fred's defaults: a command timeout of 0 means
         // wait-forever, which turns a half-open Redis into a data-plane stall
-        // (see DEFAULT_COMMAND_TIMEOUT_MS).
-        let pool = Pool::new(
-            config,
-            Some(performance_config()),
-            Some(connection_config()),
-            None,
-            2,
-        )
-        .map_err(RedisError::from)?;
+        // (see DEFAULT_COMMAND_TIMEOUT_MS) — and a reconnect policy of `None`
+        // means a severed connection is never dialled again (see
+        // [`reconnect_policy`]). Both are asserted by unit tests on
+        // [`pool_for`], because passing `None` here is invisible until Redis
+        // actually goes away.
+        let pool = pool_for(config)?;
         pool.init()
             .await
             .map_err(|e| RedisError::Init(e.to_string()))?;
@@ -401,6 +507,62 @@ mod tests {
         assert!(conn.unresponsive.interval < max);
     }
 
+    /// Regression (measured 2026-09-30): `Pool::new`'s `policy` argument was `None`, so
+    /// fred never reconnected a connection that closed — `Has policy: false` in its debug
+    /// log — and a ~2s Redis outage left the node dialling **nothing** for 90s while every
+    /// command failed on the command timeout and the leader stayed demoted. The policy is
+    /// not part of `Config`, so a `None` here is invisible until Redis goes away: assert
+    /// the pool that would really be built carries one, and that it retries forever.
+    #[test]
+    fn the_pool_always_gets_a_reconnect_policy_that_never_gives_up() {
+        // 0 = retry forever (fred: "Use a `max_attempts` value of `0` to retry forever").
+        assert_eq!(reconnect_policy().max_attempts(), 0);
+        // A zero delay would hammer Redis in a tight loop; checked at compile time so
+        // clippy's `assertions_on_constants` stays satisfied.
+        const { assert!(RECONNECT_DELAY_MS > 0) };
+
+        let pool = pool_for(Config::from_url("redis://127.0.0.1:1/0").expect("url parses"))
+            .expect("a pool is built without connecting");
+        assert_eq!(pool.clients().len(), 2);
+        for client in pool.clients() {
+            assert!(
+                client.client_reconnect_policy().is_some(),
+                "every client must be constructed WITH a reconnect policy; None means a \
+                 closed connection is never dialled again"
+            );
+            assert_eq!(
+                client
+                    .client_reconnect_policy()
+                    .expect("policy present")
+                    .max_attempts(),
+                0,
+                "the policy must retry forever, not give up after N attempts"
+            );
+            let _ = client.client_config(); // the config itself must still be the parsed URL's
+        }
+    }
+
+    /// The TEST harness must build its pool exactly like production.
+    ///
+    /// Measured 2026-09-30: four of this tree's five `Pool::new` call sites passed fred's
+    /// defaults — `isolated_pool` (every Redis-backed lib test) among them, i.e. **no**
+    /// reconnect policy and `default_command_timeout = 0` (wait forever). A harness pool
+    /// that cannot time out and cannot reconnect tests a different program than the one
+    /// that ships, and it is exactly the pool whose behaviour the reconnection fix depends
+    /// on. Needs a live test Redis (`HYDRA_TEST_REDIS_URL`), like its siblings here.
+    #[tokio::test]
+    async fn the_test_harness_builds_the_same_pool_as_production() {
+        let pool = test_redis::isolated_pool().await;
+        assert_eq!(pool.clients().len(), 2);
+        for client in pool.clients() {
+            let policy = client.client_reconnect_policy().expect(
+                "the harness pool must carry the production reconnect policy; with `None` a \
+                 severed connection is never dialled again",
+            );
+            assert_eq!(policy.max_attempts(), 0);
+        }
+    }
+
     /// `env_millis` ignores unset, unparseable and zero values so a typo in an
     /// env var falls back to the safe default instead of disabling the bound.
     #[test]
@@ -410,5 +572,39 @@ mod tests {
             env_millis("HYDRA_TEST_UNSET_MS_KEY_2", DEFAULT_COMMAND_TIMEOUT_MS),
             DEFAULT_COMMAND_TIMEOUT_MS
         );
+    }
+
+    /// Round 191: the mode knob must FAIL FAST for anything it does not understand. It used to fall
+    /// through to `Single`, so `HYDRA_REDIS_MODE=clustr` silently started a single-mode node (measured
+    /// on the wire) while the module's own contract says "fail fast rather than silently misbehaving".
+    /// `parse` is pure, so these cases do not touch the process environment.
+    #[test]
+    fn redis_mode_parses_the_known_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("single"),
+            Some("single "),
+            Some("SINGLE"),
+            Some(" Single "),
+        ] {
+            assert_eq!(
+                RedisMode::parse(value).expect("the default and `single` are accepted"),
+                RedisMode::Single,
+                "value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redis_mode_refuses_everything_else_including_typos() {
+        for value in [
+            "sentinel", "cluster", "clustr", "SENTINEL", "snetinel", "banana",
+        ] {
+            match RedisMode::parse(Some(value)) {
+                Err(RedisError::UnsupportedMode { mode }) => assert_eq!(mode, value),
+                other => panic!("{value:?} must be refused, got {other:?}"),
+            }
+        }
     }
 }

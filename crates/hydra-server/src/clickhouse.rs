@@ -49,6 +49,16 @@ pub(crate) struct ClickHouseConfig {
     /// `?user=x&password=y`), WITHOUT the leading `?`. Appended to the POST
     /// request's query string; empty when the URL had none.
     pub(crate) query_params: String,
+    /// The URL asked for `https://`, which this transport CANNOT provide.
+    ///
+    /// Recorded rather than ignored: `parse_clickhouse_url` used to strip both
+    /// `http://` and `https://` alike and keep only `host:port`, so an operator who
+    /// configured the documented `https://host:port` form got a PLAIN TCP
+    /// connection with `Authorization: Basic <user:pass>` on the wire — a silent
+    /// credential disclosure dressed up as encryption, with symptoms (connection
+    /// succeeds, request rejected or times out against a TLS-only port) that point
+    /// at certificates instead of at this. `send` now refuses such a config.
+    pub(crate) tls_requested: bool,
     /// Deadline for the TCP connect
     /// (`HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS`, default 3000).
     pub(crate) connect_timeout: Duration,
@@ -75,7 +85,8 @@ pub(crate) fn env_millis(key: &str, default_ms: u64) -> Duration {
 
 /// Parse a ClickHouse URL into transport + credentials. Accepted forms:
 ///
-/// - `http://host:port` / `https://host:port` / bare `host:port` (anonymous);
+/// - `http://host:port` / bare `host:port` (anonymous); **`https://` is parsed but
+///   then REFUSED by `send`** — see `ClickHouseConfig::tls_requested`;
 /// - `http://user:pass@host:port` — userinfo becomes HTTP Basic auth;
 /// - any of the above plus a query string (`?database=dogress`,
 ///   `?user=x&password=y`), which is passed through verbatim.
@@ -83,6 +94,7 @@ pub(crate) fn env_millis(key: &str, default_ms: u64) -> Duration {
 /// CR/LF in credentials are stripped (header-injection guard); the password is
 /// otherwise sent as-is inside the Basic auth header.
 pub(crate) fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
+    let tls_requested = url.starts_with("https://");
     let stripped = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -109,8 +121,14 @@ pub(crate) fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
         }
     });
     ClickHouseConfig {
-        // Trim a trailing '/' (and any path): we only dial host:port.
-        host_port: host_port.trim_end_matches('/').to_string(),
+        tls_requested,
+        // Trim any PATH and a trailing '/': we only dial host:port and always POST to `/`.
+        // Measured 2026-09-30: this used to be `trim_end_matches('/')`, which trimmed the
+        // slash but KEPT a path — `http://host:8123/clickhouse` then failed to parse its
+        // port and the sink logged `clickhouse connect 127.0.0.1:8123/clickhouse: invalid
+        // port value` while the comment above claimed "and any path". Splitting on '/' makes
+        // the comment true and turns a confusing failure into a working connection.
+        host_port: host_port.split('/').next().unwrap_or(host_port).to_string(),
         auth,
         query_params: query.unwrap_or("").to_string(),
         connect_timeout: env_millis("HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS", 3_000),
@@ -180,7 +198,22 @@ pub(crate) async fn send(
     params: &[(&str, &str)],
     body: &[u8],
 ) -> Result<SendResult, String> {
-    // POST /?<passthrough params>&query=<url-encoded SQL>&param_k=v … HTTP/1.1
+    // Fail BEFORE anything is dialled or written, so the credentials in `cfg.auth`
+    // have no chance to leave in plaintext. This is the only place that opens the
+    // connection, so one guard covers the writer and the reader.
+    if cfg.tls_requested {
+        return Err(
+            "HYDRA_CLICKHOUSE_URL uses https:// but this build has no TLS transport for \
+             ClickHouse: refusing to send credentials and usage rows in PLAINTEXT. Use \
+             http:// on a private network or through a tunnel, or terminate TLS in \
+             front of the database"
+                .to_string(),
+        );
+    }
+    // POST /?<passthrough params>&query=<url-encoded SQL>[&param_k=v …] HTTP/1.1
+    // The `param_*` bindings appear only when the caller passes `params`: the usage
+    // WRITER passes none — its rows ride in the `FORMAT JSONEachRow` body (measured
+    // 2026-09-30 against a mock ClickHouse) — while the tenant API's READER binds.
     let mut request = String::with_capacity(body.len() + query.len() * 2 + 256);
     request.push_str("POST /?");
     if !cfg.query_params.is_empty() {
@@ -450,6 +483,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_trims_a_path() {
+        // Measured 2026-09-30: `http://host:8123/clickhouse` used to KEEP the path, so the
+        // port parse failed and the sink logged `invalid port value` — while the code
+        // comment claimed paths were trimmed. The sink always POSTs to `/`, so a path can
+        // only be noise.
+        for url in [
+            "http://clickhouse:8123/clickhouse",
+            "http://u:p@clickhouse:8123/clickhouse",
+            "http://clickhouse:8123/clickhouse/",
+        ] {
+            assert_eq!(
+                parse_clickhouse_url(url).host_port,
+                "clickhouse:8123",
+                "{url}"
+            );
+        }
+        // ...and the documented forms keep working unchanged.
+        assert_eq!(
+            parse_clickhouse_url("http://clickhouse:8123").host_port,
+            "clickhouse:8123"
+        );
+        assert_eq!(
+            parse_clickhouse_url("http://clickhouse:8123/").host_port,
+            "clickhouse:8123"
+        );
+        assert_eq!(
+            parse_clickhouse_url("http://u:p@clickhouse:8123/?database=d").host_port,
+            "clickhouse:8123"
+        );
+    }
+
+    #[test]
     fn parse_url_userinfo_and_query() {
         let cfg = parse_clickhouse_url("http://u:p@clickhouse:8123/?database=dogress");
         assert_eq!(cfg.auth, Some(("u".into(), "p".into())));
@@ -590,11 +655,57 @@ mod tests {
     // Transport: real sockets, real deadlines
     // -----------------------------------------------------------------------
 
+    /// `https://` must NOT be silently downgraded to a plaintext connection.
+    ///
+    /// This parser stripped `http://` and `https://` alike and kept only
+    /// `host:port`, and the transport is a bare `TcpStream` with
+    /// `Authorization: Basic <user:pass>` in the request — so an operator who used
+    /// the documented `https://host:port` form sent credentials IN THE CLEAR while
+    /// believing the connection was encrypted, and the failure mode on a TLS-only
+    /// port (connects, then the request is rejected or times out) pointed at
+    /// certificates rather than at this.
+    ///
+    /// Falsification: delete the `tls_requested` guard in `send` and the call does
+    /// not fail with OUR message — it tries to dial and comes back with a network
+    /// error instead.
+    #[tokio::test]
+    async fn an_https_url_is_refused_rather_than_sent_in_plaintext() {
+        let cfg = parse_clickhouse_url("https://alice:secret@ch.example.com:8443/?database=usage");
+        assert!(
+            cfg.tls_requested,
+            "the https scheme must be REMEMBERED, not silently stripped"
+        );
+        assert_eq!(cfg.host_port, "ch.example.com:8443");
+        assert_eq!(
+            cfg.auth,
+            Some(("alice".to_string(), "secret".to_string())),
+            "the credentials are still parsed — which is exactly why the transport must refuse"
+        );
+
+        // Refused BEFORE anything is dialled: no DNS lookup, no socket, so the
+        // password cannot leave even if the host resolves.
+        match send(&cfg, "SELECT 1", &[], b"").await {
+            Ok(_) => panic!("an https:// ClickHouse config must never be sent in plaintext"),
+            Err(err) => {
+                assert!(
+                    err.contains("https://") && err.contains("PLAINTEXT"),
+                    "the refusal must name the cause and the risk, got: {err}"
+                );
+            }
+        }
+
+        // A plaintext URL is unaffected: this is a scheme check, not a new ban.
+        let plain = parse_clickhouse_url("http://127.0.0.1:8123");
+        assert!(!plain.tls_requested);
+        assert_eq!(plain.host_port, "127.0.0.1:8123");
+    }
+
     fn cfg_for(addr: std::net::SocketAddr, connect_ms: u64, io_ms: u64) -> ClickHouseConfig {
         ClickHouseConfig {
             host_port: addr.to_string(),
             auth: None,
             query_params: String::new(),
+            tls_requested: false,
             connect_timeout: Duration::from_millis(connect_ms),
             io_timeout: Duration::from_millis(io_ms),
         }

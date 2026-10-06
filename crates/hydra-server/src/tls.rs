@@ -261,13 +261,23 @@ impl HydraCertStore {
 
     /// Select a cert for `domain`: exact match → first-level wildcard → `None`.
     /// Borrowed-from-the-guard lookup path used by the callback.
+    ///
+    /// The match is **case-insensitive** because the SNI the peer sends is not
+    /// normalised: `SSL_get_servername` returns the raw bytes, while the map keys
+    /// are built from `store.rs`'s `t.domain.to_lowercase()`. Without folding
+    /// here, a client asking for `ACME.example.com` missed both the exact key and
+    /// the wildcard (`*.Example.com` ≠ `*.example.com`) and the handshake was
+    /// refused — RFC 6066/RFC 6125 require hostname comparison to ignore case;
+    /// `sni_matches_host` in this same file already folds. Folding produces only
+    /// lower-case keys for `wildcard_of`, which is what the map holds.
     fn lookup(&self, domain: &str) -> Option<ResolvedCert> {
+        let domain = domain.to_ascii_lowercase();
         let map = self.certs.load();
-        if let Some(c) = map.get(domain) {
+        if let Some(c) = map.get(&domain) {
             return Some(c.clone());
         }
         // First-level wildcard: `foo.example.com` → `*.example.com`.
-        if let Some(wild) = wildcard_of(domain) {
+        if let Some(wild) = wildcard_of(&domain) {
             if let Some(c) = map.get(&wild) {
                 return Some(c.clone());
             }
@@ -646,6 +656,18 @@ mod tests {
                 cert_key_pem: None,
             },
         );
+        // A first-level wildcard entry. `resolve_certs` does no SAN validation
+        // (recorded separately), so the acme fixture stands in for it.
+        certs.insert(
+            "*.acme.com".to_string(),
+            CertMeta {
+                domain: "*.acme.com".to_string(),
+                cert_file: Some(format!("{fixtures}/acme.crt")),
+                cert_key: Some(format!("{fixtures}/acme.key")),
+                cert_pem: None,
+                cert_key_pem: None,
+            },
+        );
         let store = HydraCertStore::new(None);
         store.resolve_and_store(&certs);
 
@@ -657,6 +679,25 @@ mod tests {
         assert!(store.lookup("acme.com").is_some());
         // Unknown domain misses (no default).
         assert!(store.lookup("evil.example").is_none());
+
+        // SNI case-insensitivity (RFC 6066 / RFC 6125). The map keys come from
+        // `store.rs`'s `to_lowercase`, and `SSL_get_servername` returns the raw
+        // bytes the peer sent, so a mixed-case SNI must still find its cert —
+        // both by exact key and by wildcard. Before this was folded, such a
+        // client fell through to "no cert matches SNI and no default
+        // configured" and the handshake was refused.
+        assert!(
+            store.lookup("ACME.com").is_some(),
+            "mixed-case exact SNI must match"
+        );
+        assert!(
+            store.lookup("API.ACME.COM").is_some(),
+            "mixed-case SNI must match the wildcard entry"
+        );
+        assert!(
+            store.lookup("acme.com.evil.example").is_none(),
+            "a suffix that merely contains the domain must not match"
+        );
     }
 
     #[test]

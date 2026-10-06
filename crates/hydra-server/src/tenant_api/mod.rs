@@ -267,13 +267,26 @@ pub async fn dispatch(
             | TenantWriteRoute::UpsertRoute { tenant_id }
             | TenantWriteRoute::DeleteRoute { tenant_id, .. } => tenant_id,
         };
+        // The ROUTE is known here — from the path alone, before any credential is
+        // looked at — so it must be set BEFORE the gate, exactly as on the read
+        // path below. `run_gate` is what writes the 401/403/429/503 refusal, and
+        // the response writers read this field to label
+        // `hydra_tenant_api_requests_total`; assigning it after the gate made
+        // every refused WRITE show up under `endpoint="unrouted"`, the one label
+        // that means "this is not a route" for a request that hit a perfectly
+        // well-known one.
+        //
+        // `ctx.tenant` deliberately stays AFTER the gate: until the token is
+        // verified the tenant in the URL is only an unverified claim, and using
+        // it as a metric label would let a caller pick which tenant its failed
+        // request is billed to in the dashboards.
+        ctx.tenant_api_endpoint = Some(write.label());
         // The write is authenticated with the EXACT same gate a read is, so a
         // write endpoint cannot become a weaker door (D3). `None` ⇒ a response
         // (401/403/429/503) was already written.
         let Some(authenticated) = run_gate(state, session, ctx, path, url_tenant).await? else {
             return Ok(true);
         };
-        ctx.tenant_api_endpoint = Some(write.label());
         ctx.tenant = Some(authenticated.tenant.clone());
         return handlers::write(state, session, ctx, &authenticated, write).await;
     }

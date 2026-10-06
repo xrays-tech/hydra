@@ -13,7 +13,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fred::clients::Pool;
 use fred::prelude::*;
@@ -51,32 +51,58 @@ end
 /// COUNT where every consumer expects a token sum — wrong by two to three orders
 /// of magnitude, and it would have under-enforced the moment token limits were
 /// actually checked.
+/// Token accounting: the SCORE is the TIME, and the member carries the token
+/// count (`<now>:<tokens>:<salt>`).
+///
+/// The score used to be the token count, so that the check could `SUM` the
+/// scores — but eviction is `ZREMRANGEBYSCORE zk '-inf' (now - window_ms)`, which
+/// compares scores against a millisecond TIMESTAMP. With a real clock
+/// (`now ≈ 1.79e12`) that bound exceeds any token count, so every add wiped the
+/// whole window and the check summed 0: a token budget never accumulated and was
+/// never enforced. The existing script test could not see it because it passed a
+/// fake `now` of 1000/2000, where `now - window_ms` is negative. Score = time
+/// keeps eviction and accumulation consistent; the member is the only place a
+/// count can live, so the sum parses it (and SKIPS entries it cannot parse, i.e.
+/// legacy-format members, which the first new-format call evicts anyway because
+/// their score — a token count — is far below the time-based bound).
 pub const ADD_TOKENS_SCRIPT: &str = r#"
 local now = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
 local member = ARGV[3]
-local tokens = tonumber(ARGV[4])
 local zk = KEYS[1]
 redis.call('ZREMRANGEBYSCORE', zk, '-inf', now - window_ms)
-redis.call('ZADD', zk, tokens, member)
+redis.call('ZADD', zk, now, member)
 redis.call('PEXPIRE', zk, window_ms)
-return redis.call('ZCARD', zk)
+local total = 0
+for _, m in ipairs(redis.call('ZRANGE', zk, 0, -1)) do
+  local t = string.match(m, '^%d+:(%d+):')
+  if t then total = total + tonumber(t) end
+end
+return total
 "#;
 
 /// Atomic token check: prune the window, sum the live token scores.
 /// `ARGV`: [now_ms, window_ms, limit] → 1 admit, 0 deny.
+/// Token verdict: evict expired entries by SCORE (time), sum the token counts
+/// carried by the members, and compare. 1 = admit, 0 = deny.
+///
+/// The eviction here is housekeeping only — it must never be able to empty a
+/// live window. The previous version summed the SCORES, which (with score =
+/// tokens) meant the eviction bound above removed everything first and the sum
+/// was always 0: this read path admitted unconditionally AND destroyed the window
+/// it read.
 pub const CHECK_TOKENS_SCRIPT: &str = r#"
 local now = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
 local limit = tonumber(ARGV[3])
 local zk = KEYS[1]
 redis.call('ZREMRANGEBYSCORE', zk, '-inf', now - window_ms)
-local parts = redis.call('ZRANGE', zk, 0, -1, 'WITHSCORES')
-local sum = 0
-for i = 2, #parts, 2 do
-  sum = sum + tonumber(parts[i])
+local total = 0
+for _, m in ipairs(redis.call('ZRANGE', zk, 0, -1)) do
+  local t = string.match(m, '^%d+:(%d+):')
+  if t then total = total + tonumber(t) end
 end
-if sum >= limit then return 0 else return 1 end
+if total >= limit then return 0 else return 1 end
 "#;
 
 fn now_ms() -> i64 {
@@ -91,6 +117,22 @@ fn now_ms() -> i64 {
 /// Redis (Lua), so limits are enforced across the WHOLE cluster.
 pub struct RedisRateLimiter {
     pool: Pool,
+    /// This INSTANCE's member prefix, mixed into every window member.
+    ///
+    /// The members are `SET`-like entries in a sorted set: two writes whose
+    /// member strings are equal COLLAPSE into one (`ZADD` overwrites the score),
+    /// so the count silently under-reports. The member used to be
+    /// `<now_ms>-<counter>` with a per-PROCESS counter starting at 0, which means
+    /// the first request of the same millisecond on two different nodes produced
+    /// the SAME member on both — the fleet counted one, not two. Under-counting
+    /// is the fail-open direction: a tenant could hold a window full of requests
+    /// that the limiter never saw.
+    ///
+    /// The prefix is per instance (and carries a boot-time nonce) so it is unique
+    /// across processes AND testable: two limiter instances in one test process
+    /// behave like two nodes. `pid` alone would NOT be enough — every container
+    /// can be PID 1.
+    instance: String,
 }
 
 impl crate::proxy::limiter::Limiter for RedisRateLimiter {
@@ -130,7 +172,10 @@ impl crate::proxy::limiter::Limiter for RedisRateLimiter {
 impl RedisRateLimiter {
     #[must_use]
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            instance: new_instance_nonce(),
+        }
     }
 
     /// Pre-gate count check: for every matched role with a `limit_count`,
@@ -144,11 +189,14 @@ impl RedisRateLimiter {
         let now = now_ms();
         for (role, key, limit) in windows_to_check(roles, ctx) {
             if limit == 0 {
+                // Unconditional deny: no window is involved, so there is no window
+                // remainder to promise (`Retry-After` then falls back to 1s).
                 return CountVerdict::Denied {
                     role_id: role.id.clone(),
+                    retry_after: None,
                 };
             }
-            let member = format!("{now}-{}", member_salt(&key));
+            let member = format!("{now}-{}-{}", self.instance, member_salt());
             let admitted: i64 = match self
                 .pool
                 .eval(
@@ -173,8 +221,14 @@ impl RedisRateLimiter {
                 }
             };
             if admitted == 0 {
+                // The Redis limiter keeps its samples inside Redis, so it cannot read the
+                // OLDEST one's age the way the in-process window can: it reports the whole
+                // window as an upper bound on the remainder. That is deliberately
+                // conservative — `Retry-After` must never invite an EARLIER retry than the
+                // window allows, or the client walks straight into another 429.
                 return CountVerdict::Denied {
                     role_id: role.id.clone(),
+                    retry_after: Some(Duration::from_millis(window_ms(role).max(0) as u64)),
                 };
             }
         }
@@ -223,8 +277,14 @@ impl RedisRateLimiter {
                 }
             };
             if admitted == 0 {
+                // The Redis limiter keeps its samples inside Redis, so it cannot read the
+                // OLDEST one's age the way the in-process window can: it reports the whole
+                // window as an upper bound on the remainder. That is deliberately
+                // conservative — `Retry-After` must never invite an EARLIER retry than the
+                // window allows, or the client walks straight into another 429.
                 return CountVerdict::Denied {
                     role_id: role.id.clone(),
+                    retry_after: Some(Duration::from_millis(window_ms(role).max(0) as u64)),
                 };
             }
         }
@@ -248,18 +308,16 @@ impl RedisRateLimiter {
                     role_id: role.id.clone(),
                     bucket: bucket_for(role, ctx),
                 };
-                let member = format!("{now}-{}", member_salt(&key.bucket));
+                // Member = `<now>:<tokens>:<instance>-<salt>`; the score is the
+                // time (see ADD_TOKENS_SCRIPT). The token count lives in the
+                // member so the sum and the eviction can both be consistent.
+                let member = format!("{now}:{tokens}:{}-{}", self.instance, member_salt());
                 let _: Result<i64, _> = self
                     .pool
                     .eval(
                         ADD_TOKENS_SCRIPT,
                         vec![tokens_key(&key)],
-                        vec![
-                            now.to_string(),
-                            window_ms(role).to_string(),
-                            member,
-                            tokens.to_string(),
-                        ],
+                        vec![now.to_string(), window_ms(role).to_string(), member],
                     )
                     .await;
             }
@@ -303,11 +361,28 @@ fn windows_to_check<'a>(
         .collect()
 }
 
-fn member_salt(_key: &str) -> String {
-    // Uniqueness within the same millisecond: a monotonic-ish component.
+/// Uniqueness WITHIN one instance: a monotonic per-process counter.
+fn member_salt() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SALT: AtomicU64 = AtomicU64::new(0);
     SALT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
+/// A nonce unique to this limiter instance (see [`RedisRateLimiter::instance`]).
+///
+/// `pid` alone is not enough (in containers every node can be PID 1), so it is
+/// mixed with the wall clock at construction time and an atomic counter: two
+/// instances in one process differ by the counter, and two processes differ by
+/// pid and/or the clock reading.
+fn new_instance_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{}-{seq:x}", std::process::id(), nanos)
 }
 
 /// Window length for a role's `window` field (m=60s, h=3600s, d=86400s).
@@ -325,15 +400,17 @@ fn window_ms(role: &LimitRole) -> i64 {
 /// [`crate::proxy::limiter::bucket_for`] (kept private there; the provider
 /// dimension is unknown until routing, §10.3).
 fn bucket_for(role: &LimitRole, ctx: &MatchCtx<'_>) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    let mut parts: Vec<String> = Vec::with_capacity(3);
     if role.matching_key.is_some() {
-        parts.push(ctx.api_key.unwrap_or(""));
+        // `hydra_core::limit::bucket_key` (single owner): the masked key, or the raw key masked
+        // here — never `""`, which would give every client of this role one shared window.
+        parts.push(hydra_core::limit::bucket_key(ctx));
     }
     if role.matching_model.is_some() {
-        parts.push(ctx.model.unwrap_or(""));
+        parts.push(ctx.model.unwrap_or("").to_string());
     }
     if role.matching_tenant.is_some() {
-        parts.push(ctx.tenant.unwrap_or(""));
+        parts.push(ctx.tenant.unwrap_or("").to_string());
     }
     parts.join("\u{1f}")
 }
@@ -365,6 +442,7 @@ mod tests {
     fn ctx() -> MatchCtx<'static> {
         MatchCtx {
             api_key: None,
+            api_key_raw: None, // this fixture exercises key-less roles, so no raw key is needed
             model: None,
             tenant: Some("t1"),
             provider: None,
@@ -407,6 +485,120 @@ mod tests {
             bucket: "b".into(),
         };
         assert!(count_key(&k).contains("{rl:r1:b}") && tokens_key(&k).contains("{rl:r1:b}"));
+    }
+
+    /// The token window must ACCUMULATE, and the check must not destroy it.
+    ///
+    /// Found while fixing the member collision above: the scripts store the token
+    /// COUNT as the sorted-set score but evict with
+    /// `ZREMRANGEBYSCORE zk '-inf' (now - window_ms)` — comparing a token count
+    /// against a millisecond timestamp. With a real `now` (1.79e12) that bound is
+    /// larger than any token count, so every call wiped the whole window:
+    ///
+    /// * `add_tokens` left exactly one entry (the last write), so a token budget
+    ///   never accumulated; and
+    /// * `check_tokens` evicted everything BEFORE summing, so the sum was always
+    ///   0 and the check admitted unconditionally — a READ path that also
+    ///   destroyed the window it was reading.
+    ///
+    /// The existing script test missed it because it passes a fake `now` of 2000,
+    /// where `now - window_ms` is negative and nothing is evicted.
+    #[tokio::test]
+    async fn the_token_window_accumulates_and_check_does_not_wipe_it() {
+        let pool = crate::redis::test_redis::isolated_pool().await;
+        let limiter = RedisRateLimiter::new(pool.clone());
+        let mut r = role("r-tok", None, "m");
+        r.limit_token = Some(100);
+        let roles = vec![r];
+        let c = ctx();
+
+        // 60 tokens, then 60 more: the window holds 120 > the 100 budget, so the
+        // third check must DENY.
+        limiter.add_tokens(&roles, &c, 60, Instant::now()).await;
+        limiter.add_tokens(&roles, &c, 60, Instant::now()).await;
+
+        // Read the window directly (the sum must be 120, not 60).
+        use fred::prelude::*;
+        let key = LimitKey {
+            role_id: "r-tok".into(),
+            bucket: bucket_for(&roles[0], &c),
+        };
+        let members: Vec<String> = pool
+            .zrange(tokens_key(&key), 0, -1, None, false, None, false)
+            .await
+            .expect("zrange");
+        assert_eq!(
+            members.len(),
+            2,
+            "both token writes must still be in the window: {members:?}"
+        );
+
+        // The check must DENY (120 > 100) and must still deny on a second call —
+        // a read path that evicted would flip to admit.
+        for attempt in 0..2 {
+            let verdict = limiter.check_tokens(&roles, &c, Instant::now()).await;
+            assert!(
+                matches!(verdict, CountVerdict::Denied { .. }),
+                "attempt {attempt}: 120 tokens exceed the 100 budget ⇒ deny"
+            );
+        }
+    }
+
+    /// Two NODES must not share a window member.
+    ///
+    /// Members live in a sorted set, so equal member strings COLLAPSE (`ZADD`
+    /// overwrites the score) and the window under-reports. The member used to be
+    /// `<now_ms>-<per-process counter>`, so two nodes' first write in the same
+    /// millisecond produced the SAME member: the fleet counted one request where
+    /// two arrived. Under-counting is the fail-open direction — a tenant could
+    /// fill a window with requests the limiter never saw.
+    ///
+    /// Exercised through the REAL `add_tokens` path (not hand-built members), with
+    /// two limiter instances standing in for two nodes.
+    #[tokio::test]
+    async fn two_instances_do_not_collapse_the_same_window_member() {
+        let pool = crate::redis::test_redis::isolated_pool().await;
+        let a = RedisRateLimiter::new(pool.clone());
+        let b = RedisRateLimiter::new(pool.clone());
+        assert_ne!(
+            a.instance, b.instance,
+            "two instances must not share a member namespace"
+        );
+
+        // Same role, same key, same `now` (the same millisecond) on both nodes.
+        let mut r = role("r-tok", Some(1000), "m");
+        r.limit_token = Some(1_000_000);
+        let roles = vec![r];
+        let c = ctx();
+        let now = Instant::now();
+        a.add_tokens(&roles, &c, 5, now).await;
+        b.add_tokens(&roles, &c, 5, now).await;
+
+        // The window must hold BOTH writes: 5 + 5.
+        let key = bucket_for(&roles[0], &c);
+        let parts: Vec<String> = {
+            use fred::prelude::*;
+            pool.zrange(
+                tokens_key(&LimitKey {
+                    role_id: "r-tok".into(),
+                    bucket: key,
+                }),
+                0,
+                -1,
+                None,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("zrange")
+        };
+        assert_eq!(
+            parts.len(),
+            2,
+            "both nodes' writes must be distinct members (one member = the same \
+             millisecond collapsed them, i.e. the window under-reported)"
+        );
     }
 
     /// The sliding-window semantics of the REAL Lua script, evaluated by a REAL
@@ -452,63 +644,74 @@ mod tests {
         assert_eq!(later, 1, "the window rolled over ⇒ admit again");
     }
 
-    /// Token accounting on the real script: the SCORE is the token count, not a
-    /// timestamp (a previous version stored the timestamp and summed counts).
+    /// Token accounting on the real scripts: the SCORE is the TIME and the member
+    /// carries the token count, so eviction and accumulation agree.
+    ///
+    /// This test used to pass a fake `now` of 1000/2000 and members WITHOUT the
+    /// token prefix — exactly the shape that hid the score/time confusion: with
+    /// `now = 1000`, `now - window_ms` is negative, so nothing was ever evicted
+    /// and the "sum the scores" check looked correct. It now uses a real
+    /// millisecond clock and the production member format.
     #[tokio::test]
     async fn token_accounting_on_real_redis() {
         use fred::prelude::*;
         let pool = crate::redis::test_redis::isolated_pool().await;
         let tk = "hydra:{rl:r1:b}:tokens".to_string();
-        for tokens in ["10", "20", "30"] {
-            let _: i64 = pool
+        let now = now_ms();
+
+        let mut expected = 0i64;
+        for tokens in [10u64, 20, 30] {
+            expected += tokens as i64;
+            let sum: i64 = pool
                 .eval(
                     ADD_TOKENS_SCRIPT,
                     vec![tk.clone()],
                     vec![
-                        "1000".to_string(),
+                        now.to_string(),
                         "60000".to_string(),
-                        format!("m-{tokens}"),
-                        tokens.to_string(),
+                        format!("{now}:{tokens}:m-{tokens}"),
                     ],
                 )
                 .await
                 .expect("EVAL");
+            assert_eq!(
+                sum, expected,
+                "the add returns the running total: the window must ACCUMULATE"
+            );
         }
-        // The verdict script sums the live SCORES (60 = 10+20+30 tokens, not 3
-        // requests) and compares against the limit: 1 = admit, 0 = deny.
-        let admit: i64 = pool
-            .eval(
-                CHECK_TOKENS_SCRIPT,
-                vec![tk.clone()],
-                vec!["2000".to_string(), "60000".to_string(), "100".to_string()],
-            )
-            .await
-            .expect("EVAL");
-        assert_eq!(admit, 1, "60 tokens is under a 100-token limit");
 
-        let deny: i64 = pool
-            .eval(
-                CHECK_TOKENS_SCRIPT,
-                vec![tk.clone()],
-                vec!["2000".to_string(), "60000".to_string(), "50".to_string()],
-            )
-            .await
-            .expect("EVAL");
-        assert_eq!(
-            deny, 0,
-            "60 tokens (three requests' worth, not three requests) exceeds a 50-token limit"
-        );
+        // 60 tokens: admits under 100, denies under 50 — and the second check
+        // must not have destroyed the window (a read path that evicted would flip
+        // the verdict).
+        for (limit, want) in [("100", 1i64), ("50", 0), ("100", 1)] {
+            let verdict: i64 = pool
+                .eval(
+                    CHECK_TOKENS_SCRIPT,
+                    vec![tk.clone()],
+                    vec![now.to_string(), "60000".to_string(), limit.to_string()],
+                )
+                .await
+                .expect("EVAL");
+            assert_eq!(
+                verdict, want,
+                "60 tokens against a {limit}-token limit ⇒ {want}"
+            );
+        }
 
-        // A request count would have been 3 here and passed BOTH limits — which
-        // is exactly the mis-accounting the score-based version fixes.
-        let count_like_deny: i64 = pool
+        // The window really is time-based: a check one window later evicts
+        // everything by SCORE and admits again.
+        let later: i64 = pool
             .eval(
                 CHECK_TOKENS_SCRIPT,
                 vec![tk.clone()],
-                vec!["2000".to_string(), "60000".to_string(), "4".to_string()],
+                vec![
+                    (now + 61_000).to_string(),
+                    "60000".to_string(),
+                    "50".to_string(),
+                ],
             )
             .await
             .expect("EVAL");
-        assert_eq!(count_like_deny, 0, "still denied at limit 4");
+        assert_eq!(later, 1, "the window rolled over ⇒ the budget resets");
     }
 }

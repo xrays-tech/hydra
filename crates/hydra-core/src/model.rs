@@ -234,6 +234,69 @@ pub struct Candidate {
     pub weight: i32,
 }
 
+/// Why a provider that WOULD have served a request was dropped from the
+/// candidate set (pipeline step 4). Attribution only: it never changes whether
+/// the request succeeds, it only names the loser.
+///
+/// Exists because "this provider stopped being chosen" used to be invisible: the
+/// only signal was a tenant-labelled `hydra_route_errors_total` on requests that
+/// FAILED, so a provider dropping out of rotation while other providers still
+/// served the tenant left no trace at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// One string per variant: the metric labels below are a contract an operator
+// writes alert rules against, so a serialized value must not be able to disagree
+// with `as_str()` (`tenant_api.rs` sets the same precedent).
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionReason {
+    /// The breaker is open (too many recent failures). An anomaly: the provider
+    /// is being routed around because it is failing.
+    BreakerDead,
+    /// No api-key rows: the provider cannot be called at all. An anomaly unless
+    /// it was never configured.
+    NoKey,
+    /// `weight < 0`: a configuration ERROR that `config::validate` warns about.
+    /// Counted as a fault, but DEFENSIVE: the schema forbids it
+    /// (`migrations/0001_init.sql` has `CHECK (weight >= 0)`) and every provider
+    /// in memory comes from those rows, so no running process produces this
+    /// reason — see `admin::metrics::record_candidate_skipped`.
+    InvalidWeight,
+    /// `weight == 0`: a SUPPORTED, deliberate action ("soft disable", documented
+    /// in `ops.md`): the configuration is kept, routing is stopped. Reported here
+    /// for completeness, but the proxy deliberately does NOT count it — see
+    /// `hydra_server::proxy::record_excluded_candidates`.
+    SoftDisabled,
+}
+
+impl ExclusionReason {
+    /// Stable label for metrics/logs, kept identical to the serialized form by
+    /// `#[serde(rename_all = "snake_case")]`. These strings are part of the
+    /// `hydra_candidate_skipped_total{reason=...}` contract.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExclusionReason::BreakerDead => "breaker_dead",
+            ExclusionReason::NoKey => "no_key",
+            ExclusionReason::InvalidWeight => "invalid_weight",
+            ExclusionReason::SoftDisabled => "soft_disabled",
+        }
+    }
+}
+
+/// A provider dropped in step 4, with the reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedCandidate {
+    pub provider_id: String,
+    pub reason: ExclusionReason,
+}
+
+/// The full result of [`crate::router::resolve_detailed`]: the candidates plus
+/// the providers that were filtered out on the way.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveOutcome {
+    pub candidates: Vec<Candidate>,
+    /// Deterministically ordered by `provider_id` (same rule as `candidates`).
+    pub excluded: Vec<ExcludedCandidate>,
+}
+
 /// Why routing failed. Maps to HTTP statuses by the proxy shell
 /// (design §7.3): `ModelNotAllowed`→403, `ModelNotFound`→404,
 /// `TenantForbidden`→403, `NoAvailableProvider`/`NoAvailableKey`→503.
