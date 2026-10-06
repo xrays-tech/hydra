@@ -1535,15 +1535,18 @@ the node that received them (there is no forward timeout).
 
 ### 13.4 Failover drill
 
+> `/healthz/leader` is the **only token-free route** (an LB must be able to route to the writer
+> without a secret). `/healthz` and `/readyz` were the `edge` role's token-free probes and are
+> **deleted with it** — measured 2026-10-05: both answer **404** on the admin port and on the data
+> port of every node. A probe uses `/api/v1/health` with the admin token.
+
 ```bash
 # who is the writer? exactly one node answers 200
 for p in 8081 8082 8083; do echo -n "$p: "; \
-  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
-    localhost:$p/healthz/leader; done
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:$p/healthz/leader; done
 docker compose -f docker-compose.cluster.yml kill hydra-a     # the one that answered 200
 for p in 8082 8083; do echo -n "$p: "; \
-  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
-    localhost:$p/healthz/leader; done                          # → 200 on exactly one, ~1–2 s
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:$p/healthz/leader; done   # 200 on one, ~1–2 s
 docker compose -f docker-compose.cluster.yml start hydra-a     # rejoins as a member
 ```
 

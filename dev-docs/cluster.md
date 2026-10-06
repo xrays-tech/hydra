@@ -250,7 +250,9 @@ spec:
 
 **一条规则**：每个 hydra 服务都用带 token 的管理探针
 （`curl -fsS -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://127.0.0.1:8081/api/v1/health`）。
-`/metrics` 走同一条门禁。由 `scripts/check_compose_health.cjs` 在 CI 里守住。
+`/metrics` 走同一条门禁。**探测路径只有这一条**：`/healthz` 与 `/readyz` 是旧 `edge` 角色提供的
+免 token 探针，**随角色一起删除**（实测 2026-10-05：在管理口与数据口都返回 404）。由
+`scripts/check_compose_health.cjs` 在 CI 里守住。
 
 ### 5.5 持久卷与数据目录
 
@@ -276,18 +278,18 @@ leader 需要多数派。`PREFLIGHT_DEADLINE` 是 **10 秒**。
 ### 6.1 步骤
 
 ```bash
-# 1. 看谁在写（三台各问一次；恰好一台 200）
+# 1. 看谁在写（三台各问一次；恰好一台 200）。
+#    `/healthz/leader` 是唯一免 token 的路由（LB 要能不带密钥就路由到 writer）；
+#    单节点节点上它答 404（"没有控制面"）。
 for p in 8081 8082 8083; do echo -n "$p: "; \
-  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
-    localhost:$p/healthz/leader; done
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:$p/healthz/leader; done
 
 # 2. 硬杀当前 leader（不优雅退出，演练的是最坏情况）
 docker compose -f docker-compose.cluster.yml kill hydra-a     # 换成上一步里 200 的那台
 
 # 3. 等新 leader（选举超时量级；实测 1.1–1.6 s）
 for p in 8082 8083; do echo -n "$p: "; \
-  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
-    localhost:$p/healthz/leader; done
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:$p/healthz/leader; done
 
 # 4. 数据面必须全程无感（这是验收 2 的口径，见下）；管理写打任意幸存节点都应成功，
 #    失去多数派时应立刻 503 config_not_published

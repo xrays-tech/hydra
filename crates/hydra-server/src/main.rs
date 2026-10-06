@@ -1312,8 +1312,10 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
 /// Our "listener bound" log line is printed *before* Pingora binds, so it is
 /// not evidence. When the bind really fails, Pingora retries once a second for
 /// 30 s and then panics **inside its service task**: the process stays alive and
-/// keeps answering `/healthz` `/readyz` on the admin port while the data plane
-/// has no listener at all (measured 2026-09-16; `dev-docs/dev-plan.md`
+/// keeps answering its health probes on the admin port while the data plane has
+/// no listener at all (measured 2026-09-16; the probe paths then were the
+/// token-free `/healthz` `/readyz` an `edge` served, both retired with the role —
+/// what answers today is `/api/v1/health` with the admin token; `dev-docs/dev-plan.md`
 /// 「监听拓扑与启动约定」). A connect attempt is the cheapest honest check.
 ///
 /// The plaintext listener is the one probed: both listeners live in the same

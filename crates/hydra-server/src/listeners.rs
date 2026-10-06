@@ -9,7 +9,9 @@
 //! flipped the transport protocol of the *only* data-plane port, silently, and
 //! only at the next restart. Every restart then made the plaintext entry
 //! (`80 → NodePort → pod :8080`) answer with RST while the process stayed
-//! healthy and `/healthz` `/readyz` stayed green.
+//! healthy and the health probes stayed green (in that deployment the probes were
+//! the token-free `/healthz` `/readyz` an `edge` used to serve — both routes are
+//! gone with the role; today's probe is `/api/v1/health` with the admin token).
 //! See `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`.
 //!
 //! ## KNOWN LIMITATION — same port, different bind addresses

@@ -199,9 +199,10 @@ impl AdminService {
 }
 
 pub struct AdminState {
-    /// Leader-mode SQLite pool. `None` on edge nodes (no local DB, cluster
-    /// P0b) — edge routes only serve `/metrics` `/healthz` `/readyz`, so no
-    /// CRUD handler ever touches a `None` pool.
+    /// The node's SQLite pool. `None` only when the store was built without a
+    /// local database — every cluster node HAS one now (ADR-0001 D-2 retired the
+    /// edge role that used to be the `None` case), so no CRUD handler should meet
+    /// a `None` pool on a served route.
     pub pool: Option<SqlitePool>,
     pub store: ConfigStore,
     pub auth: Arc<HttpAuthChecker>,
@@ -698,29 +699,31 @@ impl ServeHttp for AdminService {
         let path = session.req_header().uri.path().to_string();
         let query = session.req_header().uri.query().map(str::to_string);
 
-        // Edge data-plane node (cluster P0b): serve the health PROBES without a
-        // token (an LB must be able to probe without holding a secret) and
-        // everything else — including `/metrics` — through the ordinary gates.
-        // No admin UI, no CRUD.
-        //
-        // `/metrics` used to be token-free here, which made the metrics exposure
-        // depend on the ROLE: an edge published tenant/provider/model-labelled
-        // series to anyone who could reach the port, while the same series on a
-        // leader required the admin token — and the shipped cluster topology
-        // binds the edge admin port to `0.0.0.0` (`jiqun-deploy.md`), so that was
-        // the one deployment where it mattered. `/metrics` now takes the same
-        // path as everywhere else: admin token required (see ops.md §9).
+        // The edge role's token-free PROBE block used to sit here: an edge served
+        // `/healthz` and `/readyz` without a token so an LB could probe it without
+        // holding a secret. `edge` is retired (ADR-0001 D-2) and **both routes are
+        // gone with it** — measured 2026-10-05 on a live node: `/healthz` and
+        // `/readyz` answer **404** (401 without a token, because the admin gate runs
+        // first) on BOTH the admin and the data port, on every kind of node. A probe
+        // must use `/api/v1/health` with the admin token (`scripts/check_compose_health.cjs`
+        // enforces exactly that). `/metrics` was token-free here too and is not any
+        // more: the series carry tenant/provider/model labels, and publishing them to
+        // anyone who can reach the port made the exposure depend on the node's role.
 
-        // Leader-lease probe (cluster P2): 200 while this node holds the
-        // lease, 503 on standby, 404 on non-candidate nodes. Token-free so
-        // LBs / orchestrators can route to the active leader.
+        // Leader probe: 200 when this node is a raft writer, 503 when it has the gate
+        // and the gate says no, 404 when it has no control plane at all (single node).
+        // The ONLY token-free route, because an LB or orchestrator must be able to
+        // route to the writer without holding a secret.
         if path == "/healthz/leader" {
             return cluster_api::leader_health(&self.state, &trace_id);
         }
 
         // Internal control-plane endpoints (cluster P1): gated by the SHARED
-        // cluster token (`HYDRA_CLUSTER_TOKEN`), not the admin token — edges
-        // hold only the cluster token. Fail-closed when unset.
+        // cluster token (`HYDRA_CLUSTER_TOKEN`), not the admin token. Fail-closed
+        // when unset — and NOTE that no route lives under this prefix any more
+        // (both families retired: T4.1 and T3.5), so this gate currently matches
+        // nothing and answers 401 to the prefix. Kept because the token itself is
+        // still a startup requirement (ADR-0001 §7.1).
         if path.starts_with("/api/v1/internal/") {
             // Both sides must be PRESENT and equal. Comparing
             // `Option != Option` made an unset `HYDRA_CLUSTER_TOKEN` (None —

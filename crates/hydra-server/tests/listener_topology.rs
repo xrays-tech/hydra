@@ -5,7 +5,9 @@
 //! writing a tenant certificate (a pure data change) flipped the process's
 //! **only** listener from plaintext to TLS, so every restart made the plaintext
 //! entry (port 80 → NodePort 30090 → pod `:8080`) answer with RST — interfaces
-//! down, process healthy, `/healthz` `/readyz` green, metrics frozen.
+//! down, process healthy, the health probes green, metrics frozen. (Those probes
+//! were the token-free `/healthz` `/readyz` an `edge` served; both routes went with
+//! the role, and today's probe is `/api/v1/health` with the admin token.)
 //!
 //! These tests are deliberately **black box**: they spawn the real `hydra`
 //! binary and talk to it over real sockets. Nothing about the internal decision

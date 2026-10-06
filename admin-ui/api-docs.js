@@ -17,7 +17,7 @@ const API_HOST = "<host>:8081";
 const API_DOCS = [
   { tag: "System", endpoints: [
     { method: "GET", path: "/metrics", summary: "Prometheus metrics (admin-token gated)",
-      desc: "Self-hosted Prometheus text exposition on the admin port. Requires the admin bearer token on EVERY role (leader, all and edge): the series carry tenant/provider/model labels, and publishing them to anyone who can reach the port made the exposure depend on the node's role. Health probes (/healthz, /readyz) remain token-free so a load balancer can probe without a secret.",
+      desc: "Self-hosted Prometheus text exposition on the admin port. Requires the admin bearer token on EVERY node: the series carry tenant/provider/model labels, and publishing them to anyone who can reach the port made the exposure depend on how the node was configured. The ONLY token-free route is /healthz/leader (200 = this node is the raft writer, 503 = it is not, 404 = no control plane) so a load balancer can route to the writer without a secret; everything else, including /api/v1/health, needs the admin token.",
       auth: true,
       resp: ["200 text/plain — Prometheus metrics exposition (0.0.4)"],
       errors: [{ status: 401, code: "unauthorized", when: "missing or invalid admin token" },
