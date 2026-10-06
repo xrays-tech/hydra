@@ -538,8 +538,8 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 > * **Write the MASK form** (see below how to get it) — it is the form to use, because
 >   `matching_key` is stored and shipped **in plaintext**: `limit_role.matching_key` is a plain
 >   column (`db.rs:1288` insert / `db.rs:1311` select — no `kp.seal`, unlike provider api-keys at
->   `db.rs:568`), it travels in the cluster snapshot payload as a plain `LimitRole`
->   (`cluster/snapshot.rs:119`), and the edge re-inserts it verbatim (`db/restore.rs:242`). It is
+>   `db.rs:568`), it travels in the **config tree** as a plain `LimitRole`
+>   (ADR-0001 D-7 carries the fidelity rows verbatim), and every node re-inserts it as-is (`db/restore.rs:242`). It is
 >   also returned by `GET /api/v1/limit-roles` and rendered in the admin UI. **A raw key written
 >   there is a live credential sitting in plaintext in every node's database, every backup, and
 >   every admin API response.**
@@ -566,9 +566,9 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   at **startup**, on **every config load**, and — because the admin write path reloads — **immediately
 >   when you write the role** (`POST`/`PUT /api/v1/limit-roles` answers `201`/`200` and the warning is in
 >   the node log right after it; no explicit `POST /reload` needed). They are **not** in the HTTP
->   response body, and an **edge never re-validates** a snapshot it receives (`apply_snapshot` loads
->   without validation, by design: the leader owns config validation) — so scripts that create roles
->   should check the leader's log, not assume a clean `201` means a sound role.
+>   response body, and a **materializing node does not re-validate** the tree it receives (`apply_snapshot` loads
+>   without validation, by design: the WRITER validated it before publishing) — so scripts that create roles
+>   should check the log of the node that received the write, not assume a clean `201` means a sound role.
 > * **always set `matching_tenant` on a key-scoped role.** The window belongs to
 >   `(role_id, mask(key))` and nothing else, so a role with `matching_key` set and
 >   `matching_tenant` NULL is a **cross-tenant** budget: two tenants whose auth backends both accept
@@ -628,7 +628,7 @@ exists but did not answer; **the fleet was NOT told**).
 > | HTTP | `fleet.state` | when | what it means |
 > |---|---|---|---|
 > | `200` | `applied` | every live node confirmed | done |
-> | `200` | `single_node` | no `cluster-redis` feature (the local clear IS the whole answer — `main` refuses `leader\|edge` without it) | done |
+> | `200` | `single_node` | not a cluster node (its own local clear IS the whole answer) | done |
 > | `202` | `pending` | published, not confirmed everywhere — **including the deterministic empty-fleet case below** | **in flight, not a failure**; retry (idempotent) or check `lagging` |
 > | `503` | `unavailable` | no invalidation stream **or** publish failed, or the watermark read failed | the fleet was **not** told — retry / escalate |
 >
@@ -935,10 +935,9 @@ with intent.
 **Observability**: v1 adds **no new Prometheus metrics** for sub-tenant routing (per
 plan; catalog consistency is pinned by core tests, not a metric).
 
-**Availability**: admin CRUD is only available on nodes that serve the admin API
-(leader / standby). **Edge nodes 404 every admin path pre-auth** (they serve only
-`/metrics` `/healthz` `/readyz`), so sub-tenant CRUD from an edge is unavailable —
-the same boundary as every existing admin resource.
+**Availability**: admin CRUD is available on **every cluster node** — each one serves its own admin
+API and applies its own writes (ADR-0001 D-2/D-6), so point the admin UI or a script at any node. The
+old rule ("only leader/standby; an edge 404s every admin path") went with the `edge` role.
 
 ### 5.5a Tenant self-service write path (v2, A′ — **as of 2026-10-05: applied by the receiving node**)
 
@@ -1174,11 +1173,10 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
 
 ## 9. Observability (design §17, implemented W5)
 
-- **`/metrics`** (self-hosted, no sidecar): Prometheus exposition on the admin
-  port, **gated by the admin bearer token on every role** (leader, all and edge —
-  an edge used to serve it token-free, which made the exposure depend on the
-  node's ROLE while the shipped cluster topology binds the edge admin port to
-  `0.0.0.0`). The series carry `tenant`/`provider`/`model` labels, i.e. customer
+- **`/metrics`** (self-hosted, no sidecar): Prometheus exposition on the admin port, **gated by the
+  admin bearer token — one rule, every node**. It used to depend on the node's ROLE (an `edge` served
+  it token-free), so the exposure depended on how a node was configured rather than on one rule; the
+  role is retired (ADR-0001 D-2). The series carry `tenant`/`provider`/`model` labels, i.e. customer
   identifiers, so this is not public data.
   **Scrape configuration:** send `Authorization: Bearer <admin token>`
   (Prometheus: `authorization: {type: Bearer, credentials_file: ...}` with the
@@ -1462,31 +1460,40 @@ For the remaining v2 backlog see design §16.6.
 
 ## 13. Cluster mode operations (design §20 / dev-docs/cluster.md)
 
-Cluster mode is opt-in (set the member list) with **Redis as the only
-external dependency** (K8s/k3s-agnostic, self-sustaining). The authoritative
-reference is **[`cluster.md`](cluster.md)** — env table, shared-state
-map, Redis failure matrix, deploy manifests, failover drill and the live
-acceptance record (§5.1). This section is the runbook-level index.
+Cluster mode is opt-in (**set the member list**) and self-sustaining: the control plane is embedded
+(Arachne/raft, no process to deploy) and **Redis is the only external service** the cluster needs
+besides the usage store. Every node is identical — data plane, admin API, local SQLite and a raft
+membership. The authoritative reference is **[`cluster.md`](cluster.md)** (node model, env table,
+key space, deploy manifests, failover drill, member-change SOP, measured acceptance records); this
+section is the runbook-level index.
 
 ### 13.1 Build
 
 ```bash
-cargo build --release --features server,cluster-redis,usage-clickhouse
+cargo build --release --features server,cluster-redis,arachne,usage-clickhouse
 # single-node builds stay feature-free: cargo build --release --features server
 ```
 
-### 13.2 Minimal leader pair + edge (compose)
+**`arachne` is not optional for a cluster build.** Without it a node with `HYDRA_CLUSTER_PEERS` set
+**refuses to start** ("this build has no control plane"), so a binary built from a narrower recipe
+cannot join a cluster at all — measured 2026-10-05, and the reason `environment/build.sh` bundles all
+four features.
+
+### 13.2 Minimal cluster (compose)
 
 ```bash
 cd environment
-export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"         # required, >= 16 chars
-export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"       # required (control channel)
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"         # required, >= 16 chars — on EVERY node
+export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"       # required at startup (see §13.3)
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
-docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+docker compose -f docker-compose.cluster.yml up -d
 curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/tenants
 ```
 
-k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
+Three members (`hydra-a`/`b`/`c`), identical except for identity, ports and volume. There is **no
+edge service to scale**: membership is fixed and changing it is a raft membership change
+(`cluster.md` §6.3). k3s / k8s manifests — including the `podManagementPolicy: Parallel` a
+StatefulSet needs — and bare-metal systemd live in `dev-docs/cluster.md` §5.
 
 ### 13.3 Cluster environment variables (quick map)
 
@@ -1496,14 +1503,13 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 
 | `HYDRA_CLUSTER_PEERS` | **required in cluster mode**: the static member list, `id=host:port` per member, this node included. Its presence IS the cluster decision. The member ORDER is immutable: Arachne derives each member's numeric raft id from its position in the list |
 | `HYDRA_NODE_ID` | **required in cluster mode**: this node's identity, and it must appear in the member list. No `HOSTNAME`/random fallback on purpose — a duplicate id means two nodes share one raft identity |
-| `HYDRA_ARACHNE_LISTEN` | **required in cluster mode**: where this node's raft transport binds. Its port must equal the admin port (the interface may differ) so the address Arachne reports as the leader hint is directly usable |
+| `HYDRA_ARACHNE_LISTEN` | **required in cluster mode**: where this node's raft transport binds. It must equal **this node's own entry** in the member list, or the node refuses to start (`ListenMismatch`). Its port is unrelated to the admin port — the old "must equal the admin port" rule existed only so the leader hint was directly usable as an admin endpoint, and nothing uses it that way any more (the hint is display-only) |
 | `HYDRA_CLUSTER_ID` | optional: names the cluster so a node refuses to adopt an Arachne data directory that belongs to a different one. Defaults to a hash of the MEMBER LIST (ADR-0001: the list is the cluster identity; the order matters) |
 | `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
 | `HYDRA_ADMIN_TOKEN` | required in cluster mode: every node serves its own admin API, so it gates EACH node (not a relaying standby — that layer is retired) |
-| `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes)  **Minimum 16 characters AND it must be random** (`openssl rand -hex 32`) — the length is a floor, not a guarantee: the startup check cannot tell `aaaaaaaaaaaaaaaa` from a real token, and this is the token that authorises the internal control plane and the cross-tenant write endpoints. |
+| `HYDRA_CLUSTER_TOKEN` | **required at startup**, **minimum 16 characters, random** (`openssl rand -hex 32`) — the length is a floor, not a guarantee: the check cannot tell `aaaaaaaaaaaaaaaa` from a real token. ⚠ **It currently authorises nothing**: `/api/v1/internal/*` has no routes left (the snapshot channel and the internal tenant-write family are both retired), so this is a boot requirement with no consumer — kept deliberately, because deleting it changes the deployment contract and needs its own decision (ADR-0001 §7.1) |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
-| `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
 | `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` | bound on **establishing** the TCP/TLS connection to a provider (default **10**); `0`/garbage falls back to the default. **Must be strictly below `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`** — the node refuses to start otherwise, because the first-byte bound wraps the whole send (connect included) and would always fire first. What it buys (measured 2026-09-30 against a black-holed route, `integration/test_upstream_connect_bound.py`): without it a provider whose SYN goes nowhere burned the whole first-byte bound and was classified as a *post-send* failure, so the request returned `502 upstream_transport_error` **instead of failing over** to a healthy provider (`codes=[502,200,502,200,502,200]`, `retries=0`); with it the attempt fails in ≤10s as a connect error and the request **fails over** (`codes=[200×6]`, `retries=4`, and `hydra_upstream_first_byte_timeout_total` stays 0 for that provider). A healthy provider on a normal RTT establishes in milliseconds, so this bound only ever fires on a dead route. **What a dead route costs, measured 2026-09-30** (`integration/test_dead_route_cost.py`, shipped defaults 10s/30s, dead route = a dropped SYN): every affected request pays ~**10s** and is then served by a healthy peer (`10.0s, 0.0s, 10.0s, …` — one penalty per time the dead provider is chosen), the provider is taken out of the rotation after exactly **5** such failures (`hydra_candidate_skipped_total{reason="breaker_dead"}` starts at 1 per skipped request), and the penalties then **stop** (all later requests < 1s). Worst case for a two-provider SWRR rotation: ~5 × 10s of user-visible latency spread over the first ~9 requests. `DELETE /api/v1/breaker/{id}` clears the dead-set, so resetting **without fixing the route** buys those 10s penalties again — fix the route first |
 | `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected (it falls back to the default rather than meaning 'instant'). Covers the response HEADERS only — a connect that never completes is bounded by `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` above, and the response BODY by `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`. See the alert row in §9.1 |
 | `HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN` | per-PEER budget for FAILED credential attempts on the admin port — **shared by BOTH gates** (the `admin` token and the internal `cluster` token) (default 10; `0`/garbage falls back). Past it the peer gets `429 too_many_failed_attempts` + `Retry-After` for the rest of the minute; a VALID token is always accepted, so this cannot lock an operator out. Watch `hydra_admin_auth_failures_total{result=~".+_throttled"}` — the label is `<gate>_denied` \| `<gate>_throttled` (gate = `admin` \| `cluster`), so a rule written against the old bare `denied`/`throttled` values would never match |
@@ -1518,7 +1524,7 @@ These are **read by nothing** and are listed in the code's `RETIRED_CLUSTER_ENV`
 still sets one gets a startup ERROR naming it, so nobody believes it still does something. Remove
 them from the manifests:
 
-`HYDRA_ROLE`, `HYDRA_CONTROL_URL`, `HYDRA_PUBLIC_URL`, `HYDRA_CONTROL_POLL_MS`,
+`HYDRA_ROLE`, `HYDRA_EDGE`, `HYDRA_CONTROL_URL`, `HYDRA_PUBLIC_URL`, `HYDRA_CONTROL_POLL_MS`,
 `HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS`, `HYDRA_FAILOVER_GRACE_MS`,
 `HYDRA_FORWARD_TIMEOUT_SECS`.
 
@@ -1530,24 +1536,31 @@ the node that received them (there is no forward timeout).
 ### 13.4 Failover drill
 
 ```bash
-for p in 8081 8082; do curl -s -o /dev/null -w "port $p: %{http_code}\n" localhost:$p/healthz/leader; done
-docker compose -f docker-compose.cluster.yml stop hydra-control-a   # kill the active
-curl -s localhost:8082/healthz/leader    # → 200 after ≤ ~20s (measured 11–18s)
-docker compose -f docker-compose.cluster.yml start hydra-control-a  # rejoins as standby
+# who is the writer? exactly one node answers 200
+for p in 8081 8082 8083; do echo -n "$p: "; \
+  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
+    localhost:$p/healthz/leader; done
+docker compose -f docker-compose.cluster.yml kill hydra-a     # the one that answered 200
+for p in 8082 8083; do echo -n "$p: "; \
+  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
+    localhost:$p/healthz/leader; done                          # → 200 on exactly one, ~1–2 s
+docker compose -f docker-compose.cluster.yml start hydra-a     # rejoins as a member
 ```
 
-Edges and standbys follow the new active automatically (registry rotation +
-lease-aware rotation); a rejoining leader rebuilds its replica from the current
-active (no shared volume). Admin writes on a standby are forwarded to the
-actual lease holder (registry-resolved, with a forward-once loop guard) — you
-can point the admin UI at ANY leader candidate, including one whose
-`HYDRA_CONTROL_URL` points at itself. Full checklist: `dev-docs/cluster.md` §5.
+**Measured 2026-10-05** (three real processes, `kill -9`): leader elected in **1.08 s / 1.63 s**
+(two runs), never two nodes answering 200 during the handover, and the **data plane served
+1200/1200 requests at 20 rps for 60 s across the kill**
+(`integration/test_data_plane_failover_load.py`). Admin writes are accepted on **any** node now;
+with a minority alive they answer `503 config_not_published` in 0.0 s while the survivors keep
+serving their materialized config. Full checklist: `dev-docs/cluster.md` §6.
 
 ### 13.5 Redis outage behavior
 
-Data plane keeps serving (last-known-good snapshot + local caches). Election is
-**fail-closed**: a leader that cannot renew demotes immediately (writes stop)
-until Redis recovers. See `dev-docs/cluster.md` §3 for the full matrix.
+The data plane keeps serving (each node's materialized config + local caches), and the **control
+plane does not notice at all**: leadership comes from raft, not from a Redis lease. What a Redis
+outage costs is the four data-plane roles it still carries — shared rate limits go fail-open,
+breaker votes stop syncing, the auth L2 falls back to L1 alone, and invalidation propagation pauses
+(entries expire by TTL). See `dev-docs/cluster.md` §4.2 for the full matrix.
 
 **"Until Redis recovers" only held after 2026-09-30.** The pool was built with fred's
 `Pool::new(…, policy: None, …)`, i.e. **no reconnect policy at all** — and a policy is not
@@ -1615,7 +1628,8 @@ sends it) and the rolling upgrade in §3 step 1 is `kill -SIGQUIT <pid>`. Pingor
 handles `SIGQUIT` itself for socket handover and then exits through
 `process::exit(0)`, which runs **no destructors** — so the flush and the registry
 de-registration each need an explicit signal hook
-(`main.rs::spawn_sink_flush_on_shutdown` / `spawn_registry_unregister_on_shutdown`).
+(`main.rs::spawn_sink_flush_on_shutdown`). There is no registry to de-register from any more: that
+  second hook went with the registry (ADR-0001 T4.1).
 
 **Measured 2026-09-30, and the earlier wording here was an overclaim.** Removing the hook and
 re-running `integration/test_shutdown_drain.py` did NOT lose a buffered row: the periodic sink
@@ -1636,38 +1650,41 @@ in place (the next start replays the WAL), but it is why the restore step in §1
 insists on deleting those two files: replacing `hydra.db` under a leftover `-wal`
 makes the node refuse to boot (`database disk image is malformed`).
 
-### 13.6 Registry identity: `HYDRA_NODE_ID`, `HOSTNAME`, and why they matter
+### 13.6 Cluster identity: `HYDRA_NODE_ID`, `HYDRA_CLUSTER_ID`, and the member list
 
-Node identity is resolved as **`HYDRA_NODE_ID` → `HOSTNAME` → random**, and it is
-used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
-(the lease value is the bare node id). Three consequences, all operator-visible:
+There is no registry and no lease, so identity is no longer a row you can inspect — it is
+**configuration**, and three values must agree:
 
-1. **Pods need STABLE names.** The `HOSTNAME` fallback only helps under a
-   StatefulSet (or a Deployment with a pinned name). Under a plain Deployment
-   `HOSTNAME` changes on every restart, so each restart registers a new row and
-   the fallback buys nothing — set `HYDRA_NODE_ID` explicitly instead.
-2. **Two nodes must never share one `HOSTNAME`.** They would share a registry
-   row, and — worse — BOTH would satisfy the lease-renew check (`GET
-   hydra:lease == <our node_id>`), i.e. **two nodes would each believe they hold
-   the lease** (split brain). The shutdown `unregister()` of either process also
-   deletes the shared row, including the peer's registration.
-3. **~~Reaping is two-strike, deliberately.~~ RETIRED.** The registry reaper is
-   deleted (ADR-0001 T4.1) and so are the two series this item told you to watch;
-   there is no registry row, no heartbeat and no grace witness any more —
-   membership is the static member list. What a node still cannot answer is
-   "is that peer alive", and it does not pretend to (see §9.1's raft rows and the
-   Admin UI's `unknown` state). **The paragraph below is kept as the record of how
-   the reaper worked while it existed.** A registry row is
-   deleted only when its 30s heartbeat AND its grace witness
-   (`hydra:{node:seen}:<id>`, TTL = `HYDRA_REGISTRY_STALE_GRACE_SECS`, default
-   120) are both absent **on two consecutive sweeps** (the reaper ticks every
-   60s). The first observation only records a strike. That extra tick exists
-   because a node running a binary that predates the witness key writes its row
-   exactly ONCE, at boot: deleting such a row while the process is alive would
-   make it invisible to the fleet forever — and if it held the lease, every
-   standby admin write would answer 503 permanently (forwarding is fail-closed
-   with no static fallback). Any sign of life (a heartbeat, or a refreshed
-   witness) clears the strike. The current lease holder is never reaped at all.
+1. **`HYDRA_NODE_ID` must appear in `HYDRA_CLUSTER_PEERS`**, and its POSITION in the list is its
+   numeric raft id. Two nodes configured with the same id are a startup error (`SelfNotAMember`),
+   not a silent split brain — the one class of bug the old topology could not rule out and this one
+   can.
+2. **Pods need STABLE names.** The `HYDRA_NODE_ID` → `HOSTNAME` → random fallback survives for
+   single-node use, but **do not rely on it in a cluster**: a plain Deployment changes `HOSTNAME` on
+   every restart, which moves a member away from the id its member list declares. Set
+   `HYDRA_NODE_ID` explicitly (a StatefulSet's pinned name, or `$(POD_NAME)`).
+3. **`HYDRA_CLUSTER_ID` is the cluster's identity, and its DEFAULT IS DERIVED FROM THE MEMBER LIST.**
+   Arachne refuses to open a data directory whose recorded cluster id differs, which is what stops a
+   node from silently joining the wrong raft group after a volume is reused or mis-mounted. Because
+   the default is a hash of the list, **editing the list changes the identity**, and every existing
+   data directory is then rejected at startup:
+
+   ```
+   META cluster_id mismatch: expected "hydra-0718fec1d91bd94b", got "hydra-47b808fb0733c41f"
+   ```
+
+   (measured 2026-10-05: a 3-member list changed to 4 members on a directory that had already been
+   adopted). **If you ever intend to change membership — adding, removing or reordering a member —
+   set `HYDRA_CLUSTER_ID` to a stable, human-chosen name from the very first deployment.** Doing it
+   later means working out what the old default hash was and writing it explicitly, or the whole
+   cluster refuses to start. The change procedure itself is in `dev-docs/cluster.md` §6.3.
+
+**What a node can no longer answer: "is that peer alive?"** There is no heartbeat table and no
+per-node RPC, so `/api/v1/cluster/status` reports `alive: null` for peers and the Admin UI renders
+that as **unknown** — not as "down", which is a claim nobody measured. Membership is still exact (it
+is the configured list); only liveness is unknowable. The retired registry, its reaper and its two
+series (`hydra_registry_nodes`, `hydra_registry_reaped_total`) are gone — see §9.1's RETIRED rows —
+and `HYDRA_REGISTRY_STALE_GRACE_SECS` is in §13.3b's retired list.
 
 ### 13.7 Known limitations (as of this revision)
 
@@ -1678,12 +1695,13 @@ used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
   is byte-faithful. See `dev-docs/cluster.md` and the snapshot wire v2 notes.
 - `[auth] fail_mode` (`FailMode::Open`, design §11.4) is **implemented but not selectable**: no env var and no config file reaches `AuthConfig.fail_mode`, so the "availability-first" mode cannot be turned on (see §5.x). The default `Closed` is what ships.
 - Breaker `threshold` (5) and `probe_interval` (10s) are **not configurable at all**: no env var and no config file exists (measured 2026-09-30: `grep -rn BREAKER_THRESHOLD crates/` and `grep -rn PROBE_INTERVAL crates/` are both empty, and the tree has no config-file loader) — `design.md`'s `[breaker]` sketch and `ops.md` §6.3's earlier "tune `threshold`" advice are therefore about knobs that do not exist. §6.3 now says so; the lever that works is `DELETE /api/v1/breaker/{id}`.
-- `HYDRA_FAILOVER_GRACE_MS` is documented but not wired. `HYDRA_BREAKER_QUORUM` uses
-  an in-code default (`1`) **and is read** (`main.rs`). `HYDRA_RATE_LIMIT_FAIL_MODE`
-  **does not exist at all** (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty): the
-  Redis rate-limit path is *hard-coded* fail-open and **not configurable** — see
-  `crates/hydra-server/src/redis/rate_limit.rs` (`failing open`) and its note
-  "there is NO env override".
+- `HYDRA_FAILOVER_GRACE_MS` was **never wired** and is now in the RETIRED list (§13.3b): raft
+  elections decide the handover, so there is nothing for a grace window to do. `HYDRA_BREAKER_QUORUM`
+  uses an in-code default (`1`) **and is read** (`main.rs`). `HYDRA_RATE_LIMIT_FAIL_MODE`
+  **does not exist at all** (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty): the Redis
+  rate-limit path is *hard-coded* fail-open and **not configurable** — see
+  `crates/hydra-server/src/redis/rate_limit.rs` (`failing open`) and its note "there is NO env
+  override".
 - Redis sentinel/cluster deployment modes fail fast (single mode wired), and so does **any other
   value** of `HYDRA_REDIS_MODE` — including a typo: `clustr` used to fall through to `single` (measured
   2026-10-01 on the wire: the node started and registered), which is the opposite of this section's
@@ -1692,17 +1710,18 @@ used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
   the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the
   value is not validated at all (measured 2026-10-01: the node serves, and the only line that can
   mention the variable is the "cluster wiring is configured but …" ERROR, which never quotes the
-  value). Pinned by `integration/test_startup_knobs.py` K1/K2 and K12.
-- **A replica that cannot materialize is retried forever, at a decreasing rate**
-  (1 s, 2 s, 4 s … capped at 60 s; a newer config snapshot resets it). It used to
-  give up after three attempts *per snapshot* — and since the control client never
-  re-delivers a version its memory watermark has passed, the node stayed unable to
-  lead until a newer config write (which needs a working leader) or a restart.
-  Watch `hydra_replica_materialize_retries_total{outcome="failed"}` (wired
-  2026-10-05 — until then the counter was registered with no recorder and this
-  instruction pointed at a series that never moved): a sustained
-  non-zero rate means a node cannot materialize its replica and therefore cannot
-  take the lease — alert on it.
+  value). Pinned by `integration/test_startup_knobs.py` K1/K2 and K12 — and the "on a cluster node"
+  half of that pair now runs against a REAL three-member cluster, because a lone member of a
+  three-member list cannot boot at all (a fresh data directory must be adopted by a majority within
+  10 s; see `cluster.md` §5.6).
+- **A node that cannot materialize is retried forever, at a decreasing rate**
+  (1 s, 2 s, 4 s … capped at 60 s; a newer tree resets it). It used to give up after three attempts
+  *per snapshot* — and since the polling client never re-delivered a version its memory watermark had
+  passed, the node stayed unable to lead until a newer config write (which needs a working writer) or
+  a restart. Watch `hydra_replica_materialize_retries_total{outcome="failed"}` (wired 2026-10-05 —
+  until then the counter was registered with no recorder and this instruction pointed at a series
+  that never moved): a sustained non-zero rate means a node cannot materialize the config tree and is
+  therefore **not eligible to be the writer** — alert on it.
 - The invalidation stream is trimmed by `MAXLEN` (10 000) every 30 s, and the
   generation is bumped — every node clears its whole auth cache (L1+L2) — **only
   when a dropped entry had not been applied by every live node**. Watch

@@ -1,369 +1,402 @@
 # Hydra 集群模式（Cluster Mode）
 
-> 集群模式是 **opt-in**：不设置任何集群环境变量时，Hydra 以单节点模式运行，
-> 行为与之前完全一致（零外部依赖）。设置 `HYDRA_ROLE=leader|edge` 即进入集群：
-> **Redis 是唯一必选外置依赖**（限流/熔断/认证缓存 L2/失效总线/租约/注册表共用
-> 同一个 Redis），K8s/k3s 完全无关——Hydra 不调用任何编排 API，compose、k3s、
-> k8s、裸机同一镜像同一行为。
+> **集群是 opt-in，而且只有一个开关**：设了 `HYDRA_CLUSTER_PEERS`（静态成员表）就是集群成员，
+> 没设就是单节点——行为与之前完全一致、零外部依赖。**成员表就是决策本身**：没有可拼错的角色变量，
+> 也就没有"拼错后静默回落到单节点"这条路径（ADR-0001 退役了 `HYDRA_ROLE`）。
+>
+> **集群里每个节点完全一样**：都跑数据面、都跑管理面、都是 raft 成员、都能当 leader。不存在
+> `edge` 角色，也不存在"无状态数据面"（那是 D-2 撤回的产品承诺）。
+>
+> **控制面权威是 Arachne（raft 线性化 KV）**；**Redis 只承载数据面的近似状态**（限流 / 熔断 /
+> 认证缓存 L2 / 失效总线，D-1 明确"不搬"）。因此 Arachne 失去多数派时数据面继续服务，而 Redis
+> 断连时控制面完全不受影响。
+>
+> 权威文档：[`ADR-0001`](aegis/adr/ADR-0001-arachne-control-plane.md)（决策与论证）、
+> [`计划`](aegis/plans/2026-10-05-arachne-control-plane.md)（实现与实测记录）、
+> [`ops.md`](ops.md) §13（运维动作）。本文是集群的**行为与契约**说明。
 
 ---
 
-## 1. 角色模型
+## 1. 节点模型
 
-| 角色（`HYDRA_ROLE`） | 职责 | 本地 SQLite | 管理 API | 说明 |
-|---|---|---|---|---|
-| 未设置 / `all` | 单节点（默认） | ✅ | ✅ 全部 | 现状零变化 |
-| `leader` | leader 候选（租约竞争） | ✅（副本随快照重建） | ✅ 读本地 + **变更转发给 active**（P3） | 持有租约者 = active（唯一写者） |
-| `edge` | 无状态数据面 | ❌ | ❌（**无 token 时 `/metrics` 也是 401**；仅 `/healthz` `/readyz` 免鉴权） | 配置随快照分发，可任意扩缩。`/metrics` 走的是与别处**同一条** token 门禁（早期它在这里免鉴权，于是「指标暴露面取决于角色」——而官方拓扑把 edge 的管理口绑在 `0.0.0.0`，那正是唯一要紧的部署）。官方 compose 的 `hydra-edge` 只注入 `HYDRA_CLUSTER_TOKEN`，**没有** `HYDRA_ADMIN_TOKEN`，所以按现状抓取必然 401；要让抓取器拿到指标，必须先做一次取舍（给 edge 注入 admin token / 把 edge 管理口绑到私有地址后另行免鉴权 / 新增仅抓取用的 token），见 `ops.md` §9 |
+| 状态 | 判定 | 数据面 | 管理面 | 本地 SQLite | raft |
+|---|---|---|---|---|---|
+| 单节点（默认） | 没设 `HYDRA_CLUSTER_PEERS` | ✅ | ✅ 全部 | ✅ 权威 | ❌ 完全不启动 |
+| 集群成员 | 设了 `HYDRA_CLUSTER_PEERS` | ✅ | ✅ 全部 | ✅ **可重建的物化状态**（权威是 `head`） | ✅ 成员表里的一个节点 |
 
-**自维持**（集群在任何编排环境下自我管理）：
-1. **自举**：节点只需 `HYDRA_REDIS_URL` + `HYDRA_CLUSTER_TOKEN` → 注册表发现 leader → 拉全量快照（含证书）→ 开始服务；
-2. **自动选举**：leader 候选经 Redis 租约竞争，恰一个 active；
-3. **自动故障切换**：active 死亡 → 租约过期 → 合格候选提升（实测 ≤ 租约 15s + 选举 tick 5s，约 11–18s），edge 数据面与控制面均无感（edge 轮询失败自动经注册表旋转到新 active；standby 也按**租约持有者**轮换 —— 即使它的静态 `HYDRA_CONTROL_URL` 指向自己，见 §5.1）；**管理变更同样按租约持有者转发**：standby 的管理写入目标在转发时从注册表实时解析（绝不使用静态 `HYDRA_CONTROL_URL`，它可能指向节点自身），且每个转发请求带 once 标记，任何自转发/互转循环都会立即 fail-closed 503 而不是超时递归（见 §5.2）；
+**成员表就是集群的身份**，三点必须一起理解：
 
-   > **⚠ 下面这段复核记录的是 ADR-0001 之前的 leader/edge 拓扑（2026-09-29 实测）**：`HYDRA_ROLE`、
-   > `HYDRA_CONTROL_URL`、Redis 租约与注册表**全部退役**，其中点名的 `hydra_control_snapshot_version`
-   > 与 `hydra_control_poll_total{result="ok"}` **已不再注册**（前者的记录器随轮询客户端删除，后者
-   > 的 `result="ok"` 从来没有被写过）。今天的对应信号是 `hydra_arachne_this_node_leader`（谁在写）、
-   > `hydra_arachne_publish_total{result}`（发布是否成功）与 `hydra_arachne_leader_flips_total`（切主频率），
-   > 见 `ops.md` §9.1。**这段数字仍然是当时那份测量的忠实记录**，不是现在的行为描述。
+1. **顺序 = raft id**：每个成员的数字 id 是它在表里的**位置**（1-based）。**改顺序 = 换一个集群**，
+   不是"重排一下"。
+2. **至少 3 台**：`MINIMUM_MEMBERS = 3`，少于 3 个条目**在解析成员表时就拒绝启动**
+   （`TooFewMembers`）——两台互相都容不了故障，比一台更不可用。
+3. **每个成员必须能在表里找到自己**：`HYDRA_NODE_ID` 必须出现在表中，且
+   `HYDRA_ARACHNE_LISTEN` 必须与**自己那一项**的地址一致（`SelfNotAMember` /
+   `ListenMismatch`），否则拒绝启动——"peers 会拨一个地址而本节点绑另一个"是必须当场说出来的错。
 
-   **复核（2026-09-29，两节点 + edge 实测）**：
-   - **提升耗时 17.7 s / 18.2 s**（两次独立运行，硬杀 `SIGKILL` 口径）——正好落在上面那个 11–18s 带的上沿；粒度为 `HYDRA_LEADER_LEASE_MS` 15s + 选举 tick。
-   - **edge 数据面确实"无感"**：整个故障切换期间以 20 rps 持续压 edge 的数据面（`Host:` 指向真实租户）⇒ **355/355 全是 200，0 次连接被拒、0 个非 200**；旧 active 死亡后新 active 就位、`standby` 被提升，edge 侧没有任何一次失败。
-   - **edge 控制面会自己旋转到新 active**（即使它的静态 `HYDRA_CONTROL_URL` 指向已被杀死的节点）：在新 active 上改一次配置后，edge 自己的 `hydra_control_snapshot_version` 从 **6 → 7** 前进，`hydra_control_poll_total{result="ok"}` 从 **2 → 17** —— 即"按租约持有者从注册表实时解析"这条链路是活的。
-   - **实测夹具的坑（值得写下来）**：跑这套 drill 必须**显式清空自己用的 Redis DB**。共享的测试 Redis 不是私有的：上一次运行（或别的进程）留下的租约/注册表条目会让新的 leader 候选"忠实地"把控制轮询目标旋转到那个**已经不存在的节点**上并 fail-closed —— 我第一次运行就是这样得到一支从未被正确初始化的集群（所有请求 404、主节点从未当选），却看起来像产品缺陷。两个 drill 现在都先用 RESP 显式 `SELECT`+`FLUSHDB`（本机没有 `redis-cli`）。
-4. **自动加入/退出**：edge 无状态任意增删；leader 候选可加可减；
-5. **自愈**：租约时间栅栏杜绝双写、快照版本冲突由胜方覆盖、熔断投票 TTL 自清理、失效事件流跨故障切换不丢（幂等重放）。
+**为什么没有 edge**：一个不持有配置数据库的节点无法物化配置树，而"所有节点配置相同"正是集群行为
+可预测的前提。代价如实记账：**每台都需要持久卷**（raft WAL + SQLite），**扩容 = raft 成员变更**
+（见 §6.3），不再是把副本数 +1。
 
 ---
 
 ## 2. 环境变量
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-> **`HYDRA_ROLE` 已退役（ADR-0001）**：集群判定改为「有没有配 `HYDRA_CLUSTER_PEERS`」，成员表就是决策本身，不再有可拼错的角色变量与静默回落。代码里已无读取点，设了不生效，因此本表已删除该行（`scripts/check_documented_env.cjs` 把配置表当承诺：要么接线，要么移出表）。取代它的名字见下方新行；本节其余内容仍描述 Redis 租约世界，随 ADR-0001 同步的排期在计划的 T4.3。
-| `HYDRA_REDIS_URL` | — | **集群必填**（fail-closed）；如 `redis://redis:6379` |
-| `HYDRA_REDIS_MODE` | `single` | `single`（默认，大小写不敏感）/ `sentinel` / `cluster`（后两者接线中，**fail-fast**）；**其它任何值也 fail-fast**（拼错不得静默降级为 `single`）。**限定**：该开关**只在集群角色分支里被读取**（`if role.is_cluster()`，`main.rs`）⇒ `HYDRA_ROLE` 未设/`all` 时**根本不校验**，此时最多只会被那条 "cluster wiring is configured but …" 的 ERROR 提到**变量名**、**不会**出现拼错的值（第一百九十四轮实测，由 drill 的 K12 钉住） |
-| `HYDRA_CLUSTER_TOKEN` | — | **集群必填**：控制通道共享 token（leader 服务、edge/standby 调用） |
-| `HYDRA_CONTROL_URL` | — | leader/edge 必填：**控制面快照轮询**端点（active leader 的管理端点，如 `http://hydra-control:8081`）。注意它不是管理变更的转发目标 —— 转发目标在转发时按**租约持有者**从注册表实时解析（见 §5.2），因此候选节点把该变量指向自己也是安全的 |
-| `HYDRA_PUBLIC_URL` | — | 本节点注册到注册表的可达管理端点（如 `http://hydra-control-a:8081`）；leader 建议必填 |
-| `HYDRA_CONTROL_POLL_MS` | `1000` | 控制快照轮询间隔（standby 副本同步可收紧至 200） |
-| `HYDRA_LEADER_LEASE_MS` | `15000` | 租约时长（续约每 lease/3） |
-| `HYDRA_FAILOVER_GRACE_MS` | `5000` | **预留，尚未接线**（见 §5.1 实测：故障切换 ≈ 租约过期 + 轮换 + 选举 tick） |
-| `HYDRA_NODE_ID` | 自动生成 | 节点标识（租约持有者/熔断投票者/注册表条目）；回退顺序 `HYDRA_NODE_ID` → `HOSTNAME` → 随机，回退前提见 §3.1 |
-| `HYDRA_REGISTRY_STALE_GRACE_SECS` | 120 | 回收见证键的 TTL（= 宽限窗口）；`<= 0` 视为未设。过小会缩短"仅一时静默"的节点的保护窗口 |
-| `HYDRA_USAGE_SINK` | `sqlite` | **集群必须 `clickhouse`**（fail-closed） |
-| `HYDRA_CLICKHOUSE_URL` | — | sink=clickhouse 时必填 |
-| `HYDRA_ADMIN_TOKEN` | — | **leader 必须**：全集群共享（standby 转发管理变更时沿用） |
-| `HYDRA_ENCRYPTION_KEY` | — | **全集群一致**（provider key 与证书私钥共用同一主密钥） |
+运维侧的完整表与默认值以 [`ops.md`](ops.md) §1.1 / §13.3 为权威；这里是集群**特有**的部分。
 
-> **集群启动 fail-closed 检查**：leader/edge 缺 `HYDRA_REDIS_URL`、`HYDRA_CLUSTER_TOKEN`、
-> `HYDRA_CONTROL_URL`，或 `HYDRA_USAGE_SINK≠clickhouse`，或 leader 缺
-> `HYDRA_ADMIN_TOKEN` / `cluster-redis` feature → 拒绝启动。
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `HYDRA_CLUSTER_PEERS` | **是** | 静态成员表，`name=host:port` 逗号分隔。**每个成员的值必须完全相同**（含顺序）。≥3 项 |
+| `HYDRA_NODE_ID` | **是** | 本节点在表里的名字。**集群下不要依赖 `HOSTNAME` 回退**：普通 Deployment 每次重启换 Pod 名，身份跟着漂 |
+| `HYDRA_ARACHNE_LISTEN` | **是** | 本节点 raft 传输绑定的地址，**必须等于表里自己那一项** |
+| `HYDRA_ARACHNE_DATA_DIR` | 否 | raft 数据目录。默认 = SQLite 路径所在目录下的 `arachne/`（`sqlite:/app/data/hydra.db` ⇒ `/app/data/arachne`） |
+| `HYDRA_CLUSTER_ID` | **建议显式** | 集群身份。默认 = **成员表内容的哈希** ⇒ **改成员表就会改身份**，而每个节点的数据目录记录着旧身份，于是全部拒绝启动。**要在将来做成员变更，就从第一天起显式设一个人类可读的名字**（见 §6.3，含实测报错） |
+| `HYDRA_REDIS_URL` | **是** | 数据面骨干（fail-closed，集群模式缺它就拒绝启动） |
+| `HYDRA_REDIS_MODE` | 否（默认 `single`） | 只接受 `single`；其它任何值**快速失败**。**限定**：这个开关**只在集群模式下被读取**，单节点默认下既不校验也不提及（由 `integration/test_startup_knobs.py` 的 K12 钉住） |
+| `HYDRA_CLUSTER_TOKEN` | **是** | 启动**要求**它存在且够长。⚠ **今天它守不住任何东西**：`/api/v1/internal/*` 前缀已经一条路由都不剩（快照通道与转发的管理写都退役了）。保留而不静默删除，是因为删它是**部署契约变化**，需要单独的裁定（ADR-0001 §7.1） |
+| `HYDRA_USAGE_SINK` | **是** | 集群下必须 `clickhouse`：每节点各自的 SQLite 用量记录在集群里没有意义 |
+| `HYDRA_ADMIN_TOKEN` | **是** | 每个节点都要，因为**每个节点都提供管理 API** |
+| `HYDRA_ENCRYPTION_KEY` | **是** | **全集群必须一致**（provider key 与证书私钥共用同一主密钥） |
+
+### 2.1 已退役的变量（设了会在启动时被点名）
+
+`cluster/mod.rs` 的 `RETIRED_CLUSTER_ENV` 是这张表的**唯一所有者**，启动时若有任何一个被设置，
+会打一条 ERROR **逐个点名**它们（"these variables were retired … and are IGNORED"）：
+
+| 退役的名字 | 被谁取代 |
+|---|---|
+| `HYDRA_ROLE` / `HYDRA_EDGE` | **成员表**（有没有配 `HYDRA_CLUSTER_PEERS`） |
+| `HYDRA_CONTROL_URL` | 无需替代：节点之间不再互相轮询；配置从 Arachne 物化 |
+| `HYDRA_PUBLIC_URL` | 无需替代：`leader_hint` 提供 leader 的 **raft 地址**，而它只用于显示 |
+| `HYDRA_LEADER_LEASE_MS` | **raft 选举**（LAN profile，选举超时量级） |
+| `HYDRA_CONTROL_POLL_MS` | 每个节点自己的物化循环（1 s 一跳，版本闸门挡住空转） |
+| `HYDRA_REGISTRY_STALE_GRACE_SECS` | 无需替代：没有注册表行可回收 |
+| `HYDRA_FAILOVER_GRACE_MS`（从未接线） | 无需替代（切换由选举决定） |
+| `HYDRA_FORWARD_TIMEOUT_SECS` | 无需替代：Hydra 侧零转发 |
+
+**集群启动 fail-closed 检查**：缺 `HYDRA_REDIS_URL` / `HYDRA_CLUSTER_TOKEN` / `HYDRA_ADMIN_TOKEN`、
+`HYDRA_USAGE_SINK≠clickhouse`、成员表 <3 项或自身不在表里、二进制没编 `arachne` feature ⇒ **拒绝启动**。
+（单节点模式只受 `HYDRA_ADMIN_TOKEN` 与用量 sink 的约束。）
 
 ---
 
-## 3. 共享状态（一个 Redis，七个用途）
+## 3. 控制面：Arachne
 
-> **控制面权威 = Arachne；Redis 只承载数据面的近似状态**（ADR-0001，2026-10-05）。
-> 本节以下的表格与行为描述里，**leader 租约 / 节点注册表 / 配置快照 HTTP 推送**这三项已由 raft 领导权
-> 与 Arachne 键路径配置树取代，属于**已退役**的机制；Redis 剩下的四项（共享限流 / 熔断投票 / 认证缓存 L2 /
-> 失效总线）仍然是它的职责，D-1 明确「不搬」。
->
-> | 子系统 | 现在由谁承载 |
-> |---|---|
-> | leader 身份 | **raft 领导权**（`ArachneControl` 的写探测回答「本节点能否提交」） |
-> | 配置权威 | **Arachne `ctl/head` 内容哈希**（每节点各自物化，见 `dev-docs/aegis/plans/2026-10-05-arachne-control-plane.md`） |
-> | 共享限流 / 熔断 / 认证 L2 / 失效总线 | **Redis**（不变） |
->
-> 本节其余内容作为**历史与数据面细节**保留；控制面部分在 T4.3 基线同步时逐条改写。
+### 3.1 键空间（权威定义在 `crates/hydra-server/src/cluster/arachne_keys.rs`）
 
+| 键 | 内容 |
+|---|---|
+| `hydra/ctl/head` | **当前配置树的内容哈希** —— **提交点**，最后写 |
+| `hydra/cfg/toc/<toc-hash>` | 该树的目录（每个实体的路径 + 内容哈希 + 长度） |
+| `hydra/cfg/e/<path>/<content-hash>` | **每实体一键，键自带内容哈希** |
+| `hydra/ctl/cluster_id` | 本节点数据目录记录下来的集群身份（"认领"机制，见 §5.6） |
+| `hydra/ctl/format` | 键空间格式版本（`TOC_FORMAT = 3`） |
+
+实体键**内容寻址**是刻意的：同一个实体的两个版本各有各的键，于是"并发发布互相撕裂"在键层面就
+不可能发生，而"这个实体是否已经存过"由**键自身**回答（对自己副本查一次，不需要基线、不需要跨节点
+协商）。**读取一律 `get_stale`**：线性读 `get` 在 follower 上会立刻返回 `QuorumUnavailable`，
+所以"顺序严格"不是靠线性读保证的，而是靠**单写者 + 内容哈希 + 逐实体校验**。
+
+### 3.2 写入与提交点
+
+管理写打在**任意节点**都成立，序列是：
+
+1. 入口节点在**本地 SQLite 事务**里提交（`BEGIN IMMEDIATE`，事务内重读活行 + 当前配置，校验归属/配额/前缀）；
+2. 本地重建 `ConfigData` → 编码成分片 → 写实体（键已存在则跳过）→ 写 toc；
+3. **最后写 `hydra/ctl/head`** —— 这一步才是提交点，也是**唯一**被库转发给 raft leader 的操作。
+
+因此：**head 不前进 ⇒ 集群里没有任何节点会看到半份配置**。第 3 步失败时，本地事务**已经提交**，
+所以错误是 `StoreError::NotPublished`（"已提交到本节点库、**未发布**到集群"），管理 API 答
+**503 `config_not_published`**，而节点继续用自己那份新配置服务——文案不是"写失败"，因为回滚没有发生。
+
+### 3.3 每个节点自己物化
+
+每个节点一个循环（1 s 一跳）：读 `head` → 与本地已物化的哈希比较（**版本闸门**，没变就空转）→
+变了才读 toc 与实体 → 解码 → 写回**本地** SQLite → 换入内存 `ConfigData`。失败按 1s→2s→4s…（上限
+60s）**无限次**退避重试，新树立刻重置退避（`hydra_replica_materialize_retries_total{outcome}` 观测；
+历史上曾是"3 次后永久放弃"，那会让一个节点在**没有任何回头路**的情况下停在旧配置上）。
+
+**配置权威是 `head`，本地 SQLite 是可重建的物化状态。** 不一致时以 Arachne 为准——否则"本机改了
+数据库就算数"会变成第二个真相。
+
+### 3.4 领导权（写探测）与 `leader_hint`（只用于显示）
+
+- **"本节点能否写"由写探测回答**：`without_redirect().put(探测键, 本节点id)` 成功即 `leader_ready`。
+  不能用 `leader_hint` 自判——**刚当选的 leader 自己的 hint 在很长一个窗口内不指向自己**（实测），
+  用它自判会让新 leader 拒绝写。
+- **`leader_hint` 只用于显示**：舰队视图与 admin UI 的"谁是 leader"横幅由它填充（控制面每 250 ms
+  缓存一次）。它**不参与任何写路径**，也不构成任何重定向契约（响应头与 409 契约随 D-3 一起不存在）。
+
+### 3.5 失去多数派会怎样
+
+| 面 | 行为 |
+|---|---|
+| 管理写 | **立刻** 503 `config_not_published`（不挂起、不静默接受；实测 0.0 s 返回） |
+| `/healthz/leader` | 503（本节点无法提交 ⇒ 不许自称 leader） |
+| 数据面 | **继续用已物化的配置服务**（真请求闸门→路由→上游实测 200） |
+| 配置更新 | 停滞（没人能提交），恢复多数派后自动跟上 |
+
+---
+
+## 4. 数据面：一个 Redis，四个用途
+
+控制面搬走之后，Redis 的职责只剩下面四项（D-1"不搬"）：
 
 | 子系统 | Key | 说明 |
 |---|---|---|
-| leader 租约 | `hydra:{lease:leader}` | `SET NX PX` + Lua 原子续约（只续自己的） |
-| 节点注册表 | `hydra:{nodes}` + `hydra:{node:hb}:<id>` + `hydra:{node:seen}:<id>` | 注册/心跳（TTL 30s）/leader 发现；第三个键是**回收见证**（TTL = grace，见 §3.1） |
-| 失效总线 | `hydra:{ctl:events}` + `hydra:{ctl:gen}` | Streams 持久可重放 + generation 兜底 |
-
-### 5.1a 失效事件流的裁剪语义（2026-09-29 修正）
-
-**旧行为（缺陷）**：裁剪固定用 `XTRIM MAXLEN 10000`（每 30 s 一次），且**只要删掉了条目就 bump generation** ⇒ 超过 `10000 / 30 ≈ 333 事件/秒` 时**每一次裁剪都会删条目**，于是**每个节点每 30 s 清空整个 L1+L2 认证缓存**——与消费者是否落后无关。一个租户每分钟 2 次 invalidation 就能把全集群缓存永久维持在冷态（节流只限速率、不限后果）。
-
-**现行为**：裁剪仍按 `MAXLEN` 执行（内存上界不变），但 bump 只在**删掉的条目中有人尚未应用**时才发生。判定依据是"最慢存活消费者的 applied watermark"（`hydra:{ctl:inv:applied}:<node>`，`InvalidationStream::slowest_live_watermark`）：只有当**每一个存活节点都有 watermark**、且被删的最新条目 ≤ 最慢 watermark 时，才证明"这些条目所有人都已应用"⇒ 不 bump、不清缓存。任何一环无法证明（没有存活视图、某个存活节点从未发布 watermark、watermark 不可解析）都退回旧行为（bump），所以安全方向不变。
-
-**指标**（原先整条链路零指标）：
-- `hydra_invalidation_trimmed_total` —— 裁剪掉的条目数（无论是否需要 bump）；
-- `hydra_invalidation_generation_bumps_total` —— 真正"丢了没人读过的条目"的次数；**非零表示真实的收敛损失**（或事件速率超过 `maxlen / 裁剪间隔` 且有消费者跟不上）。
-| 共享限流 | `hydra:{rl:role:bucket}:count|tokens` | Lua 滑动窗口（同 `{rl:...}` tag 同槽） |
+| 共享限流 | `hydra:{rl:role:bucket}:count\|tokens` | Lua 滑动窗口（同 `{rl:...}` tag 同槽） |
 | 共享熔断 | `hydra:{br}:dead:{p}` + `hydra:{br}:alldead` | 投票 + 心跳 TTL + 本地 1s 同步 |
 | 认证缓存 L2 | `hydra:{auth}:{tenant}:{keyhash}` + 索引 | L1 miss 才访问；租户索引免 SCAN |
+| 失效总线 | `hydra:{ctl:events}` + `hydra:{ctl:gen}` | Streams 持久可重放 + generation 兜底 |
 | — | 命名空间规则 | 多 key 操作必须同 hash tag；禁 SCAN/MATCH（Cluster 安全） |
 
-**Redis 故障行为**（数据面永不受影响——edge 持 last-known-good 快照与本地缓存）：
+### 4.1 失效事件流的裁剪语义
+
+**旧行为（缺陷）**：裁剪固定 `XTRIM MAXLEN 10000`（每 30 s），且**只要删了条目就 bump
+generation** ⇒ 事件速率超过 `10000/30 ≈ 333/s` 时**每次裁剪都会清空全集群的 L1+L2 认证缓存**，
+与消费者是否落后无关。
+
+**现行为**：裁剪仍按 `MAXLEN`（内存上界不变），但**只有当被删掉的条目里有人尚未应用时才 bump**。
+判据是"最慢存活消费者的 applied watermark"（`hydra:{ctl:inv:applied}:<node>`）：只有**每个存活节点
+都有 watermark** 且被删的最新条目 ≤ 最慢 watermark，才证明"所有人都读过了"。任何一环无法证明就
+退回旧行为（bump），所以安全方向不变。
+
+指标：`hydra_invalidation_trimmed_total`（裁剪条目数）、
+`hydra_invalidation_generation_bumps_total`（**真正丢了没人读过的条目** ⇒ 非零即真实收敛损失）。
+
+### 4.2 Redis 故障行为
 
 | 子系统 | Redis 宕机行为 |
 |---|---|
-| 配置快照 | ~~暂停更新（快照走 leader HTTP）~~ 已退役：配置走 Arachne，失 quorum 时各节点继续用本地已物化状态服务（ADR-0001 验收 5） |
-| 限流 | fail-open（**硬编码，NOT configurable**：`HYDRA_RATE_LIMIT_FAIL_MODE` 从未实现 —— `grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空）+ 告警指标（`hydra_control_poll_total{result="rate_limit_error"}`） |
+| 配置 / 控制面 | **不受影响**：配置走 Arachne，与 Redis 无关 |
+| 限流 | fail-open，**硬编码、不可配置**（`HYDRA_RATE_LIMIT_FAIL_MODE` 从未实现）+ 告警指标 `hydra_control_poll_total{result="rate_limit_error"}` |
 | 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
 | 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
-| 选举 | ~~续约失败 → 立即降级停写~~ 已退役：领导权来自 raft，与 Redis 无关；Redis 断连只影响上面四项数据面状态 |
+| 领导权 | **不受影响**：领导权来自 raft |
 
-> **2026-09-30 实测修正（P1，已修）**：上表最后一行原先并不成立。连接池是用
-> `Pool::new(…, policy: None, …)` 建的 —— **fred 根本没有重连策略**（策略不是 `Config` 的字段，
-> 别处也补不上），所以"连接被切断"之后**一次都不会重拨**：实测切断 ~2s 再恢复后，**90 秒内新建连接
-> 数 = 0**，每条命令都撞 500ms 命令超时，`/healthz/leader` **整整 90 秒 503**（租约永远拿不回来 ⇒
-> 集群长期没有 leader），限流的 fail-open 从"临时"变成"永久"，**只有重启能恢复**。fred 自己的
-> debug 日志点名了原因：`Checking reconnect state. Has policy: false`。修法：`redis::reconnect_policy()`
-> （`max_attempts = 0` = 永久重试，间隔 1s、带 jitter）交给 `Pool::new`，单测 + 集成 drill
-> `integration/test_cluster_limits.py` 双侧钉住；修复后切断期间每秒重拨、恢复后 ~3s 重新当上 leader、
-> `hydra_control_poll_total{result="rate_limit_error"}` 立刻停止增长。运维侧说明见 `ops.md` §13.5 / §9.1。
-
-### 3.1 注册表：值格式、回收判据与身份前提
-
-本节是注册表契约的权威说明；运维侧的取值要求见 `ops.md` §13.5b/§13.6。
-
-**值格式是冻结的**：`hydra:{nodes}` 的字段值恒为 `role|control_url`（如
-`leader|http://hydra-control-a:8081`）。**不得**往里追加时间戳或版本前缀——
-追加会让时间戳粘进 `control_url`（把对端的转发目标写坏），加 `v2|` 前缀会让
-`role` 变成 `"v2"`，而 `active_leader_url()` 按 `role == "leader"` 判断 ⇒ 返回
-`None` ⇒ **每一次 standby 管理写都 503**。因此"最后可见时间"放在**独立键**里：
-
-| 键 | 语义 |
-|---|---|
-| `hydra:{nodes}` | `node_id → "role|control_url"`（值格式不变） |
-| `hydra:{node:hb}:<id>` | 心跳，TTL 30s；缺失即视为离线 |
-| `hydra:{node:seen}:<id>` | 回收**见证**，TTL = `HYDRA_REGISTRY_STALE_GRACE_SECS`（默认 120） |
-| `hydra:{node:reap}:<id>` | 回收器自己的"一击"标记（无 TTL；见下） |
-
-**续期与注册是同一个入口**（`NodeRegistry::register(ttl, seen_ttl)`，每 20s 调用）：
-它同时**重写行**、续心跳、续见证。历史实现把两者分开（启动注册一次、20s 只续心跳），
-结果是节点启动后 `role`/`control_url` 变化时行值**永远停在启动值**却一直"活着"。
-
-**回收判据（两击）**：一次扫描同时满足"心跳缺失 **且** 见证缺失"时**不立即删除**，
-而是写一个 `hydra:{node:reap}:<id>` 标记并跳过；只有**下一次**扫描仍处于同一状态
-（≥60s 连续静默，即三个心跳周期）才真正删除，任何生命迹象（心跳或见证键）都会
-**清除**该标记。**当前租约持有者永不回收**（`active_leader_url()` 不看心跳，删掉它的行
-会让所有备用节点失去唯一的转发指针）。
-
-> 两击规则不是保守，而是必要：**未升级节点只在启动时写一次行**（其 20s 循环只续心跳），
-> 所以一次 ≥30s 的心跳中断若导致行被删，该节点会**永远**从 `list_nodes`/
-> `leader_control_urls` 消失；若它正持租约，所有 standby 的管理写会**永久 503**
-> （转发是 fail-closed，无静态回退）。历史积压仍会被清理，只晚一个 tick。
-
-**身份前提（控制器要求）**：节点身份取 `HYDRA_NODE_ID` → `HOSTNAME` → 随机。
-`HOSTNAME` 这一层只在 **StatefulSet**（或固定 Pod 名的 Deployment）下稳定；普通
-Deployment 每次重启都换 Pod 名，该层回退**无收益**。**两个节点绝不能共用同一个
-`HOSTNAME`**：它们会共用一行注册，任一方的停机 `unregister()` 会删掉对方的注册；
-更严重的是——**该 id 同时是租约身份**（`GET hydra:lease == 本节点 id` 即续租）——
-两个进程会**同时认为自己是 leader**（脑裂），而两个"leader"会各自接受管理写并
-各自发布快照。生产上用显式 `HYDRA_NODE_ID` 或 StatefulSet 固定名。
+> **2026-09-30 实测修正（已修）**：连接池曾用 `policy: None` 建，而 **fred 没有默认重连策略**，
+> 于是连接被切断后**一次都不重拨**：实测切断 ~2s 后 90 秒内新建连接数 = 0，限流的 fail-open 从
+> "临时"变成"永久"，只有重启能恢复。修法：`redis::reconnect_policy()`（`max_attempts = 0`，1s 间隔
+> 带 jitter）交给 `Pool::new`。运维说明见 `ops.md` §13.5。
 
 ---
 
-## 4. 部署
+## 5. 部署
 
-### 4.1 docker-compose（推荐起步）
+### 5.1 docker compose（推荐起步）
 
 ```bash
 cd environment
-export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"      # 必填，>= 16 字符
-export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"    # 必填（控制通道）
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # 每个节点都用它
+export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # 启动要求（见 §2）
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # 全集群必须一致
-docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
-# 管理面：指向任一 leader 候选（standby 自动转发到 active）
-curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/tenants
+./environment/build.sh                                      # 镜像含 server,cluster-redis,arachne
+docker compose -f docker-compose.cluster.yml up -d
+python3 environment/init.py                                 # 指向任一节点的管理口即可
 ```
 
-### 4.2 k3s / k8s（纯容器清单，零 K8s API 依赖）
+`docker-compose.cluster.yml` 里三个服务**只有身份、端口与卷不同**（同一 environment 锚点）；
+`HYDRA_CLUSTER_PEERS` 三处完全相同。
+
+### 5.2 k3s / k8s
+
+**必须是 StatefulSet（固定身份 + 独立 PVC），而且必须改一项默认值**：
 
 ```yaml
-# redis（或托管 Redis）
-apiVersion: apps/v1
-kind: Deployment
-metadata: { name: redis }
-spec:
-  replicas: 1
-  selector: { matchLabels: { app: redis } }
-  template:
-    metadata: { labels: { app: redis } }
-    spec:
-      containers:
-        - { name: redis, image: redis:7, ports: [{ containerPort: 6379 }] }
----
-apiVersion: v1
-kind: Service
-metadata: { name: redis }
-spec: { selector: { app: redis }, ports: [{ port: 6379 }] }
----
-# leader 候选 ×2（独立 PVC；StatefulSet 保证稳定身份）
 apiVersion: apps/v1
 kind: StatefulSet
-metadata: { name: hydra-control }
+metadata: { name: hydra }
 spec:
-  serviceName: hydra-control
-  replicas: 2
-  selector: { matchLabels: { app: hydra-control } }
+  serviceName: hydra
+  replicas: 3
+  # ↓↓↓ 关键：默认的 OrderedReady 会"等 pod-0 Ready 才起 pod-1"，
+  #     而一个新数据目录必须由多数派先认领（§5.6），于是 pod-0 永远等不到多数派 ⇒ 集群起不来。
+  podManagementPolicy: Parallel
   template:
-    metadata: { labels: { app: hydra-control } }
     spec:
       containers:
         - name: hydra
           image: hydra:latest
-          args: ["--features=server,cluster-redis"]   # 构建时启用
           env:
-            - { name: HYDRA_ROLE, value: leader }
-            - { name: HYDRA_ADMIN_ADDR, value: 0.0.0.0:8081 }   # 探针/Service 需从 Pod 外访问 admin
+            - { name: HYDRA_CLUSTER_PEERS, value: "hydra-0.hydra:8091,hydra-1.hydra:8091,hydra-2.hydra:8091" }
+            - { name: HYDRA_NODE_ID, value: "$(POD_NAME)" }            # StatefulSet 保证稳定
+            - { name: HYDRA_ARACHNE_LISTEN, value: "0.0.0.0:8091" }
+            - { name: HYDRA_CLUSTER_ID, value: "hydra-prod" }          # 显式！见 §6.3
             - { name: HYDRA_REDIS_URL, value: redis://redis:6379 }
-            - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: token } } }
-            - { name: HYDRA_CONTROL_URL, value: http://hydra-control-0.hydra-control:8081 }
-            - { name: HYDRA_PUBLIC_URL, value: "http://$(POD_NAME).hydra-control:8081" }
+            - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra, key: cluster } } }
+            - { name: HYDRA_ADMIN_TOKEN, valueFrom: { secretKeyRef: { name: hydra, key: admin } } }
+            - { name: HYDRA_ENCRYPTION_KEY, valueFrom: { secretKeyRef: { name: hydra, key: enc } } }
             - { name: HYDRA_USAGE_SINK, value: clickhouse }
             - { name: HYDRA_CLICKHOUSE_URL, value: http://clickhouse:8123 }
-            - { name: HYDRA_ADMIN_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: admin } } }
-            - { name: HYDRA_ENCRYPTION_KEY, valueFrom: { secretKeyRef: { name: hydra-cluster, key: enc } } }
-          ports: [{ containerPort: 8080 }, { containerPort: 8081 }]
+          ports: [{ containerPort: 8080 }, { containerPort: 8081 }, { containerPort: 8091 }]
           readinessProbe:
-            httpGet: { path: /healthz/leader, port: 8081 }   # 仅 active 就绪 → Service 路由到 active
+            # 每个节点都提供管理 API，探针同一条规则（带 token 探 /api/v1/health）
+            httpGet: { path: /api/v1/health, port: 8081 }
+            httpHeaders: [{ name: Authorization, value: "Bearer $(HYDRA_ADMIN_TOKEN)" }]
   volumeClaimTemplates:
     - metadata: { name: data }
-      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
----
-apiVersion: v1
-kind: Service
-metadata: { name: hydra-control }
-spec:
-  selector: { app: hydra-control }
-  ports: [{ port: 8081, targetPort: 8081 }]
----
-# edge ×N（无状态，HPA 扩缩）
-apiVersion: apps/v1
-kind: Deployment
-metadata: { name: hydra-edge }
-spec:
-  replicas: 3
-  selector: { matchLabels: { app: hydra-edge } }
-  template:
-    metadata: { labels: { app: hydra-edge } }
-    spec:
-      containers:
-        - name: hydra
-          image: hydra:latest
-          env:
-            - { name: HYDRA_ROLE, value: edge }
-            - { name: HYDRA_ADMIN_ADDR, value: 0.0.0.0:8081 }
-            - { name: HYDRA_REDIS_URL, value: redis://redis:6379 }
-            - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: token } } }
-            - { name: HYDRA_CONTROL_URL, value: http://hydra-control-0.hydra-control:8081 }
-            - { name: HYDRA_PUBLIC_URL, value: "http://$(POD_NAME):8081" }
-            - { name: HYDRA_USAGE_SINK, value: clickhouse }
-            - { name: HYDRA_CLICKHOUSE_URL, value: http://clickhouse:8123 }
-            - { name: HYDRA_ENCRYPTION_KEY, valueFrom: { secretKeyRef: { name: hydra-cluster, key: enc } } }
-          ports: [{ containerPort: 8080 }, { containerPort: 8081 }]
-          readinessProbe:
-            httpGet: { path: /readyz, port: 8081 }
----
-# 代理入口（Ingress / LB 指向 edge 的 8080）
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }
 ```
 
-> **edge TLS**：用 `HYDRA_TLS_LISTEN=0.0.0.0:8443` 让 edge 额外绑定 TLS 监听器
-> （证书随快照分发，无需共享卷；证书写入后由快照交换自动重解析，**无需重启**）。
-> 明文 `HYDRA_LISTEN` 恒定存在——曾有过的 `HYDRA_EDGE_TLS` 开关文档提过、代码从未读取，
-> 已删除；而“有证书就把唯一监听器切成 TLS”的做法已按事故报告修掉
-> （`dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`）。
+**不要**用 `readinessProbe: /healthz/leader` 做 Service 路由（那是旧 leader/edge 拓扑的做法）：
+集群里**每个节点都能接受管理写**，把流量引到单一节点只会浪费另外两台。
 
-### 4.3 裸机 / VM
+### 5.3 裸机 / VM
 
-同一二进制 + systemd；`HYDRA_CONTROL_URL`/`HYDRA_PUBLIC_URL` 用主机名或 VIP；
-leader 用 `HYDRA_NODE_ID` 固定标识。
+同一二进制 + systemd；每个节点需要**持久卷**（raft WAL + SQLite）。三台之间必须能互相访问
+`HYDRA_ARACHNE_LISTEN` 的端口（raft 传输），该端口只应对内网暴露（见 §8）。
+
+### 5.4 探针与存活监督
+
+**一条规则**：每个 hydra 服务都用带 token 的管理探针
+（`curl -fsS -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://127.0.0.1:8081/api/v1/health`）。
+`/metrics` 走同一条门禁。由 `scripts/check_compose_health.cjs` 在 CI 里守住。
+
+### 5.5 持久卷与数据目录
+
+每个节点自带 `/app/data`（SQLite + `arachne/` raft 目录）。**卷是必需的，不是优化**：丢失它等于
+丢掉该节点的 raft 日志与物化状态（节点能用 `head` 重建配置，但要以"新目录"重新认领，见 §5.6）。
+
+### 5.6 数据目录的"认领"（**从全停恢复的关键**）
+
+一个**新**数据目录必须由多数派**认领**才能服务：节点先**本地读**目录里记录的集群身份
+（`hydra/ctl/cluster_id`），已经记着且与配置一致 ⇒ 立刻通过；**没记着** ⇒ 只能由 leader 写，而
+leader 需要多数派。`PREFLIGHT_DEADLINE` 是 **10 秒**。
+
+两个直接后果：
+
+- **不能"先起一台"**：全停之后必须让 ≥2 台在 10 秒窗口内一起起来（`docker compose up -d` 天然满足；
+  K8s 必须 `podManagementPolicy: Parallel`，见 §5.2）。
+- **一旦认领过，单独重启就很快**：认领是**本地读**，所以重启一个成员不需要等多数派（实测 ~500 ms）。
 
 ---
 
-### 4.x Liveness supervision (added 2026-09-29)
+## 6. 故障切换演练
 
-每个 hydra 服务都带 **按角色** 的 container healthcheck，且路径必须随角色而变：
-
-| 角色 | 探针 | 原因（2026-09-29 在真实两节点集群上实测） |
-|---|---|---|
-| `leader`（control-a/b） | `curl -fsS -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://127.0.0.1:8081/api/v1/health` | 管理口需 token；不带 token 会 401 而永远 unhealthy |
-| `edge` | `curl -fsS http://127.0.0.1:8081/healthz` | **edge 不提供管理 API**：`/api/v1/health` 返回 **404**（实测），`/healthz`/`/readyz` 免鉴权 200；`/metrics` 无 token 401、带 token 200 |
-
-官方 `environment/docker-compose.cluster.yml` 此前**三个服务都没有 healthcheck**（单机与本地栈都有）—— 现已补上，并由 `scripts/check_compose_health.cjs`（CI `scripts` 作业 + 本机门禁）守住"角色 ↔ 探针路径"的匹配。
-
-## 5. 故障切换演练
+### 6.1 步骤
 
 ```bash
-# 1. 观察当前 active（两个 leader 的 /healthz/leader：一个 200 一个 503）
-for p in 8081 8082; do echo -n "port $p: "; curl -s -o /dev/null -w "%{http_code}\n" localhost:$p/healthz/leader; done
+# 1. 看谁在写（三台各问一次；恰好一台 200）
+for p in 8081 8082 8083; do echo -n "$p: "; \
+  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
+    localhost:$p/healthz/leader; done
 
-# 2. 杀掉 active（如 port 8081 的容器）
-docker compose -f docker-compose.cluster.yml stop hydra-control-a
+# 2. 硬杀当前 leader（不优雅退出，演练的是最坏情况）
+docker compose -f docker-compose.cluster.yml kill hydra-a     # 换成上一步里 200 的那台
 
-# 3. ≤ 宽限+租约（~20s）后，standby 提升：
-curl -s localhost:8082/healthz/leader          # → 200（新 active）
-#    管理变更经 standby 转发到新 active，无需重定向
+# 3. 等新 leader（选举超时量级；实测 1.1–1.6 s）
+for p in 8082 8083; do echo -n "$p: "; \
+  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" \
+    localhost:$p/healthz/leader; done
 
-# 4. edge 轮询失败 → 注册表旋转 → 继续同步（数据面无感）
-# 5. 恢复旧节点：以 standby 身份加入（自动降级 + 重建副本）
-docker compose -f docker-compose.cluster.yml start hydra-control-a
+# 4. 数据面必须全程无感（这是验收 2 的口径，见下）；管理写打任意幸存节点都应成功，
+#    失去多数派时应立刻 503 config_not_published
+
+# 5. 恢复旧节点：它已有认领过的目录 ⇒ 直接以成员身份回来并自动跟上 head
+docker compose -f docker-compose.cluster.yml start hydra-a
 ```
 
-**验证清单**：
-- [x] 单节点模式（`HYDRA_ROLE` 未设置）零行为变化
-- [x] active 宕机 → standby 自动提升，管理写入恢复，edge 继续服务
-- [x] 跨节点限流：两节点合计超 `limit_count` 即 429
-- [x] 熔断：A 节点 trip → B 节点 ≤1s 收敛排除
-- [x] 认证失效：`DELETE /api/v1/auth/cache` → 全节点 ≤0.5s 清本地缓存
-- [x] 证书轮换：admin PUT 新 PEM → 全节点 ≤poll 生效（无共享卷、无文件操作）
+### 6.2 实测记录（2026-10-05，三个真进程）
 
-### 5.1 实测记录（2025-08，本地 docker redis + 双 leader + 双 edge）
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 选举耗时 | **1.08 s / 1.63 s**（两次独立运行，`kill -9`；预算 3 s） | `integration/test_arachne_control_plane.py` gate 1 |
+| 双 leader | **切换全过程从未出现两台同时 200**（连续轮询） | 同上，gate 3 |
+| 配置收敛 | 三个节点服务同一份配置（内容层）；`materialized() == head`（哈希层） | 同上 gate 4 + `tests/arachne_three_nodes.rs` |
+| 任意节点写 | 打在三台上的管理写**全部 201**（入口节点就地应用并发布） | 同上，gate 1 |
+| 失去多数派 | 管理写 **0.0 s** 返回 503 `config_not_published`；`/healthz/leader` 503；**真代理请求仍 200** | 同上，gate 5 |
+| **数据面跨故障切换** | **20 rps × 60 s = 1200 次请求全部 200**（p50 2 ms / p99 3 ms / max 3 ms），第 15 s `kill -9` leader；被杀前后 ±3 s 的 120 次也全 200 | `integration/test_data_plane_failover_load.py`（验收 2） |
 
-| 项 | 结果 |
-|---|---|
-| 故障切换（两次） | ~11s / ~18s（租约 15s + tick ≤5s，注册表轮换失效修正后） |
-| 旧 leader 回归 | 租约感知轮换 → 自动跟随新 active 重建副本（物化新版本 + 证书） |
-| 跨节点限流 | 5 次 200 后第 6 次 429（两 edge 合计计数） |
-| 共享熔断 | trip → 投票落 Redis → 对端 ≤1s 收敛 503；probe 仅 <500 才复活（防振荡）；上游恢复后自动撤销 |
-| 认证失效 | DELETE 后请求变 MISS（L1 确实被清），事件流 500ms 内消费 |
-| 版本持久化 | 重启后版本从 `config_meta` 恢复（不再重置为 1），`since` 水位跨重启单调 |
+旧 leader/edge 拓扑下的历史数字（切换 11–18 s、edge 355/355）**不再适用**：那套机制已删除，且旧
+证据成立的原因完全不同（无状态 edge 没有本地库）。历史记录保留在计划与 ADR 里。
 
-**验收中发现并修复**：① 轮换锁定字典序第一的死节点（→ 跳过当前失败目标）；② 事件消费者对空 stream 的 nil 回复解析失败死循环（→ 原始 `Value` 判空）；③ 熔断投票任务在 Pingora runtime 上 `tokio::spawn` 不执行（→ 改投 bg runtime `Handle::spawn`）；④ `SharedBreaker` 包裹了与路由无关的独立 breaker（→ 必须包裹路由用的同一实例）；⑤ probe 对任意 HTTP 响应判活导致熔断振荡（→ 仅 <500 复活）；⑥ 版本号重启重置导致 `since` 水位失效（→ 持久化到 `config_meta`）。
+### 6.3 成员变更 SOP（**先读 `HYDRA_CLUSTER_ID` 那条陷阱**）
 
-**已知限制**（未在本轮修复）：
-- 禁用的 `limit_role`/`provider_key_binding` 只存在于 active 本地 DB，**不进快照**（`build_config` 只带 enabled 行，契约见 T5.7）—— 故障切换后该行在副本/新 active 上丢失，需重新创建。修复方向：快照单独携带禁用行。
-- **物化失败的重试不再有次数上限（2026-09-29）**：`MaterializationGuard` 曾对每个快照只重试 **3 次**，用尽后**永久**不再尝试——而控制客户端不会重投"内存水位已越过"的版本，于是节点只有两条回头路：一次**更新的配置写入**（需要一个能工作的 leader，恰恰是"没有可当选节点"的集群给不出的）或重启。现在改为**次数不限、速率受限**：失败后按 1s→2s→4s…（上限 60s）退避，新快照立即重置退避与失败计数；`materialize` 本身幂等且被版本闸门与 `in_flight` 串行保护，所以重试是安全的。可观测：`hydra_replica_materialize_retries_total{outcome="attempt|succeeded|failed|throttled"}`——`failed` 持续增长说明节点物化不了（因而不能当选），这个状态以前既**永久**又**不可见**。
-- 新鲜度闸门基于"最近一次轮询成功"：重启后立刻提升的极端场景（active 同时死亡）仍可能以旧副本上任（租约感知轮换只覆盖"active 存活时回归"的常规路径）。
-- `HYDRA_FAILOVER_GRACE_MS` 已文档化但未接线（`grep -rn HYDRA_FAILOVER_GRACE_MS crates/` 为空）；`HYDRA_RATE_LIMIT_FAIL_MODE` **代码里根本不存在**（`grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空），Redis 宕机时限流是**硬编码 fail-open、NOT configurable**（`crates/hydra-server/src/redis/rate_limit.rs` 的 `warn!("redis rate-limit check failed; failing open")` + 注释 "there is NO env override"）。`HYDRA_BREAKER_QUORUM` 有代码内默认值 `1`，且**确实被读取**（`crates/hydra-server/src/main.rs` 的 `std::env::var("HYDRA_BREAKER_QUORUM")`）。
+> ⚠ **陷阱（实测 2026-10-05）**：`HYDRA_CLUSTER_ID` 的默认值是**成员表内容的哈希**。于是
+> **只要改动成员表，默认身份就变了**，而每个节点自己的数据目录记录着旧身份 ⇒ 启动时直接失败：
+>
+> ```
+> fatal startup error error=arachne control plane refused to start: Arachne::start: unrecoverable:
+> facade init: cannot open WAL: unrecoverable storage error:
+> META cluster_id mismatch: expected "hydra-0718fec1d91bd94b", got "hydra-47b808fb0733c41f"
+> ```
+>
+> （复现方式：拿一个被认领过的数据目录，把成员表从 3 项改成 4 项，不设 `HYDRA_CLUSTER_ID`。
+> 这是库自己的身份校验，**不是** Hydra 的 preflight。）
+>
+> **规避方式只有一个：从第一天起显式设 `HYDRA_CLUSTER_ID`**（一个人类可读的稳定名字）。之后改成员
+> 表就不再改身份。**已经上线的集群如果当初没设**，要做成员变更就得先按新表算出默认哈希、把它显式写
+> 进配置——否则三台会同时拒绝启动。
 
-### 5.2 管理变更转发（standby → active）与循环防护
+变更步骤（**本仓没有把这条流程包成命令**，必须人工执行）：
 
-**转发目标 = 实际租约持有者（绝不使用静态 URL）**：standby 收到管理变更
-（POST/PUT/DELETE）时，转发目标在转发时刻从节点注册表实时解析
-（`NodeRegistry::active_leader_url()`，即 Redis 租约持有者注册的
-`HYDRA_PUBLIC_URL`）。静态 `HYDRA_CONTROL_URL` **只**用于控制面快照轮询，
-不作为转发目标——它可能指向节点自身（主候选的常见配置），且无法跨故障切换
-跟踪租约。
-
-**三层防护**（缺一不可，防御纵深）：
-1. **注册表解析**（主修复）：目标始终跟随实际租约持有者，故障切换后无需
-   重配置；
-2. **自转发护栏**：若解析出的目标恰是本节点自己的注册 URL（误注册/共用
-   URL），拒绝转发并 fail-closed 503，绝不自转发；
-3. **forward-once 标记**（`x-hydra-forwarded`）：每个转发请求携带标记，
-   收到带标记变更的非 active 节点直接 503，不再二次转发——任何自转发或
-   节点间互转循环都会立即终止，而不是 5s 超时递归。
-
-**验证**：standby 上 `POST /api/v1/providers` → 成功落盘到 active 并回 201；
-向 standby 直接构造带 `x-hydra-forwarded` 的变更 → 503 `forward_loop`；
-目标不可达/无租约 → 503 `not_leader`（fail-closed，绝不本地代写）。
+1. 改**所有**成员上的 `HYDRA_CLUSTER_PEERS`（含顺序）并重启——顺序即 raft id，改顺序等于换集群；
+2. 新成员第一次起来时需要多数派在 10 s 内一起可用（§5.6），否则它只是"认领不到目录"；
+3. 用 raft 的成员变更把新节点加入并追平（`add_learner` → 等追平 → `promote`），**移除成员同理**；
+   集群在变更期间**不能失去多数派**，所以每次只动一台；
+4. 变更后确认三台里**恰好一台**答 `/healthz/leader` 200，且各节点物化哈希 == `head`。
 
 ---
 
-## 6. 安全说明
+## 7. 可观测性与告警
 
-- **明文永不跨节点**：provider key 与证书私钥在快照中均为 AES-256-GCM 密封，
-  节点用 `HYDRA_ENCRYPTION_KEY` 本地解密（全集群一致）；
-- **管理面永不返回明文私钥**（单节点语义延续）；
-- **集群共享 `HYDRA_ADMIN_TOKEN`**（standby 转发管理变更的前提）；
-- **Redis 建议开启 ACL + 内网隔离**；生产用托管多 AZ（故障切换窗口最小化）。
+控制面的信号（`ops.md` §9.1 有对应的告警表达式）：
+
+| 指标 | 含义 |
+|---|---|
+| `hydra_arachne_this_node_leader{node}` | 1 = 本节点是 writer。**`sum() == 0` 就是"集群没有写者"**（该序列只在集群节点上存在，单节点部署不会误报） |
+| `hydra_arachne_leader_flips_total` | 本节点"我是不是 leader"的答案变了几次（采样 gauge 看不到抖动） |
+| `hydra_arachne_publish_total{result}` | `ok` / `not_leader` / `quorum_unavailable` / `error` / `refused`（编码期拒绝：超 1 MiB、无法成键、密封失败 ⇒ **容量告警**） |
+| `hydra_arachne_config_bytes` | 最近一次成功发布的树字节数（增长曲线） |
+| `hydra_arachne_quorum_unavailable_total{op}` | 因无多数派而被拒的操作（`publish` / `read`） |
+| `hydra_replica_materialize_retries_total{outcome}` | 物化循环：`attempt` / `succeeded` / `failed` / `throttled`（稳态不计） |
+| `hydra_control_poll_total{result="rate_limit_error"}` | 限流因 Redis 不可达而 fail-open（**数据面**信号） |
+
+数据面本身的指标（请求、令牌、熔断、限流、失效流）见 `ops.md` §9。
+
+---
+
+## 8. 安全说明
+
+- **明文永不跨节点**：provider key 与证书私钥在配置树里都是**密封**的（AES-256-GCM，密钥来自
+  `HYDRA_ENCRYPTION_KEY`，全集群一致）。密封是**确定性**的（nonce 由主密钥 + 域分隔 + 密钥版本 +
+  明文派生），所以同一份逻辑配置在任何节点发布都得到同一棵树名——这是内容寻址"没变就不重写"成立
+  的前提，代价（同一树内相同明文 ⇒ 相同密文、不是 SIV）写在 `crypto.rs` 里。
+- **管理面永不返回明文私钥**（单节点语义延续）。
+- **每个节点都有自己的管理口与 admin token**：不再有"只有 leader 需要 token"这回事；每个节点的管理口
+  都应像以前一样只绑内网/回环。
+- **`HYDRA_CLUSTER_TOKEN` 今天不守任何东西**（§2）：它仍是启动要求，但 `/api/v1/internal/*` 已无路由。
+- **raft 传输（tonic）与下游租户 TLS 是两件事**：前者是集群内部通道，后者是租户 SNI 证书，开关与
+  文档分开。raft 端口必须只对内网暴露。
+- **Redis 建议开启 ACL + 内网隔离**；生产用托管多 AZ。
+
+---
+
+## 9. 已知限制 / 未闭合项（如实记账）
+
+- **成员变更是人工流程**（§6.3），没有命令封装；且**默认身份会随成员表变化**（那条陷阱）。
+- **配置树的旧分片没有 GC**：内容寻址意味着每次发布都留下上一版实体键，回收（只回收没有任何存活
+  toc 引用的键）**尚未实现**，目前只有一条 `format` 版本号。
+- **2 节点部署被拒绝**（不是告警）：`MINIMUM_MEMBERS = 3`。
+- **每节点都需要持久卷**，且**配置物化在 N 个节点各跑一遍**（版本闸门 + 分片复用压低成本，仍是 N 倍）。
+- **租户写限流是每节点进程内窗口** ⇒ 集群总量上界 = N × 单窗口（沿用"反 DoS 而非计费"定位）。
+- **`HYDRA_ARACHNE_LISTEN` 的端口与 `HYDRA_ADMIN_ADDR` 无关**（旧文档要求两者相同，那条约定随
+  leader 提示的转发用途一起作废）。
+- **失去多数派期间管理写全不可用**（fail-closed）：这是设计，不是缺陷，但意味着"多数派恢复"必须是
+  运维的第一优先级。
+- 旧文档曾要求 `HYDRA_FAILOVER_GRACE_MS` / `HYDRA_RATE_LIMIT_FAIL_MODE`：前者**从未接线**、后者
+  **代码里根本不存在**（限流 fail-open 是硬编码）。
+
+---
+
+## 10. 退役对照（历史，便于查阅旧文档与旧工单）
+
+| 旧机制 | 替代者 | 决策 |
+|---|---|---|
+| Redis 租约选举（`cluster/lease.rs`） | raft 领导权（写探测） | D-1 / D-3 |
+| 节点注册表 + 心跳 + 回收（`cluster/registry.rs`） | 静态成员表；对端存活**不可知**（UI 显示"未知"） | D-2 |
+| 配置快照 HTTP 推送 / 轮询（`cluster/control_client.rs`、`snapshot.rs` 的线上路径） | 每节点自己从 Arachne 物化 | D-4 |
+| 管理写转发 `cluster/forward.rs` + `x-hydra-forwarded` 护栏 | 库内转发 + 入口节点就地执行 | D-3 / D-6 |
+| 租户写内部端点 `/api/v1/internal/tenant-config/*` | 入口节点自己跑写核心 | D-6（乙-full） |
+| `edge` 角色与"无状态数据面" | 节点同构；**扩缩容 = raft 成员变更** | D-2 / D-5 |
+| `LeaderElection` / `NodeRegistry` / `LEASE_KEY` 等 | 全部删除（计划的退役 grep 归零） | T4.1 |

@@ -88,6 +88,7 @@ const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_REGISTRY_STALE_GRACE_SECS', 'RETIRED by ADR-0001 T4.1 (the registry reaper it tuned is deleted): listed in ops.md §13.3b'],
   ['HYDRA_FORWARD_TIMEOUT_SECS', 'RETIRED by ADR-0001 T3.3 (the admin forwarder is deleted): listed in ops.md §13.3b'],
   ['HYDRA_ROLE', 'RETIRED by ADR-0001: the member list decides the cluster; listed in ops.md §13.3b'],
+  ['HYDRA_EDGE', 'never a knob: it is the sentinel ADR-0001 put in `RETIRED_CLUSTER_ENV` so a deployment that still sets it is TOLD it does nothing. Listed in ops.md §13.3b with the other retired names — and unlike them it never had a reader, which is why no read site can be verified'],
   ['HYDRA_FAILOVER_GRACE_MS', 'documented but never wired (round 166), and now listed among the retired names in ops.md §13.3b'],
   ['HYDRA_RATE_LIMIT_FAIL_MODE', 'ops.md says it does not exist at all (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty)'],
   ['HYDRA_ENCRYPTION_KEY_FILE', 'a real knob, mentioned inside the `HYDRA_ENCRYPTION_KEY` row; read at `crypto.rs:142` (verified this round)'],
