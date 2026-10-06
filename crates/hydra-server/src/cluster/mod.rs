@@ -40,6 +40,8 @@ pub mod arachne_keys;
 #[cfg(feature = "arachne")]
 pub mod arachne_materialize;
 #[cfg(feature = "arachne")]
+pub mod arachne_materializer;
+#[cfg(feature = "arachne")]
 pub mod arachne_node;
 #[cfg(feature = "arachne")]
 pub mod arachne_store;

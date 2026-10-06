@@ -145,6 +145,10 @@ pub fn plan_publish(previous: Option<&Toc>, next: &ConfigTree) -> Result<Publish
 }
 
 /// The commit point for the config tree.
+///
+/// `Clone` is cheap (the handle wraps an `Arc` to the node's command channel) and exists so a
+/// materializer and a publisher can share one node without either owning it.
+#[derive(Clone)]
 pub struct ArachneConfigStore {
     handle: Handle,
 }
