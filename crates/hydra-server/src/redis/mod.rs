@@ -5,7 +5,6 @@
 //! | subsystem        | key(s)                                        | lands |
 //! |------------------|-----------------------------------------------|-------|
 //! | leader lease     | `hydra:{lease:leader}`                        | P2    |
-//! | node registry    | `hydra:{nodes}` / `hydra:{node:hb}:<id>`      | P4    |
 //! | invalidation bus | `hydra:{ctl:events}` / `hydra:{ctl:gen}`      | P4    |
 //! | rate limits      | `hydra:{rl:role:bucket}:count|tokens` (Lua)   | P4    |
 //! | breaker          | `hydra:{br}:dead:{p}` / `hydra:{br}:alldead`  | P4    |
@@ -19,7 +18,6 @@
 //!   structures (`hydra:{br}:alldead`, `hydra:{auth:idx}:{tenant}`);
 //! - single-key commands (SET/DEL/EXPIRE) are topology-safe as-is.
 //!
-//! The [`RedisLeaseStore`] implements the leader-lease store (P2) with a Lua
 //! compare-and-renew so a renew can never clobber another holder's lease.
 
 pub mod auth_cache;
@@ -102,11 +100,7 @@ pub mod test_redis {
 
 use fred::prelude::*;
 use fred::types::config::{ConnectionConfig, PerformanceConfig, UnresponsiveConfig};
-use fred::types::{Expiration, SetOptions};
 use std::time::Duration;
-
-/// The leader-lease key (single key — topology-safe, plan §6.1).
-pub const LEASE_KEY: &str = "hydra:{lease:leader}";
 
 /// Reconnect delay (ms) for a lost Redis connection. Paired with
 /// `max_attempts = 0` = **retry forever** (fred's own wording: "Use a
@@ -170,7 +164,7 @@ fn env_millis(key: &str, default: u64) -> u64 {
 /// argument (it is not part of `Config`), and this process passed `None`, so
 /// `ReconnectPolicy` — whose `max_attempts = 0` means "retry forever, every 1 s" — was never
 /// installed. `ops.md` §13.5 promises the opposite ("until Redis recovers"), and every
-/// fail-open path (cluster rate limits, auth-cache L2, breaker sync, registry) silently
+/// fail-open path (cluster rate limits, auth-cache L2, breaker sync) silently
 /// became **permanent** instead of temporary.
 #[must_use]
 pub fn reconnect_policy() -> ReconnectPolicy {
@@ -372,102 +366,6 @@ impl RedisBackend {
     #[must_use]
     pub fn pool(&self) -> &Pool {
         &self.pool
-    }
-}
-
-/// Leader lease stored in Redis (cluster P2): `SET <key> <node> NX PX <ms>`
-/// to acquire, and a **Lua compare-and-renew** to extend — a renew only
-/// succeeds while the key still holds OUR node id, so it can never clobber a
-/// lease that another node acquired after we lost ours.
-pub struct RedisLeaseStore {
-    pool: Pool,
-}
-
-/// Atomic compare-and-renew: extend the TTL only if the current holder is us.
-pub const RENEW_SCRIPT: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('PEXPIRE', KEYS[1], ARGV[2])
-  return 1
-else
-  return 0
-end
-"#;
-
-impl RedisLeaseStore {
-    #[must_use]
-    pub fn new(pool: Pool) -> Self {
-        Self { pool }
-    }
-
-    /// Acquire the lease (`SET NX PX`). `true` = we are the new holder.
-    pub async fn try_acquire(&self, node_id: &str, lease_ms: u64) -> Result<bool, RedisError> {
-        let r: Option<String> = self
-            .pool
-            .set(
-                LEASE_KEY,
-                node_id,
-                Some(Expiration::PX(lease_ms as i64)),
-                Some(SetOptions::NX),
-                false,
-            )
-            .await
-            .map_err(RedisError::from)?;
-        Ok(r.is_some())
-    }
-
-    /// Renew while we still hold it (Lua compare-and-renew). `false` = the
-    /// lease was lost (another node holds it, or it expired).
-    pub async fn renew(&self, node_id: &str, lease_ms: u64) -> Result<bool, RedisError> {
-        let r: i64 = self
-            .pool
-            .eval(
-                RENEW_SCRIPT,
-                vec![LEASE_KEY],
-                vec![node_id, &lease_ms.to_string()],
-            )
-            .await
-            .map_err(RedisError::from)?;
-        Ok(r == 1)
-    }
-}
-
-/// Convenience so `RedisLeaseStore` can be held behind `Arc<dyn LeaseStore>`
-/// (see [`crate::cluster::lease`]).
-impl crate::cluster::lease::LeaseStore for RedisLeaseStore {
-    fn try_acquire<'a>(
-        &'a self,
-        node_id: &'a str,
-        lease_ms: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<bool, crate::cluster::lease::LeaseError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.try_acquire(node_id, lease_ms)
-                .await
-                .map_err(|e| crate::cluster::lease::LeaseError::Store(e.to_string()))
-        })
-    }
-
-    fn renew<'a>(
-        &'a self,
-        node_id: &'a str,
-        lease_ms: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<bool, crate::cluster::lease::LeaseError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.renew(node_id, lease_ms)
-                .await
-                .map_err(|e| crate::cluster::lease::LeaseError::Store(e.to_string()))
-        })
     }
 }
 

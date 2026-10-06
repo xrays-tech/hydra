@@ -17,78 +17,81 @@ use super::AdminState;
 // Cluster status (cluster P4) — whole-fleet view for the Admin UI Health page
 // ===========================================================================
 
-/// One fleet node as rendered by `GET /api/v1/cluster/status`.
-#[derive(Serialize)]
-struct ClusterNodeDto {
-    node_id: String,
-    role: String,
-    control_url: String,
-    alive: bool,
-    is_lease_holder: bool,
-    is_self: bool,
-}
-
 /// Whole-cluster status. `cluster=false` on the single-node build / default
 /// mode — the UI then renders just the local Health panel.
+///
+/// ## Where these fields come from now (ADR-0001 T4.1)
+///
+/// The Redis registry used to answer all of it: who is a member, which member is alive (heartbeat
+/// TTL), and who holds the lease. That registry is deleted, and the replacement knows LESS, so the
+/// payload says less rather than guessing:
+///
+/// * **membership** comes from the CONFIGURED member list (`HYDRA_CLUSTER_PEERS`), which is the
+///   cluster's definition — the plan's own words: "the member list IS the decision";
+/// * **who leads** comes from raft's `leader_hint`, cached by the control plane's 250 ms watch.
+///   `None` means "not known yet" (a cold cluster, or a lost quorum), which is exactly what the UI
+///   needs to distinguish from "no leader exists";
+/// * **per-peer liveness is NOT knowable** from a single node any more. There is no heartbeat
+///   table and no per-node RPC to ask, so `alive` is a THREE-state field: `true` for this node,
+///   `null` for every other member. The UI renders that as "unknown" — reporting peers as "down"
+///   (what a `false` would say) would be a claim nobody measured.
 #[derive(Serialize)]
 struct ClusterStatusDto {
     cluster: bool,
     mode: String,
     node_id: String,
     this_node_leader: bool,
+    /// The raft leader's node name, when this node knows it.
     lease_holder: Option<String>,
     nodes: Vec<ClusterNodeDto>,
 }
 
-/// `GET /api/v1/cluster/status` (admin-token gated): fleet nodes from the
-/// registry (role + control URL + heartbeat liveness) plus the current
-/// leader-lease holder. Single-node mode reports `cluster=false`.
+#[derive(Serialize)]
+struct ClusterNodeDto {
+    node_id: String,
+    /// The configured raft address. (The column is still called `control_url` because that is what
+    /// the Admin UI's table reads; the value is now the raft transport address, and renaming the
+    /// field is a UI change this task does not need.)
+    control_url: String,
+    /// `true` for this node, `null` for a peer: see the type docs above.
+    alive: Option<bool>,
+    is_lease_holder: bool,
+    is_self: bool,
+}
+
+/// `GET /api/v1/cluster/status` (admin-token gated): this node's view of the fleet.
 #[allow(unused_variables)] // params are unused on the single-node build
 pub(super) async fn cluster_status(state: &AdminState, trace_id: &str) -> Resp {
-    #[cfg(feature = "cluster-redis")]
+    #[cfg(feature = "arachne")]
     {
-        let Some(registry) = &state.cluster_registry else {
+        let Some(peers) = state.cluster_peers.as_ref() else {
             return ok_json(200, &single_node_status());
         };
-        let (nodes, holder) = match (registry.list_nodes().await, registry.lease_holder().await) {
-            (Ok(nodes), Ok(holder)) => (nodes, holder),
-            _ => {
-                return err_json(
-                    502,
-                    "cluster_unavailable",
-                    "cannot read the cluster registry (Redis unreachable?)",
-                    trace_id,
-                );
-            }
-        };
-        let self_id = registry.node_id().to_string();
-        let mode = match registry.role() {
-            crate::cluster::NodeRole::Leader => "leader",
-            crate::cluster::NodeRole::Edge => "edge",
-            crate::cluster::NodeRole::All => "all",
-        }
-        .to_string();
+        let self_id = state.node_id.clone();
+        let leader = state.leader_name.as_deref().and_then(|f| f());
+        let this_node_leader = state.leader_ready.as_ref().is_some_and(|f| f());
         let dto = ClusterStatusDto {
             cluster: true,
-            mode,
-            this_node_leader: holder.as_deref() == Some(registry.node_id()),
+            mode: "cluster".to_string(),
             node_id: self_id.clone(),
-            lease_holder: holder.clone(),
-            nodes: nodes
-                .into_iter()
-                .map(|n| ClusterNodeDto {
-                    is_lease_holder: holder.as_deref() == Some(n.node_id.as_str()),
-                    is_self: n.node_id == self_id,
-                    node_id: n.node_id,
-                    role: n.role,
-                    control_url: n.control_url,
-                    alive: n.alive,
+            this_node_leader,
+            nodes: peers
+                .addresses()
+                .iter()
+                .map(|(id, addr)| ClusterNodeDto {
+                    node_id: id.to_string(),
+                    control_url: addr.to_string(),
+                    // Only this node's own liveness is observable here.
+                    alive: (id.to_string() == self_id).then_some(true),
+                    is_lease_holder: leader.as_deref() == Some(id.to_string().as_str()),
+                    is_self: id.to_string() == self_id,
                 })
                 .collect(),
+            lease_holder: leader,
         };
         ok_json(200, &dto)
     }
-    #[cfg(not(feature = "cluster-redis"))]
+    #[cfg(not(feature = "arachne"))]
     {
         ok_json(200, &single_node_status())
     }

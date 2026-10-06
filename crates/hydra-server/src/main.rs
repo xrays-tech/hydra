@@ -203,7 +203,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     };
     // Without the feature the control plane does not exist at all; the binding stays so the
     // `leader_ready` merge below is written once rather than twice (the same shape the
-    // `invalidation_stream` / `cluster_registry` fields use in `BootstrapComponents`).
+    // `invalidation_stream` / `fleet_live` fields use in `BootstrapComponents`).
     #[cfg(not(feature = "arachne"))]
     #[allow(unused_variables, clippy::no_effect_underscore_binding)]
     let _arachne_control: Option<()> = None;
@@ -306,31 +306,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             .into());
         }
     }
-    if role == hydra_server::cluster::NodeRole::Leader && !cfg!(feature = "cluster-redis") {
-        return Err(
-            "HYDRA_ROLE=leader requires the 'cluster-redis' cargo feature \
-             (rebuild with --features cluster-redis); refusing to start"
-                .into(),
-        );
-    }
-    // The control URL was the Redis-era standby-sync endpoint. A node whose leadership comes from
-    // the Arachne control plane does not poll it, so it must not be REQUIRED to configure it.
-    if role == hydra_server::cluster::NodeRole::Leader
-        && cluster.control_url.is_none()
-        && !arachne_carries_leadership
-    {
-        return Err(
-            "leader mode requires HYDRA_CONTROL_URL (the active leader's control endpoint, \
-             used by the standby sync); refusing to start"
-                .into(),
-        );
-    }
-    if role == hydra_server::cluster::NodeRole::Edge && cluster.control_url.is_none() {
-        return Err(
-            "edge mode requires HYDRA_CONTROL_URL (leader control endpoint); refusing to start"
-                .into(),
-        );
-    }
+    // The old mode validations lived here: `HYDRA_ROLE=leader` needing the Redis backbone and a
+    // control URL, and `HYDRA_ROLE=edge` needing one too. All three are retired — there is no role
+    // variable (the member list decides), no control channel to point at, and no stateless role.
+    // What replaced them is the pair above: cluster mode requires the control plane, and it
+    // requires an admin token, because every node now serves its own admin API.
     let sink_kind =
         std::env::var("HYDRA_USAGE_SINK").unwrap_or_else(|_| DEFAULT_USAGE_SINK.to_string());
     if role.is_cluster() && sink_kind != "clickhouse" {
@@ -353,9 +333,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     );
     let key_provider: Arc<dyn crypto::KeyProvider> = Arc::new(static_kp);
 
-    // (2a) DB pool + migrations — leader/all only. Edge nodes are stateless:
-    // no local SQLite, the config snapshot arrives via the control plane.
-    let pool = if role == hydra_server::cluster::NodeRole::Edge {
+    // (2a) DB pool + migrations. EVERY node has one (ADR-0001 D-2: a node that cannot materialize
+    // the config tree into its own database cannot serve it).
+    let pool = if false {
         None
     } else {
         let db_url = std::env::var("HYDRA_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string());
@@ -533,82 +513,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[allow(unused_variables)]
     let redis_backend: Option<()> = None;
 
-    // (2c-registry) Node registry (P4): every cluster node registers + sends
-    // heartbeats; edges use it to follow the active leader across failover.
-    #[cfg(feature = "cluster-redis")]
-    let registry: Option<Arc<hydra_server::cluster::registry::NodeRegistry>> = match &redis_backend
-    {
-        Some(b) => {
-            let public_url = std::env::var("HYDRA_PUBLIC_URL")
-                .ok()
-                .filter(|u| !u.is_empty());
-            if role == hydra_server::cluster::NodeRole::Leader && public_url.is_none() {
-                tracing::warn!(
-                        "HYDRA_PUBLIC_URL unset: this leader registers without a pollable URL —                          edges cannot discover it through the registry"
-                    );
-            }
-            let reg = Arc::new(hydra_server::cluster::registry::NodeRegistry::new(
-                b.pool().clone(),
-                cluster.node_id.clone(),
-                role,
-                public_url.clone().unwrap_or_default(),
-            ));
-            // Best-effort de-registration on shutdown, so a clean restart does
-            // not leave a row behind for the reaper to clean up later.
-            spawn_registry_unregister_on_shutdown((*reg).clone());
-            // Register once and FAIL FAST: a node that cannot register must not
-            // look healthy to the cluster (audit §3). The renewal loop below
-            // must not re-register before its first interval elapses —
-            // `tokio::time::interval` fires immediately, hence the leading
-            // `tick.tick().await`.
-            let grace = registry_stale_grace_secs();
-            reg.register(30, grace).await?;
-            let reg2 = reg.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
-                ticker.tick().await;
-                loop {
-                    ticker.tick().await;
-                    // `register`, NOT a heartbeat-only refresh: renewal must
-                    // rewrite the row too, or a node whose role/control_url
-                    // changed after boot advertises the boot-time value forever.
-                    if let Err(e) = reg2.register(30, grace).await {
-                        tracing::warn!(error = %e, "node registry: renew failed");
-                    }
-                }
-            });
-            // The reaper: without it nothing ever deletes a registry row (the
-            // 113-rows/108-offline symptom — there was no delete path at all).
-            let reaper = reg.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    ticker.tick().await;
-                    match reaper.sweep_stale().await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            hydra_server::admin::metrics::record_registry_reaped(n as u64);
-                            info!(reaped = n, "node registry: reaped stale rows");
-                        }
-                        Err(e) => tracing::warn!(error = %e, "node registry: sweep failed"),
-                    }
-                    if let Ok(nodes) = reaper.list_nodes().await {
-                        let alive = nodes.iter().filter(|n| n.alive).count();
-                        hydra_server::admin::metrics::record_registry_nodes(
-                            alive as i64,
-                            (nodes.len() - alive) as i64,
-                        );
-                    }
-                }
-            });
-            info!(node_id = %cluster.node_id, "node registered in the cluster registry");
-            Some(reg)
-        }
-        None => None,
-    };
-    #[cfg(not(feature = "cluster-redis"))]
-    #[allow(unused_variables)]
-    let registry: Option<()> = None;
+    // (2c-registry) The node registry USED TO BE HERE: every cluster node registered and sent
+    // heartbeats into Redis, and edges followed the active leader through it. Retired (ADR-0001
+    // T4.1) — membership is the static member list, leadership is raft's, and no node polls a peer.
 
     // (2c) Auth checker (with the Redis L2 in cluster mode: L1 misses are
     // served verdicts the cluster already resolved).
@@ -927,96 +834,26 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             );
         }
     }
-    // ONE live-node view, shared by the tenant API's E2 and the operator's
-    // `DELETE /api/v1/auth/cache`: two views could disagree about the fleet, and
-    // the whole point of the barrier is that both callers get the same answer.
-    #[cfg(feature = "cluster-redis")]
-    let mut fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = None;
-    #[cfg(feature = "cluster-redis")]
-    if let Some(reg) = &registry {
-        let live: Arc<arc_swap::ArcSwap<Vec<String>>> =
-            Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
-        let refresh = {
-            let reg = reg.clone();
-            let live = live.clone();
-            async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-                // One refresh immediately, then one per second. The previous form
-                // skipped the first tick, so the view stayed empty for up to a
-                // second after boot — and an empty view must never be read as
-                // "converged". Refreshing up front shrinks that window to a single
-                // `list_nodes` round trip.
-                let refresh_once = || {
-                    // Clone the `Arc`s so the closure is `Fn` (callable every tick)
-                    // while each future owns its own handles.
-                    let reg = reg.clone();
-                    let live = live.clone();
-                    async move {
-                        match reg.list_nodes().await {
-                            Ok(nodes) => {
-                                let ids: Vec<String> = nodes
-                                    .into_iter()
-                                    .filter(|n| n.alive)
-                                    .map(|n| n.node_id)
-                                    .collect();
-                                live.store(Arc::new(ids));
-                            }
-                            Err(e) => {
-                                // Keep the PREVIOUS view rather than reporting an
-                                // empty fleet: an empty set makes the barrier
-                                // report `pending` (nobody checked), and a stale
-                                // view of nodes we KNOW were live is strictly more
-                                // informative than "we cannot enumerate the fleet".
-                                // Either way the answer is never "converged".
-                                tracing::warn!(error = %e, "live-node refresh failed; keeping the previous view");
-                            }
-                        }
-                    }
-                };
-                refresh_once().await;
-                // `interval`'s first tick resolves immediately; consume it so the
-                // rhythm really is "once now, then once per second" rather than two
-                // back-to-back `list_nodes` calls at boot.
-                ticker.tick().await;
-                loop {
-                    ticker.tick().await;
-                    refresh_once().await;
-                }
-            }
-        };
-        tokio::spawn(refresh);
-        let view: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-            Arc::new(move || live.load().to_vec());
-        tenant_api_cfg.live_nodes = Some(view.clone());
-        fleet_live = Some(view.clone());
-        // F-6: keep the invalidation stream bounded. A trim that drops an entry
-        // some LIVE consumer had not applied bumps the generation so lagging
-        // consumers re-hydrate (idempotent full clear). When the live view
-        // PROVES every dropped entry was already applied, no bump happens —
-        // otherwise a fleet that is keeping up perfectly still wiped every
-        // node's auth cache on each trim above `maxlen / interval` events/s.
-        if let Some(stream) = &invalidation_stream {
-            hydra_server::cluster::events::spawn_trim_task(
-                stream.clone(),
-                // retain the most recent N invalidation events
-                10_000,
-                std::time::Duration::from_secs(30),
-                Some(view),
-            );
-            info!("invalidation stream trim task started (watermark-aware)");
-        }
-    }
+    // The live-node view the tenant API's E2 and `DELETE /api/v1/auth/cache` share. It used to be
+    // refreshed from the registry's heartbeat table; with the registry retired (ADR-0001 T4.1) the
+    // honest membership is the CONFIGURED member list, which is what the convergence barrier can
+    // verify against (a peer that is down cannot answer, and the barrier's timeout is what
+    // expresses that).
+    #[cfg(all(feature = "cluster-redis", feature = "arachne"))]
+    let fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = arachne_control
+        .as_ref()
+        .and_then(|c| c.peers())
+        .map(|peers| {
+            let names: Vec<String> = peers
+                .order()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            Arc::new(move || names.clone()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
+        });
+    #[cfg(all(feature = "cluster-redis", not(feature = "arachne")))]
+    let fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = None;
 
-    #[cfg(feature = "db")]
-    // The read capability is chosen from the SINK KIND, in one library function
-    // (`select`), not by probing for a pool: in a cluster the leader also has a
-    // local SQLite file and it holds no usage rows at all, so "is there a pool?"
-    // would answer a well-formed zero from an empty table.
-    //
-    // A failure here is NOT fatal: the endpoint reports 503 for a missing
-    // capability, which is the honest answer, and refusing to boot the whole
-    // data plane over an unreadable metering store would take the proxy down
-    // with it.
     let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
         match hydra_server::usage_query::select(
             &sink_kind_for_api,
@@ -1093,7 +930,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
     Ok(BootstrapComponents {
-        role,
         cluster,
         pool,
         store,
@@ -1108,10 +944,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         #[cfg(not(feature = "cluster-redis"))]
         invalidation_stream,
         #[cfg(feature = "cluster-redis")]
-        cluster_registry: registry,
-        #[cfg(not(feature = "cluster-redis"))]
-        cluster_registry: None,
-        #[cfg(feature = "cluster-redis")]
         fleet_live,
         #[cfg(feature = "cluster-redis")]
         converge_timeout: tenant_api_cfg.converge_timeout,
@@ -1120,7 +952,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
 /// The shared components built by [`bootstrap`] and consumed by [`run_server`].
 struct BootstrapComponents {
-    role: hydra_server::cluster::NodeRole,
     cluster: hydra_server::cluster::ClusterConfig,
     pool: Option<sqlx::SqlitePool>,
     store: ConfigStore,
@@ -1136,13 +967,6 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     invalidation_stream: Option<()>,
-    /// Fleet registry (cluster P4): handed to the admin service for the
-    /// whole-cluster status endpoint (`/api/v1/cluster/status`).
-    #[cfg(feature = "cluster-redis")]
-    cluster_registry: Option<Arc<hydra_server::cluster::registry::NodeRegistry>>,
-    #[cfg(not(feature = "cluster-redis"))]
-    #[allow(dead_code)]
-    cluster_registry: Option<()>,
     /// The live-node view the tenant API uses, carried to `run_server` so the
     /// admin service waits on the SAME fleet — a second view could disagree.
     #[cfg(feature = "cluster-redis")]
@@ -1383,8 +1207,6 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         c.key_provider.clone(),
         admin_token.clone(),
         admission.clone(),
-        // Edge data-plane nodes serve only probe endpoints (cluster P0b).
-        c.role == hydra_server::cluster::NodeRole::Edge,
         // Internal control-plane endpoints (cluster P1).
         c.cluster.cluster_token.clone(),
         // Leader-lease gate (/healthz/leader + admin mutation forwarding, P2/P3).
@@ -1398,7 +1220,6 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     #[cfg(feature = "cluster-redis")]
     {
         admin_state.invalidation = c.invalidation_stream;
-        admin_state.cluster_registry = c.cluster_registry;
     }
     // The same live-node view and convergence budget the tenant API got, so
     // `DELETE /api/v1/auth/cache` can report the fleet honestly (and so the two
@@ -1435,9 +1256,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         pingora_core::services::listening::Service::new("Hydra admin API".to_string(), admin_app);
     admin_service.add_tcp(&admin_addr);
     server.add_service(admin_service);
-    if c.role == hydra_server::cluster::NodeRole::Edge {
-        info!(admin = %admin_addr, "edge admin bound: /metrics /healthz /readyz only (no admin API)");
-    } else if admin_token.is_some() {
+    if admin_token.is_some() {
         info!(admin = %admin_addr, "admin REST API + UI bound (admin token configured)");
     } else {
         error!(
@@ -1628,18 +1447,6 @@ fn parse_reseal_switch(raw: Option<&str>) -> ResealSwitch {
 /// reapable (`HYDRA_REGISTRY_STALE_GRACE_SECS`, default 120).
 ///
 /// This value is used ONLY here, at registration time: it is the TTL of the
-/// witness key that `register` writes. The reaper itself does no time
-/// arithmetic — Redis expiry is what makes a row reapable, so there is no
-/// timestamp comparison and no clock-skew handling anywhere.
-#[cfg(feature = "cluster-redis")]
-fn registry_stale_grace_secs() -> u64 {
-    std::env::var("HYDRA_REGISTRY_STALE_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0) // 0 would make every row instantly reapable
-        .unwrap_or(120)
-}
-
 /// Seconds Pingora may spend draining in-flight requests after SIGTERM
 /// (`HYDRA_SHUTDOWN_DRAIN_SECS`, default 20).
 ///
@@ -1684,36 +1491,6 @@ fn parse_shutdown_drain_secs(raw: Option<&str>) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(20)
-}
-
-/// Best-effort registry de-registration on shutdown. Mirrors
-/// [`spawn_sink_flush_on_shutdown`]: pingora's SIGQUIT/SIGTERM path ends in
-/// `process::exit(0)`, which runs no destructors, so this is the only chance to
-/// remove our row (otherwise a clean restart leaves a row for the reaper).
-/// SIGQUIT is listed because that is what the documented systemd unit sends
-/// (`ops.md` §1.2 `KillSignal=SIGQUIT`).
-#[cfg(feature = "cluster-redis")]
-fn spawn_registry_unregister_on_shutdown(reg: hydra_server::cluster::registry::NodeRegistry) {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    tokio::spawn(async move {
-        let (Ok(mut term), Ok(mut interrupt), Ok(mut quit)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::quit()),
-        ) else {
-            tracing::warn!("cannot listen for shutdown signals; the registry row stays behind");
-            return;
-        };
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = interrupt.recv() => {}
-            _ = quit.recv() => {}
-        }
-        if let Err(e) = reg.unregister().await {
-            tracing::warn!(error = %e, "node registry: unregister on shutdown failed");
-        }
-    });
 }
 
 #[cfg(test)]

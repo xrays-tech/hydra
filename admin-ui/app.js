@@ -1285,11 +1285,20 @@ function renderClusterStatus(c) {
       text: t("custom.health.clusterNotEnabled") }));
     return;
   }
-  const alive = c.nodes.filter((n) => n.alive).length;
+  // `alive` is a THREE-state field since ADR-0001 T4.1: `true` for this node, `null` for a peer
+  // whose liveness this node cannot observe (there is no registry and no per-node RPC to ask).
+  // Counting null as "not alive" would render a healthy peer as DOWN, which is a claim nobody
+  // measured — so the card counts what is known and says so when something is not.
+  const alive = c.nodes.filter((n) => n.alive === true).length;
+  const unknown = c.nodes.filter((n) => n.alive === null || n.alive === undefined).length;
   const cards = [
     { l: t("custom.health.mode"), v: c.mode, cls: "" },
     { l: t("custom.health.leaseHolder"), v: c.lease_holder ?? "—", cls: c.lease_holder ? "ok" : "warn" },
-    { l: t("custom.health.nodesAlive"), v: `${alive}/${c.nodes.length}`, cls: alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn" },
+    {
+      l: t("custom.health.nodesAlive"),
+      v: unknown > 0 ? `${alive}/${c.nodes.length} (+${unknown} ${t("custom.health.unknownPill")})` : `${alive}/${c.nodes.length}`,
+      cls: unknown > 0 ? "" : alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn",
+    },
     { l: t("custom.health.self"), v: c.node_id || "—", cls: "" },
   ];
   for (const k of cards) stats.appendChild(el("div", { class: `stat ${k.cls}` },
@@ -1305,9 +1314,11 @@ function renderClusterStatus(c) {
       el("td", {}, name),
       el("td", {}, el("span", { class: `pill ${n.role === "leader" ? "info" : "warn"}`, text: n.role })),
       el("td", { class: "mono" }, n.control_url || "—"),
-      el("td", {}, n.alive
+      el("td", {}, n.alive === true
         ? el("span", { class: "pill ok", text: t("custom.health.alivePill") })
-        : el("span", { class: "pill dead", text: t("custom.health.downPill") })),
+        : n.alive === false
+          ? el("span", { class: "pill dead", text: t("custom.health.downPill") })
+          : el("span", { class: "pill", text: t("custom.health.unknownPill") })),
     ));
   }
   nodes.appendChild(el("div", { class: "table-wrap" },

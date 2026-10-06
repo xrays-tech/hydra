@@ -21,7 +21,7 @@ use tracing::debug;
 /// Rate-limiter abstraction (cluster P4): the in-memory [`RateLimiter`]
 /// (single node) and the Redis-backed [`crate::redis::rate_limit::RedisRateLimiter`]
 /// (cluster) both implement it, so the proxy's hot path is agnostic. Boxed
-/// futures for object safety (same pattern as `UsageSink` / `LeaseStore`).
+/// futures for object safety (same pattern as `UsageSink`).
 pub trait Limiter: Send + Sync {
     /// Pre-gate count check (request count): deny when any matched window is
     /// over its limit.

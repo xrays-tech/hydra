@@ -234,9 +234,6 @@ pub struct AdminState {
     /// thread through. If that ever gains an env knob, wire the real value here — a unit
     /// test in `admin/mod.rs` asserts the two defaults still agree.
     pub default_concurrency_policy: hydra_core::config::ConcurrencyPolicy,
-    /// Edge data-plane mode (cluster P0b): the admin service serves only
-    /// `/metrics` `/healthz` `/readyz`; everything else is 404 (no CRUD, no UI).
-    pub edge_mode: bool,
     /// `true` when the LAST post-write `reload_all` failed, i.e. the in-memory
     /// snapshot no longer matches the committed config (same condition as the
     /// `hydra_config_snapshot_stale` gauge).
@@ -299,15 +296,17 @@ pub struct AdminState {
     /// How long `DELETE /api/v1/auth/cache` waits for confirmation.
     #[cfg(feature = "cluster-redis")]
     pub converge_timeout: std::time::Duration,
-    /// Fleet registry (cluster P4): backs `GET /api/v1/cluster/status` for
-    /// the Admin UI Health page (whole-cluster view: nodes, roles, liveness,
-    /// lease holder). `None` off-cluster.
-    #[cfg(feature = "cluster-redis")]
-    pub cluster_registry: Option<Arc<crate::cluster::registry::NodeRegistry>>,
-    /// Placeholder so single-node builds keep a uniform shape.
-    #[cfg(not(feature = "cluster-redis"))]
-    #[allow(dead_code)]
-    pub cluster_registry: Option<()>,
+    /// The CONFIGURED member list (ADR-0001): the fleet, as far as any single node can know it.
+    /// `None` off-cluster.
+    #[cfg(feature = "arachne")]
+    pub cluster_peers: Option<Arc<crate::cluster::arachne_node::ClusterPeers>>,
+    /// This node's own identity, so the fleet view can mark which row is "self".
+    #[cfg(feature = "arachne")]
+    pub node_id: String,
+    /// The raft leader's node name, when the control plane knows it (a synchronous read of the
+    /// cache the 250 ms watch maintains).
+    #[cfg(feature = "arachne")]
+    pub leader_name: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 /// The default admission policy the concurrency endpoint resolves providers against.
@@ -337,7 +336,6 @@ impl AdminState {
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
         admission: AdmissionControl,
-        edge_mode: bool,
         cluster_token: Option<String>,
         leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
@@ -352,7 +350,6 @@ impl AdminState {
             snapshot_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission,
             default_concurrency_policy: DEFAULT_CONCURRENCY_POLICY,
-            edge_mode,
             cluster_token,
             leader_ready,
             auth_fail_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
@@ -365,14 +362,18 @@ impl AdminState {
             // new `new` parameter: this constructor has 14 call sites, and a
             // defaulted parameter is exactly what pushes them back to struct
             // literals.
+            // Injected by `main` through the builder below, like `live_nodes`: this constructor
+            // has many call sites and a defaulted parameter would push them back to struct literals.
+            #[cfg(feature = "arachne")]
+            cluster_peers: None,
+            #[cfg(feature = "arachne")]
+            node_id: String::new(),
+            #[cfg(feature = "arachne")]
+            leader_name: None,
             #[cfg(feature = "cluster-redis")]
             live_nodes: None,
             #[cfg(feature = "cluster-redis")]
             converge_timeout: std::time::Duration::from_millis(2_000),
-            #[cfg(feature = "cluster-redis")]
-            cluster_registry: None,
-            #[cfg(not(feature = "cluster-redis"))]
-            cluster_registry: None,
         }
     }
 
@@ -409,24 +410,6 @@ impl AdminState {
         self.pool
             .as_ref()
             .expect("admin SQLite pool (leader mode only)")
-    }
-
-    /// Whether this node may act as a cluster LEADER CANDIDATE.
-    ///
-    /// Defined as `!edge_mode` on purpose. `AdminState` carries no role field,
-    /// and under `--features server` (no `cluster-redis`) the cluster registry
-    /// is an `Option<()>` that cannot be read for a role at all. `edge_mode` is
-    /// present in every build and means exactly "data-plane node: no admin
-    /// CRUD", i.e. not a candidate.
-    ///
-    /// The single-node `all` role is NOT an edge, so it remains a candidate and
-    /// keeps serving control snapshots — the pre-existing behaviour.
-    ///
-    /// NOTE: this is the role/eligibility half only. Whether the node currently
-    /// HOLDS the lease is a separate question answered by `leader_ready`.
-    #[must_use]
-    pub fn is_leader_candidate(&self) -> bool {
-        !self.edge_mode
     }
 }
 
@@ -720,14 +703,6 @@ impl ServeHttp for AdminService {
         // binds the edge admin port to `0.0.0.0` (`jiqun-deploy.md`), so that was
         // the one deployment where it mattered. `/metrics` now takes the same
         // path as everywhere else: admin token required (see ops.md §9).
-        if self.state.edge_mode {
-            if path == "/healthz" || path == "/readyz" {
-                return handlers::health(&self.state, &trace_id).await;
-            }
-            if path != "/metrics" {
-                return handlers::err_json(404, "not_found", "edge node: no admin API", &trace_id);
-            }
-        }
 
         // Leader-lease probe (cluster P2): 200 while this node holds the
         // lease, 503 on standby, 404 on non-candidate nodes. Token-free so

@@ -68,7 +68,6 @@ async fn admin_state_with(auth_fail_per_min: u32, cluster_token: Option<&str>) -
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        false,
         cluster_token.map(str::to_string),
         None, // no leader election in tests
     );
@@ -1001,96 +1000,6 @@ async fn tenant_create_ui_payload_no_zombie_on_400() {
     let _ = std::fs::remove_file(&key_path);
 }
 
-/// Edge data-plane admin (cluster P0b): pool-less state serving ONLY the
-/// probe endpoints (`/metrics` `/healthz` `/readyz`); no admin UI, no CRUD —
-/// everything else is 404, even with a valid admin token.
-#[tokio::test]
-async fn edge_admin_probes_only() {
-    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
-    let store = ConfigStore::from_snapshot(
-        hydra_core::config::ConfigData::default(),
-        key_provider.clone(),
-    );
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
-    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
-    let state = Arc::new(AdminState::new(
-        None, // edge: no local SQLite
-        store,
-        auth,
-        breaker,
-        key_provider,
-        Some(TOKEN.to_string()),
-        hydra_server::proxy::admission::AdmissionControl::new(),
-        true, // edge_mode
-        None, // no cluster token in tests
-        None, // no leader election in tests
-    ));
-    let port = start_admin(state);
-
-    // Health PROBES are token-free: a load balancer must be able to probe
-    // without holding the admin secret.
-    let r = req(port, reqwest::Method::GET, "/healthz", None, None).await;
-    assert_eq!(r.status(), 200);
-    let r = req(port, reqwest::Method::GET, "/readyz", None, None).await;
-    assert_eq!(r.status(), 200);
-
-    // `/metrics` is NOT: it is admin-token gated on an edge exactly as on a
-    // leader. Publishing tenant/provider/model-labelled series to anyone who can
-    // reach the port made the exposure depend on the node's ROLE, and the shipped
-    // cluster topology binds the edge admin port to 0.0.0.0.
-    let r = req(port, reqwest::Method::GET, "/metrics", None, None).await;
-    assert_eq!(
-        r.status(),
-        401,
-        "an edge must not publish metrics without the admin token"
-    );
-    let r = req(port, reqwest::Method::GET, "/metrics", Some(TOKEN), None).await;
-    assert_eq!(
-        r.status(),
-        200,
-        "with the token the exposition works on an edge too"
-    );
-
-    // Admin API + UI are gone, even with the token.
-    let r = req(
-        port,
-        reqwest::Method::GET,
-        "/api/v1/tenants",
-        Some(TOKEN),
-        None,
-    )
-    .await;
-    assert_eq!(r.status(), 404, "edge has no CRUD GET");
-    let r = req(
-        port,
-        reqwest::Method::POST,
-        "/api/v1/providers",
-        Some(TOKEN),
-        Some(r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#),
-    )
-    .await;
-    assert_eq!(r.status(), 404, "edge has no CRUD POST");
-    let r = req(port, reqwest::Method::GET, "/admin/", None, None).await;
-    assert_eq!(r.status(), 404, "edge has no admin UI");
-    // The read-only model-catalog endpoint is admin API too ⇒ 404 on edge
-    // (edge short-circuits BEFORE the token gate / router).
-    let r = req(
-        port,
-        reqwest::Method::GET,
-        "/api/v1/tenants/t1/models",
-        Some(TOKEN),
-        None,
-    )
-    .await;
-    assert_eq!(r.status(), 404, "edge has no tenant model catalog");
-}
-
 // ===========================================================================
 // §2.5 / §2.6 — tenant-provider / tenant-model (UNIQUE conflict)
 // ===========================================================================
@@ -1778,7 +1687,6 @@ async fn empty_body_delete_invalidates_all_local() {
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        false,
         None,
         None,
     );
@@ -1972,7 +1880,6 @@ async fn concurrency_snapshot_reports_live_gates() {
         key_provider,
         Some(TOKEN.to_string()),
         admission,
-        false,
         None, // no cluster token in tests
         None, // no leader election in tests
     ));
@@ -2627,7 +2534,6 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        false,
         None,
         None,
     ));
@@ -3116,7 +3022,6 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        false,
         None,
         None,
     );

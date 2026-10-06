@@ -17,14 +17,12 @@
 //! zero-dependency behavior unchanged.
 
 use std::fmt;
-use std::time::Duration;
 
 pub mod content;
 #[cfg(feature = "cluster-redis")]
 pub mod events;
-pub mod lease;
-#[cfg(feature = "cluster-redis")]
-pub mod registry;
+// UNGATED: what is left of this module is `HydratedWire`, the value `ConfigStore::apply_snapshot`
+// installs — a plain data type used by every build, not a cluster facility.
 pub mod snapshot;
 
 // Arachne control plane (ADR-0001). Gated on its own feature, independent of
@@ -50,11 +48,11 @@ pub mod arachne_store;
 pub enum NodeRole {
     /// Single-node mode (default): today's behavior, zero cluster machinery.
     All,
-    /// Leader candidate: full node (proxy + admin + SQLite) and, once wired,
-    /// the control-plane endpoints and lease participation.
-    Leader,
-    /// Stateless data-plane node: proxy-only, no local SQLite, no admin CRUD.
-    Edge,
+    /// A raft member (ADR-0001 D-2): the FULL node — proxy, admin API, local SQLite, the control
+    /// plane — exactly like every other member. The former `edge` state is retired: a node that
+    /// serves traffic without the config database cannot materialize the tree, and "all nodes are
+    /// configured the same" is what makes the cluster's behaviour predictable.
+    Cluster,
 }
 
 impl NodeRole {
@@ -112,16 +110,10 @@ impl NodeRole {
         decision.role
     }
 
-    /// Whether this role participates in a cluster (leader/edge).
+    /// Whether this role participates in a cluster.
     #[must_use]
     pub fn is_cluster(self) -> bool {
-        matches!(self, Self::Leader | Self::Edge)
-    }
-
-    /// Whether this node runs the admin CRUD API (leader/all only).
-    #[must_use]
-    pub fn has_admin_crud(self) -> bool {
-        !matches!(self, Self::Edge)
+        matches!(self, Self::Cluster)
     }
 }
 
@@ -129,8 +121,7 @@ impl fmt::Display for NodeRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::All => f.write_str("all"),
-            Self::Leader => f.write_str("leader"),
-            Self::Edge => f.write_str("edge"),
+            Self::Cluster => f.write_str("cluster"),
         }
     }
 }
@@ -139,15 +130,12 @@ impl fmt::Display for NodeRole {
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub role: NodeRole,
-    /// Leader control endpoint base (`HYDRA_CONTROL_URL`), required on edges.
-    pub control_url: Option<String>,
-    /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`), required in
-    /// cluster mode (fail-closed).
+    /// Shared control-plane token (`HYDRA_CLUSTER_TOKEN`), required in cluster mode
+    /// (fail-closed). It is what gates the internal endpoints that remain — the health and status
+    /// surfaces — and what identifies a peer.
     pub cluster_token: Option<String>,
-    /// Control poll interval (`HYDRA_CONTROL_POLL_MS`, default 1000 ms).
-    pub poll_interval: Duration,
-    /// Stable node identity (`HYDRA_NODE_ID`, else `node-<random hex>`): the
-    /// lease holder id and the future registry identity.
+    /// Stable node identity (`HYDRA_NODE_ID`, else `node-<random hex>`). This is a raft member's
+    /// name, and its POSITION in `HYDRA_CLUSTER_PEERS` is its numeric raft id.
     pub node_id: String,
 }
 
@@ -157,17 +145,9 @@ impl ClusterConfig {
     pub fn from_env(role: NodeRole) -> Self {
         Self {
             role,
-            control_url: std::env::var("HYDRA_CONTROL_URL")
-                .ok()
-                .filter(|u| !u.is_empty()),
             cluster_token: std::env::var("HYDRA_CLUSTER_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty()),
-            poll_interval: std::env::var("HYDRA_CONTROL_POLL_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::from_millis(1000)),
             node_id: node_id_from(
                 std::env::var("HYDRA_NODE_ID").ok().as_deref(),
                 std::env::var("HOSTNAME").ok().as_deref(),
@@ -188,7 +168,7 @@ impl ClusterConfig {
 /// and the last one is the dangerous one: they share a registry row, the
 /// shutdown `unregister()` of either deletes that shared row (including the
 /// peer's registration), and — because this same id is the LEASE identity
-/// (`LeaderElection` renews whenever `GET hydra:lease == our node_id`) — BOTH
+/// (the retired lease election renewed whenever `GET hydra:lease == our node_id`) — BOTH
 /// processes would consider themselves the lease holder, i.e. split brain.
 /// Runbook: `dev-docs/ops.md` §13.6.
 ///
@@ -215,7 +195,7 @@ pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> St
 /// (`cluster/arachne_node.rs`, through named constants rather than literals) and by
 /// `main.rs`; `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` / `HYDRA_CLUSTER_TOKEN` are still read
 /// by the Redis backbone, which stays for the data-plane hot path (ADR-0001 D-1).
-const CLUSTER_ONLY_ENV: [&str; 9] = [
+const CLUSTER_ONLY_ENV: [&str; 7] = [
     "HYDRA_CLUSTER_PEERS",  // the member list — the decision itself
     "HYDRA_CLUSTER_ID",     // optional cluster name: refuses a data directory from another cluster
     "HYDRA_REDIS_URL",      // the data-plane backbone (still required in a cluster)
@@ -223,12 +203,6 @@ const CLUSTER_ONLY_ENV: [&str; 9] = [
     "HYDRA_CLUSTER_TOKEN",  // shared control-plane token
     "HYDRA_NODE_ID",        // this node's identity (registry today, raft id after T1.3)
     "HYDRA_ARACHNE_LISTEN", // where this node's raft transport binds
-    // Still read by the Redis control path that has not been deleted yet. They move to
-    // RETIRED_CLUSTER_ENV in the same commit that deletes their readers (plan T4.1) — until
-    // then they are genuinely live, and claiming otherwise would make the retirement
-    // diagnostic a lie.
-    "HYDRA_CONTROL_URL", // snapshot polling (control_client, registry, forward)
-    "HYDRA_CONTROL_POLL_MS", // ...and its interval (control_client)
 ];
 
 /// Variables the Arachne control plane RETIRES, once their readers are gone.
@@ -250,7 +224,19 @@ const CLUSTER_ONLY_ENV: [&str; 9] = [
 /// yet (`cluster/lease.rs`, `cluster/registry.rs`, `main.rs`'s cluster validation). They move here
 /// in the commit that deletes their readers, not before — claiming otherwise would make the
 /// diagnostic a lie. `HYDRA_ROLE` is already unread (the member list replaced it).
-const RETIRED_CLUSTER_ENV: [&str; 2] = ["HYDRA_FORWARD_TIMEOUT_SECS", "HYDRA_LEADER_LEASE_MS"];
+const RETIRED_CLUSTER_ENV: [&str; 9] = [
+    "HYDRA_FORWARD_TIMEOUT_SECS",
+    "HYDRA_LEADER_LEASE_MS",
+    "HYDRA_CONTROL_URL",
+    "HYDRA_CONTROL_POLL_MS",
+    "HYDRA_PUBLIC_URL",
+    "HYDRA_REGISTRY_STALE_GRACE_SECS",
+    "HYDRA_FAILOVER_GRACE_MS",
+    "HYDRA_ROLE",
+    // Not a variable a deployment may keep: it is read by nobody, and it is listed so a
+    // deployment that still carries it is TOLD rather than left believing it does something.
+    "HYDRA_EDGE",
+];
 
 /// Which of `present` are retired, according to `table`.
 ///
@@ -326,7 +312,7 @@ pub fn cluster_decision_with(
         // telling them about their role.
         return ClusterDecision {
             role: if clustered {
-                NodeRole::Leader
+                NodeRole::Cluster
             } else {
                 NodeRole::All
             },
@@ -338,7 +324,7 @@ pub fn cluster_decision_with(
 
     if clustered {
         return ClusterDecision {
-            role: NodeRole::Leader,
+            role: NodeRole::Cluster,
             notice: ClusterNotice::Quiet,
         };
     }
@@ -394,8 +380,6 @@ mod tests {
                 "HYDRA_CLUSTER_TOKEN",
                 "HYDRA_NODE_ID",
                 "HYDRA_ARACHNE_LISTEN",
-                "HYDRA_CONTROL_URL",
-                "HYDRA_CONTROL_POLL_MS",
             ],
             "the cluster-only table is what the fallback diagnostic names — changing it is a \
              user-visible change"
@@ -443,7 +427,7 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(node.role, NodeRole::Leader);
+        assert_eq!(node.role, NodeRole::Cluster);
         assert_eq!(node.notice, ClusterNotice::Quiet);
 
         // Nothing cluster-shaped at all: the documented single-node default, silently.
@@ -484,7 +468,7 @@ mod tests {
             "a retired variable must be named even on a healthy cluster node"
         );
         // ...and it must not change the decision.
-        assert_eq!(retired.role, NodeRole::Leader);
+        assert_eq!(retired.role, NodeRole::Cluster);
     }
 
     /// A retired variable must be detectable from the environment table alone, and the
@@ -530,7 +514,17 @@ mod tests {
         // nothing reads a retired name: it fails if a documented variable has no read site.
         assert_eq!(
             RETIRED_CLUSTER_ENV,
-            ["HYDRA_FORWARD_TIMEOUT_SECS", "HYDRA_LEADER_LEASE_MS"],
+            [
+                "HYDRA_FORWARD_TIMEOUT_SECS",
+                "HYDRA_LEADER_LEASE_MS",
+                "HYDRA_CONTROL_URL",
+                "HYDRA_CONTROL_POLL_MS",
+                "HYDRA_PUBLIC_URL",
+                "HYDRA_REGISTRY_STALE_GRACE_SECS",
+                "HYDRA_FAILOVER_GRACE_MS",
+                "HYDRA_ROLE",
+                "HYDRA_EDGE",
+            ],
             "the retirement table changed: update this test AND confirm (via the env guard) that \
              nothing reads the variable that moved"
         );

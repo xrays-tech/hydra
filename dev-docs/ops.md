@@ -1494,14 +1494,12 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_CLUSTER_PEERS` | **required in cluster mode**: the static member list, `id=host:port` per member, this node included. Its presence IS the cluster decision. The member ORDER is immutable: Arachne derives each member's numeric raft id from its position in the list |
 | `HYDRA_NODE_ID` | **required in cluster mode**: this node's identity, and it must appear in the member list. No `HOSTNAME`/random fallback on purpose — a duplicate id means two nodes share one raft identity |
 | `HYDRA_ARACHNE_LISTEN` | **required in cluster mode**: where this node's raft transport binds. Its port must equal the admin port (the interface may differ) so the address Arachne reports as the leader hint is directly usable |
-| `HYDRA_CLUSTER_ID` | optional: names the cluster so a node refuses to adopt an Arachne data directory that belongs to a different one. Defaults to a hash of the data directory |
+| `HYDRA_CLUSTER_ID` | optional: names the cluster so a node refuses to adopt an Arachne data directory that belongs to a different one. Defaults to a hash of the MEMBER LIST (ADR-0001: the list is the cluster identity; the order matters) |
 | `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
+| `HYDRA_ADMIN_TOKEN` | required in cluster mode: every node serves its own admin API, so it gates EACH node (not a relaying standby — that layer is retired) |
 | `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes)  **Minimum 16 characters AND it must be random** (`openssl rand -hex 32`) — the length is a floor, not a guarantee: the startup check cannot tell `aaaaaaaaaaaaaaaa` from a real token, and this is the token that authorises the internal control plane and the cross-tenant write endpoints. |
-| `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `dev-docs/cluster.md` §5.2) |
-| `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
-| `HYDRA_CONTROL_POLL_MS` | 1000 | ~~`HYDRA_LEADER_LEASE_MS`~~: the Redis lease is retired (ADR-0001 T4.1) — leadership is raft's, so the TTL has no reader (see `RETIRED_CLUSTER_ENV`) |
 | `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
 | `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` | bound on **establishing** the TCP/TLS connection to a provider (default **10**); `0`/garbage falls back to the default. **Must be strictly below `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`** — the node refuses to start otherwise, because the first-byte bound wraps the whole send (connect included) and would always fire first. What it buys (measured 2026-09-30 against a black-holed route, `integration/test_upstream_connect_bound.py`): without it a provider whose SYN goes nowhere burned the whole first-byte bound and was classified as a *post-send* failure, so the request returned `502 upstream_transport_error` **instead of failing over** to a healthy provider (`codes=[502,200,502,200,502,200]`, `retries=0`); with it the attempt fails in ≤10s as a connect error and the request **fails over** (`codes=[200×6]`, `retries=4`, and `hydra_upstream_first_byte_timeout_total` stays 0 for that provider). A healthy provider on a normal RTT establishes in milliseconds, so this bound only ever fires on a dead route. **What a dead route costs, measured 2026-09-30** (`integration/test_dead_route_cost.py`, shipped defaults 10s/30s, dead route = a dropped SYN): every affected request pays ~**10s** and is then served by a healthy peer (`10.0s, 0.0s, 10.0s, …` — one penalty per time the dead provider is chosen), the provider is taken out of the rotation after exactly **5** such failures (`hydra_candidate_skipped_total{reason="breaker_dead"}` starts at 1 per skipped request), and the penalties then **stop** (all later requests < 1s). Worst case for a two-provider SWRR rotation: ~5 × 10s of user-visible latency spread over the first ~9 requests. `DELETE /api/v1/breaker/{id}` clears the dead-set, so resetting **without fixing the route** buys those 10s penalties again — fix the route first |
 | `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected (it falls back to the default rather than meaning 'instant'). Covers the response HEADERS only — a connect that never completes is bounded by `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` above, and the response BODY by `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`. See the alert row in §9.1 |
@@ -1510,7 +1508,21 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_MAX_REQUEST_BODY_HARD` | hard cap on ONE downstream request body, in **bytes** (default 33554432 = 32 MiB); `0`/garbage falls back to the default. Exceeding it is `413 request_body_too_large` + close. Lower it to cut peak memory (memory ≈ concurrency × average body); raise it for bigger payloads. The **admin** API and the tenant API have their own 1 MiB caps, which are compile-time constants and NOT tunable (`MAX_ADMIN_BODY_BYTES`, `tenant_api/mod.rs` `MAX_BODY`) — both answer `413 request_body_too_large` / `413 payload_too_large` |
 | `HYDRA_REQUEST_BODY_TIMEOUT_SECS` | TOTAL deadline for reading one downstream request body (default 60); `0` is rejected. Exceeding it is `408 request_body_timeout` — see the body-cap table in §6.7 |
 | `HYDRA_SHUTDOWN_DRAIN_SECS` | seconds Pingora drains in-flight requests after SIGTERM (default 20); size `terminationGracePeriodSeconds` from it (see §13.5b) |
-| `HYDRA_REGISTRY_STALE_GRACE_SECS` | TTL of the registry "last seen" witness (default 120). Only `> 0` values are accepted; a small value narrows the grace window in which a merely-silent node is protected from reaping |
+
+### 13.3b Variables the Arachne control plane RETIRED
+
+These are **read by nothing** and are listed in the code's `RETIRED_CLUSTER_ENV`; a deployment that
+still sets one gets a startup ERROR naming it, so nobody believes it still does something. Remove
+them from the manifests:
+
+`HYDRA_ROLE`, `HYDRA_CONTROL_URL`, `HYDRA_PUBLIC_URL`, `HYDRA_CONTROL_POLL_MS`,
+`HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS`, `HYDRA_FAILOVER_GRACE_MS`,
+`HYDRA_FORWARD_TIMEOUT_SECS`.
+
+What replaced them: membership is `HYDRA_CLUSTER_PEERS` (the list IS the cluster), leadership is
+raft's (there is no lease to set a TTL for), config reaches every node by materializing the tree
+(there is no control URL to point at and no poll interval to tune), and admin writes are applied by
+the node that received them (there is no forward timeout).
 
 ### 13.4 Failover drill
 

@@ -430,6 +430,16 @@ pub struct ArachneControl {
     is_leader: Arc<AtomicBool>,
     /// How many times this node's leadership verdict changed.
     flips: Arc<AtomicU64>,
+    /// The member list this node was started with (`None` when no node was started).
+    peers: Option<super::arachne_node::ClusterPeers>,
+    /// The raft leader's NODE NAME as of the last watch round — `None` while nobody is known to
+    /// lead (a cold cluster, or a lost quorum).
+    ///
+    /// Cached because the surfaces that need it (the admin UI's fleet panel and its "you are not
+    /// the leader" banner) are SYNCHRONOUS: they cannot await `leader_hint`, and the watch already
+    /// runs every 250 ms. It replaces the Redis registry's `lease_holder` — the same fact, read
+    /// through raft instead.
+    leader: Arc<std::sync::Mutex<Option<String>>>,
     /// Stops the background watch at shutdown.
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -444,9 +454,11 @@ impl ArachneControl {
     pub fn not_started() -> Self {
         Self {
             handle: None,
+            peers: None,
             node_id: NodeId::new("unstarted"),
             is_leader: Arc::new(AtomicBool::new(false)),
             flips: Arc::new(AtomicU64::new(0)),
+            leader: Arc::new(std::sync::Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -460,9 +472,11 @@ impl ArachneControl {
     pub fn for_tests(handle: Handle, node_id: NodeId) -> Self {
         Self {
             handle: Some(handle),
+            peers: None,
             node_id,
             is_leader: Arc::new(AtomicBool::new(false)),
             flips: Arc::new(AtomicU64::new(0)),
+            leader: Arc::new(std::sync::Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -478,6 +492,28 @@ impl ArachneControl {
         self.handle
             .as_ref()
             .map(|h| super::arachne_store::ArachneConfigStore::new(h.clone()))
+    }
+
+    /// The parsed MEMBER LIST this node was started with, when it was started.
+    ///
+    /// This is the fleet, as far as any single node can know it (ADR-0001: "the member list IS the
+    /// decision"). It is a static table — no heartbeats, no liveness — which is why the surfaces
+    /// that used to report liveness now report "unknown" instead.
+    #[must_use]
+    pub fn peers(&self) -> Option<&super::arachne_node::ClusterPeers> {
+        self.peers.as_ref()
+    }
+
+    /// The raft leader's node name as of the last watch round (cheap, synchronous).
+    ///
+    /// `None` when nothing is known to lead yet — a cold cluster, or a lost quorum. It replaced the
+    /// Redis registry's `lease_holder`: the same fact, observed through raft instead.
+    #[must_use]
+    pub fn leader_name(&self) -> Option<String> {
+        self.leader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// This node's identity.
@@ -573,6 +609,19 @@ impl ArachneControl {
                     }
                 }
                 let observed = control.probe_once().await;
+                // One more local call per round: `leader_hint` is authoritative for "who leads"
+                // (ADR-0001 relies on it for follower→leader resolution), and caching it here is
+                // what lets the synchronous operator surfaces answer that question at all. A hint
+                // we cannot read leaves the previous value in place rather than reporting "no
+                // leader" for a transient failure.
+                if let Some(handle) = control.handle_ref() {
+                    // `leader_hint` returns `Option<(NodeId, SocketAddr)>`: `None` means "no leader
+                    // is known", which is exactly the state we must NOT overwrite with a stale name
+                    // — a lost quorum clears it.
+                    let hint = handle.leader_hint().await;
+                    *control.leader.lock().unwrap_or_else(|e| e.into_inner()) =
+                        hint.map(|(id, _addr)| id.to_string());
+                }
                 let previous = control.is_leader.swap(observed, Ordering::AcqRel);
                 if observed != previous {
                     if observed {
@@ -613,6 +662,18 @@ impl ArachneControl {
         let cfg = config_from_env(sqlite_path, data_dir_override)?;
         let node_id = cfg.node_id.clone();
         let data_dir = cfg.data_dir.clone();
+        // The member table, kept so the operator surfaces can report the fleet: it is the ONLY
+        // thing this process knows about its peers (no registry, no heartbeats — by design).
+        let peers = cluster_peers(
+            std::env::var("HYDRA_CLUSTER_PEERS")
+                .unwrap_or_default()
+                .as_str(),
+            std::env::var("HYDRA_NODE_ID").unwrap_or_default().as_str(),
+            std::env::var("HYDRA_ARACHNE_LISTEN")
+                .unwrap_or_default()
+                .as_str(),
+        )
+        .map_err(|e| e.to_string())?;
 
         let started = Arachne::start(cfg).map_err(|e| format!("Arachne::start: {e}"))?;
         let _ = started; // zero-field marker: the node lives in the facade's process-wide slot
@@ -622,9 +683,11 @@ impl ArachneControl {
 
         let control = Arc::new(Self {
             handle: Some(handle),
+            peers: Some(peers),
             node_id: node_id.clone(),
             is_leader: Arc::new(AtomicBool::new(false)),
             flips: Arc::new(AtomicU64::new(0)),
+            leader: Arc::new(std::sync::Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         });
 
