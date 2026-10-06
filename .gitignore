@@ -8,10 +8,21 @@
 # Local SQLite data directory (created at runtime by hydra-server)
 /data
 
-# SQLite database files created at workspace root by integration tests
-/hydra.db
-/hydra.db-shm
-/hydra.db-wal
+# SQLite database files created at the workspace root by integration tests and by
+# in-place runs. The `-shm`/`-wal` sidecars matter most: they are rewritten on every
+# run and were committed by accident once (`e2e_test.db-shm`, `e2e_test.db-wal`).
+/*.db
+/*.db-shm
+/*.db-wal
+/*.db-journal
+
+# Runtime leftovers: pid files. The acceptance gate writes its own into $RUN, but
+# `hydra.pid` was written at the repo root before that and got committed.
+*.pid
+
+# Python byte-code caches (environment/init.py, tools/hydra-py/**).
+__pycache__/
+*.pyc
 
 # Cross-compiled Linux binary staged for Docker (built by environment/build.sh)
 /bin/
@@ -58,3 +69,12 @@
 # Temporary local tooling (sqlx-cli bootstrap cache; deleted after .sqlx regen)
 /.cargo-cache/
 /.acceptance/
+
+# Playwright (the e2e suite writes these into the repo root; `.dockerignore`
+# already excluded them, but an unclean `git status` after a local e2e run is
+# how a stray artefact gets committed by accident.)
+test-results/
+playwright-report/
+
+# Arachne Phase 0 evaluation artefacts (docs snapshot, upstream checkout, probes).
+/.arachne-research/
