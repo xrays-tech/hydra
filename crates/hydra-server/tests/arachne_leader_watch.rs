@@ -1,3 +1,4 @@
+#![cfg(feature = "arachne")]
 //! T1.3 — leader detection must be a **write probe**, never `leader_hint()`.
 //!
 //! A probe measured that a node which has just become leader does **not** name

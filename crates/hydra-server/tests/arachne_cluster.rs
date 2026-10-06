@@ -1,3 +1,4 @@
+#![cfg(feature = "arachne")]
 //! T1.2 — a peer table parsed from `HYDRA_CLUSTER_PEERS` really can start a
 //! raft cluster (ADR-0001, plan Phase 1).
 //!

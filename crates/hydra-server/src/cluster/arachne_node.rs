@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arachne_kv::client::Handle;
+use arachne_kv::server::Arachne;
 use arachne_kv::{NodeId, Profile};
 
 /// The environment variable carrying the static member list.
@@ -433,6 +434,8 @@ pub struct ArachneControl {
     is_leader: Arc<AtomicBool>,
     /// How many times this node's leadership verdict changed.
     flips: Arc<AtomicU64>,
+    /// Stops the background watch at shutdown.
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl ArachneControl {
@@ -448,6 +451,7 @@ impl ArachneControl {
             node_id: NodeId::new("unstarted"),
             is_leader: Arc::new(AtomicBool::new(false)),
             flips: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -463,6 +467,7 @@ impl ArachneControl {
             node_id,
             is_leader: Arc::new(AtomicBool::new(false)),
             flips: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -541,34 +546,97 @@ impl ArachneControl {
     ///
     /// `/healthz/leader` must be answerable without awaiting anything, so this
     /// task owns the only place that awaits the probe.
-    pub fn spawn_leader_watch(&self) -> tokio::task::JoinHandle<()> {
-        let handle = self.handle.clone();
-        let node_id = self.node_id.clone();
-        let is_leader = Arc::clone(&self.is_leader);
-        let flips = Arc::clone(&self.flips);
+    /// Takes `&Arc<Self>` rather than `&self`: the task owns a clone for as long as the
+    /// process runs, so the control (its handle and its flag) cannot be dropped out from
+    /// under the probe — which would silently freeze the cached answer at whatever it was,
+    /// and a frozen "I am the leader" is exactly the value that must never be served.
+    pub fn spawn_leader_watch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let control = Arc::clone(self);
+        let shutdown = Arc::clone(&self.shutdown);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(LEADER_PROBE_INTERVAL);
             loop {
-                ticker.tick().await;
-                let observed = match handle.as_ref() {
-                    Some(h) => h
-                        .without_redirect()
-                        .put(LEADER_PROBE_KEY, node_id.as_str().as_bytes())
-                        .await
-                        .is_ok(),
-                    None => false,
-                };
-                let previous = is_leader.swap(observed, Ordering::AcqRel);
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown.notified() => {
+                        tracing::debug!(node_id = %control.node_id, "leader watch stopping");
+                        return;
+                    }
+                }
+                let observed = control.probe_once().await;
+                let previous = control.is_leader.swap(observed, Ordering::AcqRel);
                 if observed != previous {
                     if observed {
-                        tracing::info!(node_id = %node_id, "this node is now the raft leader");
+                        tracing::info!(node_id = %control.node_id, "this node is now the raft leader");
                     } else {
-                        tracing::warn!(node_id = %node_id, "this node is no longer the raft leader");
+                        tracing::warn!(node_id = %control.node_id, "this node is no longer the raft leader");
                     }
-                    flips.fetch_add(1, Ordering::AcqRel);
+                    control.flips.fetch_add(1, Ordering::AcqRel);
                 }
             }
         })
+    }
+
+    /// Stop the background watch (used by `shutdown`).
+    pub fn stop_watch(&self) {
+        self.shutdown.notify_waiters();
+    }
+
+    /// Start the Arachne node this process was configured for, or `None` in single-node mode.
+    ///
+    /// **Must be called from inside a tokio runtime.** Measured: `Arachne::start` builds its
+    /// own `tokio::time::Interval` while assembling the actor, so calling it from a plain
+    /// synchronous `main` panics with "there is no reactor running" — on BOTH the single-node
+    /// and the member path (probed against 0.1.1 and 0.1.2). Hydra's bootstrap already runs
+    /// inside the background runtime, so the call site is fine; the constraint is stated here
+    /// because the next person to move this call will not rediscover it cheaply.
+    ///
+    /// # Errors
+    /// A reason for every failure: an unusable member list, a data directory that belongs to
+    /// another cluster, or Arachne refusing to start.
+    pub async fn start_from_env(
+        sqlite_path: &str,
+        data_dir_override: Option<&str>,
+    ) -> Result<Option<Arc<Self>>, String> {
+        if !cluster_enabled() {
+            return Ok(None);
+        }
+        let cfg = config_from_env(sqlite_path, data_dir_override)?;
+        let node_id = cfg.node_id.clone();
+        let data_dir = cfg.data_dir.clone();
+
+        let started = Arachne::start(cfg).map_err(|e| format!("Arachne::start: {e}"))?;
+        let _ = started; // zero-field marker: the node lives in the facade's process-wide slot
+        let handle = Arachne::handle()
+            .await
+            .map_err(|e| format!("Arachne::handle after start: {e}"))?;
+
+        let control = Arc::new(Self {
+            handle: Some(handle),
+            node_id: node_id.clone(),
+            is_leader: Arc::new(AtomicBool::new(false)),
+            flips: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        });
+
+        // The identity check runs before the watch: a node that cannot agree with its own
+        // data directory about which cluster it belongs to must not start serving.
+        await_cluster_preflight(
+            &control,
+            &cluster_id_from(
+                std::env::var("HYDRA_CLUSTER_ID").ok().as_deref(),
+                &data_dir.to_string_lossy(),
+            ),
+        )
+        .await?;
+
+        control.spawn_leader_watch();
+        tracing::info!(
+            node_id = %node_id,
+            data_dir = %data_dir.display(),
+            "arachne control plane started; leadership is decided by a write probe"
+        );
+        Ok(Some(control))
     }
 }
 

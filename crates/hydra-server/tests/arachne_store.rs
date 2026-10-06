@@ -1,3 +1,4 @@
+#![cfg(feature = "arachne")]
 //! T2.2 — the config commit point, against a real Arachne node.
 //!
 //! What only a real node can show:

@@ -210,7 +210,40 @@ fn main() {
 /// bg tasks that share them).
 async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> {
     // (0) Node role (cluster P0b): all (default, single-node) | leader | edge.
+    //     ADR-0001: the role is now derived from `HYDRA_CLUSTER_PEERS` — the member list IS
+    //     the decision — and a node with the list set is a raft member.
     let role = hydra_server::cluster::NodeRole::from_env();
+
+    // (0b) Arachne control plane (ADR-0001). Started HERE, inside the async bootstrap, and
+    //      that placement is a requirement rather than a preference: `Arachne::start` builds a
+    //      `tokio::time::Interval` while assembling its actor and panics with
+    //      "there is no reactor running" when called from a synchronous context (measured on
+    //      both the single-node and the member path). `main` runs the bootstrap inside the
+    //      background runtime, so this is the one place the call is legal.
+    //
+    //      In single-node mode (`HYDRA_CLUSTER_PEERS` unset) this is a no-op and the process
+    //      keeps zero new dependencies on its path.
+    #[cfg(feature = "arachne")]
+    let arachne_control: Option<
+        std::sync::Arc<hydra_server::cluster::arachne_node::ArachneControl>,
+    > = {
+        let sqlite_path = std::env::var("HYDRA_DB").unwrap_or_else(|_| "hydra.db".to_string());
+        let data_dir_override = std::env::var("HYDRA_ARACHNE_DATA_DIR").ok();
+        hydra_server::cluster::arachne_node::ArachneControl::start_from_env(
+            &sqlite_path,
+            data_dir_override.as_deref(),
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("arachne control plane refused to start: {e}").into()
+        })?
+    };
+    // Without the feature the control plane does not exist at all; the binding stays so the
+    // `leader_ready` merge below is written once rather than twice (the same shape the
+    // `invalidation_stream` / `cluster_registry` fields use in `BootstrapComponents`).
+    #[cfg(not(feature = "arachne"))]
+    #[allow(unused_variables, clippy::no_effect_underscore_binding)]
+    let _arachne_control: Option<()> = None;
     info!(role = %role, "hydra gateway starting");
 
     // Cluster-mode fail-closed startup contract (v8 plan §2.1 / §7.3):
@@ -1166,6 +1199,26 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     };
     #[cfg(not(feature = "cluster-redis"))]
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
+
+    // Arachne control plane (ADR-0001): when it is up, leadership comes from the WRITE PROBE
+    // and not from the Redis lease. The probe answers "can THIS node commit", which is the
+    // question `/healthz/leader` and the admin write path actually ask; the lease answered
+    // "does this node hold a key with a TTL", which was only ever a proxy for it. The Redis
+    // election above still runs when its feature is compiled in, because the data-plane
+    // subsystems (rate limit, breaker, L2 cache, invalidation) are still backed by Redis —
+    // retiring the lease itself is plan T4.1.
+    #[cfg(feature = "arachne")]
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = match &arachne_control {
+        Some(control) => {
+            let control = Arc::clone(control);
+            info!(
+                node_id = %control.node_id(),
+                "leadership is decided by the Arachne write probe (raft), not the Redis lease"
+            );
+            Some(Arc::new(move || control.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
+        }
+        None => leader_ready,
+    };
 
     Ok(BootstrapComponents {
         role,
