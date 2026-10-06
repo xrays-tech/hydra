@@ -33,12 +33,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arachne_kv::client::Handle;
-use arachne_kv::NodeId;
+use arachne_kv::{NodeId, Profile};
 
 /// The environment variable carrying the static member list.
 pub const PEERS_ENV: &str = "HYDRA_CLUSTER_PEERS";
@@ -46,6 +47,15 @@ pub const PEERS_ENV: &str = "HYDRA_CLUSTER_PEERS";
 pub const NODE_ID_ENV: &str = "HYDRA_NODE_ID";
 /// The environment variable carrying this node's raft listen address.
 pub const LISTEN_ENV: &str = "HYDRA_ARACHNE_LISTEN";
+/// The environment variable carrying this node's Arachne data directory (the
+/// WAL + snapshot location). Optional: when unset, the durable state is placed
+/// beside the proxy's own data directory under a fixed name.
+pub const DATA_DIR_ENV: &str = "HYDRA_ARACHNE_DATA_DIR";
+/// The environment variable naming the cluster. Optional, and used for exactly
+/// one thing: refusing to join a data directory that belongs to another
+/// cluster (`ClusterConfig::cluster_id`, which Arachne checks during the
+/// transport handshake).
+pub const CLUSTER_ID_ENV: &str = "HYDRA_CLUSTER_ID";
 
 /// Every way a cluster configuration can be wrong.
 ///
@@ -432,6 +442,11 @@ impl ArachneControl {
     pub fn flips(&self) -> u64 {
         self.flips.load(Ordering::Acquire)
     }
+    /// The node's handle, when one was started. Crate-internal: the assembly
+    /// step needs it, and nothing else should reach past the cache.
+    pub(crate) fn handle_ref(&self) -> Option<&Handle> {
+        self.handle.as_ref()
+    }
 
     /// Whether this node can currently commit a write — the only question whose
     /// answer is authoritative in both directions.
@@ -513,6 +528,189 @@ impl ArachneControl {
                 }
             }
         })
+    }
+}
+
+/// Build the Arachne config for `peers`.
+///
+/// A pure function of the parsed table plus the two derived values, so the
+/// mapping from the peer table to raft's view of the cluster is asserted
+/// without starting a node. The profile is the LAN preset: these are
+/// control-plane nodes inside one deployment, not a geo-distributed quorum.
+#[must_use]
+pub fn arachne_config(
+    peers: &ClusterPeers,
+    cluster_id: String,
+    data_dir: PathBuf,
+) -> arachne_kv::server::ClusterConfig {
+    let mut cfg = arachne_kv::server::ClusterConfig::member(
+        cluster_id,
+        peers.node_id().clone(),
+        peers.listen(),
+        data_dir,
+        peers.order().to_vec(),
+        peers.addresses().clone(),
+    );
+    cfg.profile = Profile::Lan;
+    cfg
+}
+
+/// Where this node's Arachne WAL and snapshots live.
+///
+/// Defaults to a directory **beside the SQLite file**. The WAL is durable state
+/// — it holds the raft log this node needs to rejoin without a snapshot — so a
+/// `/tmp` default would lose it on reboot and silently turn every restart into a
+/// full catch-up.
+#[must_use]
+pub fn arachne_data_dir(sqlite_path: &str, override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let sqlite = Path::new(sqlite_path);
+    let dir = sqlite
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("arachne"), |p| p.join("arachne"));
+    dir
+}
+
+/// The cluster name given to Arachne.
+///
+/// Arachne refuses a data directory whose recorded cluster id differs, which is
+/// what stops a node from silently joining the wrong raft group after a
+/// directory is reused or a volume is mis-mounted.
+///
+/// The default is derived from the **data directory path**, not from a constant:
+/// two clusters on one host must not share an id merely because neither operator
+/// set the variable. It is a hash rather than the path itself so the id is a
+/// stable, short, filesystem-agnostic token; an explicit `HYDRA_CLUSTER_ID`
+/// always wins.
+#[must_use]
+pub fn cluster_id_from(explicit: Option<&str>, data_dir: &str) -> String {
+    if let Some(id) = explicit.map(str::trim).filter(|v| !v.is_empty()) {
+        return id.to_string();
+    }
+    // Standard-library hashing only: this default is a *local* sanity token, not
+    // a security boundary, and adding a digest crate to the dependency tree for
+    // it would be a poor trade. Determinism across builds is not required either
+    // — a cluster that wants a stable, human-chosen id sets HYDRA_CLUSTER_ID.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    data_dir.hash(&mut hasher);
+    format!("hydra-{:016x}", hasher.finish())
+}
+
+/// The state a node reports about its own cluster membership, used to verify on
+/// every start that this process and its data directory agree about which
+/// cluster they belong to.
+const HANDSHAKE_CLUSTER_KEY: &[u8] = b"hydra/ctl/cluster_id";
+
+/// Refuse to start when the data directory belongs to another cluster.
+///
+/// **Read first, write second**, and the order is load-bearing (it was wrong on
+/// the first implementation, which turned "this node is not the leader yet" into
+/// "this directory belongs to another cluster" — measured). The two cases are:
+///
+/// * a directory that **already records** an identity: every member must agree
+///   with it, whatever its own role is — a plain local read answers this;
+/// * a directory with **no** identity yet: it is adopted by writing the key,
+///   which only the leader can do. A node that cannot write it is not an error —
+///   some other member will, and until then there is nothing to disagree with.
+///
+/// So a non-leader only ever fails this check when the directory's recorded
+/// identity differs from its own configuration, which is exactly the case worth
+/// refusing.
+///
+/// **The caller must retry** this until it returns `Ready` — a node that starts
+/// before the cluster has elected anyone cannot have adopted its directory yet,
+/// and the first implementation returned success in that window, which left the
+/// directory unclaimed and made a later mismatched start look like a fresh one
+/// (measured). The assembly step therefore polls this function; see
+/// [`PREFLIGHT_DEADLINE`].
+pub async fn preflight_cluster_id(
+    control: &ArachneControl,
+    cluster_id: &str,
+) -> Result<(), String> {
+    let Some(handle) = control.handle_ref() else {
+        return Ok(());
+    };
+    let expected = cluster_id.as_bytes();
+
+    // 1. What does the directory say, if anything?
+    match handle.get_stale(HANDSHAKE_CLUSTER_KEY).await {
+        Ok(Some(found)) if found.as_slice() == expected => return Ok(()),
+        Ok(Some(found)) => {
+            return Err(format!(
+                "this node's Arachne data directory belongs to a different cluster: it recorded \
+                 {:?} but this process is configured for {:?} (HYDRA_CLUSTER_ID / \
+                 HYDRA_ARACHNE_DATA_DIR). Refusing to join.",
+                String::from_utf8_lossy(&found),
+                cluster_id
+            ))
+        }
+        // Nothing recorded yet (or the read could not answer): try to adopt it.
+        Ok(None) => {}
+        Err(e) => {
+            tracing::debug!("cluster identity read did not answer yet: {e:?}");
+        }
+    }
+
+    // 2. Adopt the directory. Only the leader can, and until it does the answer
+    //    is "ask again" rather than a verdict either way.
+    match handle
+        .without_redirect()
+        .put(HANDSHAKE_CLUSTER_KEY, expected)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(arachne_kv::client::ArachneError::NotLeader { .. })
+        | Err(arachne_kv::client::ArachneError::QuorumUnavailable)
+        | Err(arachne_kv::client::ArachneError::Timeout)
+        | Err(arachne_kv::client::ArachneError::Busy) => Err(format!(
+            "{} (no leader has adopted this data directory yet)",
+            PENDING_ADOPTION
+        )),
+        Err(e) => Err(format!(
+            "cannot record this node's cluster identity in its Arachne data directory: {e:?}"
+        )),
+    }
+}
+
+/// The marker a caller retries on: the data directory has no recorded cluster
+/// identity yet and THIS node could not claim it. Distinguished from a real
+/// mismatch by its text, because the two need opposite responses — retry versus
+/// refuse to start.
+pub const PENDING_ADOPTION: &str = "cluster identity not adopted yet";
+
+/// How long the assembly step keeps asking before giving up. Longer than one
+/// election timeout on the LAN profile (1 s) with room for a cold start, short
+/// enough that a genuinely stuck cluster still fails a rollout quickly.
+pub const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Poll [`preflight_cluster_id`] until the directory is adopted or the deadline
+/// passes.
+///
+/// Returns `Ok(())` once this node and its data directory agree, and `Err` for a
+/// real mismatch (`another cluster`) or for a directory nobody claimed in time.
+pub async fn await_cluster_preflight(
+    control: &ArachneControl,
+    cluster_id: &str,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + PREFLIGHT_DEADLINE;
+    loop {
+        let pending = match preflight_cluster_id(control, cluster_id).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains(PENDING_ADOPTION) => e,
+            Err(e) => return Err(e),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "no member adopted this node's Arachne data directory within {:?}: {pending}",
+                PREFLIGHT_DEADLINE
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -774,6 +972,91 @@ mod tests {
             Some(1),
             "reordering the list changes the raft ids, which is why the variable's order is \
              documented as immutable"
+        );
+    }
+
+    /// The Arachne config this module hands to `Arachne::start` must carry the
+    /// parsed table verbatim: the member order (raft ids), every address, this
+    /// node's identity and its listen address.
+    ///
+    /// Falsification: build `initial_cluster` from a `HashMap` and the order
+    /// assertion fails; pass the peer map without the self entry and the
+    /// address-count assertion fails.
+    #[test]
+    fn the_arachne_config_carries_the_parsed_table_verbatim() {
+        let peers = cluster_peers(THREE, "b", "10.0.0.2:7001").expect("valid");
+        let cfg = arachne_config(
+            &peers,
+            "hydra-cluster".to_string(),
+            PathBuf::from("/var/lib/hydra/arachne"),
+        );
+
+        assert_eq!(cfg.cluster_id, "hydra-cluster");
+        assert_eq!(cfg.node_id, NodeId::new("b"));
+        assert_eq!(cfg.listen, addr("10.0.0.2:7001"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/hydra/arachne"));
+        assert_eq!(
+            cfg.initial_cluster,
+            vec![NodeId::new("a"), NodeId::new("b"), NodeId::new("c")],
+            "position is identity: Arachne derives each member's raft id from this order"
+        );
+        assert_eq!(
+            cfg.addresses.len(),
+            3,
+            "every member needs a dialable address"
+        );
+        assert_eq!(cfg.addresses[&NodeId::new("a")], addr("10.0.0.1:7001"));
+        assert_eq!(cfg.addresses[&NodeId::new("b")], addr("10.0.0.2:7001"));
+    }
+
+    /// This node's data directory defaults next to the proxy's own data, and an
+    /// explicit override wins. Both are pure functions of the two inputs, so
+    /// they are asserted without touching the environment.
+    ///
+    /// Falsification: ignore the override and the second assertion fails.
+    #[test]
+    fn the_data_dir_is_derived_or_overridden() {
+        let derived = arachne_data_dir("/var/lib/hydra/hydra.db", None);
+        assert_eq!(
+            derived,
+            PathBuf::from("/var/lib/hydra/arachne"),
+            "the default must live beside the SQLite file, not in /tmp: the WAL is durable state"
+        );
+
+        let overridden = arachne_data_dir("/var/lib/hydra/hydra.db", Some("/mnt/fast/arachne"));
+        assert_eq!(overridden, PathBuf::from("/mnt/fast/arachne"));
+
+        let in_memory = arachne_data_dir("hydra.db", None);
+        assert_eq!(
+            in_memory,
+            PathBuf::from("arachne"),
+            "a relative sqlite path must yield a relative arachne dir beside it"
+        );
+    }
+
+    /// The cluster id defaults per data directory rather than per host: two
+    /// clusters on one box must not silently share a raft group just because
+    /// neither set the variable.
+    ///
+    /// Falsification: return a constant default and the two directories produce
+    /// the same id, which makes the assertion fail.
+    #[test]
+    fn the_cluster_id_default_is_per_data_dir() {
+        let a = cluster_id_from(None, "/var/lib/hydra/arachne-a");
+        let b = cluster_id_from(None, "/var/lib/hydra/arachne-b");
+        assert_ne!(
+            a, b,
+            "the default cluster id must differ per data directory, or two clusters on one host \
+             would form one raft group"
+        );
+        assert_eq!(
+            cluster_id_from(Some("named-cluster"), "/var/lib/hydra/arachne-a"),
+            "named-cluster",
+            "an explicit HYDRA_CLUSTER_ID wins"
+        );
+        assert!(
+            a.starts_with("hydra-"),
+            "the default must be recognisable as Hydra's (got {a:?})"
         );
     }
 }

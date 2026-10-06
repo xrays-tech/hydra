@@ -378,3 +378,78 @@ async fn the_probe_refuses_a_leader_that_lost_its_quorum() {
 
     shutdown(kept).await;
 }
+
+/// T1.3 / T1.2 step 5 — the first-contact identity check.
+///
+/// Adopting an existing data directory is the dangerous case: a node that joins
+/// a raft group which does not match the identity recorded in its own WAL is
+/// unrecoverable without manual intervention, and the failure is silent (the
+/// node just behaves oddly). So a mismatched id must be a hard `Err`, and it
+/// must be raised on the SECOND start of the same directory, which is where a
+/// re-used volume or a mis-mounted PVC shows up.
+///
+/// Falsification: return `Ok(())` from the mismatch arm and the third assertion
+/// fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_contact_check_rejects_a_directory_from_another_cluster() {
+    use arachne_kv::server::ClusterConfig;
+    use hydra_server::cluster::arachne_node::{await_cluster_preflight, ArachneControl};
+
+    // A one-member *member* config, not `single_node`: `assemble_cluster` is the
+    // multi-node assembly path, and the peerless `single_node` shape has an empty
+    // member list (measured: it fails with "node '1' is not part of this
+    // factory's cluster"). One member is enough here — the preflight writes the
+    // identity key through the leader, and a lone voter elects itself.
+    let dir = data_dir("preflight");
+    let cfg = {
+        use std::collections::HashMap;
+        let id = NodeId::new("solo");
+        let addr: SocketAddr = "127.0.0.1:18101".parse().expect("fixture address");
+        let mut cfg = ClusterConfig::member(
+            "hydra-preflight".to_string(),
+            id.clone(),
+            addr,
+            dir,
+            vec![id.clone()],
+            HashMap::from([(id, addr)]),
+        );
+        cfg.profile = arachne_kv::Profile::Lan;
+        cfg
+    };
+    let node = arachne_kv::server::assemble_cluster(cfg)
+        .await
+        .expect("assemble a one-member cluster");
+    let control = ArachneControl::for_tests(node.handle.clone(), NodeId::new("solo"));
+
+    // First contact: this directory has no recorded cluster yet, so adopting it
+    // under this id must succeed...
+    let first = await_cluster_preflight(&control, "hydra-cluster-a").await;
+    assert!(
+        first.is_ok(),
+        "adopting a fresh data directory must succeed, got {first:?}"
+    );
+
+    // ...and a restart with the SAME id must succeed too (restarts are the
+    // common case; a check that only passes once would break every reboot).
+    let same = await_cluster_preflight(&control, "hydra-cluster-a").await;
+    assert!(
+        same.is_ok(),
+        "a restart with the same cluster id must succeed, got {same:?}"
+    );
+
+    // A different id on the same directory must be refused, with a message that
+    // names the disagreement rather than a bare error.
+    let other = await_cluster_preflight(&control, "hydra-cluster-b").await;
+    let message = other.expect_err("a different cluster id on the same directory must be refused");
+    assert!(
+        message.contains("hydra-cluster-b") || message.contains("different cluster"),
+        "the refusal must say what disagreed, got: {message}"
+    );
+    assert!(
+        message.contains("HYDRA_CLUSTER_ID") || message.contains("HYDRA_ARACHNE_DATA_DIR"),
+        "the refusal must point the operator at the variables that decide this, got: {message}"
+    );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
