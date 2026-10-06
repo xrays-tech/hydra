@@ -55,11 +55,20 @@ pub enum ReadOutcome {
     Tree(Arc<ConfigTree>),
 }
 
-/// Why a publish failed.
+/// Why a store operation failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     /// This node is not the leader: someone else owns the commit point.
     NotLeader,
+    /// No majority was reachable, so raft could not commit or confirm anything.
+    ///
+    /// Its own variant rather than a string inside [`StoreError::Arachne`] because
+    /// it is a different FACT: the cluster has no quorum, which is an outage with
+    /// one fix (get a majority up), not a transport hiccup or a codec bug. It is
+    /// what `hydra_arachne_quorum_unavailable_total` counts, and the difference is
+    /// what separates "the alert fires when the cluster is down" from "the alert
+    /// fires whenever anything goes wrong".
+    QuorumUnavailable,
     /// The key space refused something (a bad entity id, an undecodable toc).
     Keys(KeysError),
     /// Arachne refused or could not serve the operation.
@@ -71,6 +80,10 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::NotLeader => f.write_str(
                 "this node is not the raft leader; the config commit point is owned by the leader",
+            ),
+            Self::QuorumUnavailable => f.write_str(
+                "no raft majority was reachable, so the control plane could not commit or confirm \
+                 anything; the node keeps serving the config it already materialized",
             ),
             Self::Keys(e) => write!(f, "config key space: {e}"),
             Self::Arachne(e) => write!(f, "arachne: {e}"),
@@ -89,7 +102,20 @@ impl From<KeysError> for StoreError {
 fn map_err(e: ArachneError) -> StoreError {
     match e {
         ArachneError::NotLeader { .. } => StoreError::NotLeader,
+        ArachneError::QuorumUnavailable => StoreError::QuorumUnavailable,
         other => StoreError::Arachne(format!("{other:?}")),
+    }
+}
+
+/// Record a lost-quorum refusal against the operation that hit it.
+///
+/// `map_err` stays PURE (it is called from five places, and a side effect inside a
+/// name like `map_err` is the kind of thing that gets deleted during a refactor);
+/// the two public entry points do the counting, which is also what lets the label
+/// be `read` or `publish` instead of a guess.
+fn note_quorum_failure(op: &str, e: &StoreError) {
+    if matches!(e, StoreError::QuorumUnavailable) {
+        crate::admin::metrics::record_arachne_quorum_unavailable(op);
     }
 }
 
@@ -145,6 +171,15 @@ impl ArachneConfigStore {
     /// [`StoreError`] when the cluster cannot answer, or when what it returned
     /// does not match what the toc describes (a retry, not a repair).
     pub async fn read(&self) -> Result<ReadOutcome, StoreError> {
+        let outcome = self.read_inner().await;
+        if let Err(e) = &outcome {
+            note_quorum_failure("read", e);
+        }
+        outcome
+    }
+
+    /// [`Self::read`] without the instrumentation, so the counting happens once.
+    async fn read_inner(&self) -> Result<ReadOutcome, StoreError> {
         let Some(hash) = self.current_hash().await? else {
             return Ok(ReadOutcome::Empty);
         };
@@ -211,6 +246,28 @@ impl ArachneConfigStore {
     /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Arachne`] for a
     /// transport or quorum failure.
     pub async fn publish(&self, tree: &ConfigTree) -> Result<String, StoreError> {
+        let outcome = self.publish_inner(tree).await;
+        // One record per publish, with the outcome the operator's rule is written
+        // against. The SIZE comes from the tree that was SENT, not from what the
+        // cluster stored: it is the growth series for the capacity question
+        // (ADR-0001 risk R2), and it must move even when the commit is refused.
+        crate::admin::metrics::record_arachne_publish(match &outcome {
+            Ok(_) => "ok",
+            Err(StoreError::NotLeader) => "not_leader",
+            Err(StoreError::QuorumUnavailable) => "quorum_unavailable",
+            Err(_) => "error",
+        });
+        if let Err(e) = &outcome {
+            note_quorum_failure("publish", e);
+        }
+        if outcome.is_ok() {
+            crate::admin::metrics::record_arachne_config_bytes(tree.values().map(Vec::len).sum());
+        }
+        outcome
+    }
+
+    /// [`Self::publish`] without the instrumentation, so the counting happens once.
+    async fn publish_inner(&self, tree: &ConfigTree) -> Result<String, StoreError> {
         // The toc first: it validates every id, so an unkeyable entity is refused before a single
         // byte is sent to the cluster.
         let toc = toc_for(tree)?;

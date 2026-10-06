@@ -67,8 +67,16 @@ impl ConfigPublisher {
         cfg: &ConfigData,
         fidelity: &FidelityRows,
     ) -> Result<String, String> {
-        let tree = encode_config(cfg, fidelity, self.key_provider.as_ref())
-            .map_err(|e| format!("cannot encode the config tree: {e}"))?;
+        // A REFUSAL, not a transport failure: the config cannot be published as it
+        // stands (an over-sized value against the library's 1 MiB cap, an id that
+        // cannot be keyed, a failed seal), so retrying will not help and the fix is
+        // a configuration change. Counted separately from `error` for that reason —
+        // it is the capacity alarm ADR-0001 risk R2 asks for, and it is a fact about
+        // the CONFIG rather than about the cluster.
+        let tree = encode_config(cfg, fidelity, self.key_provider.as_ref()).map_err(|e| {
+            crate::admin::metrics::record_arachne_publish("refused");
+            format!("cannot encode the config tree: {e}")
+        })?;
         self.store
             .publish(&tree)
             .await

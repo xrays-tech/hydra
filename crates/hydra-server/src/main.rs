@@ -460,19 +460,44 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    match materializer.converge().await {
+                    // `hydra_replica_materialize_retries_total` was registered with this loop in
+                    // mind and had NO caller until 2026-10-05 — while `ops.md` §13 told the operator
+                    // to watch `{outcome="failed"}` and ADR-0001 risk R7 offered it as the mitigation
+                    // for the N-fold materialization cost. A documented series nobody records is a
+                    // panel that can never move.
+                    let outcome = match materializer.converge().await {
                         Ok(hydra_server::cluster::arachne_materializer::Converged::Applied {
                             hash,
                         }) => {
                             info!(head = %hash, "config materialized from the control plane");
+                            // A real apply: the tree moved and this node now serves it.
+                            Some("succeeded")
                         }
-                        // Steady state, and "a previous failure is still backing off".
-                        Ok(_) => {}
+                        // Nothing to do (the head already names what we serve) — NOT an
+                        // attempt, so it does not count. The steady state is one of these
+                        // per second and counting it would drown the signal.
+                        Ok(hydra_server::cluster::arachne_materializer::Converged::NoChange) => {
+                            None
+                        }
+                        // A previous failure is still inside its backoff window.
+                        Ok(_) => Some("throttled"),
                         Err(e) => {
                             // Not fatal: the node keeps serving its last-known-good config, and
                             // an un-materialized node is not eligible to lead.
                             warn!(error = %e, "config materialization did not complete; will retry");
+                            Some("failed")
                         }
+                    };
+                    if let Some(o) = outcome {
+                        // `attempt` counts every pass that TRIED to materialize a new tree,
+                        // including the ones that succeeded or failed, so a rate on it answers
+                        // "how much work is this loop doing" separately from the outcome mix.
+                        if o != "throttled" {
+                            hydra_server::admin::metrics::record_replica_materialize_retry(
+                                "attempt",
+                            );
+                        }
+                        hydra_server::admin::metrics::record_replica_materialize_retry(o);
                     }
                 }
             });

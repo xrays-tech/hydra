@@ -54,6 +54,11 @@ function run(files, extraEnv = {}) {
         // there (and the rule that checks them would fire for the wrong reason). Cases that need an
         // exclusion pass their own JSON.
         CDM_NOT_A_METRIC: '{}',
+        // Same reason, same rule, for the OTHER recorded list: it is REPLACED here so a fixture
+        // never inherits this repository's "deliberately absent" names (see the guard's note — the
+        // merge that used to happen here turned eleven cases red the moment the built-in list
+        // stopped being empty).
+        CDM_ABSENT_ON_PURPOSE: '{}',
         ...extraEnv,
       },
     });
@@ -164,7 +169,7 @@ check('a wildcard prefix (`hydra_x_*`) and crate names are ignored',
 r = run({
   ...doc('There is deliberately no `hydra_proxy_listener_bound` alias.'),
   'crates/hydra-server/src/metrics.rs': 'register_int_counter!("hydra_requests_total", "h");\n',
-}, { CDM_MIN_CHECKED: '0', CDM_ABSENT_ON_PURPOSE: 'hydra_proxy_listener_bound' });
+}, { CDM_MIN_CHECKED: '0', CDM_ABSENT_ON_PURPOSE: '{"hydra_proxy_listener_bound":"spelled as absent in the fixture doc"}' });
 check('an allowlisted "deliberately absent" name does not fail the guard',
   r.status === 0 && /1 of 1 allowlisted name\(s\) were actually needed/.test(r.out),
   `exit=${r.status} ${r.out.trim().slice(0, 140)}`);
@@ -172,7 +177,7 @@ check('an allowlisted "deliberately absent" name does not fail the guard',
 r = run({
   ...doc('There is deliberately no `hydra_proxy_listener_*` alias. Key series: `hydra_requests_total`.'),
   'crates/hydra-server/src/metrics.rs': 'register_int_counter!("hydra_requests_total", "h");\n',
-}, { CDM_MIN_CHECKED: '0', CDM_ABSENT_ON_PURPOSE: 'hydra_proxy_listener_bound' });
+}, { CDM_MIN_CHECKED: '0', CDM_ABSENT_ON_PURPOSE: '{"hydra_proxy_listener_bound":"spelled as absent in the fixture doc"}' });
 check('...but an entry nobody needs is DRIFT (a dead allowlist entry is where a drift would hide)',
   r.status === 1 && /never consulted/.test(r.out) && /hydra_proxy_listener_bound/.test(r.out),
   `exit=${r.status} ${r.out.trim().split('\n')[0].slice(0, 140)}`);

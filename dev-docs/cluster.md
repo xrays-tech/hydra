@@ -21,6 +21,13 @@
 2. **自动选举**：leader 候选经 Redis 租约竞争，恰一个 active；
 3. **自动故障切换**：active 死亡 → 租约过期 → 合格候选提升（实测 ≤ 租约 15s + 选举 tick 5s，约 11–18s），edge 数据面与控制面均无感（edge 轮询失败自动经注册表旋转到新 active；standby 也按**租约持有者**轮换 —— 即使它的静态 `HYDRA_CONTROL_URL` 指向自己，见 §5.1）；**管理变更同样按租约持有者转发**：standby 的管理写入目标在转发时从注册表实时解析（绝不使用静态 `HYDRA_CONTROL_URL`，它可能指向节点自身），且每个转发请求带 once 标记，任何自转发/互转循环都会立即 fail-closed 503 而不是超时递归（见 §5.2）；
 
+   > **⚠ 下面这段复核记录的是 ADR-0001 之前的 leader/edge 拓扑（2026-09-29 实测）**：`HYDRA_ROLE`、
+   > `HYDRA_CONTROL_URL`、Redis 租约与注册表**全部退役**，其中点名的 `hydra_control_snapshot_version`
+   > 与 `hydra_control_poll_total{result="ok"}` **已不再注册**（前者的记录器随轮询客户端删除，后者
+   > 的 `result="ok"` 从来没有被写过）。今天的对应信号是 `hydra_arachne_this_node_leader`（谁在写）、
+   > `hydra_arachne_publish_total{result}`（发布是否成功）与 `hydra_arachne_leader_flips_total`（切主频率），
+   > 见 `ops.md` §9.1。**这段数字仍然是当时那份测量的忠实记录**，不是现在的行为描述。
+
    **复核（2026-09-29，两节点 + edge 实测）**：
    - **提升耗时 17.7 s / 18.2 s**（两次独立运行，硬杀 `SIGKILL` 口径）——正好落在上面那个 11–18s 带的上沿；粒度为 `HYDRA_LEADER_LEASE_MS` 15s + 选举 tick。
    - **edge 数据面确实"无感"**：整个故障切换期间以 20 rps 持续压 edge 的数据面（`Host:` 指向真实租户）⇒ **355/355 全是 200，0 次连接被拒、0 个非 200**；旧 active 死亡后新 active 就位、`standby` 被提升，edge 侧没有任何一次失败。

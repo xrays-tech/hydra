@@ -623,6 +623,17 @@ impl ArachneControl {
                         hint.map(|(id, _addr)| id.to_string());
                 }
                 let previous = control.is_leader.swap(observed, Ordering::AcqRel);
+                // Published every round, not only on a change: the gauge is what a
+                // metric backend samples, and `sum()` over the fleet is the "does the
+                // cluster have a writer" signal that replaced the retired registry's
+                // heartbeat table.
+                // `ArachneControl::node_id` is an `ariadne`-style `NodeId`, so it is
+                // rendered for the label; the value is the member name from the member
+                // list, which is what an operator greps for.
+                crate::admin::metrics::record_arachne_leader(
+                    &control.node_id.to_string(),
+                    observed,
+                );
                 if observed != previous {
                     if observed {
                         tracing::info!(node_id = %control.node_id, "this node is now the raft leader");
@@ -630,6 +641,9 @@ impl ArachneControl {
                         tracing::warn!(node_id = %control.node_id, "this node is no longer the raft leader");
                     }
                     control.flips.fetch_add(1, Ordering::AcqRel);
+                    // The flapping signal: a sampled gauge cannot show a leadership
+                    // that changed between two scrapes.
+                    crate::admin::metrics::record_arachne_leader_flip();
                 }
             }
         })

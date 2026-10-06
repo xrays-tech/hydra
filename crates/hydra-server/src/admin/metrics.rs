@@ -50,14 +50,17 @@
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
 //! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
 //! | `hydra_candidate_skipped_total` | counter | provider, reason | candidates dropped before any attempt — SELECTION (breaker_dead \| no_key; deliberate soft-disables are NOT counted, invalid_weight cannot occur) and the defensive failover-loop set (missing_config \| bad_endpoint \| no_key \| no_usable_key) |
-//! | `hydra_registry_nodes` | gauge | state | node registry reaper (alive\|dead rows) |
-//! | `hydra_registry_reaped_total` | counter | — | node registry reaper (stale rows removed) |
 //! | `hydra_listener_tenant_certs` | gauge | — | `tls::follow_snapshot` (certs in the current snapshot) |
 //! | `hydra_upstream_first_byte_timeout_total` | counter | provider | proxy send path (upstream accepted, then sent no headers within the bound) |
 //! | `hydra_upstream_stream_idle_timeout_total` | counter | provider | proxy stream path (upstream sent headers, then no body byte within the idle bound) |
 //! | `hydra_invalidation_trimmed_total` | counter | — | invalidation stream trim task (entries dropped; whether or not a bump was needed) |
 //! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ every node clears its auth cache) |
-//! | `hydra_replica_materialize_retries_total` | counter | outcome | replica materialization retries (attempt|succeeded|failed|throttled) |
+//! | `hydra_replica_materialize_retries_total` | counter | outcome | replica materialization passes (attempt\|succeeded\|failed\|throttled) — `main.rs`'s convergence loop |
+//! | `hydra_arachne_this_node_leader` | gauge | — | raft `ArachneControl` leader watch (1 = this node is the writer) |
+//! | `hydra_arachne_leader_flips_total` | counter | — | raft `ArachneControl` leader watch (a change of answer) |
+//! | `hydra_arachne_publish_total` | counter | result | `ArachneConfigStore::publish` + `ConfigPublisher` (ok\|not_leader\|quorum_unavailable\|error\|refused) |
+//! | `hydra_arachne_config_bytes` | gauge | — | bytes in the tree the last publish committed (`ArachneConfigStore::publish`) |
+//! | `hydra_arachne_quorum_unavailable_total` | counter | op | raft operation that failed because no majority was reachable (publish\|read) |
 //! | `hydra_auth_cache_clear_total` | counter | layer,result | whole-cache clears (layer=l1|l2, result=ok|partial|error) |
 //! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
 //!
@@ -193,7 +196,6 @@ struct Metrics {
     /// here means real convergence loss — or an event rate above
     /// `maxlen / trim_interval` with a consumer that cannot keep up.
     invalidation_generation_bumps: IntCounter,
-    control_snapshot_version: IntGauge,
     // ── Downstream listener topology (审核四 P4) ─────────────────────────
     /// 1 = the configured listener was verified to accept connections at
     /// startup (protocol=plain|tls); 0 = configured but NOT accepting — the
@@ -225,12 +227,44 @@ struct Metrics {
     /// hot-reloaded at runtime, so a boot-time-only gauge would be permanently
     /// stale in exactly the scenario this alert targets.
     listener_tenant_certs: IntGauge,
-    // ── Node registry (cluster P4 → 审核 G2) ────────────────────────────
-    /// Registry rows by liveness (`state="alive"|"dead"`). A growing `dead`
-    /// series is the "113 rows, 108 offline" symptom in a queryable form.
-    registry_nodes: IntGaugeVec,
-    /// Total registry rows reaped as stale (no heartbeat AND no seen marker).
-    registry_reaped_total: IntCounter,
+    // ── Arachne control plane (ADR-0001) ────────────────────────────────
+    //
+    // The node registry that used to sit here is DELETED, and so are its two
+    // series (`hydra_registry_nodes`, `hydra_registry_reaped_total`): the reaper
+    // went with the registry (T4.1), so the metrics had no recorder left — their
+    // two alert rows could never fire, which is the exact failure mode
+    // `check_documented_metrics` and the §9.1 table exist to prevent. What
+    // replaces them is the raft surface below: "is anyone the writer" and "is
+    // publishing getting through" are the questions an operator actually has now.
+    /// 1 while THIS node is the raft leader (the writer), labelled by node id.
+    /// `sum()` over the fleet is 0 when the cluster has no writer — the alert that
+    /// replaces "registry rows piling up".
+    ///
+    /// A `Vec`, not a bare gauge, and that is load-bearing: a bare `IntGauge` is
+    /// exported with its zero as soon as it is registered, so on a SINGLE-NODE
+    /// deployment (no raft node exists, the watch never runs) it would read 0 and
+    /// an alert written as `sum(...) == 0` would fire forever on every deployment
+    /// that is not a cluster. A `Vec` exports no series until a label set is used,
+    /// so the series exists exactly where the question is meaningful — the same
+    /// reason `hydra_invalidation_consumer_*` is labelled by node.
+    arachne_this_node_leader: IntGaugeVec,
+    /// How many times this node's answer to "am I the leader" CHANGED. A node
+    /// that flaps is a cluster whose commit point keeps moving.
+    arachne_leader_flips_total: IntCounter,
+    /// Publish outcomes: `ok` (the head moved), `not_leader` (the library refused
+    /// the commit), `quorum_unavailable` (no majority), `error` (anything else,
+    /// including a malformed tree), `refused` (encoding rejected the config
+    /// before a byte was sent — the size limit, an unkeyable id, a failed seal).
+    arachne_publish_total: IntCounterVec,
+    /// Bytes in the tree the last successful publish committed. The growth series
+    /// for the capacity question R2 raises; the HARD signal is
+    /// `publish_total{result="refused"}`, not a byte threshold invented here.
+    arachne_config_bytes: IntGauge,
+    /// Raft operations that failed because no majority was reachable, by
+    /// operation (`publish`|`read`). Distinct from `error`: a lost quorum is a
+    /// cluster-level fact with a different fix (start a majority) from a
+    /// transport or codec failure.
+    arachne_quorum_unavailable_total: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -506,11 +540,6 @@ fn metrics() -> Option<&'static Metrics> {
                 "Trims that dropped an entry a live consumer had not applied (whole-fleet cache clear)"
             )
             .ok()?,
-            control_snapshot_version: register_int_gauge!(
-                "hydra_control_snapshot_version",
-                "Last config snapshot version applied from the control plane"
-            )
-            .ok()?,
             // ── Downstream listener topology ──────────────────────────────
             listener_bound: register_int_gauge_vec!(
                 "hydra_listener_bound",
@@ -541,15 +570,33 @@ fn metrics() -> Option<&'static Metrics> {
                 "Tenant certificates present in the config snapshot"
             )
             .ok()?,
-            registry_nodes: register_int_gauge_vec!(
-                "hydra_registry_nodes",
-                "Nodes in the registry, by liveness state (alive|dead)",
-                &["state"]
+            // ── Arachne control plane (ADR-0001) ──────────────────────
+            arachne_this_node_leader: register_int_gauge_vec!(
+                "hydra_arachne_this_node_leader",
+                "1 = this node currently answers the raft write probe; the fleet sum is the writer count (node = raft member name)",
+                &["node"]
             )
             .ok()?,
-            registry_reaped_total: register_int_counter!(
-                "hydra_registry_reaped_total",
-                "Registry rows reaped as stale (no heartbeat and no seen marker)"
+            arachne_leader_flips_total: register_int_counter!(
+                "hydra_arachne_leader_flips_total",
+                "Changes of this node's own leadership answer (0 -> 1 or 1 -> 0)"
+            )
+            .ok()?,
+            arachne_publish_total: register_int_counter_vec!(
+                "hydra_arachne_publish_total",
+                "Config publish outcomes (result=ok|not_leader|quorum_unavailable|error|refused)",
+                &["result"]
+            )
+            .ok()?,
+            arachne_config_bytes: register_int_gauge!(
+                "hydra_arachne_config_bytes",
+                "Bytes in the config tree the last successful publish committed"
+            )
+            .ok()?,
+            arachne_quorum_unavailable_total: register_int_counter_vec!(
+                "hydra_arachne_quorum_unavailable_total",
+                "Raft operations refused for lack of a majority (op=publish|read)",
+                &["op"]
             )
             .ok()?,
         })
@@ -1020,14 +1067,6 @@ pub fn record_invalidation_generation_bump() {
     }
 }
 
-/// Set the last applied config snapshot version (edge/standby).
-#[allow(dead_code)]
-pub fn record_control_snapshot_version(version: u64) {
-    if let Some(m) = metrics() {
-        m.control_snapshot_version.set(version as i64);
-    }
-}
-
 /// Count an upstream first-byte timeout for `provider`.
 pub fn record_upstream_first_byte_timeout(provider: &str) {
     if let Some(m) = metrics() {
@@ -1057,18 +1096,63 @@ pub fn record_listener_tenant_certs(n: usize) {
     }
 }
 
-/// Publish the registry liveness split (called by the reaper each tick).
-pub fn record_registry_nodes(alive: i64, dead: i64) {
+// ---------------------------------------------------------------------------
+// Arachne control plane (ADR-0001) — the raft surface an operator alerts on
+// ---------------------------------------------------------------------------
+
+/// Publish whether THIS node is the raft leader.
+///
+/// Called by the leader watch on every round, so the fleet `sum()` answers "does
+/// the cluster have a writer" — the question the retired registry answered with a
+/// heartbeat table, and the one an operator must be able to alert on.
+pub fn record_arachne_leader(node: &str, is_leader: bool) {
     if let Some(m) = metrics() {
-        m.registry_nodes.with_label_values(&["alive"]).set(alive);
-        m.registry_nodes.with_label_values(&["dead"]).set(dead);
+        m.arachne_this_node_leader
+            .with_label_values(&[node])
+            .set(i64::from(is_leader));
     }
 }
 
-/// Count registry rows reaped as stale.
-pub fn record_registry_reaped(n: u64) {
+/// Count a CHANGE in this node's own leadership answer (either direction).
+///
+/// Separate from the gauge because a flapping leader is invisible in a sampled
+/// gauge: by the time a scrape lands the answer is true again.
+pub fn record_arachne_leader_flip() {
     if let Some(m) = metrics() {
-        m.registry_reaped_total.inc_by(n);
+        m.arachne_leader_flips_total.inc();
+    }
+}
+
+/// Count a config publish by outcome.
+///
+/// The outcomes are not interchangeable, which is why they are one family with a
+/// label rather than one counter: `not_leader` is momentary (the library retries
+/// on the next write), `quorum_unavailable` is an outage, `refused` is a config
+/// that can never be published as it stands, and `error` is a bug or a
+/// transport failure.
+pub fn record_arachne_publish(result: &str) {
+    if let Some(m) = metrics() {
+        m.arachne_publish_total.with_label_values(&[result]).inc();
+    }
+}
+
+/// Publish the size of the tree the last publish committed.
+pub fn record_arachne_config_bytes(bytes: usize) {
+    if let Some(m) = metrics() {
+        m.arachne_config_bytes.set(bytes as i64);
+    }
+}
+
+/// Count a raft operation that failed because no majority was reachable.
+///
+/// `op` is `publish` or `read`: a lost quorum makes the cluster unable to commit
+/// a new config while still serving the materialized one, and the two operations
+/// show that asymmetry at different times.
+pub fn record_arachne_quorum_unavailable(op: &str) {
+    if let Some(m) = metrics() {
+        m.arachne_quorum_unavailable_total
+            .with_label_values(&[op])
+            .inc();
     }
 }
 
@@ -1429,27 +1513,44 @@ mod tests {
         );
     }
 
-    /// The registry metrics must actually be PUBLISHED, not merely
-    /// panic-free: the reaper's whole point is to make the "113 rows, 108
-    /// offline" symptom alertable, so a no-op `record_*` stub would silently
-    /// remove the signal (the exporter is the only consumer).
+    /// The raft surface must actually be PUBLISHED, not merely panic-free.
+    ///
+    /// This replaces the same test for the retired registry metrics, which had
+    /// exactly this purpose and outlived their recorder: a `record_*` helper that
+    /// nothing calls is indistinguishable from a working signal until someone
+    /// writes an alert rule against it. These five families are what an operator
+    /// alerts on now, so the exposition is asserted rather than assumed — and the
+    /// LABELS with it, because a renamed label value is a rule that stops firing.
     #[test]
-    fn registry_metrics_reach_the_exposition() {
-        record_registry_nodes(2, 7);
-        record_registry_reaped(3);
+    fn arachne_metrics_reach_the_exposition() {
+        record_arachne_leader("probe-node", true);
+        record_arachne_leader_flip();
+        record_arachne_publish("ok");
+        record_arachne_publish("quorum_unavailable");
+        record_arachne_publish("refused");
+        record_arachne_config_bytes(4096);
+        record_arachne_quorum_unavailable("read");
         let out = render();
-        assert!(
-            out.contains("hydra_registry_nodes{state=\"alive\"} 2"),
-            "the alive count must be exposed with its label:\n{out}"
-        );
-        assert!(
-            out.contains("hydra_registry_nodes{state=\"dead\"} 7"),
-            "the dead count must be exposed:\n{out}"
-        );
-        assert!(
-            out.contains("hydra_registry_reaped_total 3"),
-            "the reaped counter must be exposed:\n{out}"
-        );
+        for needle in [
+            "hydra_arachne_this_node_leader{node=\"probe-node\"} 1",
+            "hydra_arachne_leader_flips_total 1",
+            "hydra_arachne_publish_total{result=\"ok\"} 1",
+            "hydra_arachne_publish_total{result=\"quorum_unavailable\"} 1",
+            "hydra_arachne_publish_total{result=\"refused\"} 1",
+            "hydra_arachne_config_bytes 4096",
+            "hydra_arachne_quorum_unavailable_total{op=\"read\"} 1",
+        ] {
+            assert!(out.contains(needle), "missing {needle}:\n{out}");
+        }
+        // The retired series must be GONE, or an old dashboard keeps rendering a
+        // flat line that no longer means anything.
+        for dead in [
+            "hydra_registry_nodes",
+            "hydra_registry_reaped_total",
+            "hydra_control_snapshot_version",
+        ] {
+            assert!(!out.contains(dead), "{dead} is retired but still exposed");
+        }
     }
 
     #[test]

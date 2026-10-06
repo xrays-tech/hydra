@@ -55,8 +55,8 @@ const MIN_CHECKED = Number(process.env.CDM_MIN_CHECKED ?? 20);
 
 /** Names the docs mention only to say they do NOT exist. Each needs a reason.
  *
- * EMPTY ON PURPOSE, and an entry that is never consulted is now DRIFT (see `main`). The real note in
- * `ops.md` §9.1 is written as a WILDCARD — "there is deliberately **no** `hydra_proxy_listener_*`
+ * An entry that is never consulted is DRIFT (see `main`). The real note in `ops.md` §9.1 about the
+ * listener family is written as a WILDCARD — "there is deliberately **no** `hydra_proxy_listener_*`
  * alias" — and a wildcard token is skipped before this map is consulted, so the four entries that
  * used to live here (`hydra_proxy_listener_bound`, `…_tenant_certs`, `hydra_proxy_tenant_certs`,
  * `…_tls`) were dead: measured 2026-09-30, none of those exact names appears anywhere in the three
@@ -65,17 +65,33 @@ const MIN_CHECKED = Number(process.env.CDM_MIN_CHECKED ?? 20);
  *
  * Add a name here only when a doc line spells that EXACT name as absent.
  */
-const BUILTIN_ABSENT_ON_PURPOSE = new Map();
+const BUILTIN_ABSENT_ON_PURPOSE = [
+  // The three series ADR-0001 retired, listed because `ops.md` §9.1 names them ON PURPOSE — in
+  // RETIRED rows that tell the operator not to write the rule. They are named rather than quietly
+  // removed because their documentation WAS live and wrong: `hydra_registry_*` lost its recorder
+  // with the registry reaper, and `hydra_control_snapshot_version` lost its own with the polling
+  // client while still being exported as 0, so BOTH alert rows looked healthy and could never fire.
+  // An operator greps for the series name they copied from an old dashboard, and the answer has to
+  // be where they look.
+  ['hydra_registry_nodes', 'retired with the node registry (ADR-0001 T4.1); ops.md §9.1 marks its alert row RETIRED'],
+  ['hydra_registry_reaped_total', 'retired with the node registry reaper (ADR-0001 T4.1); ops.md §9.1 marks its alert row RETIRED'],
+  ['hydra_control_snapshot_version', 'retired with the polling control client (ADR-0001 T4.1); nothing recorded it, so it read 0 forever — ops.md §9.1 marks its alert row RETIRED'],
+];
 
-/** `CDM_ABSENT_ON_PURPOSE=a,b` exists so the suite can exercise both the used and the stale path. */
-const ABSENT_ON_PURPOSE = new Map([
-  ...BUILTIN_ABSENT_ON_PURPOSE,
-  ...(process.env.CDM_ABSENT_ON_PURPOSE || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((n) => [n, 'named via CDM_ABSENT_ON_PURPOSE']),
-]);
+/**
+ * `CDM_ABSENT_ON_PURPOSE` (a JSON object of name → reason, like `CDM_NOT_A_METRIC`) exists so the
+ * suite can exercise both the used and the stale path.
+ *
+ * It goes through `records()` like every other recorded-exception list, and that is a FIX, not a
+ * refactor: the previous version MERGED the override into the built-in map, which violates the
+ * shared algebra's first rule ("REPLACE, never merge" — `recorded_exceptions.cjs`) and leaked this
+ * repository's records into every fixture. Measured 2026-10-05: the moment this map stopped being
+ * empty, ELEVEN existing self-test cases went red at once with
+ * "the ABSENT_ON_PURPOSE entry `hydra_registry_nodes` is never consulted" — the fixture docs never
+ * spell that name, because it is this repository's name and not theirs. The built-in list was empty
+ * until then, so the merge had never been observable.
+ */
+const ABSENT_ON_PURPOSE = records(process.env.CDM_ABSENT_ON_PURPOSE, BUILTIN_ABSENT_ON_PURPOSE);
 
 /**
  * `hydra_core` / `hydra_server` / … are crate, tool, package or binary names, not metrics.

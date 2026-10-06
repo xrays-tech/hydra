@@ -857,7 +857,7 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
 | **T4.0 清单半边** | ✅ 已完成 | `docker-compose.cluster.yml` 改为**三个同构成员**（同一 environment 锚点，只有 node id / raft 地址 / 发布端口 / 卷不同）；`docker-compose.local.yml` 去掉 `HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL`、补上 `HYDRA_CLUSTER_PEERS` + `HYDRA_ARACHNE_LISTEN`；`scripts/check_compose_health.cjs` 的角色分支删除（一条规则：每个节点都用 `Authorization: Bearer` 探 `/api/v1/health`）；`scripts/compose_static.cjs` 的三条角色拒绝规则删除；`admin-ui` 的 `alive` 改为三态渲染；`environment/{build.sh,release.sh}` 的特征集补齐 |
 | **T4.2 环境变量** | ✅ 已完成（代码/文档/清单） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单里残留的三处已清除**（见下） |
-| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。**尚未做**：验收 2（20 rps / 60 s）；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
+| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。✅ **集群可观测面已落地**：见下节"退役后的可观测面"。**尚未做**：验收 2（20 rps / 60 s）；`cluster.md` / `design.md` 逐条改写（`cluster.md` 只加了"该段描述已退役拓扑"的横幅）；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
 
 ### 清单半边实际改出来的三个缺陷（都不是"文案问题"）
 
@@ -866,6 +866,30 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 1. **`docker-compose.local.yml` 仍在设置三个已退役变量**：`HYDRA_LEADER_LEASE_MS`（a/b 两个节点）与 `HYDRA_CONTROL_POLL_MS`（a/b/c 三个节点）。它们在 `RETIRED_CLUSTER_ENV` 里，所以这套"本地集群"每次启动都会打 ERROR 说这些设置被忽略——文件本身却在告诉读者它们有用。**修法**：删掉这三处；**守卫**：`scripts/check_compose_env.cjs` 规则 1（表从源码读，不在这里复制第二份）。
 2. **镜像配方缺 `arachne` 特征**：`environment/build.sh` 是产出 `environment/` 下每个清单所跑镜像的配方，它只写了 `server,cluster-redis,usage-clickhouse`。而设置 `HYDRA_CLUSTER_PEERS` 却没有 `arachne` 时二进制**拒绝启动**（`main.rs`），所以那个镜像**根本跑不起 `docker-compose.cluster.yml`**。CI 一直是绿的，因为 CI 自己的构建步骤单独带了 `arachne`。**修法**：`build.sh` / `release.sh` 补齐；**守卫**：`check_compose_env.cjs` 规则 2，所需特征**从清单推导**（清单开始用 raft 就把配方一起拽上）。
 3. **`hydra-c` 没有卷**：本地栈的第三个成员没有任何 `/app/data` 挂载，于是它的 raft 日志与 SQLite 全在容器层——重启即重置，这不叫"三个同构成员"。**修法**：补 `hydra-c-data:/app/data` 与顶层卷声明。
+
+### 退役后的可观测面（2026-10-05 修完，实测）
+
+控制面换代之后，**最该能告警的两件事一件都告不了**，而且三处告警行指向**已经没有记录器的序列**——规则写得出来、Prometheus 收得下、**永远不会触发**：
+
+| 发现的缺陷 | 事实 | 处置 |
+|---|---|---|
+| 三条告警行指向**死指标** | `hydra_registry_nodes{state="dead"} > 5`、`increase(hydra_registry_reaped_total[1h]) > 20`（回收器随注册表 T4.1 删除，两个序列**注册着但没有任何调用点**）、`changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0`（前者的记录器随轮询客户端删除、**仍以 0 导出**；`result="ok"` **从来没有被写过**，实际只有 `rate_limit_error` 与 `invalidation_trim_error`） | 三个序列与三条告警行**退役**，并在 §9.1 留 **RETIRED 行点名**（operator 拿着老 dashboard 里的名字来 grep，答案必须在他看的地方）；`check_documented_metrics` 的 `ABSENT_ON_PURPOSE` 记下三个名字与理由 |
+| 文档让人盯一个**从不移动**的指标 | `ops.md` §13 让运维"Watch `hydra_replica_materialize_retries_total{outcome="failed"}`"，R7 也把它当作物化放大的对冲手段——而这个计数器**注册了但零调用点** | **接线**（`main.rs` 的物化循环：`attempt` / `succeeded` / `failed` / `throttled`，稳态 `NoChange` **不计**，否则每秒一次会淹掉信号）。实测：一次管理写后三节点各自 `attempt=1, succeeded=1` |
+| 集群**没有任何指标** | `grep hydra_arachne` 在代码与文档里**零命中**：切主、发布失败、失去多数派——ADR-0001 引入的三种失效模式没有一种可告警 | 新增五个家族并接线（见下）+ §9.1 四条新告警行 |
+
+**新增的五个家族（实测值来自一次真实三节点 + 一次管理写）**：
+
+| 指标 | 类型/标签 | 实测 |
+|---|---|---|
+| `hydra_arachne_this_node_leader` | gauge `{node}` | `{node="m-b"} 1`，另两节点 `0` ⇒ `sum() == 0` 就是"集群没有写者"的告警 |
+| `hydra_arachne_leader_flips_total` | counter | 当选的那台 `1`，全程没变过的 `0`（采样 gauge 看不到抖动，所以单独计数） |
+| `hydra_arachne_publish_total` | counter `{result}` | `{result="ok"} 1`／每节点一次；`not_leader`、`quorum_unavailable`、`error`、`refused`（**编码期拒绝**：超 1 MiB、无法成键、密封失败——这是 R2 要的容量告警，比一个自己编的字节阈值诚实） |
+| `hydra_arachne_config_bytes` | gauge | `430`（最近一次成功发布的树字节数，R2 的增长曲线） |
+| `hydra_arachne_quorum_unavailable_total` | counter `{op}` | `publish` / `read`；新增 `StoreError::QuorumUnavailable` 变体，让"失去多数派"不再混在 `Arachne(String)` 里 |
+
+`hydra_arachne_this_node_leader` **故意是 `IntGaugeVec{node}` 而不是裸 gauge**：裸 `IntGauge` 一注册就以 0 导出，于是**单节点部署**上 `sum(...) == 0` 的规则会**永久误报**（那个 0 的含义是"这里没有 raft"，不是"没有写者"）。`Vec` 在用到标签前不导出任何序列，序列只在问题有意义的地方存在——与 `hydra_invalidation_consumer_*{node}` 同一个理由。
+
+**顺带修好的一处守卫缺陷**：`check_documented_metrics` 的 `ABSENT_ON_PURPOSE` 把环境覆盖**合并**进内建表，违反 `recorded_exceptions.cjs` 的第一条规则（**REPLACE, never merge**）。它一直不可见，因为内建表此前是空的；本轮的三个名字一进去，**11 条既有自测同时变红**（fixture 的文档当然不会拼出本仓的名字）。已改为走 `records()`，自测的公共环境补 `CDM_ABSENT_ON_PURPOSE: '{}'`。
 
 ### 本轮新发现（尚未处理，登记在案）
 
