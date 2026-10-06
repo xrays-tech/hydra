@@ -44,6 +44,8 @@ pub mod arachne_materializer;
 #[cfg(feature = "arachne")]
 pub mod arachne_node;
 #[cfg(feature = "arachne")]
+pub mod arachne_publish;
+#[cfg(feature = "arachne")]
 pub mod arachne_store;
 
 /// Node role in a Hydra cluster (v8 plan §2.1).

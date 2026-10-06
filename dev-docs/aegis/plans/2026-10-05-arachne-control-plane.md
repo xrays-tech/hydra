@@ -643,6 +643,28 @@ Plan Pressure Test:
 - **Verification**：`cargo test -p hydra-server --features "server,arachne"`；故障注入用例 ②③④ 各一次。
 - **Retirement Track**：`config_meta` 的「版本权威」语义退役（表与列保留）。
 
+#### T3.2 实现记录（2026-10-05；与上面的 Steps 不一致处以这里为准）
+
+**已落地**：
+
+| 部件 | 位置 | 说明 |
+| --- | --- | --- |
+| `ConfigPublisher` | `cluster/arachne_publish.rs` | 编码 + 提交 head。只做这两件事，编码是纯函数（可脱离集群测），commit 是 `ArachneConfigStore::publish`（head 的唯一写者） |
+| 发布时机 | `ConfigStore::reload_all_with` | 本地置性判定的**唯一漏斗**：内容变了才发布，且是在**本地置换之后**。顺序的理由：SQL 事务早就提交了，所以本节点状态必须与自己的库一致；发布失败则返回 `StoreError::NotPublished` |
+| 失败语义 | `StoreError::NotPublished` → admin 层 503 `config_not_published` | 文案是「已提交到本节点库、**未发布**到集群」，不是「写失败」——本地事务没有回滚。28 + 4 个调用点改为 `if let Err(r) = reload_best_effort(..).await { return r; }` |
+| 物化循环 | `main.rs` bootstrap (2c-arachne) | 每秒一次 `converge()`；**与发布同时落地**——只发布不物化会得到一个「head 没人读、集群静默分叉」的进程 |
+
+**与 Steps 的偏差（如实记账）**：
+
+1. **没有把版本权威换成 head 哈希**：`config_meta.config_version` 仍是自增计数器，`ConfigStore::version()` 仍从 `ReplicationContent` 派生。理由是它与本轮的落地点无关且会牵动多处 API；**权威事实上已经是 head**（节点服务的配置由 head 决定、物化以 head 为准），只是那个**整数水位**还没被降级。属 T3.2 残余。
+2. **没有把物化门接到 `leader_ready`**：`leader_ready` 仍是 Arachne 写探测（`ArachneControl::is_leader`）。计划里「未物化 = 不可当选」的接线还没做，因为 `Materializer` 的门不是可共享的（需要 `Arc` 化或把门拆出来独立持有）。属 T3.2 残余。
+3. **`POST /api/v1/reload`（force）与 tenant 写路径**都走同一漏斗；tenant 侧那份 `reload_best_effort` 副本也做了同样的 503 映射（该文件按 D-6 乙-full 会在 T3.5 整文件删除，所以只做了最小改动）。
+
+**这一轮抓出的东西**：
+
+- **发布失败的触发条件是真的**：`a_failed_publish_names_itself_and_keeps_serving_locally` 用一个超过库 1 MiB 单值上限的 provider 触发；它证明了「本地照常服务 + 明确的未发布错误」这条路径，也说明**配置大到某个程度会全体写 503**——这不是 bug，但要在 `ops.md` 里点名（fidelity 单例是**一个值**，它的大小上界就是 1 MiB）。
+- **两个 `StoreError` 同名**（`store::StoreError` 与 `cluster::arachne_store::StoreError`）：新变体属于前者，写测试时踩了一次。属于命名债，未动。
+
 **T3.3 写路径的转发行为（验证任务；上游 `bce2943` 后**本任务只验证不实现**）**
 - **Files**：`crates/hydra-server/src/cluster/forward.rs`（**删除**）、`crates/hydra-server/src/tenant_config/forward.rs`（**保留**，见 D-6）、`crates/hydra-server/src/admin/mod.rs`（无 leader 时的 503 文案）。
 - **Why**：原设计要在 Hydra 侧做「409 + leader 地址 + UI 自动重发」；复核 `bce2943` 后**这个需求消失了** —— 库已把 follower 上的写透明转发到 leader（p11/p12 实测）。因此本任务从"实现一层"变成"删掉一层并证明它不需要"。

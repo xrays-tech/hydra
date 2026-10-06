@@ -502,7 +502,9 @@ async fn write_sub_tenant(state: &AdminState, session: &mut ServerSession, trace
     };
     match apply_config_write(state.db(), &cfg, &tenant_id, &write).await {
         Ok(WriteOutcome::SubTenant(st)) => {
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             let config_version = state.store.version();
             // A-2 6 / D7: one structured audit record per write (never the
             // bearer/body).
@@ -559,7 +561,9 @@ async fn delete_sub_tenant(
     let cfg = std::sync::Arc::clone(&*state.store.snapshot());
     match apply_config_write(state.db(), &cfg, &tenant_id, &write).await {
         Ok(WriteOutcome::Deleted(id)) => {
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             let config_version = state.store.version();
             audit(
                 trace_id,
@@ -625,7 +629,9 @@ async fn write_route(state: &AdminState, session: &mut ServerSession, trace_id: 
     };
     match apply_config_write(state.db(), &cfg, &tenant_id, &write).await {
         Ok(WriteOutcome::Route(r)) => {
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             let config_version = state.store.version();
             audit(
                 trace_id,
@@ -679,7 +685,9 @@ async fn delete_route(
     let write = TenantConfigWrite::DeleteRoute { id: id.to_string() };
     match apply_config_write(state.db(), &cfg, &tenant_id, &write).await {
         Ok(WriteOutcome::Deleted(id)) => {
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             let config_version = state.store.version();
             audit(
                 trace_id,
@@ -778,9 +786,29 @@ fn db_err_resp(e: &sqlx::Error, trace_id: &str) -> Resp {
 /// consistency, design §13.2). Best-effort: a fatal validation failure is
 /// logged and recorded, not fatal — the write already committed (design §5.3
 /// keeps the old snapshot; the next successful reload recovers).
-async fn reload_best_effort(state: &AdminState, trace_id: &str) {
+async fn reload_best_effort(state: &AdminState, trace_id: &str) -> Option<Resp> {
     let _guard = state.reload_lock.lock().await;
     if let Err(e) = state.store.reload_all().await {
+        // Same split as the admin path: "the local commit could not be published" is NOT the
+        // best-effort case — an operator (or the tenant's own tooling) has to be told that only
+        // this node sees the change.
+        if let crate::store::StoreError::NotPublished { reason } = &e {
+            tracing::error!(
+                target: "hydra::tenant_config_write",
+                trace_id, %reason,
+                "post-write PUBLISH FAILED: committed locally, not visible to the cluster"
+            );
+            super::metrics::record_config_snapshot_stale(false);
+            return Some(err_json(
+                503,
+                "config_not_published",
+                &format!(
+                    "the change was committed to this node's database but could NOT be published \
+                     to the cluster, so no other node will see it: {reason}"
+                ),
+                trace_id,
+            ));
+        }
         tracing::error!(
             target: "hydra::tenant_config_write",
             trace_id, error = %e,
@@ -790,12 +818,13 @@ async fn reload_best_effort(state: &AdminState, trace_id: &str) {
         state
             .snapshot_stale
             .store(true, std::sync::atomic::Ordering::Release);
-        return;
+        return None;
     }
     super::metrics::record_config_snapshot_stale(false);
     state
         .snapshot_stale
         .store(false, std::sync::atomic::Ordering::Release);
+    None
 }
 
 /// A-2 前置 6 / D7 — one structured audit record per successful write.

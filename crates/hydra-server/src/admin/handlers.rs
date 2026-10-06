@@ -207,9 +207,31 @@ fn is_not_found(e: &sqlx::Error) -> bool {
 /// Best-effort: a fatal validation failure is logged but does **not** fail an
 /// already-committed write (design §5.3 keeps the old snapshot; the next
 /// successful reload recovers).
-async fn reload_best_effort(state: &AdminState, trace_id: &str) {
+async fn reload_best_effort(state: &AdminState, trace_id: &str) -> Option<Resp> {
     let _guard = state.reload_lock.lock().await;
     if let Err(e) = state.store.reload_all().await {
+        // ADR-0001 D-9/T3.2: the local commit succeeded but the config did NOT reach the cluster
+        // (Arachne refused to encode or the head could not be committed). This is NOT the
+        // best-effort case below — the response has to say "local only" or an operator will
+        // believe a change is fleet-wide when exactly one node has it.
+        if let crate::store::StoreError::NotPublished { reason } = &e {
+            tracing::error!(
+                target: "hydra::admin",
+                trace_id, %reason,
+                "post-write PUBLISH FAILED: the local SQLite transaction committed and this node \
+                 serves the new config, but the cluster does not have it"
+            );
+            note_reload_outcome(state, false);
+            return Some(err_json(
+                503,
+                "config_not_published",
+                &format!(
+                    "the change was committed to this node's database but could NOT be published \
+                     to the cluster, so no other node will see it: {reason}"
+                ),
+                trace_id,
+            ));
+        }
         // ERROR, not WARN (audit §3.14): the write was committed, but the
         // runtime is now permanently serving the PREVIOUS snapshot — every later
         // write (key rotation, revocation, tenant disable) will also fail to
@@ -221,9 +243,10 @@ async fn reload_best_effort(state: &AdminState, trace_id: &str) {
             "post-write reload_all FAILED: the in-memory config snapshot is now STALE              (design §5.3 keeps the old snapshot; admin writes will keep returning              2xx while having no runtime effect until a reload succeeds)"
         );
         note_reload_outcome(state, true);
-        return;
+        return None;
     }
     note_reload_outcome(state, false);
+    None
 }
 
 /// Record the outcome of a config reload — **the single owner** of
@@ -380,7 +403,9 @@ pub(super) async fn provider_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &p)
     } else {
         method_not_allowed(trace_id)
@@ -422,7 +447,9 @@ pub(super) async fn provider_item(
             }
             match crate::db::get_provider(state.db(), id).await {
                 Ok(p) => {
-                    reload_best_effort(state, trace_id).await;
+                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                        return r;
+                    }
                     ok_json(200, &p)
                 }
                 Err(_) => err_json(404, "not_found", "provider not found", trace_id),
@@ -430,7 +457,9 @@ pub(super) async fn provider_item(
         }
         "DELETE" => match crate::db::delete_provider(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -467,7 +496,9 @@ pub(super) async fn provider_model_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &m)
     } else {
         method_not_allowed(trace_id)
@@ -503,7 +534,9 @@ pub(super) async fn provider_model_item(
             }
             match crate::db::get_provider_model(state.db(), id).await {
                 Ok(m) => {
-                    reload_best_effort(state, trace_id).await;
+                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                        return r;
+                    }
                     ok_json(200, &m)
                 }
                 Err(_) => err_json(404, "not_found", "model not found", trace_id),
@@ -511,7 +544,9 @@ pub(super) async fn provider_model_item(
         }
         "DELETE" => match crate::db::delete_provider_model(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -584,7 +619,9 @@ pub(super) async fn provider_key_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         // Never echo plaintext back (P1-5) — re-expose only via the masked DTO.
         let masked = hydra_core::rewrite::mask_key(&k.api_key);
         let dto = ProviderKeyDto {
@@ -655,7 +692,9 @@ pub(super) async fn provider_key_item(
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             let masked = hydra_core::rewrite::mask_key(&k.api_key);
             let dto = ProviderKeyDto {
                 id: k.id,
@@ -667,7 +706,9 @@ pub(super) async fn provider_key_item(
         }
         "DELETE" => match crate::db::delete_provider_key(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1055,7 +1096,9 @@ pub(super) async fn tenant_collection(
         let has = crate::db::tenant_has_access_token(state.db(), &t.id)
             .await
             .unwrap_or(false);
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &TenantView::from_state(state, t, has))
     } else {
         method_not_allowed(trace_id)
@@ -1146,7 +1189,9 @@ pub(super) async fn tenant_item(
             };
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
-                    reload_best_effort(state, trace_id).await;
+                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                        return r;
+                    }
                     ok_json(200, &TenantView::from_state(state, t, has))
                 }
                 Err(e) if is_not_found(&e) => {
@@ -1157,7 +1202,9 @@ pub(super) async fn tenant_item(
         }
         "DELETE" => match crate::db::delete_tenant(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1197,7 +1244,9 @@ pub(super) async fn tenant_provider_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &tp)
     } else {
         method_not_allowed(trace_id)
@@ -1220,7 +1269,9 @@ pub(super) async fn tenant_provider_item(
         },
         "DELETE" => match crate::db::delete_tenant_provider(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1256,7 +1307,9 @@ pub(super) async fn tenant_model_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &tm)
     } else {
         method_not_allowed(trace_id)
@@ -1279,7 +1332,9 @@ pub(super) async fn tenant_model_item(
         },
         "DELETE" => match crate::db::delete_tenant_model(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1463,7 +1518,9 @@ pub(super) async fn limit_role_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &r)
     } else {
         method_not_allowed(trace_id)
@@ -1499,7 +1556,9 @@ pub(super) async fn limit_role_item(
             }
             match crate::db::get_limit_role(state.db(), id).await {
                 Ok(r) => {
-                    reload_best_effort(state, trace_id).await;
+                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                        return r;
+                    }
                     ok_json(200, &r)
                 }
                 Err(_) => err_json(404, "not_found", "role not found", trace_id),
@@ -1507,7 +1566,9 @@ pub(super) async fn limit_role_item(
         }
         "DELETE" => match crate::db::delete_limit_role(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1557,7 +1618,9 @@ pub(super) async fn provider_key_binding_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &b)
     } else {
         method_not_allowed(trace_id)
@@ -1599,7 +1662,9 @@ pub(super) async fn provider_key_binding_item(
             }
             match crate::db::get_provider_key_binding(state.db(), id).await {
                 Ok(b) => {
-                    reload_best_effort(state, trace_id).await;
+                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                        return r;
+                    }
                     ok_json(200, &b)
                 }
                 Err(_) => err_json(404, "not_found", "provider_key_binding not found", trace_id),
@@ -1607,7 +1672,9 @@ pub(super) async fn provider_key_binding_item(
         }
         "DELETE" => match crate::db::delete_provider_key_binding(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -1786,7 +1853,9 @@ pub(super) async fn sub_tenant_collection(
             Ok(st) => st,
             Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
         };
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &created)
     } else {
         method_not_allowed(trace_id)
@@ -1845,12 +1914,16 @@ pub(super) async fn sub_tenant_item(
                 Ok(st) => st,
                 Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
             };
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             ok_json(200, &updated)
         }
         "DELETE" => match sub_tenant_write::delete_sub_tenant(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
@@ -1912,7 +1985,9 @@ pub(super) async fn sub_tenant_route_collection(
             Ok(r) => r,
             Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
         };
-        reload_best_effort(state, trace_id).await;
+        if let Some(r) = reload_best_effort(state, trace_id).await {
+            return r;
+        }
         ok_json(201, &created)
     } else {
         method_not_allowed(trace_id)
@@ -1965,12 +2040,16 @@ pub(super) async fn sub_tenant_route_item(
                     return sub_tenant_core_err_resp(e, trace_id, "sub_tenant_route not found")
                 }
             };
-            reload_best_effort(state, trace_id).await;
+            if let Some(r) = reload_best_effort(state, trace_id).await {
+                return r;
+            }
             ok_json(200, &updated)
         }
         "DELETE" => match sub_tenant_write::delete_route(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, trace_id).await;
+                if let Some(r) = reload_best_effort(state, trace_id).await {
+                    return r;
+                }
                 empty(204)
             }
             Err(e) => sub_tenant_core_err_resp(e, trace_id, "sub_tenant_route not found"),

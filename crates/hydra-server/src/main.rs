@@ -437,6 +437,61 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     };
     info!("config store loaded");
 
+    // (2c-arachne) The two halves of the Arachne control plane that touch the config store
+    // (ADR-0001, plan T3.2). Both are no-ops when the control plane did not start (single-node
+    // mode, i.e. no `HYDRA_CLUSTER_PEERS`), which is the same condition under which
+    // `arachne_control` is `None`.
+    //
+    // 1. PUBLISHER: a management write commits its config to the cluster instead of only to this
+    //    node's database. Attached here because this is the only place that knows whether a
+    //    control plane exists.
+    // 2. MATERIALIZER: every node follows `ctl/head`, so a write on ANY node reaches all of them.
+    //    Spawned here, and this is load-bearing — publishing without it would move the head that
+    //    nobody reads, and the cluster would silently diverge.
+    #[cfg(feature = "arachne")]
+    let store = match arachne_control.as_ref().and_then(|c| c.config_store()) {
+        Some(ctl_store) => {
+            use hydra_server::cluster::arachne_materializer::{Materializer, ReplicaTarget};
+            use hydra_server::cluster::arachne_publish::ConfigPublisher;
+
+            let publisher = Arc::new(ConfigPublisher::new(
+                ctl_store.clone(),
+                key_provider.clone(),
+            ));
+            let store = store.with_publisher(publisher);
+
+            let target = Arc::new(ReplicaTarget::new(store.clone(), key_provider.clone()));
+            let mut materializer = Materializer::new(ctl_store, target, key_provider.clone());
+            tokio::spawn(async move {
+                // One local `get_stale(head)` per tick in the steady state, so the interval is
+                // what bounds propagation latency (the measured follower convergence is
+                // milliseconds; ADR-0001 §10 F-5).
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    match materializer.converge().await {
+                        Ok(hydra_server::cluster::arachne_materializer::Converged::Applied {
+                            hash,
+                        }) => {
+                            info!(head = %hash, "config materialized from the control plane");
+                        }
+                        // Steady state, and "a previous failure is still backing off".
+                        Ok(_) => {}
+                        Err(e) => {
+                            // Not fatal: the node keeps serving its last-known-good config, and
+                            // an un-materialized node is not eligible to lead.
+                            warn!(error = %e, "config materialization did not complete; will retry");
+                        }
+                    }
+                }
+            });
+            info!("config materialization loop started (poll every 1s)");
+            store
+        }
+        None => store,
+    };
+
     // (2c'') Resolved-cert store (design §12.1) + its single wiring: follow the
     //        snapshot. It is created here, not in `run_server`, because the
     //        control client (spawned below) can apply a snapshot — carrying new

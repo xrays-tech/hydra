@@ -49,6 +49,16 @@ pub enum StoreError {
     /// rebuild from; `apply_snapshot` is the only mutation path.
     #[error("config store has no local database (edge/snapshot-fed mode)")]
     NoDatabase,
+    /// The config committed to the LOCAL database but could not be published to
+    /// the control plane (Arachne), so the rest of the cluster will not see it.
+    ///
+    /// The wording is deliberate: the SQLite transaction DID commit, so this is
+    /// not "the write failed" — it is "the write is local only". An operator who
+    /// reads "database error" would look for a rollback that never happened.
+    #[error(
+        "the config was committed to the local database but NOT PUBLISHED to the cluster: {reason}"
+    )]
+    NotPublished { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +311,10 @@ pub struct ConfigStore {
     /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
     /// be forgotten by one of the writers.
     hooks: Arc<std::sync::Mutex<Vec<SnapshotHook>>>,
+    /// The Arachne publisher (ADR-0001), present only in a cluster node built with the `arachne`
+    /// feature. `None` in single-node mode, where a local reload IS the whole truth.
+    #[cfg(feature = "arachne")]
+    publisher: Option<Arc<crate::cluster::arachne_publish::ConfigPublisher>>,
 }
 
 /// A consumer that follows every snapshot swap (see
@@ -369,6 +383,8 @@ impl ConfigStore {
             key_provider,
             replication: Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(content)))),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(feature = "arachne")]
+            publisher: None,
         })
     }
 
@@ -391,6 +407,8 @@ impl ConfigStore {
             // only the first `apply_snapshot` (from a verified wire) fills it.
             replication: Arc::new(arc_swap::ArcSwapOption::empty()),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(feature = "arachne")]
+            publisher: None,
         }
     }
 
@@ -530,7 +548,41 @@ impl ConfigStore {
         // cert written through the admin API is live on the very next
         // handshake — on every node role, including edge.
         self.notify(&self.snapshot());
+
+        // ...and now the CLUSTER. Order (local swap, then publish) is deliberate: the SQLite
+        // transaction committed before any of this, so this node's own state must be consistent
+        // with its own database whether or not the cluster accepts the publish. A failure here is
+        // returned as `NotPublished` — the admin layer turns that into a 503 saying the change is
+        // local only — and the local config STAYS SERVED by this node until some other node's
+        // publish moves the head, at which point the materializer rebuilds this node from that
+        // head and the un-published change is gone. That is the correct direction (the head is
+        // the authority) and it is why the 503 must not be silent.
+        #[cfg(feature = "arachne")]
+        if let Some(publisher) = &self.publisher {
+            let content = self.replication();
+            if let Some(content) = content.as_deref() {
+                publisher
+                    .publish(&content.cfg, content.fidelity())
+                    .await
+                    .map_err(|reason| StoreError::NotPublished { reason })?;
+            }
+        }
         Ok(true)
+    }
+
+    /// Attach the Arachne publisher (ADR-0001, plan T3.2).
+    ///
+    /// A builder rather than a `load` parameter: single-node and non-`arachne` builds have no
+    /// publisher at all, and the call site that HAS one is the cluster bootstrap, which is also the
+    /// only place that knows whether the control plane started.
+    #[cfg(feature = "arachne")]
+    #[must_use]
+    pub fn with_publisher(
+        mut self,
+        publisher: Arc<crate::cluster::arachne_publish::ConfigPublisher>,
+    ) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 }
 

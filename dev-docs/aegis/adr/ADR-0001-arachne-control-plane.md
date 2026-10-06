@@ -160,6 +160,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | cert 私钥随树走（D-7 的 (b)） | 本轮 | `cert` 实体改为 `CertTreeEntity{meta, sealed_key}`；解码时回填 `cert_key_pem`；缺少密封材料**拒绝发布**而不是丢掉密钥；`TOC_FORMAT` 1→2（同一批字节两种解法的版本必须互相拒绝） |
 | 集合的编码序（D-8 推论②） | 本轮 | `tenant_providers` / `tenant_models` 是 `HashSet`，改为**排序后**编码（`sorted_members`），否则同一配置每次读库换树名 |
 | 解码必须复现 loader 的**推导规则** | 本轮 | ① 四个 `Vec` 的排序原先一律按 `id`，而 loader 用的是 SQL `ORDER BY`（`limit_role.created_at,id` / `binding.key_prefix` / `sub_tenant.tenant_id,name` / `route.sub_tenant_id,model_key`）⇒ 副本持有的顺序与 leader 不同；② `tenants_by_domain` 的键在 loader 侧是**小写域**，解码侧却拿值里的原样域名当键 ⇒ 存储域名为混合大小写时，副本上的租户落在**没人会去查的键**下（`proxy::resolve_tenant` 用小写 `Host` 查表），于是同一租户在 leader 上解析得到、在副本上解析不到。守卫：`tests/arachne_derivation_fidelity.rs`（两处都先红后绿，fixture 让"loader 序"与"id 序"反向、让域名非小写） |
+| 发布切换 + 物化循环落地（T3.2 主体） | 本轮 | `ConfigPublisher` + `ConfigStore::reload_all_with` 里的发布（内容变化才发、本地置换之后）⇒ 本地提交成功但发布失败返回 `StoreError::NotPublished`，admin 层答 503 `config_not_published`（文案是「已提交到本节点库、未发布到集群」）；`main.rs` bootstrap 挂上发布者并**同时**按 1 s 周期拉起物化循环（只发布不物化 = head 没人读，集群静默分叉）。守卫：`a_local_change_is_published_and_another_node_materializes_it`（两个真 store + 一个真 raft 节点：A 写库 → 发布 → B 物化并落盘）、`a_failed_publish_names_itself_and_keeps_serving_locally`（超 1 MiB 单值上限触发） |
 | 真实 target（`ReplicaTarget`） | 本轮 | 先 `db::restore_config`（一个事务重建本地 SQLite）**再** `ConfigStore::apply_snapshot`（换入内存态）：反了会让节点服务一份自己库里没有的配置；`MaterializeTarget` 相应改为 `async`。守卫用例连"把副本自己的库用 loader 读回来 == 发布的那份配置"都钉住了 |
 | toc 解码器缺判别值 12/13 | 本轮 | `TenantProvider`/`TenantModel` **能写不能读** ⇒ 配置里只要有一条授权，`read` 在 toc 处失败、物化无限重试、**全集群零物化**。躲过既有用例的原因：没有 fixture 带授权走过真实 toc。补 12/13，并加 `every_entity_kind_survives_a_toc_round_trip` 把这一类堵死（能当键用 ⇒ 必须能解码） |
 
@@ -169,8 +170,9 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 **尚未落地（引用本 ADR 时不得当作已完成）**：
 
-1. **发布侧仍走 `SnapshotWire`**（属 T3.2），而且**启动时没有人拉起物化循环**（没有 spawn）。`ReplicaTarget` 本身已实现并端到端验证（真 raft + 真 store + 真 SQLite），但**节点今天仍不从 Arachne 服务配置** —— 只做一半会得到一个「没有人写 head、节点却自称已物化」的进程。T3.1 的「真实 3 节点」验收因此未执行；已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值/确定性/保密用例。
-2. `SealedMaterial` 缺"从已存密文构造"的入口（见上），发布切换时必须先补 `db` 侧的读取函数。
+1. **T3.2 的两条残余**（主体已落地）：① 版本权威仍是自增计数器 `config_meta.config_version`，**没有**换成 head 哈希（权威事实上已是 head，但那个整数水位还没降级）；② `leader_ready` 仍是 Arachne 写探测，**没有**把物化门接上去（「未物化 = 不可当选」尚未生效）。两条都不影响「发布 → 物化」这条链本身。
+2. **T3.1 的「真实 3 节点」验收仍未执行**（现在具备条件了：发布与物化都已接线）。已执行的是 1 节点真实 raft + 真 store 的端到端，以及两个真 store 之间的发布→物化用例。
+3. ~~`SealedMaterial` 缺"从已存密文构造"的入口~~ → **该条已作废**：D-9 用确定性密封取代了整条思路，`SealedMaterial` 已删除。
 3. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
 4. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。
 5. §9 基线同步未做：`dev-docs/cluster.md` / `ops.md` 仍描述 Redis 租约世界。

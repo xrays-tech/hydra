@@ -406,7 +406,7 @@ mod tests {
     /// Dedicated loopback ports: cargo runs the tests in this module CONCURRENTLY, so two tests
     /// sharing a port would fail with "Address already in use" — which is how the fifth one below
     /// was caught when the real-target test first borrowed `PORTS[3]`.
-    const PORTS: [u16; 5] = [18401, 18402, 18403, 18404, 18405];
+    const PORTS: [u16; 7] = [18401, 18402, 18403, 18404, 18405, 18406, 18407];
 
     fn data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hydra-mat-{tag}-{}", std::process::id()));
@@ -926,6 +926,160 @@ mod tests {
         assert!(
             replica_store.snapshot().tenants_by_domain.is_empty(),
             "nothing may be installed when the target refuses"
+        );
+    }
+
+    /// THE CUTOVER, end to end: a local config change is PUBLISHED, and another node picks it up.
+    ///
+    /// This is the property plan T3.2 exists for, and it is asserted across two real stores and one
+    /// real raft node, in the order production does it:
+    ///
+    /// 1. node A loads its store from its own database and attaches a publisher;
+    /// 2. a write lands in A's database and `reload_all` runs (exactly what every admin handler
+    ///    does after a committed transaction) — this PUBLISHES;
+    /// 3. node B, which shares nothing with A but the raft cluster, converges and ends up serving
+    ///    A's config with the row in its OWN database.
+    ///
+    /// It also pins the property that makes publishing affordable: A publishing the SAME config
+    /// again does NOT move the head, because the tree's name is a function of the config (D-9). A
+    /// non-deterministic seal would rename it here, and every publish would re-materialize the
+    /// whole cluster.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_change_is_published_and_another_node_materializes_it() {
+        let raft = node("publish", PORTS[5]).await;
+        wait_writable(&raft).await;
+        let ctl = ArachneConfigStore::new(raft.handle.clone());
+        let key_provider: Arc<dyn crate::crypto::KeyProvider> = Arc::new(kp());
+
+        // --- node A: its own database, its own store, and a publisher -------------------------
+        let a_pool = pool().await;
+        let a_store = ConfigStore::load(a_pool.clone(), key_provider.clone())
+            .await
+            .expect("load A")
+            .with_publisher(Arc::new(
+                crate::cluster::arachne_publish::ConfigPublisher::new(
+                    ctl.clone(),
+                    key_provider.clone(),
+                ),
+            ));
+        assert_eq!(
+            ctl.current_hash().await.expect("read head"),
+            None,
+            "fixture: nothing is published yet"
+        );
+
+        // The write: in production this is the admin handler's SQL transaction.
+        crate::db::insert_provider(&a_pool, &provider("p1"))
+            .await
+            .expect("insert provider");
+
+        assert!(
+            a_store.reload_all().await.expect("reload + publish"),
+            "a real change must reload"
+        );
+        let head = ctl
+            .current_hash()
+            .await
+            .expect("read head")
+            .expect("the reload must have PUBLISHED a head");
+        assert_eq!(head.len(), 64, "the head is a content hash");
+
+        // Republishing an unchanged config must not move the head: `changed` is false, so publish
+        // is not even reached — and if it were, the tree name would be identical anyway.
+        assert!(
+            !a_store.reload_all().await.expect("second reload"),
+            "no change means no publish"
+        );
+        assert_eq!(
+            ctl.current_hash().await.expect("read head"),
+            Some(head.clone()),
+            "the head must not move for an unchanged config"
+        );
+
+        // --- node B: nothing but the raft cluster in common ----------------------------------
+        let b_pool = pool().await;
+        let b_store = ConfigStore::load(b_pool.clone(), key_provider.clone())
+            .await
+            .expect("load B");
+        assert!(
+            b_store.snapshot().providers.is_empty(),
+            "fixture: B starts empty"
+        );
+        let target = Arc::new(ReplicaTarget::new(b_store.clone(), key_provider.clone()));
+        let mut mat = Materializer::new(ctl.clone(), target, key_provider.clone());
+        assert_eq!(
+            mat.converge().await.expect("B converges"),
+            Converged::Applied { hash: head.clone() },
+            "B must materialize the head A published"
+        );
+
+        assert!(
+            b_store.snapshot().providers.contains_key("p1"),
+            "B must SERVE the config A published"
+        );
+        assert!(
+            crate::db::get_provider(&b_pool, "p1").await.is_ok(),
+            "B's own database must carry the row, or it could not rebuild itself"
+        );
+    }
+
+    /// A publish that cannot go through is reported as "committed locally, NOT published".
+    ///
+    /// The local transaction cannot be rolled back at that point, so the honest answer is the one
+    /// the admin layer turns into a 503: the change is on THIS node only. The trigger here is a
+    /// value past the library's 1 MiB per-value cap — a real config can reach it (a provider with
+    /// a huge name), and it fails at `put` time rather than at encode time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_publish_names_itself_and_keeps_serving_locally() {
+        let raft = node("publish-fail", PORTS[6]).await;
+        wait_writable(&raft).await;
+        let ctl = ArachneConfigStore::new(raft.handle.clone());
+        let key_provider: Arc<dyn crate::crypto::KeyProvider> = Arc::new(kp());
+
+        let a_pool = pool().await;
+        let a_store = ConfigStore::load(a_pool.clone(), key_provider.clone())
+            .await
+            .expect("load")
+            .with_publisher(Arc::new(
+                crate::cluster::arachne_publish::ConfigPublisher::new(
+                    ctl.clone(),
+                    key_provider.clone(),
+                ),
+            ));
+
+        // Over the library's per-value cap (1 MiB), so the entity cannot be committed.
+        let mut huge = provider("p1");
+        huge.name = "x".repeat(2 * 1024 * 1024);
+        crate::db::insert_provider(&a_pool, &huge)
+            .await
+            .expect("insert oversized provider");
+
+        let got = a_store.reload_all().await;
+        match got {
+            // NB: `crate::store::StoreError` (the ConfigStore's) is a DIFFERENT type from
+            // this module's `arachne_store::StoreError` — the publish step belongs to the former.
+            Err(crate::store::StoreError::NotPublished { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "the refusal must carry the underlying reason, or the 503 says nothing"
+                );
+            }
+            other => panic!(
+                "an uncommittable tree must surface as NotPublished (local commit stands, cluster \
+                 does not have it), got {other:?}"
+            ),
+        }
+
+        // The local side stands: the write committed, and this node serves it. That is precisely
+        // why the error says "committed but NOT published" rather than "the write failed".
+        assert!(
+            a_store.snapshot().providers.contains_key("p1"),
+            "the local commit must stand and be served"
+        );
+        assert_eq!(
+            ctl.current_hash().await.expect("read head"),
+            None,
+            "nothing may be published when the tree cannot be encoded"
         );
     }
 }

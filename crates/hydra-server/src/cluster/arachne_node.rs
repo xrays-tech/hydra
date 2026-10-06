@@ -471,6 +471,19 @@ impl ArachneControl {
         }
     }
 
+    /// The started node's config store — the single thing the cluster bootstrap needs from this
+    /// control plane, for both halves of T3.2: the store's PUBLISHER (a management write commits
+    /// its tree) and the MATERIALIZER (every node follows the head).
+    ///
+    /// `None` when no node was started (single-node mode, or a test double), which is exactly when
+    /// there is nothing to publish to or materialize from.
+    #[must_use]
+    pub fn config_store(&self) -> Option<super::arachne_store::ArachneConfigStore> {
+        self.handle
+            .as_ref()
+            .map(|h| super::arachne_store::ArachneConfigStore::new(h.clone()))
+    }
+
     /// This node's identity.
     #[must_use]
     pub fn node_id(&self) -> &NodeId {
