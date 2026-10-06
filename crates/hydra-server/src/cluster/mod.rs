@@ -29,6 +29,20 @@ pub mod registry;
 pub mod replica;
 pub mod snapshot;
 
+// Arachne control plane (ADR-0001). Gated on its own feature, independent of
+// `cluster-redis`: the default build must neither compile nor link it, and a
+// single-node deployment must not reach any of its code paths.
+#[cfg(feature = "arachne")]
+pub mod arachne_entities;
+#[cfg(feature = "arachne")]
+pub mod arachne_keys;
+#[cfg(feature = "arachne")]
+pub mod arachne_materialize;
+#[cfg(feature = "arachne")]
+pub mod arachne_node;
+#[cfg(feature = "arachne")]
+pub mod arachne_store;
+
 /// Node role in a Hydra cluster (v8 plan §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeRole {
