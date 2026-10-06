@@ -5,9 +5,26 @@
 //!
 //! ```text
 //! hydra/ctl/head                      -> the current tree's content hash
-//! hydra/cfg/<toc-hash>/toc            -> the table of contents of that tree
-//! hydra/cfg/<toc-hash>/<path>         -> one entity, keyed by its entity path
+//! hydra/cfg/toc/<toc-hash>            -> the table of contents of that tree
+//! hydra/cfg/e/<path>                  -> one entity, keyed by its entity path
 //! ```
+//!
+//! ## Why the entity key does NOT contain the tree hash
+//!
+//! The first version of this module keyed entities as `hydra/cfg/<toc-hash>/<path>`,
+//! which reads well and is wrong: entities are written only when their bytes
+//! CHANGE, so an unchanged entity lives under the previous tree's hash while the
+//! new tree names the new one — and the new tree then cannot find it (measured:
+//! the round-trip test failed with "tree <h> is missing entity tenant/acme").
+//! Content-addressing every entity instead would fix the lookup but force a new
+//! key per entity content version, i.e. a garbage stream to collect, for files
+//! whose logical identity is the PATH.
+//!
+//! So the two are decoupled: the tree is named by the hash of its toc, the toc
+//! is stored under that hash, and entity keys are stable per path. A reader
+//! fetches an entity by path and verifies it against the hash the toc records,
+//! which is what makes the toc the authority and the entity key merely an
+//! address.
 //!
 //! ## Why a tree keyed by entity path, and not byte shards
 //!
@@ -69,13 +86,15 @@ pub fn ctl_format() -> String {
 /// The table of contents of the tree identified by `toc_hash`.
 #[must_use]
 pub fn cfg_toc(toc_hash: &str) -> String {
-    format!("{CFG_PREFIX}{toc_hash}/toc")
+    format!("{CFG_PREFIX}toc/{toc_hash}")
 }
 
-/// One entity inside the tree identified by `toc_hash`.
+/// One entity, keyed by its own path — **not** by the tree it currently belongs
+/// to, because an unchanged entity is not rewritten and therefore outlives the
+/// tree that introduced it (see the module docs).
 #[must_use]
-pub fn cfg_entity(toc_hash: &str, path: &EntityPath) -> String {
-    format!("{CFG_PREFIX}{toc_hash}/{}", path.to_key_segment())
+pub fn cfg_entity(path: &EntityPath) -> String {
+    format!("{CFG_PREFIX}e/{}", path.to_key_segment())
 }
 
 /// Where one entity lives inside a config tree.
@@ -361,6 +380,21 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Validate every id in `entities`.
+///
+/// Public to the crate so a publisher can validate a whole plan BEFORE it writes
+/// anything: refusing a bad id after three entities are already stored would
+/// leave an unreachable partial tree behind for no reason.
+pub(crate) fn validate_entities(entities: &[TocEntry]) -> Result<(), KeysError> {
+    for e in entities {
+        let kind = kind_name(&e.path);
+        if let Some(id) = e.path.id() {
+            validate_id(kind, id)?;
+        }
+    }
+    Ok(())
+}
+
 impl Toc {
     /// Encode for storage as the value of [`cfg_toc`].
     ///
@@ -396,12 +430,7 @@ impl Toc {
     /// This is the only constructor that accepts unvalidated strings, and it
     /// refuses the ids that would corrupt a key.
     pub fn new(format: u32, entities: Vec<TocEntry>) -> Result<Self, KeysError> {
-        for e in &entities {
-            let kind = kind_name(&e.path);
-            if let Some(id) = e.path.id() {
-                validate_id(kind, id)?;
-            }
-        }
+        validate_entities(&entities)?;
         Ok(Self { format, entities })
     }
 
@@ -524,15 +553,9 @@ mod tests {
         assert_eq!(ctl_head(), "hydra/ctl/head");
         assert_eq!(ctl_cluster_id(), "hydra/ctl/cluster_id");
         assert_eq!(ctl_format(), "hydra/ctl/format");
-        assert_eq!(cfg_toc("abc123"), "hydra/cfg/abc123/toc");
-        assert_eq!(
-            cfg_entity("abc123", &target("acme")),
-            "hydra/cfg/abc123/tenant/acme"
-        );
-        assert_eq!(
-            cfg_entity("abc123", &EntityPath::Meta),
-            "hydra/cfg/abc123/meta"
-        );
+        assert_eq!(cfg_toc("abc123"), "hydra/cfg/toc/abc123");
+        assert_eq!(cfg_entity(&target("acme")), "hydra/cfg/e/tenant/acme");
+        assert_eq!(cfg_entity(&EntityPath::Meta), "hydra/cfg/e/meta");
     }
 
     /// Every entity kind has a distinct, `/`-free segment, and the singleton has
