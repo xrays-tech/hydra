@@ -323,23 +323,27 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_arachne_control_plane.py
 
-      # STARTUP KNOBS on the real binary — the two operator-facing promises that were prose
-      # only: `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster-role node**
-      # (round 191 measured `HYDRA_REDIS_MODE=clustr` booting as `single`, i.e. a topology switch
-      # silently ignored; round 194 measured the qualifier — on the single-node default the mode is
-      # not read at all, and K12 pins that boundary rather than the unqualified claim), and cluster
-      # wiring that a non-cluster role is not going to use must be named
-      # on EVERY path that reaches it — including `HYDRA_ROLE` unset, which round 192 measured
-      # as completely silent. Also pins that the documented `all` value is not reported as an
-      # unknown role, that a whitespace-padded role is still the role, and that the same legs
-      # stay SILENT on the documented single-node default (a rule that cannot stay quiet on
-      # correct input is noise).
+      # STARTUP KNOBS on the real binary — two operator-facing promises that used to be prose only:
+      # `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster node** (round 191
+      # measured `HYDRA_REDIS_MODE=clustr` booting as `single`, i.e. a topology switch silently
+      # ignored; round 194 measured the qualifier — on the single-node default the mode is not read
+      # at all, and K12 pins that boundary rather than the unqualified claim), and cluster wiring a
+      # node is not going to use must be NAMED, variable by variable, including on the path that used
+      # to be completely silent (round 192). It also pins the `Dropped` notice's two groups reaching
+      # the operator in ONE line, and that the ordinary single-node default stays quiet (a rule that
+      # cannot stay quiet on correct input is noise).
+      #
+      # The build MUST include `arachne`: the drill's K1/K2/K3/K11 run against a real
+      # `HYDRA_CLUSTER_PEERS` member, and a binary without the control plane REFUSES to boot with a
+      # member list set — so the legs would fail for a reason that is not the knob under test. (That
+      # is also why the recipe is stated here rather than inherited from an earlier step: this file
+      # has more than one feature recipe, and `cargo test` relinks the binary.)
       - name: startup knobs (fail fast / name what is dropped)
         env:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_startup_knobs.py
 
       # The tenant SDK against a REAL node and a REAL bus: `200 applied` (2/2 nodes),
