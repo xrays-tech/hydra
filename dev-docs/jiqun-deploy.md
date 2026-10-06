@@ -140,10 +140,11 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
   带成员表的节点会直接拒绝启动**（"this build has no control plane"）——这是实测抓到的
   一类缺陷，不要用更窄的 feature 配方。
 - **工作负载形态**：三个节点用**同一个 StatefulSet**（`replicas: 3`）+ **headless Service**
-  （`clusterIP: None`）提供稳定 DNS `hydra-N.hydra`。**必须设
-  `podManagementPolicy: Parallel`**：默认的 `OrderedReady` 会等 pod-0 Ready 才起 pod-1，
-  而一个**新数据目录必须由多数派先认领**（10 s 窗口），于是 pod-0 永远等不到多数派 ——
-  **这个集群用默认顺序启动起不来**（实测 2026-10-05）。
+  （`clusterIP: None`）提供稳定 DNS `hydra-N.hydra`。**首次安装时把
+  `podManagementPolicy` 设成 `Parallel`**：默认的 `OrderedReady` 会等 pod-0 Ready 才起 pod-1，
+  而一个**从未被认领的数据目录**要等多数派（10 s 窗口），于是 pod-0 永远等不到 ⇒ 集群起不来
+  （实测 2026-10-05）。**已经认领过的集群**顺序启动也能起（单台重启实测 ~500 ms），
+  但 `Parallel` 对两种情况都对，所以推荐一直开着。
 - **探针**：`readinessProbe` 用**带 admin token 的管理探针**
   （`/api/v1/health` + `Authorization: Bearer`）。**不要**用旧文档的
   `readinessProbe: /healthz/leader`——它会把 Service 收敛到单一节点，而集群里**每个节点

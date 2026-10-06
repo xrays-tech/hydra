@@ -167,8 +167,9 @@ metadata: { name: hydra, namespace: hydra }
 spec:
   serviceName: hydra
   replicas: 3
-  # ↓↓↓ 必须：默认的 OrderedReady 会"等 pod-0 Ready 才起 pod-1"，而一个【新数据目录必须由多数派
-  #     先认领】（10 s 窗口，cluster.md §5.6），于是 pod-0 永远等不到多数派 —— 集群起不来（实测）。
+  # ↓↓↓ 首次安装（PVC 全新）必须这样：默认的 OrderedReady 会"等 pod-0 Ready 才起 pod-1"，而一个
+  #     【从未被认领的数据目录】要等多数派（10 s 窗口，cluster.md §5.6），pod-0 永远等不到 ⇒ 起不来。
+  #     已认领过的集群顺序启动也能起（实测单台重启 ~500 ms），但 Parallel 对两种情况都对。
   podManagementPolicy: Parallel
   selector: { matchLabels: { app: hydra } }
   template:
