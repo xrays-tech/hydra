@@ -71,7 +71,6 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_TRUSTED_PROXIES` | *(unset)* | Comma-separated **IP or CIDR** allowlist of reverse proxies whose `X-Forwarded-For` is trusted (IPv4/IPv6; a bare IP is treated as /32 or /128). Unset/empty = trust nobody (use the socket peer IP — the conservative default). When the peer is trusted, the per-IP limiter reads **all** `X-Forwarded-For` header lines (in order) and keys on the **rightmost** address that is not itself a trusted proxy, falling back to the peer when there is no `X-Forwarded-For` / all entries are trusted proxies / any entry is invalid. **A malformed entry fails startup.** Misconfiguration risk: trusting a proxy that does not strip inbound `X-Forwarded-For` lets a client forge it and rotate its per-IP bucket, effectively disabling the per-IP dimension. |
 | `HYDRA_TENANT_API_INVALIDATE_PER_MIN` | `10` | Per-tenant invalidation cap (429 beyond it). Each one fans out to every node and re-hits the tenant's `auth_url` from all of them. |
 | `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` | `31` | E3 window ceiling. Not cosmetic: the ClickHouse table's key leads with `created_at`, so a wide window scans every tenant's rows in it. |
-| `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` | `60` | Per-tenant cap on **tenant self-service config writes** (sub-tenant / route CRUD, §5.5 v2), enforced on the **leader** (`429 too_many_requests` beyond it). A missing / zero / unparseable value falls back to 60 (never 0, which would refuse every write). Anti-DoS only; see the failover-reset note in §5.5. |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
 | `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
 
@@ -941,13 +940,12 @@ plan; catalog consistency is pinned by core tests, not a metric).
 `/metrics` `/healthz` `/readyz`), so sub-tenant CRUD from an edge is unavailable —
 the same boundary as every existing admin resource.
 
-### 5.5a Tenant self-service write path (v2, A′)
+### 5.5a Tenant self-service write path (v2, A′ — **as of 2026-10-05: applied by the receiving node**)
 
-In v2 a tenant can CRUD its **own** sub-tenants and routes on the **data plane**,
-without the operator. The two faces and the single write point:
+A tenant can CRUD its **own** sub-tenants and routes on the **data plane**, without an operator.
 
-**Four data-plane endpoints** (tenant-token gated, on the data-plane port; the tenant
-sees a normal response):
+**Four data-plane endpoints** (tenant-token gated, on the data-plane port; the tenant sees a normal
+response):
 
 | endpoint | what it does |
 | --- | --- |
@@ -956,57 +954,47 @@ sees a normal response):
 | `PUT    /tenant/{tid}/api/v1/sub-tenant-routes` | upsert by `(sub_tenant_id, model_key)`; body `{sub_tenant_id, model_key?, provider_id, enabled}` |
 | `DELETE /tenant/{tid}/api/v1/sub-tenant-routes/{id}` | delete by immutable id (idempotent) |
 
-**Four internal routes** (the leader's write point — **NOT exposed on the data-plane
-port**; cluster-token gated, **leader-only**):
+> **The four internal routes are GONE** (`/api/v1/internal/tenant-config/*`), together with the
+> `x-hydra-tenant-token` header and the cluster-token-gated leader-only write face (ADR-0001 D-6,
+> 乙-full). A request to that path is now an ordinary 404.
 
-| route | gate |
-| --- | --- |
-| `PUT /api/v1/internal/tenant-config/sub-tenants` | `HYDRA_CLUSTER_TOKEN` + receiver-side lease assertion |
-| `DELETE /api/v1/internal/tenant-config/sub-tenants/{id}` | same |
-| `PUT /api/v1/internal/tenant-config/sub-tenant-routes` | same |
-| `DELETE /api/v1/internal/tenant-config/sub-tenant-routes/{id}` | same |
+**What happens on a write**: the node that received the request authenticates the tenant (the same
+token gate as the read endpoints), then:
 
-The data-plane edge authenticates with the **tenant token** (same gate as the read
-endpoints) and then either **forwards to the lease-holding leader** (cluster) or
-**executes locally** (single-node). The leader:
+1. **authorization binding** — the write target must be the authenticated tenant's own resources
+   (`body.tenant_id != T` → `403` by pure string comparison before any lookup; a route whose
+   `sub_tenant_id` is missing or foreign → `404`, deliberately indistinguishable);
+2. **write** — the shared transactional write core (`admin/sub_tenant_write.rs`);
+3. **reload + publish** — the snapshot is reloaded and the resulting config is published to the
+   control plane (Arachne). The raft library forwards the head write to the leader, so the write
+   needs this node to be able to COMMIT, not to be the leader;
+4. **audit** — one structured record per write (below).
 
-1. **lease assertion** — non-candidate → `404`, candidate without the lease → `503
-   not_leader` (a standby **never** writes locally);
-2. **re-auth** — the tenant Bearer travels in the dedicated `x-hydra-tenant-token`
-   header (**never** `Authorization`, **never** the body) and is re-authenticated
-   against the same `ConfigStore`;
-3. **authorization binding** — the write target must be the authenticated tenant's own
-   resources (`body.tenant_id != T` → `403` by pure string comparison before any
-   lookup; a route whose `sub_tenant_id` is missing / foreign → `404`, indistinguishable);
-4. **write** — the shared transactional write core (`admin/sub_tenant_write.rs`);
-5. **audit** — one structured record per write (below).
+**Why there is no forwarding any more**: under raft the write does not need a leader to LAND, only
+to be COMMITTED, and the identity gate was always at the entry node. The old model relayed the whole
+request to the lease holder's internal endpoint with the tenant's bearer in a dedicated header; both
+the endpoint family and the header are retired, and the tenant credential no longer travels.
 
-**Single-node executes locally**: with no forwarder (a single-node / `all` build), the
-data-plane node **is** the writer and applies the write locally through the same
-write core, then `reload_all` so `config_version` advances. The two faces share one
-write point (`apply_config_write`), so the admin / internal / local paths cannot diverge
-on validation, quota, or natural-key upsert semantics.
+**Two properties that were given up deliberately** (recorded, not hidden):
 
-**Cluster topology constraint (known limitation)**: a cluster node with a forwarder
-**always forwards**; a cluster **leader's own data plane** therefore has no forward
-target (the self-forward guard resolves `None`) and returns `503 no_leader` for tenant
-writes. The leader still owns the authoritative DB — it simply does not serve tenant
-writes on its data plane. The sample topology (LB → edge:8080) does not route tenant
-traffic to the leader, so this is latent today; a deployment that exposes the leader
-data plane would need the lease holder to take the local path (the single writer is the
-lease holder, so this preserves the invariant). Tracked as a refinement, not a
-correctness bug: it fails closed.
+* **No freshness gate.** The old leader re-authenticated the tenant against ITS OWN snapshot (the
+  newest one) before executing. Now the entry node validates against the snapshot it holds, which
+  can be marginally behind the head. The write is still validated against the LIVE database inside
+  the transaction (that is where quota, prefix-overlap and existence checks run), so the exposure is
+  limited to "a tenant whose token was revoked microseconds ago may still be accepted once" — the
+  same window the data-plane read gate already has, bounded by the snapshot poll. A freshness gate
+  was considered and rejected (D-6).
+* **A compromised entry node can impersonate any tenant.** Note this is NOT a new capability: any
+  cluster node holds `HYDRA_ENCRYPTION_KEY` and a full config snapshot (it can decrypt provider keys
+  and certificate private keys), so compromising ONE node was already a fleet-wide compromise. What
+  changes is the shape: it is now "any tenant" rather than "tenant A becomes tenant B".
 
-**Per-tenant write rate limit (D6)**: the leader applies a fixed-window,
-**process-local** `Throttle` keyed on the authenticated tenant id
-(`AdminState.config_write_throttle` / `config_write_per_min`, `admin/mod.rs`). Budget is
-`HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (**default 60**/min); beyond it the write is `429
-too_many_requests` (the retry seconds are in the message body; this endpoint sets **no**
-`Retry-After` header, unlike the data-plane invalidate 429). Because all writes land on the leader, one
-in-process window covers the cluster. **Anti-DoS only — the window is in-process and
-therefore RESETS when leadership moves**: a leader failover allows a bounded burst of
-config writes. This is the same accepted class as the E2 allow-TTL bound
-(`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`) — it is not a durability guarantee.
+**Write-rate accounting (quantified)**: the per-tenant config-write throttle that used to live on
+the leader's internal endpoint is gone with it. Writes are now bounded by the general tenant-API
+per-tenant request budget, which is **per node** — so the cluster-wide ceiling for sub-tenant writes
+is **N x single-window** for N nodes, not one window. That is a real relaxation of the anti-DoS
+bound, accepted with the D-6 ruling (it was never a durability guarantee: the old window was
+process-local and reset on failover anyway).
 
 **Audit log (D7)**: each successful config write emits one `tracing` record
 (`target = "hydra::tenant_config_write"`) carrying `tenant_id`, `trace_id`, `action`
@@ -1515,7 +1503,6 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
 | `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` | 15000 / 1000 defaults |
 | `HYDRA_NODE_ID` | this node's registry + lease identity; defaults to `HOSTNAME`, then random (see §13.6) |
-| `HYDRA_FORWARD_TIMEOUT_SECS` | standby→leader admin-forward timeout (default 5). It bounds the CONNECT phase; the total deadline is that value + 2s so a connect-phase failure is reported as the definite failure it is (see `forward.rs`) |
 | `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` | bound on **establishing** the TCP/TLS connection to a provider (default **10**); `0`/garbage falls back to the default. **Must be strictly below `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS`** — the node refuses to start otherwise, because the first-byte bound wraps the whole send (connect included) and would always fire first. What it buys (measured 2026-09-30 against a black-holed route, `integration/test_upstream_connect_bound.py`): without it a provider whose SYN goes nowhere burned the whole first-byte bound and was classified as a *post-send* failure, so the request returned `502 upstream_transport_error` **instead of failing over** to a healthy provider (`codes=[502,200,502,200,502,200]`, `retries=0`); with it the attempt fails in ≤10s as a connect error and the request **fails over** (`codes=[200×6]`, `retries=4`, and `hydra_upstream_first_byte_timeout_total` stays 0 for that provider). A healthy provider on a normal RTT establishes in milliseconds, so this bound only ever fires on a dead route. **What a dead route costs, measured 2026-09-30** (`integration/test_dead_route_cost.py`, shipped defaults 10s/30s, dead route = a dropped SYN): every affected request pays ~**10s** and is then served by a healthy peer (`10.0s, 0.0s, 10.0s, …` — one penalty per time the dead provider is chosen), the provider is taken out of the rotation after exactly **5** such failures (`hydra_candidate_skipped_total{reason="breaker_dead"}` starts at 1 per skipped request), and the penalties then **stop** (all later requests < 1s). Worst case for a two-provider SWRR rotation: ~5 × 10s of user-visible latency spread over the first ~9 requests. `DELETE /api/v1/breaker/{id}` clears the dead-set, so resetting **without fixing the route** buys those 10s penalties again — fix the route first |
 | `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | upstream time-to-first-byte bound per attempt (default 30); `0` is rejected (it falls back to the default rather than meaning 'instant'). Covers the response HEADERS only — a connect that never completes is bounded by `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` above, and the response BODY by `HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`. See the alert row in §9.1 |
 | `HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN` | per-PEER budget for FAILED credential attempts on the admin port — **shared by BOTH gates** (the `admin` token and the internal `cluster` token) (default 10; `0`/garbage falls back). Past it the peer gets `429 too_many_failed_attempts` + `Retry-After` for the rest of the minute; a VALID token is always accepted, so this cannot lock an operator out. Watch `hydra_admin_auth_failures_total{result=~".+_throttled"}` — the label is `<gate>_denied` \| `<gate>_throttled` (gate = `admin` \| `cluster`), so a rule written against the old bare `denied`/`throttled` values would never match |

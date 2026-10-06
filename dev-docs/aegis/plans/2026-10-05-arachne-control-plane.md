@@ -768,6 +768,26 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **③ 基线**：`dev-docs/cluster.md` §3 顶部加了「控制面权威 = Arachne；Redis 只承载数据面近似状态」的说明与三行归属表，并把该节的「配置快照 / 选举」两行标注为已退役（其余逐条改写留 T4.3）。
 
+#### T3.5 实现记录（2026-10-05，D-6 乙-full）
+
+**做了什么**：
+
+| 动作 | 位置 | 说明 |
+| --- | --- | --- |
+| 数据面写路径改为**就地执行** | `tenant_api/handlers.rs` | 删掉整段转发分支（含 `internal_request` 的四端点映射、`ForwardedWrite`、`forward_write`、`ForwardError`/`TenantConfigForwarderError` 的 502/503/504 分类）⇒ 入口节点跑共享写核心 + `reload_all`（后者会**发布**，T3.2） |
+| **写核心搬家** | `admin/sub_tenant_write.rs` | `TenantConfigWrite` / `WriteOutcome` / `ApplyError` / `apply_config_write` 从 `admin/tenant_config_api.rs` 移入——它们本来就是单一写点，且从不依赖 `AdminState`/`Session`/HTTP |
+| 内网端点族**整族删除** | `admin/mod.rs`、`admin/tenant_config_api.rs` | `/api/v1/internal/tenant-config/*` 的路由与 960 行实现删除（现在落到普通 404）；`x-hydra-tenant-token` / `TENANT_TOKEN_HEADER` 零命中 |
+| 转发器与模块删除 | `tenant_config/`、`cluster/forward.rs`、`proxy.rs`、`main.rs`、`lib.rs` | `TenantConfigForwarder` 及其 `AppState` 字段/访问器/装配、整个 `tenant_config` 模块、`cluster/forward.rs`（操作员半边已在 T3.3 删） |
+| `WriteOutcome::Deleted` 去掉 id | `admin/sub_tenant_write.rs` | 唯一读者是已删的内网响应封装；编译器立刻报了「字段从未被读」——留着一个没人读的值就是留一个假接口 |
+| **限流旋钮退役** | `admin/mod.rs`、`ops.md` | `config_write_throttle` / `config_write_per_min` / `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` 的唯一执行点是已删的内网端点 ⇒ 一并删除（运维事实写进 `ops.md` §5.5a：集群写总量上界 = **N × 单窗口**） |
+| **环境变量退役机制第一次真正启用** | `cluster/mod.rs` | `HYDRA_FORWARD_TIMEOUT_SECS` 在 T3.3 失去最后一个读者，**是 `check_documented_env.cjs` 抓出来的**（它要求「文档里的变量必须有读点」）⇒ 移入 `RETIRED_CLUSTER_ENV`，`CLUSTER_ONLY_ENV` 10→9，并把「表是空的」那条断言改成**精确钉住表内容** |
+
+**用例**：删除 `tests/sub_tenant_internal_write.rs`（整族内网端点，893 行）与 `tests/sub_tenant_data_plane_write.rs` 的两条转发用例（`edge_write_forwards_...`、`edge_write_forward_timeout_is_504`）；后者重写为 `a_data_plane_write_is_applied_by_the_node_that_received_it`（本节点应用 + 落**本节点自己的库** + `config_version` 前进 + 幂等 PUT + DELETE 真的删掉）。跨节点那一半由 `tests/arachne_three_nodes.rs` 覆盖。
+
+**grep 断言（代码零命中，注释里的历史说明保留）**：`internal/tenant-config`、`x-hydra-tenant-token`、`TENANT_TOKEN_HEADER`、`tenant_config_api` 在 `crates/hydra-server/src/` 内的**代码**引用为 0（剩余出现全部是「这里曾是 X，已退役」的注释）。
+
+**记账（已写进 `ops.md` §5.5a）**：① **无新鲜度闸**（入口节点按自己持有的快照鉴权，可能略滞后于 head；事务内仍会对活的 DB 行重校）；② **入口节点被攻破可冒充任意租户**（并说明这不是新增能力：任何节点本来就持主密钥与全量快照）；③ 写限流总量上界 = **N × 单窗口**。
+
 ### Phase 4 — 同构收口、退役与验收
 
 **T4.0 节点同构收口（删除 edge 分支）**

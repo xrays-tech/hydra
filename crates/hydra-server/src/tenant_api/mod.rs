@@ -658,9 +658,10 @@ fn endpoint_label(ctx: &RequestContext) -> &'static str {
 
 /// The `Authorization: Bearer …` value, if present.
 ///
-/// `pub(super)` so the write handler (V5) can re-read the authenticated tenant's
-/// bearer to forward it to the leader in the dedicated `x-hydra-tenant-token`
-/// header (D2) — the gate already validated it, so re-reading is safe.
+/// `pub(super)` for the write handler (V5). It used to re-read this to forward the tenant's
+/// bearer to the leader in a dedicated `x-hydra-tenant-token` header; that path is retired
+/// (D-6 乙-full), and the write handler now applies the write itself, so nothing relays the
+/// credential anywhere.
 pub(super) fn bearer_token(session: &Session) -> Option<&str> {
     session
         .req_header()

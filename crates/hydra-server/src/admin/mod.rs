@@ -52,10 +52,7 @@ mod static_files;
 pub mod sub_tenant_write;
 /// Leader internal tenant-config write endpoint (sub-tenant v2, D3/D5/D6/D7):
 /// the A-2 receiver-side gates (lease assertion, tenant re-auth, authorization
-/// binding) plus the write + audit for the `/api/v1/internal/tenant-config/...`
 /// family. Cluster-token gated in `AdminService::response`.
-pub mod tenant_config_api;
-
 // Re-export the metrics module publicly so the proxy / breaker / tls can reach
 // the `record_*` call-sites and the `/metrics` renderer.
 pub use metrics as metrics_export;
@@ -64,9 +61,6 @@ use handlers::Resp;
 
 /// Shared state for the admin service (design §13.1: a subset of `AppState`).
 /// Cheap to `Arc`-clone so tests can inspect it after requests.
-/// Read `HYDRA_TENANT_CONFIG_WRITE_PER_MIN` (v2 D6). A missing, unparseable or
-/// zero value falls back to the default: 0 would reject every write, i.e. a
-/// denial of service triggered by a typo.
 /// Per-IP budget for FAILED admin-token attempts, per minute
 /// (`HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN`, default 10; `0`/garbage falls back).
 ///
@@ -83,13 +77,6 @@ fn admin_auth_fail_limit_per_min_from_env() -> u32 {
         .unwrap_or(10)
 }
 
-fn config_write_per_min_from_env() -> u32 {
-    std::env::var("HYDRA_TENANT_CONFIG_WRITE_PER_MIN")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(60)
-}
 /// The peer address of an admin request, with the PORT DROPPED: every request
 /// arrives on a new ephemeral port, so keying a failure budget on the full socket
 /// address would give each connection its own bucket and the limit would never
@@ -288,12 +275,6 @@ pub struct AdminState {
     pub auth_fail_throttle: Arc<crate::tenant_api::throttle::Throttle>,
     /// See [`admin_auth_fail_limit_per_min_from_env`].
     pub auth_fail_per_min: u32,
-    pub config_write_throttle: Arc<crate::tenant_api::throttle::Throttle>,
-    /// The per-tenant, per-minute config-write budget (v2 D6). Defaults to 60;
-    /// override with `HYDRA_TENANT_CONFIG_WRITE_PER_MIN`. A missing / zero /
-    /// unparseable value falls back to the default (never to 0, which would
-    /// reject every write).
-    pub config_write_per_min: u32,
     /// Invalidation-stream publisher (cluster P4): `DELETE /api/v1/auth/cache`
     /// broadcasts the invalidation cluster-wide instead of clearing only the
     /// local cache. `None` off-cluster / on the single-node build.
@@ -376,8 +357,6 @@ impl AdminState {
             leader_ready,
             auth_fail_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             auth_fail_per_min: admin_auth_fail_limit_per_min_from_env(),
-            config_write_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
-            config_write_per_min: config_write_per_min_from_env(),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
@@ -577,18 +556,12 @@ impl AdminService {
         if parts == ["internal", "control"] && method == "GET" {
             return cluster_api::internal_control(&self.state, query, trace_id).await;
         }
-        // Tenant-config writes (sub-tenant v2, D3/D5/D6/D7): the leader's
-        // internal write endpoint for sub-tenants / routes. Registered BEFORE the
-        // deep-path rejection below (this family is 3–4 segments, like the
-        // `/internal/control` precedent). Cluster-token gated (handled in
-        // `AdminService::response` above) and NOT routed through the admin token
-        // or `maybe_forward_mutation` — the edge already forwarded here carrying
-        // the cluster token. The lease assertion (A-2 7), tenant re-auth (A-2 4),
-        // authorization binding (A-2 4), audit (A-2 6) and the reserved per-tenant
-        // rate-limit seam (V6/D6) live in `tenant_config_api`.
-        if parts.len() >= 2 && parts[0] == "internal" && parts[1] == "tenant-config" {
-            return tenant_config_api::route(&self.state, method, &parts, session, trace_id).await;
-        }
+        // The `/api/v1/internal/tenant-config/*` family USED to be here: the leader's internal
+        // write endpoint for sub-tenants and routes, reached by a forwarded data-plane write. It
+        // is gone (ADR-0001 D-6, plan T3.5): the entry node applies the write itself, so there is
+        // nothing to relay and no internal write face to authenticate. A request to that path now
+        // falls through to the unknown-path 404 below, which is the honest answer — the family is
+        // retired, not hidden.
         // Cluster status (cluster P4): whole-fleet view for the Health page.
         if parts == ["cluster", "status"] && method == "GET" {
             return cluster_api::cluster_status(&self.state, trace_id).await;
@@ -718,7 +691,7 @@ impl ServeHttp for AdminService {
         // id in `x-hydra-trace-id` (see `cluster::forward`, which uses the id the
         // edge also returns to the tenant in `X-Hydra-Trace-Id`). Minting a fresh
         // id here meant the leader's audit record
-        // (`hydra::tenant_config_write`, see `tenant_config_api::audit`) carried an
+        // (`hydra::tenant_config_write`, formerly written by the retired internal endpoint) carried an
         // id the tenant could never see, so "here is my trace id, what happened to
         // my write?" could not be answered from the leader's audit trail at all —
         // the two sides of the same write were labelled with different strings.

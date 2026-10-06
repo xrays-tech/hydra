@@ -24,20 +24,15 @@ use hydra_core::sub_tenant::SubTenantWriteError;
 use hydra_core::tenant_api::TenantWriteRoute;
 
 use crate::admin::sub_tenant_write::CoreError;
-use crate::admin::tenant_config_api::{
+// The write core lives in `admin::sub_tenant_write` — the module that SERVES it. It used to sit
+// next to the leader's internal endpoint family, which is retired (D-6 / T3.5).
+use crate::admin::sub_tenant_write::{
     apply_config_write, ApplyError, TenantConfigWrite, WriteOutcome,
 };
 use crate::http::AuthChecker as _;
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
 use crate::tenant_api::{respond_json, Authenticated};
-// The forward path (and only it) is cluster-only; the imports stay gated so a
-// single-node build has no unused-import warnings.
-#[cfg(feature = "cluster-redis")]
-use crate::cluster::forward::ForwardError;
-#[cfg(feature = "cluster-redis")]
-use crate::tenant_config::TenantConfigForwardError;
-
 /// The body of `GET /whoami`.
 ///
 /// Every field is either the tenant's own non-secret configuration or a fact the
@@ -819,87 +814,25 @@ pub async fn write(
     //     general tenant-API per-tenant request budget instead. Do NOT add a
     //     second throttle here: it would double-meter forwarded writes.
 
-    // (3) Dispatch: a cluster node forwards to the lease-holding leader; a
-    //     single-node node (no forwarder) applies locally (D8).
-    #[cfg(feature = "cluster-redis")]
-    if let Some(fwd) = state.tenant_config_forwarder() {
-        // The Bearer the gate already validated (D2): forward it in the
-        // dedicated `x-hydra-tenant-token` header, never `Authorization`, never
-        // the body, never logged.
-        let bearer = super::bearer_token(session).unwrap_or_default().to_string();
-        let (method, internal_path, internal_body) = internal_request(&config_write);
-        let body = serde_json::to_vec(&internal_body).unwrap_or_default();
-        return forward_write(
-            session,
-            ctx,
-            ForwardedWrite {
-                fwd,
-                method: method.as_str(),
-                internal_path: internal_path.as_str(),
-                tenant_bearer: bearer.as_str(),
-                body,
-                trace_id: trace_id.as_str(),
-            },
-        )
-        .await;
-    }
+    // (3) Dispatch: THE ENTRY NODE APPLIES IT (D-6, 乙-full). There is no forwarding any more —
+    //     `local_write` runs the shared write core against this node's own database and reloads the
+    //     snapshot, which PUBLISHES the resulting config to the control plane (plan T3.2). The
+    //     library forwards the head write to the raft leader, so the write needs this node to be
+    //     able to COMMIT, not to be the leader.
+    //
+    //     What this replaced: a cluster node relayed the request to the lease holder's internal
+    //     endpoint (`/api/v1/internal/tenant-config/*`) with the tenant Bearer in a dedicated
+    //     `x-hydra-tenant-token` header. Both that endpoint family and that header are gone. The
+    //     identity gate is HERE, on the entry node — the only place that ever held the tenant's
+    //     credential (D-6).
+    //
+    //     The per-tenant config-write throttle that lived on that internal endpoint went with it;
+    //     this path is bounded by the general tenant-API per-tenant request budget. See `ops.md`
+    //     for the accounting (cluster write ceiling = N x single-window).
 
     local_write(session, ctx, state, &config_write, &tenant_id, &trace_id).await
 }
 
-/// The internal endpoint (method, path, JSON body) a data-plane write maps to.
-/// Derived from the shared [`TenantConfigWrite`] so the forward face cannot
-/// disagree with the local face on what is written.
-#[cfg(feature = "cluster-redis")]
-fn internal_request(write: &TenantConfigWrite) -> (String, String, serde_json::Value) {
-    match write {
-        TenantConfigWrite::UpsertSubTenant {
-            tenant_id,
-            name,
-            key_prefix,
-            enabled,
-        } => (
-            "PUT".to_string(),
-            "/api/v1/internal/tenant-config/sub-tenants".to_string(),
-            json!({
-                "tenant_id": tenant_id,
-                "name": name,
-                "key_prefix": key_prefix,
-                "enabled": enabled,
-            }),
-        ),
-        TenantConfigWrite::DeleteSubTenant { id } => (
-            "DELETE".to_string(),
-            format!("/api/v1/internal/tenant-config/sub-tenants/{id}"),
-            json!({}),
-        ),
-        TenantConfigWrite::UpsertRoute {
-            sub_tenant_id,
-            model_key,
-            provider_id,
-            enabled,
-        } => (
-            "PUT".to_string(),
-            "/api/v1/internal/tenant-config/sub-tenant-routes".to_string(),
-            json!({
-                "sub_tenant_id": sub_tenant_id,
-                "model_key": model_key,
-                "provider_id": provider_id,
-                "enabled": enabled,
-            }),
-        ),
-        TenantConfigWrite::DeleteRoute { id } => (
-            "DELETE".to_string(),
-            format!("/api/v1/internal/tenant-config/sub-tenant-routes/{id}"),
-            json!({}),
-        ),
-    }
-}
-
-/// D8 single-node: the node is the only writer. Apply the write through the
-/// shared write core ([`apply_config_write`]), reload the snapshot so
-/// `config_version` advances, and answer with the produced resource (or the
-/// idempotent delete marker).
 async fn local_write(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -959,7 +892,7 @@ async fn local_write(
                     .await
                 }
                 // Idempotent delete: 204, no body.
-                WriteOutcome::Deleted(_) => super::respond_raw(session, ctx, 204, Vec::new()).await,
+                WriteOutcome::Deleted => super::respond_raw(session, ctx, 204, Vec::new()).await,
             }
         }
         Err(e) => {
@@ -982,11 +915,11 @@ async fn local_write(
 /// Map the shared write core's [`CoreError`] to (status, code, message) for the
 /// data-plane envelope.
 ///
-/// The status / code are IDENTICAL to the internal face
-/// (`admin::tenant_config_api::core_err_resp`) — and that is now enforced rather
-/// than asserted: the storage branch CALLS the one classifier
-/// (`admin::handlers::classify_db_err`), because a hand-written copy here had
-/// already drifted (it answered 500 for SQLITE_BUSY). Only the rendering differs.
+/// The status / code are the SHARED ones — enforced rather than asserted: the
+/// storage branch calls the one classifier (`admin::handlers::classify_db_err`)
+/// that the operator-facing admin handlers use, because a hand-written copy here
+/// had already drifted (it answered 500 for SQLITE_BUSY, which the classifier
+/// maps to the retryable 503 `storage_busy`). Only the rendering differs.
 fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
     match e {
         CoreError::Validation(v) => {
@@ -1039,96 +972,6 @@ fn map_core_err(e: &CoreError) -> (u16, &'static str, String) {
             "could not generate a non-conflicting key_prefix after 5 attempts".to_string(),
         ),
         CoreError::NotFound => (404, "not_found", "not found".to_string()),
-    }
-}
-
-/// One data-plane config write on its way to the lease-holding leader.
-///
-/// The parts travel as one value (rather than six positional arguments) so the
-/// A-2 precondition 5 contract — the tenant Bearer goes in the dedicated
-/// `x-hydra-tenant-token` header, NEVER in `Authorization`, never in the body,
-/// never in a log — has a single owner that can be read in one place.
-#[cfg(feature = "cluster-redis")]
-struct ForwardedWrite<'a> {
-    /// Resolves the lease-holding leader and refuses to self-forward.
-    fwd: &'a crate::tenant_config::TenantConfigForwarder,
-    method: &'a str,
-    internal_path: &'a str,
-    /// The tenant Bearer the tenant-API gate already validated (D2).
-    tenant_bearer: &'a str,
-    body: Vec<u8>,
-    trace_id: &'a str,
-}
-
-/// D1/D2: forward the tenant config write to the lease-holding leader's
-/// internal endpoint and relay its status + body. The tenant Bearer travels in
-/// the dedicated `x-hydra-tenant-token` header (never `Authorization`, never
-/// the body, never logged) — see
-/// [`crate::tenant_config::TenantConfigForwarder::forward_config_write`].
-#[cfg(feature = "cluster-redis")]
-async fn forward_write(
-    session: &mut Session,
-    ctx: &mut RequestContext,
-    req: ForwardedWrite<'_>,
-) -> pingora_core::Result<bool> {
-    let ForwardedWrite {
-        fwd,
-        method,
-        internal_path,
-        tenant_bearer,
-        body,
-        trace_id,
-    } = req;
-    match fwd
-        .forward_config_write(method, internal_path, tenant_bearer, body, trace_id)
-        .await
-    {
-        // The leader is the single writer; relay its verdict verbatim (status +
-        // body) so the data plane and the internal face never disagree.
-        Ok(resp) => {
-            super::respond_raw(session, ctx, resp.status().as_u16(), resp.into_body()).await
-        }
-        // A timeout / response-read failure is AMBIGUOUS (the write may have
-        // landed): 504, re-read before retrying. A connect failure is DEFINITE
-        // (nothing left this node): 502. No leader is a fail-closed 503.
-        Err(e) => {
-            let (status, code, message) = match e {
-                TenantConfigForwardError::NoLeader => (
-                    503,
-                    "no_leader",
-                    "no leader is resolvable to apply this write; the write was not applied"
-                        .to_string(),
-                ),
-                TenantConfigForwardError::Forward(ForwardError::Timeout { secs }) => (
-                    504,
-                    "forward_result_unknown",
-                    format!(
-                        "the leader did not answer within {secs}s; the write may or may not \
-                         have been applied — re-read the resource before retrying"
-                    ),
-                ),
-                // `AfterResponse`'s reason can embed the request URL too: keep
-                // the transport detail out of the tenant-facing message (same
-                // class as the 502 arm).
-                TenantConfigForwardError::Forward(ForwardError::AfterResponse(_)) => (
-                    504,
-                    "forward_result_unknown",
-                    "the leader answered but the response could not be read; the write may or \
-                     may not have been applied — re-read the resource before retrying"
-                        .to_string(),
-                ),
-                // `Other`'s reason embeds the reqwest error, which includes the
-                // leader's control-plane URL. Never relay that to a TENANT:
-                // the transport detail stays in the leader-facing logs, and the
-                // tenant gets a stable message.
-                TenantConfigForwardError::Forward(ForwardError::Other(_)) => (
-                    502,
-                    "forward_failed",
-                    "failed to reach the leader; the request was not applied".to_string(),
-                ),
-            };
-            super::respond_error(session, ctx, status, code, &message).await
-        }
     }
 }
 

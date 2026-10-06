@@ -20,8 +20,9 @@
 //! 5. `tx.commit()`.
 //!
 //! This module is the **single write path** for sub-tenant config. It is
-//! called by the v1 admin handlers (`admin::handlers`) now and by the v2
-//! leader internal handler later. It is **not HTTP-specific**: it takes a
+//! called by the v1 admin handlers (`admin::handlers`), by the shared
+//! plane-agnostic write core ([`apply_config_write`], which the data-plane
+//! self-service write path calls) and by nothing else. It is **not HTTP-specific**: it takes a
 //! pool + the current [`ConfigData`] and returns typed results /
 //! [`CoreError`]s, never an HTTP `Resp`.
 //!
@@ -146,7 +147,7 @@ fn validate_route_in_tx(
 /// **The "idempotent upsert by `(tenant_id, name)`" (D4) guarantee belongs to the
 /// TENANT-facing `PUT /tenant/{tid}/api/v1/sub-tenants/{name}` route**, which looks
 /// the row up first and then calls [`update_sub_tenant`] with `self_id = Some(id)`
-/// (see `tenant_config_api`). THIS function is the CREATE path: both of its
+/// THIS function is the CREATE path: both of its
 /// branches pass `self_id = None` (below), so a repeated create — a retry after a
 /// leader failover, an idempotent replay, a double submit — hits the validator's
 /// `NameDuplicate` and answers **409** instead of converging. (The
@@ -427,4 +428,220 @@ pub async fn delete_route(pool: &SqlitePool, id: &str) -> Result<(), CoreError> 
         .map_err(CoreError::Db)?;
     tx.commit().await.map_err(CoreError::Db)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The plane-agnostic tenant config write (moved here when the internal endpoint family retired)
+// ---------------------------------------------------------------------------
+//
+// This lived in the module that also served the leader's INTERNAL write endpoint
+// (`/api/v1/internal/tenant-config/*`). That endpoint family is retired (ADR-0001 D-6, plan T3.5)
+// because the entry node now applies the write itself, and this core is the part that survived: it
+// is the single write point, and it never depended on `AdminState`, `ServerSession` or HTTP.
+
+// ---------------------------------------------------------------------------
+// The plane-agnostic tenant config write (D5: admin internal + data-plane local)
+// ---------------------------------------------------------------------------
+
+/// The parsed tenant config write — the A-2 "authorised work" — independent of
+/// which plane (the leader internal handler, or the data-plane local path, D8)
+/// produced it. The write's declared target (`tenant_id` / `sub_tenant_id`) is
+/// checked against the authenticated tenant by [`apply_config_write`] (the
+/// binding gate), so a body that names another tenant is refused before any
+/// lookup.
+#[derive(Clone, Debug)]
+pub(crate) enum TenantConfigWrite {
+    /// `PUT .../sub-tenants` — upsert by natural key `(tenant_id, name)` (D4).
+    /// Idempotent: a repeated PUT converges to the same row.
+    UpsertSubTenant {
+        tenant_id: String,
+        name: String,
+        key_prefix: Option<String>,
+        enabled: bool,
+    },
+    /// `DELETE .../sub-tenants/{id}` — delete by immutable id (D4). Idempotent:
+    /// an absent id is a no-op; a foreign id is a resource-scoped 404.
+    DeleteSubTenant { id: String },
+    /// `PUT .../sub-tenant-routes` — upsert by `(sub_tenant_id, model_key)` (D4,
+    /// `None` = the default route). The sub-tenant must exist and be the
+    /// authenticated tenant's own.
+    UpsertRoute {
+        sub_tenant_id: String,
+        model_key: Option<String>,
+        provider_id: String,
+        enabled: bool,
+    },
+    /// `DELETE .../sub-tenant-routes/{id}` — delete by immutable id (D4).
+    /// Idempotent: an absent id is a no-op; a foreign route is a 404.
+    DeleteRoute { id: String },
+}
+
+/// The resource a successful write produced (the caller reports it with the
+/// `config_version` it is live at), or the idempotent delete marker.
+pub(crate) enum WriteOutcome {
+    SubTenant(SubTenant),
+    Route(SubTenantRoute),
+    /// `DELETE` — idempotent. The id is deliberately NOT carried: the only consumer was the
+    /// leader's internal response envelope, which is retired (D-6 / T3.5), and the data-plane face
+    /// answers 204 with no body. Keeping the field would have kept a value nobody reads — which the
+    /// compiler flagged the moment the internal face went away.
+    Deleted,
+}
+
+/// Why a tenant config write was refused — by the A-2 binding gate (before the
+/// write core) or by the write core itself. The caller maps each variant to a
+/// precise HTTP response (the admin face and the data plane map to their own
+/// envelopes, but the same variant → the same status/code).
+#[derive(Debug)]
+pub(crate) enum ApplyError {
+    /// The write target tenant does not match the authenticated tenant (403).
+    /// A pure string comparison, before any lookup — never a tenant-existence
+    /// oracle.
+    TenantMismatch,
+    /// The resource does not exist, or belongs to another tenant (404). Missing
+    /// and foreign are deliberately indistinguishable (no oracle).
+    NotFound,
+    /// A transactional write-core failure (400/409/500).
+    Core(CoreError),
+}
+
+/// Apply a tenant config write: run the A-2 **binding gate** (the write's
+/// declared target must be the authenticated tenant's own resources), then the
+/// shared **transactional write core** (`sub_tenant_write`). This is the SINGLE
+/// write point shared by the leader internal handler (V2/V3) and the data-plane
+/// local path (V5, D8) — so the two faces cannot diverge on validation, quota or
+/// natural-key upsert semantics.
+///
+/// It does **not** depend on `AdminState` or `ServerSession`: it takes the
+/// config [`SqlitePool`], the current [`ConfigData`] (provider / model / tenant
+/// membership), the authenticated tenant id (the write target, resolved from the
+/// tenant token) and the parsed write. It performs the write and returns the
+/// produced resource, leaving the snapshot **reload** to the caller — the admin
+/// face uses the `reload_best_effort` helper (serialising lock + stale flag),
+/// the data-plane local path calls `ConfigStore::reload_all` directly
+/// (single-node: the node is the only writer).
+pub(crate) async fn apply_config_write(
+    pool: &SqlitePool,
+    cfg: &ConfigData,
+    tenant_id: &str,
+    write: &TenantConfigWrite,
+) -> Result<WriteOutcome, ApplyError> {
+    match write {
+        TenantConfigWrite::UpsertSubTenant {
+            tenant_id: target,
+            name,
+            key_prefix,
+            enabled,
+        } => {
+            // A-2 binding: the write target must be the authenticated tenant, by
+            // pure string comparison BEFORE any lookup (never a tenant-existence
+            // oracle).
+            if target != tenant_id {
+                return Err(ApplyError::TenantMismatch);
+            }
+            // D4 idempotent upsert by natural key `(tenant_id, name)`: resolve the
+            // existing row and CONVERGE (update by its immutable id), or create it
+            // (the atomic upsert handles a concurrent race). An omitted
+            // `key_prefix` keeps the current one on an existing row and
+            // auto-generates (Q13 / F3) on a new one.
+            let existing = match crate::db::list_sub_tenants(pool).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .find(|s| s.tenant_id == *target && s.name == *name),
+                Err(e) => return Err(ApplyError::Core(CoreError::Db(e))),
+            };
+            let st = match existing {
+                Some(st) => {
+                    let prefix = key_prefix.clone().unwrap_or_else(|| st.key_prefix.clone());
+                    update_sub_tenant(pool, cfg, &st.id, name, &prefix, *enabled)
+                        .await
+                        .map_err(ApplyError::Core)?
+                }
+                None => {
+                    let id = crate::admin::handlers::gen_id();
+                    create_sub_tenant(
+                        pool,
+                        cfg,
+                        target,
+                        name,
+                        key_prefix.as_deref(),
+                        &id,
+                        *enabled,
+                    )
+                    .await
+                    .map_err(ApplyError::Core)?
+                }
+            };
+            Ok(WriteOutcome::SubTenant(st))
+        }
+        TenantConfigWrite::DeleteSubTenant { id } => {
+            // A-2 binding: the row (if present) must be the tenant's own. A
+            // foreign row is 404 (resource-scoped; never written); an absent row
+            // is an idempotent no-op.
+            match crate::db::get_sub_tenant(pool, id).await {
+                Ok(st) if st.tenant_id == tenant_id => {}
+                Ok(_) => return Err(ApplyError::NotFound),
+                Err(sqlx::Error::RowNotFound) => return Ok(WriteOutcome::Deleted),
+                Err(e) => return Err(ApplyError::Core(CoreError::Db(e))),
+            }
+            delete_sub_tenant(pool, id)
+                .await
+                .map_err(ApplyError::Core)?;
+            Ok(WriteOutcome::Deleted)
+        }
+        TenantConfigWrite::UpsertRoute {
+            sub_tenant_id,
+            model_key,
+            provider_id,
+            enabled,
+        } => {
+            // A-2 binding: the sub-tenant must exist and be the tenant's own.
+            // Missing OR foreign → 404 (resource-scoped; indistinguishable, no
+            // oracle).
+            let st = match crate::db::get_sub_tenant(pool, sub_tenant_id).await {
+                Ok(st) => st,
+                Err(sqlx::Error::RowNotFound) => return Err(ApplyError::NotFound),
+                Err(e) => return Err(ApplyError::Core(CoreError::Db(e))),
+            };
+            if st.tenant_id != tenant_id {
+                return Err(ApplyError::NotFound);
+            }
+            let id = crate::admin::handlers::gen_id();
+            let r = create_route(
+                pool,
+                cfg,
+                sub_tenant_id,
+                provider_id,
+                model_key.as_deref(),
+                &id,
+                *enabled,
+            )
+            .await
+            .map_err(ApplyError::Core)?;
+            Ok(WriteOutcome::Route(r))
+        }
+        TenantConfigWrite::DeleteRoute { id } => {
+            // A-2 binding: the route (if present) must belong to the tenant's
+            // sub-tenant. A foreign sub-tenant is 404 (resource-scoped); an
+            // absent row is a no-op.
+            match crate::db::get_sub_tenant_route(pool, id).await {
+                Ok(r) => {
+                    let st = match crate::db::get_sub_tenant(pool, &r.sub_tenant_id).await {
+                        Ok(st) => st,
+                        // A dangling sub-tenant is impossible (FK CASCADE); treat
+                        // as a no-op so a replay after a cascade cannot 404.
+                        Err(sqlx::Error::RowNotFound) => return Ok(WriteOutcome::Deleted),
+                        Err(e) => return Err(ApplyError::Core(CoreError::Db(e))),
+                    };
+                    if st.tenant_id != tenant_id {
+                        return Err(ApplyError::NotFound);
+                    }
+                }
+                Err(sqlx::Error::RowNotFound) => return Ok(WriteOutcome::Deleted),
+                Err(e) => return Err(ApplyError::Core(CoreError::Db(e))),
+            }
+            delete_route(pool, id).await.map_err(ApplyError::Core)?;
+            Ok(WriteOutcome::Deleted)
+        }
+    }
 }

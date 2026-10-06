@@ -298,7 +298,13 @@ fn now_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn gen_id() -> String {
+/// A fresh opaque id (`id-<nanos>-<len(thread id)>`).
+///
+/// `pub(crate)` because the shared tenant-config write core
+/// ([`crate::admin::sub_tenant_write::apply_config_write`]) needs it too: that core moved out of
+/// the module that used to own the internal endpoint, and this is the ONE id generator — a second
+/// copy is how two faces of the same write start minting different shapes of id.
+pub(crate) fn gen_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

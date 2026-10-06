@@ -23,7 +23,6 @@ pub mod content;
 pub mod control_client;
 #[cfg(feature = "cluster-redis")]
 pub mod events;
-pub mod forward;
 pub mod lease;
 #[cfg(feature = "cluster-redis")]
 pub mod registry;
@@ -218,7 +217,7 @@ pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> St
 /// (`cluster/arachne_node.rs`, through named constants rather than literals) and by
 /// `main.rs`; `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` / `HYDRA_CLUSTER_TOKEN` are still read
 /// by the Redis backbone, which stays for the data-plane hot path (ADR-0001 D-1).
-const CLUSTER_ONLY_ENV: [&str; 10] = [
+const CLUSTER_ONLY_ENV: [&str; 9] = [
     "HYDRA_CLUSTER_PEERS",  // the member list — the decision itself
     "HYDRA_CLUSTER_ID",     // optional cluster name: refuses a data directory from another cluster
     "HYDRA_REDIS_URL",      // the data-plane backbone (still required in a cluster)
@@ -232,24 +231,25 @@ const CLUSTER_ONLY_ENV: [&str; 10] = [
     // diagnostic a lie.
     "HYDRA_CONTROL_URL", // snapshot polling (control_client, registry, forward)
     "HYDRA_CONTROL_POLL_MS", // ...and its interval (control_client)
-    "HYDRA_FORWARD_TIMEOUT_SECS", // standby → active admin-write forwarding (forward)
 ];
 
 /// Variables the Arachne control plane RETIRES, once their readers are gone.
 ///
-/// **INACTIVE — the table is empty, and that is the measured truth, not an oversight.**
-/// Every variable that ADR-0001 retires is STILL READ by the Redis path that has not been
-/// deleted: `main.rs` (`HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`,
-/// `HYDRA_REGISTRY_STALE_GRACE_SECS`), `cluster/control_client.rs`, `cluster/registry.rs`,
-/// `cluster/forward.rs`. A name belongs in this table only when nothing reads it, because the
-/// table's diagnostic tells the operator the setting does nothing — and the environment guard
-/// checks exactly that, in both directions.
+/// A name belongs here only when NOTHING reads it: the table's diagnostic tells an operator that
+/// the setting does nothing, and `scripts/check_documented_env.cjs` checks exactly that, in both
+/// directions.
 ///
-/// The mechanism below is kept and tested so that the retirement commit (plan T4.1) is a
-/// one-line table change plus the deletions, rather than new logic written under pressure.
-/// `HYDRA_ROLE` is the first name that will move here: nothing reads it any more (ADR-0001
-/// replaced it with the member list), only comments still mention it.
-const RETIRED_CLUSTER_ENV: [&str; 0] = [];
+/// **First entry (2026-10-05, plan T3.3)**: `HYDRA_FORWARD_TIMEOUT_SECS`. Its only reader was the
+/// standby→leader admin-write forwarder, which D-3 retired; the environment guard is what noticed
+/// that the variable had lost its last reader while still being documented as live.
+///
+/// The rest of ADR-0001's retired variables are STILL READ by the Redis path that has not been
+/// deleted yet: `main.rs` (`HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`,
+/// `HYDRA_REGISTRY_STALE_GRACE_SECS`), `cluster/control_client.rs`, `cluster/registry.rs`. They
+/// move here in the commit that deletes their readers (plan T4.1), not before — claiming otherwise
+/// would make the diagnostic a lie. `HYDRA_ROLE` is already unread (the member list replaced it)
+/// and only comments mention it.
+const RETIRED_CLUSTER_ENV: [&str; 1] = ["HYDRA_FORWARD_TIMEOUT_SECS"];
 
 /// Which of `present` are retired, according to `table`.
 ///
@@ -395,7 +395,6 @@ mod tests {
                 "HYDRA_ARACHNE_LISTEN",
                 "HYDRA_CONTROL_URL",
                 "HYDRA_CONTROL_POLL_MS",
-                "HYDRA_FORWARD_TIMEOUT_SECS",
             ],
             "the cluster-only table is what the fallback diagnostic names — changing it is a \
              user-visible change"
@@ -524,13 +523,14 @@ mod tests {
             retired_present(&[], &table).is_empty(),
             "nothing configured ⇒ nothing to report"
         );
-        // The real table is empty, and that is a FACT worth pinning: the moment a name moves
-        // in, this assertion must be updated deliberately (and only after confirming nothing
-        // reads that variable any more).
-        assert!(
-            RETIRED_CLUSTER_ENV.is_empty(),
-            "the retirement table gained an entry: update this test AND confirm nothing reads \
-             that variable any more"
+        // The real table is pinned EXACTLY, so a name can only move in or out deliberately —
+        // and the environment guard (`scripts/check_documented_env.cjs`) is what proves that
+        // nothing reads a retired name: it fails if a documented variable has no read site.
+        assert_eq!(
+            RETIRED_CLUSTER_ENV,
+            ["HYDRA_FORWARD_TIMEOUT_SECS"],
+            "the retirement table changed: update this test AND confirm (via the env guard) that \
+             nothing reads the variable that moved"
         );
     }
 
