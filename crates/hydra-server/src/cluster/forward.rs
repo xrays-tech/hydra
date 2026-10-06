@@ -1,33 +1,31 @@
-//! # Control-flow forwarding (cluster P3)
+//! # Control-flow forwarding — TENANT CONFIG WRITES ONLY (ADR-0001 T3.3)
 //!
-//! A standby leader-candidate serves **reads** from its local replica but
-//! forwards every admin **mutation** to the active leader, so operators can
-//! point their admin tools (REST / UI / CLI) at ANY leader-candidate node and
-//! failover stays transparent to them.
+//! ## What this module used to be, and why half of it is gone
 //!
-//! **Fail-closed**: when the active is unreachable the standby answers 503 —
-//! it never "takes over" a write on its own. Taking over is exclusively the
-//! lease machine's job (`cluster::lease`), so a partition can never produce
-//! two writers via the forwarding path.
+//! It forwarded EVERY admin mutation from a standby to the lease holder, so operators could point
+//! their tools at any leader-candidate and failover stayed invisible. That layer is retired
+//! (ADR-0001 D-3, T3.3): under raft a write does not need a leader to LAND, only to be COMMITTED.
+//! A node executes an admin mutation locally and publishes the resulting config; the library
+//! forwards the head write to the leader (plan T3.2). `forward_mutation` and the
+//! `FORWARD_ONCE_HEADER` loop guard went with it — the loop they guarded against was produced by
+//! the forwarding itself.
 //!
-//! **Forward target = the ACTUAL lease holder** (cluster P2/P4): the target
-//! is resolved live from the node registry at forward time
-//! (`forward_target_from_registry`) — never from a static
-//! `HYDRA_CONTROL_URL`. A static URL cannot track the lease across failover,
-//! and for a primary leader candidate it may point at the node ITSELF, which
-//! would make a standby forward every mutation back into itself in an
-//! infinite loop (the original self-forward bug).
+//! What remains is [`forward_config_write`], which serves ONE caller: the tenant self-service
+//! write path ([`crate::tenant_config::forward`]). It survives for one more task: D-6 (乙-full)
+//! moves those four endpoints onto the entry node, which runs the write core itself, so this
+//! module, its header contract and its caller all disappear in T3.5.
 //!
-//! **Forward-once marker** (`FORWARD_ONCE_HEADER`): every forwarded
-//! mutation carries the marker, and a node that is not the active leader
-//! must never forward a request that already carries it. This turns ANY
-//! (self- or mutual-) forward loop into an immediate fail-closed 503 instead
-//! of a 5 s timeout recursion — a belt-and-suspenders guard underneath the
-//! registry resolution.
+//! The two paths authenticated different things, and that is why the tenant half was not
+//! collapsible into the admin half: the admin forwarder relayed the OPERATOR's `Authorization`
+//! (one fleet-wide admin token), while this one authenticates the NODE with the cluster token and
+//! carries the TENANT's bearer in a dedicated header ([`TENANT_TOKEN_HEADER`]).
+//!
+//! **Fail-closed**: when no target is resolvable the caller answers 503 and never writes locally
+//! on this path.
 
 use std::time::Duration;
 
-use http::{HeaderMap, Response};
+use http::Response;
 
 /// Default forward timeout for admin mutations (generous; admin ops are rare).
 const DEFAULT_FORWARD_TIMEOUT_SECS: u64 = 5;
@@ -107,12 +105,6 @@ impl ForwardError {
         }
     }
 }
-
-/// Forward-once marker: set on every forwarded admin mutation so the
-/// receiving node can tell a mutation that already travelled through a
-/// standby. A node that is not the active leader must never forward such a
-/// request again — see the module docs (forward loop guard).
-pub const FORWARD_ONCE_HEADER: &str = "x-hydra-forwarded";
 
 /// Dedicated header carrying the tenant's Bearer token when a **tenant config
 /// write** is forwarded to the leader (sub-tenant v2, decision A-2, precond. 5).
@@ -203,100 +195,16 @@ fn client_for(secs: u64) -> reqwest::Client {
         .expect("a reqwest client with constant settings and no redirects must build")
 }
 
-/// Forward one admin request to the active leader's admin endpoint,
-/// preserving the operator's `Authorization` (the fleet shares
-/// `HYDRA_ADMIN_TOKEN`), the content type and the trace id. The forwarded
-/// request carries [`FORWARD_ONCE_HEADER`] so a receiving node that is not
-/// the active leader fails closed instead of forwarding it again (forward
-/// loop guard). Returns the active's response (status + content-type + body)
-/// or an error message when the active is unreachable (the caller maps it to
-/// 502/503).
-pub async fn forward_mutation(
-    base_url: &str,
-    method: &str,
-    path_and_query: &str,
-    body: Vec<u8>,
-    headers: &HeaderMap,
-    trace_id: &str,
-) -> Result<Response<Vec<u8>>, ForwardError> {
-    forward_mutation_with_timeout(
-        base_url,
-        method,
-        path_and_query,
-        body,
-        headers,
-        trace_id,
-        forward_timeout_secs(),
-    )
-    .await
-}
-
-/// [`forward_mutation`] with an explicit timeout — the seam that lets the
-/// timeout path be exercised in ~1s instead of the 5s production default. The
-/// production entry point always derives the value from the environment; there
-/// is no "are we testing" branch anywhere.
-#[allow(clippy::too_many_arguments)]
-async fn forward_mutation_with_timeout(
-    base_url: &str,
-    method: &str,
-    path_and_query: &str,
-    body: Vec<u8>,
-    headers: &HeaderMap,
-    trace_id: &str,
-    secs: u64,
-) -> Result<Response<Vec<u8>>, ForwardError> {
-    // `secs` bounds the CONNECT phase; the total deadline is longer so a
-    // connect-phase failure is never masked by it (see `CONNECT_SLACK_SECS`).
-    let total_secs = secs + CONNECT_SLACK_SECS;
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
-    let mut req = client_for(secs)
-        .request(
-            reqwest::Method::from_bytes(method.as_bytes())
-                .map_err(|e| ForwardError::Other(format!("unsupported method {method}: {e}")))?,
-            &url,
-        )
-        .header("x-hydra-trace-id", trace_id)
-        .header(FORWARD_ONCE_HEADER, "1")
-        .timeout(Duration::from_secs(total_secs));
-    if let Some(auth) = headers.get("authorization") {
-        req = req.header("authorization", auth);
-    }
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-    if !body.is_empty() {
-        req = req.body(body);
-    }
-
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| ForwardError::from_transport(&e, total_secs))?;
-    let status = resp.status();
-    let content_type = resp.headers().get("content-type").cloned();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| ForwardError::AfterResponse(format!("response read failed: {e}")))?;
-
-    let mut out = Response::builder().status(status);
-    if let Some(ct) = content_type {
-        out = out.header("content-type", ct);
-    }
-    out.body(bytes.to_vec())
-        .map_err(|e| ForwardError::AfterResponse(e.to_string()))
-}
-
 /// Forward one **tenant config write** to the leader's internal control
 /// endpoint (sub-tenant v2, decision A-2).
 ///
-/// This is the data plane's ONLY trust-scoped path to the leader, and it is a
-/// SEPARATE function from [`forward_mutation`] on purpose. The admin forwarder
-/// relays the operator's `Authorization` verbatim (`forward.rs` fixed
-/// `authorization` relay), because the fleet shares `HYDRA_ADMIN_TOKEN`. A
-/// tenant config write cannot do that: on the edge the caller presents its
-/// TENANT Bearer in `Authorization`, which is not the cluster token and must
-/// never reach the internal gate under `Authorization`.
+/// This is the data plane's ONLY trust-scoped path to the leader. It is
+/// separate from the (retired) admin forwarder for a reason that still stands:
+/// that one relayed the operator's `Authorization` verbatim, because the fleet
+/// shares `HYDRA_ADMIN_TOKEN`. A tenant config write cannot do that — on the
+/// entry node the caller presents its TENANT Bearer in `Authorization`, which is
+/// NOT the cluster token and must never reach the internal gate under
+/// `Authorization`.
 ///
 /// Header contract (A-2 precond. 5/8):
 /// - `Authorization: Bearer <cluster_token>` — authenticates the NODE (who
@@ -305,8 +213,6 @@ async fn forward_mutation_with_timeout(
 ///   (who the write is on behalf of). The leader re-authenticates it and binds
 ///   it to the write target. It is NEVER relayed from the caller's
 ///   `Authorization` and NEVER placed in the body.
-/// - [`FORWARD_ONCE_HEADER`]: the forward-loop guard (a non-leader must never
-///   forward a request that already carried it).
 /// - `x-hydra-trace-id`: audit attribution (relayed, as the admin forwarder
 ///   does).
 /// - `content-type: application/json`: the config write body is always JSON.
@@ -314,9 +220,10 @@ async fn forward_mutation_with_timeout(
 /// The caller's `Authorization` is deliberately NOT forwarded. The tenant
 /// Bearer and the body are never logged on this path.
 ///
-/// Reuses the exact timeout / connect-classification of [`forward_mutation`]
-/// (see [`ForwardError`]): a connect failure is a definite failure, a timeout
-/// after connect is genuinely ambiguous (the write may have landed).
+/// The timeout / connect classification ([`ForwardError`]): a connect failure is a DEFINITE
+/// failure, while a timeout after connect is genuinely ambiguous (the write may have landed). That
+/// distinction is load-bearing — it is why this path gets 504 `forward_result_unknown` instead of
+/// a 502 that would tell an operator "nothing happened" about a write that may have landed.
 #[allow(clippy::too_many_arguments)]
 pub async fn forward_config_write(
     base_url: &str,
@@ -373,7 +280,6 @@ async fn forward_config_write_with_timeout(
         // `Authorization`, never in the body, never logged (A-2 precond. 5).
         .header(TENANT_TOKEN_HEADER, tenant_bearer)
         .header("x-hydra-trace-id", trace_id)
-        .header(FORWARD_ONCE_HEADER, "1")
         .header("content-type", "application/json")
         .timeout(Duration::from_secs(total_secs));
     if !body.is_empty() {
@@ -402,7 +308,6 @@ async fn forward_config_write_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::HeaderValue;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -443,12 +348,13 @@ mod tests {
             }
         });
 
-        let err = forward_mutation_with_timeout(
+        let err = forward_config_write_with_timeout(
             &format!("http://{addr}"),
-            "POST",
-            "/api/v1/providers",
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenants",
+            "cluster-token",
+            "tenant-bearer",
             Vec::new(),
-            &HeaderMap::new(),
             "t",
             1,
         )
@@ -478,12 +384,13 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             l.local_addr().expect("addr").port()
         };
-        let err = forward_mutation_with_timeout(
+        let err = forward_config_write_with_timeout(
             &format!("http://127.0.0.1:{port}"),
-            "POST",
-            "/api/v1/providers",
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenants",
+            "cluster-token",
+            "tenant-bearer",
             Vec::new(),
-            &HeaderMap::new(),
             "t",
             1,
         )
@@ -512,12 +419,13 @@ mod tests {
         // RFC 5737 TEST-NET-1: unroutable, so the SYN is dropped rather than
         // answered. (In an environment that rejects it outright the error is
         // still a connect error, so the assertion holds either way.)
-        let err = forward_mutation_with_timeout(
+        let err = forward_config_write_with_timeout(
             "http://192.0.2.1:81",
-            "POST",
-            "/api/v1/providers",
+            "PUT",
+            "/api/v1/internal/tenant-config/sub-tenants",
+            "cluster-token",
+            "tenant-bearer",
             Vec::new(),
-            &HeaderMap::new(),
             "t",
             2,
         )
@@ -534,41 +442,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forwarded_mutation_carries_forward_once_marker() {
-        // The forwarded request MUST carry the loop-guard marker so a
-        // receiving node that is not the active leader fails closed instead
-        // of forwarding it again (self-/mutual-forward loop termination).
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/providers"))
-            .and(header("x-hydra-forwarded", "1"))
-            .and(header("authorization", "Bearer admin-secret"))
-            .and(header("content-type", "application/json"))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer admin-secret"),
-        );
-        headers.insert("content-type", HeaderValue::from_static("application/json"));
-        let resp = forward_mutation(
-            &server.uri(),
-            "POST",
-            "/api/v1/providers",
-            br#"{"id":"sl01","key":"silicon-flow"}"#.to_vec(),
-            &headers,
-            "test-trace",
-        )
-        .await
-        .expect("forward succeeds");
-        assert_eq!(resp.status(), 201, "active's response is relayed verbatim");
-    }
-
     /// The tenant config write forward must authenticate the NODE with the
     /// cluster token in `Authorization`, carry the TENANT bearer in the
     /// dedicated `x-hydra-tenant-token` header, and send the forward-loop
@@ -581,7 +454,6 @@ mod tests {
             .and(path("/api/v1/internal/tenant-config/sub-tenants"))
             .and(header("authorization", "Bearer secret-cluster-token"))
             .and(header(TENANT_TOKEN_HEADER, "sk-tenant-bearer-123"))
-            .and(header("x-hydra-forwarded", "1"))
             .and(header("x-hydra-trace-id", "cfg-trace-42"))
             .and(header("content-type", "application/json"))
             .and(body_json(
@@ -658,8 +530,8 @@ mod tests {
             &format!("http://127.0.0.1:{port}"),
             "PUT",
             "/api/v1/internal/tenant-config/sub-tenants",
-            "token",
-            "bearer",
+            "cluster-token",
+            "tenant-bearer",
             Vec::new(),
             "t",
             1,

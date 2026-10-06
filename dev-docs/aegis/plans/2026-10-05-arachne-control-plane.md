@@ -693,7 +693,8 @@ Plan Pressure Test:
 - **Files**：`crates/hydra-server/src/cluster/forward.rs`（**删除**）、`crates/hydra-server/src/tenant_config/forward.rs`（**保留**，见 D-6）、`crates/hydra-server/src/admin/mod.rs`（无 leader 时的 503 文案）。
 - **Why**：原设计要在 Hydra 侧做「409 + leader 地址 + UI 自动重发」；复核 `bce2943` 后**这个需求消失了** —— 库已把 follower 上的写透明转发到 leader（p11/p12 实测）。因此本任务从"实现一层"变成"删掉一层并证明它不需要"。
 - **Steps**：
-  1. 写集成用例（3 节点 Hydra）：① 把管理写**分别打到三个节点**，三者都 2xx，且落盘在同一份配置上（同一 `head` 哈希）；② 杀掉 leader 后（无 leader 窗口内）写返回 **503**（不是 409、不是挂起），新 leader 选出后写恢复；③ 断言 `grep` 层面：仓库里不再有 `forward_mutation` / `forward_config_write` 的**操作员**路径调用；④ **反向证伪**：把库换成旧行为（follower 写返回 `QuorumUnavailable`）时用例 ① 必须变红 —— 证明这条简化**依赖上游修复**；
+  1. 写集成用例（3 节点 Hydra）：① 把管理写**分别打到三个节点**，三者都 2xx，且**收敛到同一个 `head` 哈希**；② 杀掉 leader 后（无 leader 窗口内）写返回 **503**（不是 409、不是挂起），新 leader 选出后写恢复；③ 断言 `grep` 层面：仓库里不再有 `forward_mutation` / `forward_config_write` 的**操作员**路径调用；④ **反向证伪**：把库换成旧行为（follower 写返回 `QuorumUnavailable`）时用例 ① 必须变红 —— 证明这条简化**依赖上游修复**；
+     > **① 的原文已按用户裁定改齐（2026-10-05）**：原文是「三者都 2xx，且**落盘在同一份配置上**」，但每个节点是**各自**提交再发布的（裁定乙），三次不同的管理写是**后写者胜**，不是三次改动合并 ⇒ 能断言的是「每一次写都被接受」+「最后三个节点收敛到同一个 head、服务同一份配置」，不是「三次改动都在」。原措辞与 R5「管理写必须经 leader」也互相矛盾（R5 那条是对"无 CAS"的对策，与本裁定不兼容，已标注作废）。
   2. 删除 `cluster/forward.rs` 与 `x-hydra-forwarded` 护栏；确认 `AppState` 里对应字段一并移除；
   3. 租户自助写的转发路径**保留**（D-6），并在代码注释里写明"为什么只有它保留"；
   4. 上游修复**未发布**（crates.io 仍 0.1.1 旧行为）⇒ 在 `Cargo.toml` 里把依赖固定到可用该修复的版本/来源，并在此写清（这是本任务的一部分，不是运维事项）。
@@ -720,6 +721,24 @@ Plan Pressure Test:
   5. **记账**：`ops.md` 写明两条放弃项（新鲜度闸、入口节点被攻破的威胁模型）与一条量化事实（集群写限流总量上界 = N × 单窗口）。
 - **Verification**：`cargo test -p hydra-server --features "server,cluster-redis,arachne"`；`integration/test_sub_tenant_data_plane_write.py`（既有套件，含越权写用例）；新增 `integration/test_tenant_write_any_node.py`（①③）；`grep` 三条零命中断言；`node scripts/check_ci_wiring.cjs`。
 - **Retirement Track**：`x-hydra-tenant-token` / `TENANT_TOKEN_HEADER` / `admin/tenant_config_api.rs` / `tenant_config/forward.rs` 全部 delete-first；**保留** `admin/sub_tenant_write.rs`（唯一写核心）与操作员侧入口。
+
+#### T3.3 实现记录（2026-10-05）
+
+**做了什么**：
+
+| 动作 | 位置 | 说明 |
+| --- | --- | --- |
+| 删除操作员转发的整个闸门 | `admin/mod.rs` | `maybe_forward_mutation`（含 forward-once 循环护栏）、它的调用点、`resolve_forward_target` 全部删除。管理写现在**就地执行 + 就地发布** |
+| 删除操作员转发器 | `cluster/forward.rs` | `forward_mutation` / `forward_mutation_with_timeout` / `FORWARD_ONCE_HEADER` 删除；模块头改写为「只剩租户配置写这一条路径」，并写明它在 T3.5 整块消失 |
+| 保留租户转发 | `tenant_config/forward.rs` | 按 D-6 保留，直到 T3.5（乙-full）把 4 个端点搬到入口节点 |
+| 退役旧用例 | `tests/cluster.rs` | 删除 4 条断言**旧契约**的用例（`leader_health_and_write_gate`、`a_silent_leader_produces_504_*`、`a_refused_leader_produces_502_*`、`standby_forwards_mutations_to_active`）——它们断言「standby 绝不本地写」，而乙正好相反 |
+| 新契约的用例 | `tests/arachne_three_nodes.rs` | ① `a_management_write_on_any_node_is_accepted_and_the_cluster_converges`（三节点各发一次，都被接受，最终收敛到同一 head、服务同一份配置）；② `a_write_that_cannot_be_published_is_refused_rather_than_accepted`（三成员集群只起一个 ⇒ 永远没有 quorum ⇒ 发布失败 ⇒ `NotPublished`，本地照样提交并服务）——这是已删的「502 forward_failed」的继任者，且**确定性**（不靠"杀 leader 抢窗口"） |
+
+**与计划 Files 一行的偏差**：T3.3 的 Files 写「`cluster/forward.rs`（删除）」，但同一份计划的 **T3.5 退役清单**又写 `cluster/forward.rs`（`forward_config_write` / `TENANT_TOKEN_HEADER` 删除）——即该文件在 T3.5 时仍在。以 T3.5 那行为准：**T3.3 退役这个文件的"操作员一半"**，租户那一半随 T3.5 一起消失（否则要把 `forward_config_write` 搬进一个下次就被删掉的文件里）。
+
+**一条测试自身的缺陷（已修，值得记）**：新用例第一次跑是红的，报「三个节点 10 s 内没收敛」，而**实际上三个节点已经收敛到同一个 head**——是我的断言错了：`wait_for_head` 返回了**第一个可见**的 head，而这个节点自己的 `get_stale` 视图当时还停在前一个 head 上（三次发布，头动了三次）。改成**等一个稳定的 head**（连续两次读到相同值），并把失败信息改成带「各节点最后一次结果 + 各自已物化的哈希」，否则下次再红还是只能靠猜。
+
+**②（无 leader 窗口写 503）的诚实边界**：这条现在由「无 quorum ⇒ 发布失败 ⇒ NotPublished」覆盖，走的是**同一条** 503 映射；"杀掉在任 leader 然后抢窗口"那种版本**没有**写成用例（时序脆弱），没有做的原因写在这里而不是含糊过去。
 
 ### Phase 4 — 同构收口、退役与验收
 
@@ -760,7 +779,7 @@ Plan Pressure Test:
 | R2 | 全内存状态机 + 容量硬上限；大配置触顶后**拒写** | 中 | 高 | 分片（256 KiB）+ 启动校验配置总量 + `hydra_arachne_config_bytes` 告警阈值；**同构后每个节点都吃这份内存**，容量要按最大值规划 |
 | R3 | 依赖图冲突（tonic / rustls / protobuf 重复或版本不兼容） | 中 | 中 | Phase 0 T0.1 实测；不可接受则本计划作废（falsifier） |
 | R4 | `Arachne::start` 每进程单例 | 低 | 中 | 同构设计下每进程正好一个 raft 节点，天然吻合；探针 T0.2-5 钉住 `AlreadyInitialized` |
-| R5 | 无 CAS ⇒ 版本分配依赖「单写者」前提 | 中 | 高 | 管理写必须经 leader；T2.2 用例③ 证明「head 不前进即无部分提交」；T3.3 用例③ 证明不读注册表 |
+| R5 | 无 CAS ⇒ 版本分配依赖「单写者」前提 | 中 | 高 | ~~管理写必须经 leader~~ **已被用户裁定（乙）取代**：任意节点都可就地写 + 就地发布，并发管理写**后写者胜、先写者被物化覆盖**（这是自带的、已知的暴露面，与 T3.5 租户写同一性质）；T2.2 用例③ 证明「head 不前进即无部分提交」；T3.3 用例③ 证明不读注册表 |
 | R6 | 同构化是**产品语义变化**（撤回无状态数据面 + 2 节点不再容错） | 高 | 高 | 用户已裁定（D-2 / D-5）；T4.0 与文档/清单一并改，并在 `cluster.md` 顶部写明这条不变量 |
 | R7 | 配置物化在每个节点各跑一遍 ⇒ 配置越大，全集群 CPU/IO 放大 N 倍 | 中 | 中 | 版本闸门（未变则空转）+ 分片复用（内容未变不重写）+ `hydra_replica_materialize_retries_total` 观测 |
 | R8 | 集群扩容 = raft 成员变更（不再是拉起一个无状态副本） | 中 | 中 | `ops.md` 写明成员变更 SOP（`add_learner` → 追平 → `promote`）；扩容需人工一步，不能只改副本数 |

@@ -44,11 +44,13 @@ use hydra_server::cluster::arachne_publish::ConfigPublisher;
 use hydra_server::cluster::arachne_store::ArachneConfigStore;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::store::ConfigStore;
+use hydra_server::store::{ConfigStore, StoreError};
 
 /// Two disjoint ranges: the two tests run CONCURRENTLY (cargo), and a raft member must be
 /// dialable at the address its peers were told about, so these cannot be ephemeral.
 const PORTS_ANY_NODE: [u16; 3] = [18501, 18502, 18503];
+const PORTS_ANY_NODE_ALT: [u16; 3] = [18701, 18702, 18703];
+const PORTS_NO_QUORUM: [u16; 3] = [18801, 18802, 18803];
 const PORTS_LEADER: [u16; 3] = [18601, 18602, 18603];
 
 fn data_dir(tag: &str, i: usize) -> PathBuf {
@@ -189,15 +191,24 @@ async fn wait_writable(nodes: &[TestNode]) {
 /// and everyone converges on it") while not depending on that lag being zero.
 async fn wait_for_head(node: &TestNode) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut previous: Option<String> = None;
     loop {
         if let Ok(Some(hash)) = node.ctl().current_hash().await {
-            return hash;
+            // STABLE, not merely visible: this node's view is a local `get_stale`, so right after
+            // a publish it can still show the PREVIOUS head. Returning that value made a test
+            // compare a stale hash against the real one — the cluster had converged correctly and
+            // the assertion was wrong (measured: expected 22f9af3c, all three nodes on 67ac96b8).
+            if previous.as_deref() == Some(hash.as_str()) {
+                return hash;
+            }
+            previous = Some(hash);
         }
         assert!(
             Instant::now() < deadline,
-            "no head became visible on this node within 10 s, although the publish returned Ok"
+            "no STABLE head became visible on this node within 10 s, although the publish \
+             returned Ok"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -209,6 +220,9 @@ async fn wait_for_head(node: &TestNode) -> String {
 async fn converge_all(nodes: &mut [TestNode], expected: &str) -> Vec<usize> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut passes = vec![0usize; nodes.len()];
+    // The LAST outcome per node, so a failure says WHICH node is stuck and WHY instead of only
+    // "not converged" — the first version of this helper left an operator to guess.
+    let mut last: Vec<String> = vec!["(never ran)".to_string(); nodes.len()];
     loop {
         let mut done = 0;
         for (i, node) in nodes.iter_mut().enumerate() {
@@ -218,17 +232,13 @@ async fn converge_all(nodes: &mut [TestNode], expected: &str) -> Vec<usize> {
             }
             passes[i] += 1;
             match node.converge().await {
-                Ok(_) => {
+                Ok(outcome) => {
+                    last[i] = format!("{outcome:?}");
                     if node.materializer.materialized() == Some(expected) {
                         done += 1;
                     }
                 }
-                Err(e) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "node {i} could not materialize {expected}: {e}"
-                    );
-                }
+                Err(e) => last[i] = format!("ERR {e}"),
             }
         }
         if done == nodes.len() {
@@ -236,7 +246,12 @@ async fn converge_all(nodes: &mut [TestNode], expected: &str) -> Vec<usize> {
         }
         assert!(
             Instant::now() < deadline,
-            "not every node reached head {expected} within 10 s (passes so far: {passes:?})"
+            "not every node reached head {expected} within 10 s (passes: {passes:?}, last \
+             outcomes: {last:?}, materialized: {:?})",
+            nodes
+                .iter()
+                .map(|n| n.materializer.materialized().map(str::to_string))
+                .collect::<Vec<_>>()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -352,6 +367,106 @@ async fn a_write_on_a_non_leader_node_reaches_every_node() {
             "node {i} must have the row in its own database"
         );
     }
+
+    shutdown(nodes).await;
+}
+
+/// A MANAGEMENT WRITE ON EVERY NODE IS ACCEPTED, AND THE CLUSTER ENDS ON ONE CONFIG.
+///
+/// This is the contract that replaced HTTP forwarding (ADR-0001 D-3, T3.3): a node executes the
+/// mutation against its OWN database and publishes the result, instead of relaying the request to
+/// the lease holder. The retired contract sat in `tests/cluster.rs`
+/// (`standby_forwards_mutations_to_active`, and the 502/504 mapping tests): they asserted that a
+/// standby never writes locally, which is now the OPPOSITE of the design.
+///
+/// Three writes go to three different nodes. Each is a DIFFERENT config (a different provider id),
+/// so the head legitimately moves three times and the cluster converges on whichever publish
+/// landed last — the point is that every write was ACCEPTED and that all three nodes agree
+/// afterwards, not that the three changes merge (they do not; concurrent management writes are
+/// last-writer-wins, which is the model's accepted exposure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_management_write_on_any_node_is_accepted_and_the_cluster_converges() {
+    let mut nodes = start_cluster("write-anywhere", &PORTS_ANY_NODE_ALT).await;
+    wait_writable(&nodes).await;
+
+    for (i, node) in nodes.iter().enumerate() {
+        let id = format!("p-node{}", i + 1);
+        repo::insert_provider(&node.pool, &provider(&id, "written-here"))
+            .await
+            .unwrap_or_else(|e| panic!("insert on node {i}: {e}"));
+        assert!(
+            node.store
+                .reload_all()
+                .await
+                .unwrap_or_else(|e| panic!("node {i} could not publish its own write: {e}")),
+            "node {i} must see a change and publish it"
+        );
+    }
+
+    // WHICH tree wins is decided by which publish landed last, so the assertion is not "the head
+    // is X" but "every node ends on the SAME head" — read after the dust settles.
+    let head = wait_for_head(&nodes[0]).await;
+    converge_all(&mut nodes, &head).await;
+
+    let served: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|n| {
+            let mut ids: Vec<String> = n.store.snapshot().providers.keys().cloned().collect();
+            ids.sort();
+            ids
+        })
+        .collect();
+    assert!(
+        served.windows(2).all(|w| w[0] == w[1]),
+        "all three nodes must serve the same provider set after converging, got {served:?}"
+    );
+    assert!(
+        !served[0].is_empty(),
+        "and it must not be empty: a converged node serves what the head names"
+    );
+
+    shutdown(nodes).await;
+}
+
+/// A write whose PUBLISH cannot commit is refused with 503, not silently accepted.
+///
+/// The successor of the retired `a_refused_leader_produces_502_forward_failed`: there is no
+/// forwarding to fail any more, so the interesting failure is a publish that cannot reach the
+/// cluster. This node is a member of a three-member cluster whose peers were NEVER STARTED, so no
+/// leader can be elected — deterministic, unlike killing a leader and racing the election.
+///
+/// The write itself still lands in the local database (the SQLite transaction is local and
+/// committed); what fails is making the cluster see it, which is exactly what
+/// `StoreError::NotPublished` exists to say and what the admin layer turns into 503
+/// `config_not_published`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_cannot_be_published_is_refused_rather_than_accepted() {
+    // One member of three, alone: its peers are unreachable, so there is no quorum and no leader.
+    let mut nodes = start_cluster("no-quorum", &PORTS_NO_QUORUM).await;
+    let lonely = &mut nodes[0];
+    // No `wait_writable` here on purpose: the point is that the cluster never becomes writable.
+    repo::insert_provider(&lonely.pool, &provider("p1", "written-while-alone"))
+        .await
+        .expect("the local insert succeeds: it is this node's own database");
+
+    let got = lonely.store.reload_all().await;
+    match got {
+        Err(StoreError::NotPublished { reason }) => {
+            assert!(
+                !reason.is_empty(),
+                "the refusal must carry the reason the cluster did not take the config"
+            );
+        }
+        other => panic!(
+            "a config that cannot be published must be refused, not reported as applied: {other:?}"
+        ),
+    }
+
+    // The local half stands — and that is precisely why the error is worded the way it is.
+    assert!(
+        lonely.store.snapshot().providers.contains_key("p1"),
+        "this node committed and serves its own write; the cluster simply does not have it yet"
+    );
 
     shutdown(nodes).await;
 }

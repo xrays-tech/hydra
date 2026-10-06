@@ -162,8 +162,7 @@ mod tests {
     /// The forwarder resolves the leader URL from the closure and the write
     /// reaches a REAL HTTP server (the external boundary) with the node cluster
     /// token in `Authorization`, the tenant bearer in the dedicated header, the
-    /// forward-loop marker, the trace id and a JSON content type (A-2
-    /// precond. 5/8). No mock of our own functions — wiremock is the server.
+    /// trace id and a JSON content type (A-2 precond. 5/8). No mock of our own functions — wiremock is the server.
     #[tokio::test]
     async fn resolves_leader_url_and_forwards_with_headers() {
         let server = MockServer::start().await;
@@ -174,7 +173,6 @@ mod tests {
                 crate::cluster::forward::TENANT_TOKEN_HEADER,
                 "sk-tenant-bearer-123",
             ))
-            .and(header("x-hydra-forwarded", "1"))
             .and(header("x-hydra-trace-id", "cfg-trace-9"))
             .and(header("content-type", "application/json"))
             .respond_with(
@@ -260,7 +258,6 @@ mod registry_tests {
                 crate::cluster::forward::TENANT_TOKEN_HEADER,
                 "sk-tenant-bearer-123",
             ))
-            .and(header("x-hydra-forwarded", "1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
