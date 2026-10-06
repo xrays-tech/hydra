@@ -158,6 +158,8 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | cert 私钥随树走（D-7 的 (b)） | 本轮 | `cert` 实体改为 `CertTreeEntity{meta, sealed_key}`；解码时回填 `cert_key_pem`；缺少密封材料**拒绝发布**而不是丢掉密钥；`TOC_FORMAT` 1→2（同一批字节两种解法的版本必须互相拒绝） |
 | 集合的编码序（D-8 推论②） | 本轮 | `tenant_providers` / `tenant_models` 是 `HashSet`，改为**排序后**编码（`sorted_members`），否则同一配置每次读库换树名 |
 | 解码必须复现 loader 的**推导规则** | 本轮 | ① 四个 `Vec` 的排序原先一律按 `id`，而 loader 用的是 SQL `ORDER BY`（`limit_role.created_at,id` / `binding.key_prefix` / `sub_tenant.tenant_id,name` / `route.sub_tenant_id,model_key`）⇒ 副本持有的顺序与 leader 不同；② `tenants_by_domain` 的键在 loader 侧是**小写域**，解码侧却拿值里的原样域名当键 ⇒ 存储域名为混合大小写时，副本上的租户落在**没人会去查的键**下（`proxy::resolve_tenant` 用小写 `Host` 查表），于是同一租户在 leader 上解析得到、在副本上解析不到。守卫：`tests/arachne_derivation_fidelity.rs`（两处都先红后绿，fixture 让"loader 序"与"id 序"反向、让域名非小写） |
+| 真实 target（`ReplicaTarget`） | 本轮 | 先 `db::restore_config`（一个事务重建本地 SQLite）**再** `ConfigStore::apply_snapshot`（换入内存态）：反了会让节点服务一份自己库里没有的配置；`MaterializeTarget` 相应改为 `async`。守卫用例连"把副本自己的库用 loader 读回来 == 发布的那份配置"都钉住了 |
+| toc 解码器缺判别值 12/13 | 本轮 | `TenantProvider`/`TenantModel` **能写不能读** ⇒ 配置里只要有一条授权，`read` 在 toc 处失败、物化无限重试、**全集群零物化**。躲过既有用例的原因：没有 fixture 带授权走过真实 toc。补 12/13，并加 `every_entity_kind_survives_a_toc_round_trip` 把这一类堵死（能当键用 ⇒ 必须能解码） |
 
 **实现期抓出的一个缺陷（如实记账）**：`8ef3692` 的提交信息写「树携带副本所需的、`ConfigData` 推导时丢掉的行」，**这句话当时是过强的**——它漏掉了 cert 私钥。`CertMeta::cert_key_pem` 带 `skip_serializing`，Redis 时代的 wire 用一个**单独的**密封字段（`SnapshotWire::sealed_certs`）补偿这个 skip，而树没有对应字段。后果不是"少一个字段"：`restore_config` 见到 `cert_key_pem == None` 会往 `cert_key_ciphertext` 写 NULL，于是**物化一次就删掉该节点已有的租户 TLS 私钥**（与 G1 丢禁用行、G3 重铸 provider-key 主键同一类）。已由 `tests/arachne_cert_fidelity.rs` 判红后修复。
 
@@ -165,7 +167,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 **尚未落地（引用本 ADR 时不得当作已完成）**：
 
-1. `MaterializeTarget` 的真实实现（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）**未接**；发布侧仍走 `SnapshotWire`（属 T3.2）。**因此节点目前还不能从 Arachne 服务配置** —— T3.1 的「真实 3 节点」验收未执行，已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值/确定性/保密用例。
+1. **发布侧仍走 `SnapshotWire`**（属 T3.2），而且**启动时没有人拉起物化循环**（没有 spawn）。`ReplicaTarget` 本身已实现并端到端验证（真 raft + 真 store + 真 SQLite），但**节点今天仍不从 Arachne 服务配置** —— 只做一半会得到一个「没有人写 head、节点却自称已物化」的进程。T3.1 的「真实 3 节点」验收因此未执行；已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值/确定性/保密用例。
 2. `SealedMaterial` 缺"从已存密文构造"的入口（见上），发布切换时必须先补 `db` 侧的读取函数。
 3. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
 4. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。

@@ -623,9 +623,15 @@ Plan Pressure Test:
 
 **T3.1 明确没做完的部分（如实记账，不算完成）**：
 
-1. `MaterializeTarget` 目前只有测试里的记录型实现；**真实的 target（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）还没接**。也就是说：物化循环本身跑通了（真实 1 节点 raft + 真 store，HEAD→toc→实体→解码→安装→水位），但节点还不能**从 Arachne 服务配置**。
+1. ~~`MaterializeTarget` 目前只有测试里的记录型实现~~ → **已完成**：真实 target = `ReplicaTarget`（先 `db::restore_config` 一个事务重建本地 SQLite，再 `ConfigStore::apply_snapshot` 换入内存态；顺序是**先库后内存**，反了会让节点服务一份自己库里没有的配置）。守卫用例 `the_real_target_rebuilds_the_replica_and_serves_the_published_config`（真 raft + 真 store，含"把副本**自己的库**用 loader 读回来必须等于发布的那份配置"这一条）。`MaterializeTarget` 因此改成 `async`（`async-trait`），因为失败必须在事务提交前被看见。
+   - **仍未做**：**没有任何东西在启动时拉起这个循环**（没有 spawn），所以节点今天还是不从 Arachne 服务配置。这一条与发布侧切换同属 T3.2 —— 只做一半会得到一个"head 永远没有人写、节点却自称已物化"的进程。
 2. 发布侧仍然走 `SnapshotWire`（`arachne_entities::encode_config` 已经能产出树，但管理写路径还没改用它）——这是 **T3.2** 的内容。
 3. 因此 T3.1 的 Verification 里那条「真实 3 节点、3 个节点物化出同一 toc-hash」**尚未执行**；已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值性/确定性/保密性用例。
+
+**这一轮由真实 target 用例抓出的两个缺陷（已修）**：
+
+- **toc 解码器缺 `TenantProvider`/`TenantModel`（判别值 12/13）**：两个实体**能写**（`id()`/`discriminant()` 一直产出这两个值）但**读不回来**，于是只要配置里有一条"租户→供应商"或"租户→模型"授权，`read` 就在 toc 处失败、物化无限重试、**全集群一份配置都物化不出来**。躲过所有既有用例的原因很朴素：**没有一个 fixture 带着授权走过真实 toc**（`arachne_entities` 的单测直接 `split_config`+`tree_of`，绕过了 toc 编解码）。现在补上 12/13，并且加了一条把这一类**堵死**的用例：`every_entity_kind_survives_a_toc_round_trip`——凡是本 build 能当键用的实体种类，都必须能解码；它与 `every_entity_kind_has_its_own_segment` 共用同一份 `all_entity_kinds()` 清单。
+- **fixture 的 `window: "1m"` 违反 schema 的 CHECK**：记录型 target 什么都接受，所以这条只有真的把行写进 SQLite 才暴露。改 fixture 时把原因写在旁边，免得下次又被"简化"回去。
 
 **T3.2 配置版本权威 = `head` 内容哈希**
 - **Files**：`crates/hydra-server/src/store.rs`、`crates/hydra-server/src/db.rs`、`crates/hydra-server/src/admin/*`。

@@ -22,10 +22,14 @@
 //!
 //! ## What this layer deliberately does NOT do yet
 //!
-//! Rebuild the local SQLite replica. Today `FidelityRows` reach the target but the SQLite
-//! restore path is still driven by the snapshot channel; switching it over is the step this
-//! module exists to make possible, and it is called out in the commit that adds this file
-//! rather than left as an implied completion.
+//! Wire itself into `main.rs`. [`ReplicaTarget`] is the real target (it rebuilds the node's
+//! SQLite replica and swaps the in-memory config), and the loop is proven against a live raft node
+//! and a live store — but nothing spawns the loop on startup yet, and publishing still goes
+//! through `SnapshotWire`, so today no node serves config from Arachne. Both halves belong to the
+//! publish cutover (T3.2), and doing one without the other would leave a node that reports itself
+//! materialized against a head nobody writes.
+
+#![cfg(feature = "arachne")]
 
 use std::sync::Arc;
 
@@ -35,6 +39,9 @@ use super::arachne_entities::{build_config_with_fidelity, split_config, tree_of,
 use super::arachne_materialize::{MaterializeGate, Plan};
 use super::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome, StoreError};
 use super::content::FidelityRows;
+use super::snapshot::HydratedWire;
+use crate::crypto::KeyProvider;
+use crate::store::ConfigStore;
 
 /// What one convergence pass did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,13 +78,23 @@ impl std::error::Error for MaterializeError {}
 
 /// What a materialized config is installed into.
 ///
-/// A trait rather than a direct `ConfigStore` call so the loop can be driven against a
+/// A trait rather than a direct [`ConfigStore`] call so the loop can be driven against a
 /// recording target: the properties above are about ORDER (apply before watermark), which a
 /// test that only inspected a live store could not observe.
+///
+/// **Async**, because the real target's first step is a SQLite transaction (`db::restore_config`)
+/// and the loop must not report success before it commits. `async_trait` boxes the future so the
+/// trait stays usable as a `dyn` object; the repo already depends on it for pingora's handler
+/// impls.
+#[async_trait::async_trait]
 pub trait MaterializeTarget: Send + Sync {
     /// Install `cfg` (and the fidelity rows a replica needs to rebuild its own SQLite tables)
     /// as the state this node serves.
-    fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String>;
+    ///
+    /// # Errors
+    /// A human-readable reason. The loop treats any error as "not materialized": the watermark
+    /// does not move, the backoff starts, and the next pass retries.
+    async fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String>;
 }
 
 /// The per-node loop: gate + store + target.
@@ -167,7 +184,7 @@ impl Materializer {
                             // Apply FIRST, then move the watermark: the other order is the bug
                             // this test file exists for.
                             if let Err(reason) =
-                                self.target.apply(Arc::new(cfg), Arc::new(fidelity))
+                                self.target.apply(Arc::new(cfg), Arc::new(fidelity)).await
                             {
                                 let wait = self.gate.failed(&hash);
                                 return Err(MaterializeError::Unavailable {
@@ -218,6 +235,83 @@ impl Materializer {
 /// string, and an empty one would be indistinguishable from a bug that passed `""`.
 pub const NO_HEAD_MARKER: &str = "<no-config-published>";
 
+/// The real target: rebuild this node's SQLite replica from the materialized config, then swap it
+/// into the [`ConfigStore`] the data plane reads.
+///
+/// ## Order, and why it is this order
+///
+/// 1. **SQLite first** (`db::restore_config`, ONE transaction). It can fail on a locked database,
+///    a foreign-key violation, or a master key that cannot re-seal — and if the in-memory swap
+///    happened first, the node would serve a config its own database does not contain. A crash
+///    between the two leaves the database ahead of memory, which the next pass repairs; the
+///    reverse would leave memory ahead of the database, which nothing repairs.
+/// 2. **Then the in-memory store** (`ConfigStore::apply_snapshot`), which clears the SWRR state
+///    and runs the snapshot hooks (tenant TLS cert re-resolution) — the same funnel every other
+///    config swap uses, so this path cannot forget them.
+///
+/// ## The version it writes, honestly
+///
+/// `restore_config` also writes `config_meta.config_version`, an INTEGER watermark that the
+/// Redis-era freshness gate compares against the store's. Under Arachne the authority is the
+/// `head` HASH, and making that column carry the hash is T3.2. Until then this target keeps the
+/// old column consistent with the old rule — `current + 1`, exactly as `ConfigStore::reload_all_with`
+/// does — so the two numbers always agree and nothing reads a stale one. It is a MONOTONIC COUNTER,
+/// not the config's identity, and this comment exists so that nobody mistakes it for one.
+pub struct ReplicaTarget {
+    store: ConfigStore,
+    key_provider: Arc<dyn KeyProvider>,
+}
+
+impl ReplicaTarget {
+    /// Build a target over the store it installs into. The key provider is the same one the store
+    /// unseals with: a target that could not open the material it just decoded would be a second,
+    /// silently different master key.
+    #[must_use]
+    pub fn new(store: ConfigStore, key_provider: Arc<dyn KeyProvider>) -> Self {
+        Self {
+            store,
+            key_provider,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MaterializeTarget for ReplicaTarget {
+    async fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
+        // A store built by `ConfigStore::from_snapshot` (the retired edge mode) has no database to
+        // rebuild. Refused rather than silently applied in memory: the node would serve a config it
+        // could not reproduce after a restart, which is the whole point of materializing.
+        let Some(pool) = self.store.pool() else {
+            return Err(
+                "this node has no local config database, so it cannot materialize a tree; a \
+                 snapshot-fed store is not a valid target"
+                    .to_string(),
+            );
+        };
+
+        let version = self.store.version() + 1;
+        crate::db::restore_config(
+            pool,
+            self.key_provider.as_ref(),
+            cfg.as_ref(),
+            fidelity.as_ref(),
+            version,
+        )
+        .await
+        .map_err(|e| format!("the local replica could not be rebuilt: {e}"))?;
+
+        // Only now is the config what this node serves. `apply_snapshot` clones internally (it owns
+        // the `Arc` it publishes), so the two clones here are one deep copy of a config that
+        // changes rarely — not a hot-path cost.
+        self.store.apply_snapshot(HydratedWire {
+            version,
+            cfg: cfg.as_ref().clone(),
+            fidelity: fidelity.as_ref().clone(),
+        });
+        Ok(())
+    }
+}
+
 /// Encode a config into the tree a publisher commits.
 ///
 /// Encoding only: committing is `ArachneConfigStore::publish`, which is the single writer of the
@@ -247,7 +341,17 @@ mod tests {
 
     use arachne_kv::server::{assemble_cluster, ClusterConfig};
     use arachne_kv::{NodeId, Profile};
-    use hydra_core::model::{Provider, Tenant};
+    use hydra_core::config::{CertMeta, ModelProvider};
+    use hydra_core::model::{Provider, ProviderKey, ProviderModel, Tenant, TenantProvider};
+
+    /// A migrated in-memory pool — the replica side of the real-target test.
+    async fn pool() -> sqlx::SqlitePool {
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+        pool
+    }
 
     /// A target that records every apply, and can be told to fail.
     #[derive(Default)]
@@ -275,8 +379,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl MaterializeTarget for RecordingTarget {
-        fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
+        async fn apply(
+            &self,
+            cfg: Arc<ConfigData>,
+            fidelity: Arc<FidelityRows>,
+        ) -> Result<(), String> {
             *self.fidelity_rows.lock().expect("lock") = fidelity.limit_roles.len();
             if *self.fail_next.lock().expect("lock") {
                 *self.fail_next.lock().expect("lock") = false;
@@ -291,7 +400,10 @@ mod tests {
         }
     }
 
-    const PORTS: [u16; 4] = [18401, 18402, 18403, 18404];
+    /// Dedicated loopback ports: cargo runs the tests in this module CONCURRENTLY, so two tests
+    /// sharing a port would fail with "Address already in use" — which is how the fifth one below
+    /// was caught when the real-target test first borrowed `PORTS[3]`.
+    const PORTS: [u16; 5] = [18401, 18402, 18403, 18404, 18405];
 
     fn data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hydra-mat-{tag}-{}", std::process::id()));
@@ -370,7 +482,10 @@ mod tests {
                 matching_provider: None,
                 limit_count: None,
                 limit_token: None,
-                window: "1m".into(),
+                // "m", not "1m": the schema CHECKs the window vocabulary, and this fixture only
+                // met that CHECK once a target actually WROTE its rows — a recording target
+                // accepts anything.
+                window: "m".into(),
                 enabled: false,
                 created_at: String::new(),
             }],
@@ -607,5 +722,224 @@ mod tests {
         );
         assert_eq!(mat.materialized(), None);
         assert_eq!(target.applied_count(), 0, "nothing may be applied");
+    }
+
+    /// A config with everything a replica must reproduce: the rows `ConfigData` keeps, the rows it
+    /// throws away, and the two secret-bearing sets.
+    fn rich_config() -> ConfigData {
+        let mut cfg = ConfigData::default();
+        cfg.tenants_by_domain
+            .insert("acme.example".into(), tenant("t1", "acme.example"));
+        cfg.providers.insert("p1".into(), provider("p1"));
+        cfg.provider_keys
+            .insert("p1".into(), vec!["sk-one".to_string()]);
+        cfg.models_by_key.insert(
+            "gpt-x".into(),
+            vec![ModelProvider {
+                provider_id: "p1".into(),
+                weight: 1,
+            }],
+        );
+        cfg.tenant_providers.insert(
+            "t1".into(),
+            std::collections::HashSet::from(["p1".to_string()]),
+        );
+        // The cert is the case that was MISSING from the tree until it was caught: the private key
+        // is `skip_serializing`, so the entity has to carry it sealed.
+        cfg.certs.insert(
+            "acme.example".into(),
+            CertMeta {
+                domain: "acme.example".into(),
+                cert_file: None,
+                cert_key: None,
+                cert_pem: Some(RICH_CERT_PEM.into()),
+                cert_key_pem: Some(RICH_KEY_PEM.into()),
+            },
+        );
+        cfg.reindex_tenants();
+        cfg
+    }
+
+    const RICH_CERT_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBacme\n-----END CERTIFICATE-----\n";
+    const RICH_KEY_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQacme\n-----END PRIVATE KEY-----\n";
+
+    /// The rows `ConfigData` is derived from and cannot express: a DISABLED role, a provider-key
+    /// row with its identity, an OFFLINE model, a grant, and the token hash.
+    fn rich_fidelity() -> FidelityRows {
+        FidelityRows {
+            limit_roles: fidelity().limit_roles,
+            provider_keys: vec![ProviderKey {
+                id: "pk-1".into(),
+                provider_id: "p1".into(),
+                api_key: "sk-one".into(),
+                created_at: "2026-01-04 00:00:00".into(),
+            }],
+            tenant_token_hashes: vec![("t1".into(), "a".repeat(64))],
+            provider_models: vec![
+                ProviderModel {
+                    id: "pm-online".into(),
+                    key: "gpt-x".into(),
+                    name: "GPT X".into(),
+                    provider_id: "p1".into(),
+                    status: 1,
+                },
+                ProviderModel {
+                    id: "pm-offline".into(),
+                    key: "gpt-old".into(),
+                    name: "GPT old".into(),
+                    provider_id: "p1".into(),
+                    status: -1,
+                },
+            ],
+            tenant_providers: vec![TenantProvider {
+                id: "tp-1".into(),
+                tenant_id: "t1".into(),
+                provider_id: "p1".into(),
+            }],
+            ..FidelityRows::default()
+        }
+    }
+
+    /// The real target, driven by the real loop over a real raft node: a config published on one
+    /// side ends up as this node's SERVED config AND as rows in its own SQLite.
+    ///
+    /// The last assertion is the one that matters most: the replica's database, read back through
+    /// the ordinary loader, reproduces the published config. That is what "a node can rebuild
+    /// itself" means — and it fails if ANY part of the tree is incomplete (a disabled row, a
+    /// provider-key id, an offline model, the tenant's TLS private key, a token hash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_target_rebuilds_the_replica_and_serves_the_published_config() {
+        let node = node("real-target", PORTS[4]).await;
+        wait_writable(&node).await;
+        let store = ArachneConfigStore::new(node.handle.clone());
+
+        let cfg = rich_config();
+        let rows = rich_fidelity();
+        let key_provider = Arc::new(kp());
+        let sealed = SealedMaterial::seal_plaintext(&cfg, &rows, key_provider.as_ref())
+            .expect("seal the publish material");
+        let tree = encode_config(&cfg, &rows, sealed).expect("encode");
+        let hash = store.publish(&tree).await.expect("commit the tree");
+
+        // The node that will serve it: a fresh database, and a store over it. `ConfigStore::load`
+        // is how a real node starts, so the target is exercised against the production type
+        // rather than a test double.
+        let replica_pool = pool().await;
+        let replica_store = ConfigStore::load(replica_pool.clone(), key_provider.clone())
+            .await
+            .expect("load the replica store");
+        assert!(
+            replica_store.snapshot().tenants_by_domain.is_empty(),
+            "fixture: the replica starts with nothing"
+        );
+
+        let target = Arc::new(ReplicaTarget::new(
+            replica_store.clone(),
+            key_provider.clone(),
+        ));
+        let mut mat = Materializer::new(store.clone(), target, key_provider.clone());
+
+        assert_eq!(
+            mat.converge().await.expect("converge"),
+            Converged::Applied { hash: hash.clone() },
+            "the loop must apply the tree the head names"
+        );
+        assert_eq!(mat.materialized(), Some(hash.as_str()));
+
+        // 1) What this node SERVES is the published config, whole.
+        assert_eq!(
+            (**replica_store.snapshot()).clone(),
+            cfg,
+            "the materialized config must EQUAL the published one"
+        );
+        assert_eq!(
+            replica_store.version(),
+            1,
+            "the watermark moves to the next value on the first materialization"
+        );
+
+        // 2) The FIDELITY rows are in the replica's own database...
+        let roles = crate::db::list_limit_roles(&replica_pool)
+            .await
+            .expect("list limit roles");
+        assert_eq!(
+            roles.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r-disabled"],
+            "the DISABLED limit role is not in `ConfigData` at all and must still reach the \
+             replica's table, or every materialization deletes it"
+        );
+        let keys = crate::db::list_provider_keys(&replica_pool, key_provider.as_ref())
+            .await
+            .expect("list provider keys");
+        assert_eq!(
+            keys.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            vec!["pk-1"],
+            "the provider key keeps the leader's row identity"
+        );
+        assert_eq!(keys[0].created_at, "2026-01-04 00:00:00");
+        let models = crate::db::list_provider_models(&replica_pool)
+            .await
+            .expect("list models");
+        assert_eq!(
+            models.len(),
+            2,
+            "the OFFLINE model is dropped by `models_by_key` and must still reach the replica"
+        );
+        let hashes = crate::db::list_tenant_access_token_hashes(&replica_pool)
+            .await
+            .expect("list token hashes");
+        assert_eq!(
+            hashes,
+            vec![("t1".to_string(), "a".repeat(64))],
+            "the tenant token hash rides the fidelity entity and is written verbatim"
+        );
+
+        // 3) ...and so is the cert private key (the defect that made the entity gain a sealed key).
+        let cert = crate::db::get_tenant_cert(&replica_pool, key_provider.as_ref(), "t1")
+            .await
+            .expect("read the cert")
+            .expect("the tenant row exists");
+        assert_eq!(
+            cert.cert_key_pem.as_deref(),
+            Some(RICH_KEY_PEM),
+            "the replica must keep the tenant's TLS private key"
+        );
+
+        // 4) THE STRONGEST ONE: the replica's database alone reproduces the config. A node that
+        //    restarts and rebuilds from its own tables lands on exactly what the leader published.
+        let rebuilt = crate::store::build_config(&replica_pool, key_provider.as_ref())
+            .await
+            .expect("the replica must be able to rebuild itself from its own database");
+        assert_eq!(
+            rebuilt, cfg,
+            "reading the replica's OWN tables back through the loader must reproduce the \
+             published config; any entity the tree failed to carry shows up here as a difference"
+        );
+    }
+
+    /// A store with no database cannot materialize, and says so instead of pretending.
+    ///
+    /// `ConfigStore::from_snapshot` is the retired edge shape: no local config database by design.
+    /// Applying in memory only would leave a node that serves a config it cannot reproduce after a
+    /// restart — the opposite of what materializing is for.
+    #[tokio::test]
+    async fn a_target_without_a_database_refuses_rather_than_applying_in_memory_only() {
+        let replica_store = ConfigStore::from_snapshot(ConfigData::default(), Arc::new(kp()));
+        let target = ReplicaTarget::new(replica_store.clone(), Arc::new(kp()));
+
+        let got = target
+            .apply(Arc::new(rich_config()), Arc::new(FidelityRows::default()))
+            .await;
+        let reason = got.expect_err("a pool-less store must be refused");
+        assert!(
+            reason.contains("no local config database"),
+            "the refusal must name the reason, got: {reason}"
+        );
+        assert!(
+            replica_store.snapshot().tenants_by_domain.is_empty(),
+            "nothing may be installed when the target refuses"
+        );
     }
 }

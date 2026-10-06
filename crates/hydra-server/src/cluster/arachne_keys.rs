@@ -516,6 +516,18 @@ impl Toc {
                     }
                 }
                 11 => EntityPath::Meta,
+                // 12 and 13 were MISSING here: `TenantProvider` and `TenantModel` could be KEYED
+                // (`EntityPath::id`/`sort_key` have always produced these discriminants) but not
+                // DECODED, so a config with a single tenant→provider or tenant→model grant could
+                // be published and never read back — `read` failed at the toc, the materializer
+                // retried forever, and no node ever materialized. It survived because every
+                // fixture in this module happened to use a config without grants; the real-target
+                // test (`arachne_materializer::tests`) reads one with a grant and caught it.
+                //
+                // `every_entity_kind_survives_a_toc_round_trip` below now makes this class
+                // impossible: a kind this build can key must decode.
+                12 => EntityPath::TenantProvider(id),
+                13 => EntityPath::TenantModel(id),
                 14 => EntityPath::Fidelity,
                 other => {
                     return Err(KeysError::UnknownEntityKind {
@@ -586,14 +598,14 @@ mod tests {
         assert_eq!(cfg_entity(&EntityPath::Meta), "hydra/cfg/e/meta");
     }
 
-    /// Every entity kind has a distinct, `/`-free segment, and the singleton has
-    /// no id at all.
+    /// ONE list of every `EntityPath` variant, for the tests that must cover all of them.
     ///
-    /// Falsification: give two variants the same segment and the uniqueness
-    /// assertion fails.
-    #[test]
-    fn every_entity_kind_has_its_own_segment() {
-        let all = [
+    /// Hand-written because the enum cannot be iterated. The point is that adding a variant
+    /// requires touching exactly ONE place in this file, and two tests (segments, toc round trip)
+    /// then both cover it — before this existed, adding `Fidelity` updated the segment list while
+    /// the toc decoder was left behind, and `TenantProvider`/`TenantModel` were never in either.
+    fn all_entity_kinds() -> Vec<EntityPath> {
+        vec![
             EntityPath::Tenant("x".into()),
             EntityPath::Provider("x".into()),
             EntityPath::ProviderKey("x".into()),
@@ -606,9 +618,25 @@ mod tests {
             EntityPath::TenantModel("x".into()),
             EntityPath::Token("x".into()),
             EntityPath::Cert("x".into()),
-        ];
+            EntityPath::Meta,
+            EntityPath::Fidelity,
+        ]
+    }
+
+    /// Every entity kind has a distinct, `/`-free segment, and the singletons have
+    /// no id at all.
+    ///
+    /// Falsification: give two variants the same segment and the uniqueness
+    /// assertion fails.
+    #[test]
+    fn every_entity_kind_has_its_own_segment() {
+        let all = all_entity_kinds();
         let mut seen = std::collections::BTreeSet::new();
         for path in &all {
+            // The singletons have no `<kind>/<id>` shape; they are named, not segmented.
+            if matches!(path, EntityPath::Meta | EntityPath::Fidelity) {
+                continue;
+            }
             let segment = path.to_key_segment();
             assert!(
                 seen.insert(segment.clone()),
@@ -621,8 +649,15 @@ mod tests {
             );
         }
         assert_eq!(EntityPath::Meta.to_key_segment(), "meta");
-        assert!(all.iter().all(|p| p.id().is_some()));
+        assert_eq!(EntityPath::Fidelity.to_key_segment(), "_fidelity");
+        assert!(
+            all.iter()
+                .filter(|p| !matches!(p, EntityPath::Meta | EntityPath::Fidelity))
+                .all(|p| p.id().is_some()),
+            "every non-singleton kind must carry an id"
+        );
         assert!(EntityPath::Meta.id().is_none());
+        assert!(EntityPath::Fidelity.id().is_none());
     }
 
     /// Round trip, and the two properties the tree identity depends on: a fixed
@@ -649,6 +684,48 @@ mod tests {
             "reordering the entities must change the tree's name"
         );
         assert_eq!(t.hash().len(), 64, "the hash is hex-encoded");
+    }
+
+    /// EVERY entity kind this build can KEY must also DECODE.
+    ///
+    /// A kind with a discriminant on the way out but no arm on the way in is a tree that can be
+    /// written and never read: `ArachneConfigStore::read` fails at the toc, so the materializer
+    /// retries forever and no node ever materializes a config — while each half looks fine in
+    /// isolation. That is not hypothetical: discriminants 12 and 13 (`TenantProvider`,
+    /// `TenantModel`) were missing from the decoder, so ONE tenant→provider grant made the whole
+    /// config unreadable. It survived every other test in the repo because no fixture carried a
+    /// grant through a real toc; `arachne_materializer::tests` found it the first time such a
+    /// config was published and read back.
+    ///
+    /// Falsification: delete any arm of the decoder's match and the round trip fails with
+    /// `UnknownEntityKind` naming that discriminant.
+    #[test]
+    fn every_entity_kind_survives_a_toc_round_trip() {
+        // One entry per variant, in the canonical order a publisher sorts into.
+        let mut entities: Vec<TocEntry> = all_entity_kinds()
+            .into_iter()
+            .map(|path| TocEntry {
+                path,
+                content_hash: [7u8; 32],
+                len: 1,
+            })
+            .collect();
+        // Ordered by the WIRE discriminant, which is the numbering this test is about.
+        entities.sort_by_key(|e| e.path.discriminant());
+
+        let t = Toc::new(TOC_FORMAT, entities.clone()).expect("toc");
+        let back = Toc::decode(&t.encode()).expect(
+            "every entity kind this build can key must decode; a kind that cannot is a config \
+             that can be published and never read",
+        );
+        assert_eq!(
+            back.entities
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
+            entities.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            "the round trip must preserve every kind AND their order"
+        );
     }
 
     /// A changed entity changes the tree's name — the property that makes the
