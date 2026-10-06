@@ -18,14 +18,17 @@
  *
  * Rules (checked on the RENDERED compose, so anchors/`extends` cannot hide anything):
  *   1. every service whose image is `hydra*` declares a healthcheck;
- *   2. a service with `HYDRA_ROLE: edge` must probe a token-free endpoint
- *      (`/healthz` or `/readyz`) and must NOT probe `/api/v1/health`;
- *   3. every other hydra service must probe `/api/v1/health` **with** an
- *      Authorization header (it answers 401 otherwise, so a probe without the token
- *      would report unhealthy forever).
+ *   2. every hydra service must probe `/api/v1/health` **with** an Authorization
+ *      header (it answers 401 otherwise, so a probe without the token would report
+ *      unhealthy forever).
+ *
+ * The rule USED to be role-dependent: an `edge` served no admin API, so it had to be
+ * probed through a token-free path. ADR-0001 retired the role (`HYDRA_ROLE` is
+ * ignored), every node runs the admin API, and the edge exception went with it — one
+ * rule for every service, which is also what makes a new service hard to get wrong.
  *
  * Usage: node scripts/check_compose_health.cjs [--compose-json=FILE]…
- * Exit:  0 ok · 1 a healthcheck is missing or wrong for the role · 2 cannot verify.
+ * Exit:  0 ok · 1 a healthcheck is missing or wrong · 2 cannot verify.
  */
 
 const fs = require('fs');
@@ -92,35 +95,22 @@ function render(file) {
   }
 }
 
-function roleOf(svc) {
-  const env = svc.environment || {};
-  const raw = env.HYDRA_ROLE;
-  if (raw === undefined || raw === null) return 'all';
-  return String(raw).trim().toLowerCase() || 'all';
-}
-
 /**
  * The rule set, applied to values that either extractor produced: the rendered compose document or
  * the static YAML text. Factored out in round 121 so the two paths cannot drift apart (the static
  * path exists because a skipped file used to mean "not checked at all" — see `compose_static.cjs`).
  */
-function evaluateService({ label, name, role, hasHealthcheck, test }) {
+function evaluateService({ label, name, hasHealthcheck, test }) {
   const probs = [];
   if (!hasHealthcheck) {
     probs.push('no healthcheck (nothing supervises this node)');
   } else {
-    const tokenFree = /\/healthz|\/readyz/.test(test);
     const adminHealth = /\/api\/v1\/health/.test(test);
     const hasAuth = /Authorization:\s*Bearer/.test(test);
-    if (role === 'edge') {
-      if (adminHealth) probs.push('/api/v1/health is 404 on an edge (measured) — it would report every healthy edge unhealthy');
-      if (!tokenFree) probs.push('an edge must be probed through a token-free path (/healthz or /readyz)');
-    } else {
-      if (!adminHealth) probs.push(`a ${role}-role node runs the admin API — probe /api/v1/health`);
-      if (!hasAuth) probs.push('/api/v1/health answers 401 without the admin token — the probe needs Authorization: Bearer $HYDRA_ADMIN_TOKEN');
-    }
+    if (!adminHealth) probs.push('every hydra node runs the admin API — probe /api/v1/health');
+    if (!hasAuth) probs.push('/api/v1/health answers 401 without the admin token — the probe needs Authorization: Bearer $HYDRA_ADMIN_TOKEN');
   }
-  return { label, name, role, test: test.slice(0, 120), probs };
+  return { label, name, test: test.slice(0, 120), probs };
 }
 
 /**
@@ -164,10 +154,9 @@ function staticHealthCheck(label, file) {
   return services.map(({ name, block }) => evaluateService({
     label: `${label} (static)`,
     name,
-    // Both values come from the RIGHT sub-mapping: `HYDRA_ROLE` from this service's own
-    // `environment:`, and the probe command from its own `healthcheck:` (a nested decoy appearing
-    // earlier in the block used to supply the probe text — caught by the parser's own test).
-    role: (envValue(block, 'HYDRA_ROLE', anchors) || 'all').toLowerCase(),
+    // The probe command comes from this service's OWN `healthcheck:` (a nested decoy appearing
+    // earlier in the block used to supply the probe text — caught by the parser's own test). The
+    // role is no longer read: ADR-0001 retired it, so there is one rule for every service.
     // `disable: true` composes into "no healthcheck" (see compose_static.js), so both paths agree.
     hasHealthcheck: hasOwnKey(block, 'healthcheck') && !healthcheckDisabled(block),
     test: healthcheckTest(block) || '',
@@ -248,10 +237,9 @@ function main(argv) {
           results.push({
             label: src.label,
             name,
-            role: 'unknown (unfiltered)',
             probs: [
               `the service NAME looks like a hydra node but its image \`${svc && svc.image ? svc.image : '<none>'}\` ` +
-                `does not match ${IMAGE_RE} — the image filter skipped it, so its role and healthcheck are unchecked`,
+                `does not match ${IMAGE_RE} — the image filter skipped it, so its healthcheck is unchecked`,
             ],
           });
         }
@@ -259,7 +247,7 @@ function main(argv) {
       }
       const hc = svc.healthcheck;
       const test = hc && Array.isArray(hc.test) ? hc.test.join(' ') : (hc ? String(hc.test) : '');
-      results.push(evaluateService({ label: src.label, name, role: roleOf(svc), hasHealthcheck: Boolean(hc && hc.test), test }));
+      results.push(evaluateService({ label: src.label, name, hasHealthcheck: Boolean(hc && hc.test), test }));
     }
   }
 
@@ -269,12 +257,12 @@ function main(argv) {
   const bad = results.filter((r) => r.probs.length > 0);
   if (bad.length === 0) {
     console.log(`[compose-health] ${results.length} hydra service(s) checked: OK`);
-    for (const r of results) console.log(`[compose-health]   OK ${r.label} · ${r.name} (role=${r.role})`);
+    for (const r of results) console.log(`[compose-health]   OK ${r.label} · ${r.name}`);
     for (const s of skipped) console.log(`[compose-health]   SKIP ${s}`);
     return 0;
   }
   console.error(`[compose-health] FAIL: ${bad.length} of ${results.length} hydra service(s)`);
-  for (const r of bad) console.error(`[compose-health]   ${r.label} · ${r.name} (role=${r.role}): ${r.probs.join('; ')}`);
+  for (const r of bad) console.error(`[compose-health]   ${r.label} · ${r.name}: ${r.probs.join('; ')}`);
   return 1;
 }
 

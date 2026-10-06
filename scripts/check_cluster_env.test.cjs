@@ -294,10 +294,16 @@ test('an unknown argument is refused', () => {
 test('the real repository tree passes (the table names exactly the cluster topology)', () => {
   const res = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', env: { ...process.env, CLUSTER_ENV_ROOT: '' } });
   assert.equal(res.status, 0, `${res.status} ${res.stdout}${res.stderr}`);
-  assert.match(res.stdout, /10 cluster-only name\(s\)/);
-  // ADR-0001 replaced the role selector with the member list, so the table gained the three
-  // names the Arachne assembly path reads. Asserting on the NEW names (rather than on a name
-  // that is merely still present) is what makes this a check on the decision, not on the count.
+  // The count is DERIVED from the declaration, not hard-coded: a literal here rots the moment the
+  // table legitimately changes (it went 10 -> 7 when ADR-0001 retired the role selector's names),
+  // and a rotted literal fails for the wrong reason. ADR-0001 replaced the role selector with the
+  // member list, so asserting on the NEW names below — rather than on a name that is merely still
+  // present — is what makes this a check on the decision, not on the count.
+  const decl = fs.readFileSync(path.join(REPO, 'crates/hydra-server/src/cluster/mod.rs'), 'utf8')
+    .match(/const\s+CLUSTER_ONLY_ENV\s*:\s*\[&str;\s*(\d+)\]\s*=\s*\[([\s\S]*?)\];/);
+  assert.ok(decl, 'CLUSTER_ONLY_ENV declaration not found');
+  const declared = [...decl[2].matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]);
+  assert.match(res.stdout, new RegExp(`${declared.length} cluster-only name\\(s\\)`));
   assert.match(res.stdout, /HYDRA_CLUSTER_PEERS/);
   assert.match(res.stdout, /HYDRA_CLUSTER_ID/);
   assert.match(res.stdout, /HYDRA_ARACHNE_LISTEN/);

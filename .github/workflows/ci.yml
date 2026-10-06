@@ -960,15 +960,27 @@ jobs:
       - name: compose static reader tests
         run: node --test scripts/compose_static.test.cjs
 
-      # Every hydra service must be supervised by a healthcheck that suits its ROLE:
-      # the official cluster topology had none at all, and an edge answers /healthz
-      # (200, token-free) but 404 for /api/v1/health — so a control-node probe copied
-      # onto an edge would report every healthy edge unhealthy.
-      - name: compose healthchecks match the node role
+      # Every hydra service must be supervised by a healthcheck. There is ONE rule since
+      # ADR-0001 retired the role split: every node runs the admin API, so every node is
+      # probed through /api/v1/health with the admin token. (The old edge role answered
+      # /healthz, 200 and token-free, and 404 for /api/v1/health — so a control-node probe
+      # copied onto an edge reported every healthy edge unhealthy.)
+      - name: compose healthchecks probe the admin API on every node
         run: node scripts/check_compose_health.cjs
 
       - name: compose health checker tests
         run: node --test scripts/check_compose_health.test.cjs
+
+      # Two manifest/binary mismatches no other job caught: `docker-compose.local.yml`
+      # still SET variables `RETIRED_CLUSTER_ENV` reports as ignored at boot, and
+      # `environment/build.sh` — the recipe that produces the image every manifest here
+      # runs — omitted the `arachne` feature that `HYDRA_CLUSTER_PEERS` needs to boot.
+      # Both rules are read out of the source/manifests, never duplicated in the checker.
+      - name: shipped manifests agree with the binary (retired vars + feature set)
+        run: node scripts/check_compose_env.cjs
+
+      - name: compose env checker tests
+        run: node --test scripts/check_compose_env.test.cjs
 
       # The repository has repeatedly shipped a test/checker that no job ever ran
       # (`#[ignore]`d tests in round 15, three SDK suites with no job, a checker

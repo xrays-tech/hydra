@@ -49,10 +49,10 @@ function run(docs, env = {}) {
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
-test('control nodes with the token and edges on /healthz pass', () => {
+test('every node probed through /api/v1/health with the token passes', () => {
   const r = run([fixture({ services: {
-    'hydra-control-a': svc('hydra:latest', 'leader', CONTROL_HC),
-    'hydra-edge': svc('hydra:latest', 'edge', EDGE_HC),
+    'hydra-a': svc('hydra:latest', 'cluster', CONTROL_HC),
+    'hydra-b': svc('hydra:latest', 'cluster', CONTROL_HC),
     'hydra': svc('hydra:latest', undefined, CONTROL_HC),
     'redis': { image: 'redis:7-alpine' },
   } })]);
@@ -60,23 +60,20 @@ test('control nodes with the token and edges on /healthz pass', () => {
   assert.match(r.stdout, /3 hydra service\(s\) checked: OK/);
 });
 
+// ADR-0001 retired the role, so the role-specific exceptions went with it: a service that is
+// probed through the token-free `/healthz` is now a FINDING like any other, whichever name it
+// carries. The fixture keeps the old `HYDRA_ROLE: edge` environment to prove the checker no longer
+// special-cases it.
+test('a token-free /healthz probe is a finding even on a service that still sets HYDRA_ROLE', () => {
+  const r = run([fixture({ services: { 'hydra-edge': svc('hydra:latest', 'edge', EDGE_HC) } })]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /every hydra node runs the admin API — probe \/api\/v1\/health/);
+});
+
 test('the defect that motivated the checker: a hydra service with NO healthcheck', () => {
   const r = run([fixture({ services: { 'hydra-control-a': svc('hydra:latest', 'leader', undefined) } })]);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /no healthcheck \(nothing supervises this node\)/);
-});
-
-test('an edge probed through /api/v1/health fails (that path is 404 on an edge)', () => {
-  const r = run([fixture({ services: { 'hydra-edge': svc('hydra:latest', 'edge', CONTROL_HC) } })]);
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /\/api\/v1\/health is 404 on an edge/);
-});
-
-test('an edge with no /healthz or /readyz probe fails', () => {
-  const odd = { test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:8081/ || exit 1'] };
-  const r = run([fixture({ services: { 'hydra-edge': svc('hydra:latest', 'edge', odd) } })]);
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /must be probed through a token-free path/);
 });
 
 test('a control probe without the admin token fails (it would 401 forever)', () => {
@@ -87,7 +84,7 @@ test('a control probe without the admin token fails (it would 401 forever)', () 
 });
 
 test('a hydra-local image (the local stack) is recognised too', () => {
-  const r = run([fixture({ services: { 'hydra-c': svc('hydra-local:latest', 'edge', EDGE_HC) } })]);
+  const r = run([fixture({ services: { 'hydra-c': svc('hydra-local:latest', 'cluster', CONTROL_HC) } })]);
   assert.equal(r.status, 0, r.stderr);
 });
 
@@ -141,7 +138,7 @@ test('CONTROL: the untouched local stack passes the static check', () => {
     `--static-file=${path.join(REPO, 'environment', 'docker-compose.local.yml')}`,
   ], { encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stdout, /hydra-c \(role=edge\)/);
+  assert.match(res.stdout, /hydra-c/);
 });
 
 test('the static path never passes by finding nothing', () => {
@@ -157,7 +154,7 @@ test('all shipped compose files pass (real docker compose render)', () => {
   const res = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8' });
   assert.equal(res.status, 0, `a shipped hydra service is unsupervised or probed wrongly:\n${res.stderr}`);
   assert.match(res.stdout, /hydra service\(s\) checked: OK/);
-  assert.match(res.stdout, /hydra-edge \(role=edge\)/);
+  assert.match(res.stdout, /hydra-c/);
 });
 
 /* Round 129: a service the text reader cannot judge must stop the check (see the grace test). */
@@ -199,14 +196,14 @@ test('`healthcheck: { disable: true }` means NO healthcheck (the rendered path a
  * static path printed `role=all` for both while the RENDERED path printed `role=leader` — the two
  * extractors disagreed, and an `edge` that merges its environment would have been told to probe the
  * admin API it does not have. */
-function anchoredFixture(role, probe) {
+function anchoredFixture(probe) {
   const p = path.join(os.tmpdir(), `health-anchor-${process.pid}.yml`);
   fs.writeFileSync(p, [
     'services:',
     '  hydra-a:',
     '    image: hydra-local:latest',
     '    environment: &control-env',
-    `      HYDRA_ROLE: ${role}`,
+    '      HYDRA_REDIS_URL: redis://redis:6379',
     '    healthcheck:',
     `      test: ["CMD-SHELL", "${probe}"]`,
     '  hydra-b:',
@@ -220,11 +217,14 @@ function anchoredFixture(role, probe) {
   return p;
 }
 
-test('a role arriving through an anchor/merge key is read (an edge is not told to probe the admin API)', () => {
-  const p = anchoredFixture('edge', 'curl -fsS http://127.0.0.1:8081/healthz');
+test('a probe arriving through an anchor/merge key is read (the merging service is judged on its OWN healthcheck)', () => {
+  // The anchor carries the PROBE now, not the role (ADR-0001 retired `HYDRA_ROLE`). The property
+  // this test exists for is unchanged: a service whose `healthcheck:` sits in its own sub-mapping
+  // must be judged on THAT, even when its `environment:` merges an anchor.
+  const p = anchoredFixture(CONTROL_HC.test[1]);
   const res = spawnSync(process.execPath, [CHECKER, `--static-file=${p}`], { encoding: 'utf8' });
-  assert.equal(res.status, 0, `the merged edge role was not read:\n${res.stdout}${res.stderr}`);
-  assert.match(res.stdout, /hydra-b \(role=edge\)/, 'the merging service has no role in the output');
+  assert.equal(res.status, 0, `the merged environment was not read:\n${res.stdout}${res.stderr}`);
+  assert.match(res.stdout, /hydra-b/, 'the merging service is missing from the output');
   fs.rmSync(p, { force: true });
 });
 
@@ -252,39 +252,24 @@ test('a merge key this file cannot resolve is REFUSED (exit 2), never defaulted 
  * path said `role=edge` and passed, the STATIC path said `role=all` and FAILED it — telling the
  * operator to give an edge an admin probe, which is the false positive this guard exists to prevent.
  * The `${VAR}` form behaves the same way. */
-test('an unreadable HYDRA_ROLE is REFUSED (exit 2), never defaulted to `all`', () => {
-  const listForm = path.join(os.tmpdir(), `health-envlist-${process.pid}.yml`);
-  fs.writeFileSync(listForm, [
+// ADR-0001: `HYDRA_ROLE` is retired and the guard no longer reads it, so an interpolated value for
+// it can no longer make a service unjudgeable. What MUST still refuse is an interpolated IMAGE (it
+// can hide the service entirely) — asserted here so the rule that survived is pinned where the
+// removed one used to be.
+test('an interpolated IMAGE is REFUSED (exit 2), never treated as a hydra service', () => {
+  const p = path.join(os.tmpdir(), `health-image-${process.pid}.yml`);
+  fs.writeFileSync(p, [
     'services:',
-    '  hydra-edge:',
-    '    image: hydra-local:latest',
-    '    environment:',
-    '      - HYDRA_ROLE=edge',
+    '  hydra-a:',
+    '    image: ${HYDRA_IMAGE:-hydra-local:latest}',
     '    healthcheck:',
-    '      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz"]',
+    `      test: ["CMD-SHELL", "${CONTROL_HC.test[1]}"]`,
     '',
   ].join('\n'));
-  const r1 = spawnSync(process.execPath, [CHECKER, `--static-file=${listForm}`], { encoding: 'utf8' });
-  assert.equal(r1.status, 2, `LIST form: status=${r1.status} ${r1.stdout}`);
-  assert.match(r1.stderr, /environment:. is a LIST/);
-  assert.doesNotMatch(r1.stderr, /role=all/, 'the unreadable role was turned into `all`');
-  fs.rmSync(listForm, { force: true });
-
-  const interpolated = path.join(os.tmpdir(), `health-envvar-${process.pid}.yml`);
-  fs.writeFileSync(interpolated, [
-    'services:',
-    '  hydra-edge:',
-    '    image: hydra-local:latest',
-    '    environment:',
-    '      HYDRA_ROLE: ${NODE_ROLE:-edge}',
-    '    healthcheck:',
-    '      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz"]',
-    '',
-  ].join('\n'));
-  const r2 = spawnSync(process.execPath, [CHECKER, `--static-file=${interpolated}`], { encoding: 'utf8' });
-  assert.equal(r2.status, 2, `interpolated: status=${r2.status} ${r2.stdout}`);
-  assert.match(r2.stderr, /not decided until render time/);
-  fs.rmSync(interpolated, { force: true });
+  const r = spawnSync(process.execPath, [CHECKER, `--static-file=${p}`], { encoding: 'utf8' });
+  assert.equal(r.status, 2, `interpolated image: status=${r.status} ${r.stdout}`);
+  assert.match(r.stderr, /image is not decided until render time/);
+  fs.rmSync(p, { force: true });
 });
 
 /* Round 185: the image FILTER must not eat a service by NAME — a service called `hydra-*` whose image
@@ -297,8 +282,8 @@ test('a hydra-NAMED service the image filter skips is a finding (rendered path)'
   } })]);
   assert.equal(r.status, 1, `${r.status} ${r.stdout}${r.stderr}`);
   assert.match(r.stdout + r.stderr, /hydra-ghost/);
-  assert.match(r.stdout + r.stderr, /the service NAME looks like a hydra node/);
-  assert.match(r.stdout + r.stderr, /image filter skipped it, so its role and healthcheck are unchecked/);
+  assert.match(r.stdout + r.stderr, /hydra-ghost/);
+  assert.match(r.stdout + r.stderr, /image filter skipped it, so its healthcheck is unchecked/);
 });
 
 test('CONTROL: a NON-hydra service with a foreign image is skipped without complaint', () => {

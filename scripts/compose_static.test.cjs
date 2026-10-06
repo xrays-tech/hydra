@@ -285,22 +285,35 @@ test('a SERVICE-level merge is refused (its grace/healthcheck may come from the 
   );
 });
 
-test('REGRESSION on the real cluster file: both control nodes read `leader`', () => {
+test('REGRESSION on the real cluster file: the three members read the SAME member list', () => {
   const fsmod = require('node:fs');
   const pathmod = require('node:path');
   const file = pathmod.resolve(__dirname, '..', 'environment', 'docker-compose.cluster.yml');
   const text = fsmod.readFileSync(file, 'utf8');
   const anchors = collectAnchors(text);
-  const roles = {};
+  // ADR-0001: there is no role to read any more. What the real file MUST get right is the thing the
+  // cluster's identity depends on — every member carries the SAME `HYDRA_CLUSTER_PEERS` string (the
+  // order is positional raft identity, so a member with a different list is a different cluster),
+  // and each carries its OWN node id / raft address.
+  const peers = {};
+  const nodes = {};
+  const listen = {};
   for (const [name, block] of serviceBlocks(text)) {
     if (!/^hydra-/.test(name)) continue;
-    roles[name] = envValue(block, 'HYDRA_ROLE', anchors);
+    peers[name] = envValue(block, 'HYDRA_CLUSTER_PEERS', anchors);
+    nodes[name] = envValue(block, 'HYDRA_NODE_ID', anchors);
+    listen[name] = envValue(block, 'HYDRA_ARACHNE_LISTEN', anchors);
   }
-  assert.deepEqual(roles, {
-    'hydra-control-a': 'leader',
-    'hydra-control-b': 'leader',
-    'hydra-edge': 'edge',
-  });
+  const names = Object.keys(peers).sort();
+  assert.equal(names.length, 3, `expected three members, got ${names.join(', ')}`);
+  const distinctPeers = new Set(Object.values(peers));
+  assert.deepEqual(
+    [...distinctPeers].filter((v) => v !== null).length,
+    1,
+    `every member must carry the SAME member list, got ${JSON.stringify(peers)}`,
+  );
+  assert.equal(new Set(Object.values(nodes)).size, 3, `each member needs its own node id, got ${JSON.stringify(nodes)}`);
+  assert.equal(new Set(Object.values(listen)).size, 3, `each member needs its own raft address, got ${JSON.stringify(listen)}`);
   // ...and the real file must NOT be refused: every anchor it merges is defined inline.
   assert.deepEqual(unjudgeableServices(text), []);
 });

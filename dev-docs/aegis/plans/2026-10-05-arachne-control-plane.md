@@ -851,9 +851,23 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | **T4.1 前半（启动半边）** | ✅ 已完成（`6043441`） | 租约选举 / 快照轮询客户端 / 备用物化器不再启动；`control_client.rs`、`replica.rs` 删除；`snapshot.rs` 只剩 `HydratedWire`（线缆整个退役）；`/api/v1/internal/control` 删除；`leader_ready` 只剩一个来源 |
 | **T4.1 后半** | ✅ 已完成（`f4f83e9`） | `lease.rs`（715）、`registry.rs`（743）、`RedisLeaseStore`、`LEASE_KEY`、关闭时的注销钩子、`registry_stale_grace_secs`、三套对应测试全部删除。**计划的退役 grep 归零**（`LeaseStore|LeaderElection|NodeRegistry|LEASE_KEY|MemoryLeaseStore`） |
 | **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
-| **T4.0 清单半边** | ⏳ **未做**（刻意留在一起） | `environment/docker-compose.cluster.yml` 仍是 leader/edge 拓扑；`scripts/{compose_static,check_compose_health}.cjs` 仍断言它。**两者必须同批改**（守卫脚本会读这些文件），另加 `docker-compose.local.yml` / `build.sh` 的 `HYDRA_ROLE` 与 `admin-ui/i18n.js` 的角色文案 |
-| **T4.2 环境变量** | ✅ 代码/文档半边完成（`f4f83e9`） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单/README 尚未改**（与 T4.0 清单半边同批） |
-| **T4.3 验收与运维文档** | ⏳ 未做 | 验收 2（20 rps / 60 s）未移植；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写未做 |
+| **T4.0 清单半边** | ✅ 已完成 | `docker-compose.cluster.yml` 改为**三个同构成员**（同一 environment 锚点，只有 node id / raft 地址 / 发布端口 / 卷不同）；`docker-compose.local.yml` 去掉 `HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL`、补上 `HYDRA_CLUSTER_PEERS` + `HYDRA_ARACHNE_LISTEN`；`scripts/check_compose_health.cjs` 的角色分支删除（一条规则：每个节点都用 `Authorization: Bearer` 探 `/api/v1/health`）；`scripts/compose_static.cjs` 的三条角色拒绝规则删除；`admin-ui` 的 `alive` 改为三态渲染；`environment/{build.sh,release.sh}` 的特征集补齐 |
+| **T4.2 环境变量** | ✅ 已完成（代码/文档/清单） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单里残留的三处已清除**（见下） |
+| **T4.3 验收与运维文档** | ⏳ 未做 | 验收 2（20 rps / 60 s）未移植；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写未做；**`integration/test_startup_knobs.py` 目前 11 条红**（见下，这是本轮新发现，CI 步骤就在跑它） |
+
+### 清单半边实际改出来的三个缺陷（都不是"文案问题"）
+
+清单半边不是格式活：这三处都是**声明与事实不符**，而且当时全部门禁是绿的。
+
+1. **`docker-compose.local.yml` 仍在设置三个已退役变量**：`HYDRA_LEADER_LEASE_MS`（a/b 两个节点）与 `HYDRA_CONTROL_POLL_MS`（a/b/c 三个节点）。它们在 `RETIRED_CLUSTER_ENV` 里，所以这套"本地集群"每次启动都会打 ERROR 说这些设置被忽略——文件本身却在告诉读者它们有用。**修法**：删掉这三处；**守卫**：`scripts/check_compose_env.cjs` 规则 1（表从源码读，不在这里复制第二份）。
+2. **镜像配方缺 `arachne` 特征**：`environment/build.sh` 是产出 `environment/` 下每个清单所跑镜像的配方，它只写了 `server,cluster-redis,usage-clickhouse`。而设置 `HYDRA_CLUSTER_PEERS` 却没有 `arachne` 时二进制**拒绝启动**（`main.rs`），所以那个镜像**根本跑不起 `docker-compose.cluster.yml`**。CI 一直是绿的，因为 CI 自己的构建步骤单独带了 `arachne`。**修法**：`build.sh` / `release.sh` 补齐；**守卫**：`check_compose_env.cjs` 规则 2，所需特征**从清单推导**（清单开始用 raft 就把配方一起拽上）。
+3. **`hydra-c` 没有卷**：本地栈的第三个成员没有任何 `/app/data` 挂载，于是它的 raft 日志与 SQLite 全在容器层——重启即重置，这不叫"三个同构成员"。**修法**：补 `hydra-c-data:/app/data` 与顶层卷声明。
+
+### 本轮新发现（尚未处理，登记在案）
+
+* **`integration/test_startup_knobs.py` 是红的：11 条失败**（实测 2026-10-05，`.github/workflows/ci.yml` 有它的步骤）。这份演练整份是围绕 `HYDRA_ROLE` 写的：K1/K2/K3 用 `HYDRA_ROLE=edge` 造"集群节点"、K4/K5/K6/K11 断言"角色写错但配了 wiring ⇒ 报出被丢弃的变量"、K8 用 `" edge "`。角色退役后这些前提到处不成立。**它自己的 K9/K12 仍绿，K7 的一半仍绿**——也就是说：不是整份作废，是**地基换了**。移植方案与 `test_cluster_limits.py` / `test_auth_cache_layers.py` 同一批（T4.3 的"移植"项），口径都是 `HYDRA_CLUSTER_PEERS`。
+* **`HYDRA_CLUSTER_TOKEN` 现在是一个没有消费者的启动要求**：`/api/v1/internal/*` 这个路由族已经**一条都不存在**（随快照通道与转发的管理写一起退役），闸门代码还在（`admin/mod.rs:717`，任何该前缀的请求现在得到 401 而不是 404），而 `main.rs` 仍**要求**它存在且够强，三个清单也都用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它。也就是说：运维必须为一件没人读的东西准备一个秘密，而删掉它是**部署契约变化**（要连同清单、`CLUSTER_ONLY_ENV`、启动拒绝、`test_startup_knobs.py` K10 一起动），所以本轮只把它**写进启动点注释**（`main.rs` 那段契约里）并登记在此，**不改行为**。
+* **`main.rs` 的集群模式拒绝文案曾点名退役变量**：原文 `cluster mode (HYDRA_ROLE=leader|edge) requires HYDRA_REDIS_URL`——运维照着这句话去设一个本产品会报"已忽略"的变量，真因就此丢掉，而**没有任何测试读过这个字符串**。已修，并加守卫 `cluster::tests::no_operator_facing_message_names_a_retired_variable`（扫 `main.rs` 的字符串字面量，**跳过注释**——第一版把注释里引用的历史文案误报成字面量，这本身也是个教训）。
 
 **这一轮的一个额外发现（社区面）**：舰队视图 `/api/v1/cluster/status` 以前从注册表读「成员 + 每个成员是否存活 + 谁持租约」。注册表没了之后，**单个节点再也无法知道对端是否存活**（没有心跳表，也没有节点间 RPC），所以 `alive` 变成**三态**（本节点 `true`、对端 `null`），Admin UI 把 `null` 渲染为「未知」——把健康对端显示成「下线」是**没人测量过的断言**。
 

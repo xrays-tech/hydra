@@ -1,21 +1,36 @@
-# Hydra cluster full-stack: redis + leader pair + stateless edges.
+# Hydra cluster: three IDENTICAL nodes + redis + clickhouse (ADR-0001).
 #
-# Build the image first:  ./environment/build.sh   (with cluster-redis feature:
-#   cargo build --release --features server,cluster-redis  → stage to bin/hydra)
+# Build the image first:  ./environment/build.sh
+#   (the image bundles server,cluster-redis,arachne,usage-clickhouse — see environment/build.sh,
+#    and scripts/check_compose_env.cjs, which derives the required set from THESE manifests)
 #
 # Prereqs:
 #   export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # admin API, >= 16 chars
-#   export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # control channel, REQUIRED
+#   export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # internal endpoints
 #   export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
-#   python3 environment/init.py  (point it at the leader admin port)
+#   python3 environment/init.py  (point it at ANY node's admin port)
 #
 # Start:
-#   docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+#   docker compose -f docker-compose.cluster.yml up -d
 #
-# NOTE: the leader's data volume is per-container; failover is state-based
-# (the standby materializes the config snapshot into its OWN replica DB), so
-# no shared volume is required — certs ship inside the snapshot (migration
-# 0007), not via mounts.
+# ## What changed in ADR-0001, and why this file looks different
+#
+# * **Every node is the same node.** There is no leader/edge split: each one proxies, serves the
+#   admin API, holds its own SQLite, and is a raft member. The old `HYDRA_ROLE` and the edge
+#   service are gone, so the three services below differ ONLY in identity (node id, raft address,
+#   published ports, volume) — the environment block is one anchor.
+# * **The member list IS the cluster.** `HYDRA_CLUSTER_PEERS` is the same string on every node, and
+#   the ORDER is part of the cluster's identity (Arachne derives each member's numeric raft id from
+#   its position). Changing the order means changing the cluster.
+# * **Membership is FIXED at three.** You cannot `--scale` a raft member: adding or removing one is
+#   a membership change that must reach every member, and it is NOT yet wrapped by a command in
+#   this repo — change the list on all members together and restart them (see `dev-docs/ops.md`
+#   §13). Three is the minimum that tolerates one failure.
+# * **No control URL, no lease TTL, no poll interval.** Config reaches each node by materializing
+#   the tree from Arachne; leadership is raft's. A deployment that still sets those variables gets
+#   a startup ERROR naming them (`RETIRED_CLUSTER_ENV`).
+# * Certs ship inside the config tree (migration 0007), not via mounts, and each node keeps its own
+#   data volume — there is nothing to share.
 
 services:
   redis:
@@ -30,54 +45,50 @@ services:
       retries: 10
     restart: unless-stopped
 
-  hydra-control-a:
+  # ---------------------------------------------------------------------------------------------
+  # The three members. Only the marked lines differ between them.
+  # ---------------------------------------------------------------------------------------------
+  hydra-a:
     image: hydra:latest
-    container_name: hydra-control-a
-    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
-    # shorter than this process needs: it drains in-flight requests for
-    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
-    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
-    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
-    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
-    # the drain completes). 30s covers the default SIGTERM path with slack;
-    # use 40s if you also set `stop_signal: SIGQUIT`.
+    container_name: hydra-a
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far shorter than this
+    # process needs: it drains in-flight requests for HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a
+    # 5s final runtime step. Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM
+    # and 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records (control: 20
+    # proxied requests -> 0 rows in usage_record, vs 20 rows when the drain completes). 30s covers
+    # the default SIGTERM path with slack; use 40s if you also set `stop_signal: SIGQUIT`.
     stop_grace_period: 30s
-    environment: &control-env
-      HYDRA_ROLE: leader
+    environment: &node-env
+      HYDRA_CLUSTER_PEERS: "a=hydra-a:8091,b=hydra-b:8092,c=hydra-c:8093"
+      HYDRA_NODE_ID: a                                         # differs (a/b/c)
+      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8091"                     # differs; must match the table above
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: single
-      # REQUIRED — no default: this token authenticates the inter-node config
-      # channel (/api/v1/internal/*), which carries the sealed provider keys.
+      # REQUIRED — no default: it authenticates the internal endpoints (health/status) and
+      # identifies a peer.
       HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:?set HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)" — required in cluster mode}
-      # Control-plane SNAPSHOT URL (standbys/edges poll this for config).
-      # It is NOT the admin-mutation forward target: forwarding follows the
-      # actual lease holder via the registry, so pointing at this node itself
-      # is safe (see dev-docs/cluster.md §5.2).
-      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
-      HYDRA_PUBLIC_URL: "http://hydra-control-a:8081"
-      HYDRA_NODE_ID: control-a
-      HYDRA_LEADER_LEASE_MS: "15000"
-      HYDRA_CONTROL_POLL_MS: "500"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_USAGE_SINK: clickhouse
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      # Every node serves the admin API, so every node needs the admin token.
       HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:?set HYDRA_ADMIN_TOKEN}
       HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY}
       RUST_LOG: info
     ports:
       # Loopback only — the admin port has no TLS (see docker-compose.yml).
-      - "127.0.0.1:8081:8081"   # admin (the second leader is on 8082, see below)
+      - "127.0.0.1:8081:8081"   # admin (differs per node: 8081/8082/8083)
+      - "127.0.0.1:8091:8091"   # raft  (differs per node: 8091/8092/8093)
     volumes:
-      - control-a-data:/app/data
+      - node-a-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
     healthcheck:
-      # /api/v1/health requires the admin Bearer token; $$ escapes to $ so the shell
-      # expands HYDRA_ADMIN_TOKEN (set above) at healthcheck runtime. The CONTENDER
-      # nodes run the admin API, so this is the right probe for them.
+      # EVERY node runs the admin API now (there is no edge role), and /api/v1/health requires the
+      # Bearer token. $$ escapes to $ so the shell expands HYDRA_ADMIN_TOKEN at healthcheck runtime.
       test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://127.0.0.1:8081/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s
@@ -85,37 +96,25 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # Second leader candidate: expose its admin on 8082 for local drills.
-  hydra-control-b:
+  hydra-b:
     image: hydra:latest
-    container_name: hydra-control-b
-    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
-    # shorter than this process needs: it drains in-flight requests for
-    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
-    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
-    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
-    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
-    # the drain completes). 30s covers the default SIGTERM path with slack;
-    # use 40s if you also set `stop_signal: SIGQUIT`.
+    container_name: hydra-b
     stop_grace_period: 30s
     environment:
-      <<: *control-env
-      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
-      HYDRA_PUBLIC_URL: "http://hydra-control-b:8081"
-      HYDRA_NODE_ID: control-b
+      <<: *node-env
+      HYDRA_NODE_ID: b
+      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8092"
     ports:
       - "127.0.0.1:8082:8081"
+      - "127.0.0.1:8092:8092"
     volumes:
-      - control-b-data:/app/data
+      - node-b-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
     healthcheck:
-      # /api/v1/health requires the admin Bearer token; $$ escapes to $ so the shell
-      # expands HYDRA_ADMIN_TOKEN (set above) at healthcheck runtime. The CONTENDER
-      # nodes run the admin API, so this is the right probe for them.
       test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://127.0.0.1:8081/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s
@@ -123,43 +122,26 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  hydra-edge:
+  hydra-c:
     image: hydra:latest
-    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
-    # shorter than this process needs: it drains in-flight requests for
-    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
-    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
-    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
-    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
-    # the drain completes). 30s covers the default SIGTERM path with slack;
-    # use 40s if you also set `stop_signal: SIGQUIT`.
+    container_name: hydra-c
     stop_grace_period: 30s
     environment:
-      HYDRA_ROLE: edge
-      HYDRA_REDIS_URL: "redis://redis:6379"
-      # REQUIRED — no default: this token authenticates the inter-node config
-      # channel (/api/v1/internal/*), which carries the sealed provider keys.
-      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:?set HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)" — required in cluster mode}
-      HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
-      HYDRA_PUBLIC_URL: "http://hydra-edge:8081"
-      HYDRA_CONTROL_POLL_MS: "500"
-      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
-      HYDRA_USAGE_SINK: clickhouse
-      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
-      HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY}
-      RUST_LOG: info
+      <<: *node-env
+      HYDRA_NODE_ID: c
+      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8093"
     ports:
-      - "8080"   # proxy — no host port mapping needed beyond the LB
+      - "127.0.0.1:8083:8081"
+      - "127.0.0.1:8093:8093"
+    volumes:
+      - node-c-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
     healthcheck:
-      # An EDGE serves no admin API: /api/v1/health answers 404 on it (measured
-      # 2026-09-29), so probing that path would mark every healthy edge unhealthy.
-      # Its token-free liveness probe is /healthz — same choice as the local stack.
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://127.0.0.1:8081/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -170,9 +152,8 @@ services:
     image: clickhouse/clickhouse-server:24.3
     container_name: clickhouse
     ports:
-      # Loopback only, unauthenticated (see docker-compose.yml for the full
-      # reasoning): `usage_record` is billing data and an open ClickHouse also
-      # accepts DROP. Nodes reach it as `http://clickhouse:8123`.
+      # Loopback only, unauthenticated (see docker-compose.yml for the full reasoning):
+      # `usage_record` is billing data and an open ClickHouse also accepts DROP.
       - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
@@ -191,6 +172,7 @@ services:
 
 volumes:
   redis-data:
-  control-a-data:
-  control-b-data:
+  node-a-data:
+  node-b-data:
+  node-c-data:
   clickhouse-data:

@@ -157,30 +157,15 @@ function unjudgeableServices(text) {
       });
       continue;
     }
-    // `environment:` written as a LIST (`- HYDRA_ROLE=edge`) is legal compose and unreadable here
-    // (`envValue` reads the mapping form). Round 155: the health guard's `|| 'all'` fallback then
-    // turned a correct `edge` into `all` and told the operator to give an edge an admin probe — the
-    // FALSE POSITIVE that guard's header exists to prevent, and the rendered path disagreed with the
-    // static path about the SAME service. Refusing is this module's rule: unreadable is not guessed.
-    const envBlock = subBlock(block, 'environment');
-    if (envBlock.some((l) => /^\s*-\s+\S/.test(l)) && envValue(block, 'HYDRA_ROLE', anchors) === null) {
-      out.push({
-        name,
-        reason: 'its `environment:` is a LIST (`- NAME=value`), which this text reader cannot read: ' +
-          'HYDRA_ROLE and every other variable would look unset',
-      });
-      continue;
-    }
-    // A value decided at render time (`HYDRA_ROLE: ${NODE_ROLE:-edge}`) is unreadable for the same
-    // reason — and reading it as "unset" means reading it as `all`.
-    const roleValue = envValue(block, 'HYDRA_ROLE', anchors);
-    if (roleValue !== null && roleValue.includes('${')) {
-      out.push({
-        name,
-        reason: `HYDRA_ROLE is not decided until render time (\`${roleValue}\`), so role-dependent ` +
-          `rules cannot judge this service`,
-      });
-    }
+    // The three rules that used to sit here all protected ONE read: `HYDRA_ROLE`, which decided
+    // which probe a service had to carry. ADR-0001 retired the variable, the guard no longer reads
+    // it (one rule for every service), and with them went: the LIST-form refusal, the
+    // interpolated-role refusal, and the "inherited variables (HYDRA_ROLE among them)" wording.
+    //
+    // What still refuses: `extends:`, an interpolated IMAGE, an unrendered value at the service's
+    // own level, a service-level merge key, and an `environment:` merging an anchor this file does
+    // not define — every one of those can hide the SERVICE (and therefore its healthcheck), which
+    // is the property this function exists for.
   }
   return out;
 }

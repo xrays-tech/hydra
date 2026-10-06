@@ -13,9 +13,18 @@
 # target (which has `required-features = ["server"]`) for the cross target, so the binary is
 # silently skipped. This script does that for you.
 #
-# The image bundles ALL optional features (server + cluster-redis + usage-clickhouse) so a
-# SINGLE `hydra:latest` image serves both single-node (HYDRA_ROLE unset → zero external
-# deps, unchanged behavior) and cluster mode (HYDRA_ROLE=leader|edge + Redis).
+# The image bundles ALL optional features (server + cluster-redis + arachne + usage-clickhouse)
+# so a SINGLE `hydra:latest` image serves both single-node (no HYDRA_CLUSTER_PEERS → zero external
+# deps, unchanged behavior) and cluster mode (HYDRA_CLUSTER_PEERS set → Arachne raft membership +
+# Redis for the data-plane state). ADR-0001 retired HYDRA_ROLE: the member list IS the decision.
+#
+# `arachne` is NOT optional for a cluster deployment: without it the binary refuses to BOOT when
+# `HYDRA_CLUSTER_PEERS` is set (main.rs: "this build has no control plane"), so an image built
+# from this recipe without the feature could not run `docker-compose.cluster.yml` at all. Measured
+# 2026-10-05: the recipe listed three features while every compose manifest in this directory
+# requires raft, and CI stayed green because CI's own builds pass `arachne` separately.
+# `scripts/check_image_features.cjs` now derives the required set from the manifests so this
+# cannot drift again.
 #
 # Usage:
 #   ./environment/build.sh              # full: cross-compile + stage + docker build
@@ -31,11 +40,11 @@ DO_DOCKER=1
 [[ "${1:-}" == "--no-build" ]] && DO_DOCKER=0
 
 echo ">> [1/3] cross-compiling hydra for $TARGET (release) via rust_build_linux..."
-# Run from the package dir so --features server,cluster-redis,usage-clickhouse --bin hydra
-# resolves correctly for the cross target. usage-clickhouse compiles BOTH sinks (sqlite +
-# clickhouse) into one binary; cluster-redis enables the cluster mode (Redis backbone).
-# HYDRA_ROLE / HYDRA_USAGE_SINK select behavior at runtime.
-( cd crates/hydra-server && rust_build_linux --features server,cluster-redis,usage-clickhouse --bin hydra )
+# Run from the package dir so `--features … --bin hydra` resolves correctly for the cross target
+# (the `[[bin]] hydra` target has `required-features = ["server"]`). usage-clickhouse compiles
+# BOTH sinks (sqlite + clickhouse) into one binary; cluster-redis is the data-plane backbone;
+# arachne is the control plane (raft). HYDRA_CLUSTER_PEERS / HYDRA_USAGE_SINK select at runtime.
+( cd crates/hydra-server && rust_build_linux --features server,cluster-redis,arachne,usage-clickhouse --bin hydra )
 
 if [[ ! -f "$GLOBAL_TARGET_BIN" ]]; then
     echo "!! expected binary not found at $GLOBAL_TARGET_BIN" >&2

@@ -1262,8 +1262,8 @@ function renderHealthProbeError(e) {
 }
 
 /** The `/cluster/status` probe failed. Deliberately NOT `clusterNotEnabled`:
- *  that message ASSERTS "HYDRA_ROLE unset / single node", which is a different
- *  fact from "we could not ask the registry". */
+ *  that message ASSERTS "no member list / single node", which is a different
+ *  fact from "this node could not answer the status route". */
 function renderClusterUnavailable(e) {
   const stats = $("#cluster-stats");
   const nodes = $("#cluster-nodes");
