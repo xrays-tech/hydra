@@ -123,6 +123,36 @@ function invalidateFK(kind) { delete FK[kind]; }
 /* ===========================================================================
  * HTTP
  * ======================================================================== */
+/** The status part of an error message. The `code` is appended ONLY when it says
+ *  something the status does not: printing both unconditionally is how an empty
+ *  body became "429 429: ". */
+function errorHead(status, code) {
+  return String(code) === String(status) ? String(status) : `${status} ${code}`;
+}
+
+/** A non-JSON error body, made fit for a human. Ingresses in front of this API
+ *  answer with HTML pages: the title says what happened, the markup says nothing
+ *  and can be kilobytes of it. */
+function cleanErrorBody(raw, max = 160) {
+  let s = String(raw);
+  if (/^\s*</.test(s)) {
+    const title = (s.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+    s = title !== undefined ? title : s.replace(/<[^>]*>/g, " ");
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > max ? s.slice(0, max) + "\u2026" : s;
+}
+
+/** `Retry-After` (RFC 9110: delta-seconds or an HTTP-date) as seconds, else null. */
+function parseRetryAfter(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  const at = Date.parse(s);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, Math.round((at - Date.now()) / 1000));
+}
+
 async function api(method, path, { body, query } = {}) {
   if (!TOKEN) throw new Error(t("common.auth.notAuthenticated"));
   const headers = { Authorization: `Bearer ${TOKEN}` };
@@ -143,10 +173,26 @@ async function api(method, path, { body, query } = {}) {
   let json = null;
   if (text) { try { json = JSON.parse(text); } catch { json = text; } }
   if (!resp.ok) {
-    const code = json?.error?.code || resp.status;
-    const message = json?.error?.message || (typeof json === "string" ? json : resp.statusText);
-    const err = new Error(`${resp.status} ${code}: ${message}`);
-    err.status = resp.status; err.code = code; err.body = json;
+    const env = json && typeof json === "object" ? json.error : null;
+    const code = (env && env.code) || resp.status;
+    // A non-JSON (or empty) body used to be interpolated verbatim. Two measured
+    // consequences: an ingress 429 with no body and no reason phrase (HTTP/2
+    // carries none, so `statusText` is "") became the literal string `429 429: `,
+    // and an HTML error page was dumped WHOLE into a toast — 6478 characters in the
+    // case measured for `scripts/admin_ui_render.test.cjs`.
+    let message = (env && env.message) || "";
+    if (!message && typeof json === "string") message = cleanErrorBody(json);
+    if (!message) message = String(resp.statusText || "").trim() || t("common.err.noDetails");
+    const retryAfterSec = parseRetryAfter(resp.headers && resp.headers.get("Retry-After"));
+    let text = `${errorHead(resp.status, code)}: ${message}`;
+    // The server computes `Retry-After` for its rate-limited answers
+    // (`admin/mod.rs:181-198` -> `handlers.rs:94` `err_json_throttled`); the UI threw
+    // the header away and told the operator to retry without saying when.
+    if (retryAfterSec !== null && retryAfterSec > 0) {
+      text += ` (${t("common.err.retryAfter", { sec: retryAfterSec })})`;
+    }
+    const err = new Error(text);
+    err.status = resp.status; err.code = code; err.body = json; err.retryAfterSec = retryAfterSec;
     // A rotated/expired ticket used to leave every page half-logged-in: the
     // requests kept failing with no way back except a manual reload.
     if (resp.status === 401 && !suppress401.active) onSessionInvalid();
@@ -154,10 +200,35 @@ async function api(method, path, { body, query } = {}) {
   }
   return json;
 }
-/** write = POST/PUT/DELETE; after every successful write, reload the store. */
+/** write = POST/PUT/DELETE; after every successful write, reload the store.
+ *
+ *  Returns `null` when the running process ADOPTED the new config, or the Error
+ *  when the write landed but the reload did not — see `toastReloadFailed`. */
 async function writeAndReload(op) {
   await op();
-  try { await api("POST", "/reload", { body: {} }); } catch { /* reload best-effort */ }
+  try {
+    await api("POST", "/reload", { body: {} });
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+/** Report a write that landed while the runtime kept the previous snapshot.
+ *
+ *  A failed reload is NOT cosmetic: the server answers `400 reload_failed` and
+ *  keeps the OLD snapshot, so the row IS committed while the running proxy still
+ *  serves the previous config — and every later view in this UI reads the
+ *  DATABASE rows, so with only the caller's optimistic toast the operator sees
+ *  the new value everywhere and concludes it is live. (`snapshot_stale` on reads
+ *  is the read-side counterpart of this condition.) This used to be an empty
+ *  `catch { /* reload best-effort *\/ }` in `writeAndReload`.
+ *
+ *  Called by the CALLER, after its own success toast: `toast()` appends, so the
+ *  newest message is the one the operator's eye lands on, and "Saved, but the
+ *  runtime reload FAILED" must not be buried above "Provider updated". */
+function toastReloadFailed(err) {
+  toast(`${t("common.reloadFailed")} — ${err && err.message}`, "err");
 }
 
 /* ===========================================================================
@@ -300,6 +371,16 @@ const CRUD = {
       { name: "name", label: "field.displayName", required: true, placeholder: "OpenAI" },
       { name: "endpoint", label: "field.endpoint", type: "url", required: true, placeholder: "https://api.openai.com", full: true },
       { name: "weight", label: "field.weight", type: "number", map: "int", value: 1, tip: "tip.weight" },
+      // Admission-control limits. These MUST be in the form: editing a provider
+      // sends the WHOLE record (a PUT), and the server writes every column from the
+      // body it receives — a field the form does not submit therefore arrives as
+      // "absent", deserialises to `None`, and the column is set to NULL. Leaving
+      // these out silently turned the operator's concurrency cap off (`proxy.rs`
+      // uses `max_concurrency` as the admission gate) on any edit through the UI.
+      // `optint` maps "" to null, which is exactly "unlimited".
+      { name: "max_concurrency", label: "field.maxConcurrency", type: "number", map: "optint", tip: "tip.maxConcurrency" },
+      { name: "max_queue_depth", label: "field.maxQueueDepth", type: "number", map: "optint", tip: "tip.maxQueueDepth" },
+      { name: "queue_wait_timeout_ms", label: "field.queueWaitTimeoutMs", type: "number", map: "optint", tip: "tip.queueWaitTimeoutMs" },
     ],
   },
   "provider-models": {
@@ -323,7 +404,6 @@ const CRUD = {
   "provider-keys": {
     title: "crud.provider-keys.title", nav: "crud.provider-keys.nav", icon: "keys", path: "/provider-keys", singular: "crud.provider-keys.singular",
     desc: "crud.provider-keys.desc",
-    maskedKeys: true,
     noEdit: true,
     columns: [
       { key: "id", label: "col.id", mono: true },
@@ -367,6 +447,23 @@ const CRUD = {
       { name: "cert_key_pem", label: "field.certKeyPem", type: "textarea", full: true, rows: 4, map: "opt",
         placeholder: "-----BEGIN PRIVATE KEY----- …",
         tip: "tip.certKey" },
+      // The legacy cert PATH columns. They belong in the form for the same reason
+      // the provider concurrency columns do: PUT is a whole-record replace
+      // (`db.rs` `UPDATE tenant SET ... cert_key = ?, cert_file = ?`), so omitting
+      // them does not "leave them alone" — it sets them to NULL. `app.js`'s own
+      // content fields cannot cover this: they are action-based at the handler
+      // (`CertWrite::None` = leave the sealed content alone), while these two are
+      // ordinary columns.
+      //
+      // Re-sending both paths is not a no-op either, by design: the handler READS
+      // those files on this node and converts them into sealed content
+      // (`handlers.rs` `resolve_tenant_cert_write`), which is how a pre-0007 row
+      // gets migrated. Unreadable files are a loud 400 (`cert_file_unreadable`)
+      // instead of a silent wipe. `opt` maps a blank input to null = "no path".
+      { name: "cert_file", label: "field.certFilePath", map: "opt", full: true,
+        placeholder: "/etc/hydra/certs/acme.crt", tip: "tip.certFilePath" },
+      { name: "cert_key", label: "field.certKeyPath", map: "opt", full: true,
+        placeholder: "/etc/hydra/certs/acme.key", tip: "tip.certKeyPath" },
       { name: "enabled", label: "field.enabled", type: "checkbox", map: "bool", value: true },
     ],
   },
@@ -600,14 +697,13 @@ function renderEntityPanel(cfg, rows) {
     el("div", { class: "spacer" }),
   );
 
-  // keys reveal toggle
-  if (cfg.maskedKeys) {
-    head.appendChild(el("label", { class: "toggle-pill" },
-      el("input", { type: "checkbox", id: "keys-reveal",
-        onChange: (e) => { STATE.revealKeys = e.target.checked; loadEntity("provider-keys"); } }),
-      el("span", { text: t("common.form.reveal") }),
-    ));
-  }
+  // No "reveal plaintext" toggle here. The admin API ALWAYS masks provider keys
+  // (`hydra_core::rewrite::mask_key`: `first10 + *** + last4` for keys >= 20 chars,
+  // `first2 + *** + last2` for >= 6, harder still below that) and `?reveal=1` is
+  // an accepted no-op (P1-5), so such a toggle could only ever lie - the one that
+  // used to sit in this spot assigned a flag nothing read, and re-rendering
+  // unchecked it again. The honest statement lives in `crud.provider-keys.desc` /
+  // `tip.masked`, i.e. next to where a key is entered.
   head.appendChild(el("button", { class: "btn primary sm", onClick: () => openCreate(cfg) },
     icon("plus", 14), el("span", { class: "btn-label", text: t("common.action.new", { singular: t(cfg.singular) }) }),
   ));
@@ -621,8 +717,6 @@ function renderEntityPanel(cfg, rows) {
   }
   content.appendChild(panel);
 }
-
-const STATE = { revealKeys: false };
 
 function renderTable(cfg, rows) {
   const cols = cfg.columns;
@@ -746,12 +840,13 @@ async function openForm(cfg, record) {
     setLoading(submitBtn, true, isEdit ? t("common.action.saving") : t("common.action.creating"));
     try {
       const bodyObj = collectBody(cfg, inputs, record);
-      await writeAndReload(() =>
+      const reloadErr = await writeAndReload(() =>
         isEdit ? api("PUT", `${cfg.path}/${record.id}`, { body: bodyObj })
                : api("POST", cfg.path, { body: bodyObj }));
       (cfg.clearsFK || []).forEach(invalidateFK);
       closeModal();
       toast(t(isEdit ? "common.toast.updated" : "common.toast.created", { singular: t(cfg.singular) }), "ok");
+      if (reloadErr) toastReloadFailed(reloadErr);
       await loadEntity(CURRENT);
     } catch (e) {
       setLoading(submitBtn, false);
@@ -845,7 +940,16 @@ function readValue(f, input) {
     case "int": return v === "" ? 0 : parseInt(v, 10);
     case "optint": return v === "" ? null : parseInt(v, 10);
     case "bool": return !!input.checked;
-    case "opt": return v === "" ? null : v;
+    // Whitespace-only counts as "not given", not as an empty VALUE. The server
+    // reads a present-but-blank string as an explicit CLEAR for three of these
+    // fields (`handlers.rs` `resolve_tenant_cert_write`: `(Some(""), _) =>
+    // CertWrite::Clear`; `resolved_secret_writes`: `token.trim().is_empty() =>
+    // Some(None)`), so a stray space in the PEM textarea or the access-token box
+    // used to delete a tenant's certificate / self-service token — while the copy
+    // next to those fields promises "leave blank to keep". `v` itself is passed
+    // through untouched: PEM content must round-trip byte-for-byte (the server
+    // trims only to test emptiness).
+    case "opt": return v.trim() === "" ? null : v;
     default: return v;
   }
 }
@@ -927,9 +1031,10 @@ async function doDelete(cfg, record) {
   });
   if (!ok) return;
   try {
-    await writeAndReload(() => api("DELETE", `${cfg.path}/${record.id}`));
+    const reloadErr = await writeAndReload(() => api("DELETE", `${cfg.path}/${record.id}`));
     (cfg.clearsFK || []).forEach(invalidateFK);
     toast(t("common.toast.deleted", { singular: t(cfg.singular) }), "ok");
+    if (reloadErr) toastReloadFailed(reloadErr);
     await loadEntity(CURRENT);
   } catch (e) {
     toast(e.message, "err", { title: t("common.toast.failedDelete", { singular: t(cfg.singular) }) });
@@ -1111,18 +1216,63 @@ async function renderHealth() {
     el("div", { id: "cluster-nodes" }),
   ));
   content.appendChild(el("pre", { class: "json", id: "health-json" }, "{}"));
-  try {
-    const [h, c] = await Promise.all([
-      api("GET", "/health"),
-      api("GET", "/cluster/status"),
-    ]);
-    renderHealthStats(h);
-    renderClusterStatus(c);
-    $("#health-json").innerHTML = highlightJson({ health: h, cluster: c });
-  } catch (e) {
-    $("#health-json").textContent = `error: ${e.message}`;
-    toast(e.message, "err");
+  // Each panel renders from ITS OWN result. `Promise.all` used to let a failed
+  // cluster probe discard the `/health` payload that had ALREADY arrived: the
+  // Status panel kept its skeleton forever while the process was healthy, and the
+  // raw-JSON view showed only the cluster error. Note the asymmetry this fixes —
+  // `refreshLeaderBanner` polls this same endpoint and already tolerates its
+  // failure (`catch { return; }`), while the health page let it take the page down.
+  //
+  // `cluster_unavailable` (502) means "cannot read the cluster registry (Redis
+  // unreachable?)" — NOT "single node": single-node mode answers
+  // `200 {cluster:false}` (`cluster_api.rs:92-95` -> `single_node_status`). So a
+  // 502 here is a real degradation and is rendered as one.
+  const errText = (r) => (r && r.message) || t("common.empty.unknownError");
+  const [healthRes, clusterRes] = await Promise.allSettled([
+    api("GET", "/health"),
+    api("GET", "/cluster/status"),
+  ]);
+  if (healthRes.status === "fulfilled") {
+    renderHealthStats(healthRes.value);
+  } else {
+    renderHealthProbeError(healthRes.reason);
+    toast(errText(healthRes.reason), "err");
   }
+  if (clusterRes.status === "fulfilled") {
+    renderClusterStatus(clusterRes.value);
+  } else {
+    renderClusterUnavailable(clusterRes.reason);
+  }
+  // Both outcomes are in the raw view, labelled — an absent key would read as
+  // "healthy and empty".
+  $("#health-json").innerHTML = highlightJson({
+    health: healthRes.status === "fulfilled" ? healthRes.value : { error: errText(healthRes.reason) },
+    cluster: clusterRes.status === "fulfilled" ? clusterRes.value : { error: errText(clusterRes.reason) },
+  });
+}
+
+/** The `/health` probe itself failed: say so where the numbers would have been. */
+function renderHealthProbeError(e) {
+  const grid = $("#health-stats");
+  clear(grid);
+  grid.appendChild(el("div", { class: "stat warn" },
+    el("div", { class: "sl", text: t("custom.health.status") }),
+    el("div", { class: "sv", text: t("custom.health.unavailable") })));
+  grid.appendChild(el("p", { class: "muted", text: (e && e.message) || t("common.empty.unknownError") }));
+}
+
+/** The `/cluster/status` probe failed. Deliberately NOT `clusterNotEnabled`:
+ *  that message ASSERTS "HYDRA_ROLE unset / single node", which is a different
+ *  fact from "we could not ask the registry". */
+function renderClusterUnavailable(e) {
+  const stats = $("#cluster-stats");
+  const nodes = $("#cluster-nodes");
+  clear(stats); clear(nodes);
+  stats.appendChild(el("div", { class: "stat warn" },
+    el("div", { class: "sl", text: t("custom.health.mode") }),
+    el("div", { class: "sv", text: t("custom.health.unavailable") })));
+  nodes.appendChild(el("p", { class: "muted",
+    text: t("custom.health.clusterUnavailable", { msg: (e && e.message) || t("common.empty.unknownError") }) }));
 }
 function renderClusterStatus(c) {
   const stats = $("#cluster-stats");

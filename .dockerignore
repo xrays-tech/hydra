@@ -18,6 +18,60 @@
 **/.ignore
 **/node_modules
 
-# KEEP the staged binary (build.sh writes it here):
+# The whole build context is uploaded to the builder even though this Dockerfile
+# only COPYs `bin/hydra`, so local secrets and per-machine run-time state must not
+# travel with it: `secure/` holds TLS material plus a local-test env file, and the
+# SQLite/pid files can contain tenant rows. (`**/*.md` above already covers
+# LOCAL_TEST_ENV.md / CODE_REVIEW.md; they are repeated because those two are the
+# files most likely to be renamed away from `.md`.)
+**/secure
+**/*.env
+**/.env
+**/.env.*
+LOCAL_TEST_ENV.md
+CODE_REVIEW.md
+**/*.pid
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.db-journal
+**/__pycache__
+**/*.pyc
+
+# Local AI-agent state. `.gitignore` already lists these as "never commit", and
+# they routinely hold session transcripts (which quote source, config and
+# sometimes credentials). They are absent from a clean checkout, so this only
+# matters on a developer machine — which is exactly where `docker build` runs.
+**/.claude
+**/.opencode
+**/.agents
+**/.cursor
+**/.windsurf
+**/.continue
+**/.codeium
+**/.aider*
+
+# Playwright artifacts from a local UI-E2E run (CI uploads them; a local run just
+# leaves them in the build context).
+**/test-results
+**/playwright-report
+
+# Local caches and acceptance-run leftovers. `.acceptance/` + `.cargo-cache/` are
+# ~1.4 GB on a machine that has run the gates, and NOTHING excluded them, so every
+# `environment/build.sh` uploaded them alongside a single 32 MB binary (measured
+# context: ~1.28 GB). None of it is referenced by the Dockerfile.
+**/.acceptance
+**/.cargo-cache
+**/.docker
+**/.buildx
+**/data
+**/environment/bin
+
+# Defensive no-ops, kept deliberately: NOTHING above excludes `bin/`, so
+# `bin/hydra` (staged by environment/build.sh, and needed by the Dockerfile's
+# `COPY bin/hydra`) is already included — measured: deleting these two lines
+# changes nothing. They are here so that a future rule excluding `bin/` cannot
+# silently break the image build. The comment used to read "KEEP the staged
+# binary", which implied they were load-bearing.
 !bin/
 !bin/hydra

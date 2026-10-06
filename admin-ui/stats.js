@@ -76,10 +76,10 @@ function renderStatsData(d) {
 
   const t_ = d.totals || {};
   const cards = [
-    { l: t("stats.cardRequests"), v: fmtNum(t_.requests) },
-    { l: t("stats.cardTokens"), v: fmtNum(t_.tokens) },
-    { l: t("stats.cardPromptTokens"), v: fmtNum(t_.tokens_prompt) },
-    { l: t("stats.cardCompletionTokens"), v: fmtNum(t_.tokens_completion) },
+    { l: t("stats.cardRequests"), v: fmtNumCompact(t_.requests) },
+    { l: t("stats.cardTokens"), v: fmtNumCompact(t_.tokens) },
+    { l: t("stats.cardPromptTokens"), v: fmtNumCompact(t_.tokens_prompt) },
+    { l: t("stats.cardCompletionTokens"), v: fmtNumCompact(t_.tokens_completion) },
     { l: t("stats.cardTenants"), v: String(t_.tenants || 0) },
     { l: t("stats.cardProviders"), v: String(t_.providers || 0) },
   ];
@@ -166,7 +166,7 @@ function barChart(opts) {
     const row = el("div", { class: "chart-row", title: tip },
       el("div", { class: "chart-label", text: r.name }),
       el("div", { class: "chart-track" }),
-      el("div", { class: "chart-value", text: fmtNum(v) }),
+      el("div", { class: "chart-value", text: fmtNumCompact(v) }),
     );
     const track = row.querySelector(".chart-track");
     if (opts.stacked) {
@@ -186,8 +186,17 @@ function barChart(opts) {
   return wrap;
 }
 
-/* Compact number formatting: 1234 -> 1.23k, 1500000 -> 1.5M. */
-function fmtNum(n) {
+/* Compact number formatting: 1234 -> 1.23k, 1500000 -> 1.5M.
+ *
+ * Named `fmtNumCompact`, NOT `fmtNum`: the four admin-ui scripts share ONE global
+ * scope, and `app.js` already declares a global `fmtNum` for a different job
+ * (array length / "—" placeholder). Since `app.js` is loaded last it won that
+ * name silently, so this formatter never ran and the stats page printed
+ * `1234567` where `1.23M` was intended. Duplicate top-level names across these
+ * scripts are a bug, not a style issue: `scripts/admin_ui_render.test.cjs` now
+ * fails on any of them. */
+
+function fmtNumCompact(n) {
   if (typeof n !== "number" || !isFinite(n)) n = 0;
   if (n >= 1e9) return trimNum(n / 1e9) + "B";
   if (n >= 1e6) return trimNum(n / 1e6) + "M";

@@ -33,6 +33,15 @@ services:
   hydra-control-a:
     image: hydra:latest
     container_name: hydra-control-a
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     environment: &control-env
       HYDRA_ROLE: leader
       HYDRA_REDIS_URL: "redis://redis:6379"
@@ -65,12 +74,30 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      # /api/v1/health requires the admin Bearer token; $$ escapes to $ so the shell
+      # expands HYDRA_ADMIN_TOKEN (set above) at healthcheck runtime. The CONTENDER
+      # nodes run the admin API, so this is the right probe for them.
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://127.0.0.1:8081/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   # Second leader candidate: expose its admin on 8082 for local drills.
   hydra-control-b:
     image: hydra:latest
     container_name: hydra-control-b
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     environment:
       <<: *control-env
       HYDRA_CONTROL_URL: "http://hydra-control-a:8081"
@@ -85,10 +112,28 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      # /api/v1/health requires the admin Bearer token; $$ escapes to $ so the shell
+      # expands HYDRA_ADMIN_TOKEN (set above) at healthcheck runtime. The CONTENDER
+      # nodes run the admin API, so this is the right probe for them.
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://127.0.0.1:8081/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   hydra-edge:
     image: hydra:latest
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     environment:
       HYDRA_ROLE: edge
       HYDRA_REDIS_URL: "redis://redis:6379"
@@ -110,13 +155,25 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+    healthcheck:
+      # An EDGE serves no admin API: /api/v1/health answers 404 on it (measured
+      # 2026-09-29), so probing that path would mark every healthy edge unhealthy.
+      # Its token-free liveness probe is /healthz — same choice as the local stack.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     container_name: clickhouse
     ports:
-      - "8123:8123"
+      # Loopback only, unauthenticated (see docker-compose.yml for the full
+      # reasoning): `usage_record` is billing data and an open ClickHouse also
+      # accepts DROP. Nodes reach it as `http://clickhouse:8123`.
+      - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro

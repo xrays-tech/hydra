@@ -39,6 +39,15 @@ services:
   hydra-a:
     image: hydra-local:latest
     container_name: hydra-a
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -79,6 +88,15 @@ services:
   hydra-b:
     image: hydra-local:latest
     container_name: hydra-b
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -117,6 +135,15 @@ services:
   hydra-c:
     image: hydra-local:latest
     container_name: hydra-c
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
@@ -135,7 +162,14 @@ services:
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here
-      - "127.0.0.1:8084:8081"   # edge admin: /metrics /healthz /readyz only
+      # edge admin: /healthz + /readyz are TOKEN-FREE (edge mode), /metrics is NOT:
+      # it goes through the same admin-token gate as everywhere else, and this
+      # service does have the token (env_file above), so a scraper must send it.
+      # (Until the Sept-16 change the edge served /metrics unauthenticated — a
+      # running container built before that still does, which is easy to mistake
+      # for the current contract: a stale local stack answered /metrics 200 with no
+      # token, measured 2026-09-29.)
+      - "127.0.0.1:8084:8081"
     depends_on:
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
@@ -208,6 +242,14 @@ services:
   # usage_record DDL. The repo ships it as environment/clickhouse/init.sql, but a
   # bind-mounted .sql file is NOT readable in this environment (only executables
   # are), so the DDL is applied by a one-shot client container instead.
+  #
+  # This DDL MUST stay byte-identical in shape to environment/clickhouse/init.sql
+  # (and therefore to `crates/hydra-server/migrations/0011_usage_sub_tenant_id.sql`).
+  # It previously stopped at the pre-v3 table (no `sub_tenant_id`) while the sink
+  # (sink.rs CLICKHOUSE_INSERT) writes that column — so a fresh `up` on this file
+  # failed every usage flush with `NO_SUCH_COLUMN_IN_TABLE` and silently dropped
+  # the batch after the retention cap. `CREATE TABLE IF NOT EXISTS` never adds a
+  # column to an EXISTING volume, hence the idempotent ALTER below as well.
   clickhouse-init:
     image: clickhouse/clickhouse-server:24.3
     container_name: hydra-local-clickhouse-init
@@ -220,6 +262,7 @@ services:
             provider_id        String,
             model_key          String,
             client_api_key     Nullable(String),
+            sub_tenant_id      Nullable(String),
             status_code        UInt16,
             tokens_in          Nullable(UInt64),
             tokens_out         Nullable(UInt64),
@@ -230,8 +273,12 @@ services:
             upstream_host      Nullable(String),
             error              Nullable(String),
             created_at         String
-          ) ENGINE = MergeTree() ORDER BY (created_at, tenant_id, provider_id)"
-        echo "[clickhouse-init] usage_record ready"
+          ) ENGINE = MergeTree() ORDER BY (created_at, tenant_id, provider_id) SETTINGS non_replicated_deduplication_window = 1000"
+        clickhouse-client --host clickhouse --query "
+          ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000"
+        clickhouse-client --host clickhouse --query "
+          ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)"
+        echo "[clickhouse-init] usage_record ready (v3: sub_tenant_id present)"
     depends_on:
       clickhouse: { condition: service_healthy }
     restart: "no"

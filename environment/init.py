@@ -30,7 +30,16 @@ def req(method, url, token, body=None):
         return 0, str(e)[:200]
 
 def wait_health(base, token, timeout=30):
-    for _ in range(timeout * 10):
+    """Poll /health until it answers 200, or `timeout` SECONDS have passed.
+
+    This used to be `for _ in range(timeout * 10)` with a 0.2s sleep: the argument
+    was a poll COUNT in disguise, so `timeout=30` waited ~62s (measured against an
+    unreachable port). A monotonic deadline means the parameter says what it does,
+    whatever the poll interval is. (`integration/e2e_proxy_test.py` has the same
+    loop but with a 0.1s sleep, which happens to be exact.)
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         s, _ = req("GET", f"{base}/health", token)
         if s == 200:
             return True

@@ -29,4 +29,16 @@ CREATE TABLE IF NOT EXISTS usage_record (
     error              Nullable(String),
     created_at         String
 ) ENGINE = MergeTree()
-ORDER BY (created_at, tenant_id, provider_id);
+ORDER BY (created_at, tenant_id, provider_id)
+-- Retry idempotency (2026-09-29): the sink sends a stable
+-- `insert_deduplication_token` per batch, so re-sending a batch whose response
+-- was lost cannot double-count usage/billing. This table setting is what MAKES
+-- that token effective on a non-replicated MergeTree; without it the token is
+-- accepted and silently ignored (verified on 24.3 — no error, just no
+-- deduplication). It used to live here as a COMMENT ONLY, which meant every
+-- fresh instance created from this file silently lost the protection while
+-- `docker-compose.local.yml`'s inline DDL had it. Existing instances still need
+--   ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000;
+-- (see dev-docs/ops.md). `tests/clickhouse_ddl_parity.rs` fails if this file and
+-- the inline DDL in `docker-compose.local.yml` ever disagree again.
+SETTINGS non_replicated_deduplication_window = 1000;

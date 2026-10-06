@@ -15,12 +15,20 @@
 #   6. Start:  cd environment && docker-compose up -d
 #   7. Init:   python3 environment/init.py
 #
-version: "3.8"
 
 services:
   hydra:
     image: hydra:latest
     container_name: hydra
+    # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
+    # shorter than this process needs: it drains in-flight requests for
+    # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
+    # Measured 2026-09-29 on a release build: shutdown takes 25s on SIGTERM and
+    # 35s on SIGQUIT, and a SIGKILLed drain loses the buffered usage records
+    # (control: 20 proxied requests -> 0 rows in usage_record, vs 20 rows when
+    # the drain completes). 30s covers the default SIGTERM path with slack;
+    # use 40s if you also set `stop_signal: SIGQUIT`.
+    stop_grace_period: 30s
     ports:
       - "8080:8080"   # proxy (HTTP)
       # Admin REST + UI + /metrics — published on LOOPBACK ONLY. This port has no
@@ -75,7 +83,10 @@ services:
       dockerfile: Dockerfile.tenant
     container_name: mock-tenant
     ports:
-      - "9091:9091"
+      # Loopback only: this stand-in answers {"allowed":true} for ANY key
+      # (environment/mock_tenant/app.py). Reachable from the host for debugging,
+      # never from the network. Hydra uses the compose service name.
+      - "127.0.0.1:9091:9091"
     healthcheck:
       # Python stdlib only (no curl in the mock image); GET /health -> {"status":"ok"}
       test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9091/health',timeout=2).status==200 else 1)\""]
@@ -89,10 +100,31 @@ services:
     image: clickhouse/clickhouse-server:24.3
     container_name: clickhouse
     ports:
-      - "8123:8123"   # HTTP interface (Hydra writes usage here)
-      - "9000:9000"   # native TCP (optional: clickhouse-client)
+      # LOOPBACK ONLY, and this port carries NO authentication
+      # (`CLICKHOUSE_SKIP_USER_SETUP: 1` below skips the default-user password).
+      # `usage_record` holds every tenant's usage/billing rows — tenant_id,
+      # model_key, the masked client key, token counts — and an unauthenticated
+      # ClickHouse also accepts DROP/TRUNCATE. Hydra reaches it over the compose
+      # network by service name (`http://clickhouse:8123`), so publishing these
+      # on 0.0.0.0 bought nothing but exposure. The host-side acceptance tests
+      # (`CH_URL=http://127.0.0.1:8123`) keep working: loopback is exactly where
+      # they connect. Need remote access? Add CLICKHOUSE_USER/PASSWORD and put
+      # the credentials in HYDRA_CLICKHOUSE_URL instead of reopening the port.
+      - "127.0.0.1:8123:8123"   # HTTP interface (Hydra writes usage here)
+      - "127.0.0.1:9000:9000"   # native TCP (optional: clickhouse-client)
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      # The schema is applied by the official entrypoint on FIRST start. It reads the
+      # file as the container user, so every parent directory of this repository must be
+      # traversable by that user: with the checkout under a `0700` home directory the
+      # mount fails with `Permission denied`, ClickHouse starts WITHOUT `usage_record`,
+      # and hydra's sink reports it on every retry (`usage sink batch insert failed …
+      # Table default.usage_record does not exist`, measured 2026-09-30 while booting
+      # this stack). The container's own log has the same story
+      # (`/entrypoint.sh: running …/init.sql` then `Permission denied`). Check with
+      # `docker compose exec clickhouse clickhouse-client -q 'SHOW TABLES'` after a fresh
+      # start; if the table is missing, apply it through the HTTP interface:
+      #   curl --data-binary @clickhouse/init.sql http://127.0.0.1:8123/
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: 1

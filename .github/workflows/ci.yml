@@ -72,9 +72,12 @@ jobs:
         run: cargo build --workspace --features hydra-server/server
 
       # T1.1 / T1.2 / T10.1 (mirror) / T10.2 — the pure-core suite, incl. the
-      # in-process dependency-firewall test.
+      # in-process dependency-firewall test. The transcript is kept so the
+      # public-claims step below can compare it against docs/index.html.
       - name: Test hydra-core (pure)
-        run: cargo test -p hydra-core
+        run: |
+          set -o pipefail
+          cargo test -p hydra-core 2>&1 | tee "$RUNNER_TEMP/core-tests.log"
 
       # T10.1 — authoritative dependency firewall. Asserts `hydra-core`'s
       # resolved tree contains NONE of tokio/pingora/sqlx/reqwest/hyper
@@ -97,7 +100,17 @@ jobs:
       # covers `cluster-redis` / `usage-clickhouse`, which `server` does not
       # pull in — and which nothing used to compile at all.)
       - name: Test hydra-server (shell)
-        run: cargo test -p hydra-server --features server
+        run: |
+          set -o pipefail
+          cargo test -p hydra-server --features server 2>&1 | tee "$RUNNER_TEMP/server-tests.log"
+
+      # docs/index.html is published (GitHub Pages) and advertises an exact Rust
+      # test count. That number is hand-edited; it already went stale twice, and
+      # nothing compared it with reality. Here the comparison is free: CI has
+      # just run both suites, so their transcripts are the measurement. The
+      # checker exits 2 (never 0) when a transcript is missing or unusable.
+      - name: Public claims match the measured suites
+        run: node scripts/check_public_claims.cjs --core-log="$RUNNER_TEMP/core-tests.log" --server-log="$RUNNER_TEMP/server-tests.log"
 
   # Neither `cluster-redis` (Redis-backed leader lease, cluster rate limits,
   # shared breaker votes, auth-cache L2, invalidation stream) nor
@@ -142,13 +155,642 @@ jobs:
       - name: Build workspace (optional features)
         run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
 
+      # ORDER MATTERS: keep this step BEFORE the full suite. A step that follows a
+      # failing one never executes, which would make this automated guard for the
+      # known listener limitation a no-op while claiming otherwise. That was not
+      # hypothetical when the rule was written — the suite WAS red on two `admin_api`
+      # tests (decision item D-2, asserting a flat 200 against a documented tri-state
+      # endpoint). D-2 was resolved on 2026-09-30 (the tests now assert the documented
+      # `200 applied` / `202 pending` / `503 unavailable` mapping, see plan §2bn), so
+      # the suite is green — but the ordering stays: the guard must not depend on the
+      # suite passing to run. The ignored test needs no service (it binds two
+      # ephemeral ports), and the ClickHouse-dependent ignored tests live in
+      # `live-deps`.
+      - name: Ignored test that needs no service (listener limitation)
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test boot_listeners -- --ignored
+
       - name: Test hydra-server (optional features)
         run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse
+
+
+  # The feature combinations that NO other job compiles. Both were holes of the
+  # same shape the `optional-features` job above was added to close, and both are
+  # documented as supported builds:
+  #
+  #   * `tls-openssl` — the alternative downstream-TLS backend (design §12.1 allows
+  #     an OpenSSL derivative as well as BoringSSL), for hosts where the vendored
+  #     BoringSSL build is impractical. It cannot ride along with the other jobs
+  #     because `server` turns on `tls-boringssl` and the two are mutually exclusive.
+  #   * `proxy` WITHOUT any TLS backend — `crates/hydra-server/Cargo.toml` says this
+  #     "must build standalone". It did not: adding this very check found
+  #     `tests/metrics.rs` using `hydra_server::tls` behind a non-TLS gate (the whole
+  #     test binary failed to compile) and a test helper that was dead code without a
+  #     TLS backend (an ERROR under `-D warnings`). Both were fixed rather than
+  #     documented as broken.
+  #
+  # No Redis is needed: both steps only compile and lint.
+  alt-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No `apt-get` step: this does NOT use the system OpenSSL. `pingora-openssl`
+      # enables the `vendored` feature unconditionally
+      # (`pingora-openssl-0.8.1/Cargo.toml`, `openssl = { …, features =
+      # ["vendored"] }`), which pulls in `openssl-src` (see `Cargo.lock` and
+      # `cargo tree -e features`: `openssl-sys` → `openssl-src`), so the job
+      # COMPILES OpenSSL from source. A comment here used to claim the opposite
+      # system-OpenSSL story and installed `libssl-dev`/`pkg-config` for it —
+      # neither is used. What that build does need is `perl`, `make` and a C
+      # compiler, all present on the runner; the first run takes minutes and
+      # `Swatinem/rust-cache` caches the result. BoringSSL is still not built.
+      - name: Clippy (deny warnings, OpenSSL TLS backend)
+        run: cargo clippy --workspace --all-targets --features hydra-server/tls-openssl -- -D warnings
+
+      # Linking, not just lints — and since the `hydra` binary's
+      # `required-features` moved from `server` to `proxy`, these steps cover the
+      # BINARY as well: `main.rs` (and its `#[cfg(not(any(tls-*)))]` branches, which
+      # no job had ever compiled) is now part of them. Before that change the binary
+      # was silently SKIPPED here, so "proxy must build standalone" and "the OpenSSL
+      # backend links" were both unverified claims.
+      - name: Build workspace (OpenSSL TLS backend)
+        run: cargo build --workspace --features hydra-server/tls-openssl
+
+      - name: Clippy (deny warnings, proxy with NO TLS backend)
+        run: cargo clippy --workspace --all-targets --features hydra-server/proxy -- -D warnings
+
+      - name: The binary compiles with NO TLS backend (the documented standalone build)
+        run: cargo check -p hydra-server --features hydra-server/proxy --bin hydra
+
+  # The `#[ignore]`d tests are the ONLY end-to-end coverage for two things this
+  # repo has already got wrong: ClickHouse retry idempotency (a re-sent batch must
+  # not double-count usage/billing) and the aggregate read. No job ever passed
+  # `--ignored`, so both ran only on a developer's machine, via a gate script that
+  # is not even in version control.
+  #
+  # The ClickHouse container is initialised from OUR `environment/clickhouse/init.sql`
+  # and then ASSERTED: that file is what a fresh production instance is built from,
+  # and it was missing `non_replicated_deduplication_window` (the setting existed
+  # only as a comment) — so a brand-new deployment silently lost dedup while the
+  # local compose had it. This job is what makes "a fresh instance is protected" a
+  # checked fact instead of a claim.
+  live-deps:
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.3
+        ports:
+          - 8123:8123
+        # Same readiness command this repo's own compose uses for the same image
+        # (`environment/docker-compose.yml`: "clickhouse-client is bundled in the
+        # official image"). Verified inside a running 24.3 container: the image has
+        # `wget` and `clickhouse-client`, and NO `curl` — so the `curl` calls in the
+        # steps below must stay on the RUNNER (they do).
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1' || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start a real Redis for tests
+        run: |
+          set -euo pipefail
+          docker run -d --name hydra-test-redis -p 6379:6379 \
+            redis:7-alpine redis-server --save "" --appendonly no --databases 64
+          for _ in $(seq 1 30); do
+            if docker exec hydra-test-redis redis-cli ping >/dev/null 2>&1; then
+              echo "redis is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the test Redis did not become reachable"; exit 1
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create usage_record from environment/clickhouse/init.sql
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8123/ping >/dev/null; then break; fi
+            sleep 2
+          done
+          # Executing the file through the HTTP interface proves it is valid
+          # ClickHouse AND that this is the schema a fresh instance gets.
+          curl -sS --fail --data-binary @environment/clickhouse/init.sql http://127.0.0.1:8123/
+          curl -sS --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/
+
+      - name: A fresh instance must carry the ClickHouse dedup window
+        run: |
+          set -euo pipefail
+          ddl="$(curl -sS --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/)"
+          if ! printf '%s' "$ddl" | grep -q 'non_replicated_deduplication_window'; then
+            echo "::error::a fresh instance built from environment/clickhouse/init.sql has NO non_replicated_deduplication_window: insert_deduplication_token is accepted and SILENTLY IGNORED, so a re-sent batch double-counts usage/quota/billing"
+            printf '%s\n' "$ddl"
+            exit 1
+          fi
+
+      # Cluster HA, end to end: a standby forwards admin writes to the active node, the
+      # standby is promoted when the active dies, and an edge keeps serving across the
+      # switch and re-points its polling at the new active by itself. The drill shortens
+      # HYDRA_LEADER_LEASE_MS to 3s, so it runs in seconds instead of ~18s.
+      - name: Cluster HA (forwarding + failover + edge transparency)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_cluster_ha.py
+
+      # STARTUP KNOBS on the real binary — the two operator-facing promises that were prose
+      # only: `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster-role node**
+      # (round 191 measured `HYDRA_REDIS_MODE=clustr` booting as `single`, i.e. a topology switch
+      # silently ignored; round 194 measured the qualifier — on the single-node default the mode is
+      # not read at all, and K12 pins that boundary rather than the unqualified claim), and cluster
+      # wiring that a non-cluster role is not going to use must be named
+      # on EVERY path that reaches it — including `HYDRA_ROLE` unset, which round 192 measured
+      # as completely silent. Also pins that the documented `all` value is not reported as an
+      # unknown role, that a whitespace-padded role is still the role, and that the same legs
+      # stay SILENT on the documented single-node default (a rule that cannot stay quiet on
+      # correct input is noise).
+      - name: startup knobs (fail fast / name what is dropped)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_startup_knobs.py
+
+      # The tenant SDK against a REAL node and a REAL bus: `200 applied` (2/2 nodes),
+      # `202 pending` via wait=none, and `503 unavailable` when the bus is cut under a
+      # running edge (a dead Redis URL cannot produce that state — the node refuses to
+      # start). Its own 787-line suite runs against mocks only.
+      - name: Tenant SDK against a live cluster (applied / pending / unavailable)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_sdk_live.py --cluster
+
+      # The TypeScript SDK on the same bus, plus the CROSS-SDK parity leg: two
+      # implementations of one documented contract must report the same fleet state and
+      # the same node counts for the same node.
+      - name: Tenant TypeScript SDK against a live cluster (+ parity with the Python SDK)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cd tools/hydra-ts && npm install && npm run build && cd ../..
+          python3 integration/test_sdk_ts_live.py --cluster
+
+      # The Go SDK on the same bus, plus THREE-WAY parity: all three SDKs must agree
+      # about the same node's fleet state and node counts.
+      - name: Tenant Go SDK against a live cluster (+ three-way parity)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cd tools/hydra-ts && npm install && npm run build && cd ../..
+          python3 integration/test_sdk_go_live.py --cluster
+
+      # The TWO-LAYER auth verdict cache, measured with a counting auth upstream on a real
+      # cluster: L1 per node, L2 written to Redis (`1`/`0` + tenant index), **L2 SHARED** so
+      # the second node serves without re-asking, and a fleet invalidation that clears BOTH
+      # layers. This is the behaviour decision item D-9 is about.
+      - name: auth cache layers (L1 + shared Redis L2 + fleet clear)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_auth_cache_layers.py
+
+      # REPLICA FIDELITY: what a promoted/re-materialized replica must still know. Enabled limit
+      # roles, tenant access-token hashes and sub-tenant routes must all be present on the edge,
+      # survive its restart, and keep working after the leader dies. It also pins what
+      # `limit_role.matching_key` really compares against (the MASKED client key — a role written
+      # with the raw key never fires, and two keys with the same mask share one quota; the docs used
+      # to say "equal to the client api-key"), which is decision item D-15.
+      - name: replica fidelity (limit roles / token hashes / sub-tenants on an edge — 6380)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: python3 integration/test_replica_fidelity.py
+
+      # CLUSTER RATE LIMITS over Redis, on a real leader + edge and through a CUTTABLE relay:
+      # `ops.md` §12's "shared rate-limit counters" (a window filled by both nodes refuses on
+      # both, with distinct per-instance members), the shared TOKEN window, and §13.4's
+      # hard-coded fail-open under a Redis outage with its metric. The recovery leg is the
+      # reason this step exists: it caught a P1 — the pool was built with `policy: None`, so
+      # fred never re-dialled a severed connection and a ~2s Redis blip left the leader
+      # demoted and every limit failed open **permanently** (measured: zero reconnect
+      # attempts in 90s; fred logged `Has policy: false`).
+      - name: cluster rate limits (shared windows, fail-open, reconnect — 6380)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: python3 integration/test_cluster_limits.py
+
+      # The `#[ignore]`d ClickHouse suites: they need a LIVE ClickHouse (`CH_URL`) and Redis.
+      # ⚠️ This step's `- name:`/list marker went missing in an earlier uncommitted edit, which
+      # made its `env:`/`run:` collide with the step ABOVE (duplicate YAML mapping keys): GitHub
+      # rejects such a workflow, and even a tolerant parser would let the later `run:` override
+      # the earlier one — so BOTH the auth-cache drill and these ignored suites silently stopped
+      # running. Found 2026-09-30 by `check_ci_wiring.cjs` once its coverage predicate stopped
+      # accepting "its directory is mentioned somewhere".
+      - name: ClickHouse sink + usage query against a live instance (ignored tests)
+        env:
+          CH_URL: http://127.0.0.1:8123
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test clickhouse_sink --test usage_query -- --ignored
+
+  # The three SDKs are shipped artifacts with their own tests, and NO job ran
+  # them: the endpoints they call (a data-plane path that used to point at a
+  # DELETED admin route, with the wrong port) were fixed on the strength of tests
+  # nothing executed.
+  sdks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Go SDK tests
+        working-directory: tools/hydra-go
+        run: go test ./...
+
+      # `npm install`, not `npm ci`: this package has no lockfile committed, so
+      # `npm ci` fails immediately. (The suite also type-checks before running:
+      # `tsc -p tsconfig.test.json && node --test dist-test/test/client.test.js`.)
+      - name: TypeScript SDK tests
+        working-directory: tools/hydra-ts
+        run: npm install && npm test
+
+      - name: Python SDK tests
+        working-directory: tools/hydra-py
+        run: python3 -m unittest discover -s tests -v
+
+      # The admin CLI ships as a package (`hydra-admin`, `bin: hydra-admin`) and has
+      # its own typechecked test suite — which NOTHING ran until this step existed.
+      # It has a lockfile, so `npm ci` (not `npm install` like hydra-ts, which has none).
+      - name: Admin CLI tests
+        working-directory: tools/hydra-cli
+        run: npm ci && npm test
 
   # The admin UI, its i18n and the shell entry points have their own checks and
   # tests, and NOTHING ran them: `check_i18n.js` had already found two real
   # issues when it was written, and it would not have found a third (review C2).
   # No build step is involved — the UI is plain ES2017 loaded from disk.
+  # The black-box integration suites under `integration/` were never executed by
+  # anything: `integration/run.sh` needs Docker plus a prebuilt image AND hardcodes
+  # 8080/8081, so it cannot even run next to a dev stack. Both suites need only a
+  # binary and python3 — the CRUD one via the same disposable-instance script a human
+  # uses locally (`integration/run-crud-local.sh`), the proxy one self-orchestrated
+  # (it starts its own mocks and hydra, with env-overridable ports).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hydra
+        run: cargo build -p hydra-server --features server --bin hydra
+
+      - name: CRUD lifecycle suite (all 7 entities over real HTTP)
+        run: ./integration/run-crud-local.sh
+
+      # `HYDRA_TRUSTED_PROXIES` semantics: which address the per-IP auth-failure budget
+      # keys on (peer when unset/untrusted, the rightmost non-trusted XFF entry when the
+      # peer is allowlisted, and the PEER again under a 0.0.0.0/0 catch-all — where every
+      # client then shares one bucket). Needs no Redis.
+      - name: trusted-proxy keying
+        run: python3 integration/test_trusted_proxies.py
+
+      # The tenant API's three documented budgets: the authorised-request cap (which
+      # also counts requests the node then rejects), the lower invalidation cap, the
+      # Retry-After on a throttle, the failure-lockout isolation for valid tokens, and
+      # the 0-falls-back-to-default rule. Needs no Redis.
+      - name: tenant API rate limits
+        run: python3 integration/test_tenant_api_limits.py
+
+      # The per-provider admission queue: the saturation bound (queue_depth never exceeds
+      # max_queue_depth), the drop reasons, the gauges/counters, the passthrough opt-out,
+      # and the documented limitation that admission limits are NOT resized on hot-reload.
+      # Needs no Redis; the upstream is a slow in-process mock.
+      - name: admission queue (per-provider concurrency)
+        run: python3 integration/test_admission_queue.py
+
+      # The ops.md §1.4 backup/restore runbook, executed: the naive `cp` of a live WAL
+      # database silently loses rows, `VACUUM INTO` is complete and its snapshot serves
+      # traffic, a stale -wal left beside a REPLACED database makes the node refuse to
+      # start (`database disk image is malformed`) while deleting it fixes that, and a
+      # different master key is refused. Needs no Redis; uses in-process mock upstreams.
+      - name: backup / restore runbook
+        run: python3 integration/test_backup_restore.py
+
+      # The tenant Python SDK against a real node (its own suite is mock-only): the
+      # documented usage, `single_node`, the auth cache ACTUALLY being cleared, another
+      # tenant's token being refused, and the pre-2026-09-17 management path being gone.
+      - name: tenant SDK against a live node
+        run: python3 integration/test_sdk_live.py
+
+      # `hydra-admin` (the operator CLI) against a real node. Its own suite is a
+      # typechecked UNIT suite against a fake fetch, so the documented command surface,
+      # the documented env-var config and the README examples were unverified — and two
+      # of them were broken: `--max-concurrency null` sent "" (400 from the server) and
+      # `tenants auth-test <url>` silently listed tenants instead of probing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the admin CLI
+        working-directory: tools/hydra-cli
+        run: npm ci && npm run build
+
+      - name: admin CLI against a live node (every documented command)
+        run: python3 integration/test_cli_live.py
+
+      # The tenant TypeScript SDK against a real node — the same contract the Python SDK
+      # is checked against in round 80, implemented a second time. Its own suite is
+      # mock-only. (`npm install`, not `npm ci`: this package has no lockfile.)
+      - name: Build the TypeScript SDK
+        working-directory: tools/hydra-ts
+        run: npm install && npm run build
+
+      - name: tenant TypeScript SDK against a live node
+        run: python3 integration/test_sdk_ts_live.py
+
+      # The tenant Go SDK against a real node — the third implementation of the same
+      # contract. Its driver is compiled against the local SDK (`replace` in a sidecar
+      # go.mod), so the SDK is exercised as a consumer would.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: tenant Go SDK against a live node
+        run: python3 integration/test_sdk_go_live.py
+
+      # The EXTERNAL tenant contract (dev-docs/tenant-api-integration.md §4 + the appendix),
+      # executed against a real node: the nine routes, the 405-vs-404 method rule, the error
+      # envelope + trace header, identity-from-the-token-only, idempotency, and the
+      # documented parameter validation. Round 88 pinned the §6 code→HTTP table statically;
+      # this pins the behaviour. It immediately found one wrong example in §4.4.
+      - name: tenant API contract (routes, methods, envelope, idempotency)
+        run: python3 integration/test_tenant_api_contract.py
+
+      # §7's BOUNDARIES, black-box: a suspended tenant keeps the whole self-service API
+      # (the documented recovery path) while its client traffic is refused as 403
+      # `tenant_disabled`; a PREFIX in `api_keys` is a silent no-op (exactly as documented);
+      # there is no `tenant_id` query parameter; an empty window is `as_of: null`. It also
+      # pins the envelope DIFFERENCE the document now spells out (data plane: message+type,
+      # no code/trace_id; tenant API: code+message+trace_id).
+      - name: tenant API boundaries (§7)
+        run: python3 integration/test_tenant_api_boundaries.py
+
+      # The STREAMING path — the gap round 63 recorded ("the load test used a single JSON
+      # upstream, so real SSE was never measured"). §9.1 turns both failure modes into alert
+      # contracts, so this drill is the first time those two metrics were seen firing:
+      # incremental delivery (asserted on ARRIVAL TIMES, not on the body — a buffering proxy
+      # would pass a body comparison), a wedged stream cut at the idle bound with the client
+      # left truncated, an upstream that dies mid-answer, and metering of streamed requests.
+      - name: streaming path (SSE, idle bound, mid-stream death, metering)
+        run: python3 integration/test_streaming_path.py
+
+      # The circuit breaker's documented operator workflow: the dead-set (`GET
+      # /api/v1/breaker`), the §9.1 skip counter, traffic actually stopping, the documented
+      # `DELETE /api/v1/breaker/{id}` reset really reviving the provider, and `on_success`
+      # keeping a healthy provider out of the set.
+      - name: circuit breaker lifecycle (trip, skip, reset, recover)
+        run: python3 integration/test_breaker_lifecycle.py
+
+      # `limit_roles` ENFORCEMENT (entity CRUD was covered by the CLI drill): the count and
+      # token ceilings, the documented `Retry-After` on their 429, the
+      # most-restrictive-surviving-role rule, dimension scoping, soft-disable — and the
+      # measured evidence for D-11 (`matching_provider` can never match).
+      - name: limit_roles enforcement (count/token ceilings, Retry-After, D-11 evidence)
+        run: python3 integration/test_limit_roles_enforcement.py
+
+      # The data-plane model catalog (`GET /v1/models`): the documented PUBLIC read (with or
+      # without a key), the "a presented key never runs external auth, it only narrows" rule
+      # (asserted on a counting auth mock), the whitelist + online filter (measured as a
+      # transition when the provider trips), and the two different narrowing mechanisms
+      # (operator key-prefix binding vs a sub-tenant's per-model routes).
+      - name: data-plane model catalog (public, local, narrowing, online filter)
+        run: python3 integration/test_model_catalog.py
+
+      # Sub-tenant / key-prefix STEERING on the chat path: the sub-tenant's per-model routes,
+      # the documented fallback for a model it has no route for, the operator prefix binding
+      # winning over it, and §7.6.2's boundary — deleting or disabling a sub-tenant is NOT
+      # revocation (the key keeps working through the default pipeline). The serving provider
+      # is observable because the two mocks answer with different ids.
+      - name: sub-tenant / key-prefix steering
+        run: python3 integration/test_sub_tenant_steering.py
+
+      # The ClickHouse sink's WIRE format — what `HYDRA_CLICKHOUSE_URL` actually produces,
+      # which `ops.md` §1.1 documents and no test observed: the userinfo becoming
+      # `Authorization: Basic …`, the passthrough query string surviving verbatim, the row
+      # travelling as a MASKED `FORMAT JSONEachRow` BODY while the SQL rides `query=`, a
+      # path in the URL being trimmed rather than glued to the port (the 2026-09-30 fix),
+      # and a 500 from ClickHouse never breaking the client. It stands in a MOCK ClickHouse
+      # for the database, so it needs no live dependency — but it DOES need the sink
+      # compiled in, and this job's binary is built with `server` alone, so build the
+      # production feature set here (a `server`-only binary fails `build_sink` at startup
+      # for `HYDRA_USAGE_SINK=clickhouse`, which the drill reports as exit 2).
+      - name: ClickHouse sink wire format (mock ClickHouse, no live deps)
+        run: |
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_clickhouse_sink_wire.py
+
+      # A reload that FAILS: a provider row the loader rejects, written straight into SQLite (the
+      # admin write boundary refuses it, so this is what a hand-edited database or a restore
+      # produces). Pins the documented alert and the trap around it — the node keeps serving, the
+      # gauge flips to 1, every later admin write answers 2xx with NO runtime effect, each tenant
+      # view says `snapshot_stale: true`, and fixing the row + reloading recovers both the gauge
+      # and the pending write. Needs no service.
+      - name: config snapshot stale (a failing reload, and its recovery)
+        run: python3 integration/test_snapshot_stale.py
+
+      # The listener/SNI alert contract of `ops.md` §9.1, evaluated against a live scrape in all
+      # four configurations: no certs (all rows false), a STARTUP certificate with no TLS port
+      # (row 1 + the `certs_without_tls_port` misconfig), a TLS port with no cert (row 2 + the
+      # `tls_port_without_certs` misconfig), and the healthy pair (all rows false, plus an HTTPS
+      # request carrying the tenant's SNI that must answer 200). The planner runs once at startup,
+      # so each case starts on a database that already holds the certificate.
+      - name: listener signals (SNI alert rows + misconfig, all four shapes)
+        run: python3 integration/test_listener_signals.py
+
+      # The CLIENT hanging up mid-stream (the one direction of the streaming path nobody had
+      # measured): the gateway stops pulling from the upstream instead of draining a client-less
+      # answer, the request is still metered with the tokens already reported (and the row looks
+      # like a clean 200 — the store cannot show the truncation), the provider is NOT blamed
+      # (breaker stays empty) while the mid-stream counter does move — the documented disagreement
+      # between the metric and the breaker. Needs no service.
+      - name: client disconnect mid-stream (cancel + metering)
+        run: python3 integration/test_client_disconnect.py
+
+      # The two 1 MiB body caps and who DRAINS: the tenant API answers its `413 payload_too_large`
+      # after ~1 MiB (leaving the rest of the upload on the wire — the documented non-draining
+      # limitation) and a client that stops pushing when the response arrives still reads it,
+      # while the DATA plane drains the whole upload first and always lets the client read its
+      # `413 request_body_too_large`. Uses raw sockets (urllib cannot dribble a body).
+      - name: body cap draining (tenant API vs data plane)
+        run: python3 integration/test_body_cap_drain.py
+
+      # Usage-row LOSS accounting — the series that says "you are under-billing", which no
+      # operator document mentioned before this round. Pins: no false positives on a healthy sink;
+      # a dead backend still serves every request 200 while counting and WARNING (with the row's
+      # trace id) about each undeliverable row; the reason vocabulary and which reason actually
+      # fires first at the shipped defaults (~600 requests, `channel_full`); and that the counter
+      # stops growing once the backend recovers and the retained batch lands.
+      - name: usage drop accounting (under-billing signal)
+        run: python3 integration/test_usage_drop_accounting.py
+
+      # The AUTH hop against a dead route (the last hop without one): TEST-NET-1 as the black hole,
+      # so nothing on the network is contacted. Pins the documented 503
+      # `auth_upstream_unavailable` in bounded time, that the provider is never called, that the
+      # failure is attributed, that it is NOT cached (three requests in a row each pay the 2 s
+      # round-trip timeout — caching it would keep the tenant blocked for the deny TTL after
+      # recovery, which the falsification showed), the millisecond contrast for a REFUSED port,
+      # immediate recovery, and that `FailMode::Open` cannot be selected.
+      - name: auth hop (dead route, fail mode, no caching of an outage)
+        run: python3 integration/test_auth_hop_failmode.py
+
+      # Where the master key comes from: the inline BASE64 variable vs `HYDRA_ENCRYPTION_KEY_FILE`
+      # (RAW 32 bytes) — the asymmetry an operator gets wrong, and the one a Kubernetes secret
+      # volume exercises (the file ends with a newline). Pins that the two forms are the same
+      # keystream in BOTH directions, that the FILE wins when both are set, that only line endings
+      # are trimmed, and that every failure mode (unset, missing path, base64 in the file) refuses
+      # to start with a message that names what to change.
+      - name: master key sources (inline base64 vs raw key file)
+        run: python3 integration/test_master_key_sources.py
+
+      # MASTER-KEY ROTATION on the real binary — `ops.md` §3's one-shot maintenance switch, whose
+      # wiring decides whether a rotation succeeds or loses every provider credential. The library
+      # test (`crates/hydra-server/tests/key_rotation.rs`) never ran the switch an operator runs:
+      # this drill does the whole flow (seal under A, re-seal to B, start with B alone and still
+      # present the same decrypted key upstream, re-seal an already-current row, refuse the
+      # retired key, exit 1 and leave the row untouched when a row cannot be opened) AND pins the
+      # switch's own vocabulary — an unrecognised value used to make the node serve traffic
+      # normally, i.e. a typo silently skipped the rotation.
+      - name: master-key rotation (one-shot reseal, end to end)
+        run: python3 integration/test_key_rotation_live.py
+
+      # GRACEFUL SHUTDOWN (ops.md §13.5b's Kubernetes contract): a request in flight when
+      # SIGTERM arrives must still get a complete 200, the drain budget must be a real bound, the
+      # exit must be drain+5s, and — measured — NO listener accepts during the drain (no probe, no
+      # scrape, new traffic refused), which is why the docs now say to gate readiness BEFORE the
+      # signal. Also pins that a buffered usage row is persisted at shutdown. Needs no service.
+      - name: graceful shutdown drain (SIGTERM with a request in flight)
+        run: python3 integration/test_shutdown_drain.py
+
+      # The REQUEST BODY contract on the data plane — the gateway's own memory/availability
+      # surface (terminate-mode reads the whole body). `integration/` had no test for any of it:
+      # the hard cap AND its boundary (exactly-at-cap must pass), the TOTAL deadline on both the
+      # length-delimited and the chunked path, a truncated body failing CLOSED (measured: without
+      # that guard a valid-but-short body was answered 200 and forwarded to the provider), and the
+      # two other 1 MiB caps, which use DIFFERENT error codes (`request_body_too_large` for the
+      # admin API vs `payload_too_large` for the tenant API).
+      - name: request body contract (cap boundary, 408 deadline, truncation, 1 MiB caps)
+        run: python3 integration/test_request_body_contract.py
+
+      # The breaker's PROBE, i.e. the other half of "the provider left the rotation":
+      # design §8.4 promises a dead provider is probed every 10s and revived when it answers.
+      # Measured: a genuinely recovered provider comes back BY ITSELF in 9.5s (no traffic, no
+      # manual reset) — and a provider whose `/v1/models` answers 404 while its chat path is
+      # 100% broken is revived too (the blind spot §9.1 records, here measured as flap:
+      # trip → revive → trip). The 5xx leg is the opposite direction and is what keeps
+      # `ops.md` §6.3's "< 500 counts as healthy" honest.
+      - name: breaker probe revival (auto-revive, 404 blind spot, 5xx stays dead)
+        run: python3 integration/test_breaker_probe_revival.py
+
+      # What that dead route COSTS with the shipped defaults (10s connect bound / 30s
+      # first-byte: neither is overridden here), and whether the breaker stops it: ~10s per
+      # affected request, the provider leaves the rotation after exactly 5 consecutive
+      # failures (`hydra_candidate_skipped_total{reason="breaker_dead"}`), the penalties then
+      # stop, `DELETE /api/v1/breaker/{id}` is a real lever, and a tenant whose only provider is
+      # dead fails in bounded time instead of hanging. `test_breaker_lifecycle.py` cannot see
+      # any of this: it uses a CLOSED port, i.e. a failure that returns instantly.
+      - name: dead route cost + breaker trip (shipped defaults)
+        run: python3 integration/test_dead_route_cost.py
+
+      # An upstream whose CONNECT never completes (a dead route — TEST-NET-1 is used, so no
+      # real host is contacted). Measured 2026-09-30 before this drill's fix: the request
+      # burned the whole first-byte bound, was classified as a POST-send failure, and
+      # therefore did NOT fail over — `codes=[502,200,502,200,502,200]` over six requests with
+      # `retries=0`, while a healthy provider sat in the same candidate set. The connect bound
+      # (`HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS`, default 10s) turns it into a connect error,
+      # which is the one class `proxy.rs` proves "never reached the upstream" and fails over —
+      # while the CONTRAST leg keeps a connected-then-silent upstream a first-byte timeout with
+      # no failover (the documented double-billing policy). Needs no service.
+      - name: upstream connect bound (dead route fails over)
+        run: python3 integration/test_upstream_connect_bound.py
+
+      # The OTHER half of the ClickHouse transport: the tenant API's usage READER, i.e.
+      # `GET /tenant/{tid}/api/v1/usage` in a cluster deployment (`tenant-api-integration.md`
+      # §5.3). The facts §5.3 documents were measured once by hand and pinned only by
+      # `#[ignore]`d tests needing a live database; this drill observes the reader's wire
+      # behaviour with a mock store: the measured string-encoded counters decoding to real
+      # numbers instead of a zeroed window, the tenant id and window travelling as BOUND
+      # `param_*` values, grouped reads as a SECOND query, the empty-window `""` -> `as_of:
+      # null`, and every unreadable-store shape (shape drift, non-JSON, 5xx, past-the-cap)
+      # becoming a 503 attributed in `hydra_tenant_api_usage_query_total{result=…}` rather
+      # than a zeroed 200. Same mock-only property and same feature requirement as above,
+      # so it rides the binary that step just built.
+      - name: tenant usage read over ClickHouse (mock store, no live deps)
+        run: python3 integration/test_usage_query_wire.py
+
+      - name: Proxy E2E suite (mock auth + mock LLM + failover path)
+        run: python3 integration/e2e_proxy_test.py
+
+      # Pure-helper tests for the error-contract probe itself (it reported ~150
+      # "violations" on its first run, all four causes being its own bugs).
+      - name: error-contract probe tests
+        run: python3 integration/test_error_contract.py
+
+      # The documented zero-downtime upgrade (`ops.md` §2): SIGQUIT the old process,
+      # start the new one with `-u`, and assert a client hammering the data port sees
+      # ZERO refused connections across the switch and that the port is still served
+      # after the old process exits.
+      - name: zero-downtime upgrade handover
+        run: bash scripts/handover.test.sh
+
+      # `ops.md` §3.1's hot certificate rotation + per-SNI multi-tenancy: a PUT must
+      # make a new cert live without a restart, an already-open session must keep the
+      # old one, and an SNI with no tenant must be refused without wedging the listener.
+      - name: certificate hot-reload + SNI
+        run: python3 integration/test_cert_reload.py
+
   scripts:
     runs-on: ubuntu-latest
     steps:
@@ -164,8 +806,240 @@ jobs:
       - name: i18n checker tests
         run: node --test scripts/check_i18n.test.cjs
 
+      # UI render logic that needs neither a browser nor a seeded instance: the
+      # admin-ui scripts run in a `vm` context with a small DOM stub, so behaviours
+      # that were asserted ONLY by the Playwright job are checked here as well — and
+      # on any machine where Playwright cannot run at all.
+      - name: admin-ui render tests (no browser)
+        run: node --test scripts/admin_ui_render.test.cjs
+
+      # The Playwright suite is the only coverage for several behaviours and it
+      # needs a browser plus a seeded instance, so a selector/nav-key typo in a
+      # spec survives review and only shows up as a red (or silently vacuous) CI
+      # run. This checks the specs' selectors against the admin-ui sources.
+      - name: e2e selector contracts (static)
+        run: node scripts/check_e2e_contracts.cjs
+
+      - name: e2e contract checker tests
+        run: node --test scripts/check_e2e_contracts.test.cjs
+
+      # A case appended AFTER a suite's top-level `process.exit` never runs while the suite still
+      # prints PASS — it happened twice in this repository (rounds 132 and 137) and was caught by
+      # accident both times.
+      - name: no test cases after a top-level exit
+        run: node scripts/check_test_tails.cjs
+
+      - name: test-tail checker tests
+        run: node --test scripts/check_test_tails.test.cjs
+
+      # A gate entry must not depend on what another entry happened to build: measured
+      # 2026-09-30, two entries inherited the binary built above them and a parallel
+      # `check_public_claims --measure` (`cargo test -p hydra-server --features server`) relinked
+      # it WITHOUT the cluster features — the gate read RED for a reason unrelated to the code.
+      - name: gate entries build what they run
+        run: node scripts/check_gate_entries.cjs
+
+      - name: gate-entry checker tests
+        run: node --test scripts/check_gate_entries.test.cjs
+
+      # The public-claims checker is exercised in the `check` job (against real
+      # suite transcripts); its own test suite runs here with the other JS suites.
+      - name: public claims checker tests
+        run: node --test scripts/check_public_claims.test.cjs
+
+      # docs/index.html advertises "no unwrap / panic / unsafe in production
+      # code" and nothing enforced it. This scans `crates/*/src` outside
+      # `#[cfg(test)]` items (both gating forms) and also asserts every crate
+      # ROOT — `src/lib.rs` and each `[[bin]]` — carries #![forbid(unsafe_code)].
+      - name: production purity (the public claim)
+        run: node scripts/check_source_purity.cjs
+
+      - name: purity checker tests
+        run: node --test scripts/check_source_purity.test.cjs
+
+      # The operator runbook's config table is a promise: every variable it lists
+      # must be read by something. It listed a `HYDRA_LOG` alias that no code has
+      # ever read (verified at runtime: HYDRA_LOG=debug logs 0 lines).
+      - name: documented env vars are wired (ops.md table)
+        run: node scripts/check_documented_env.cjs
+
+      - name: documented env checker tests
+        run: node --test scripts/check_documented_env.test.cjs
+
+      # ...and the VALUE matters as much as the name: the table's defaults are what an
+      # operator sizes `terminationGracePeriodSeconds`, timeouts and memory from. Every
+      # number in it was hand-written and nothing compared it to the code until now
+      # (18 of them are now compared; the rest are non-numeric — unset, host:port, roles
+      # — and are REPORTED as unverified rather than passed).
+      - name: documented defaults match the code (ops.md table)
+        run: node scripts/check_documented_defaults.cjs
+
+      - name: documented default checker tests
+        run: node --test scripts/check_documented_defaults.test.cjs
+
+      # The §9.1 alert table is the contract the operations repository's rules are written
+      # against, and it says so itself: "every expression uses a metric name and label that
+      # really exists in this codebase". A typo there is a rule that can never fire — a
+      # monitoring hole nobody notices until the incident.
+      - name: alert expressions reference real metrics/labels (§9.1)
+        run: node scripts/check_alert_expressions.cjs
+
+      - name: alert expression checker tests
+        run: node --test scripts/check_alert_expressions.test.cjs
+
+      # Every metric name the OPERATOR docs mention must exist in the code: a documented series
+      # that does not exist is a dashboard panel or an alert rule that can never resolve, and the
+      # prose around §9.1's table (the "Key series" list, cluster.md's metric table) was unguarded.
+      # The scan understands all three registration shapes the tree uses — including a name held in
+      # a CONSTANT, which a hand audit of the same docs got wrong (`hydra_sni_host_mismatch_total`
+      # is registered that way and was reported as missing).
+      - name: documented metric names exist in code
+        run: node scripts/check_documented_metrics.cjs
+
+      - name: documented metric guard tests
+        run: node --test scripts/check_documented_metrics.test.cjs
+
+      # Every fred `Pool::new` must go through the single owner in `redis/mod.rs`, with a
+      # non-`None` reconnect policy. Measured 2026-09-30: FOUR of this tree's five call sites
+      # passed fred's defaults — `default_command_timeout = 0` (wait forever) and no reconnect
+      # policy at all — including the lib-test harness, so the tests exercised a different
+      # program than the one that ships (the missing policy was the P1 of round 99).
+      - name: fred pool has one owner (no default-config pools)
+        run: node scripts/check_redis_pool.cjs
+
+      - name: fred pool guard tests
+        run: node --test scripts/check_redis_pool.test.cjs
+
+      # `CLUSTER_ONLY_ENV` (in `cluster/mod.rs`) is the single owner of "what counts as cluster
+      # wiring", and the fallback ERROR prints the set ones when a node has cluster wiring
+      # configured but is not a cluster node. Round 193 measured the defect: the list was three
+      # literals while `HYDRA_NODE_ID`, `HYDRA_CONTROL_POLL_MS`, `HYDRA_REDIS_MODE`,
+      # `HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS` and
+      # `HYDRA_FORWARD_TIMEOUT_SECS` were configured, dropped and never mentioned. The guard checks
+      # three directions: every literal read under `src/cluster/` is listed or recorded (ANY name,
+      # not just `HYDRA_*` — the first version's prefix filter hid `HOSTNAME`), every non-literal
+      # read is a recorded decision, and every listed name has a reader. The drill's K10 asserts the
+      # wire behaviour.
+      - name: cluster-only env table (complete + no invisible reads + every name earned)
+        run: node scripts/check_cluster_env.cjs
+
+      - name: cluster-only env guard tests
+        run: node --test scripts/check_cluster_env.test.cjs
+
+      # The tenant API's §6 error table is the EXTERNAL contract: integrators key retry
+      # logic on `code` + HTTP (429 ⇒ wait for Retry-After, 503 no_leader ⇒ switch node,
+      # 504 forward_result_unknown ⇒ re-read first). A row that drifts from the code breaks
+      # every client that followed the document, and nothing else fails.
+      - name: tenant API error table matches the emitted statuses
+        run: node scripts/check_tenant_error_codes.cjs
+
+      - name: tenant error-code checker tests
+        run: node --test scripts/check_tenant_error_codes.test.cjs
+
+      # A hydra container must be allowed to finish its ~25s shutdown drain:
+      # Docker's default grace is 10s (SIGTERM, then SIGKILL), and a SIGKILLed
+      # drain loses buffered usage (measured: 20 requests -> 0 rows). The
+      # threshold is read from main.rs, so raising the drain default raises it too.
+      - name: compose stop grace covers the drain (all hydra services)
+        run: node scripts/check_compose_grace.cjs
+
+      - name: compose grace checker tests
+        run: node --test scripts/check_compose_grace.test.cjs
+
+      # The text reader both compose guards fall back to when `docker compose config`
+      # cannot render a file: in CI the LOCAL stack always hits that path (its
+      # gitignored env_file is absent), so the fallback is what actually checks
+      # hydra-a/b/c there.
+      - name: compose static reader tests
+        run: node --test scripts/compose_static.test.cjs
+
+      # Every hydra service must be supervised by a healthcheck that suits its ROLE:
+      # the official cluster topology had none at all, and an edge answers /healthz
+      # (200, token-free) but 404 for /api/v1/health — so a control-node probe copied
+      # onto an edge would report every healthy edge unhealthy.
+      - name: compose healthchecks match the node role
+        run: node scripts/check_compose_health.cjs
+
+      - name: compose health checker tests
+        run: node --test scripts/check_compose_health.test.cjs
+
+      # The repository has repeatedly shipped a test/checker that no job ever ran
+      # (`#[ignore]`d tests in round 15, three SDK suites with no job, a checker
+      # added without a step). This asserts every artifact has a runner.
+      - name: test wiring (everything is executed)
+        run: node scripts/check_ci_wiring.cjs
+
+      - name: test wiring checker tests
+        run: node --test scripts/check_ci_wiring.test.cjs
+
+      # The shared JS masker blanks comments and literal contents for the guards that must not be fooled
+      # by strings. Measured round 176: a backtick inside a REGEX literal opened a template that never
+      # closed, blanking 74% of `check_redis_pool.test.cjs`, reporting a VALID file as `unterminated`,
+      # and hiding its `process.exit(` from `check_test_tails` — a guard blinded by its own masker.
+      - name: shared JS masker tests (regex/backtick desync)
+        run: node --test scripts/js_blank.test.cjs
+
+      # The shared RUST blanker SEVEN guards depend on. It had no dedicated suite: one incidental case
+      # in `check_source_purity.test.cjs` was all the direct coverage, while its own header records
+      # three separately-measured bugs. A silent over-blank here turns a guard into a rubber stamp.
+      - name: shared Rust blanker tests (comments/literals/test items)
+        run: node --test scripts/rust_blank.test.cjs
+
+      # The tree manifest is what lets a gate verdict be tied to a revision: a CODE change during a run
+      # means the earlier entries judged a revision that no longer exists (rounds 178-179).
+      - name: tree manifest tests (code change vs docs-only)
+        run: node --test scripts/tree_manifest.test.cjs
+
+      # The shared algebra behind five guards' recorded-exception lists (replace-not-merge, unrecorded
+      # ⇒ finding, stale ⇒ finding). Each obligation was learned by a guard turning red for the wrong
+      # reason, so they are pinned in one place instead of five.
+      - name: recorded-exception algebra tests
+        run: node --test scripts/recorded_exceptions.test.cjs
+
       - name: "Shell checks: LLM_API_KEY required, no request when unset (ask_llm)"
         run: bash scripts/ask_llm.test.sh
+
+      # The load harness (`scripts/load_test.sh`) is a MEASUREMENT tool: its full run needs a live
+      # node and a concurrent echo upstream, so it stays manual. Its deterministic half — the SWRR
+      # distribution judge exercised on four known inputs — is reachable without any of that
+      # (`SELFTEST_ONLY=1`), and this step is what keeps that judge honest in CI. Before it existed,
+      # the four cases had only been checked by hand (round 6: extracted and called directly), and
+      # the script was executed by NO job and NO gate entry.
+      - name: "Load harness: distribution-judge self-check (no instance needed)"
+        run: SELFTEST_ONLY=1 bash scripts/load_test.sh
+
+      # The compose files are production deployment artifacts and NOTHING
+      # validated them: a YAML typo, a bad interpolation or a port-mapping mistake
+      # would only surface on an operator's machine. `config -q` resolves every
+      # file without starting anything. Dummy secrets satisfy the `${VAR:?}`
+      # requirements (they are only checked for PRESENCE here, which is the point:
+      # the files refuse to render without them).
+      - name: Validate the compose files
+        env:
+          HYDRA_ADMIN_TOKEN: dummy-admin-token-for-validation
+          HYDRA_CLUSTER_TOKEN: dummy-cluster-token-for-validation
+          HYDRA_ENCRYPTION_KEY: ZHVtbXkta2V5LWZvci12YWxpZGF0aW9uLW9ubHkAMDE=
+        run: |
+          set -euo pipefail
+          # The two OFFICIAL stacks are deliverables and are always validated.
+          for f in environment/docker-compose.yml environment/docker-compose.cluster.yml; do
+            echo "==> $f"
+            docker compose -f "$f" config -q
+          done
+          # The LOCAL stack CANNOT be validated on a clean checkout: it declares
+          # `env_file: [../secure/local-test.env]`, and `secure/` is gitignored
+          # because a real upstream api-key lives there. `docker compose config`
+          # exits non-zero for a missing env_file (measured: exit 1, "env file
+          # ... not found"), so listing it here unconditionally made this job RED
+          # on every clean CI run — the "all three files VALID" result came from a
+          # developer machine that happens to have the untracked file. Validate it
+          # when present, and say so loudly when not.
+          if [ -f secure/local-test.env ]; then
+            echo "==> environment/docker-compose.local.yml"
+            docker compose -f environment/docker-compose.local.yml config -q
+          else
+            echo "SKIP environment/docker-compose.local.yml: secure/local-test.env is not in the checkout (it is gitignored), and compose refuses to render a missing env_file"
+          fi
 
   # Real-browser UI gate. The Rust suites cannot see the admin UI: the
   # `invalidateFK` regression ("the write landed and the UI still reported a
