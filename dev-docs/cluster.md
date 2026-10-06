@@ -59,6 +59,20 @@
 
 ## 3. 共享状态（一个 Redis，七个用途）
 
+> **控制面权威 = Arachne；Redis 只承载数据面的近似状态**（ADR-0001，2026-10-05）。
+> 本节以下的表格与行为描述里，**leader 租约 / 节点注册表 / 配置快照 HTTP 推送**这三项已由 raft 领导权
+> 与 Arachne 键路径配置树取代，属于**已退役**的机制；Redis 剩下的四项（共享限流 / 熔断投票 / 认证缓存 L2 /
+> 失效总线）仍然是它的职责，D-1 明确「不搬」。
+>
+> | 子系统 | 现在由谁承载 |
+> |---|---|
+> | leader 身份 | **raft 领导权**（`ArachneControl` 的写探测回答「本节点能否提交」） |
+> | 配置权威 | **Arachne `ctl/head` 内容哈希**（每节点各自物化，见 `dev-docs/aegis/plans/2026-10-05-arachne-control-plane.md`） |
+> | 共享限流 / 熔断 / 认证 L2 / 失效总线 | **Redis**（不变） |
+>
+> 本节其余内容作为**历史与数据面细节**保留；控制面部分在 T4.3 基线同步时逐条改写。
+
+
 | 子系统 | Key | 说明 |
 |---|---|---|
 | leader 租约 | `hydra:{lease:leader}` | `SET NX PX` + Lua 原子续约（只续自己的） |
@@ -83,11 +97,11 @@
 
 | 子系统 | Redis 宕机行为 |
 |---|---|
-| 配置快照 | 暂停更新（快照走 leader HTTP） |
+| 配置快照 | ~~暂停更新（快照走 leader HTTP）~~ 已退役：配置走 Arachne，失 quorum 时各节点继续用本地已物化状态服务（ADR-0001 验收 5） |
 | 限流 | fail-open（**硬编码，NOT configurable**：`HYDRA_RATE_LIMIT_FAIL_MODE` 从未实现 —— `grep -rn RATE_LIMIT_FAIL_MODE crates/` 为空）+ 告警指标（`hydra_control_poll_total{result="rate_limit_error"}`） |
 | 熔断 | 退回本地 trip（投票不同步，本地死集仍生效） |
 | 认证 L2 | 退回纯 L1（失效传播暂停，条目按 TTL 过期） |
-| 选举 | 续约失败 → **立即降级停写**（fail-closed）；无切换直至 Redis 恢复 |
+| 选举 | ~~续约失败 → 立即降级停写~~ 已退役：领导权来自 raft，与 Redis 无关；Redis 断连只影响上面四项数据面状态 |
 
 > **2026-09-30 实测修正（P1，已修）**：上表最后一行原先并不成立。连接池是用
 > `Pool::new(…, policy: None, …)` 建的 —— **fred 根本没有重连策略**（策略不是 `Config` 的字段，

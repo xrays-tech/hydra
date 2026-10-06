@@ -740,6 +740,34 @@ Plan Pressure Test:
 
 **②（无 leader 窗口写 503）的诚实边界**：这条现在由「无 quorum ⇒ 发布失败 ⇒ NotPublished」覆盖，走的是**同一条** 503 映射；"杀掉在任 leader 然后抢窗口"那种版本**没有**写成用例（时序脆弱），没有做的原因写在这里而不是含糊过去。
 
+#### T3.4 实现记录（2026-10-05）——一条反证、两条**无法执行**
+
+**① 边界 grep（D-1 是否被破坏）：零命中。**
+
+```
+grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy/ \
+                     crates/hydra-server/src/tenant_api/ crates/hydra-server/src/sink.rs
+⇒ 0
+```
+
+即：数据面热路径（限流/熔断/认证 L2/失效总线/用量 sink）**没有任何一处**引用控制面。这是 D-1「只换控制面」的直接证据。
+
+**② 三套数据面集成套件：1 套真跑并 PASS，另外 2 套对本模型**无法执行**（如实记账）。**
+
+用**当前源码**构建的二进制（`cargo build --features "server,cluster-redis,usage-clickhouse"`，debug）实跑：
+
+| 套件 | 结果 |
+| --- | --- |
+| `integration/test_breaker_lifecycle.py` | **PASSED**（B1–B5：死集进出、§9.1 skip 计数、路由被跳过、DELETE 复位真的恢复、成功复位）。它不使用任何已退役变量 |
+| `integration/test_cluster_limits.py` | **CANNOT VERIFY**（exit 2）。它用 `HYDRA_ROLE=leader` + `edge`、`HYDRA_CONTROL_URL`、`HYDRA_PUBLIC_URL`、`HYDRA_LEADER_LEASE_MS`、`HYDRA_CONTROL_POLL_MS` 起两个节点 —— **全是已退役的租约世界变量**。节点自己的日志把话说清了：`cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set; this node is standalone — the wiring listed in ignored is NOT used`，于是 `/healthz/leader` 拿不到租约，套件按其自带守卫报 CANNOT VERIFY |
+| `integration/test_auth_cache_layers.py` | 同上，**CANNOT VERIFY**（同一条日志、同一个原因） |
+
+**要点**：这两套**不会假绿**——它们自带 `CANNOT VERIFY` 守卫（exit 2），这正是它们该有的行为。但计划里「三套全绿」这条验收**在本模型下不成立**，原因是测试脚本本身描述的是已退役的拓扑，不是实现回归。
+
+**要做的后续（属 T4.3 基线同步，不是 T3.4）**：把这两套脚本从「leader/edge + 控制面 HTTP」改成「同构 raft 成员 + `HYDRA_CLUSTER_PEERS`」——它们是**数据面**的验证（共享限流窗口、L1/L2 分层、失效总线），价值仍在，只是拓扑描述过时了。在改好之前，②这条验收应记作**未完成**，不得引用为「已通过」。
+
+**③ 基线**：`dev-docs/cluster.md` §3 顶部加了「控制面权威 = Arachne；Redis 只承载数据面近似状态」的说明与三行归属表，并把该节的「配置快照 / 选举」两行标注为已退役（其余逐条改写留 T4.3）。
+
 ### Phase 4 — 同构收口、退役与验收
 
 **T4.0 节点同构收口（删除 edge 分支）**
