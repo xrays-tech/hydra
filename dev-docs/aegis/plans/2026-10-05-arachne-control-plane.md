@@ -908,6 +908,20 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 名字移入 `RETIRED_CLUSTER_ENV`（9→**10**），`CLUSTER_ONLY_ENV` 7→**6**；因此**仍设着它的部署会在启动时被点名**。守卫同步：`check_cluster_env`（表由源码派生，自动跟随）、`check_compose_env`（**它在改清单之前就把两处强制项抓了出来**——本轮新增的守卫第一次替后续改动工作）、`check_documented_env`（记为 prose-only）、`check_documented_defaults`（**删掉条目本身**：表里已经没有这一行，记录随之失效，这正是那套 algebra 要求的）。演练同步：四个绿演练不再设置它；`test_startup_knobs.py` 的 **K6/K11 现在把 `HYDRA_CLUSTER_TOKEN` 一起断言**（它是"最可能被旧清单留下"的退役名），K5 改为对所有 `RETIRED` 名断言。
 **结果**：集群部署只剩 `HYDRA_ADMIN_TOKEN` 一个 token。
 
+### 决定 5（2026-10-05 用户裁定「乙」）：旧拓扑的 CI 演练——前提消失的退役，其余移植
+
+扫描**所有** CI 接线的演练后发现四条仍在 leader/edge 时代（此前我逐个跑的是守卫与**我改过的**演练，四条都在 `integration`/`sdks` 作业里红着——这是我上一轮"全部绿"的诚实更正）：
+
+| 演练 | 之前 | 处置 |
+|---|---|---|
+| `test_replica_fidelity.py`（709 行） | **崩溃** `UnboundLocalError: standby`；驱动 edge 角色 + 快照通道 + 已删除的 `GET /api/v1/internal/control` | **退役**（连同 CI 步骤；CI 步骤处写明覆盖搬到哪：`tests/arachne_derivation_fidelity.rs`、`tests/arachne_cert_fidelity.rs`、`tests/arachne_three_nodes.rs` + 验收 gate 4、D-15 的 mask 语义归 `test_limit_roles_enforcement.py`）。**确实不再覆盖的一项**：节点在重启中"从树重建本地库"——已如实记录，不假装有 |
+| `test_cluster_limits.py`（719 行） | CANNOT VERIFY（等一个不存在的租约） | **移植**：两成员启动（第三个只在成员表里）、不再用退役变量、**bring-up 顺序改了**（新模型下一个从未被认领的目录要多数派同时在 ⇒ "先起 leader 再起 edge"必然超时）；**删掉一条腿**：它比较另一节点的 `hydra_control_snapshot_version`，而该序列已随轮询客户端退役（正是那三条告警永远打不响的序列之一），没有任何东西替代它的"每节点数字"地位。"该节点持有整份配置"仍由它上面那条腿证明（用无条件 deny 角色做探针）。**19 条断言全 PASS** |
+| `test_auth_cache_layers.py`（454 行） | CANNOT VERIFY | **移植**（另一）：三成员**全部**启动——因为失效屏障的舰队视图**就是静态成员表**，少一台就永远 `202 pending`（实测）。移植中发现并修掉一个**产品缺陷（见下）**。**全 PASS** |
+| `test_key_rotation_live.py` | K7 红 | **K7 退役**：它钉的是「edge 节点没有本地库 ⇒ 拒绝 reseal」，而 `edge` 退役后**任何配置都造不出没有本地库的节点**（`main.rs` 是 `let pool = if false { None } else { … }`）。退役理由写在原位；**覆盖 K1–K6/K8 不动，全 PASS** |
+| 三个 SDK 演练 | 绿，但设着 5 个退役变量（每次启动多一条 ERROR） | 清掉（拓扑本来只需"一个在服务的节点"） |
+
+**移植中抓到的产品缺陷（已修）**：T4.1 删注册表时，`main.rs` 里那个"刷新一次、同时喂两处"的任务被拆掉，替代品（成员表）**只接到了 admin 状态**，`TenantApiConfig::live_nodes` 从此一直是 `None`。后果：**租户自助** `DELETE /tenant/{id}/api/v1/auth/cache` 的收敛屏障拿到**空舰队** ⇒ 永远 `nodes_total: 0` + `pending`，而且 `lagging` 也是空的（租户连"谁没跟上"都看不到）；**admin 那条路不受影响**，所以两个入口对同一屏障报出不同答案，而只有安静的那个坏了。修法：把同一个 view 也交给租户 API（3 行）。由 `test_auth_cache_layers.py` 的 PREMISE 腿（要求舰队报告为 `applied`）在移植时抓出。
+
 ### 本轮新发现（尚未处理，登记在案）
 
 * **一个集群节点无法单独启动：新数据目录必须由多数派先"认领"**。`await_cluster_preflight` 的

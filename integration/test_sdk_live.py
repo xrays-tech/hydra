@@ -433,16 +433,15 @@ def leg_cluster():
         return 2
     announce("redis for the cluster leg", f"{redis_db} ({flush_note})")
     common = {
-        "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN, "HYDRA_REDIS_MODE": "single",
-        "HYDRA_LEADER_LEASE_MS": "3000", "HYDRA_CONTROL_POLL_MS": "250",
+        "HYDRA_REDIS_MODE": "single",
         "HYDRA_USAGE_SINK": "clickhouse", "HYDRA_CLICKHOUSE_URL": "http://127.0.0.1:18999",
     }
+    # "cluster-live" is a plain SINGLE-NODE instance now: the role variables it used to carry are
+    # retired, and the SDK legs below only need a node serving plus the `single_node` fleet answer.
+    # The second instance ("cluster-deadredis") exists to answer with a DEAD Redis, which is a
+    # data-plane property and still worth pinning.
     live = start(ADMIN_C, DATA_C, "cluster-live", dict(common, **{
-        "HYDRA_ROLE": "leader", "HYDRA_NODE_ID": "sdk-live-a",
-        "HYDRA_REDIS_URL": redis_db, "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_C}",
-        # the leader refuses to start without it (the standby sync target is its own
-        # control endpoint when it IS the active leader)
-        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
+        "HYDRA_NODE_ID": "sdk-live-a", "HYDRA_REDIS_URL": redis_db,
     }))
     host, port = redis_endpoint()
     relay = RedisRelay(host, port)
@@ -450,9 +449,8 @@ def leg_cluster():
     relay_url = f"redis://127.0.0.1:{relay_port}/{REDIS_DB}"
     announce("the edge's bus goes through a TCP relay", f"{relay_url} -> {host}:{port}")
     dead = start(ADMIN_X, DATA_X, "cluster-deadredis", dict(common, **{
-        "HYDRA_ROLE": "edge", "HYDRA_NODE_ID": "sdk-live-edge",
-        "HYDRA_REDIS_URL": relay_url, "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
-        "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_X}",
+        "HYDRA_NODE_ID": "sdk-live-edge",
+        "HYDRA_REDIS_URL": relay_url,
     }))
     try:
         if not wait_healthy(ADMIN_C):

@@ -427,16 +427,23 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
           python3 integration/test_auth_cache_layers.py
 
-      # REPLICA FIDELITY: what a promoted/re-materialized replica must still know. Enabled limit
-      # roles, tenant access-token hashes and sub-tenant routes must all be present on the edge,
-      # survive its restart, and keep working after the leader dies. It also pins what
-      # `limit_role.matching_key` really compares against (the MASKED client key — a role written
-      # with the raw key never fires, and two keys with the same mask share one quota; the docs used
-      # to say "equal to the client api-key"), which is decision item D-15.
-      - name: replica fidelity (limit roles / token hashes / sub-tenants on an edge — 6380)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: python3 integration/test_replica_fidelity.py
+      # REPLICA FIDELITY is RETIRED (2026-10-05), in the same class as `test_cluster_ha.py`: its
+      # subject was a node WITHOUT a local database ("does a promoted edge serve exactly what the
+      # leader was serving?"), proved by pushing a `SnapshotWire` over
+      # `GET /api/v1/internal/control`. ADR-0001 deleted all three: the edge role, the snapshot
+      # channel, and the internal endpoint (T4.1), so the drill could only crash
+      # (`UnboundLocalError: standby`). Its COVERAGE is not gone — it moved:
+      #   * "a node rebuilds the same tables byte-for-byte" →
+      #     `crates/hydra-server/tests/arachne_derivation_fidelity.rs` +
+      #     `tests/arachne_cert_fidelity.rs` (in-process, no cluster needed);
+      #   * "three real nodes agree on one config, and a node can rebuild itself from the tree" →
+      #     `tests/arachne_three_nodes.rs` +
+      #     `integration/test_arachne_control_plane.py` gate 4 (converged content);
+      #   * "the MASKED client key is what `limit_role.matching_key` compares" (decision D-15) →
+      #     `integration/test_limit_roles_enforcement.py`, which is where the mask semantics are
+      #     pinned now (measured: it still passes).
+      # What is genuinely NOT covered any more: a node whose local database was REBUILT from the
+      # tree under a restart. That is recorded in the plan's T4.3 notes rather than left implied.
 
       # CLUSTER RATE LIMITS over Redis, on a real leader + edge and through a CUTTABLE relay:
       # `ops.md` §12's "shared rate-limit counters" (a window filled by both nodes refuses on

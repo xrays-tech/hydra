@@ -363,25 +363,23 @@ def main():
           rc6 == 1 and "failed=2" in report6 and "already_current=0" in report6,
           f"exit={rc6} :: {report6}")
 
-    # ---- K7/K8: the two ways the SWITCH itself can be wrong -------------------
-    # K7: the documented "needs a local database (this is an edge node)" refusal.
-    env7 = base_env(**{"HYDRA_ENCRYPTION_KEY": KEY_B, "HYDRA_ENCRYPTION_KEY_VERSION": "2",
-                       "HYDRA_RESEAL_SECRETS": "1", "HYDRA_ROLE": "edge",
-                       "HYDRA_CLUSTER_TOKEN": "cluster-token-for-edge-probe",
-                       # The edge role validates its control endpoint BEFORE the reseal switch
-                       # (measured: without this, the refusal is about HYDRA_CONTROL_URL, not
-                       # about the missing local database).
-                       "HYDRA_CONTROL_URL": "http://127.0.0.1:9",
-                       "HYDRA_REDIS_URL": "redis://127.0.0.1:6380/9",
-                       # ...and the cluster sink requirement, which is validated even earlier.
-                       "HYDRA_USAGE_SINK": "clickhouse",
-                       "HYDRA_CLICKHOUSE_URL": "http://127.0.0.1:18899"})
-    p7 = subprocess.run([BIN], env=env7, capture_output=True, text=True, timeout=60)
-    out7 = (p7.stdout or "") + (p7.stderr or "")
-    announce("K7 reseal on an edge node", f"exit={p7.returncode} :: {out7.strip()[-120:]}")
-    check("K7: `HYDRA_RESEAL_SECRETS=1` on an EDGE node (no local DB) refuses and says why",
-          p7.returncode != 0 and "needs a local database" in out7,
-          f"exit={p7.returncode}")
+    # ---- K7: RETIRED (2026-10-05) ---------------------------------------------
+    # K7 pinned the documented "needs a local database (this is an edge node)" refusal by starting a
+    # node with `HYDRA_ROLE=edge`. BOTH halves of that premise are gone: the `edge` role was retired
+    # with the homogeneous topology (ADR-0001 D-2), so the env no longer yields a node without a local
+    # database — every node has one — and the refusal is therefore UNREACHABLE by configuration.
+    #
+    # Measured 2026-10-05: with the retired env set, the node boots as a single node with a local
+    # database and the reseal RUNS, so the leg failed for the right reason (its premise, not its
+    # subject). The code path it covered is still there as defence in depth —
+    # `main.rs` builds the pool with `let pool = if false { None } else { … Some(p) }`, a leftover of
+    # the role retirement, and `ConfigStore::from_snapshot` / `StoreError::NoDatabase` / the
+    # `not_ready` guard in `tenant_api::handlers::local_write` exist for the case it would have
+    # produced — but nothing can reach them now. That dead defensive path (and the `if false` a reader
+    # has to decode) is recorded as its own item rather than deleted silently here.
+    #
+    # What still guards the switch itself is K8 below (a typo must not silently mean "no rotation"),
+    # and what guards the ROTATION is K1–K6: those are the ones the documented procedure depends on.
 
     # K8: THE SWITCH'S OWN TYPO. The documented procedure is "run this one-shot and read the
     # report + exit code"; a value the parser does not recognise must not silently turn into

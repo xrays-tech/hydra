@@ -881,6 +881,24 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(all(feature = "cluster-redis", not(feature = "arachne")))]
     let fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = None;
 
+    // ...and the TENANT API needs the same view — which is what T4.1 dropped.
+    //
+    // Before the registry was deleted, ONE refresh task fed both: `tenant_api_cfg.live_nodes = view`
+    // and `fleet_live = view`. The replacement (the configured member list) was wired into the ADMIN
+    // state only, so `TenantApiConfig::live_nodes` stayed `None` and the tenant self-service
+    // `DELETE /tenant/{id}/api/v1/auth/cache` could never confirm anything: `fan_out_and_confirm` got
+    // an EMPTY live list, which reports `nodes_total: 0` and `pending` forever — with `lagging` empty
+    // too, so the tenant could not even see which member was behind. Measured 2026-10-05 by
+    // `integration/test_auth_cache_layers.py`, whose PREMISE leg requires the fleet report to say
+    // `applied` before its L2 legs mean anything.
+    //
+    // The ADMIN route was unaffected, which is why nothing else noticed: two entry points to the same
+    // barrier reported different things, and only the quieter one was broken.
+    #[cfg(all(feature = "cluster-redis", feature = "arachne"))]
+    if let Some(view) = fleet_live.clone() {
+        tenant_api_cfg.live_nodes = Some(view);
+    }
+
     let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
         match hydra_server::usage_query::select(
             &sink_kind_for_api,

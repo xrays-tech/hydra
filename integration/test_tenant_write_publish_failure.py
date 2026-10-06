@@ -28,6 +28,9 @@ Gates:
      now lists it (the cluster actually converged)
 
 Run:  python3 integration/test_tenant_write_publish_failure.py
+      cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+      # the recipe matters: without `arachne` a node with a member list REFUSES to boot, and without
+      # `usage-clickhouse` a cluster node does too (the sink must be ClickHouse in cluster mode)
 Env:  HYDRA_BIN (default target/debug/hydra), HYDRA_TEST_REDIS_URL (default redis://127.0.0.1:6380)
 Exit: 0 pass · 1 an assertion failed · 2 could not verify
 """

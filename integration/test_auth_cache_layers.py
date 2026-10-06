@@ -8,7 +8,8 @@ result}`), the tenant contract's §7.4 residual-window argument relies on the it
 decision item **D-9** asks whether L2 should become a trait — a question that needs the
 current behaviour written down. Nothing had ever measured it black-box.
 
-The drill uses a real cluster (leader + edge) with a real Redis and a COUNTING auth mock, so
+The drill uses a real cluster (TWO members of a three-member raft list) with a real Redis and a
+COUNTING auth mock, so
 "was the tenant's auth_url asked again?" is a number, not a guess:
 
   A L1 works: a second request on the same node does not re-ask the auth service
@@ -38,11 +39,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "auth-cache-layers-test")
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
-A_ADMIN, A_DATA = 18820, 18821        # leader
-B_ADMIN, B_DATA = 18822, 18823        # edge
+# ALL THREE members are started, and that is not decoration. The fleet view the invalidation barrier
+# waits on is the STATIC MEMBER LIST (ADR-0001 D-2: there is no registry and no per-peer liveness), so
+# a cluster with one member down can never report `applied` — `DELETE /auth/cache` stays `202 pending`
+# with the absent member in `lagging`, forever. Measured 2026-10-05: with 2 of 3 up, the D leg below
+# saw `202 {"invalidated":1,…,"fleet":{"state":"pending"}}` and every "the clear converged" assertion
+# failed. That is the honest behaviour of a static fleet (and `ops.md` §5.2 already documents
+# `pending` as "in flight, not a failure"), so the DRILL runs a complete cluster rather than
+# weakening the assertions.
+A_ADMIN, A_DATA, A_RAFT = 18820, 18821, 18826
+B_ADMIN, B_DATA, B_RAFT = 18822, 18823, 18827
+C_ADMIN, C_DATA, C_RAFT = 18824, 18825, 18828
 UPSTREAM = 18829
 TOKEN = "hydra-auth-layers-admin-2026"
-CLUSTER_TOKEN = "hydra-auth-layers-cluster-2026"
+MEMBERS = f"layers-a=127.0.0.1:{A_RAFT},layers-b=127.0.0.1:{B_RAFT},layers-c=127.0.0.1:{C_RAFT}"
 CLIENT_KEY = "sk-tenant-1"
 REDIS = os.environ.get("HYDRA_TEST_REDIS_URL", "redis://127.0.0.1:6380")
 REDIS_DB = int(os.environ.get("HYDRA_LAYERS_REDIS_DB", "51"))
@@ -238,12 +248,12 @@ def tenant_invalidate(data_port):
 def node_env(admin_port, data_port, label, extra):
     env = dict(os.environ)
     env.update({
-        "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
+        "HYDRA_ADMIN_TOKEN": TOKEN,
+        "HYDRA_CLUSTER_PEERS": MEMBERS, "HYDRA_CLUSTER_ID": "auth-layers-drill",
         "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin_port}", "HYDRA_LISTEN": f"127.0.0.1:{data_port}",
         "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, label)}.db?mode=rwc",
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "HYDRA_REDIS_MODE": "single",
-        "HYDRA_LEADER_LEASE_MS": "3000", "HYDRA_CONTROL_POLL_MS": "250",
         "HYDRA_USAGE_SINK": "clickhouse", "HYDRA_CLICKHOUSE_URL": "http://127.0.0.1:18999",
         "RUST_LOG": "warn",
     })
@@ -262,6 +272,18 @@ def wait_healthy(port, budget=25.0):
     while time.time() < deadline:
         if admin(port, "GET", "/health")[0] == 200:
             return True
+        time.sleep(0.25)
+    return False
+
+
+def wait_for(cond, budget=25.0):
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        try:
+            if cond():
+                return True
+        except Exception:
+            pass
         time.sleep(0.25)
     return False
 
@@ -323,24 +345,36 @@ def main():
     upstream = ThreadingHTTPServer(("127.0.0.1", UPSTREAM), AuthUpstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     common = {"HYDRA_REDIS_URL": redis_url}
-    a = start(A_ADMIN, A_DATA, "leader", dict(common, **{
-        "HYDRA_ROLE": "leader", "HYDRA_NODE_ID": "layers-a",
-        "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{A_ADMIN}",
-        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{A_ADMIN}"}))
-    b = start(B_ADMIN, B_DATA, "edge", dict(common, **{
-        "HYDRA_ROLE": "edge", "HYDRA_NODE_ID": "layers-b",
-        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{A_ADMIN}",
-        "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{B_ADMIN}"}))
+    # BOTH members at once: one node of a three-member table can never claim its data directory (the
+    # claim is a raft write and needs a majority), so a sequential bring-up would time out with "no
+    # member adopted this node's Arachne data directory" — measured 2026-10-05.
+    a = start(A_ADMIN, A_DATA, "layers-a", dict(common, **{
+        "HYDRA_NODE_ID": "layers-a", "HYDRA_ARACHNE_LISTEN": f"127.0.0.1:{A_RAFT}",
+        "HYDRA_ARACHNE_DATA_DIR": os.path.join(DIR, "raft-a")}))
+    b = start(B_ADMIN, B_DATA, "layers-b", dict(common, **{
+        "HYDRA_NODE_ID": "layers-b", "HYDRA_ARACHNE_LISTEN": f"127.0.0.1:{B_RAFT}",
+        "HYDRA_ARACHNE_DATA_DIR": os.path.join(DIR, "raft-b")}))
+    c = start(C_ADMIN, C_DATA, "layers-c", dict(common, **{
+        "HYDRA_NODE_ID": "layers-c", "HYDRA_ARACHNE_LISTEN": f"127.0.0.1:{C_RAFT}",
+        "HYDRA_ARACHNE_DATA_DIR": os.path.join(DIR, "raft-c")}))
     try:
-        if not wait_healthy(A_ADMIN) or not wait_leader(A_ADMIN):
-            print("[layers] CANNOT VERIFY: the leader never became healthy/leader", file=sys.stderr)
-            print(open(os.path.join(DIR, "leader.log")).read()[-700:], file=sys.stderr)
+        if not all(wait_healthy(p) for p in (A_ADMIN, B_ADMIN, C_ADMIN)):
+            print("[layers] CANNOT VERIFY: a member never became healthy", file=sys.stderr)
+            for label in ("layers-a", "layers-b", "layers-c"):
+                print(f"--- {label} ---\n"
+                      f"{open(os.path.join(DIR, label + '.log')).read()[-700:]}", file=sys.stderr)
             return 2
-        if not call("GET", f"http://127.0.0.1:{B_ADMIN}/healthz")[0] == 200:
-            print("[layers] CANNOT VERIFY: the edge never became ready", file=sys.stderr)
-            print(open(os.path.join(DIR, "edge.log")).read()[-700:], file=sys.stderr)
+        # Exactly one of the three must be the raft writer — and it can be ANY of them (the writer is
+        # whichever member raft elected), so all three are asked. Probing with a bare GET rather than
+        # `wait_leader` keeps the check inside one pass: nesting a 25-second waiter inside `wait_for`
+        # made the writer's own poll consume the outer budget.
+        if not wait_for(lambda: sum(
+            1 for p in (A_ADMIN, B_ADMIN, C_ADMIN)
+            if call("GET", f"http://127.0.0.1:{p}/healthz/leader")[0] == 200
+        ) == 1, budget=30):
+            print("[layers] CANNOT VERIFY: no single raft writer", file=sys.stderr)
             return 2
-        # The edge must have the snapshot before it can serve the tenant at all.
+        # The other member must have materialized the config before it can serve the tenant at all.
         deadline = time.time() + 20
         while time.time() < deadline:
             if proxied(B_DATA)[0] in (200, 401, 403):
@@ -413,7 +447,7 @@ def main():
         # ---- D: invalidation clears it fleet-wide ------------------------------
         AuthState.allowed = False
         st_inv, out_inv = tenant_invalidate(B_DATA)
-        check("D: the invalidation on the EDGE is accepted", st_inv == 200, f"HTTP {st_inv} {out_inv[:60]}")
+        check("D: the invalidation on the OTHER member is accepted", st_inv == 200, f"HTTP {st_inv} {out_inv[:60]}")
         # The L2 clear must be visible BEFORE any new request re-caches a verdict.
         keys_cleared = cache_keys()
         announce("D the Redis L2 right after the invalidation",
@@ -439,6 +473,7 @@ def main():
     finally:
         stop(a)
         stop(b)
+        stop(c)
         upstream.shutdown()
 
     print()

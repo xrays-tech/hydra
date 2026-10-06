@@ -435,23 +435,20 @@ def leg_cluster():
         return 2
     announce("redis for the cluster leg", f"{redis_db} ({note})")
     common = {
-        "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN, "HYDRA_REDIS_MODE": "single",
-        "HYDRA_LEADER_LEASE_MS": "3000", "HYDRA_CONTROL_POLL_MS": "250",
+        "HYDRA_REDIS_MODE": "single",
         "HYDRA_USAGE_SINK": "clickhouse", "HYDRA_CLICKHOUSE_URL": "http://127.0.0.1:18999",
     }
     live = start(ADMIN_C, DATA_C, "cluster-live", dict(common, **{
-        "HYDRA_ROLE": "leader", "HYDRA_NODE_ID": "sdk-ts-a",
-        "HYDRA_REDIS_URL": redis_db, "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_C}",
-        "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
+        "HYDRA_NODE_ID": "sdk-ts-a",
+        "HYDRA_REDIS_URL": redis_db,
     }))
     host, port = redis_endpoint()
     relay = RedisRelay(host, port)
     relay_port = relay.start()
     relay_url = f"redis://127.0.0.1:{relay_port}/{REDIS_DB}"
     edge = start(ADMIN_X, DATA_X, "cluster-edge", dict(common, **{
-        "HYDRA_ROLE": "edge", "HYDRA_NODE_ID": "sdk-ts-edge",
-        "HYDRA_REDIS_URL": relay_url, "HYDRA_CONTROL_URL": f"http://127.0.0.1:{ADMIN_C}",
-        "HYDRA_PUBLIC_URL": f"http://127.0.0.1:{ADMIN_X}",
+        "HYDRA_NODE_ID": "sdk-ts-edge",
+        "HYDRA_REDIS_URL": relay_url,
     }))
     try:
         if not wait_healthy(ADMIN_C):
