@@ -244,8 +244,32 @@ impl ArachneConfigStore {
 
         let plan = plan_publish(previous_toc.as_ref(), tree)?;
         let toc_hash = plan.toc.hash();
-        let writer = self.handle.without_redirect();
+        // THE REDIRECTING HANDLE, on purpose (2026-10-05, user ruling).
+        //
+        // This used to be `without_redirect()`, chosen in T2.2 when `put` on a follower returned
+        // `NotLeader` and that refusal was the only available write protection — the plan even
+        // recorded it as "leader 判定与写保护的原语". Upstream 0.1.2 changed the premise: a
+        // follower's `put` is now forwarded to the leader (probe p11), and the ruling that a
+        // management write is executed wherever it lands (any node runs the write path and
+        // publishes) is what makes publishing accessible from every node. Keeping
+        // `without_redirect()` here made the whole cluster's publish leader-only, which three
+        // real nodes demonstrated immediately: 2 of 3 writes failed with `NotLeader`.
+        //
+        // Each `put` is forwarded INDIVIDUALLY, so the publisher does not need to be the leader —
+        // but see `KNOWN RISK` below: the sequence is not atomic.
+        let writer = &self.handle;
 
+        // KNOWN RISK (documented, not fixed here): with the redirecting handle, two nodes can
+        // publish CONCURRENTLY, and entity keys are addressed by PATH (`hydra/cfg/e/<path>`) while
+        // their content is verified by HASH from the toc. If two publishes interleave, the loser's
+        // entity write can land under a path the winner's toc then describes with a different
+        // hash, and readers reject the tree ("a mismatch is a retry") for as long as that head
+        // stands — every node serves its last-known-good config and materialization keeps failing
+        // until the next publish. It is loud and recoverable, and it is the price of "any node may
+        // publish"; the clean fix is CONTENT-ADDRESSED entity keys
+        // (`hydra/cfg/e/<path>/<content-hash>`), which makes an interleaving harmless — the loser's
+        // tree is simply unreferenced. Tracked in the ADR's residual-risk table.
+        //
         // 1. entities — a failure here leaves the old tree committed and the new
         //    one unreachable, because nothing names it yet.
         for (path, bytes) in &plan.write {

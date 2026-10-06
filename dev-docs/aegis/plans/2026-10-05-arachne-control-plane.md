@@ -643,6 +643,21 @@ Plan Pressure Test:
 - **Verification**：`cargo test -p hydra-server --features "server,arachne"`；故障注入用例 ②③④ 各一次。
 - **Retirement Track**：`config_meta` 的「版本权威」语义退役（表与列保留）。
 
+#### T3.1 的验收：真实 3 节点已执行（2026-10-05）
+
+`crates/hydra-server/tests/arachne_three_nodes.rs`——三个真 raft 成员（真端口）、三个 `ConfigStore`（三个 SQLite）、三个发布者与三个物化器，即 `main.rs` 的那套装配。两条用例：
+
+1. `three_nodes_converge_on_the_same_head_and_each_can_rebuild_itself`：节点 1 写库 → `reload_all` 发布 → **三个节点物化出同一个 toc-hash**、都服务该配置、**各自的库里都有那一行**（重启后能自己重建）；并断言收敛是**轮询而不是重试循环**（每节点允许的 pass 数有上界，超出即失败）。
+2. `a_write_on_a_non_leader_node_reaches_every_node`：写到**最后一个节点**（三成员里最多只有一个是 leader，所以大概率是 follower）→ 发布成功 → head 前进 → 三个节点都收敛到它、都落盘。
+
+**这一跑立刻抓出一条与既定裁定冲突的代码事实（已改）**：
+
+- `ArachneConfigStore::publish` 里用的是 **`handle.without_redirect()`**。这行是 **T2.2 时代**的决定，当时 follower 的 `put` 返回 `NotLeader`，而那个拒绝是**唯一可用的写保护原语**（计划 §Phase 0 第 2 条原文：「这就是 leader 判定与写保护的原语」）。
+- 但**上游 0.1.2 把这个前提改掉了**（探针 p11：follower 的 `put` 会被转发），而你本轮的裁定（乙：任意节点就地执行 + 就地发布）正建立在这个前提上。保留 `without_redirect()` 的后果是**发布退化成 leader 独占**：三个真节点上一跑，3 次写里有 2 次直接 `NotPublished{NotLeader}`。
+- 改法：`publish` 改用**可重定向的 handle**，让库把逐条 `put`（实体 → toc → head）转发给 leader。改完两条用例都过。
+
+**由此产生的一条残留风险（已记入 ADR，未在本轮修）**：实体键是**按路径**寻址（`hydra/cfg/e/<path>`）而内容按**哈希**校验，所以两个节点**并发**发布时可能交错，输者的实体写落在赢者 toc 用另一个哈希描述的那个路径上 ⇒ 读侧哈希不匹配、**每个节点都拒绝这棵树**（退化为继续服务 last-known-good，直到下一次发布）。彻底的做法是把实体键改成**内容寻址**（`hydra/cfg/e/<path>/<content-hash>`），交错就变得无害（输者的树只是无人引用）。**待用户裁定是否现在做。**
+
 #### T3.2 实现记录（2026-10-05；与上面的 Steps 不一致处以这里为准）
 
 **已落地**：
