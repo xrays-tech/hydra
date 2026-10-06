@@ -121,6 +121,10 @@ pub enum EntityPath {
     SubTenant(String),
     /// `sub_tenant_route/<id>`
     SubTenantRoute(String),
+    /// `tenant_provider/<tenant_id>` — the provider ids a tenant may use.
+    TenantProvider(String),
+    /// `tenant_model/<tenant_id>` — the model keys a tenant may use.
+    TenantModel(String),
     /// `token/<tenant_id>`
     Token(String),
     /// `cert/<tenant_id>`
@@ -142,6 +146,8 @@ impl EntityPath {
             Self::KeyBinding(id) => format!("key_binding/{id}"),
             Self::SubTenant(id) => format!("sub_tenant/{id}"),
             Self::SubTenantRoute(id) => format!("sub_tenant_route/{id}"),
+            Self::TenantProvider(id) => format!("tenant_provider/{id}"),
+            Self::TenantModel(id) => format!("tenant_model/{id}"),
             Self::Token(id) => format!("token/{id}"),
             Self::Cert(id) => format!("cert/{id}"),
             Self::Meta => "meta".to_string(),
@@ -163,6 +169,8 @@ impl EntityPath {
             Self::Token(_) => 9,
             Self::Cert(_) => 10,
             Self::Meta => 11,
+            Self::TenantProvider(_) => 12,
+            Self::TenantModel(_) => 13,
         }
     }
 
@@ -178,6 +186,8 @@ impl EntityPath {
             | Self::KeyBinding(id)
             | Self::SubTenant(id)
             | Self::SubTenantRoute(id)
+            | Self::TenantProvider(id)
+            | Self::TenantModel(id)
             | Self::Token(id)
             | Self::Cert(id) => Some(id),
             Self::Meta => None,
@@ -306,6 +316,8 @@ fn kind_name(path: &EntityPath) -> &'static str {
         EntityPath::KeyBinding(_) => "key_binding",
         EntityPath::SubTenant(_) => "sub_tenant",
         EntityPath::SubTenantRoute(_) => "sub_tenant_route",
+        EntityPath::TenantProvider(_) => "tenant_provider",
+        EntityPath::TenantModel(_) => "tenant_model",
         EntityPath::Token(_) => "token",
         EntityPath::Cert(_) => "cert",
         EntityPath::Meta => "meta",
@@ -574,6 +586,8 @@ mod tests {
             EntityPath::KeyBinding("x".into()),
             EntityPath::SubTenant("x".into()),
             EntityPath::SubTenantRoute("x".into()),
+            EntityPath::TenantProvider("x".into()),
+            EntityPath::TenantModel("x".into()),
             EntityPath::Token("x".into()),
             EntityPath::Cert("x".into()),
         ];
