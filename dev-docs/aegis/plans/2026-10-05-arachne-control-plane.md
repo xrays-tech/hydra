@@ -844,6 +844,19 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 ---
 
+## Phase 4 执行记录（2026-10-05）
+
+| Task | 状态 | 实际落地 |
+| --- | --- | --- |
+| **T4.1 前半（启动半边）** | ✅ 已完成（`6043441`） | 租约选举 / 快照轮询客户端 / 备用物化器不再启动；`control_client.rs`、`replica.rs` 删除；`snapshot.rs` 只剩 `HydratedWire`（线缆整个退役）；`/api/v1/internal/control` 删除；`leader_ready` 只剩一个来源 |
+| **T4.1 后半** | ✅ 已完成（`f4f83e9`） | `lease.rs`（715）、`registry.rs`（743）、`RedisLeaseStore`、`LEASE_KEY`、关闭时的注销钩子、`registry_stale_grace_secs`、三套对应测试全部删除。**计划的退役 grep 归零**（`LeaseStore|LeaderElection|NodeRegistry|LEASE_KEY|MemoryLeaseStore`） |
+| **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
+| **T4.0 清单半边** | ⏳ **未做**（刻意留在一起） | `environment/docker-compose.cluster.yml` 仍是 leader/edge 拓扑；`scripts/{compose_static,check_compose_health}.cjs` 仍断言它。**两者必须同批改**（守卫脚本会读这些文件），另加 `docker-compose.local.yml` / `build.sh` 的 `HYDRA_ROLE` 与 `admin-ui/i18n.js` 的角色文案 |
+| **T4.2 环境变量** | ✅ 代码/文档半边完成（`f4f83e9`） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单/README 尚未改**（与 T4.0 清单半边同批） |
+| **T4.3 验收与运维文档** | ⏳ 未做 | 验收 2（20 rps / 60 s）未移植；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写未做 |
+
+**这一轮的一个额外发现（社区面）**：舰队视图 `/api/v1/cluster/status` 以前从注册表读「成员 + 每个成员是否存活 + 谁持租约」。注册表没了之后，**单个节点再也无法知道对端是否存活**（没有心跳表，也没有节点间 RPC），所以 `alive` 变成**三态**（本节点 `true`、对端 `null`），Admin UI 把 `null` 渲染为「未知」——把健康对端显示成「下线」是**没人测量过的断言**。
+
 ## 风险 / Risks
 
 | # | 风险 | 概率 | 影响 | 对冲 |
