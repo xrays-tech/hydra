@@ -207,15 +207,18 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(not(feature = "arachne"))]
     #[allow(unused_variables, clippy::no_effect_underscore_binding)]
     let _arachne_control: Option<()> = None;
-    // Does the CONTROL PLANE carry leadership on this node? True only when a raft node was actually
-    // started (`HYDRA_CLUSTER_PEERS` set). It decides whether the Redis control path — the lease
-    // election, the snapshot-polling client and the standby materializer, all ADR-0001 retirements
-    // — is started at all, and therefore whether its variables are REQUIRED.
+    // Does the raft control plane carry the WRITER decision on this node? True only when a raft
+    // node was actually started (`HYDRA_CLUSTER_PEERS` set and the feature compiled in), because
+    // `ArachneControl::start_from_env` returns `None` on a standalone node.
     //
-    // Measured 2026-10-05 by `integration/test_arachne_control_plane.py`: without this, a raft
-    // member refused to boot at all ("leader mode requires HYDRA_CONTROL_URL"), so the acceptance
-    // gates 1/3/4/5 could not be executed against the new model — the product still demanded a
-    // variable that only the retired world read.
+    // This is what the cluster-mode startup contract below is gated on — NOT the retired Redis
+    // control path, which no longer exists (the lease election, the snapshot-polling client and the
+    // standby materializer were all deleted, ADR-0001 T3/T4). The gate used to be named for that
+    // path, and the refusal it guards used to name a retired variable with it.
+    //
+    // Measured 2026-10-05 by `integration/test_arachne_control_plane.py`: before this gate existed,
+    // a raft member refused to boot at all (the product still demanded a variable that only the
+    // retired world read), so the acceptance gates could not be executed against the new model.
     #[cfg(feature = "arachne")]
     let arachne_carries_leadership = arachne_control
         .as_ref()
@@ -225,25 +228,32 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
     info!(role = %role, "hydra gateway starting");
 
-    // Cluster-mode fail-closed startup contract (v8 plan §2.1 / §7.3):
-    // - `HYDRA_REDIS_URL` is the cluster backbone — required whenever a node
-    //   participates in a cluster (leader/edge). Connectivity is verified
-    //   here for the leader lease (P2).
-    // - `HYDRA_CLUSTER_TOKEN` authenticates the control channel (leader
-    //   serves it, edges/standbys call it).
+    // Cluster-mode fail-closed startup contract:
+    // - `HYDRA_REDIS_URL` is the data-plane backbone — required whenever a node
+    //   participates in a cluster (ADR-0001 D-1: the control plane moved to
+    //   Arachne, Redis stayed for the hot path).
+    // - `HYDRA_CLUSTER_TOKEN` gates the internal endpoints. NOTE: no
+    //   `/api/v1/internal/*` route exists any more (they went with the snapshot
+    //   channel and the forwarded write, T3.5/T4.1), so the token is currently a
+    //   BOOT requirement with no consumer — kept, not silently dropped, because
+    //   removing it is a deployment change that needs its own decision.
     // - the usage sink must be ClickHouse — per-node SQLite usage records are
     //   meaningless across a cluster (each node would hold its own slice).
-    // - the `cluster-redis` cargo feature must be enabled for leader mode (the
-    //   Redis-backed lease).
+    // - the `cluster-redis` cargo feature must be enabled for the shared data
+    //   plane (rate limits / breaker / auth L2 / invalidation bus).
     let cluster = hydra_server::cluster::ClusterConfig::from_env(role);
     let redis_url = std::env::var("HYDRA_REDIS_URL")
         .ok()
         .filter(|u| !u.is_empty());
     if role.is_cluster() {
         if redis_url.is_none() {
+            // Names the member list, NOT the retired `HYDRA_ROLE`: an operator who follows a
+            // message that tells them to set a retired variable makes the deployment worse, and
+            // that variable is exactly what this build reports as IGNORED at boot. Pinned by
+            // `cluster::tests::no_operator_facing_message_names_a_retired_variable`.
             return Err(
-                "cluster mode (HYDRA_ROLE=leader|edge) requires HYDRA_REDIS_URL (Redis backbone); \
-                 refusing to start"
+                "cluster mode (HYDRA_CLUSTER_PEERS is set) requires HYDRA_REDIS_URL (the \
+                 data-plane backbone); refusing to start"
                     .into(),
             );
         }

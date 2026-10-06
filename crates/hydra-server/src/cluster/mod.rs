@@ -348,6 +348,130 @@ pub fn cluster_decision_with(
 mod tests {
     use super::*;
 
+    /// Every string literal in `src`, with comments skipped.
+    ///
+    /// A `split('"')` was the first version and it was WRONG in the expensive direction: it read the
+    /// historical message quoted inside a `//` comment (`"leader mode requires HYDRA_CONTROL_URL"`,
+    /// `main.rs:216`) as a live string literal. A guard whose first act is to report a comment is a
+    /// guard that gets switched off, and the right fix for "it flagged a comment" is a scanner, not
+    /// a narrower pattern. Line comments, block comments, char literals and lifetimes are skipped;
+    /// escapes are consumed so `\"` inside a literal does not end it early.
+    ///
+    /// Residual: a RAW literal (`r#"…"#`) is not modelled. `main.rs` has none today (checked
+    /// 2026-10-05), and adding one can only make this scan miss something, never invent it.
+    fn string_literals(src: &str) -> Vec<String> {
+        let b: Vec<char> = src.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                '/' if b.get(i + 1) == Some(&'/') => {
+                    while i < b.len() && b[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if b.get(i + 1) == Some(&'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                '"' => {
+                    i += 1;
+                    let mut s = String::new();
+                    while i < b.len() && b[i] != '"' {
+                        if b[i] == '\\' {
+                            i += 1;
+                            if i < b.len() {
+                                s.push(b[i]);
+                            }
+                        } else {
+                            s.push(b[i]);
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    out.push(s);
+                }
+                '\'' => {
+                    // `'x'` / `'\n'` are char literals; a lifetime tick (`'static`) is not, and
+                    // treating it as one would swallow the rest of the file.
+                    let close = if b.get(i + 1) == Some(&'\\') {
+                        i + 3
+                    } else {
+                        i + 2
+                    };
+                    i = if b.get(close) == Some(&'\'') {
+                        close + 1
+                    } else {
+                        i + 1
+                    };
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// No operator-facing message may name a variable this table retires.
+    ///
+    /// The retirement diagnostic exists so a deployment that still carries a retired knob is TOLD.
+    /// The opposite failure is just as expensive: a REFUSAL that names one sends the operator to set
+    /// a variable the same build reports as ignored, so they "fix" nothing and lose the real cause.
+    /// Measured 2026-10-05: `main.rs`'s cluster-mode refusal read
+    /// `"cluster mode (HYDRA_ROLE=leader|edge) requires HYDRA_REDIS_URL (Redis backbone)"` — the
+    /// variable had been retired three commits earlier, and NOTHING read the string (no unit test,
+    /// no drill: `integration/test_startup_knobs.py` asserts on the WIRING diagnostic, a different
+    /// message). The scan is over `main.rs`'s string LITERALS only: a mention in a comment is
+    /// deliberate documentation, and the two live in the same file.
+    ///
+    /// Falsification: put `HYDRA_ROLE` back into that refusal and this fails; the controls below
+    /// fail if `main.rs` cannot be read as source, if the scan parses too few literals to have
+    /// looked at the file at all, or if it reports a comment as a literal.
+    #[test]
+    fn no_operator_facing_message_names_a_retired_variable() {
+        let src = include_str!("../main.rs");
+        assert!(
+            src.contains("fn main("),
+            "the scan read {} bytes of main.rs and found no `fn main(` — the include path is wrong, \
+             so an empty scan would pass for the wrong reason",
+            src.len()
+        );
+
+        let literals = string_literals(src);
+        assert!(
+            literals.len() > 100,
+            "only {} literal(s) parsed out of main.rs — the scan is not looking at the file",
+            literals.len()
+        );
+        // The scanner must not report a comment as a literal, or this guard is noise. The exact
+        // comment the first version flagged is the control that pins it.
+        assert!(
+            !literals
+                .iter()
+                .any(|l| l.contains("leader mode requires HYDRA_CONTROL_URL")),
+            "the scanner read the historical message out of a `//` comment in main.rs: {:?}",
+            literals
+                .iter()
+                .find(|l| l.contains("leader mode requires"))
+                .unwrap()
+        );
+
+        for name in RETIRED_CLUSTER_ENV {
+            for lit in &literals {
+                assert!(
+                    !lit.contains(name),
+                    "main.rs has a string literal naming the RETIRED variable {name}: {:?}\n\
+                     A refusal or log line that names it tells the operator to set a variable this \
+                     build reports as IGNORED (RETIRED_CLUSTER_ENV). Name the live knob instead — \
+                     for the member list that is HYDRA_CLUSTER_PEERS.",
+                    lit.trim()
+                );
+            }
+        }
+    }
+
     /// A typo'd `HYDRA_ROLE` on a node that HAS cluster wiring must say what it is
     /// dropping. `from_env`'s fallback is documented and stays (a typo must not make
     /// a node unable to proxy), but every cluster-only startup validation in
