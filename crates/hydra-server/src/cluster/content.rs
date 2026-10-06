@@ -36,7 +36,7 @@ pub type TenantTokenHashes = Vec<(String, String)>;
 /// Every vector is loaded in a TOTAL order (see [`ReplicationContent::load`]) so
 /// that `PartialEq` on the owning struct is a sound "did the replicated bytes
 /// change?" predicate.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FidelityRows {
     /// FULL `limit_role` rows — including `enabled == false`.
     pub limit_roles: Vec<LimitRole>,

@@ -130,7 +130,9 @@ Redis（只是数据面的加速器与近似计数器，不是任何权威）
 所有节点同构且都在 raft 里，于是旧的「leader 组装快照 → HTTP 推给 edge → edge hydrate」这条链整体退役：
 
 1. leader 提交管理写：本地 SQL 事务 → 重建 `ConfigData` → 编码 → 写 Arachne 分片 → 最后写 `ctl/head`（提交点）；
-2. 每个节点（含 leader）一个物化任务：读 `ctl/head`（顺序检查必须走 `get` 线性读；分片读可用 `get_stale` 本地读），版本前进则读分片 → 解码 → 写回**本地** SQLite → 换入内存 `ConfigData`；
+2. 每个节点（含 leader）一个物化任务：读 `ctl/head` → 版本前进则读 toc → 逐实体读 → 解码 → 写回**本地** SQLite → 换入内存 `ConfigData`；
+   - **实现时的实测修正（2026-10-05，0.1.2）**：原文写的是「顺序检查必须走 `get` 线性读」，**这条已被证伪**——follower 上的 `get` **立刻**返回 `QuorumUnavailable`（`bce2943` 的转发只对进程内 `register_peer` 生效），所以**任何节点都不能用 `get`**，只有 `put` + `get_stale`。见 ADR-0001 §10 F-2 与 `arachne_store.rs` 的模块注释（`read` 全程 `get_stale`）。
+   - 由此产生的第二个结论：**`head` 不是靠线性读来保证的，而是靠「单写者 + 内容哈希」**——`ctl/head` 只由 `ArachneConfigStore::publish` 写，且 head 指向的 toc 里每个实体都带内容哈希、逐个校验；读到「旧 head」是允许的（下一轮再读），读到「head 与 toc 不一致」是重试而不是修复。
 3. 每个节点对自身数据面读内存态 `ConfigData`，零网络往返；Arachne 失多数派时继续用本地已物化状态服务（验收 5）。
 
 > **退役**：`GET /api/v1/internal/snapshot`、`cluster/control_client.rs`（轮询 / 轮换）、`cluster/snapshot.rs` 的线上推送路径。`content.rs` 的编解码**保留**（它现在服务于「编码成 Arachne 值」与「从 Arachne 值解码」）。
@@ -276,7 +278,7 @@ Plan Pressure Test:
 
 ---
 
-## 决策记录 / Decision Records（D-1…D-5，需写入 ADR）
+## 决策记录 / Decision Records（D-1…D-5 定稿，落地时追加 D-7/D-8；均需写入 ADR）
 
 ### 决策已定稿（2026-10-05 用户裁定，实现不得偏离）
 
@@ -288,7 +290,7 @@ Plan Pressure Test:
 | 配置怎么存 | 见 §决策记录 D-4（已重新设计为分片 + 内容寻址 + 提交点） | 键空间、GC、任务分解按 D-4 执行 |
 | 节点数 | **至少 3 台**，manifest 与文档**一起改** | compose 与 k8s 清单改 3 副本（StatefulSet 固定身份）；2 节点等于没有容错 |
 | 旧环境变量 | 没有既有版本 ⇒ **可以全改**，但必须保证修改一致 | 删除旧名、统一新名、文档/清单/脚本一次改齐，由脚本双向核对 |
-| 是否为 Arachne 出 ADR | **要** | 单出一份 ADR 固化 D-1…D-5，本文档保留实现细节 |
+| 是否为 Arachne 出 ADR | **要** | 单出一份 ADR 固化 D-1…D-6（实现期追加 D-7/D-8，见 ADR §3），本文档保留实现细节 |
 
 ### 决策记录（需写入 ADR）
 
@@ -573,6 +575,32 @@ Plan Pressure Test:
   4. `Verify GREEN`。
 - **Verification**：`cargo test -p hydra-server --features "server,arachne" --test arachne_materialize`；`integration/test_snapshot_stale.py` 改为「本地物化陈旧」口径。
 - **Retirement Track**：`ControlClient`（轮询 / 按租约持有者轮换）与 `GET /api/v1/internal/snapshot` 同 Task 删除。
+
+#### T3.1 实际落地形状（2026-10-05 实现记录；与上面的 Files 不一致，以这里为准）
+
+原来的 `materialize.rs` 一个文件，落地时拆成三个，因为边界比预想的清楚：
+
+| 文件 | 是干什么的 | 为什么单独一个文件 |
+| --- | --- | --- |
+| `cluster/arachne_keys.rs` | 键空间 + `Toc` + `content_hash` | 已有（T2.1），本轮只加了 `EntityPath::Fidelity` |
+| `cluster/arachne_entities.rs` | `ConfigData`(+fidelity) ⇄ 每实体一值 | **纯函数、无集群无数据库**，可以脱离 raft 单测 |
+| `cluster/arachne_materialize.rs` | 门（gate）：head → 决策 / 退避 / 是否可当选 | 决策表是纯函数，`cluster_decision()` 复用 |
+| `cluster/arachne_materializer.rs` | 循环：store 读 → 解码 → 交给 target → 推进水位 | 唯一有 I/O 的一半 |
+| `cluster/arachne_store.rs` | 提交点（head 的唯一写者）与读路径 | 已有（T2.2） |
+
+**新增的决定：fidelity 实体（`EntityPath::Fidelity`）——树里不只有 `ConfigData`。**
+
+- **问题**：`ConfigData` 是从 SQLite 表**推导**出来的视图，推导过程是有损的：`limit_role` 里 `enabled=0` 的行、`provider_model` 里 `status != 1` 的行、以及所有行的**主键 `id` 与 `created_at`**，都不在 `ConfigData` 里。只复制 `ConfigData` 的副本无法重建出同一张表（会丢掉禁用行，并且重建时会给 provider key **重新生成 id**）。
+- **做法**：树里多一个 `Fidelity` 实体，携带这些「推导丢掉的行」。键按**路径**而不是按树哈希（`hydra/cfg/e/fidelity`），与其它实体同一规则，所以配置没变时它不会被重写。
+- **秘密怎么走**：`provider_keys`（API key）与 `tenant_token_hashes`（租户令牌哈希）**必须是密文**。旧的 snapshot 线就封了这两样，树里若走明文等于把已有的保护悄悄撤掉。所以：非秘密的行走普通 JSON，这两样走 `Sealed`，只有持主密钥的一方能打开（`FidelityTreeEntity::rows`）。有针对性用例 `the_fidelity_entity_carries_no_plaintext_secrets`（含「换一把主密钥必须被拒绝，而不是交出垃圾」）。
+- **一个被实测逼出来的约束（重要）**：树是**内容寻址**的——名字就是字节的哈希。而 AES-GCM 每次封都用**新的随机 nonce**，所以**在编码过程里封密文 = 同一个逻辑配置每次发布都换一个树名**，于是 head 前进、所有节点无限重新物化。因此密封被移到编码**之外**：发布方把已封好的材料作为参数传进来（`SealedMaterial`），来源是它自己库里**已经存着的密文**（`provider_key` 行），与 `SnapshotWire::build` 的取值口径一致。守卫用例：`the_same_inputs_name_the_same_tree`（这条用例是红的抓出来的：第一版把密封写在 `split_config` 里，一个没变的配置命名出了两棵不同的树）。
+- **不是「顺便加的」**：这是本轮唯一一处**扩大**树的内容的地方，理由不是「将来可能有用」，而是「不加就重建不出同一份副本」。
+
+**T3.1 明确没做完的部分（如实记账，不算完成）**：
+
+1. `MaterializeTarget` 目前只有测试里的记录型实现；**真实的 target（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）还没接**。也就是说：物化循环本身跑通了（真实 1 节点 raft + 真 store，HEAD→toc→实体→解码→安装→水位），但节点还不能**从 Arachne 服务配置**。
+2. 发布侧仍然走 `SnapshotWire`（`arachne_entities::encode_config` 已经能产出树，但管理写路径还没改用它）——这是 **T3.2** 的内容。
+3. 因此 T3.1 的 Verification 里那条「真实 3 节点、3 个节点物化出同一 toc-hash」**尚未执行**；已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值性/确定性/保密性用例。
 
 **T3.2 配置版本权威 = `head` 内容哈希**
 - **Files**：`crates/hydra-server/src/store.rs`、`crates/hydra-server/src/db.rs`、`crates/hydra-server/src/admin/*`。

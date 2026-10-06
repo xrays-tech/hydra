@@ -131,6 +131,13 @@ pub enum EntityPath {
     Cert(String),
     /// `meta` — the singleton carrying the config's own metadata.
     Meta,
+    /// `_fidelity` — the singleton carrying the rows a REPLICA needs beyond `ConfigData`
+    /// (disabled rows, provider-key identity, offline models, sealed token hashes).
+    ///
+    /// A singleton rather than a per-row entity: the rows are one coherent value that is only
+    /// ever replaced whole (they come from one read transaction), and splitting them would
+    /// multiply the toc for no benefit a replica can use.
+    Fidelity,
 }
 
 impl EntityPath {
@@ -151,6 +158,7 @@ impl EntityPath {
             Self::Token(id) => format!("token/{id}"),
             Self::Cert(id) => format!("cert/{id}"),
             Self::Meta => "meta".to_string(),
+            Self::Fidelity => "_fidelity".to_string(),
         }
     }
 
@@ -171,6 +179,7 @@ impl EntityPath {
             Self::Meta => 11,
             Self::TenantProvider(_) => 12,
             Self::TenantModel(_) => 13,
+            Self::Fidelity => 14,
         }
     }
 
@@ -190,7 +199,7 @@ impl EntityPath {
             | Self::TenantModel(id)
             | Self::Token(id)
             | Self::Cert(id) => Some(id),
-            Self::Meta => None,
+            Self::Meta | Self::Fidelity => None,
         }
     }
 }
@@ -321,6 +330,7 @@ fn kind_name(path: &EntityPath) -> &'static str {
         EntityPath::Token(_) => "token",
         EntityPath::Cert(_) => "cert",
         EntityPath::Meta => "meta",
+        EntityPath::Fidelity => "_fidelity",
     }
 }
 
@@ -501,6 +511,7 @@ impl Toc {
                     }
                 }
                 11 => EntityPath::Meta,
+                14 => EntityPath::Fidelity,
                 other => {
                     return Err(KeysError::UnknownEntityKind {
                         discriminant: other,

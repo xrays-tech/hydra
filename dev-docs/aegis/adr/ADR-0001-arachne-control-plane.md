@@ -40,7 +40,9 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 6. **Redis 只留数据面热路径**：限流（Lua 滑动窗口）、熔断投票、认证 L2、失效事件流（Streams）**不迁移**。
 7. **单节点模式不受影响**：未配集群变量时不启动 Arachne、不需要 Redis，行为与今天一致。
 
-## 3. 六条决策记录（D-1…D-6，含被否决的备选）
+## 3. 八条决策记录（D-1…D-8，含被否决的备选）
+
+> D-1…D-6 为方案定稿时的裁定；**D-7、D-8 是实现期追加的**（T3.1 写代码时才发现的问题，见 §10 实施进展）。两条都不是"顺手加的"：D-7 不加就重建不出同一份副本，D-8 不遵守就无限重新物化。
 
 | # | 决策 | 备选（真实存在过的） | 裁定 |
 |---|---|---|---|
@@ -50,6 +52,8 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | **D-4** | 配置 = key-path（版本化目录 + 每实体一键 + head 单一提交点）；`head` 是**内容哈希**不是版本号 | ① 整体 blob + 字节分片（删一个实体导致后续分片全部移位 ⇒ 近乎全量重写）；② 每实体一键但用版本号做提交点（`get_stale` 不保证单调 ⇒ 可能拼出从未存在过的配置） | 用户要求重新设计后定稿 |
 | **D-5** | 集群 HA 前提 = **至少 3 台奇数同构节点** | ① 保持 2 台（raft 下无容错）；② 引入外部协调服务 | 用户裁定 |
 | **D-6** | 租户自助写：身份闸唯一在入口节点，不重复鉴权，收口到那 4 个端点 | ① 保留三道闸（含 leader 重鉴权）；② 请上游在转发协议里带调用方上下文；③ 乙-lite 先删身份保留转发作过渡（用户否决） | 用户裁定（乙-full） |
+| **D-7** | 配置树的**内容范围**：除 `ConfigData` 外，还包含它推导时丢弃的行（新增 `EntityPath::Fidelity` 实体） | ① 只复制 `ConfigData`（原计划的字面做法）：副本重建不出同一份 SQLite —— 丢 `enabled=0` 的 `limit_role`、`status != 1` 的 `provider_model`，且 provider key 的 `id`/`created_at` 会**被重铸**；② 副本"尽力而为"重建、缺的行当不存在：节点间表内容合法地不同，而 `head` 只声明"配置是这一份" | 实现期裁定（用户选 A） |
+| **D-8** | **密封必须在编码之外**：发布方传入已封好的材料（`SealedMaterial`），编码器不持有主密钥 | ① 由编码器在 `split_config` 里现封：树是内容寻址的，AES-GCM 每次新 nonce ⇒ **同一个没变的配置每次发布都换一个树名**，head 前进、全集群无限重新物化（第一版就是这样，被 `the_same_inputs_name_the_same_tree` 抓出） | 实测强制（非可选） |
 
 ## 4. 「为什么引入共识层」的论证
 
@@ -142,6 +146,22 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 - 五条反馈全部落实；探针切回 **crates.io 的 0.1.2** 重跑 **13/13 PASS**。证据 `.arachne-research/results/probes-after-fix.log`、`probes-0.1.2-published.log`
 - 修复带来**三处简化**：写打在任意节点由库转发（D-3 的 409/hint/UI 重试层不再需要）、`cluster/forward.rs` 整文件退役、唯一保留项是租户自助写（即 D-6）
 - 一条探针自身的缺陷也记录在案：单节点首写窗口返回的是 `Timeout`（可重试），不是 `NotLeader` —— 曾一度误报为库的回归
+
+**实施进展（2026-10-05，T1.3 / T2 / T3.1）**：
+
+| 已落地 | 提交 | 说明 |
+| --- | --- | --- |
+| 集群装配与同构启动 | `a421580`、`0dca1c6`…`c41185d`、`4ca5ee5` | `arachne` feature 下挂载 `cluster::arachne_*`；`Arachne::start` 在自己的运行时里引导（F-1 的直接后果）；`leader_ready` 由写探测回答（F-3） |
+| 成员表取代 `HYDRA_ROLE` | `b87c289` | 集群判定 = 有没有配 `HYDRA_CLUSTER_PEERS`；`NodeRole::Edge` 退役 |
+| 物化循环端到端 | `2176f14` | 真 raft + 真 store：`head` → toc → 逐实体 → 解码 → 安装 → **成功后才推水位**；退避 1s→2s→…→60s；未物化 = 不可当选 |
+| fidelity 实体（D-7）与编码期密封（D-8） | 本轮 | `EntityPath::Fidelity`；`SealedMaterial` 由调用方传入 |
+
+**尚未落地（引用本 ADR 时不得当作已完成）**：
+
+1. `MaterializeTarget` 的真实实现（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）**未接**；发布侧仍走 `SnapshotWire`（属 T3.2）。**因此节点目前还不能从 Arachne 服务配置** —— T3.1 的「真实 3 节点」验收未执行，已执行的是 1 节点 + 真实 store 的端到端与纯函数层的等值/确定性/保密用例。
+2. T3.5（D-6 乙-full）未开始：`admin/tenant_config_api.rs`、`x-hydra-tenant-token`、`/api/v1/internal/tenant-config/*` 仍在。
+3. `RETIRED_CLUSTER_ENV` **刻意为空**：计划要退役的 7 个变量目前仍被 Redis 路径读取，表里填名字等于宣称已退役（有用例钉住这张表为空）。
+4. §9 基线同步未做：`dev-docs/cluster.md` / `ops.md` 仍描述 Redis 租约世界。
 
 ## 11. 可逆性（Reversibility）
 

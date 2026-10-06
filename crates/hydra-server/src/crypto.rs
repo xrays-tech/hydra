@@ -51,7 +51,11 @@ pub enum CryptoError {
 }
 
 /// One encrypted secret as persisted: ciphertext + nonce + key version.
-#[derive(Debug, Clone)]
+///
+/// Serialisable because it now travels inside a config-tree entity
+/// (`arachne_entities::FidelityTreeEntity`), not only through the snapshot wire's DTOs. The
+/// serialized form carries the same three fields the DTO does, so nothing new is exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sealed {
     pub ciphertext: Vec<u8>,
     pub nonce: [u8; NONCE_LEN],

@@ -31,9 +31,10 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 
-use super::arachne_entities::{build_config, split_config, toc_of, tree_of};
+use super::arachne_entities::{build_config_with_fidelity, split_config, tree_of, SealedMaterial};
 use super::arachne_materialize::{MaterializeGate, Plan};
 use super::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome, StoreError};
+use super::content::FidelityRows;
 
 /// What one convergence pass did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +75,9 @@ impl std::error::Error for MaterializeError {}
 /// recording target: the properties above are about ORDER (apply before watermark), which a
 /// test that only inspected a live store could not observe.
 pub trait MaterializeTarget: Send + Sync {
-    /// Install `cfg` as the config this node serves.
-    fn apply(&self, cfg: Arc<ConfigData>) -> Result<(), String>;
+    /// Install `cfg` (and the fidelity rows a replica needs to rebuild its own SQLite tables)
+    /// as the state this node serves.
+    fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String>;
 }
 
 /// The per-node loop: gate + store + target.
@@ -83,17 +85,25 @@ pub struct Materializer {
     store: ArachneConfigStore,
     gate: MaterializeGate,
     target: Arc<dyn MaterializeTarget>,
+    /// Needed to open the sealed fidelity rows. Held rather than passed per call so a
+    /// materializer cannot be driven without the key that unseals its own replica.
+    key_provider: Arc<dyn crate::crypto::KeyProvider>,
 }
 
 impl Materializer {
     /// Build a loop over a store and a target. The gate starts empty, i.e. this node has
     /// materialized nothing and is therefore not yet eligible to lead.
     #[must_use]
-    pub fn new(store: ArachneConfigStore, target: Arc<dyn MaterializeTarget>) -> Self {
+    pub fn new(
+        store: ArachneConfigStore,
+        target: Arc<dyn MaterializeTarget>,
+        key_provider: Arc<dyn crate::crypto::KeyProvider>,
+    ) -> Self {
         Self {
             store,
             gate: MaterializeGate::new(),
             target,
+            key_provider,
         }
     }
 
@@ -151,29 +161,33 @@ impl Materializer {
             }
             Plan::Hold { hash, .. } => Ok(Converged::Deferred { hash }),
             Plan::Materialize { hash } => match self.store.read().await {
-                Ok(ReadOutcome::Tree(tree)) => match build_config(&tree) {
-                    Ok(cfg) => {
-                        // Apply FIRST, then move the watermark: the other order is the bug
-                        // this test file exists for.
-                        if let Err(reason) = self.target.apply(Arc::new(cfg)) {
-                            let wait = self.gate.failed(&hash);
-                            return Err(MaterializeError::Unavailable {
-                                hash,
-                                reason: format!("{reason} (retry in {wait:?})"),
-                            });
+                Ok(ReadOutcome::Tree(tree)) => {
+                    match build_config_with_fidelity(&tree, self.key_provider.as_ref()) {
+                        Ok((cfg, fidelity)) => {
+                            // Apply FIRST, then move the watermark: the other order is the bug
+                            // this test file exists for.
+                            if let Err(reason) =
+                                self.target.apply(Arc::new(cfg), Arc::new(fidelity))
+                            {
+                                let wait = self.gate.failed(&hash);
+                                return Err(MaterializeError::Unavailable {
+                                    hash,
+                                    reason: format!("{reason} (retry in {wait:?})"),
+                                });
+                            }
+                            self.gate.succeeded(&hash);
+                            tracing::info!(hash = %hash, "config materialized");
+                            Ok(Converged::Applied { hash })
                         }
-                        self.gate.succeeded(&hash);
-                        tracing::info!(hash = %hash, "config materialized");
-                        Ok(Converged::Applied { hash })
+                        Err(e) => {
+                            let wait = self.gate.failed(&hash);
+                            Err(MaterializeError::Unavailable {
+                                hash,
+                                reason: format!("{e} (retry in {wait:?})"),
+                            })
+                        }
                     }
-                    Err(e) => {
-                        let wait = self.gate.failed(&hash);
-                        Err(MaterializeError::Unavailable {
-                            hash,
-                            reason: format!("{e} (retry in {wait:?})"),
-                        })
-                    }
-                },
+                }
                 Ok(ReadOutcome::Empty) => {
                     // The head named a tree, then vanished. Holding the previous config is the
                     // safe answer; wiping it is not.
@@ -204,21 +218,22 @@ impl Materializer {
 /// string, and an empty one would be indistinguishable from a bug that passed `""`.
 pub const NO_HEAD_MARKER: &str = "<no-config-published>";
 
-/// Publish a tree built from `cfg`, for tests and for the leader's own startup publish.
+/// Encode a config into the tree a publisher commits.
+///
+/// Encoding only: committing is `ArachneConfigStore::publish`, which is the single writer of the
+/// head. Splitting the two keeps "what bytes describe this config" testable without a cluster.
 ///
 /// # Errors
-/// [`StoreError`] from the store, or a codec refusal surfaced as a store error.
-pub async fn publish_config(
-    store: &ArachneConfigStore,
+/// [`StoreError::Arachne`] when the codec refuses the config (an unkeyable id, a missing sealed
+/// row, a seal that fails). All of them must stop the publish rather than degrade.
+pub fn encode_config(
     cfg: &ConfigData,
-) -> Result<String, StoreError> {
-    let blobs = split_config(cfg)
+    fidelity: &crate::cluster::content::FidelityRows,
+    sealed: SealedMaterial,
+) -> Result<ConfigTree, StoreError> {
+    let blobs = split_config(cfg, fidelity, sealed)
         .map_err(|e| StoreError::Arachne(format!("cannot encode the config tree: {e}")))?;
-    let tree: ConfigTree = tree_of(&blobs)
-        .map_err(|e| StoreError::Arachne(format!("cannot build the config tree: {e}")))?;
-    let _ = toc_of(&tree)
-        .map_err(|e| StoreError::Arachne(format!("cannot describe the config tree: {e}")))?;
-    store.publish(&tree).await
+    tree_of(&blobs).map_err(|e| StoreError::Arachne(format!("cannot build the config tree: {e}")))
 }
 
 #[cfg(test)]
@@ -240,6 +255,9 @@ mod tests {
         applied: Mutex<Vec<(usize, usize)>>,
         fail_next: Mutex<bool>,
         tenants_seen: Mutex<usize>,
+        /// How many limit roles the last apply carried — the fidelity rows must travel WITH the
+        /// config, or a replica cannot rebuild its tables.
+        fidelity_rows: Mutex<usize>,
     }
 
     impl RecordingTarget {
@@ -252,10 +270,14 @@ mod tests {
         fn tenants_seen(&self) -> usize {
             *self.tenants_seen.lock().expect("lock")
         }
+        fn fidelity_rows(&self) -> usize {
+            *self.fidelity_rows.lock().expect("lock")
+        }
     }
 
     impl MaterializeTarget for RecordingTarget {
-        fn apply(&self, cfg: Arc<ConfigData>) -> Result<(), String> {
+        fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
+            *self.fidelity_rows.lock().expect("lock") = fidelity.limit_roles.len();
             if *self.fail_next.lock().expect("lock") {
                 *self.fail_next.lock().expect("lock") = false;
                 return Err("target refused the apply".to_string());
@@ -304,6 +326,55 @@ mod tests {
         {
             assert!(Instant::now() < deadline, "node never accepted a write");
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Encode and commit `cfg`: the two steps a publisher performs, so the tests read as
+    /// "publish a config" instead of spelling the split out at every call site.
+    async fn publish(store: &ArachneConfigStore, cfg: &ConfigData) -> String {
+        let tree = encode_config(cfg, &fidelity(), sealed_fixture()).expect("encode");
+        store.publish(&tree).await.expect("commit the config tree")
+    }
+
+    fn kp() -> crate::crypto::StaticKeyProvider {
+        crate::crypto::StaticKeyProvider::new([7u8; 32], 1)
+    }
+
+    /// Sealed ONCE and reused: the tree name must not move between publishes of the same rows
+    /// (a fresh AES-GCM seal would use a new nonce and rename the tree every time).
+    fn sealed_fixture() -> SealedMaterial {
+        use std::sync::OnceLock;
+        static SEALED: OnceLock<SealedMaterial> = OnceLock::new();
+        SEALED
+            .get_or_init(|| {
+                SealedMaterial::seal_plaintext(
+                    &config(&[("t1", "acme.example")]),
+                    &fidelity(),
+                    &kp(),
+                )
+                .expect("seal fixture")
+            })
+            .clone()
+    }
+
+    /// Fidelity rows with one DISABLED row: the shape a replica must be able to rebuild, and
+    /// the reason the fidelity entity exists at all.
+    fn fidelity() -> FidelityRows {
+        FidelityRows {
+            limit_roles: vec![hydra_core::model::LimitRole {
+                id: "r-disabled".into(),
+                name: "disabled".into(),
+                matching_key: None,
+                matching_model: None,
+                matching_tenant: None,
+                matching_provider: None,
+                limit_count: None,
+                limit_token: None,
+                window: "1m".into(),
+                enabled: false,
+                created_at: String::new(),
+            }],
+            ..FidelityRows::default()
         }
     }
 
@@ -358,7 +429,7 @@ mod tests {
         wait_writable(&node).await;
         let store = ArachneConfigStore::new(node.handle.clone());
         let target = Arc::new(RecordingTarget::default());
-        let mut mat = Materializer::new(store.clone(), target.clone());
+        let mut mat = Materializer::new(store.clone(), target.clone(), Arc::new(kp()));
 
         assert!(
             !mat.may_be_leader(),
@@ -371,7 +442,7 @@ mod tests {
         );
 
         let cfg = config(&[("t1", "acme.example"), ("t2", "globex.example")]);
-        let hash = publish_config(&store, &cfg).await.expect("publish");
+        let hash = publish(&store, &cfg).await;
 
         let outcome = mat.converge().await.expect("converge");
         assert_eq!(outcome, Converged::Applied { hash: hash.clone() });
@@ -381,6 +452,13 @@ mod tests {
             target.tenants_seen(),
             2,
             "the target must receive the DECODED config, not a blob"
+        );
+        assert_eq!(
+            target.fidelity_rows(),
+            1,
+            "the target must receive the fidelity rows TOO: `ConfigData` alone cannot rebuild a \
+             replica, and the one row here is DISABLED, so it is absent from the decoded config \
+             and present only in the fidelity entity"
         );
         assert!(
             mat.may_be_leader(),
@@ -407,10 +485,10 @@ mod tests {
         wait_writable(&node).await;
         let store = ArachneConfigStore::new(node.handle.clone());
         let target = Arc::new(RecordingTarget::default());
-        let mut mat = Materializer::new(store.clone(), target.clone());
+        let mut mat = Materializer::new(store.clone(), target.clone(), Arc::new(kp()));
 
         let cfg = config(&[("t1", "acme.example")]);
-        let hash = publish_config(&store, &cfg).await.expect("publish");
+        let hash = publish(&store, &cfg).await;
 
         target.fail_next();
         let first = mat.converge().await;
@@ -462,17 +540,17 @@ mod tests {
         wait_writable(&node).await;
         let store = ArachneConfigStore::new(node.handle.clone());
         let target = Arc::new(RecordingTarget::default());
-        let mut mat = Materializer::new(store.clone(), target.clone());
+        let mut mat = Materializer::new(store.clone(), target.clone(), Arc::new(kp()));
 
         let mut cfg = config(&[("t1", "acme.example")]);
-        let first_hash = publish_config(&store, &cfg).await.expect("publish");
+        let first_hash = publish(&store, &cfg).await;
         mat.converge().await.expect("first");
         assert_eq!(target.applied_count(), 1);
 
         // Publishing the SAME config again (which a management write does after any change,
         // whether or not the change touched an entity) must produce the same tree name and
         // therefore re-materialize nothing.
-        let same_hash = publish_config(&store, &cfg).await.expect("publish again");
+        let same_hash = publish(&store, &cfg).await;
         assert_eq!(
             first_hash, same_hash,
             "a publish with identical entities must be the same tree"
@@ -488,7 +566,7 @@ mod tests {
         cfg.tenants_by_domain
             .insert("initech.example".into(), tenant("t3", "initech.example"));
         cfg.reindex_tenants();
-        let edited = publish_config(&store, &cfg).await.expect("publish edit");
+        let edited = publish(&store, &cfg).await;
         assert_ne!(edited, first_hash, "an edit must name a new tree");
         assert_eq!(
             mat.converge().await.expect("converge edit"),
@@ -511,7 +589,7 @@ mod tests {
         wait_writable(&node).await;
         let store = ArachneConfigStore::new(node.handle.clone());
         let target = Arc::new(RecordingTarget::default());
-        let mut mat = Materializer::new(store.clone(), target.clone());
+        let mut mat = Materializer::new(store.clone(), target.clone(), Arc::new(kp()));
 
         node.handle
             .without_redirect()
