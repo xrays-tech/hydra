@@ -304,17 +304,24 @@ jobs:
             exit 1
           fi
 
-      # Cluster HA, end to end: a standby forwards admin writes to the active node, the
-      # standby is promoted when the active dies, and an edge keeps serving across the
-      # switch and re-points its polling at the new active by itself. The drill shortens
-      # HYDRA_LEADER_LEASE_MS to 3s, so it runs in seconds instead of ~18s.
-      - name: Cluster HA (forwarding + failover + edge transparency)
+      # Cluster HA, end to end (ADR-0001 gates 1/3/4/5): three REAL hydra processes that are all
+      # raft members — a management write aimed at ANY of them is accepted, `kill -9` on the leader
+      # promotes a new one within 3s with never two claimants, every node ends up serving the same
+      # config, and with a minority alive a write is refused 503 `config_not_published` while the
+      # data plane keeps serving a real proxied request.
+      #
+      # This REPLACES `integration/test_cluster_ha.py`, which drove the retired topology
+      # (`HYDRA_ROLE=leader|edge` + `HYDRA_CONTROL_URL`) and could therefore only report CANNOT
+      # VERIFY. What that drill covered and this one does not: "a standby forwards admin writes to
+      # the active node" (retired by D-3/乙 — any node applies its own write), and edge transparency
+      # (the `edge` role is retired with T4.0; there is no polling to re-point).
+      - name: Arachne control plane (write anywhere, failover, convergence, minority)
         env:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
-          python3 integration/test_cluster_ha.py
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          python3 integration/test_arachne_control_plane.py
 
       # STARTUP KNOBS on the real binary — the two operator-facing promises that were prose
       # only: `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster-role node**

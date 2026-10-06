@@ -401,11 +401,7 @@ pub fn config_from_env(
     .map_err(|e| e.to_string())?;
 
     let data_dir = arachne_data_dir(sqlite_path, override_data_dir);
-    let cluster_id = cluster_id_from(
-        std::env::var("HYDRA_CLUSTER_ID").ok().as_deref(),
-        &data_dir.to_string_lossy(),
-    );
-    Ok(arachne_config(&peers, cluster_id, data_dir))
+    Ok(arachne_config(&peers, cluster_id_env(), data_dir))
 }
 
 /// A live Arachne node plus the cached answer to "am I the leader".
@@ -632,16 +628,10 @@ impl ArachneControl {
             shutdown: Arc::new(tokio::sync::Notify::new()),
         });
 
-        // The identity check runs before the watch: a node that cannot agree with its own
-        // data directory about which cluster it belongs to must not start serving.
-        await_cluster_preflight(
-            &control,
-            &cluster_id_from(
-                std::env::var("HYDRA_CLUSTER_ID").ok().as_deref(),
-                &data_dir.to_string_lossy(),
-            ),
-        )
-        .await?;
+        // The identity check runs before the watch: a node that cannot agree with its own data
+        // directory about which cluster it belongs to must not start serving. The expected id comes
+        // from the SAME helper the raft group name came from, so the two cannot disagree.
+        await_cluster_preflight(&control, &cluster_id_env()).await?;
 
         control.spawn_leader_watch();
         tracing::info!(
@@ -708,19 +698,54 @@ pub fn arachne_data_dir(sqlite_path: &str, override_dir: Option<&str>) -> PathBu
 /// stable, short, filesystem-agnostic token; an explicit `HYDRA_CLUSTER_ID`
 /// always wins.
 #[must_use]
-pub fn cluster_id_from(explicit: Option<&str>, data_dir: &str) -> String {
+pub fn cluster_id_from(explicit: Option<&str>, members_spec: &str) -> String {
     if let Some(id) = explicit.map(str::trim).filter(|v| !v.is_empty()) {
         return id.to_string();
     }
-    // Standard-library hashing only: this default is a *local* sanity token, not
-    // a security boundary, and adding a digest crate to the dependency tree for
-    // it would be a poor trade. Determinism across builds is not required either
-    // — a cluster that wants a stable, human-chosen id sets HYDRA_CLUSTER_ID.
+    // The default is derived from the MEMBER LIST, not from the data directory. That is the
+    // difference between a cluster that can start and one that cannot: every member of a cluster
+    // shares its `HYDRA_CLUSTER_PEERS` value, while each has its OWN data directory — so a
+    // per-directory default gives every member a different identity, the first one to claim the
+    // handshake key wins, and every other member refuses to join ("this node's Arachne data
+    // directory belongs to a different cluster"). Measured 2026-10-05 by
+    // `integration/test_arachne_control_plane.py`: three nodes, no explicit id, none of them
+    // started.
+    //
+    // The member list is also what ADR-0001 calls the cluster's identity ("the ORDER of
+    // `HYDRA_CLUSTER_PEERS` is immutable for the cluster's lifetime; changing the order means
+    // changing the cluster identity"), which is why the normalised spec — order preserved, only
+    // whitespace and empty entries removed — is hashed rather than a sorted form.
+    //
+    // Standard-library hashing only: this is a *local* sanity token, not a security boundary, and
+    // a digest crate for it would be a poor trade. Determinism across builds is not required
+    // either — a cluster that wants a stable, human-chosen id sets `HYDRA_CLUSTER_ID`.
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    let canonical = members_spec
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
     let mut hasher = DefaultHasher::new();
-    data_dir.hash(&mut hasher);
+    canonical.hash(&mut hasher);
     format!("hydra-{:016x}", hasher.finish())
+}
+
+/// The cluster identity THIS process was configured for: `HYDRA_CLUSTER_ID` when set, otherwise
+/// [`cluster_id_from`]'s member-list default.
+///
+/// ONE owner for the derivation, because two call sites must agree exactly: the raft group's name
+/// (`config_from_env`) and the handshake that compares the data directory's recorded id against it
+/// (`start_from_env`). Computing them separately is how they drift.
+#[must_use]
+pub fn cluster_id_env() -> String {
+    cluster_id_from(
+        std::env::var("HYDRA_CLUSTER_ID").ok().as_deref(),
+        std::env::var("HYDRA_CLUSTER_PEERS")
+            .unwrap_or_default()
+            .as_str(),
+    )
 }
 
 /// The state a node reports about its own cluster membership, used to verify on
@@ -1163,16 +1188,30 @@ mod tests {
     /// Falsification: return a constant default and the two directories produce
     /// the same id, which makes the assertion fail.
     #[test]
-    fn the_cluster_id_default_is_per_data_dir() {
-        let a = cluster_id_from(None, "/var/lib/hydra/arachne-a");
-        let b = cluster_id_from(None, "/var/lib/hydra/arachne-b");
+    fn the_cluster_id_default_follows_the_member_list() {
+        let a = cluster_id_from(None, "n1=127.0.0.1:1,n2=127.0.0.1:2,n3=127.0.0.1:3");
+        let b = cluster_id_from(None, "n1=127.0.0.1:1,n2=127.0.0.1:2,n3=127.0.0.1:4");
         assert_ne!(
             a, b,
-            "the default cluster id must differ per data directory, or two clusters on one host \
-             would form one raft group"
+            "a different member list is a different cluster, or two clusters on one host would \
+             form one raft group"
+        );
+        // THE property that makes a multi-node cluster start at all: every MEMBER of one cluster
+        // derives the SAME id. The old default hashed each node's own data directory, so the first
+        // member to claim the handshake key won and the rest refused to join.
+        assert_eq!(
+            a,
+            cluster_id_from(None, "n1=127.0.0.1:1, n2=127.0.0.1:2 ,n3=127.0.0.1:3"),
+            "whitespace must not change the identity: every member types the list its own way"
+        );
+        assert_ne!(
+            a,
+            cluster_id_from(None, "n1=127.0.0.1:2,n2=127.0.0.1:1,n3=127.0.0.1:3"),
+            "the ORDER is part of the identity (ADR-0001: raft ids are the 1-based position), so a \
+             reordered list is a different cluster"
         );
         assert_eq!(
-            cluster_id_from(Some("named-cluster"), "/var/lib/hydra/arachne-a"),
+            cluster_id_from(Some("named-cluster"), "n1=127.0.0.1:1"),
             "named-cluster",
             "an explicit HYDRA_CLUSTER_ID wins"
         );

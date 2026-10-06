@@ -244,6 +244,22 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(not(feature = "arachne"))]
     #[allow(unused_variables, clippy::no_effect_underscore_binding)]
     let _arachne_control: Option<()> = None;
+    // Does the CONTROL PLANE carry leadership on this node? True only when a raft node was actually
+    // started (`HYDRA_CLUSTER_PEERS` set). It decides whether the Redis control path — the lease
+    // election, the snapshot-polling client and the standby materializer, all ADR-0001 retirements
+    // — is started at all, and therefore whether its variables are REQUIRED.
+    //
+    // Measured 2026-10-05 by `integration/test_arachne_control_plane.py`: without this, a raft
+    // member refused to boot at all ("leader mode requires HYDRA_CONTROL_URL"), so the acceptance
+    // gates 1/3/4/5 could not be executed against the new model — the product still demanded a
+    // variable that only the retired world read.
+    #[cfg(feature = "arachne")]
+    let arachne_carries_leadership = arachne_control
+        .as_ref()
+        .is_some_and(|c| c.config_store().is_some());
+    #[cfg(not(feature = "arachne"))]
+    let arachne_carries_leadership = false;
+
     info!(role = %role, "hydra gateway starting");
 
     // Cluster-mode fail-closed startup contract (v8 plan §2.1 / §7.3):
@@ -318,7 +334,12 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 .into(),
         );
     }
-    if role == hydra_server::cluster::NodeRole::Leader && cluster.control_url.is_none() {
+    // The control URL was the Redis-era standby-sync endpoint. A node whose leadership comes from
+    // the Arachne control plane does not poll it, so it must not be REQUIRED to configure it.
+    if role == hydra_server::cluster::NodeRole::Leader
+        && cluster.control_url.is_none()
+        && !arachne_carries_leadership
+    {
         return Err(
             "leader mode requires HYDRA_CONTROL_URL (the active leader's control endpoint, \
              used by the standby sync); refusing to start"
@@ -1098,82 +1119,86 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // materialization so they are ready to take over within one lease.
     // Gated on `cluster-redis` (the Redis backbone); leader mode without the
     // feature already failed the startup checks above.
+    // ...and skipped entirely when the Arachne control plane is up: leadership is the raft write
+    // probe then, and the snapshot-polling client, the lease machine and the standby materializer
+    // would be three conflicting owners of "who may write" and "what config is current". This is
+    // the boot half of plan T4.1; the files themselves are deleted next.
     #[cfg(feature = "cluster-redis")]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = if role
-        == hydra_server::cluster::NodeRole::Leader
-    {
-        let backend = redis_backend.ok_or("cluster mode has a Redis backbone (checked above)")?;
-        let lease_ms = leader_lease_ms_from_env()?;
-        let lease_store: Arc<dyn hydra_server::cluster::lease::LeaseStore> = Arc::new(
-            hydra_server::redis::RedisLeaseStore::new(backend.pool().clone()),
-        );
-        let election = Arc::new(hydra_server::cluster::lease::LeaderElection::new(
-            lease_store,
-            cluster.node_id.clone(),
-            lease_ms,
-        ));
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+        if role == hydra_server::cluster::NodeRole::Leader && !arachne_carries_leadership {
+            let backend =
+                redis_backend.ok_or("cluster mode has a Redis backbone (checked above)")?;
+            let lease_ms = leader_lease_ms_from_env()?;
+            let lease_store: Arc<dyn hydra_server::cluster::lease::LeaseStore> = Arc::new(
+                hydra_server::redis::RedisLeaseStore::new(backend.pool().clone()),
+            );
+            let election = Arc::new(hydra_server::cluster::lease::LeaderElection::new(
+                lease_store,
+                cluster.node_id.clone(),
+                lease_ms,
+            ));
 
-        // Standby sync: poll the active leader, materialize the local replica
-        // on every applied snapshot (out-of-order guarded, F-4), and drive
-        // the election freshness gate from the materialization result.
-        let url = cluster
-            .control_url
-            .clone()
-            .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
-        let token = cluster
-            .cluster_token
-            .clone()
-            .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
-        let on_poll = {
-            let election = election.clone();
-            let pool = pool
+            // Standby sync: poll the active leader, materialize the local replica
+            // on every applied snapshot (out-of-order guarded, F-4), and drive
+            // the election freshness gate from the materialization result.
+            let url = cluster
+                .control_url
                 .clone()
-                .ok_or("leader mode has a SQLite pool (checked above)")?;
-            let key_provider = key_provider.clone();
-            // F-4: monotonic out-of-order guard — a stale snapshot (version
-            // <= the last claimed) is never materialized, so the replica can
-            // never regress below a version already in flight / committed.
-            let guard = Arc::new(hydra_server::cluster::replica::MaterializationGuard::new());
-            let gate = Arc::new(move |ok: bool| election.mark_sync_ok(ok))
-                as Arc<dyn Fn(bool) + Send + Sync>;
-            // The gate decision itself lives in `replica::gate_hook`, so tests
-            // can drive the real wiring instead of a copy of it.
-            Some(hydra_server::cluster::replica::gate_hook(
-                guard,
-                pool,
+                .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
+            let token = cluster
+                .cluster_token
+                .clone()
+                .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
+            let on_poll = {
+                let election = election.clone();
+                let pool = pool
+                    .clone()
+                    .ok_or("leader mode has a SQLite pool (checked above)")?;
+                let key_provider = key_provider.clone();
+                // F-4: monotonic out-of-order guard — a stale snapshot (version
+                // <= the last claimed) is never materialized, so the replica can
+                // never regress below a version already in flight / committed.
+                let guard = Arc::new(hydra_server::cluster::replica::MaterializationGuard::new());
+                let gate = Arc::new(move |ok: bool| election.mark_sync_ok(ok))
+                    as Arc<dyn Fn(bool) + Send + Sync>;
+                // The gate decision itself lives in `replica::gate_hook`, so tests
+                // can drive the real wiring instead of a copy of it.
+                Some(hydra_server::cluster::replica::gate_hook(
+                    guard,
+                    pool,
+                    store.clone(),
+                    key_provider,
+                    gate,
+                ))
+            };
+            let client = hydra_server::cluster::control_client::ControlClient::new(
+                hydra_server::cluster::control_client::ControlClientConfig {
+                    url,
+                    token,
+                    poll_interval: cluster.poll_interval,
+                },
                 store.clone(),
-                key_provider,
-                gate,
-            ))
-        };
-        let client = hydra_server::cluster::control_client::ControlClient::new(
-            hydra_server::cluster::control_client::ControlClientConfig {
-                url,
-                token,
-                poll_interval: cluster.poll_interval,
-            },
-            store.clone(),
-            key_provider.clone(),
-            on_poll,
-        );
-        #[cfg(feature = "cluster-redis")]
-        let client = match &registry {
-            Some(r) => client.with_discovery(r.clone()),
-            None => client,
-        };
-        client.spawn();
-        hydra_server::cluster::lease::spawn_election_task(election.clone(), lease_ms);
-        info!(
-            node_id = %cluster.node_id,
-            lease_ms,
-            "leader election started (lease holder = active writer)"
-        );
+                key_provider.clone(),
+                on_poll,
+            );
+            #[cfg(feature = "cluster-redis")]
+            let client = match &registry {
+                Some(r) => client.with_discovery(r.clone()),
+                None => client,
+            };
+            client.spawn();
+            hydra_server::cluster::lease::spawn_election_task(election.clone(), lease_ms);
+            info!(
+                node_id = %cluster.node_id,
+                lease_ms,
+                "leader election started (lease holder = active writer)"
+            );
 
-        let ready = election.clone();
-        Some(Arc::new(move || ready.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
-    } else {
-        None
-    };
+            let ready = election.clone();
+            Some(Arc::new(move || ready.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
+        } else {
+            None
+        };
     #[cfg(not(feature = "cluster-redis"))]
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
