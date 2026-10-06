@@ -51,7 +51,6 @@ BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra")
 DIR = os.path.join(ROOT, ".acceptance", "tenant-write-publish")
 
 ADMIN_TOKEN = "hydra-pubfail-admin-2026"
-CLUSTER_TOKEN = "hydra-pubfail-cluster-2026"
 TENANT_TOKEN = "hydra-pubfail-tenant-token-abcdef"
 ENCRYPTION_KEY = base64.b64encode(b"P" * 32).decode()
 
@@ -132,7 +131,6 @@ class Node:
         self.env.update(
             {
                 "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
-                "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
                 "HYDRA_ENCRYPTION_KEY": ENCRYPTION_KEY,
                 "HYDRA_NODE_ID": name,
                 "HYDRA_CLUSTER_ID": "tenant-write-publish",

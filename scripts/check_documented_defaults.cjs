@@ -77,7 +77,6 @@ const UNVERIFIED_OK = records(process.env.CDD_UNVERIFIED_OK, [
   ['HYDRA_ADMIN_TOKEN', 'a secret with no default; the code refuses to start when it is missing'],
   ['HYDRA_ENCRYPTION_KEY', 'a secret with no default (see HYDRA_ENCRYPTION_KEY_FILE)'],
   ['HYDRA_RESEAL_SECRETS', 'a one-shot switch documented as OFF; the code parses a vocabulary, not a value'],
-  ['HYDRA_CLUSTER_TOKEN', 'a secret with no default'],
   ['HYDRA_TLS_LISTEN', 'documented default is "unset" — the TLS listener is bound iff the variable is set'],
   ['HYDRA_CLICKHOUSE_URL', 'documented default is *(unset)*; required only when the sink is clickhouse'],
   ['HYDRA_CLUSTER_PEERS', 'REQUIRED in cluster mode — there is no default to compare: the list is the decision itself (unset means single-node, which is a different mode rather than a fallback value)'],

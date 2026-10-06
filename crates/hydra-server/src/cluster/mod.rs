@@ -131,15 +131,6 @@ impl fmt::Display for NodeRole {
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub role: NodeRole,
-    /// Shared cluster token (`HYDRA_CLUSTER_TOKEN`), required in cluster mode (fail-closed).
-    ///
-    /// It is compared against the Bearer header on the `/api/v1/internal/*` prefix only — NOT on
-    /// the health or status surfaces, which go through the ADMIN token like every other admin route
-    /// (`admin/mod.rs`: `check_auth` runs before `route`). That prefix has had no routes since
-    /// T3.5/T4.1 retired both of its members, so today the token guards nothing at all; it is still
-    /// REQUIRED at boot, and removing that requirement is a deployment-contract change rather than a
-    /// cleanup (ADR-0001 §7.1).
-    pub cluster_token: Option<String>,
     /// Stable node identity (`HYDRA_NODE_ID`, else `node-<random hex>`). This is a raft member's
     /// name, and its POSITION in `HYDRA_CLUSTER_PEERS` is its numeric raft id.
     pub node_id: String,
@@ -151,9 +142,6 @@ impl ClusterConfig {
     pub fn from_env(role: NodeRole) -> Self {
         Self {
             role,
-            cluster_token: std::env::var("HYDRA_CLUSTER_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty()),
             node_id: node_id_from(
                 std::env::var("HYDRA_NODE_ID").ok().as_deref(),
                 std::env::var("HOSTNAME").ok().as_deref(),
@@ -201,12 +189,11 @@ pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> St
 /// (`cluster/arachne_node.rs`, through named constants rather than literals) and by
 /// `main.rs`; `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` / `HYDRA_CLUSTER_TOKEN` are still read
 /// by the Redis backbone, which stays for the data-plane hot path (ADR-0001 D-1).
-const CLUSTER_ONLY_ENV: [&str; 7] = [
+const CLUSTER_ONLY_ENV: [&str; 6] = [
     "HYDRA_CLUSTER_PEERS",  // the member list — the decision itself
     "HYDRA_CLUSTER_ID",     // optional cluster name: refuses a data directory from another cluster
     "HYDRA_REDIS_URL",      // the data-plane backbone (still required in a cluster)
     "HYDRA_REDIS_MODE",     // ...and its topology
-    "HYDRA_CLUSTER_TOKEN",  // shared control-plane token
     "HYDRA_NODE_ID",        // this node's identity (registry today, raft id after T1.3)
     "HYDRA_ARACHNE_LISTEN", // where this node's raft transport binds
 ];
@@ -230,7 +217,7 @@ const CLUSTER_ONLY_ENV: [&str; 7] = [
 /// yet (`cluster/lease.rs`, `cluster/registry.rs`, `main.rs`'s cluster validation). They move here
 /// in the commit that deletes their readers, not before — claiming otherwise would make the
 /// diagnostic a lie. `HYDRA_ROLE` is already unread (the member list replaced it).
-const RETIRED_CLUSTER_ENV: [&str; 9] = [
+const RETIRED_CLUSTER_ENV: [&str; 10] = [
     "HYDRA_FORWARD_TIMEOUT_SECS",
     "HYDRA_LEADER_LEASE_MS",
     "HYDRA_CONTROL_URL",
@@ -239,6 +226,12 @@ const RETIRED_CLUSTER_ENV: [&str; 9] = [
     "HYDRA_REGISTRY_STALE_GRACE_SECS",
     "HYDRA_FAILOVER_GRACE_MS",
     "HYDRA_ROLE",
+    // The internal control-plane token. It gated `/api/v1/internal/*`, whose two members were
+    // retired (T4.1 the snapshot channel, T3.5/D-6 the internal tenant writes), so the boot
+    // requirement was demanding a secret for endpoints that do not exist. Deleted 2026-10-05 on the
+    // user's ruling that the deployment contract is not unbreakable — and listed HERE so a
+    // deployment that still sets it is TOLD, exactly like the other retirements.
+    "HYDRA_CLUSTER_TOKEN",
     // Not a variable a deployment may keep: it is read by nobody, and it is listed so a
     // deployment that still carries it is TOLD rather than left believing it does something.
     "HYDRA_EDGE",
@@ -528,7 +521,6 @@ mod tests {
                 "HYDRA_CLUSTER_ID",
                 "HYDRA_REDIS_URL",
                 "HYDRA_REDIS_MODE",
-                "HYDRA_CLUSTER_TOKEN",
                 "HYDRA_NODE_ID",
                 "HYDRA_ARACHNE_LISTEN",
             ],
@@ -708,7 +700,7 @@ mod tests {
         );
         assert!(
             retired_present(
-                &present(&["HYDRA_CLUSTER_TOKEN", "HYDRA_REDIS_URL"]),
+                &present(&["HYDRA_CLUSTER_PEERS", "HYDRA_REDIS_URL"]),
                 &table
             )
             .is_empty(),
@@ -732,6 +724,7 @@ mod tests {
                 "HYDRA_REGISTRY_STALE_GRACE_SECS",
                 "HYDRA_FAILOVER_GRACE_MS",
                 "HYDRA_ROLE",
+                "HYDRA_CLUSTER_TOKEN",
                 "HYDRA_EDGE",
             ],
             "the retirement table changed: update this test AND confirm (via the env guard) that \

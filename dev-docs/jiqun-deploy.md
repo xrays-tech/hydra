@@ -74,7 +74,6 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `HYDRA_CLUSTER_ID` | `dogress-dev` | **强烈建议显式设置**。集群身份。**默认值是成员表内容的哈希** ⇒ 改成员表就会改身份，而每个节点的数据目录记着旧身份 ⇒ **全部拒绝启动**（实测报错见 `cluster.md` §6.3）。因此做一次成员变更的前提就是：**从第一天起**把它设成一个稳定的人类可读名字 |
 | `HYDRA_ADMIN_ADDR` | `0.0.0.0:8081` | 管理监听地址（admin REST + UI + `/metrics` + `/healthz` + `/readyz`）。**集群里必须 `0.0.0.0`**（默认 `127.0.0.1:8081` 只允许本机，探针/Service 无法访问） |
 | `HYDRA_ADMIN_TOKEN` | `<admin-token>` | 守护 `/api/v1/*` 的 Bearer token。**每个节点都要**（fail-closed，缺失拒启动）——集群里每个节点都提供管理 API，不再有"只有 leader 需要 token"这回事 |
-| `HYDRA_CLUSTER_TOKEN` | `<cluster-token>` | **启动要求**它存在且 ≥16 字符（fail-closed）。⚠ **今天它不守任何东西**：`/api/v1/internal/*` 前缀已无路由（快照通道与内部租户写端点都退役了）。保留是刻意的——删它是部署契约变化（ADR-0001 §7.1） |
 | `HYDRA_ENCRYPTION_KEY` | `<base64-32B>` | 32 字节的 base64（`openssl rand 32 \| base64`），AES-256-GCM 主密钥：provider api-key 与证书私钥落库/进配置树时密封共用。**全集群必须一致**（任一节点不同则解密失败、fail-closed）。缺失即拒启动；丢失则库不可读 |
 | `HYDRA_REDIS_URL` | `redis://:<pass>@redis:6379/0` | Redis 地址（**数据面唯一必选外置依赖**，fail-closed）。按此 URL 必须可连：服务名 `redis`、端口 `6379`、`requirepass`/ACL 与 URL 密码一致。共享限流/熔断/L2/失效总线共用这一个 Redis |
 | `HYDRA_REDIS_MODE` | `single` | Redis 部署模式：只接受 `single`；**其它任何值（含拼错）快速失败**。**限定**：该开关**只在集群模式下被读取**——单节点默认下既不校验也不提及（`integration/test_startup_knobs.py` K12） |
@@ -83,8 +82,10 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `RUST_LOG` | `info` | `tracing` 日志过滤级别（镜像默认已置 `info`，此项与镜像默认一致即可） |
 
 > **已从本表删除的项**（配置中心若还返回它们，请一并清掉）：`HYDRA_CONTROL_POLL_MS`、
-> `HYDRA_LEADER_LEASE_MS`。它们与 `HYDRA_ROLE` / `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL`
-> 等一起被 ADR-0001 退役，设了会在启动时被 ERROR **逐个点名**（完整清单见 `ops.md` §13.3b）。
+> `HYDRA_LEADER_LEASE_MS`、`HYDRA_CLUSTER_TOKEN`。它们与 `HYDRA_ROLE` / `HYDRA_CONTROL_URL` /
+> `HYDRA_PUBLIC_URL` 等一起被 ADR-0001 退役，设了会在启动时被 ERROR **逐个点名**（完整清单见
+> `ops.md` §13.3b）。**`HYDRA_CLUSTER_TOKEN` 是 2026-10-05 才加进这一列的**：它原本是**启动必填**
+> （守 `/api/v1/internal/*`），而那一族已无路由 ⇒ **集群现在只需要 `HYDRA_ADMIN_TOKEN` 一个 token**。
 
 ---
 
@@ -149,7 +150,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
   （`/api/v1/health` + `Authorization: Bearer`）。**不要**用旧文档的
   `readinessProbe: /healthz/leader`——它会把 Service 收敛到单一节点，而集群里**每个节点
   都能接受管理写**。
-- **Secret**：`kubectl -n hydra create secret generic hydra-cluster --from-literal=admin=<admin-token> --from-literal=cluster=<cluster-token> --from-literal=enc="$(openssl rand 32 | base64)"`。三项都是**启动必填**（`HYDRA_CLUSTER_TOKEN` 虽然今天不守任何东西，仍然是启动要求，见 §3）。若共享配置已含它们，可二选一作为单一来源，避免两处漂移；`HYDRA_ENCRYPTION_KEY` 必须全集群一致。
+- **Secret**：`kubectl -n hydra create secret generic hydra-cluster --from-literal=admin=<admin-token> --from-literal=enc="$(openssl rand 32 | base64)"`。**两项就够**——`HYDRA_CLUSTER_TOKEN` 曾是第三项，2026-10-05 随 `/api/v1/internal/*` 一起删除（见 §3）。若共享配置已含它们，可二选一作为单一来源，避免两处漂移；`HYDRA_ENCRYPTION_KEY` 必须全集群一致。
 - **`POD_NAME`**：若在 env 里用 `$(POD_NAME)`，须先用
   `valueFrom: { fieldRef: { fieldPath: metadata.name } }` 定义 `POD_NAME`（K8s 不会自动注入）。
 - **入口**：Ingress（k3s 默认 `traefik`）→ StatefulSet 的 Service `:8080`。**不需要单独部署
@@ -166,7 +167,6 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | 条件 | 影响 |
 |---|---|
 | 集群模式缺 `HYDRA_REDIS_URL` | 拒绝启动 |
-| 集群模式缺 `HYDRA_CLUSTER_TOKEN` | 拒绝启动（⚠ 尽管它今天不守任何东西，见 §3） |
 | 任何节点缺 `HYDRA_ADMIN_TOKEN` | 拒绝启动 |
 | 集群模式缺 `HYDRA_ENCRYPTION_KEY[_FILE]` | 拒绝启动（库不可读保护） |
 | 集群模式 `HYDRA_USAGE_SINK ≠ clickhouse` | 拒绝启动 |

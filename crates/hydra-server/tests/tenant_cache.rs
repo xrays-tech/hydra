@@ -61,8 +61,7 @@ async fn admin_state() -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no cluster token in tests
-        None, // no leader election in tests
+        None, // no leader gate in tests
     ))
 }
 

@@ -246,16 +246,6 @@ pub struct AdminState {
     /// documented that way on purpose.
     pub snapshot_stale: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Shared cluster token (`HYDRA_CLUSTER_TOKEN`), compared against the Bearer header on the
-    /// `/api/v1/internal/*` prefix. `None` ⇒ those requests are denied (fail-closed).
-    ///
-    /// That prefix now has **no routes at all**: `GET /api/v1/internal/control` went with the
-    /// snapshot channel (ADR-0001 T4.1) and `/api/v1/internal/tenant-config/*` with the forwarded
-    /// management write (D-6 / T3.5). What remains is only this gate, so the token is currently a
-    /// BOOT requirement with no consumer — recorded in ADR-0001 §7.1 and deliberately NOT removed,
-    /// because deleting it changes the deployment contract (manifests, `CLUSTER_ONLY_ENV`, the
-    /// startup refusal) and needs its own decision.
-    pub cluster_token: Option<String>,
     /// Whether this node is a leader it may accept writes on. `Some(f)` on a cluster node,
     /// `None` on single-node. Backed by the Arachne **write probe** — not by `leader_hint` (a
     /// fresh leader's hint does not point at itself) and not by any lease: the Redis lease is
@@ -344,7 +334,6 @@ impl AdminState {
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
         admission: AdmissionControl,
-        cluster_token: Option<String>,
         leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
         Self {
@@ -358,7 +347,6 @@ impl AdminState {
             snapshot_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission,
             default_concurrency_policy: DEFAULT_CONCURRENCY_POLICY,
-            cluster_token,
             leader_ready,
             auth_fail_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             auth_fail_per_min: admin_auth_fail_limit_per_min_from_env(),
@@ -442,13 +430,6 @@ impl AdminService {
     /// with one. Generate with `openssl rand -hex 32`.
     pub const MIN_ADMIN_TOKEN_LEN: usize = 16;
 
-    /// Minimum accepted `HYDRA_CLUSTER_TOKEN` length, the same floor as the admin
-    /// token. The cluster token was only ever checked for PRESENCE (`main.rs`),
-    /// so a 1-character token booted fine while the admin token refused to start
-    /// below 16 — and this is the token that authorises the internal control
-    /// plane and cross-tenant writes. One floor, two tokens that must both be
-    /// unguessable.
-    pub const MIN_CLUSTER_TOKEN_LEN: usize = 16;
     #[must_use]
     pub fn token_from_env() -> Option<String> {
         std::env::var("HYDRA_ADMIN_TOKEN")
@@ -718,45 +699,14 @@ impl ServeHttp for AdminService {
             return cluster_api::leader_health(&self.state, &trace_id);
         }
 
-        // Internal control-plane endpoints (cluster P1): gated by the SHARED
-        // cluster token (`HYDRA_CLUSTER_TOKEN`), not the admin token. Fail-closed
-        // when unset — and NOTE that no route lives under this prefix any more
-        // (both families retired: T4.1 and T3.5), so this gate currently matches
-        // nothing and answers 401 to the prefix. Kept because the token itself is
-        // still a startup requirement (ADR-0001 §7.1).
-        if path.starts_with("/api/v1/internal/") {
-            // Both sides must be PRESENT and equal. Comparing
-            // `Option != Option` made an unset `HYDRA_CLUSTER_TOKEN` (None —
-            // every single-node deployment) plus an absent Authorization header
-            // (also None) evaluate `None != None` == false, skipping the 401
-            // and dispatching to `route()` BEFORE the admin-token gate below.
-            // Explicitly deny the unset case so this stays fail-closed.
-            let authorized = match (
-                self.state.cluster_token.as_deref(),
-                Self::bearer_token(session),
-            ) {
-                (Some(expected), Some(presented)) => {
-                    handlers::constant_time_eq(expected, presented)
-                }
-                _ => false,
-            };
-            if !authorized {
-                // Same budget, same counter, same log line as the admin gate: this
-                // one guards the control plane and the cross-tenant write path, so
-                // leaving it unmetered made guessing the cluster token free and
-                // invisible (see `refuse_bad_credential`).
-                return self.refuse_bad_credential(
-                    session,
-                    &path,
-                    &trace_id,
-                    "cluster",
-                    "invalid cluster token",
-                );
-            }
-            return self
-                .route(&method, &path, query.as_deref(), session, &trace_id)
-                .await;
-        }
+        // The `/api/v1/internal/*` gate used to sit here: it compared the Bearer header against
+        // `HYDRA_CLUSTER_TOKEN` and dispatched to `route()`. BOTH members of that family are
+        // retired — `GET /api/v1/internal/control` with the snapshot channel (T4.1) and
+        // `/api/v1/internal/tenant-config/*` with the forwarded management write (T3.5, D-6) — so
+        // the gate could only ever answer 401 to a prefix with no routes. It is deleted along with
+        // the token it guarded (2026-10-05, user ruling: the deployment contract is not
+        // unbreakable). A request to that prefix is now an ordinary 404 for an authenticated
+        // caller, which is the honest answer for "there is nothing here".
 
         // Embedded UI (design §14): serve `/admin/*` WITHOUT the admin token
         // gate. The static HTML/CSS/JS contain no secrets; `app.js` collects

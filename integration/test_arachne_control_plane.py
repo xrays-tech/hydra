@@ -47,7 +47,6 @@ BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra")
 DIR = os.path.join(ROOT, ".acceptance", "arachne-drill")
 
 ADMIN_TOKEN = "hydra-acceptance-admin-2026"
-CLUSTER_TOKEN = "hydra-acceptance-internal-2026"
 ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 FAILOVER_BUDGET_S = 3.0
 
@@ -149,7 +148,6 @@ class Node:
         self.env.update(
             {
                 "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
-                "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
                 "HYDRA_ENCRYPTION_KEY": ENCRYPTION_KEY,
                 "HYDRA_NODE_ID": name,
                 "HYDRA_CLUSTER_PEERS": peers_spec,

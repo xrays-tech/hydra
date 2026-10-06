@@ -59,7 +59,6 @@ async fn admin_state() -> Arc<AdminState> {
         Some(TOKEN.to_string()),
         AdmissionControl::new(),
         None,
-        None,
     ))
 }
 

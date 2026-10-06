@@ -231,10 +231,13 @@ def main():
                     f"(documented auth: false; documented statuses: {sorted(expected) or '—'})"
                 )
         elif auth == "cluster":
-            # The internal control plane authenticates with HYDRA_CLUSTER_TOKEN,
-            # which this probe does not carry: all we can verify is that the
-            # refusal is the documented JSON envelope (401/429), not a crash.
-            check("unauthenticated", method, path, request(method, url, data=body, token=None), documented)
+            # The shared-cluster-token class is RETIRED (ADR-0001 T3.5/T4.1 deleted the
+            # `/api/v1/internal/*` family, and 2026-10-05 deleted the token with it), so nothing
+            # should carry this marker any more. If one appears, the API docs and the product have
+            # drifted apart again — report it instead of probing a route that does not exist.
+            violations.append(
+                f"auth class `cluster` is retired but {method} {path} still declares it"
+            )
         else:
             check("unauthenticated", method, path, request(method, url, data=body, token=None), documented)
 

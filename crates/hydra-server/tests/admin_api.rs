@@ -41,12 +41,15 @@ async fn admin_state() -> Arc<AdminState> {
 /// Same, with an explicit per-IP failed-token budget (the throttle test needs a
 /// small one; the default is 10/min).
 async fn admin_state_with_fail_limit(auth_fail_per_min: u32) -> Arc<AdminState> {
-    admin_state_with(auth_fail_per_min, None).await
+    admin_state_with(auth_fail_per_min).await
 }
 
-/// Same, with an explicit cluster token (`None` = a single-node deployment, where
-/// the internal control plane is not served at all).
-async fn admin_state_with(auth_fail_per_min: u32, cluster_token: Option<&str>) -> Arc<AdminState> {
+/// Same, with an explicit failed-token budget.
+///
+/// It used to take a cluster token as well, because `AdminState` held one for the `/api/v1/internal/*`
+/// gate. That gate and the token are deleted (2026-10-05), so this helper is down to the one knob its
+/// callers actually vary.
+async fn admin_state_with(auth_fail_per_min: u32) -> Arc<AdminState> {
     let pool = common::setup_pool().await;
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
@@ -68,8 +71,7 @@ async fn admin_state_with(auth_fail_per_min: u32, cluster_token: Option<&str>) -
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        cluster_token.map(str::to_string),
-        None, // no leader election in tests
+        None, // no leader gate in tests
     );
     state.auth_fail_per_min = auth_fail_per_min;
     Arc::new(state)
@@ -157,24 +159,27 @@ async fn admin_requires_token() {
     assert_eq!(r.status(), 200);
 }
 
-/// Regression — the internal cluster control-plane gate must fail CLOSED when
-/// `HYDRA_CLUSTER_TOKEN` is unset (the single-node / default deployment).
+/// The `/api/v1/internal/*` family is GONE, and the honest answer is a 404.
 ///
-/// The gate used to compare `Option<&str> != Option<&str>`. With an unset
-/// cluster token (`None`) AND no `Authorization` header (`None`),
-/// `None != None` is false, so the 401 was skipped and the request reached
-/// `route()` — *before* the admin-token gate — exposing the whole
-/// `SnapshotWire` (tenants, provider endpoints, grants) unauthenticated.
-/// An absent header was the only bypassing transport, which is why the cluster
-/// harness — it always configures a token — never caught it.
+/// This test used to pin the opposite failure: the gate compared `Option<&str> != Option<&str>`, so
+/// with no token configured AND no Authorization header (`None != None` is false) the 401 was skipped
+/// and the request reached `route()` *before* the admin-token gate, exposing the whole `SnapshotWire`
+/// (tenants, provider endpoints, grants) unauthenticated.
+///
+/// The family is now empty — the snapshot channel went in T4.1 and the internal tenant writes in
+/// T3.5/D-6 — so on 2026-10-05 the gate AND the shared token it compared were deleted. What remains
+/// true, and what this pins:
+///
+/// * an unauthenticated request is still 401: the ADMIN gate runs before any route, so no prefix is
+///   reachable without a credential;
+/// * WITH a valid admin token it is a plain 404 `not_found` — the honest answer for "there is nothing
+///   at this path", which no longer implies that some other token would open it.
 #[tokio::test]
-async fn internal_control_denied_when_no_cluster_token_configured() {
-    // `admin_state()` passes `cluster_token: None`, the production default
-    // whenever HYDRA_ROLE is not leader|edge.
+async fn the_internal_control_prefix_has_no_routes() {
     let state = admin_state().await;
     let port = start_admin(state);
 
-    // (a) No Authorization header at all — the historical bypass.
+    // (a) No Authorization header at all: the admin gate answers, exactly as for any other path.
     let r = req(
         port,
         reqwest::Method::GET,
@@ -183,11 +188,7 @@ async fn internal_control_denied_when_no_cluster_token_configured() {
         None,
     )
     .await;
-    assert_eq!(
-        r.status(),
-        401,
-        "internal/* must fail closed when no cluster token is configured"
-    );
+    assert_eq!(r.status(), 401, "the admin gate runs before any route");
     let body: serde_json::Value = r.json().await.expect("json");
     assert_eq!(body["error"]["code"], "unauthorized");
     assert!(
@@ -195,7 +196,7 @@ async fn internal_control_denied_when_no_cluster_token_configured() {
         "no config snapshot may be disclosed: {body}"
     );
 
-    // (b) The admin token must NOT open the cluster channel.
+    // (b) An admin token is not a way in either: there is nothing behind the prefix any more.
     let r = req(
         port,
         reqwest::Method::GET,
@@ -204,9 +205,19 @@ async fn internal_control_denied_when_no_cluster_token_configured() {
         None,
     )
     .await;
-    assert_eq!(r.status(), 401, "admin token is not the cluster token");
+    assert_eq!(
+        r.status(),
+        404,
+        "the prefix has no routes; an authenticated caller learns that much and no more"
+    );
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "not_found");
+    assert!(
+        body.get("snapshot").is_none(),
+        "no config snapshot may be disclosed: {body}"
+    );
 
-    // (c) A non-internal admin route still works normally (no over-correction).
+    // (c) A real admin route still works (no over-correction from deleting the prefix).
     let r = req(
         port,
         reqwest::Method::GET,
@@ -239,29 +250,27 @@ async fn admin_unknown_path_404() {
         .starts_with("hydra"));
 }
 
-/// The cluster-token gate is metered exactly like the admin-token gate.
+/// A failed credential attempt is METERED: denied, then throttled, then counted.
 ///
-/// It guards the internal control plane and the cross-tenant sub-tenant/route
-/// write endpoints, and it used to compare the token and answer 401 with **no
-/// counter, no budget and no log line** — so guessing that one secret was free and
-/// left no trace at all, which is precisely the hole the admin gate's budget had
-/// been added to close. Both gates now share one per-peer budget and report
-/// through `hydra_admin_auth_failures_total{result="<gate>_denied|_throttled"}`.
+/// The mechanism used to be tested through the cluster-token gate, which shared the same per-peer
+/// budget; that gate is deleted, so the test moved to the gate that still exists — the ADMIN one —
+/// because the property under test is the MECHANISM, not the gate. Before it existed, a failed attempt
+/// answered 401 with **no counter, no budget and no log line**, so guessing the secret was free and
+/// left no trace: precisely the hole the budget was added to close.
 ///
-/// Falsification: restore the bare `err_json(401, …)` in the cluster branch and the
-/// 4th attempt is still a 401 (never a 429) and neither counter moves.
+/// Falsification: restore the bare `err_json(401, …)` in the gate and the 4th attempt is still a 401
+/// (never a 429) and neither counter moves.
 #[tokio::test]
-async fn bad_cluster_tokens_are_throttled_and_counted() {
+async fn bad_admin_tokens_are_throttled_and_counted() {
     use hydra_server::admin::metrics;
-    let state = admin_state_with(3, Some("cluster-token-16chars")).await;
+    let state = admin_state_with(3).await;
     let port = start_admin(state);
 
-    let denied_before = metrics::admin_auth_failures_total("cluster_denied");
-    let throttled_before = metrics::admin_auth_failures_total("cluster_throttled");
+    let denied_before = metrics::admin_auth_failures_total("admin_denied");
+    let throttled_before = metrics::admin_auth_failures_total("admin_throttled");
 
-    // A path under the internal prefix: the cluster gate answers before routing.
-    let path = "/api/v1/internal/control";
-    let wrong = Some("not-the-cluster-token");
+    let path = "/api/v1/tenants";
+    let wrong = Some("not-the-admin-token");
     for attempt in 0..3 {
         let r = req(port, reqwest::Method::GET, path, wrong, None).await;
         assert_eq!(r.status(), 401, "attempt {attempt} must be denied");
@@ -270,42 +279,34 @@ async fn bad_cluster_tokens_are_throttled_and_counted() {
     assert_eq!(
         r.status(),
         429,
-        "past the per-peer budget the cluster gate must throttle, not keep answering 401"
+        "past the per-peer budget the gate must throttle, not keep answering 401"
     );
     assert!(
         r.headers().contains_key("retry-after"),
         "a 429 must tell the peer when to come back"
     );
 
-    // The counters are process-global and other tests in this binary also hit the
-    // internal prefix with the admin token, so assert INCREASE, not an exact delta.
-    let denied_after = metrics::admin_auth_failures_total("cluster_denied");
-    let throttled_after = metrics::admin_auth_failures_total("cluster_throttled");
+    // The counters are process-global and other tests in this binary hit the gate too, so assert
+    // INCREASE, not an exact delta.
+    let denied_after = metrics::admin_auth_failures_total("admin_denied");
+    let throttled_after = metrics::admin_auth_failures_total("admin_throttled");
     assert!(
         denied_after > denied_before,
-        "cluster-gate denials must be counted (before={denied_before}, after={denied_after})"
+        "denials must be counted (before={denied_before}, after={denied_after})"
     );
     assert!(
         throttled_after > throttled_before,
-        "cluster-gate throttles must be counted (before={throttled_before}, after={throttled_after})"
+        "throttles must be counted (before={throttled_before}, after={throttled_after})"
     );
 
-    // And a VALID cluster token still works from a throttled peer: the budget is
-    // only consulted on the failure path, so an operator cannot lock themselves out.
-    let r = req(
-        port,
-        reqwest::Method::GET,
-        path,
-        Some("cluster-token-16chars"),
-        None,
-    )
-    .await;
-    assert_ne!(
+    // And a VALID token still works from a throttled peer: the budget is only consulted on the
+    // failure path, so an operator cannot lock themselves out.
+    let r = req(port, reqwest::Method::GET, path, Some(TOKEN), None).await;
+    assert_eq!(
         r.status(),
-        401,
-        "a correct cluster token must never be refused by the failure budget"
+        200,
+        "a valid token must never be throttled by the same peer's failures"
     );
-    assert_ne!(r.status(), 429, "a successful check must not be throttled");
 }
 
 /// OC-3 — the leader must ADOPT the trace id its peer relayed, so the two sides
@@ -1687,8 +1688,7 @@ async fn empty_body_delete_invalidates_all_local() {
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None,
-        None,
+        None, // no leader gate in tests
     );
     // Attach the invalidation stream publisher (cluster P4).
     state.invalidation = Some(InvalidationStream::new(pool.clone()));
@@ -1880,7 +1880,6 @@ async fn concurrency_snapshot_reports_live_gates() {
         key_provider,
         Some(TOKEN.to_string()),
         admission,
-        None, // no cluster token in tests
         None, // no leader election in tests
     ));
     let port = start_admin(state);
@@ -2534,8 +2533,7 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None,
-        None,
+        None, // no leader gate in tests
     ));
     let port = start_admin(state);
 
@@ -3022,8 +3020,7 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
         Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None,
-        None,
+        None, // no leader gate in tests
     );
     state.invalidation = Some(InvalidationStream::new(pool.clone()));
     let port = start_admin(Arc::new(state));

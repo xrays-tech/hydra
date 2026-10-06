@@ -305,8 +305,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no cluster token in tests
-        None, // no leader election in tests
+        None, // no leader gate in tests
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------

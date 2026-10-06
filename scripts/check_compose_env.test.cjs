@@ -84,7 +84,7 @@ function allRecipes(text = FULL_RECIPE) {
 test('the real repository tree passes', () => {
   const res = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', env: { ...process.env, COMPOSE_ENV_ROOT: '' } });
   assert.equal(res.status, 0, `${res.status} ${res.stdout}${res.stderr}`);
-  assert.match(res.stdout, /none sets any of the 9 variable\(s\) RETIRED_CLUSTER_ENV retires/);
+  assert.match(res.stdout, /none sets any of the 10 variable\(s\) RETIRED_CLUSTER_ENV retires/);
   // The judged counts are asserted so a scan that finds nothing cannot pass: the single-node file
   // has one hydra service, both multi-node files have three.
   assert.match(res.stdout, /docker-compose\.yml=1, environment\/docker-compose\.cluster\.yml=3, environment\/docker-compose\.local\.yml=3/);
@@ -141,13 +141,13 @@ test('FALSIFY: cluster wiring with no member list is caught — that node boots 
   const dir = tree({
     manifests: allManifests([
       'services:',
-      node('hydra-a', ['HYDRA_REDIS_URL: "redis://redis:6379"', 'HYDRA_CLUSTER_TOKEN: "x".repeat(32)']),
+      node('hydra-a', ['HYDRA_REDIS_URL: "redis://redis:6379"', 'HYDRA_NODE_ID: "a"']),
     ].join('\n')),
     recipes: allRecipes(),
   });
   const r = run(dir);
   assert.equal(r.status, 1, r.stdout + r.stderr);
-  assert.match(r.stderr, /sets cluster wiring \(HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN\) but no HYDRA_CLUSTER_PEERS/);
+  assert.match(r.stderr, /sets cluster wiring \(HYDRA_REDIS_URL, HYDRA_NODE_ID\) but no HYDRA_CLUSTER_PEERS/);
 });
 
 test('CONTROL: a node whose environment is one YAML merge is read through the anchor', () => {

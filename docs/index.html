@@ -697,7 +697,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 
     <div class="term reveal">
       <div class="term-head"><i></i><i></i><i></i><span class="t">hydra — join the cluster</span></div>
-      <pre><span class="c">$</span> <span class="k">HYDRA_ROLE</span>=edge <span class="k">HYDRA_REDIS_URL</span>=redis://… <span class="k">HYDRA_CLUSTER_TOKEN</span>=… ./hydra
+      <pre><span class="c">$</span> <span class="k">HYDRA_CLUSTER_PEERS</span>=a=hydra-a:8091,b=hydra-b:8092,c=hydra-c:8093 <span class="k">HYDRA_REDIS_URL</span>=redis://… ./hydra
 <span class="c"># …</span>
 <span class="a">[edge]</span> bootstrap → <span class="k">snapshot v42</span> · routes synced · serving <span class="a">:8080</span>
 <span class="a">[edge]</span> limits <span class="k">shared</span> · breaker <span class="k">shared</span> · auth L2 <span class="k">hot</span><span class="cursor"></span></pre>

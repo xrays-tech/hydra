@@ -124,7 +124,12 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 于是今天 `admin/mod.rs` 里 `path.starts_with("/api/v1/internal/")` 这道闸门**匹配不到任何路由**：任何该前缀的请求得到 401（fail-closed，好过 404 泄露"这里曾有什么"），仅此而已。
 
-**因此 `HYDRA_CLUSTER_TOKEN` 现在是一个没有消费者的启动要求**：`main.rs` 仍要求它存在且够强，三个部署清单仍用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它，而它守的东西已经不存在。**本条只做记录，不改行为**——删掉它是**部署契约变化**（要同时改清单、`CLUSTER_ONLY_ENV`、启动拒绝、以及 `integration/test_startup_knobs.py` 的 K10），需要有它自己的决定与演练。
+**因此 `HYDRA_CLUSTER_TOKEN` 曾变成一个没有消费者的启动要求**（`main.rs` 要求它存在且够强，三个清单用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它，而它守的东西已经不存在）。
+
+**已于 2026-10-05 删除（用户裁定："部署契约又不是牢不可破，如果需要删除就修改契约"）。** 一起删掉的四样：
+① `main.rs` 的启动要求与长度下限校验（`validate_cluster_token` 及其测试模块）；② `AdminState::cluster_token`、`ClusterConfig::cluster_token`、`AdminService::MIN_CLUSTER_TOKEN_LEN`；③ `admin/mod.rs` 里那道 `/api/v1/internal/*` 闸门本身（它只能对一个没有路由的前缀回 401）；④ 清单里的 `${HYDRA_CLUSTER_TOKEN:?…}`（compose 两处 + k8s 示例 + 本地 env 文件）。
+名字移进 `RETIRED_CLUSTER_ENV`（10 项），所以**still 设着它的部署会在启动时被点名**，而不是继续以为它在起作用；`ops.md` §13.3b 与 §9.1 的告警行同步（那条 `gate=cluster` 的说明已删，计数器现在只发 `admin_*`）。
+**结果**：集群部署现在只剩 `HYDRA_ADMIN_TOKEN` 一个 token。
 
 ## 8. 退役影响（Retirement Impact）
 

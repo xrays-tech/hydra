@@ -241,39 +241,31 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     //   meaningless across a cluster (each node would hold its own slice).
     // - the `cluster-redis` cargo feature must be enabled for the shared data
     //   plane (rate limits / breaker / auth L2 / invalidation bus).
+    // Read for `node_id` under `cluster-redis` (breaker votes and the invalidation watermark); a
+    // build without that feature never looks at it, which the attribute makes explicit rather than
+    // leaving a warning that invites someone to delete a value the cluster build needs.
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_variables))]
     let cluster = hydra_server::cluster::ClusterConfig::from_env(role);
     let redis_url = std::env::var("HYDRA_REDIS_URL")
         .ok()
         .filter(|u| !u.is_empty());
-    if role.is_cluster() {
-        if redis_url.is_none() {
-            // Names the member list, NOT the retired `HYDRA_ROLE`: an operator who follows a
-            // message that tells them to set a retired variable makes the deployment worse, and
-            // that variable is exactly what this build reports as IGNORED at boot. Pinned by
-            // `cluster::tests::no_operator_facing_message_names_a_retired_variable`.
-            return Err(
-                "cluster mode (HYDRA_CLUSTER_PEERS is set) requires HYDRA_REDIS_URL (the \
+    if role.is_cluster() && redis_url.is_none() {
+        // Names the member list, NOT the retired `HYDRA_ROLE`: an operator who follows a
+        // message that tells them to set a retired variable makes the deployment worse, and
+        // that variable is exactly what this build reports as IGNORED at boot. Pinned by
+        // `cluster::tests::no_operator_facing_message_names_a_retired_variable`.
+        return Err(
+            "cluster mode (HYDRA_CLUSTER_PEERS is set) requires HYDRA_REDIS_URL (the \
                  data-plane backbone); refusing to start"
-                    .into(),
-            );
-        }
-        let Some(cluster_token) = cluster.cluster_token.as_deref() else {
-            return Err(
-                "cluster mode requires HYDRA_CLUSTER_TOKEN (shared control-channel token); \
-                 refusing to start"
-                    .into(),
-            );
-        };
-        // Strength floor, matching the admin token's. Presence alone is not
-        // enough: this token is all that stands in front of the internal control
-        // plane (fleet config snapshots) and the cross-tenant sub-tenant/route
-        // write endpoints, and the gate accepts it over the network.
-        // `.into()` (not `?`) so the error type conversion matches the other
-        // startup refusals in this function exactly.
-        if let Err(too_short) = validate_cluster_token(cluster_token) {
-            return Err(too_short.into());
-        }
+                .into(),
+        );
     }
+    // NO `HYDRA_CLUSTER_TOKEN` requirement any more (2026-10-05, user ruling). It gated the
+    // `/api/v1/internal/*` family, and BOTH of its members are retired — the config snapshot channel
+    // (T4.1) and the internal tenant-write family (T3.5, D-6). Requiring a secret for endpoints that
+    // do not exist made every deployment provision, rotate and leak-check a credential that guarded
+    // nothing. The name is now in `RETIRED_CLUSTER_ENV`, so a deployment that still sets it is TOLD
+    // rather than left believing it does something.
     if role.is_cluster()
         && std::env::var("HYDRA_ADMIN_TOKEN")
             .map(|t| t.is_empty())
@@ -965,7 +957,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
     Ok(BootstrapComponents {
-        cluster,
         pool,
         store,
         auth,
@@ -987,7 +978,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
 /// The shared components built by [`bootstrap`] and consumed by [`run_server`].
 struct BootstrapComponents {
-    cluster: hydra_server::cluster::ClusterConfig,
+    // `cluster` used to be carried here for the admin service's cluster token. That token is deleted
+    // (2026-10-05), and `ClusterConfig` is read inside `bootstrap` itself — so the field is gone
+    // rather than kept as dead weight that a reader would have to check.
     pool: Option<sqlx::SqlitePool>,
     store: ConfigStore,
     auth: Arc<HttpAuthChecker>,
@@ -1242,9 +1235,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         c.key_provider.clone(),
         admin_token.clone(),
         admission.clone(),
-        // Internal control-plane endpoints (cluster P1).
-        c.cluster.cluster_token.clone(),
-        // Leader-lease gate (/healthz/leader + admin mutation forwarding, P2/P3).
+        // Leader gate (/healthz/leader + admin mutation forwarding, P2/P3).
         // The forward target is resolved LIVE from the cluster registry (the
         // actual lease holder) at forward time — never from HYDRA_CONTROL_URL,
         // which for a primary leader candidate points at this node itself.
@@ -1499,26 +1490,6 @@ fn shutdown_drain_secs() -> u64 {
     parse_shutdown_drain_secs(std::env::var("HYDRA_SHUTDOWN_DRAIN_SECS").ok().as_deref())
 }
 
-/// Reject a cluster token that is too weak to guard the control plane.
-///
-/// Kept PURE (and next to the other parsers) so it can be unit-tested without
-/// spawning a process. Note what this can and cannot promise: it enforces a
-/// LENGTH, and length is not entropy — `"aaaaaaaaaaaaaaaa"` passes. The message
-/// therefore tells the operator how to generate a real one, and `dev-docs/ops.md`
-/// says "at least `MIN_CLUSTER_TOKEN_LEN` characters AND random" rather than
-/// implying that length alone is enough.
-fn validate_cluster_token(token: &str) -> Result<(), String> {
-    if token.len() < AdminService::MIN_CLUSTER_TOKEN_LEN {
-        return Err(format!(
-            "HYDRA_CLUSTER_TOKEN is too short ({} chars, minimum {}); \
-             generate one with `openssl rand -hex 32`; refusing to start",
-            token.len(),
-            AdminService::MIN_CLUSTER_TOKEN_LEN
-        ));
-    }
-    Ok(())
-}
-
 /// Parse half of [`shutdown_drain_secs`], kept PURE so it can be tested without
 /// touching the process environment (like the other config parsers here).
 ///
@@ -1612,50 +1583,6 @@ mod tests {
 
         std::env::remove_var("HYDRA_BREAKER_QUORUM");
         assert_eq!(breaker_quorum_from_env(), 1, "unset → default 1");
-    }
-}
-
-#[cfg(test)]
-mod cluster_token_tests {
-    use super::*;
-
-    /// The cluster token had a PRESENCE-only check until round 12, while the admin
-    /// token refused to boot below `MIN_ADMIN_TOKEN_LEN` — so a one-character token
-    /// booted fine while guarding the internal control plane and the cross-tenant
-    /// sub-tenant/route write endpoints. This pins the floor and the advice.
-    ///
-    /// It also documents the LIMIT of the check: length is not entropy, so
-    /// `"aaaaaaaaaaaaaaaa"` passes — which is why the message names the generator
-    /// instead of implying that 16 characters is "unguessable".
-    #[test]
-    fn the_cluster_token_floor_is_enforced_with_actionable_advice() {
-        let min = AdminService::MIN_CLUSTER_TOKEN_LEN;
-        assert!(
-            min >= 16,
-            "a 16-char floor is what `MIN_ADMIN_TOKEN_LEN` uses"
-        );
-        assert!(validate_cluster_token(&"x".repeat(min)).is_ok());
-        assert!(
-            validate_cluster_token(&"a".repeat(64)).is_ok(),
-            "openssl rand -hex 32"
-        );
-
-        for short in [
-            String::new(),
-            "x".to_string(),
-            "y".repeat(min.saturating_sub(1)),
-        ] {
-            let err = validate_cluster_token(&short).expect_err("must be refused");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("HYDRA_CLUSTER_TOKEN"),
-                "the message must name the variable: {msg}"
-            );
-            assert!(
-                msg.contains("openssl rand -hex 32"),
-                "the message must say how to generate a correct one: {msg}"
-            );
-        }
     }
 }
 

@@ -59,7 +59,6 @@ BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra")
 DIR = os.path.join(ROOT, ".acceptance", "data-plane-failover")
 
 ADMIN_TOKEN = "hydra-load-admin-2026"
-CLUSTER_TOKEN = "hydra-load-internal-2026"
 ENCRYPTION_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 # The acceptance row's numbers. Overridable so a developer can iterate in seconds; CI runs the real
 # window, and the assertions are on RATIOS (`issued >= 0.9 * planned`) so a shorter run is still a
@@ -161,7 +160,6 @@ class Node:
         self.env.update(
             {
                 "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
-                "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
                 "HYDRA_ENCRYPTION_KEY": ENCRYPTION_KEY,
                 "HYDRA_NODE_ID": name,
                 "HYDRA_ARACHNE_LISTEN": f"127.0.0.1:{self.raft_port}",

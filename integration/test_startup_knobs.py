@@ -99,7 +99,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "startup-knobs-test")
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
 ADMIN_TOKEN = "hydra-startup-knobs-admin-2026"
-CLUSTER_TOKEN = "hydra-startup-knobs-cluster-2026"
 # 32 raw bytes, base64: the inline form of the master key (see ops.md §1.2).
 MASTER_KEY = base64.b64encode(b"S" * 32).decode()
 
@@ -244,7 +243,6 @@ CLUSTER_ENV = {
     "HYDRA_CLUSTER_PEERS": PEERS,
     "HYDRA_REDIS_URL": redis_url(),
     "HYDRA_REDIS_MODE": "single",
-    "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
     "HYDRA_USAGE_SINK": "clickhouse",
     "HYDRA_CLICKHOUSE_URL": DEAD_CH,
 }
@@ -261,14 +259,16 @@ CLUSTER_ENV = {
 WIRING = {
     "HYDRA_REDIS_URL": redis_url(),
     "HYDRA_REDIS_MODE": "single",
-    "HYDRA_CLUSTER_TOKEN": CLUSTER_TOKEN,
     "HYDRA_NODE_ID": "knobs-wiring",
     "HYDRA_ARACHNE_LISTEN": "127.0.0.1:18944",
     "HYDRA_CLUSTER_ID": "knobs-drill-cluster",
 }
 # Variables this plan RETIRED (`RETIRED_CLUSTER_ENV` in the source, read below). Set on purpose by
 # K5/K6/K11 to pin the "these do nothing now" diagnostic.
-RETIRED = {"HYDRA_ROLE": "all"}
+# Two retired names on purpose, and the second one is the interesting case: `HYDRA_CLUSTER_TOKEN` was
+# REQUIRED in cluster mode until 2026-10-05, so a deployment that still carries it is the most likely
+# reader of the retirement notice. Both must be named.
+RETIRED = {"HYDRA_ROLE": "all", "HYDRA_CLUSTER_TOKEN": "still-set-by-an-old-manifest"}
 # A value this drill can set each cluster-only variable to, for K10. The NAMES are not copied here —
 # they are read from `CLUSTER_ONLY_ENV` in the source (see `cluster_only_names`) — so this leg grows
 # with the table instead of with a hand-maintained list (round 194: the list used to be copied by
@@ -281,7 +281,6 @@ RETIRED = {"HYDRA_ROLE": "all"}
 KNOB_VALUES = {
     "HYDRA_REDIS_URL": redis_url,
     "HYDRA_REDIS_MODE": lambda: "single",
-    "HYDRA_CLUSTER_TOKEN": lambda: CLUSTER_TOKEN,
     "HYDRA_NODE_ID": lambda: "knobs-all",
     "HYDRA_ARACHNE_LISTEN": lambda: "127.0.0.1:18944",
     "HYDRA_CLUSTER_ID": lambda: "knobs-drill-cluster",
@@ -392,7 +391,9 @@ class Member:
         return http(f"http://127.0.0.1:{self.admin}/api/v1/health", token=ADMIN_TOKEN) == 200
 
     def leads(self):
-        return http(f"http://127.0.0.1:{self.admin}/healthz/leader", token=CLUSTER_TOKEN) == 200
+        # `/healthz/leader` is the ONE token-free route (an LB must route to the writer without a
+        # secret); it used to be probed with the cluster token here, which no longer exists.
+        return http(f"http://127.0.0.1:{self.admin}/healthz/leader") == 200
 
     def kill(self):
         if self.proc.poll() is None:
@@ -586,9 +587,10 @@ def cluster_legs(victim):
     state, rc, log = observe("k11_retired_on_a_cluster_node", node_env(victim.node, RETIRED),
                              admin=victim.admin)
     line = line_about(log, "were retired by the Arachne control plane")
-    check("K11: a retired variable is reported even on a cluster node (it does nothing either way), "
+    check("K11: retired variables are reported even on a cluster node (they do nothing either way), "
           "and the member is NOT called standalone",
-          state in ("up", "alive") and bool(line) and "HYDRA_ROLE" in line
+          state in ("up", "alive") and bool(line)
+          and all(name in line for name in RETIRED)
           and "cluster wiring is configured but" not in line
           and "starting role=cluster" in log,
           f"state={state} exit={rc} src={line[:200] or '<SILENT: nothing named the retirement>'}")
@@ -626,15 +628,17 @@ def single_node_legs():
     check("K5: when a retired variable is set at the same time, the SAME line names BOTH (a node "
           "mid-migration must not hear only the least consequential of its two mistakes)",
           state in ("up", "alive") and len(parts) == 1
-          and all(n in parts[0] for n in WIRING) and "HYDRA_ROLE" in parts[0],
+          and all(n in parts[0] for n in WIRING)
+          and all(name in parts[0] for name in RETIRED),
           f"state={state} exit={rc} lines={len(parts)} src={(line or '<no line>')[:200]}")
 
     # ---- K6: a retired variable ALONE, on a single-node default -------------------------------
     state, rc, log = observe("k6_retired_alone", RETIRED)
     line = line_about(log, "were retired by the Arachne control plane")
-    check("K6: a retired variable ALONE is reported, and the node is NOT called standalone (one "
+    check("K6: retired variables ALONE are reported, and the node is NOT called standalone (one "
           "stale setting and a dropped cluster are different mistakes)",
-          state in ("up", "alive") and bool(line) and "HYDRA_ROLE" in line
+          state in ("up", "alive") and bool(line)
+          and all(name in line for name in RETIRED)
           and "cluster wiring is configured but" not in line,
           f"state={state} exit={rc} src={line[:200] or '<SILENT: nothing named the retirement>'}")
 

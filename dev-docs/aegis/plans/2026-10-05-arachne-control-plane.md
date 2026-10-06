@@ -892,6 +892,22 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **顺带修好的一处守卫缺陷**：`check_documented_metrics` 的 `ABSENT_ON_PURPOSE` 把环境覆盖**合并**进内建表，违反 `recorded_exceptions.cjs` 的第一条规则（**REPLACE, never merge**）。它一直不可见，因为内建表此前是空的；本轮的三个名字一进去，**11 条既有自测同时变红**（fixture 的文档当然不会拼出本仓的名字）。已改为走 `records()`，自测的公共环境补 `CDM_ABSENT_ON_PURPOSE: '{}'`。
 
+### 决定 4（2026-10-05 用户裁定）：删掉 `HYDRA_CLUSTER_TOKEN`
+
+用户原话：「没必要的话就删，部署契约又不是牢不可破，如果需要删除就修改契约即可。」于是从"只记录、不改行为"改成**真删**：
+
+| 删掉的 | 位置 |
+|---|---|
+| 启动要求 + 长度下限校验 + 其测试模块 | `main.rs`（`validate_cluster_token`、`cluster_token_tests`） |
+| `AdminState::cluster_token` / `ClusterConfig::cluster_token` / `MIN_CLUSTER_TOKEN_LEN` | `admin/mod.rs`、`cluster/mod.rs` |
+| `/api/v1/internal/*` 那道闸门本身 | `admin/mod.rs`（它只能对一个**没有路由**的前缀回 401；现在是鉴权后的普通 404，这是"这里什么都没有"的诚实回答） |
+| 清单里的强制项 | `docker-compose.cluster.yml`（2 处）、三份 k8s 示例、本地 `secure/local-test.env`（gitignored，仅本机） |
+| UI 的 API 文档里那条**根本不存在的路由** | `admin-ui/api-docs.js` 的 `/api/v1/internal/control` 条目改为 RETIRED 说明 |
+| 公开页示例里的 `HYDRA_ROLE=edge … HYDRA_CLUSTER_TOKEN=…` | `docs/index.html` |
+
+名字移入 `RETIRED_CLUSTER_ENV`（9→**10**），`CLUSTER_ONLY_ENV` 7→**6**；因此**仍设着它的部署会在启动时被点名**。守卫同步：`check_cluster_env`（表由源码派生，自动跟随）、`check_compose_env`（**它在改清单之前就把两处强制项抓了出来**——本轮新增的守卫第一次替后续改动工作）、`check_documented_env`（记为 prose-only）、`check_documented_defaults`（**删掉条目本身**：表里已经没有这一行，记录随之失效，这正是那套 algebra 要求的）。演练同步：四个绿演练不再设置它；`test_startup_knobs.py` 的 **K6/K11 现在把 `HYDRA_CLUSTER_TOKEN` 一起断言**（它是"最可能被旧清单留下"的退役名），K5 改为对所有 `RETIRED` 名断言。
+**结果**：集群部署只剩 `HYDRA_ADMIN_TOKEN` 一个 token。
+
 ### 本轮新发现（尚未处理，登记在案）
 
 * **一个集群节点无法单独启动：新数据目录必须由多数派先"认领"**。`await_cluster_preflight` 的

@@ -86,7 +86,6 @@ curl -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" http://localhost:8081/api/v1/
 
 ```bash
 export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # 必填，>= 16 字符（每个节点都用）
-export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # 启动必填（见 cluster.md §2 的说明）
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"    # 全集群必须一致
 docker compose -f environment/docker-compose.cluster.yml up -d
 ```
@@ -109,7 +108,7 @@ curl -s -H "Host: <tenant-domain>" -H "Authorization: Bearer <key>" \
 
 ```bash
 docker compose -f environment/docker-compose.cluster.yml kill hydra-a   # 上一步里 200 的那台
-curl -s -H "Authorization: Bearer $HYDRA_CLUSTER_TOKEN" localhost:8082/healthz/leader   # → 200
+curl -s localhost:8082/healthz/leader                # → 200（该路由免 token）
 docker compose -f environment/docker-compose.cluster.yml start hydra-a  # 以成员身份回归，自动跟上 head
 ```
 
@@ -203,7 +202,6 @@ spec:
             - { name: HYDRA_REDIS_MODE, value: single }
             - { name: HYDRA_USAGE_SINK, value: clickhouse }
             - { name: HYDRA_CLICKHOUSE_URL, value: http://clickhouse:8123 }
-            - { name: HYDRA_CLUSTER_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: token } } }
             - { name: HYDRA_ADMIN_TOKEN, valueFrom: { secretKeyRef: { name: hydra-cluster, key: admin } } }
             - { name: HYDRA_ENCRYPTION_KEY, valueFrom: { secretKeyRef: { name: hydra-cluster, key: enc } } }
           volumeMounts: [{ name: data, mountPath: /app/data }]
@@ -333,7 +331,6 @@ kubectl -n hydra delete pod hydra-<writer> --grace-period=0 --force
 | `HYDRA_CLUSTER_ID` | — | **强烈建议显式** | 集群身份；**默认 = 成员表哈希 ⇒ 改成员表就全集群拒绝启动**（`cluster.md` §6.3） |
 | `HYDRA_REDIS_URL` | — | 必填 | 唯一外置依赖（**数据面**的共享状态） |
 | `HYDRA_REDIS_MODE` | — | 只接受 `single` | 其它值（含拼错）快速失败；单节点默认下不读取 |
-| `HYDRA_CLUSTER_TOKEN` | — | 必填（启动要求） | ⚠ 今天不守任何东西（`/api/v1/internal/*` 已无路由），删它是契约变化 |
 | `HYDRA_ADMIN_TOKEN` | 必填 | **每台必填** | 每个节点都有自己的管理 API |
 | `HYDRA_ENCRYPTION_KEY` | 必填 | 必填，全集群一致 | 主密钥（provider key/证书私钥） |
 | `HYDRA_USAGE_SINK` | `sqlite` 默认 | **必须 `clickhouse`** | fail-closed（逐节点 sqlite 用量在集群里无意义） |
@@ -342,7 +339,7 @@ kubectl -n hydra delete pod hydra-<writer> --grace-period=0 --force
 | `HYDRA_LISTEN` / `HYDRA_ADMIN_ADDR` | `0.0.0.0:8080` / `127.0.0.1:8081` | 同左（集群里管理口要 `0.0.0.0` 才能被探针访问） | 代理（明文，恒定）/ 管理端口 |
 | `HYDRA_TLS_LISTEN` | *（未设置）* | 同左（如 `0.0.0.0:8443`） | 可选 HTTPS 端口；**设置它**才启用 TLS，与租户是否有证书无关 |
 
-**已退役（设了会被启动 ERROR 点名）**：`HYDRA_ROLE`、`HYDRA_EDGE`、`HYDRA_CONTROL_URL`、
+**已退役（设了会被启动 ERROR 点名）**：`HYDRA_ROLE`、`HYDRA_EDGE`、`HYDRA_CLUSTER_TOKEN`、`HYDRA_CONTROL_URL`、
 `HYDRA_PUBLIC_URL`、`HYDRA_CONTROL_POLL_MS`、`HYDRA_LEADER_LEASE_MS`、
 `HYDRA_REGISTRY_STALE_GRACE_SECS`、`HYDRA_FAILOVER_GRACE_MS`、`HYDRA_FORWARD_TIMEOUT_SECS`
 （完整清单与替代者见 `ops.md` §13.3b）。

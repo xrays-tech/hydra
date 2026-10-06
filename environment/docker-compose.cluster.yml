@@ -6,7 +6,9 @@
 #
 # Prereqs:
 #   export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # admin API, >= 16 chars
-#   export HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)"        # internal endpoints
+#   (NO HYDRA_CLUSTER_TOKEN: it gated the /api/v1/internal/* family, which is deleted, and the
+#    requirement was removed with it on 2026-10-05 — the name is in RETIRED_CLUSTER_ENV, so setting
+#    it now only earns an startup ERROR telling you it does nothing.)
 #   export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # SAME on every node
 #   python3 environment/init.py  (point it at ANY node's admin port)
 #
@@ -66,7 +68,6 @@ services:
       HYDRA_REDIS_MODE: single
       # REQUIRED — no default: it authenticates the internal endpoints (health/status) and
       # identifies a peer.
-      HYDRA_CLUSTER_TOKEN: ${HYDRA_CLUSTER_TOKEN:?set HYDRA_CLUSTER_TOKEN="$(openssl rand -hex 32)" — required in cluster mode}
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_USAGE_SINK: clickhouse
