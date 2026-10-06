@@ -33,7 +33,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
+use arachne_kv::client::Handle;
 use arachne_kv::NodeId;
 
 /// The environment variable carrying the static member list.
@@ -336,6 +340,180 @@ pub fn cluster_enabled() -> bool {
 #[must_use]
 fn cluster_enabled_from(raw: Option<&str>) -> bool {
     matches!(raw, Some(v) if !v.trim().is_empty())
+}
+
+/// The probe key. Deliberately **not** under `hydra/ctl/` or `hydra/cfg/`: those
+/// namespaces are the control-plane contract (T2.1 owns them), while this key is
+/// a liveness marker whose value is meaningless. It is rewritten by every
+/// probing node, so it must never be read as state.
+const LEADER_PROBE_KEY: &[u8] = b"hydra/probe/leader";
+
+/// How often the background task probes.
+///
+/// Fast enough that `/healthz/leader` follows a handover well inside a
+/// rollout's patience, slow enough that the cost is one small raft entry per
+/// healthy node per interval (a follower's probe is refused locally by raft and
+/// never reaches the log).
+pub const LEADER_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A live Arachne node plus the cached answer to "am I the leader".
+///
+/// The cache exists for the **synchronous** callers — `/healthz/leader` and the
+/// admin write path's decision to answer 503 — which cannot await a probe. It is
+/// deliberately conservative: it reflects the last probe, so a node that can no
+/// longer commit stops claiming leadership at the next probe rather than at the
+/// next election.
+///
+/// ## The consistency discipline (ADR-0001 D-3 / F-3)
+///
+/// This cache is **not** what decides whether a write is applied. A write is
+/// applied if and only if Arachne accepts it: a node whose cache wrongly says
+/// "leader" still gets `NotLeader` from `put` and must fail closed, and a node
+/// whose cache wrongly says "not leader" costs at most one retry. So the failure
+/// direction is safe, and no caller may treat the cache as authority for a
+/// mutation.
+// No `Debug`: `arachne_kv::client::Handle` does not implement it, and deriving a
+// Debug that hides the handle would be a footgun in logs anyway.
+pub struct ArachneControl {
+    /// `None` when no node was started (single-node mode, or a test double).
+    handle: Option<Handle>,
+    node_id: NodeId,
+    /// The last probe's verdict.
+    is_leader: Arc<AtomicBool>,
+    /// How many times this node's leadership verdict changed.
+    flips: Arc<AtomicU64>,
+}
+
+impl ArachneControl {
+    /// A control with no started node: never a leader, never a flip.
+    ///
+    /// Used by the single-node path, where there is no raft leader to be — the
+    /// caller must then keep the documented "no election" shape of
+    /// `/healthz/leader` (404) rather than fabricate a 200.
+    #[must_use]
+    pub fn not_started() -> Self {
+        Self {
+            handle: None,
+            node_id: NodeId::new("unstarted"),
+            is_leader: Arc::new(AtomicBool::new(false)),
+            flips: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Wrap an already-running node.
+    ///
+    /// Exists so the leader-probe tests can drive real nodes assembled by
+    /// `assemble_cluster`: the `Arachne::start` facade is a process-wide
+    /// singleton, so a three-node test cannot use it.
+    #[must_use]
+    pub fn for_tests(handle: Handle, node_id: NodeId) -> Self {
+        Self {
+            handle: Some(handle),
+            node_id,
+            is_leader: Arc::new(AtomicBool::new(false)),
+            flips: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// This node's identity.
+    #[must_use]
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// The cached verdict, for synchronous callers.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::Acquire)
+    }
+
+    /// How many leadership flips have been observed.
+    #[must_use]
+    pub fn flips(&self) -> u64 {
+        self.flips.load(Ordering::Acquire)
+    }
+
+    /// Whether this node can currently commit a write — the only question whose
+    /// answer is authoritative in both directions.
+    ///
+    /// `without_redirect` is the point: a redirecting handle would follow the
+    /// leader hint and write *somewhere else*, so the answer would become "the
+    /// cluster has a leader" instead of "this node is the leader".
+    pub async fn probe_once(&self) -> bool {
+        let Some(handle) = self.handle.as_ref() else {
+            return false;
+        };
+        handle
+            .without_redirect()
+            .put(LEADER_PROBE_KEY, self.node_id.as_str().as_bytes())
+            .await
+            .is_ok()
+    }
+
+    /// Run one probe and fold it into the cached verdict, returning whether the
+    /// verdict changed.
+    pub async fn observe_once(&mut self) -> bool {
+        let observed = self.probe_once().await;
+        self.record_and_log(observed)
+    }
+
+    /// Fold one already-taken probe result into the cache and log a change.
+    ///
+    /// Split from the await so the fold — which is the part that can be wrong —
+    /// is reachable without a live cluster.
+    fn record_and_log(&self, observed: bool) -> bool {
+        let previous = self.is_leader.swap(observed, Ordering::AcqRel);
+        if observed == previous {
+            return false;
+        }
+        if observed {
+            tracing::info!(
+                node_id = %self.node_id,
+                "this node now accepts writes: it is the raft leader"
+            );
+        } else {
+            tracing::warn!(
+                node_id = %self.node_id,
+                "this node no longer accepts writes: giving up leadership"
+            );
+        }
+        self.flips.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    /// Keep probing in the background until the process ends.
+    ///
+    /// `/healthz/leader` must be answerable without awaiting anything, so this
+    /// task owns the only place that awaits the probe.
+    pub fn spawn_leader_watch(&self) -> tokio::task::JoinHandle<()> {
+        let handle = self.handle.clone();
+        let node_id = self.node_id.clone();
+        let is_leader = Arc::clone(&self.is_leader);
+        let flips = Arc::clone(&self.flips);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(LEADER_PROBE_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let observed = match handle.as_ref() {
+                    Some(h) => h
+                        .without_redirect()
+                        .put(LEADER_PROBE_KEY, node_id.as_str().as_bytes())
+                        .await
+                        .is_ok(),
+                    None => false,
+                };
+                let previous = is_leader.swap(observed, Ordering::AcqRel);
+                if observed != previous {
+                    if observed {
+                        tracing::info!(node_id = %node_id, "this node is now the raft leader");
+                    } else {
+                        tracing::warn!(node_id = %node_id, "this node is no longer the raft leader");
+                    }
+                    flips.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
