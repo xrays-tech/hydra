@@ -20,13 +20,11 @@ use std::fmt;
 use std::time::Duration;
 
 pub mod content;
-pub mod control_client;
 #[cfg(feature = "cluster-redis")]
 pub mod events;
 pub mod lease;
 #[cfg(feature = "cluster-redis")]
 pub mod registry;
-pub mod replica;
 pub mod snapshot;
 
 // Arachne control plane (ADR-0001). Gated on its own feature, independent of
@@ -243,13 +241,16 @@ const CLUSTER_ONLY_ENV: [&str; 9] = [
 /// standby→leader admin-write forwarder, which D-3 retired; the environment guard is what noticed
 /// that the variable had lost its last reader while still being documented as live.
 ///
-/// The rest of ADR-0001's retired variables are STILL READ by the Redis path that has not been
-/// deleted yet: `main.rs` (`HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`,
-/// `HYDRA_REGISTRY_STALE_GRACE_SECS`), `cluster/control_client.rs`, `cluster/registry.rs`. They
-/// move here in the commit that deletes their readers (plan T4.1), not before — claiming otherwise
-/// would make the diagnostic a lie. `HYDRA_ROLE` is already unread (the member list replaced it)
-/// and only comments mention it.
-const RETIRED_CLUSTER_ENV: [&str; 1] = ["HYDRA_FORWARD_TIMEOUT_SECS"];
+/// **Second entry (2026-10-05, plan T4.1's boot half)**: `HYDRA_LEADER_LEASE_MS`. The lease
+/// machine, the snapshot-polling client and the standby materializer are no longer started — the
+/// raft write probe is the only source of leadership — so the lease TTL has no reader. Again the
+/// environment guard found it, not memory.
+///
+/// The remaining ADR-0001 retirements are STILL READ by the Redis code that has not been deleted
+/// yet (`cluster/lease.rs`, `cluster/registry.rs`, `main.rs`'s cluster validation). They move here
+/// in the commit that deletes their readers, not before — claiming otherwise would make the
+/// diagnostic a lie. `HYDRA_ROLE` is already unread (the member list replaced it).
+const RETIRED_CLUSTER_ENV: [&str; 2] = ["HYDRA_FORWARD_TIMEOUT_SECS", "HYDRA_LEADER_LEASE_MS"];
 
 /// Which of `present` are retired, according to `table`.
 ///
@@ -495,16 +496,17 @@ mod tests {
     fn retired_variables_are_reported_and_live_ones_are_not() {
         let present =
             |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
-        // An explicit table, so this exercises the MECHANISM rather than the current contents
-        // of the real one (which is empty today, and pinned as such below).
+        // An explicit table, so this exercises the MECHANISM rather than the current contents of
+        // the real one (which is pinned exactly, below). `HYDRA_LEADER_LEASE_MS` doubles as a real
+        // example: it moved into `RETIRED_CLUSTER_ENV` when the lease lost its last reader.
         let table = ["HYDRA_LEADER_LEASE_MS", "HYDRA_CONTROL_POLL_MS"];
 
         assert_eq!(
             retired_present(
                 &present(&[
-                    "HYDRA_LEADER_LEASE_MS",
                     "HYDRA_CLUSTER_TOKEN",
-                    "HYDRA_CONTROL_POLL_MS"
+                    "HYDRA_LEADER_LEASE_MS",
+                    "HYDRA_CONTROL_POLL_MS",
                 ]),
                 &table
             ),
@@ -528,7 +530,7 @@ mod tests {
         // nothing reads a retired name: it fails if a documented variable has no read site.
         assert_eq!(
             RETIRED_CLUSTER_ENV,
-            ["HYDRA_FORWARD_TIMEOUT_SECS"],
+            ["HYDRA_FORWARD_TIMEOUT_SECS", "HYDRA_LEADER_LEASE_MS"],
             "the retirement table changed: update this test AND confirm (via the env guard) that \
              nothing reads the variable that moved"
         );

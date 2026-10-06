@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 use hydra_core::model::{Provider, ProviderKey};
-use hydra_server::cluster::snapshot::SnapshotWire;
+use hydra_server::cluster::snapshot::HydratedWire;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
 
@@ -108,23 +108,20 @@ async fn replica_keeps_leader_provider_key_identity() {
         "the replication content carries every provider_key WITH its identity"
     );
 
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build");
-    assert!(
-        wire.cfg.provider_keys.is_empty(),
-        "the wire clears the plaintext map; the sealed rows carry identity"
-    );
-    assert_eq!(
-        wire.sealed_provider_keys["p1"]
-            .iter()
-            .map(|k| k.id.clone())
-            .collect::<Vec<_>>(),
-        vec!["pk-aaa", "pk-bbb", "pk-ccc"],
-        "identity rides the wire"
-    );
+    // The wire-specific assertions that used to sit here (the plaintext map is emptied, the ids
+    // ride in sealed DTOs) went with the wire itself (ADR-0001 T4.1). The property they protected —
+    // "identity survives replication" — is asserted below on the REPLICA's database, which is the
+    // claim that ever mattered; the tree's own version of the sealing argument lives in
+    // `tests/arachne_cert_fidelity.rs`.
 
-    let hydrated = wire.hydrate(key_provider.as_ref()).expect("hydrate");
+    // What the replica is handed: the leader's config plus the fidelity rows. (This replaced a
+    // `SnapshotWire::build(..).hydrate(..)` round trip, whose sealing legs went with the wire.)
+    let hydrated = HydratedWire {
+        version: content.version,
+        cfg: (*content.cfg).clone(),
+        fidelity: content.fidelity().clone(),
+    };
+
     let replica_pool = common::setup_pool().await;
     repo::restore_config(
         &replica_pool,
@@ -197,17 +194,15 @@ async fn rematerializing_does_not_renumber_provider_keys() {
         .as_deref()
         .cloned()
         .expect("content");
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build");
 
     let replica_pool = common::setup_pool().await;
     let mut seen: Vec<Vec<String>> = Vec::new();
     for _ in 0..3 {
-        let hydrated = wire
-            .clone()
-            .hydrate(key_provider.as_ref())
-            .expect("hydrate");
+        let hydrated = HydratedWire {
+            version: content.version,
+            cfg: (*content.cfg).clone(),
+            fidelity: content.fidelity().clone(),
+        };
         repo::restore_config(
             &replica_pool,
             key_provider.as_ref(),
@@ -254,10 +249,11 @@ async fn hydrated_runtime_config_exposes_the_provider_keys() {
         .as_deref()
         .cloned()
         .expect("content");
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build");
-    let hydrated = wire.hydrate(key_provider.as_ref()).expect("hydrate");
+    let hydrated = HydratedWire {
+        version: content.version,
+        cfg: (*content.cfg).clone(),
+        fidelity: content.fidelity().clone(),
+    };
 
     let cfg: &ConfigData = &hydrated.cfg;
     assert_eq!(

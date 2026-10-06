@@ -552,10 +552,11 @@ impl AdminService {
         if parts == ["stats", "usage"] && method == "GET" {
             return handlers::stats_usage();
         }
-        // Internal control plane (cluster P1): snapshot distribution.
-        if parts == ["internal", "control"] && method == "GET" {
-            return cluster_api::internal_control(&self.state, query, trace_id).await;
-        }
+        // The internal control plane was HERE: `GET /api/v1/internal/control?since=N`, which
+        // served version-labelled config snapshots to edge/standby nodes. Retired with the channel
+        // it existed for (ADR-0001 T4.1) — nodes materialize the config tree from Arachne, so
+        // there is no snapshot to hand out and no `since` watermark to compare. A request to that
+        // path is now an ordinary 404.
         // The `/api/v1/internal/tenant-config/*` family USED to be here: the leader's internal
         // write endpoint for sub-tenants and routes, reached by a forwarded data-plane write. It
         // is gone (ADR-0001 D-6, plan T3.5): the entry node applies the write itself, so there is

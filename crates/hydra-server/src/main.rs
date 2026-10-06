@@ -77,43 +77,6 @@ fn breaker_quorum_from_env() -> usize {
         .unwrap_or(1)
 }
 
-/// Bounds for `HYDRA_LEADER_LEASE_MS`.
-///
-/// Below the minimum, leadership becomes meaningless: `valid_until = now + 0`
-/// makes `is_leader()` permanently false while the election loop spins at
-/// `(lease_ms/3).max(1)` = 1 ms, i.e. ~1000 `SET NX` per second per node with
-/// no leader ever elected (and no startup error to say so). A value like `15`
-/// (someone meaning seconds) gives a 5 ms tick and a lease that any 15 ms stall
-/// loses — the active writer flaps. Above the maximum, `Expiration::PX` would
-/// overflow into a negative TTL.
-#[cfg(feature = "cluster-redis")]
-const MIN_LEADER_LEASE_MS: u64 = 1_000;
-#[cfg(feature = "cluster-redis")]
-const MAX_LEADER_LEASE_MS: u64 = 600_000;
-#[cfg(feature = "cluster-redis")]
-const DEFAULT_LEADER_LEASE_MS: u64 = 15_000;
-
-/// `HYDRA_LEADER_LEASE_MS` (cluster mode), validated: unset → the default,
-/// out-of-range or unparseable → an error that fails startup. Deliberately NOT
-/// a silent fallback: this is a safety-relevant value whose wrong setting is
-/// invisible at runtime (see [`MIN_LEADER_LEASE_MS`]).
-#[cfg(feature = "cluster-redis")]
-fn leader_lease_ms_from_env() -> Result<u64, String> {
-    let Ok(raw) = std::env::var("HYDRA_LEADER_LEASE_MS") else {
-        return Ok(DEFAULT_LEADER_LEASE_MS);
-    };
-    let ms: u64 = raw
-        .parse()
-        .map_err(|e| format!("HYDRA_LEADER_LEASE_MS={raw:?} is not a millisecond count: {e}"))?;
-    if !(MIN_LEADER_LEASE_MS..=MAX_LEADER_LEASE_MS).contains(&ms) {
-        return Err(format!(
-            "HYDRA_LEADER_LEASE_MS={ms} is outside {MIN_LEADER_LEASE_MS}..={MAX_LEADER_LEASE_MS} ms \
-             (0 or a tiny value makes this node permanently ineligible while the election loop spins)"
-        ));
-    }
-    Ok(ms)
-}
-
 /// `HYDRA_NON_ROUTE_STRATEGY` = `passthrough` | `reject` (case-insensitive).
 ///
 /// What happens to a request that carries no `model` at all (a well-formed JSON
@@ -301,15 +264,31 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             return Err(too_short.into());
         }
     }
-    if role == hydra_server::cluster::NodeRole::Leader
+    if role.is_cluster()
         && std::env::var("HYDRA_ADMIN_TOKEN")
             .map(|t| t.is_empty())
             .unwrap_or(true)
     {
+        // Still required, but no longer because a standby relays with it (that layer is retired,
+        // T3.3): every node now serves its own admin API, so the token is what gates EACH node's
+        // admin surface. A cluster node without one would expose an unauthenticated admin API.
         return Err(
-            "leader mode requires HYDRA_ADMIN_TOKEN (shared across the cluster — standby nodes forward admin mutations to the active with it); refusing to start"
+            "cluster mode requires HYDRA_ADMIN_TOKEN (each node serves its own admin API); \
+             refusing to start"
                 .into(),
         );
+    }
+    // Cluster mode IS the raft member list: without the control plane there is no writer to agree
+    // on, and the old answer (a Redis lease) has been deleted. Refused at startup rather than
+    // served as "no leader", which would accept writes on every node with no commit point.
+    if role.is_cluster() && !arachne_carries_leadership {
+        return Err(format!(
+            "HYDRA_CLUSTER_PEERS is set but this build has no control plane: rebuild with \
+             --features arachne (the member list is the cluster, and raft is what decides the \
+             writer). Refusing to start as a 'cluster' whose nodes each believe they are alone; \
+             got role={role}."
+        )
+        .into());
     }
     // Admin-token strength (design §13.3). Refuse to BOOT on a short token
     // rather than warn: the gate has no rate limit or lockout, and the admin
@@ -1074,133 +1053,19 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(not(feature = "cluster-redis"))]
     let invalidation_stream: Option<()> = None;
 
-    // (2f') Control-plane client (cluster P1): edge nodes poll the leader for
-    // config snapshots. Last-known-good semantics — the data plane keeps
-    // serving whatever snapshot it has when the control plane is unreachable.
-    if role == hydra_server::cluster::NodeRole::Edge {
-        let url = cluster
-            .control_url
-            .clone()
-            .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
-        let token = cluster
-            .cluster_token
-            .clone()
-            .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
-        let client = hydra_server::cluster::control_client::ControlClient::new(
-            hydra_server::cluster::control_client::ControlClientConfig {
-                url,
-                token,
-                poll_interval: cluster.poll_interval,
-            },
-            store.clone(),
-            key_provider.clone(),
-            // No per-poll hook needed for certs: `ConfigStore::apply_snapshot`
-            // notifies its followers, and the cert store is one of them
-            // (`tls::follow_snapshot`), so a cert arriving in a control-plane
-            // snapshot reaches the SNI callback without a restart (审核四 P3).
-            // This slot is for the leader-eligibility gate on leader nodes.
-            None,
-        );
-        #[cfg(feature = "cluster-redis")]
-        let client = match &registry {
-            Some(r) => client.with_discovery(r.clone()),
-            None => client,
-        };
-        client.spawn();
-        info!(
-            poll_ms = cluster.poll_interval.as_millis() as u64,
-            "control client started"
-        );
-    }
+    // (2f') The edge polling client USED TO BE HERE (cluster P1): an `edge` node polled the
+    // leader's control endpoint for config snapshots. Retired with the role itself (ADR-0001 D-2:
+    // nodes are homogeneous, and each one materializes the config tree locally).
 
-    // (2f''') Leader election (cluster P2): leader-candidate nodes run the
-    // lease machine against Redis; exactly one holds the lease (the active
-    // writer). Standbys additionally run the control client + replica
-    // materialization so they are ready to take over within one lease.
-    // Gated on `cluster-redis` (the Redis backbone); leader mode without the
-    // feature already failed the startup checks above.
-    // ...and skipped entirely when the Arachne control plane is up: leadership is the raft write
-    // probe then, and the snapshot-polling client, the lease machine and the standby materializer
-    // would be three conflicting owners of "who may write" and "what config is current". This is
-    // the boot half of plan T4.1; the files themselves are deleted next.
-    #[cfg(feature = "cluster-redis")]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
-        if role == hydra_server::cluster::NodeRole::Leader && !arachne_carries_leadership {
-            let backend =
-                redis_backend.ok_or("cluster mode has a Redis backbone (checked above)")?;
-            let lease_ms = leader_lease_ms_from_env()?;
-            let lease_store: Arc<dyn hydra_server::cluster::lease::LeaseStore> = Arc::new(
-                hydra_server::redis::RedisLeaseStore::new(backend.pool().clone()),
-            );
-            let election = Arc::new(hydra_server::cluster::lease::LeaderElection::new(
-                lease_store,
-                cluster.node_id.clone(),
-                lease_ms,
-            ));
-
-            // Standby sync: poll the active leader, materialize the local replica
-            // on every applied snapshot (out-of-order guarded, F-4), and drive
-            // the election freshness gate from the materialization result.
-            let url = cluster
-                .control_url
-                .clone()
-                .ok_or("HYDRA_CONTROL_URL must be set (checked above)")?;
-            let token = cluster
-                .cluster_token
-                .clone()
-                .ok_or("HYDRA_CLUSTER_TOKEN must be set (checked above)")?;
-            let on_poll = {
-                let election = election.clone();
-                let pool = pool
-                    .clone()
-                    .ok_or("leader mode has a SQLite pool (checked above)")?;
-                let key_provider = key_provider.clone();
-                // F-4: monotonic out-of-order guard — a stale snapshot (version
-                // <= the last claimed) is never materialized, so the replica can
-                // never regress below a version already in flight / committed.
-                let guard = Arc::new(hydra_server::cluster::replica::MaterializationGuard::new());
-                let gate = Arc::new(move |ok: bool| election.mark_sync_ok(ok))
-                    as Arc<dyn Fn(bool) + Send + Sync>;
-                // The gate decision itself lives in `replica::gate_hook`, so tests
-                // can drive the real wiring instead of a copy of it.
-                Some(hydra_server::cluster::replica::gate_hook(
-                    guard,
-                    pool,
-                    store.clone(),
-                    key_provider,
-                    gate,
-                ))
-            };
-            let client = hydra_server::cluster::control_client::ControlClient::new(
-                hydra_server::cluster::control_client::ControlClientConfig {
-                    url,
-                    token,
-                    poll_interval: cluster.poll_interval,
-                },
-                store.clone(),
-                key_provider.clone(),
-                on_poll,
-            );
-            #[cfg(feature = "cluster-redis")]
-            let client = match &registry {
-                Some(r) => client.with_discovery(r.clone()),
-                None => client,
-            };
-            client.spawn();
-            hydra_server::cluster::lease::spawn_election_task(election.clone(), lease_ms);
-            info!(
-                node_id = %cluster.node_id,
-                lease_ms,
-                "leader election started (lease holder = active writer)"
-            );
-
-            let ready = election.clone();
-            Some(Arc::new(move || ready.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
-        } else {
-            None
-        };
-    #[cfg(not(feature = "cluster-redis"))]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
+    // The Redis control path USED TO BE HERE: the lease election, the standby sync (the
+    // snapshot-polling client plus its replica materializer) and the leader-lease gate they fed.
+    // All of it is retired (ADR-0001 T4.1). Leadership is the raft write probe, and the per-node
+    // materializer follows `ctl/head` — see the Arachne block below, which is now the ONLY source
+    // of `leader_ready`.
+    //
+    // A cluster build therefore has no leader notion at all without the `arachne` feature, which is
+    // refused at startup rather than served as "no leader": a cluster whose nodes never agree on a
+    // writer is worse than one that does not start.
 
     // Arachne control plane (ADR-0001): when it is up, leadership comes from the WRITE PROBE
     // and not from the Redis lease. The probe answers "can THIS node commit", which is the
@@ -1209,18 +1074,23 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // election above still runs when its feature is compiled in, because the data-plane
     // subsystems (rate limit, breaker, L2 cache, invalidation) are still backed by Redis —
     // retiring the lease itself is plan T4.1.
+    // The ONLY source of `leader_ready` now. When the control plane did not start — single-node
+    // mode, i.e. no `HYDRA_CLUSTER_PEERS` — there is deliberately no leader notion at all and
+    // `/healthz/leader` answers 404 rather than fabricating one (the documented single-node shape).
     #[cfg(feature = "arachne")]
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = match &arachne_control {
         Some(control) => {
             let control = Arc::clone(control);
             info!(
                 node_id = %control.node_id(),
-                "leadership is decided by the Arachne write probe (raft), not the Redis lease"
+                "leadership is decided by the Arachne write probe (raft)"
             );
             Some(Arc::new(move || control.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
         }
-        None => leader_ready,
+        None => None,
     };
+    #[cfg(not(feature = "arachne"))]
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
     Ok(BootstrapComponents {
         role,
@@ -1928,33 +1798,6 @@ mod tests {
 
         std::env::remove_var("HYDRA_BREAKER_QUORUM");
         assert_eq!(breaker_quorum_from_env(), 1, "unset → default 1");
-    }
-
-    /// B5a: `HYDRA_LEADER_LEASE_MS` must be validated, not silently defaulted.
-    /// `0` used to be accepted — the node then never became leader (its fence
-    /// expired instantly) while the election loop spun at ~1 kHz, with no error
-    /// anywhere. The same test binary owns this env key.
-    #[test]
-    fn leader_lease_ms_env_is_validated() {
-        std::env::remove_var("HYDRA_LEADER_LEASE_MS");
-        assert_eq!(
-            leader_lease_ms_from_env(),
-            Ok(15_000),
-            "unset → the documented default"
-        );
-
-        std::env::set_var("HYDRA_LEADER_LEASE_MS", "2000");
-        assert_eq!(leader_lease_ms_from_env(), Ok(2000), "in range is honored");
-
-        for bad in ["0", "15", "999", "600001", "99999999", "bogus", ""] {
-            std::env::set_var("HYDRA_LEADER_LEASE_MS", bad);
-            assert!(
-                leader_lease_ms_from_env().is_err(),
-                "HYDRA_LEADER_LEASE_MS={bad:?} must fail startup, not silently default"
-            );
-        }
-
-        std::env::remove_var("HYDRA_LEADER_LEASE_MS");
     }
 }
 

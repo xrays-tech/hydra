@@ -81,6 +81,7 @@ const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_AUTH_FAIL_MODE', 'same note — a rejected spelling, not a knob'],
   ['HYDRA_AUTH_FAILMODE', 'same note — a rejected spelling, not a knob'],
   ['HYDRA_FAILOVER_GRACE_MS', 'ops.md lists it among the knobs that are documented but NOT wired (round 166 measurements)'],
+  ['HYDRA_LEADER_LEASE_MS', 'a knob RETIRED by ADR-0001 T4.1: ops.md names it inside the `HYDRA_CONTROL_POLL_MS` row as retired (the lease has no reader, and `RETIRED_CLUSTER_ENV` says so in code)'],
   ['HYDRA_RATE_LIMIT_FAIL_MODE', 'ops.md says it does not exist at all (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty)'],
   ['HYDRA_ENCRYPTION_KEY_FILE', 'a real knob, mentioned inside the `HYDRA_ENCRYPTION_KEY` row; read at `crypto.rs:142` (verified this round)'],
   ['HYDRA_CLICKHOUSE_IO_TIMEOUT_MS', 'a real knob, mentioned inside the `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` row; read at `clickhouse.rs:135`'],

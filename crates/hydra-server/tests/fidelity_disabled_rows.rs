@@ -20,7 +20,7 @@ use hydra_core::model::{
     LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant,
 };
 use hydra_server::cluster::content::ReplicationContent;
-use hydra_server::cluster::snapshot::SnapshotWire;
+use hydra_server::cluster::snapshot::HydratedWire;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
 
@@ -134,14 +134,14 @@ async fn replica_materialization_keeps_disabled_limit_roles_and_bindings() {
         "the replication content keeps BOTH bindings"
     );
 
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build wire");
-    // The wire is what the replica sees, so it must carry the full sets too.
-    assert_eq!(wire.fidelity.limit_roles.len(), 2);
-    assert_eq!(wire.fidelity.key_prefix_bindings.len(), 2);
-
-    let hydrated = wire.hydrate(key_provider.as_ref()).expect("hydrate");
+    let hydrated = HydratedWire {
+        version: content.version,
+        cfg: (*content.cfg).clone(),
+        fidelity: content.fidelity().clone(),
+    };
+    // What the replica is handed must carry the full sets.
+    assert_eq!(hydrated.fidelity.limit_roles.len(), 2);
+    assert_eq!(hydrated.fidelity.key_prefix_bindings.len(), 2);
 
     let replica_pool = common::setup_pool().await;
     repo::restore_config(
@@ -188,16 +188,14 @@ async fn rematerializing_the_same_content_is_stable() {
         .as_deref()
         .cloned()
         .expect("content");
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build");
 
     let replica_pool = common::setup_pool().await;
     for _ in 0..2 {
-        let hydrated = wire
-            .clone()
-            .hydrate(key_provider.as_ref())
-            .expect("hydrate");
+        let hydrated = HydratedWire {
+            version: content.version,
+            cfg: (*content.cfg).clone(),
+            fidelity: content.fidelity().clone(),
+        };
         repo::restore_config(
             &replica_pool,
             key_provider.as_ref(),
@@ -394,14 +392,14 @@ async fn replica_materialization_keeps_disabled_sub_tenants_and_routes() {
         "the replication content keeps BOTH routes (enabled and disabled)"
     );
 
-    let wire = SnapshotWire::build(&content, key_provider.as_ref())
-        .await
-        .expect("build wire");
-    // The wire is what the replica sees, so it must carry the full sets too.
-    assert_eq!(wire.fidelity.sub_tenants.len(), 2);
-    assert_eq!(wire.fidelity.sub_tenant_routes.len(), 2);
-
-    let hydrated = wire.hydrate(key_provider.as_ref()).expect("hydrate");
+    let hydrated = HydratedWire {
+        version: content.version,
+        cfg: (*content.cfg).clone(),
+        fidelity: content.fidelity().clone(),
+    };
+    // What the replica is handed must carry the full sets.
+    assert_eq!(hydrated.fidelity.sub_tenants.len(), 2);
+    assert_eq!(hydrated.fidelity.sub_tenant_routes.len(), 2);
 
     let replica_pool = common::setup_pool().await;
     repo::restore_config(
