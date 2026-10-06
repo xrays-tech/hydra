@@ -12,8 +12,9 @@
 //! | `edge`   | stateless data plane: no local SQLite, no admin CRUD; pulls config  |
 //! |          | snapshots from the leader and shares state via Redis.               |
 //!
-//! Cluster mode (leader/edge) is opt-in via `HYDRA_ROLE`; single-node builds
-//! keep the zero-dependency behavior unchanged.
+//! Cluster mode is opt-in via `HYDRA_CLUSTER_PEERS` (ADR-0001: the member list IS the
+//! decision, replacing `HYDRA_ROLE`, which is retired); single-node builds keep the
+//! zero-dependency behavior unchanged.
 
 use std::fmt;
 use std::time::Duration;
@@ -56,59 +57,58 @@ pub enum NodeRole {
 }
 
 impl NodeRole {
-    /// Parse `HYDRA_ROLE` (default `all`). A value that is not `leader`/`edge` is
-    /// treated as `all`, so a typo never leaves a node unable to proxy — but it is
-    /// never allowed to stay quiet.
+    /// Decide this node's role from the environment (ADR-0001).
     ///
-    /// The fallback is deliberate and documented (`dev-docs/jiqun-deploy.md`): a
-    /// typo must not leave a node unable to proxy. What it is NOT allowed to do is
-    /// stay quiet, because every cluster-only check in `main.rs`
-    /// (`HYDRA_REDIS_URL`, `HYDRA_CLUSTER_TOKEN`, `HYDRA_CONTROL_URL`, and the
-    /// `HYDRA_ADMIN_TOKEN` requirement that only applies to clustered roles) is
-    /// gated on [`is_cluster`](Self::is_cluster). A node that was MEANT to be a
-    /// leader and fell back to `all` therefore starts "successfully" while: skipping
-    /// all four of those validations, serving tenant writes from its OWN local
-    /// SQLite (which the next `restore_config` overwrites), never joining the
-    /// election, and answering 404 on `/healthz/leader` — which hangs a Kubernetes
-    /// rollout forever with no error anywhere. Hence `error!`, and hence
-    /// [`ignored_cluster_wiring`], which names the settings being dropped.
-    ///
-    /// The diagnosis is attached to the CONDITION (cluster wiring configured while
-    /// this node is not a cluster node), not to one arm that reaches it — measured
-    /// 2026-10-01 on the wire: with `HYDRA_ROLE` **unset** and all three wiring
-    /// variables set, the node used to start as `all` with **no log line at all**,
-    /// i.e. the one path where the operator most likely just forgot the variable was
-    /// the one path the diagnostic could not reach. `HYDRA_ROLE=all` — a value
-    /// `lib.rs` and both deployment docs name — used to be reported as an *unknown*
-    /// role, which was a false claim about a documented value.
+    /// A cluster node is one with `HYDRA_CLUSTER_PEERS` set; there is no role variable to
+    /// mistype and therefore no silent fallback. What CAN still be silent is a deployment
+    /// that configures cluster settings without the member list, or that still sets a
+    /// variable this plan retired — [`cluster_decision`] names both, and names them on the
+    /// node that would otherwise serve from its OWN database without a word.
     #[must_use]
     pub fn from_env() -> Self {
-        let raw = std::env::var("HYDRA_ROLE").ok();
-        let role = role_from_raw(raw.as_deref());
-        let mut present: Vec<(&str, Option<String>)> = Vec::with_capacity(CLUSTER_ONLY_ENV.len());
-        for name in CLUSTER_ONLY_ENV {
-            present.push((name, std::env::var(name).ok()));
+        let mut present: Vec<(String, Option<String>)> = Vec::new();
+        for name in CLUSTER_ONLY_ENV.iter().chain(RETIRED_CLUSTER_ENV.iter()) {
+            present.push(((*name).to_string(), std::env::var(name).ok()));
         }
-        let wiring = ignored_cluster_wiring(
-            &present
-                .iter()
-                .map(|(name, value)| (*name, value.as_deref()))
-                .collect::<Vec<_>>(),
+        let live_wiring: Vec<String> = present
+            .iter()
+            .filter(|(name, value)| {
+                CLUSTER_ONLY_ENV.contains(&name.as_str())
+                    && value.as_deref().is_some_and(|v| !v.trim().is_empty())
+                    && name.as_str() != "HYDRA_CLUSTER_PEERS"
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let retired: Vec<String> = present
+            .iter()
+            .filter(|(name, value)| {
+                RETIRED_CLUSTER_ENV.contains(&name.as_str())
+                    && value.as_deref().is_some_and(|v| !v.trim().is_empty())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        let decision = cluster_decision(
+            std::env::var("HYDRA_CLUSTER_PEERS").ok().as_deref(),
+            &live_wiring,
+            &retired,
         );
-        match role_notice(raw.as_deref(), wiring) {
-            RoleNotice::Quiet => {}
-            RoleNotice::Unknown { raw } => tracing::warn!(
-                role = %raw,
-                "unrecognised HYDRA_ROLE; falling back to single-node 'all' mode"
-            ),
-            RoleNotice::WiringIgnored { why, ignored } => tracing::error!(
+        match &decision.notice {
+            ClusterNotice::Quiet => {}
+            ClusterNotice::WiringWithoutMembers { ignored } => tracing::error!(
                 ignored = %ignored,
-                "cluster wiring is configured but {why}; falling back to single-node 'all' mode — \
-                 the wiring listed in `ignored` is NOT used (no registry, no lease, no L2 cache, \
-                 and tenant writes land in the LOCAL database)"
+                "cluster wiring is configured but HYDRA_CLUSTER_PEERS is not set; this node is \
+                 standalone — the wiring listed in `ignored` is NOT used (no raft membership, no \
+                 shared L2 cache, and tenant writes land in the LOCAL database)"
+            ),
+            ClusterNotice::RetiredIgnored { ignored } => tracing::error!(
+                ignored = %ignored,
+                "these variables were retired by the Arachne control plane (ADR-0001) and are \
+                 IGNORED; remove them from the deployment so nobody believes they still do \
+                 something"
             ),
         }
-        role
+        decision.role
     }
 
     /// Whether this role participates in a cluster (leader/edge).
@@ -204,130 +204,152 @@ pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> St
         )
 }
 
-/// The one value that means "not a cluster node" on purpose (`lib.rs`, `cluster.md`
-/// and `jiqun-deploy.md` all name `all` as the default role).
-const NON_CLUSTER_ROLE: &str = "all";
-
-/// `HYDRA_ROLE` → role, with no environment access (so tests are parallel-safe).
+/// Variables that ONLY a cluster node uses — the single owner of "what counts as cluster
+/// wiring", and therefore what the standalone diagnostic names.
 ///
-/// Surrounding whitespace is folded before matching — a manifest value of
-/// `"leader "` is a leading/trailing-space accident, not a different role, and
-/// treating it as unrecognised would silently drop the node out of the cluster.
-/// Case is deliberately NOT folded (unlike `HYDRA_REDIS_MODE`, which folds it):
-/// every shipped manifest spells the role in lower case, and `parses_roles` pins
-/// the case-sensitivity.
-fn role_from_raw(raw: Option<&str>) -> NodeRole {
-    match raw.map(str::trim) {
-        Some("leader") => NodeRole::Leader,
-        Some("edge") => NodeRole::Edge,
-        _ => NodeRole::All,
-    }
-}
-
-/// What `from_env` must say about a role that is not a cluster role.
+/// ADR-0001 made the member list the decision, so `HYDRA_CLUSTER_PEERS` is the first entry:
+/// setting anything else here without it is the mistake the diagnostic exists for.
 ///
-/// Split out as a pure value so every row of the table is testable without
-/// touching the process env; the logging itself stays in [`NodeRole::from_env`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RoleNotice {
-    /// Nothing to say: either this IS a cluster node (the wiring is used), or the
-    /// role is unset/blank/`all` with no cluster wiring — which is exactly the
-    /// documented single-node default.
-    Quiet,
-    /// An unrecognised value with no cluster wiring: a WARN naming the value.
-    Unknown { raw: String },
-    /// Cluster wiring is configured while this node is not a cluster node: an ERROR
-    /// naming every variable that will be ignored (`why` names the role side of the
-    /// mismatch, because "unset", "blank", `all` and a typo are four different
-    /// operator mistakes with the same consequence).
-    WiringIgnored { why: String, ignored: String },
-}
-
-/// Decide what [`NodeRole::from_env`] should log. Pure, so the whole table is a test.
-///
-/// The condition that matters is `wiring.is_some() && !role.is_cluster()`; reaching
-/// it through an unset variable, a blank variable, `all`, or a typo must produce the
-/// same diagnosis, because the consequence is identical (the node is standalone:
-/// no registry, no lease, no L2 cache, tenant writes to its own SQLite).
-fn role_notice(raw: Option<&str>, wiring: Option<String>) -> RoleNotice {
-    if role_from_raw(raw).is_cluster() {
-        // leader/edge: the wiring is used, so there is nothing to warn about.
-        return RoleNotice::Quiet;
-    }
-    match (raw.map(str::trim), wiring) {
-        (None, None) | (Some(""), None) => RoleNotice::Quiet,
-        (Some(NON_CLUSTER_ROLE), None) => RoleNotice::Quiet,
-        (None, Some(ignored)) => RoleNotice::WiringIgnored {
-            why: "HYDRA_ROLE is not set".to_string(),
-            ignored,
-        },
-        (Some(""), Some(ignored)) => RoleNotice::WiringIgnored {
-            why: "HYDRA_ROLE is blank".to_string(),
-            ignored,
-        },
-        (Some(NON_CLUSTER_ROLE), Some(ignored)) => RoleNotice::WiringIgnored {
-            why: format!("HYDRA_ROLE={NON_CLUSTER_ROLE:?} is not a cluster role"),
-            ignored,
-        },
-        (Some(unknown), Some(ignored)) => RoleNotice::WiringIgnored {
-            why: format!("HYDRA_ROLE={unknown:?} is not a known role"),
-            ignored,
-        },
-        (Some(unknown), None) => RoleNotice::Unknown {
-            raw: unknown.to_string(),
-        },
-    }
-}
-
-/// Every environment variable that ONLY a cluster role uses — the single owner of "what counts as
-/// cluster wiring".
-///
-/// [`ignored_cluster_wiring`] reports the subset that is actually set, so this table is what the
-/// operator sees named in the "you configured cluster wiring but this node is not a cluster node"
-/// ERROR. It used to be three literals inside that function, and the other seven were dropped in
-/// silence (measured 2026-10-01: `HYDRA_NODE_ID`, `HYDRA_CONTROL_POLL_MS`, `HYDRA_REDIS_MODE`,
-/// `HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS` and
-/// `HYDRA_FORWARD_TIMEOUT_SECS` were all configured, all ignored, and none of them mentioned) —
-/// the "a hand-written list eats objects" family. Every name here has its read site in code that
-/// runs only for a cluster role, which is what `check_cluster_env.cjs` checks in both directions.
-///
-/// NOT in this list, on purpose: `HYDRA_USAGE_SINK` / `HYDRA_CLICKHOUSE_URL` (mandatory in cluster
-/// mode but equally meaningful single-node), `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` (the tenant API
-/// exists in every role) and `HYDRA_RESEAL_SECRETS` (a one-shot maintenance switch that has nothing
-/// to do with topology).
+/// `HYDRA_NODE_ID` and `HYDRA_ARACHNE_LISTEN` are read by the Arachne assembly path
+/// (`cluster/arachne_node.rs`, through named constants rather than literals) and by
+/// `main.rs`; `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` / `HYDRA_CLUSTER_TOKEN` are still read
+/// by the Redis backbone, which stays for the data-plane hot path (ADR-0001 D-1).
 const CLUSTER_ONLY_ENV: [&str; 10] = [
-    "HYDRA_REDIS_URL",                 // the backbone itself
-    "HYDRA_REDIS_MODE",                // ...and its topology (read only when `is_cluster()`)
-    "HYDRA_CLUSTER_TOKEN",             // shared control-plane token
-    "HYDRA_CONTROL_URL",               // leader/edge snapshot polling
-    "HYDRA_PUBLIC_URL",                // what this node registers as (registry)
-    "HYDRA_NODE_ID",                   // registry/lease identity
-    "HYDRA_CONTROL_POLL_MS",           // snapshot poll interval (control client)
-    "HYDRA_LEADER_LEASE_MS",           // election lease length
-    "HYDRA_REGISTRY_STALE_GRACE_SECS", // when a silent node is treated as gone
-    "HYDRA_FORWARD_TIMEOUT_SECS",      // standby → active admin-write forwarding
+    "HYDRA_CLUSTER_PEERS",  // the member list — the decision itself
+    "HYDRA_CLUSTER_ID",     // optional cluster name: refuses a data directory from another cluster
+    "HYDRA_REDIS_URL",      // the data-plane backbone (still required in a cluster)
+    "HYDRA_REDIS_MODE",     // ...and its topology
+    "HYDRA_CLUSTER_TOKEN",  // shared control-plane token
+    "HYDRA_NODE_ID",        // this node's identity (registry today, raft id after T1.3)
+    "HYDRA_ARACHNE_LISTEN", // where this node's raft transport binds
+    // Still read by the Redis control path that has not been deleted yet. They move to
+    // RETIRED_CLUSTER_ENV in the same commit that deletes their readers (plan T4.1) — until
+    // then they are genuinely live, and claiming otherwise would make the retirement
+    // diagnostic a lie.
+    "HYDRA_CONTROL_URL", // snapshot polling (control_client, registry, forward)
+    "HYDRA_CONTROL_POLL_MS", // ...and its interval (control_client)
+    "HYDRA_FORWARD_TIMEOUT_SECS", // standby → active admin-write forwarding (forward)
 ];
 
-/// Which of the cluster-only settings are configured while the role is NOT a cluster role.
+/// Variables the Arachne control plane RETIRES, once their readers are gone.
 ///
-/// Returns `None` when none of them is configured (then the fallback is exactly the documented
-/// single-node default and a WARN is enough), or a comma-separated list of the variable names that
-/// will be IGNORED. Kept pure — it takes the `(name, value)` pairs instead of reading the
-/// environment — so the diagnostic itself is testable, which matters because the failure it explains
-/// (cluster wiring on a node that fell back to `all`) is invisible in the logs otherwise.
+/// **INACTIVE — the table is empty, and that is the measured truth, not an oversight.**
+/// Every variable that ADR-0001 retires is STILL READ by the Redis path that has not been
+/// deleted: `main.rs` (`HYDRA_PUBLIC_URL`, `HYDRA_LEADER_LEASE_MS`,
+/// `HYDRA_REGISTRY_STALE_GRACE_SECS`), `cluster/control_client.rs`, `cluster/registry.rs`,
+/// `cluster/forward.rs`. A name belongs in this table only when nothing reads it, because the
+/// table's diagnostic tells the operator the setting does nothing — and the environment guard
+/// checks exactly that, in both directions.
 ///
-/// A blank value is not configuration (a bare `HYDRA_REDIS_URL=` in a compose file), the same rule
-/// the role side uses.
-fn ignored_cluster_wiring(present: &[(&str, Option<&str>)]) -> Option<String> {
-    let names: Vec<&str> = present
+/// The mechanism below is kept and tested so that the retirement commit (plan T4.1) is a
+/// one-line table change plus the deletions, rather than new logic written under pressure.
+/// `HYDRA_ROLE` is the first name that will move here: nothing reads it any more (ADR-0001
+/// replaced it with the member list), only comments still mention it.
+const RETIRED_CLUSTER_ENV: [&str; 0] = [];
+
+/// Which of `present` are retired, according to `table`.
+///
+/// `table` is a parameter rather than a read of [`RETIRED_CLUSTER_ENV`] so the mechanism can
+/// be tested while the real table is still empty — and so a test cannot silently pass by
+/// depending on a global that happens to contain the fixture's name.
+fn retired_present(present: &[String], table: &[&str]) -> Vec<String> {
+    present
         .iter()
-        .filter(|(_, value)| value.is_some_and(|v| !v.trim().is_empty()))
-        .map(|(name, _)| *name)
-        .collect();
-    if names.is_empty() {
-        None
+        .filter(|name| table.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// What a node should say about its own cluster-shaped configuration.
+///
+/// Split out as a pure value so every row of the table is testable without touching the
+/// process env; the logging itself stays in [`NodeRole::from_env`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterNotice {
+    /// Nothing to say: either this IS a cluster node, or nothing cluster-shaped is set —
+    /// which is the documented single-node default.
+    Quiet,
+    /// Cluster settings are configured while the member list is missing: an ERROR naming
+    /// every variable that will be ignored. This is the mistake that used to be SILENT
+    /// (measured 2026-10-01) and that leaves a node serving from its OWN database.
+    WiringWithoutMembers { ignored: String },
+    /// Retired variables are set: an ERROR naming them, on any node.
+    RetiredIgnored { ignored: String },
+}
+
+/// The decision about this process's cluster role, plus what to say about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterDecision {
+    /// The role. `Leader` means "a cluster member" — every member is a leader candidate
+    /// under the homogeneous topology (ADR-0001 D-2), which is why `Edge` is not
+    /// produced here any more.
+    pub role: NodeRole,
+    /// What the startup path must log.
+    pub notice: ClusterNotice,
+}
+
+/// Decide this node's role from the member list, and what to say about the rest.
+///
+/// Pure — it takes the already-read values — so every row is a test. The two diagnostics
+/// are ordered deliberately: a missing member list is reported first (the node is not
+/// clustered at all), and retirement is reported in the same run because both are true.
+pub fn cluster_decision(
+    peers: Option<&str>,
+    live_wiring: &[String],
+    retired: &[String],
+) -> ClusterDecision {
+    cluster_decision_with(peers, live_wiring, retired, &RETIRED_CLUSTER_ENV)
+}
+
+/// [`cluster_decision`] against an explicit retirement table.
+///
+/// Split out so the classification is testable before the table has entries (it is empty
+/// today — see [`RETIRED_CLUSTER_ENV`]) and so the test exercises the real logic rather than
+/// a copy of it.
+pub fn cluster_decision_with(
+    peers: Option<&str>,
+    live_wiring: &[String],
+    retired: &[String],
+    retired_table: &[&str],
+) -> ClusterDecision {
+    let clustered = matches!(peers, Some(v) if !v.trim().is_empty());
+    let retired = retired_present(retired, retired_table);
+
+    if !retired.is_empty() {
+        // Retirement outranks the standalone diagnostic: it applies to a healthy cluster
+        // node too, and telling an operator about a dropped setting matters more than
+        // telling them about their role.
+        return ClusterDecision {
+            role: if clustered {
+                NodeRole::Leader
+            } else {
+                NodeRole::All
+            },
+            notice: ClusterNotice::RetiredIgnored {
+                ignored: retired.join(", "),
+            },
+        };
+    }
+
+    if clustered {
+        return ClusterDecision {
+            role: NodeRole::Leader,
+            notice: ClusterNotice::Quiet,
+        };
+    }
+
+    if live_wiring.is_empty() {
+        ClusterDecision {
+            role: NodeRole::All,
+            notice: ClusterNotice::Quiet,
+        }
     } else {
-        Some(names.join(", "))
+        ClusterDecision {
+            role: NodeRole::All,
+            notice: ClusterNotice::WiringWithoutMembers {
+                ignored: live_wiring.join(", "),
+            },
+        }
     }
 }
 
@@ -344,59 +366,15 @@ mod tests {
     /// difference between a five-second fix and an outage nobody can explain.
     ///
     /// Falsification: return `None` unconditionally and every `Some` assertion fails.
-    #[test]
-    fn a_role_fallback_names_the_cluster_wiring_it_ignores() {
-        let pair = |name: &'static str, value: Option<&'static str>| (name, value);
-
-        // Nothing cluster-shaped configured: the documented single-node default.
-        assert_eq!(ignored_cluster_wiring(&[]), None);
-        assert_eq!(
-            ignored_cluster_wiring(&[
-                pair("HYDRA_REDIS_URL", Some("  ")),
-                pair("HYDRA_CLUSTER_TOKEN", Some("")),
-                pair("HYDRA_NODE_ID", None),
-            ]),
-            None,
-            "blank/whitespace values are not configuration"
-        );
-
-        // The typo case: leader wiring present, role unrecognised. EVERY configured name must be
-        // reported — the shipped bug (round 193) was a three-literal list that named
-        // HYDRA_REDIS_URL/CLUSTER_TOKEN/CONTROL_URL and silently dropped the other seven.
-        let named = ignored_cluster_wiring(&[
-            pair("HYDRA_REDIS_URL", Some("redis://cache:6379")),
-            pair("HYDRA_CLUSTER_TOKEN", Some("cluster-token-16chars")),
-            pair("HYDRA_CONTROL_URL", Some("http://control-a:8081")),
-            pair("HYDRA_NODE_ID", Some("control-a-0")),
-            pair("HYDRA_LEADER_LEASE_MS", Some("3000")),
-            pair("HYDRA_REDIS_MODE", Some("single")),
-        ])
-        .expect("cluster wiring must be reported");
-        for var in [
-            "HYDRA_REDIS_URL",
-            "HYDRA_CLUSTER_TOKEN",
-            "HYDRA_CONTROL_URL",
-            "HYDRA_NODE_ID",
-            "HYDRA_LEADER_LEASE_MS",
-            "HYDRA_REDIS_MODE",
-        ] {
-            assert!(named.contains(var), "{var} missing from {named:?}");
-        }
-
-        // Partial wiring is reported too (a control URL alone is still a typo), and an unset one
-        // never appears in the list.
-        let only_url = ignored_cluster_wiring(&[
-            pair("HYDRA_REDIS_URL", None),
-            pair("HYDRA_CONTROL_URL", Some("http://control-a:8081")),
-        ])
-        .expect("a lone control URL is still cluster wiring");
-        assert_eq!(only_url, "HYDRA_CONTROL_URL");
-    }
-
-    /// The table is the single owner of "what counts as cluster wiring", so it is asserted instead
-    /// of assumed: this is the list an operator reads in the fallback ERROR, and each name here has
-    /// a read site that only a cluster role reaches (`check_cluster_env.cjs` verifies the other
-    /// direction — that nothing in `src/cluster/` reads an unlisted name).
+    /// The table is the single owner of "what counts as cluster wiring", so it is asserted
+    /// instead of assumed: this is what an operator reads when they configured cluster
+    /// settings without turning the node into a cluster node. ADR-0001 replaced the
+    /// role-based decision with "is `HYDRA_CLUSTER_PEERS` set".
+    ///
+    /// The last three entries are variables the plan RETIRES but that the Redis path still
+    /// READS. They stay in the live table until the commit that deletes those readers,
+    /// because the alternative — listing them as retired while the product honours them —
+    /// would make the retirement diagnostic a lie.
     ///
     /// Falsification: drop any name from `CLUSTER_ONLY_ENV` and this fails with the missing one.
     #[test]
@@ -404,18 +382,19 @@ mod tests {
         assert_eq!(
             CLUSTER_ONLY_ENV,
             [
+                "HYDRA_CLUSTER_PEERS",
+                "HYDRA_CLUSTER_ID",
                 "HYDRA_REDIS_URL",
                 "HYDRA_REDIS_MODE",
                 "HYDRA_CLUSTER_TOKEN",
-                "HYDRA_CONTROL_URL",
-                "HYDRA_PUBLIC_URL",
                 "HYDRA_NODE_ID",
+                "HYDRA_ARACHNE_LISTEN",
+                "HYDRA_CONTROL_URL",
                 "HYDRA_CONTROL_POLL_MS",
-                "HYDRA_LEADER_LEASE_MS",
-                "HYDRA_REGISTRY_STALE_GRACE_SECS",
                 "HYDRA_FORWARD_TIMEOUT_SECS",
             ],
-            "the cluster-only table is what the fallback ERROR names — changing it is a user-visible change"
+            "the cluster-only table is what the fallback diagnostic names — changing it is a \
+             user-visible change"
         );
         // No duplicates, and every name is a real `HYDRA_*` variable spelled the documented way.
         for (i, name) in CLUSTER_ONLY_ENV.iter().enumerate() {
@@ -433,126 +412,154 @@ mod tests {
         }
     }
 
-    /// The parse table, against the PRODUCTION function. Until round 192 this test
-    /// ran a private copy of the `match` living in the test module, so it would have
-    /// stayed green after `role_from_raw` changed — a duplicate that only *looked*
-    /// like coverage.
-    #[test]
-    fn parses_roles() {
-        assert_eq!(role_from_raw(Some("leader")), NodeRole::Leader);
-        assert_eq!(role_from_raw(Some("edge")), NodeRole::Edge);
-        assert_eq!(role_from_raw(None), NodeRole::All);
-        assert_eq!(
-            role_from_raw(Some("ALL")),
-            NodeRole::All,
-            "case-sensitive, unrecognised → all"
-        );
-        assert_eq!(role_from_raw(Some("typo")), NodeRole::All);
-        // Whitespace is folded (a manifest value of "leader " is not another role);
-        // without this the node silently leaves the cluster it was configured for.
-        assert_eq!(role_from_raw(Some(" leader ")), NodeRole::Leader);
-        assert_eq!(role_from_raw(Some("edge\n")), NodeRole::Edge);
-        // A blank value is the unset default, not a role.
-        assert_eq!(role_from_raw(Some("")), NodeRole::All);
-        assert_eq!(role_from_raw(Some("   ")), NodeRole::All);
-    }
-
-    /// The whole notice table. Each row is a distinct operator mistake with the same
-    /// consequence, so each row must be asserted separately: the shipped bug
-    /// (round 192, measured on the wire) was that the `unset` row was SILENT while
-    /// the `typo` row shouted, and that the documented `all` row was called unknown.
+    /// The decision table, against the PRODUCTION function, one row per operator mistake.
     ///
-    /// Falsification: make `role_notice` return `Quiet` for `(None, Some(_))` and the
-    /// `unset_role_with_wiring` row fails; return `Unknown` for `all` and the
-    /// `documented_all` row fails.
+    /// ADR-0001: `HYDRA_ROLE` is gone, so "is this a cluster node" is answered by the
+    /// presence of the static member list and nothing else. The two SILENT failure modes
+    /// this table exists for are different mistakes with different fixes:
+    ///   1. cluster wiring set, member list missing — the node is standalone and the
+    ///      wiring is dropped;
+    ///   2. a RETIRED variable set — the node may be clustered, but that setting does
+    ///      nothing now.
+    ///
+    /// Falsification: make the missing-peers branch `Quiet` and rows 1 fail; drop the
+    /// retirement arm and row 2 fails.
     #[test]
-    fn role_notice_covers_every_way_to_be_a_non_cluster_node() {
-        let wiring = || Some("HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN".to_string());
+    fn the_cluster_decision_covers_every_way_to_be_standalone() {
+        let wiring = || {
+            vec![
+                "HYDRA_REDIS_URL".to_string(),
+                "HYDRA_CLUSTER_TOKEN".to_string(),
+            ]
+        };
 
-        // A cluster node uses its wiring: nothing to say.
-        assert_eq!(role_notice(Some("leader"), wiring()), RoleNotice::Quiet);
-        assert_eq!(role_notice(Some("edge"), None), RoleNotice::Quiet);
-
-        // The documented single-node default, with nothing cluster-shaped present.
-        assert_eq!(role_notice(None, None), RoleNotice::Quiet);
-        assert_eq!(role_notice(Some(""), None), RoleNotice::Quiet);
-        assert_eq!(role_notice(Some("all"), None), RoleNotice::Quiet);
-
-        // A typo with no wiring: a WARN naming the value.
-        assert_eq!(
-            role_notice(Some("ledge"), None),
-            RoleNotice::Unknown {
-                raw: "ledge".to_string()
-            }
+        // A member list, whatever else is set: this IS a cluster node.
+        let node = cluster_decision(
+            Some("a=1.1.1.1:7001,b=1.1.1.1:7002,c=1.1.1.1:7003"),
+            &[],
+            &[],
         );
+        assert_eq!(node.role, NodeRole::Leader);
+        assert_eq!(node.notice, ClusterNotice::Quiet);
 
-        // Wiring configured + not a cluster node ⇒ the ERROR, through ALL FOUR paths.
-        let expected = [
-            (None, "HYDRA_ROLE is not set"),
-            (Some(""), "HYDRA_ROLE is blank"),
-            (Some("all"), "HYDRA_ROLE=\"all\" is not a cluster role"),
-            (Some("ledge"), "HYDRA_ROLE=\"ledge\" is not a known role"),
-        ];
-        for (raw, why) in expected {
-            match role_notice(raw, wiring()) {
-                RoleNotice::WiringIgnored { why: got, ignored } => {
-                    assert_eq!(got, why, "raw={raw:?}");
-                    assert_eq!(
-                        ignored, "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN",
-                        "the ignored list must reach the log, raw={raw:?}"
-                    );
-                }
-                other => panic!("raw={raw:?} must report the ignored wiring, got {other:?}"),
-            }
+        // Nothing cluster-shaped at all: the documented single-node default, silently.
+        for peers in [None, Some(""), Some("   ")] {
+            let d = cluster_decision(peers, &[], &[]);
+            assert_eq!(d.role, NodeRole::All, "peers={peers:?}");
+            assert_eq!(d.notice, ClusterNotice::Quiet, "peers={peers:?}");
         }
 
-        // `all` is a documented value, so the wiring error must NOT call it unknown —
-        // that was the false claim (measured 2026-10-01: `HYDRA_ROLE=all` + wiring
-        // logged "unknown HYDRA_ROLE" with the role field printed as "all").
-        if let RoleNotice::WiringIgnored { why, .. } = role_notice(Some("all"), wiring()) {
-            assert!(
-                !why.contains("unknown") && !why.contains("known role"),
-                "`all` is documented, not unknown: {why:?}"
+        // Mistake 1: wiring without a member list.
+        for peers in [None, Some(""), Some("  ")] {
+            let d = cluster_decision(peers, &wiring(), &[]);
+            assert_eq!(d.role, NodeRole::All, "peers={peers:?}");
+            assert_eq!(
+                d.notice,
+                ClusterNotice::WiringWithoutMembers {
+                    ignored: "HYDRA_REDIS_URL, HYDRA_CLUSTER_TOKEN".to_string()
+                },
+                "peers={peers:?}: configured cluster settings must be named, not dropped in silence"
             );
-        } else {
-            panic!("`all` with cluster wiring must still report the wiring it drops");
         }
-    }
 
-    /// The identity fallback chain (G2). Each tier is asserted separately
-    /// because a regression here is SILENT: it only shows up as a growing pile
-    /// of offline rows in the admin view after every restart.
-    #[test]
-    fn node_id_prefers_explicit_then_hostname_then_random() {
-        // 1) An explicit id always wins (the pinned-pod-name case).
-        assert_eq!(node_id_from(Some("pinned"), Some("host")), "pinned");
-        // 2) `HOSTNAME` is the tier that stops restarts from minting new rows.
-        assert_eq!(
-            node_id_from(None, Some("k3s-hydra-edge-1")),
-            "k3s-hydra-edge-1"
+        // Mistake 2: a retired variable. Reported whether or not the node is clustered,
+        // because either way the setting does nothing. The retirement table is empty today,
+        // so the mechanism is exercised through the explicit-table entry point with the name
+        // that is first in line to move in.
+        let retired = cluster_decision_with(
+            Some("a=1.1.1.1:7001,b=1.1.1.1:7002,c=1.1.1.1:7003"),
+            &[],
+            &["HYDRA_ROLE".to_string()],
+            &["HYDRA_ROLE"],
         );
-        // An EMPTY value is treated as unset (a bare `HYDRA_NODE_ID=` must not
-        // register a node under the empty string).
-        assert_eq!(node_id_from(Some(""), Some("host")), "host");
-        // 3) Both unset (or empty) ⇒ a fresh random id, still recognisable. The
-        // empty-string case must land here too, so a bare `HYDRA_NODE_ID=`
-        // cannot register a node under "".
-        for random in [node_id_from(Some(""), Some("")), node_id_from(None, None)] {
-            assert!(random.starts_with("node-"), "got {random}");
-            assert!(random.len() > "node-".len(), "got {random}");
-        }
-        // Distinct random ids (never a shared row for two unconfigured nodes).
-        assert_ne!(node_id_from(None, None), node_id_from(None, None));
+        assert_eq!(
+            retired.notice,
+            ClusterNotice::RetiredIgnored {
+                ignored: "HYDRA_ROLE".to_string()
+            },
+            "a retired variable must be named even on a healthy cluster node"
+        );
+        // ...and it must not change the decision.
+        assert_eq!(retired.role, NodeRole::Leader);
     }
 
+    /// A retired variable must be detectable from the environment table alone, and the
+    /// detection must not depend on which of the two mistakes also happened.
+    ///
+    /// Falsification: return the whole present list instead of the retired subset and
+    /// this fails on the healthy-node row.
     #[test]
-    fn cluster_flag_and_admin() {
-        assert!(NodeRole::Leader.is_cluster());
-        assert!(NodeRole::Edge.is_cluster());
-        assert!(!NodeRole::All.is_cluster());
+    fn retired_variables_are_reported_and_live_ones_are_not() {
+        let present =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        // An explicit table, so this exercises the MECHANISM rather than the current contents
+        // of the real one (which is empty today, and pinned as such below).
+        let table = ["HYDRA_LEADER_LEASE_MS", "HYDRA_CONTROL_POLL_MS"];
 
-        assert!(NodeRole::All.has_admin_crud());
-        assert!(NodeRole::Leader.has_admin_crud());
-        assert!(!NodeRole::Edge.has_admin_crud(), "edge has no admin CRUD");
+        assert_eq!(
+            retired_present(
+                &present(&[
+                    "HYDRA_LEADER_LEASE_MS",
+                    "HYDRA_CLUSTER_TOKEN",
+                    "HYDRA_CONTROL_POLL_MS"
+                ]),
+                &table
+            ),
+            present(&["HYDRA_LEADER_LEASE_MS", "HYDRA_CONTROL_POLL_MS"]),
+            "only the retired names may be reported"
+        );
+        assert!(
+            retired_present(
+                &present(&["HYDRA_CLUSTER_TOKEN", "HYDRA_REDIS_URL"]),
+                &table
+            )
+            .is_empty(),
+            "a healthy cluster node must not be told anything is retired"
+        );
+        assert!(
+            retired_present(&[], &table).is_empty(),
+            "nothing configured ⇒ nothing to report"
+        );
+        // The real table is empty, and that is a FACT worth pinning: the moment a name moves
+        // in, this assertion must be updated deliberately (and only after confirming nothing
+        // reads that variable any more).
+        assert!(
+            RETIRED_CLUSTER_ENV.is_empty(),
+            "the retirement table gained an entry: update this test AND confirm nothing reads \
+             that variable any more"
+        );
+    }
+
+    /// The retirement table must never overlap the live table.
+    ///
+    /// A name in both would be reported to the operator as retired while the product still
+    /// honours it — worse than either message alone. This is the honest half of the
+    /// retirement guard: the full "nothing reads these" version can only be asserted once
+    /// the Redis path is deleted (plan T4.1), and pretending otherwise would be a test that
+    /// passes for the wrong reason.
+    ///
+    /// Falsification: add any `RETIRED_CLUSTER_ENV` name to `CLUSTER_ONLY_ENV` and this
+    /// fails naming it.
+    #[test]
+    fn the_retirement_table_never_shadows_a_live_variable() {
+        for name in RETIRED_CLUSTER_ENV {
+            assert!(
+                !CLUSTER_ONLY_ENV.contains(&name),
+                "{name} is listed as BOTH live and retired; the operator would be told it is \
+                 ignored while the product still reads it"
+            );
+        }
+        // And the two tables together are what `from_env` reads, so a name that is in
+        // neither would be a knob nobody reports on.
+        let mut all: Vec<&str> = CLUSTER_ONLY_ENV.to_vec();
+        all.extend(RETIRED_CLUSTER_ENV);
+        for name in &all {
+            assert!(
+                name.starts_with("HYDRA_"),
+                "{name} is not a HYDRA_* variable"
+            );
+        }
+        let unique: std::collections::BTreeSet<&&str> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "a name appears in both tables");
     }
 }

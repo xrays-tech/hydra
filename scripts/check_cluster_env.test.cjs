@@ -295,7 +295,12 @@ test('the real repository tree passes (the table names exactly the cluster topol
   const res = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', env: { ...process.env, CLUSTER_ENV_ROOT: '' } });
   assert.equal(res.status, 0, `${res.status} ${res.stdout}${res.stderr}`);
   assert.match(res.stdout, /10 cluster-only name\(s\)/);
-  assert.match(res.stdout, /HYDRA_REGISTRY_STALE_GRACE_SECS/);
+  // ADR-0001 replaced the role selector with the member list, so the table gained the three
+  // names the Arachne assembly path reads. Asserting on the NEW names (rather than on a name
+  // that is merely still present) is what makes this a check on the decision, not on the count.
+  assert.match(res.stdout, /HYDRA_CLUSTER_PEERS/);
+  assert.match(res.stdout, /HYDRA_CLUSTER_ID/);
+  assert.match(res.stdout, /HYDRA_ARACHNE_LISTEN/);
 });
 
 test('the shipped table still matches the Rust test that pins it', () => {

@@ -82,10 +82,10 @@ const SRC_DIR = 'crates/hydra-server/src';
  * objects, in the guard written to catch exactly that.
  */
 const NOT_CLUSTER_ONLY = records(process.env.CLUSTER_ENV_NOT_CLUSTER_ONLY, [
-  [
-    'HYDRA_ROLE',
-    'the role selector itself: read in every mode, it is what decides whether cluster code runs',
-  ],
+  // `HYDRA_ROLE` used to be recorded here as "the selector itself, read in every mode".
+  // ADR-0001 removed that selector: the member list (`HYDRA_CLUSTER_PEERS`) is the decision
+  // now, and nothing under `src/cluster/` reads `HYDRA_ROLE` any more, so the record expired
+  // — the staleness direction of this algebra is what caught it.
   ['HOSTNAME', 'the OS hostname (node-id fallback tier); always set, nothing an operator configures'],
 ]);
 

@@ -35,7 +35,7 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `HYDRA_ROLE` | `all` | `leader` / `edge` 进入集群。**未设/空白/`all`** 就是单节点（默认，不报警）；**拼错的值不会阻止节点启动**（拼错不得让节点无法代理），但绝不静默 —— 只要配了**任何一个 cluster-only 变量**，就记一条 **ERROR 并用 `ignored=` 点名每一个**（**不是其中一部分**）（无注册表、无租约、无 L2 缓存、租户写入落在**本地** SQLite）；**角色未设**时同样报（第一百九十二轮实测：这条路径此前**完全静默**）。清单是 `cluster/mod.rs` 的 `CLUSTER_ONLY_ENV`（**10 个**：`HYDRA_REDIS_URL`、`HYDRA_REDIS_MODE`、`HYDRA_CLUSTER_TOKEN`、`HYDRA_CONTROL_URL`、`HYDRA_PUBLIC_URL`、`HYDRA_NODE_ID`、`HYDRA_CONTROL_POLL_MS`、`HYDRA_LEADER_LEASE_MS`、`HYDRA_REGISTRY_STALE_GRACE_SECS`、`HYDRA_FORWARD_TIMEOUT_SECS`）—— 第一百九十三轮实测：此前只点名前三个，**其余七个被静默丢弃**。首尾空白会被去掉（`" leader "` 就是 leader）；由 `scripts/check_cluster_env.cjs` 双向检查 |
+> **`HYDRA_ROLE` 已退役（ADR-0001）**：集群判定改为「有没有配 `HYDRA_CLUSTER_PEERS`」，成员表就是决策本身，不再有可拼错的角色变量与静默回落。代码里已无读取点，设了不生效，因此本表已删除该行（`scripts/check_documented_env.cjs` 把配置表当承诺：要么接线，要么移出表）。取代它的名字见下方新行；本节其余内容仍描述 Redis 租约世界，随 ADR-0001 同步的排期在计划的 T4.3。
 | `HYDRA_REDIS_URL` | — | **集群必填**（fail-closed）；如 `redis://redis:6379` |
 | `HYDRA_REDIS_MODE` | `single` | `single`（默认，大小写不敏感）/ `sentinel` / `cluster`（后两者接线中，**fail-fast**）；**其它任何值也 fail-fast**（拼错不得静默降级为 `single`）。**限定**：该开关**只在集群角色分支里被读取**（`if role.is_cluster()`，`main.rs`）⇒ `HYDRA_ROLE` 未设/`all` 时**根本不校验**，此时最多只会被那条 "cluster wiring is configured but …" 的 ERROR 提到**变量名**、**不会**出现拼错的值（第一百九十四轮实测，由 drill 的 K12 钉住） |
 | `HYDRA_CLUSTER_TOKEN` | — | **集群必填**：控制通道共享 token（leader 服务、edge/standby 调用） |

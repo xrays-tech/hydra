@@ -366,6 +366,47 @@ const LEADER_PROBE_KEY: &[u8] = b"hydra/probe/leader";
 /// never reaches the log).
 pub const LEADER_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Read the environment and assemble the Arachne config, or explain why it cannot be.
+///
+/// This is the function the startup path calls. It reads the variables as LITERALS on
+/// purpose: `scripts/check_cluster_env.cjs` decides from literal reads whether a knob is
+/// documented and earned, and an indirection here would make the cluster's own entry point
+/// invisible to that check.
+///
+/// `sqlite_path` is the proxy's database file; the Arachne data directory is derived from it
+/// unless `HYDRA_ARACHNE_DATA_DIR` overrides it (see [`arachne_data_dir`]).
+///
+/// # Errors
+/// A human-readable reason for every way this can fail — none of which may be a fallback,
+/// because a node that guesses its identity or its member list joins the wrong raft group.
+pub fn config_from_env(
+    sqlite_path: &str,
+    override_data_dir: Option<&str>,
+) -> Result<arachne_kv::server::ClusterConfig, String> {
+    // LITERAL names, not the `*_ENV` constants above: the environment guard decides from
+    // literal reads whether a knob is documented and earned, so spelling them out here is
+    // what makes these three visible to it. The constants stay for the diagnostics and the
+    // tests. (`check_cluster_env.cjs` would otherwise report each of these as an
+    // unrecordable non-literal read.)
+    let peers = cluster_peers(
+        std::env::var("HYDRA_CLUSTER_PEERS")
+            .unwrap_or_default()
+            .as_str(),
+        std::env::var("HYDRA_NODE_ID").unwrap_or_default().as_str(),
+        std::env::var("HYDRA_ARACHNE_LISTEN")
+            .unwrap_or_default()
+            .as_str(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let data_dir = arachne_data_dir(sqlite_path, override_data_dir);
+    let cluster_id = cluster_id_from(
+        std::env::var("HYDRA_CLUSTER_ID").ok().as_deref(),
+        &data_dir.to_string_lossy(),
+    );
+    Ok(arachne_config(&peers, cluster_id, data_dir))
+}
+
 /// A live Arachne node plus the cached answer to "am I the leader".
 ///
 /// The cache exists for the **synchronous** callers — `/healthz/leader` and the

@@ -1456,7 +1456,7 @@ is longer than the test window.
   mode remains one process with a local SQLite; **cluster mode is now
   implemented** (Redis-backed, see §13): multi-instance with shared rate-limit
   counters, shared circuit breaker, shared auth cache L2 and a leader-lease
-  failover is available via `HYDRA_ROLE=leader|edge` — no longer a v2 backlog
+  failover is available in cluster mode (the member list replaced the retired role selector) — no longer a v2 backlog
   item (design §16.6 updated).
 - **Single static admin token.** No RBAC, no token rotation (v2, §16.6 / §13.3).
 - **No web UI auth** beyond the in-memory token prompt. The UI is a power-user
@@ -1471,7 +1471,7 @@ For the remaining v2 backlog see design §16.6.
 
 ## 13. Cluster mode operations (design §20 / dev-docs/cluster.md)
 
-Cluster mode is opt-in (`HYDRA_ROLE=leader|edge`) with **Redis as the only
+Cluster mode is opt-in (set the member list) with **Redis as the only
 external dependency** (K8s/k3s-agnostic, self-sustaining). The authoritative
 reference is **[`cluster.md`](cluster.md)** — env table, shared-state
 map, Redis failure matrix, deploy manifests, failover drill and the live
@@ -1501,8 +1501,13 @@ k3s / k8s manifests and bare-metal systemd live in `dev-docs/cluster.md` §4.
 
 | Variable | Notes |
 |---|---|
-| `HYDRA_ROLE` | `leader` / `edge`; unset or `all` = single-node (unchanged behavior). A value that is neither **does not stop the node** (a typo must not leave a node unable to proxy) but is never quiet: if **any cluster-only variable** is configured the node logs an **ERROR naming `ignored=` — every one of them, not a subset** (no registry, no lease, no L2 cache, tenant writes to its **local** SQLite), and the same ERROR is logged when the role is **unset** or blank while that wiring is present. The list is `CLUSTER_ONLY_ENV` in `cluster/mod.rs` (10 names: `HYDRA_REDIS_URL`, `HYDRA_REDIS_MODE`, `HYDRA_CLUSTER_TOKEN`, `HYDRA_CONTROL_URL`, `HYDRA_PUBLIC_URL`, `HYDRA_NODE_ID`, `HYDRA_CONTROL_POLL_MS`, `HYDRA_LEADER_LEASE_MS`, `HYDRA_REGISTRY_STALE_GRACE_SECS`, `HYDRA_FORWARD_TIMEOUT_SECS`) — before round 193 it named only the first three and dropped the other seven in silence. Surrounding whitespace is trimmed (`" leader "` is the leader). Pinned by `integration/test_startup_knobs.py` (K4–K8) and K10 (all ten named), plus `scripts/check_cluster_env.cjs`. |
-| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with `HYDRA_ROLE` unset/`all` the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
+> **The role selector is RETIRED (ADR-0001)**: the cluster decision is now "is `HYDRA_CLUSTER_PEERS` set" — the member list IS the decision, so there is no role variable to mistype and no silent fallback. Nothing in the product reads it any more, so the row was DELETED from this table (`check_documented_env.cjs` treats a config table as a promise: wire it or move it out). The rest of this section still describes the Redis-lease world; following ADR-0001 is scheduled in plan T4.3.
+
+| `HYDRA_CLUSTER_PEERS` | **required in cluster mode**: the static member list, `id=host:port` per member, this node included. Its presence IS the cluster decision. The member ORDER is immutable: Arachne derives each member's numeric raft id from its position in the list |
+| `HYDRA_NODE_ID` | **required in cluster mode**: this node's identity, and it must appear in the member list. No `HOSTNAME`/random fallback on purpose — a duplicate id means two nodes share one raft identity |
+| `HYDRA_ARACHNE_LISTEN` | **required in cluster mode**: where this node's raft transport binds. Its port must equal the admin port (the interface may differ) so the address Arachne reports as the leader hint is directly usable |
+| `HYDRA_CLUSTER_ID` | optional: names the cluster so a node refuses to adopt an Arachne data directory that belongs to a different one. Defaults to a hash of the data directory |
+| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
 | `HYDRA_CLUSTER_TOKEN` | shared control-channel token (all nodes)  **Minimum 16 characters AND it must be random** (`openssl rand -hex 32`) — the length is a floor, not a guarantee: the startup check cannot tell `aaaaaaaaaaaaaaaa` from a real token, and this is the token that authorises the internal control plane and the cross-tenant write endpoints. |
 | `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` | active control endpoint (snapshot polling) / this node's registered URL. `HYDRA_CONTROL_URL` is **not** the admin-mutation forward target — a standby forwards writes to the ACTUAL lease holder, resolved live from the registry (self-forward/mutual-forward loop guards; see `dev-docs/cluster.md` §5.2) |
 | `HYDRA_ADMIN_TOKEN` | required on leaders, shared cluster-wide |
@@ -1677,7 +1682,7 @@ used for TWO things: the registry row (`hydra:{nodes}`) **and the leader lease**
   2026-10-01 on the wire: the node started and registered), which is the opposite of this section's
   promise. `HYDRA_REDIS_MODE=single`/`SINGLE`/unset are accepted; anything else stops the process with
   `unsupported HYDRA_REDIS_MODE '<what you wrote>' (supported: single)` — **on a cluster-role node**:
-  the mode is read inside `if role.is_cluster()` (`main.rs`), so with `HYDRA_ROLE` unset or `all` the
+  the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the
   value is not validated at all (measured 2026-10-01: the node serves, and the only line that can
   mention the variable is the "cluster wiring is configured but …" ERROR, which never quotes the
   value). Pinned by `integration/test_startup_knobs.py` K1/K2 and K12.
