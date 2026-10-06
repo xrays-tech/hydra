@@ -615,6 +615,12 @@ Plan Pressure Test:
 
 **同一轮里的第三处：集合按迭代序编码（已修）。** `cfg.tenant_providers` / `cfg.tenant_models` 是 `HashSet<String>`，而 serde 按**迭代序**序列化集合、`RandomState` 每实例随机 ⇒ 同样的行两次读库（= 两次发布）得到**不同字节** ⇒ 树名变化、head 前进、全节点重新物化。这是 D-8 的同一失效模式换了个来源（那边是随机 nonce，这边是随机哈希种子）。修法：`sorted_members()` 排序后编码（解码侧仍是集合，顺序不影响相等性）。守卫：`two_independent_builds_of_the_same_config_name_the_same_tree`——它**故意分两次构建配置**，因为原有那条 `the_same_inputs_name_the_same_tree` 对同一个对象切两次、且 fixture 的集合只有一个元素，两种情况下顺序都不构成问题（这就是它一直绿的原因）。
 
+**第四处：解码不能自己发明 loader 的推导规则（已修）。** `ConfigData` 是 loader 从 SQLite **推导**出来的，解码侧必须复现**同一套规则**，而不是另立一套"看起来更整齐"的：
+
+1. **四个 `Vec` 的顺序**：原本一律按 `id` 排，而 loader 用的是 SQL `ORDER BY`（`limit_role` 按 `created_at,id`、`provider_key_binding` 按 `key_prefix`、`sub_tenant` 按 `tenant_id,name`、`sub_tenant_route` 按 `sub_tenant_id,model_key`）⇒ 副本持有的是**另一种顺序的**配置。今天这些顺序恰好不影响行为（所有匹配的限流角色都会被独立执行；绑定/子租户匹配取**最长前缀**而非第一个；路由按唯一键选），所以它逃过了评审——但"这棵树就等于这份配置"只能靠**相等**来验证，偷偷重排会让这类比较全部失去意义。
+2. **`tenants_by_domain` 的键**：loader 用**小写域**做键、值里保留库里原样的域名；解码却拿值里的原样域名当键。于是存储域名为 `Acme.Example` 时，副本把租户放在键 `Acme.Example` 下，而 `proxy::resolve_tenant` 用**小写 `Host`** 查表 ⇒ **同一租户在 leader 上解析得到、在每个副本上都解析不到**。这条是真实的行为差异，不只是整齐问题。
+- 守卫：`tests/arachne_derivation_fidelity.rs`（两条用例都先红后绿；fixture 故意让"loader 序"与"id 序"方向相反、让域名非小写，并在断言前先证明 fixture 确实如此）。
+
 **T3.1 明确没做完的部分（如实记账，不算完成）**：
 
 1. `MaterializeTarget` 目前只有测试里的记录型实现；**真实的 target（按 fidelity 行重建本地 SQLite 并换入 `ConfigData`）还没接**。也就是说：物化循环本身跑通了（真实 1 节点 raft + 真 store，HEAD→toc→实体→解码→安装→水位），但节点还不能**从 Arachne 服务配置**。

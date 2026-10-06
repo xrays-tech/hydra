@@ -157,6 +157,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | fidelity 实体（D-7）与编码期密封（D-8） | `8ef3692` | `EntityPath::Fidelity`；`SealedMaterial` 由调用方传入 |
 | cert 私钥随树走（D-7 的 (b)） | 本轮 | `cert` 实体改为 `CertTreeEntity{meta, sealed_key}`；解码时回填 `cert_key_pem`；缺少密封材料**拒绝发布**而不是丢掉密钥；`TOC_FORMAT` 1→2（同一批字节两种解法的版本必须互相拒绝） |
 | 集合的编码序（D-8 推论②） | 本轮 | `tenant_providers` / `tenant_models` 是 `HashSet`，改为**排序后**编码（`sorted_members`），否则同一配置每次读库换树名 |
+| 解码必须复现 loader 的**推导规则** | 本轮 | ① 四个 `Vec` 的排序原先一律按 `id`，而 loader 用的是 SQL `ORDER BY`（`limit_role.created_at,id` / `binding.key_prefix` / `sub_tenant.tenant_id,name` / `route.sub_tenant_id,model_key`）⇒ 副本持有的顺序与 leader 不同；② `tenants_by_domain` 的键在 loader 侧是**小写域**，解码侧却拿值里的原样域名当键 ⇒ 存储域名为混合大小写时，副本上的租户落在**没人会去查的键**下（`proxy::resolve_tenant` 用小写 `Host` 查表），于是同一租户在 leader 上解析得到、在副本上解析不到。守卫：`tests/arachne_derivation_fidelity.rs`（两处都先红后绿，fixture 让"loader 序"与"id 序"反向、让域名非小写） |
 
 **实现期抓出的一个缺陷（如实记账）**：`8ef3692` 的提交信息写「树携带副本所需的、`ConfigData` 推导时丢掉的行」，**这句话当时是过强的**——它漏掉了 cert 私钥。`CertMeta::cert_key_pem` 带 `skip_serializing`，Redis 时代的 wire 用一个**单独的**密封字段（`SnapshotWire::sealed_certs`）补偿这个 skip，而树没有对应字段。后果不是"少一个字段"：`restore_config` 见到 `cert_key_pem == None` 会往 `cert_key_ciphertext` 写 NULL，于是**物化一次就删掉该节点已有的租户 TLS 私钥**（与 G1 丢禁用行、G3 重铸 provider-key 主键同一类）。已由 `tests/arachne_cert_fidelity.rs` 判红后修复。
 

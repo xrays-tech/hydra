@@ -643,7 +643,14 @@ pub fn build_config_with_fidelity(
         match path {
             EntityPath::Tenant(_) => {
                 let tenant = decode::<hydra_core::model::Tenant>(path, bytes)?;
-                cfg.tenants_by_domain.insert(tenant.domain.clone(), tenant);
+                // Keyed by the LOWERCASED domain, which is the loader's rule
+                // (`store::build_config`) and the one the data plane matches on:
+                // `proxy::resolve_tenant` lowercases the `Host` before the lookup. Re-deriving the
+                // key from the value's own spelling instead put a mixed-case tenant under a key no
+                // request looks up — the tenant resolved on the leader and not on any replica.
+                // The VALUE keeps the stored spelling, exactly as the loader leaves it.
+                cfg.tenants_by_domain
+                    .insert(tenant.domain.to_lowercase(), tenant);
             }
             EntityPath::Model(key) => {
                 let providers = decode(path, bytes)?;
@@ -735,13 +742,40 @@ pub fn build_config_with_fidelity(
         }
     }
 
-    // Order the vectors so two nodes that materialized the same tree hold the same value, not
-    // merely an equivalent one: `SubTenantRoute` order decides which of two overlapping prefixes
-    // wins, so "equivalent" is not enough.
-    cfg.limit_roles.sort_by(|a, b| a.id.cmp(&b.id));
-    cfg.key_prefix_bindings.sort_by(|a, b| a.id.cmp(&b.id));
-    cfg.sub_tenants.sort_by(|a, b| a.id.cmp(&b.id));
-    cfg.sub_tenant_routes.sort_by(|a, b| a.id.cmp(&b.id));
+    // ## Restoring the LOADER's vector orders
+    //
+    // The tree stores one entity per row and this rebuilds the vectors by re-collecting them, so
+    // the order has to be reproduced here — and it must be the order the LEADER's loader produced,
+    // not one invented here. The four keys below mirror `store.rs`'s `ORDER BY`s exactly:
+    //
+    //   limit_role           ORDER BY created_at, id
+    //   provider_key_binding ORDER BY key_prefix
+    //   sub_tenant           ORDER BY tenant_id, name
+    //   sub_tenant_route     ORDER BY sub_tenant_id, model_key
+    //
+    // Each SQL key is backed by a UNIQUE constraint (`limit_role.id` is the PK;
+    // `provider_key_binding.key_prefix` is UNIQUE; `sub_tenant` is UNIQUE(tenant_id, name);
+    // `sub_tenant_route` is UNIQUE(sub_tenant_id, model_key)), so those orders are TOTAL and the
+    // trailing `id` below only makes the sort deterministic, never reorders a tie. SQLite sorts
+    // NULL first and so does `Option`'s `Ord`, which is what keeps the `model_key` column's
+    // nullable default route in the same place on both sides.
+    //
+    // An earlier version sorted all four by `id`. It looked tidy and was a rule the loader never
+    // used, so the replica held a differently-ordered config than the leader. Today that changes
+    // no behaviour (all matching limit roles are enforced as independent keys; binding and
+    // sub-tenant matching take the LONGEST prefix; route lookup is by unique key), which is
+    // exactly why it survived review — but "this tree names this config" is only checkable by
+    // EQUALITY, and a silently reordered decode makes every such comparison worthless. Caught by
+    // `tests/arachne_order_fidelity.rs`, whose fixture makes the two orders disagree.
+    cfg.limit_roles
+        .sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+    cfg.key_prefix_bindings
+        .sort_by(|a, b| (&a.key_prefix, &a.id).cmp(&(&b.key_prefix, &b.id)));
+    cfg.sub_tenants
+        .sort_by(|a, b| (&a.tenant_id, &a.name, &a.id).cmp(&(&b.tenant_id, &b.name, &b.id)));
+    cfg.sub_tenant_routes.sort_by(|a, b| {
+        (&a.sub_tenant_id, &a.model_key, &a.id).cmp(&(&b.sub_tenant_id, &b.model_key, &b.id))
+    });
 
     cfg.reindex_tenants();
     Ok((cfg, fidelity))
