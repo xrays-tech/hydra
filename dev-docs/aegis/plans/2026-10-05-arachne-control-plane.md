@@ -126,13 +126,17 @@ Redis（只是数据面的加速器与近似计数器，不是任何权威）
 
 **leader 唯一性**：Arachne 没有 CAS，head 的写入由 raft 的 leader 单点执行（`put` 在非 leader 上返回 `NotLeader`）；因此**任何绕过 leader 的写路径都必须被禁掉**。
 
-### leader 提示（admin UI 自动重试所依赖的那个东西）
+### leader 提示（**读**用，不是重定向机制）
+
+> **本节已按 D-3 定稿改写（2026-10-05）**：初稿把 `leader_hint()` 当成「admin UI 自动重试」的地基
+> （响应头 `x-hydra-leader-hint` + 409 错误体里的 `leader=<id> addr=<host:port>`）。上游 0.1.2 之后
+> **写可以打在任意节点、库自己转发**，于是那套机制的需求本身消失了：响应头、409 契约、UI 重发层
+> **都不存在**（核实：全仓 grep `leader-hint` / `x-hydra-forwarded` 在服务端与 UI 均无实现）。
 
 - Arachne 的 `leader_hint() -> Option<(NodeId, SocketAddr)>` 返回的是**该节点监听地址**上的 leader；实测（p1/p2）：**follower 上的提示是可靠的**，交接后 ≤1 s 跟上，且与「谁真的能写」一致；
 - 实测（p1）：**新 leader 自己的提示不指向自己**（40 s 窗口内始终不是），所以提示**只用于 follower 找 leader**，不用于自判（见 T1.3 的写探测）；
-- 约定：`HYDRA_ARACHNE_LISTEN` 的**端口 = 管理口端口**（接口可以不同），于是「提示里的地址」直接就是可用
-  的管理端点，不需要任何额外映射或注册表查询 —— 这是 admin UI 自动重试能成立的前提；
-- 服务端把这个地址放进两处：响应头 `x-hydra-leader-hint` 与 409 错误体的 `leader=<node_id> addr=<host:port>`。
+- **今天它只用于「显示」**：`/api/v1/cluster/status` 的 `lease_holder`（舰队视图与 admin UI 的"你不在 leader 上"横幅）由控制面 250 ms 巡检缓存下来的提示提供。它**不参与任何写路径**；
+- ~~约定：`HYDRA_ARACHNE_LISTEN` 的端口 = 管理口端口~~ **该约定已作废**：它当时存在只是为了让"提示里的地址"能直接当管理端点用，而既然没有东西要用它当管理端点，就不需要这条约束了——`integration/test_arachne_control_plane.py` 用的就是**不同**端口（raft 与 admin 各自独立），三个清单同理。
 
 ### 配置分发：改成「每个节点自己物化」（不再有跨节点推送）
 
@@ -853,7 +857,7 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | **T4.0 代码半边** | ✅ 已完成（`f4f83e9`） | `NodeRole` 收敛为 `All \| Cluster`；`Edge` 删除；`AdminState::edge_mode`、`is_leader_candidate()`、admin 路由的 edge 404 分支、`main.rs` 四处 edge 分支删除；`ClusterConfig` 去掉 `control_url` / `poll_interval` |
 | **T4.0 清单半边** | ✅ 已完成 | `docker-compose.cluster.yml` 改为**三个同构成员**（同一 environment 锚点，只有 node id / raft 地址 / 发布端口 / 卷不同）；`docker-compose.local.yml` 去掉 `HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL`、补上 `HYDRA_CLUSTER_PEERS` + `HYDRA_ARACHNE_LISTEN`；`scripts/check_compose_health.cjs` 的角色分支删除（一条规则：每个节点都用 `Authorization: Bearer` 探 `/api/v1/health`）；`scripts/compose_static.cjs` 的三条角色拒绝规则删除；`admin-ui` 的 `alive` 改为三态渲染；`environment/{build.sh,release.sh}` 的特征集补齐 |
 | **T4.2 环境变量** | ✅ 已完成（代码/文档/清单） | `CLUSTER_ONLY_ENV` 9→7；`RETIRED_CLUSTER_ENV` 2→**9**（`HYDRA_ROLE` / `CONTROL_URL` / `PUBLIC_URL` / `CONTROL_POLL_MS` / `LEADER_LEASE_MS` / `REGISTRY_STALE_GRACE_SECS` / `FAILOVER_GRACE_MS` / `FORWARD_TIMEOUT_SECS` + 一个哨兵名），并有一个启动 ERROR 点名；`ops.md` §13.3b 记录它们与被谁取代；两个守卫脚本的记录同步更新。**清单里残留的三处已清除**（见下） |
-| **T4.3 验收与运维文档** | ⏳ 未做 | 验收 2（20 rps / 60 s）未移植；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写未做；**`integration/test_startup_knobs.py` 目前 11 条红**（见下，这是本轮新发现，CI 步骤就在跑它） |
+| **T4.3 验收与运维文档** | ⏳ 进行中 | ✅ **已移植 `integration/test_startup_knobs.py`**（12 条腿，13 项断言，全绿；CI 那步的特征集补上 `arachne`——没有它，带成员表的节点会**拒绝启动**，腿会因别的原因红）。**尚未做**：验收 2（20 rps / 60 s）；告警表还没有 `hydra_arachne_*` 指标；`cluster.md` / `design.md` 逐条改写；**`dev-docs/jiqun-deploy.md` 整份仍是 leader/edge 时代**（已在文首加"已退役"横幅 + 改正日志字段名；**它此前不在任何 Task 的清单里**，本轮补进 T4.3） |
 
 ### 清单半边实际改出来的三个缺陷（都不是"文案问题"）
 
@@ -864,6 +868,31 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 3. **`hydra-c` 没有卷**：本地栈的第三个成员没有任何 `/app/data` 挂载，于是它的 raft 日志与 SQLite 全在容器层——重启即重置，这不叫"三个同构成员"。**修法**：补 `hydra-c-data:/app/data` 与顶层卷声明。
 
 ### 本轮新发现（尚未处理，登记在案）
+
+* **一个集群节点无法单独启动：新数据目录必须由多数派先"认领"**。`await_cluster_preflight` 的
+  第一步是**本地读**（`get_stale` 读 `HANDSHAKE_CLUSTER_KEY`）：目录里**已经记着**正确的 cluster id
+  ⇒ 立刻通过；**没记着** ⇒ 只能由 **leader** 写（`without_redirect()`，不转发），于是**单飞的成员
+  等满 10 s（`PREFLIGHT_DEADLINE`）后拒绝启动**。**实测（2026-10-05，真二进制）**：三成员表 + 全新
+  目录 + 只有一个进程 ⇒ `exit=1`，`no member adopted this node's Arachne data directory within 10s`；
+  而**同一目录被认领过之后，单独重启只需 ~500 ms**（同样实测）。三个后果，都还没有对冲：
+  1. **从全停恢复不能"先起一台"**：必须让 ≥2 台在 10 s 窗口内一起起来（compose 的 `up -d` 天然满足）；
+  2. **K8s StatefulSet 的默认顺序启动起不来**：`podManagementPolicy: OrderedReady` 会等 pod-0 Ready
+     才起 pod-1，而 pod-0 永远等不到多数派 ⇒ **必须 `Parallel`**（`deployment.md` / `cluster.md` 里的
+     StatefulSet 片段尚未写这条，已随本文档的 T4.3 登记）；
+  3. 失败信息只说了"没人认领你的目录"，**没说"让多数派一起起来"**——可操作性可以更好。
+  **为什么不在本轮改行为**：那条检查正是"目录属于别的集群就拒绝加入"的守卫，放宽它需要独立裁定；
+  本轮只把**事实、两个后果、以及演练已按此改写**记录在案。
+* **`scripts/check_tenant_error_codes.cjs` 也是红的，而且从 T3.5 起就红**（CI 的 `scripts` 作业跑它）。
+  它不是本地噪声：那 4 条被记为 DRIFT 的错误码正是**随转发层一起消失的对外契约**——
+  `too_many_requests`(429)、`no_leader`(503)、`forward_result_unknown`(504)、`forward_failed`(502)；
+  它们的发出站点在 `cluster/forward.rs` 与 `tenant_config/forward.rs` 里，而那两个文件在 `37f0bc3`
+  （T3.5，D-6 乙-full）被删除。守卫读的是 `dev-docs/tenant-api-integration.md` §6 那张**对外契约表**，
+  所以真正的问题不是守卫，而是**那张表仍在告诉集成方去按 `code` 重试**：`504 forward_result_unknown`
+  ⇒ "先重读再重试"、`503 no_leader` ⇒ "必须换边缘节点"——**这两个码再也不会出现**，而
+  §"传输语义"的 OC-4 例外（"写端点必须经由边缘，leader 自己返回 503"）描述的是已经删掉的转发世界。
+  集成方照它实现的**重试逻辑会永远等不到那个分支**（不是崩溃，是静默失效）。**本轮未改**：这是
+  **对外契约**的退役，需要独立裁定（改 §6 表 + §5.6 + OC-4 + 那张 retry 表），且要与
+  `tenant-api-integration.md` 的其他读者一起看。
 
 * **`integration/test_startup_knobs.py` 是红的：11 条失败**（实测 2026-10-05，`.github/workflows/ci.yml` 有它的步骤）。这份演练整份是围绕 `HYDRA_ROLE` 写的：K1/K2/K3 用 `HYDRA_ROLE=edge` 造"集群节点"、K4/K5/K6/K11 断言"角色写错但配了 wiring ⇒ 报出被丢弃的变量"、K8 用 `" edge "`。角色退役后这些前提到处不成立。**它自己的 K9/K12 仍绿，K7 的一半仍绿**——也就是说：不是整份作废，是**地基换了**。移植方案与 `test_cluster_limits.py` / `test_auth_cache_layers.py` 同一批（T4.3 的"移植"项），口径都是 `HYDRA_CLUSTER_PEERS`。
 * **`HYDRA_CLUSTER_TOKEN` 现在是一个没有消费者的启动要求**：`/api/v1/internal/*` 这个路由族已经**一条都不存在**（随快照通道与转发的管理写一起退役），闸门代码还在（`admin/mod.rs:717`，任何该前缀的请求现在得到 401 而不是 404），而 `main.rs` 仍**要求**它存在且够强，三个清单也都用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它。也就是说：运维必须为一件没人读的东西准备一个秘密，而删掉它是**部署契约变化**（要连同清单、`CLUSTER_ONLY_ENV`、启动拒绝、`test_startup_knobs.py` K10 一起动），所以本轮只把它**写进启动点注释**（`main.rs` 那段契约里）并登记在此，**不改行为**。
@@ -884,9 +913,9 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 | R7 | 配置物化在每个节点各跑一遍 ⇒ 配置越大，全集群 CPU/IO 放大 N 倍 | 中 | 中 | 版本闸门（未变则空转）+ 分片复用（内容未变不重写）+ `hydra_replica_materialize_retries_total` 观测 |
 | R8 | 集群扩容 = raft 成员变更（不再是拉起一个无状态副本） | 中 | 中 | `ops.md` 写明成员变更 SOP（`add_learner` → 追平 → `promote`）；扩容需人工一步，不能只改副本数 |
 | R9 | WAL 落盘要求：每个节点需要持久卷（现仅 PVC 1Gi） | 低 | 中 | 容量估算与 `snapshot_threshold_bytes = 64 MiB` 的关系写进 `ops.md`；PVC 建议 ≥2Gi |
-| R10 | admin UI 自动重试隐藏了「当前 leader 正在切换」这一事实 | 中 | 中 | UI 必须显示「已在新主节点重试」的状态文案；服务端指标 `hydra_arachne_leader_flips_total` + 409 计数可供告警 |
+| R10 | ~~admin UI 自动重试隐藏了「当前 leader 正在切换」这一事实~~ **已随 D-3 消失**：没有 UI 重发层，就没有"重试成功但没告诉操作者"这件事 | — | — | 无需对冲。**仍然成立的相关事实**：管理写在切主瞬间失败时，操作者看到的是一个普通错误码，UI 不做静默重发——这是 D-3 的选择，不是缺口。舰队视图里"谁是 leader"由 `leader_hint` 显示（见 §leader 提示） |
 | R11 | Arachne 的 tonic 传输默认带 rustls，与 Hydra 下游租户 TLS（OpenSSL/BoringSSL）是两件事 | 低 | 低 | 文档分开写：**Arachne 传输加密 ≠ 租户 TLS** |
-| R12 | 服务端零转发 ⇒ **重试责任全在调用方**：UI 之外的客户端（CLI / SDK / 自动化脚本）若不做重发，切主窗口内会直接看到 409 | 中 | 中 | admin UI 内置重发（最多两次）；`tenant-api-integration.md` 明确写出「409 + leader 提示 ⇒ 重发」；`ops.md` 的排障表加一行；是否给 CLI/SDK 内置重发作为独立决策（D-3 待答） |
+| R12 | ~~服务端零转发 ⇒ 重试责任全在调用方，切主窗口内会看到 409~~ **已随 D-3 消失**：库自己把写转发给 leader，Hydra 侧零转发**不等于**调用方要重发——切主窗口内写会由库重试/由 raft 拒绝，**不产生 409** | — | — | 无需对冲。**D-3 的待答项已关闭**（"是否给 CLI/SDK 内置重发"），因为不需要重发层：`leader-hint` 响应头与 409 leader 契约都不存在 |
 | R13 | 目录索引（toc）是单值，实体数很大时可能触到 1 MiB 上限 | 低 | 中 | T2.1 用「实体路径 + content-hash + len」的紧凑编码；启动时校验 `entity_count` 与 toc 大小；超过阈值（建议 >512 KiB）按实体类型分段，类型集合固定、无需扫描 |
 
 ---

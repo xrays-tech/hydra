@@ -1,3 +1,18 @@
+> ## ⚠️ 本文仍描述 **ADR-0001 之前的 leader/edge 拓扑**，尚未逐条改写
+>
+> 集群判定**已经不是** `HYDRA_ROLE`，而是**有没有配 `HYDRA_CLUSTER_PEERS`**；`edge` 角色、
+> `HYDRA_CONTROL_URL`、`HYDRA_PUBLIC_URL`、租约相关的名字**全部退役**，设了不生效并会在启动时
+> 被点名。三个节点**完全同构**（都跑数据面与管理面、都是 raft 成员），扩容 = raft 成员变更而
+> 不是加一个副本。**且：集群节点需要至少 3 个成员，且一个新数据目录必须由多数派先"认领"**——
+> 单独拉起一个节点会在 10 s 后拒绝启动（实测 2026-10-05），所以 K8s StatefulSet 的默认
+> **顺序启动（`podManagementPolicy: OrderedReady`）起不来这个集群**，必须改成 `Parallel`。
+>
+> 权威文档：`dev-docs/cluster.md` §2（环境变量表，已部分同步）、
+> `dev-docs/aegis/adr/ADR-0001-arachne-control-plane.md`、
+> `dev-docs/aegis/plans/2026-10-05-arachne-control-plane.md`（T4.3 负责本文的逐条改写）。
+> **下文出现的 `HYDRA_ROLE` / `edge` / 控制面 URL 一律按"已退役"读**；日志字段也已改名为
+> `wiring_without_members=` 与 `retired=`（旧的 `ignored=` 不再存在）。
+
 # Hydra 三节点 K3s 集群部署 —— 配置清单与说明
 
 > **定位**：面向「把 Hydra 以 3 个节点跑进 K3s 集群」的配置向操作文档，覆盖两
@@ -88,7 +103,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 
 | 配置项 | 默认 | 适用 | 说明 |
 |---|---|---|---|
-| `HYDRA_ROLE` | `all`（单节点） | 每个集群节点 | 集群开关：`leader`（候选，竞争租约、本地 SQLite 随快照重建、写操作转发给 active）或 `edge`（无状态数据面，无本地库，仅 `/healthz` `/readyz` `/metrics` —— 注意 `/healthz`/`/readyz` **免鉴权**，而 `/metrics` 走**与别处同一条 admin token 门禁**；官方编排**不给 edge 注入 `HYDRA_ADMIN_TOKEN`**，所以按现状抓取 edge 的 `/metrics` 恒 **401**，取舍见 `ops.md` §9）。拼写错误**不会**静默关代理，但会**退出集群**：节点照常启动为单节点，并记一条 **ERROR** —— 只要配了**任何一个 cluster-only 变量**（清单见 `ops.md` §13.3 的 `HYDRA_ROLE` 行，共 **10 个**），日志会用 `ignored=` **逐个点名**那些不会被使用的变量（第一百九十三轮实测：此前只点名 3 个，另外 7 个被静默丢弃）；**`HYDRA_ROLE` 忘配（未设）时同样报这一条**（第一百九十二轮实测：此前这条路径完全静默，也就是"最像忘记设变量"的那种情况没有任何提示）。首尾空白会被去掉（`" leader "` 就是 leader）。务必核对日志。 |
+| `HYDRA_ROLE` | `all`（单节点） | 每个集群节点 | 集群开关：`leader`（候选，竞争租约、本地 SQLite 随快照重建、写操作转发给 active）或 `edge`（无状态数据面，无本地库，仅 `/healthz` `/readyz` `/metrics` —— 注意 `/healthz`/`/readyz` **免鉴权**，而 `/metrics` 走**与别处同一条 admin token 门禁**；官方编排**不给 edge 注入 `HYDRA_ADMIN_TOKEN`**，所以按现状抓取 edge 的 `/metrics` 恒 **401**，取舍见 `ops.md` §9）。拼写错误**不会**静默关代理，但会**退出集群**：节点照常启动为单节点，并记一条 **ERROR** —— 只要配了**任何一个 cluster-only 变量**（清单见 `ops.md` §13.3 的 `HYDRA_ROLE` 行，共 **10 个**），日志会用 `wiring_without_members=` **逐个点名**那些不会被使用的变量（`HYDRA_ROLE` 退役后，"角色写错"这一维已不存在；被退役的名字由同一行的 `retired=` 字段点名）（第一百九十三轮实测：此前只点名 3 个，另外 7 个被静默丢弃）；**`HYDRA_ROLE` 忘配（未设）时同样报这一条**（第一百九十二轮实测：此前这条路径完全静默，也就是"最像忘记设变量"的那种情况没有任何提示）。首尾空白会被去掉（`" leader "` 就是 leader）。务必核对日志。 |
 | `HYDRA_CONTROL_URL` | — | leader、edge **必填** | active leader 的**控制面快照轮询**端点（如 `http://hydra-control-0.hydra-control:8081`）。注意它**不是**管理变更的转发目标——转发按实际租约持有者从注册表实时解析，故把候选指向自己（或都指向 `sts-0`）都安全。 |
 | `HYDRA_PUBLIC_URL` | — | leader 建议必填 | 本节点注册进注册表的**可达管理端点**（K8s 里用 `http://$(POD_NAME).hydra-control:8081` / `http://$(POD_NAME):8081`）。leader 不设则注册为“不可轮询”，edge 无法经注册表发现它。 |
 | `HYDRA_NODE_ID` | `node-<随机hex>` | 建议固定 | 节点标识（租约持有者 / 熔断投票者 / 注册表条目）。StatefulSet 场景建议固定为 `hydra-control-0` / `hydra-control-1` 便于排查。 |

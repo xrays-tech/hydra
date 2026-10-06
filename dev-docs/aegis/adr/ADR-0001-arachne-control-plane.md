@@ -31,9 +31,16 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 1. **leader 身份 = raft 领导权**。`leader_ready` 由「Redis 租约未过期」改为**写探测**（`without_redirect().put(探测键, 本节点id)` 成功即 ready）。
 2. **配置权威 = Arachne 的 key-path 结构化存储**：
-   - `hydra/ctl/head` = **一个内容哈希**（配置的提交点，最后写）；
-   - `hydra/cfg/<toc-hash>/toc` = 目录索引，`hydra/cfg/<toc-hash>/<entity-type>/<id>` = 每实体一键；
-   - 读取一律 `get_stale` + content-hash 校验；**全案不使用 `get`**。
+   - `hydra/ctl/head` = **一个内容哈希**（配置的提交点，最后写），另有 `hydra/ctl/cluster_id` 与
+     `hydra/ctl/format`；
+   - `hydra/cfg/toc/<toc-hash>` = 目录索引；`hydra/cfg/e/<path>/<content-hash>` = 每实体一键
+     （**实体键内容寻址**，是 T3.1 用户裁定 A 的结果：同一个实体的两个版本各有各的键，并发发布
+     因此不可能互相撕裂；`TOC_FORMAT` 现为 **3**）。
+     > 注：本文档初稿写的是 `hydra/cfg/<toc-hash>/toc` 与 `hydra/cfg/<toc-hash>/<entity-type>/<id>`，
+     > 那个布局**从未按这种形状落地**——toc 移到了独立的 `toc/` 段下，实体键加了内容哈希。
+     > 权威是 `crates/hydra-server/src/cluster/arachne_keys.rs` 的模块注释与 `cfg_toc()`/`cfg_entity()`。
+   - 读取一律 `get_stale` + content-hash 校验；**全案不使用 `get`**（核实于 2026-10-05：
+     `arachne_store.rs` 的读取路径只有 `get_stale`）。
 3. **节点同构**：集群里每个节点完全一样 —— 都跑数据面、都跑管理面、都是 raft 成员、都能当 leader。**`edge` 角色与「无状态数据面」退役**；配置不再跨节点推送，改为每个节点各自从 Arachne 物化。
 4. **写路径交给库转发**：写可打在任意节点，库在 `NotLeader` 时经 `Forward` RPC 转发到 leader（会话表保证幂等）。Hydra 侧**不实现**跨节点转发，`cluster/forward.rs` 与 `x-hydra-forwarded` 护栏退役。
 5. **租户自助写例外（D-6）**：那 4 个数据面端点的身份闸唯一在**入口节点**；不重复鉴权（删 leader 侧 `reauth` + 授权绑定），`/api/v1/internal/tenant-config/*` 整族删除，**不留任何 Hydra 转发器**，**不加新鲜度闸**。
@@ -50,7 +57,7 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | **D-2** | 节点同构：全部是 raft 成员、都跑数据面与管理面；`edge` 与「无状态数据面」退役 | ① edge 做 raft learner（本地读、低延迟，但需 WAL + 成员变更）；② edge 纯 HTTP 客户端 + last-known-good | 用户裁定 |
 | **D-3** | 写打在任意节点，由库透明转发到 leader；Hydra 不需要 409/提示/UI 重试层 | ① 非 leader 返回 409 + leader 地址 + admin UI 重发（上游修复前的设计，已被取代）；② 只返回裸错误 | 用户裁定 → 上游 `bce2943`/0.1.2 修复后**该需求消失** |
 | **D-4** | 配置 = key-path（版本化目录 + 每实体一键 + head 单一提交点）；`head` 是**内容哈希**不是版本号 | ① 整体 blob + 字节分片（删一个实体导致后续分片全部移位 ⇒ 近乎全量重写）；② 每实体一键但用版本号做提交点（`get_stale` 不保证单调 ⇒ 可能拼出从未存在过的配置） | 用户要求重新设计后定稿 |
-| **D-5** | 集群 HA 前提 = **至少 3 台奇数同构节点** | ① 保持 2 台（raft 下无容错）；② 引入外部协调服务 | 用户裁定 |
+| **D-5** | 集群 HA 前提 = **至少 3 台奇数同构节点** | ① 保持 2 台（raft 下无容错）；② 引入外部协调服务 | 用户裁定；**「拒绝启动还是告警」已在实现中定为「拒绝」**：`MINIMUM_MEMBERS = 3`，成员表少于 3 个条目在解析时即 `TooFewMembers` 报错退出（`arachne_node.rs`），文案说明原因是「raft 需要多数派，两台互相都容不了故障」 |
 | **D-6** | 租户自助写：身份闸唯一在入口节点，不重复鉴权，收口到那 4 个端点 | ① 保留三道闸（含 leader 重鉴权）；② 请上游在转发协议里带调用方上下文；③ 乙-lite 先删身份保留转发作过渡（用户否决） | 用户裁定（乙-full） |
 | **D-7** | 配置树的**内容范围**：除 `ConfigData` 外，还包含（a）它推导时丢弃的行（`EntityPath::Fidelity`）与（b）`skip_serializing` 丢掉的**秘密**（cert 私钥，随 `cert` 实体密封；此前只有 provider key 与令牌哈希） | ① 只复制 `ConfigData`（原计划的字面做法）：副本重建不出同一份 SQLite —— 丢 `enabled=0` 的 `limit_role`、`status != 1` 的 `provider_model`，且 provider key 的 `id`/`created_at` 会**被重铸**；② 副本"尽力而为"重建、缺的行当不存在：节点间表内容合法地不同，而 `head` 只声明"配置是这一份"；③ cert 私钥不进树（第一版的真实状态，被 `tests/arachne_cert_fidelity.rs` 判红）：`restore_config` 不是"少写一个字段"而是**往 `cert_key_ciphertext` 写 NULL** ⇒ 物化一次就**删掉**该节点已有的租户 TLS 私钥 | 实现期裁定（用户选 A）；cert 部分是**实测抓出的缺陷修复**，非新增选项 |
 | **D-8** | **密封必须在编码之外**：发布方传入已封好的材料（`SealedMaterial`），编码器不持有主密钥。推论（同一类，各自实测抓出一处）：**编码结果只能依赖逻辑内容，不能依赖进程状态** —— ② `HashSet` 按迭代序序列化（`RandomState` 每实例随机）同样让"没变的配置"换树名 | ① 由编码器在 `split_config` 里现封：AES-GCM 每次新 nonce ⇒ **同一个没变的配置每次发布都换一个树名**（第一版就是这样，被 `the_same_inputs_name_the_same_tree` 抓出）；② 直接 `encode(&path, &HashSet)`：同一逻辑集合两次读库得到不同字节序（被 `two_independent_builds_of_the_same_config_name_the_same_tree` 抓出；该用例**故意分两次构建配置**——单元素 fixture 与"同一对象切两次"都抓不到） | ~~实测强制~~ **已被 D-9 取代（2026-10-05）**：D-8 依赖的「已存密文」前提经核对不成立，见 D-9 |
@@ -99,12 +106,25 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 | 面 | 边界 |
 |---|---|
 | 环境变量 | **新增** `HYDRA_CLUSTER_PEERS` / `HYDRA_ARACHNE_LISTEN` / `HYDRA_ARACHNE_DATA_DIR`；**删除** `HYDRA_ROLE` / `HYDRA_CONTROL_URL` / `HYDRA_PUBLIC_URL` / `HYDRA_LEADER_LEASE_MS` / `HYDRA_CONTROL_POLL_MS` / `HYDRA_REGISTRY_STALE_GRACE_SECS` / `HYDRA_FAILOVER_GRACE_MS`。集群判定改为「有没有配 `HYDRA_CLUSTER_PEERS`」。**无既有生产版本 ⇒ 不留别名、不留双轨**，代码/清单/文档/脚本同一批改齐 |
-| 对外 HTTP | `/healthz/leader`（200/503）、`/api/v1/internal/*`（cluster token）保留；**不再引入** 409+leader 地址契约；无 leader 时 503（可重试） |
+| 对外 HTTP | `/healthz/leader`（200 持领导权 / 503 不是 leader / 404 这台根本没有领导权闸门）保留；**不再引入** 409+leader 地址契约；无 leader 时 503（可重试）。**`/api/v1/internal/*` 已无任何路由**（更正于 2026-10-05，见下） |
 | 数据面 | 单节点与集群下都在本节点服务；各节点用本地已物化状态服务，控制面故障期间数据面不受影响 |
 | 租户侧契约 | `tenant-api-integration.md` 的三端点语义不变；那 4 个写端点的路由与鉴权不变（变的只是"谁执行"） |
 | 持久化 | 本地 SQLite **降级为可重建的物化状态**；`head`（Arachne）是权威，不一致时以 Arachne 为准（必须写进 `store.rs` 注释，否则"本机改了 DB 就算数"会变成第二个真相） |
 | Arachne 依赖 | pin `0.1.2`；**不可用 0.1.1**（旧行为：follower 写不转发、无运行时启动 panic、新 leader hint 不自指） |
 | Arachne 传输 TLS | Arachne 的 tonic 传输加密**不等于**下游租户 TLS（OpenSSL/BoringSSL），两者开关与文档分开 |
+
+### 7.1 更正：`/api/v1/internal/*` 与 cluster token（2026-10-05 核对实现）
+
+本文档初稿把 `/api/v1/internal/*` 写成「保留」，**这是错的**，两个成员各自随它存在的通道一起退役了：
+
+| 端点族成员 | 退役于 | 原因 |
+|---|---|---|
+| `GET /api/v1/internal/control?since=N`（版本化配置快照 + `since` 水位） | ADR T4.1 | 节点改为各自从 Arachne 物化，没有快照可发、也没有水位可比 |
+| `/api/v1/internal/tenant-config/*`（leader 侧内部管理写） | D-6 / T3.5 | 入口节点就地执行写，没有要转达的东西，也没有内部写面要鉴权 |
+
+于是今天 `admin/mod.rs` 里 `path.starts_with("/api/v1/internal/")` 这道闸门**匹配不到任何路由**：任何该前缀的请求得到 401（fail-closed，好过 404 泄露"这里曾有什么"），仅此而已。
+
+**因此 `HYDRA_CLUSTER_TOKEN` 现在是一个没有消费者的启动要求**：`main.rs` 仍要求它存在且够强，三个部署清单仍用 `${HYDRA_CLUSTER_TOKEN:?…}` 强制它，而它守的东西已经不存在。**本条只做记录，不改行为**——删掉它是**部署契约变化**（要同时改清单、`CLUSTER_ONLY_ENV`、启动拒绝、以及 `integration/test_startup_knobs.py` 的 K10），需要有它自己的决定与演练。
 
 ## 8. 退役影响（Retirement Impact）
 
