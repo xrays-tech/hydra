@@ -10,14 +10,33 @@ description = "Hydra I/O shell — Pingora proxy, sqlx store, reqwest auth. Thin
 [[bin]]
 name = "hydra"
 path = "src/main.rs"
-required-features = ["server"]
+required-features = ["proxy"]
 
 [features]
 default = []
 
-# Granular, composable feature set so each wave can compile its slice of the
-# I/O shell WITHOUT pulling unrelated native deps (e.g. W2/W3 must build with
-# only sqlx/reqwest and never touch pingora/BoringSSL on macOS).
+# Granular, composable feature set, with ONE caveat that is stated here because the
+# previous text claimed the opposite and was wrong:
+#
+#   The bare W2/W3 slices do NOT build. `db` and `http-client` (with or without
+#   `runtime`) both fail to compile today, so the old claim that "W2/W3 must build
+#   with only sqlx/reqwest and never touch pingora/BoringSSL" does not hold. Two
+#   edges couple them back to `proxy`-gated modules (verified by running the
+#   clippy on 2026-09-29: 6 errors in the lib + 3 in the lib test for
+#   `runtime,db,http-client`):
+#     * `http.rs` uses `crate::admin::metrics` at 5 sites — 3 production
+#       `record_*` calls (277, 395, 432) and 2 reads of the `allow_ttl_capped_total`
+#       test getter (1141, 1155) — and `admin` is gated on `proxy`;
+#     * `store.rs` (26-27) and `db/restore.rs` (74) use
+#       `crate::cluster::{content,snapshot}` — `cluster` is gated on `proxy`.
+#   Decoupling them is a small, mechanical change (5 metric call sites already
+#   follow the `#[cfg(feature = "proxy")]` no-op pattern in `sink.rs`) PLUS one
+#   design question: whether the replica-restore path belongs to `db` at all.
+#   Until that is answered, the builds CI actually compiles are:
+#     `server` | `server,cluster-redis,usage-clickhouse` | `tls-openssl` |
+#     `proxy` (no TLS backend — fixed and checked in round 15).
+#   macOS developers who want to avoid BoringSSL need `proxy` (or `tls-openssl`),
+#   not the bare slices — that escape hatch works and is CI-checked.
 #
 # `dep:` syntax is used so enabling a feature does NOT auto-activate the dep
 # under the same name (feature/dep decoupling).
@@ -87,6 +106,20 @@ tls-boringssl = ["proxy", "pingora-core?/boringssl", "pingora?/boringssl", "ping
 tls-openssl = ["proxy", "pingora-core?/openssl", "pingora?/openssl", "pingora-proxy?/openssl"]
 server = ["db", "http-client", "proxy", "tls-boringssl"]
 
+# Arachne raft-consistent control plane (ADR-0001). Opt-in and INDEPENDENT of
+# `server` and of `cluster-redis`: the default binary must keep zero new
+# dependencies, and a single-node deployment (no `HYDRA_CLUSTER_PEERS`) must not
+# execute any Arachne code path at all.
+#
+# `runtime` + `db` + `proxy` are implied because the control plane replaces the
+# leader election that lives in the proxy shell's bootstrap, and because the
+# config authority it carries is derived from the sqlite-backed ConfigStore.
+# It does NOT imply `cluster-redis`: the Redis backbone stays for the data-plane
+# hot path (rate limit / breaker / auth L2 / invalidation bus, ADR-0001 D-1), and
+# the two features are expected to be combined in a cluster deployment without
+# one silently pulling the other.
+arachne = ["runtime", "db", "proxy", "dep:arachne-kv"]
+
 # Optional usage sink (design §9.3). Off by default.
 # Dependencies are minimal: the sink talks to ClickHouse over its native HTTP
 # interface (INSERT … FORMAT JSONEachRow) and never uses the `clickhouse` crate
@@ -147,6 +180,30 @@ base64 = { version = "0.22", optional = true }
 # trim+bump). The former `mocks` feature went away with `redis/mock.rs`: Redis
 # tests run against a REAL instance (dev-plan 铁律 2).
 fred = { version = "10", features = ["i-scripts"], optional = true }
+
+# --- Arachne control plane (ADR-0001, feature `arachne`) --------------------
+# Raft-consistent control plane: leader identity and the config authority.
+#
+# PINNED, and the floor is real: 0.1.1 is NOT usable. Measured against each
+# version (see the probe evidence referenced by ADR-0001 §10):
+#   * 0.1.1 — a linearizable read/write issued at a follower fails immediately
+#     with `QuorumUnavailable` (the redirect path only worked for in-process
+#     peers registered via `register_peer`), so nothing that runs on more than
+#     one process could be built on it;
+#   * 0.1.1 — `Arachne::start` panics when the caller has no ambient tokio
+#     runtime ("there is no reactor running"), on BOTH the single-node and the
+#     member path, because `Runtime::new` built `tokio::time::interval` eagerly;
+#   * 0.1.1 — a node that has just become leader does not name itself in
+#     `leader_hint()` for a long window after a `transfer_leader`.
+# 0.1.2 carries the fixes for all three (`Forward` RPC over tonic, lazy tick
+# interval, self entry in the raft-id -> node-id map). Do not lower this pin
+# without re-running the Phase 0 probes.
+#
+# The default `transport-tonic` feature is required: the `Forward` RPC is how a
+# write issued at a follower reaches the leader (ADR-0001 D-3). The lean core
+# (`default-features = false`) has no remote transport and cannot serve a
+# multi-process cluster.
+arachne-kv = { version = "0.1.2", optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,
