@@ -1305,15 +1305,27 @@ function renderClusterStatus(c) {
     el("div", { class: "sl", text: k.l }), el("div", { class: "sv", text: String(k.v) })));
 
   const th = (label) => el("th", { text: label });
-  const rows = [el("tr", {}, th(t("custom.health.node")), th(t("custom.health.role")), th(t("custom.health.controlUrl")), th(t("custom.health.state")))];
+  // Columns since ADR-0001 (the role is gone, so the old ROLE column is too):
+  //   NODE          | the member, with `self` marked
+  //   RAFT ADDRESS  | the address in `control_url` — which is the raft TRANSPORT address now, not
+  //                 a control URL (the field name is kept because it is this table's key; the
+  //                 header must not keep lying about it)
+  //   LEADER        | `leader` for the member raft's hint names, `member` otherwise. This used to
+  //                 be `n.role`, a field the DTO no longer HAS — so the cell rendered `undefined`
+  //                 (an empty pill under a header that said "RULE", itself a mistranslation of
+  //                 ROLE). One pill per fact: the leader is named HERE, not twice.
+  //   STATE         | the three-state liveness (`alive` null = this node cannot observe the peer)
+  const rows = [el("tr", {}, th(t("custom.health.node")), th(t("custom.health.raftAddr")),
+    th(t("custom.health.leaderCol")), th(t("custom.health.state")))];
   for (const n of c.nodes) {
     const name = el("span", { text: n.node_id });
     if (n.is_self) name.appendChild(el("span", { class: "pill info", text: t("custom.health.selfPill") }));
-    if (n.is_lease_holder) name.appendChild(el("span", { class: "pill ok", text: t("custom.health.activePill") }));
     rows.push(el("tr", {},
       el("td", {}, name),
-      el("td", {}, el("span", { class: `pill ${n.role === "leader" ? "info" : "warn"}`, text: n.role })),
       el("td", { class: "mono" }, n.control_url || "—"),
+      el("td", {}, n.is_lease_holder
+        ? el("span", { class: "pill ok", text: t("custom.health.leaderPill") })
+        : el("span", { class: "pill", text: t("custom.health.memberPill") })),
       el("td", {}, n.alive === true
         ? el("span", { class: "pill ok", text: t("custom.health.alivePill") })
         : n.alive === false
@@ -1354,13 +1366,17 @@ function highlightJson(obj) {
 /* ===========================================================================
  * Leader banner (T9.5 / §7-5)
  * ======================================================================== */
-/** Show a banner when this admin UI is NOT on the leader.
+/** Show a banner when this admin UI is NOT on the node raft says is leading.
  *
- *  A standby UI gives no other hint: the external NodePort only routes to Ready
- *  (= leader) nodes, so anyone reaching a standby got there via port-forward or
- *  in-cluster access, and every write from this page is FORWARDED to the active
- *  leader. We deliberately do not redirect (§7-5) — the operator may be here
- *  precisely because the leader is unreachable.
+ *  Every node serves its own admin API since ADR-0001 (there is no edge), and writes are accepted
+ *  on ANY node — the library forwards them to the leader — so unlike the old leader/edge topology
+ *  this banner no longer warns about a write that is about to bounce. It says which node leads,
+ *  which is what an operator needs when reading the fleet view from a follower.
+ *
+ *  The "jump to the leader's admin URL" link is GONE, and it is not a missing feature: the link
+ *  was built from `HYDRA_PUBLIC_URL` per node, a variable this plan retired, and the field the DTO
+ *  still calls `control_url` now carries the node's **raft transport** address — linking a browser
+ *  at that would dial a raft port. Naming the leader is the honest thing that is left.
  *
  *  Re-entrant: it is called on login, every 30s, and after a language change, so
  *  it reuses the existing element instead of stacking banners. */
@@ -1375,29 +1391,22 @@ async function refreshLeaderBanner() {
   if (
     !cluster ||
     !cluster.cluster ||
+    // `lease_holder` is `null` while this node does not yet know who leads (cold start, lost
+    // quorum). That is "not known", not "I am the leader" — so it shows NO banner rather than a
+    // claim in either direction.
     !cluster.lease_holder ||
     cluster.node_id === cluster.lease_holder
   ) {
     if (existing) existing.remove();
     return;
   }
-  const leader = (cluster.nodes || []).find(
-    (n) => n.node_id === cluster.lease_holder,
-  );
   const banner = existing || el("div", { id: "leader-banner" });
   clear(banner);
   banner.appendChild(
     el("span", {
-      text: t("common.leaderBanner.notLeader", { node: cluster.node_id }),
+      text: t("common.leaderBanner.notLeader", { node: cluster.lease_holder }),
     }),
   );
-  if (leader && leader.control_url) {
-    // `HYDRA_PUBLIC_URL` must be BROWSER-reachable for this link to work; that
-    // is an ops prerequisite, recorded in dev-docs/ops.md.
-    banner.appendChild(
-      el("a", { href: leader.control_url, text: t("common.leaderBanner.jump") }),
-    );
-  }
   // Insert into `.main` (the content column), NOT `#app`: `#app` is a flex ROW
   // of sidebar + main, so prepending there renders a squeezed third column.
   if (!existing) $(".main").prepend(banner);

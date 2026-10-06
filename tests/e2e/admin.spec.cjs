@@ -187,39 +187,42 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     expect(status.body.cluster).toBe(false);
   });
 
-  // T9.5 (§7-5) — the POSITIVE path: on a non-leader the banner must actually
-  // appear, name this node and link to the active leader. A single-node instance
-  // cannot produce that state (it has no registry, so `/cluster/status` answers
-  // `cluster: false`), so the endpoint is stubbed here with a realistic payload.
-  // The endpoint's own contract is covered by the Rust suite; what is under test
-  // here is the banner.
-  test('T9.5b a non-leader shows the banner with a jump link, and the leader hides it', async ({ page }) => {
+  // T9.5 (§7-5) — the POSITIVE path: on a follower the banner must actually appear and NAME THE
+  // LEADER. A single-node instance cannot produce that state (`/cluster/status` answers
+  // `cluster: false`, asserted in T9.5 directly above), so the endpoint is stubbed here with a
+  // payload shaped the way the DTO really is since ADR-0001: no `role` field (it is gone — the
+  // cell that read it rendered `undefined`), `mode: "cluster"`, and `control_url` holding the
+  // node's RAFT address rather than an admin URL.
+  //
+  // The jump link is asserted ABSENT on purpose. It used to be built from `HYDRA_PUBLIC_URL`,
+  // which this plan retired; the field the link was read from now carries a raft transport
+  // address, so a browser following it would dial a raft port. Naming the leader is what is left,
+  // and this test pins that it is what happens.
+  test('T9.5b a follower names the leader in the banner (no jump link), and the leader hides it', async ({ page }) => {
     const fleet = (nodeId, holder) => ({
       cluster: true,
-      mode: 'leader',
+      mode: 'cluster',
       node_id: nodeId,
       this_node_leader: nodeId === holder,
       lease_holder: holder,
       nodes: [
         {
           node_id: 'node-a',
-          role: 'leader',
-          control_url: 'http://leader.example:8081',
-          alive: true,
+          control_url: '127.0.0.1:8091',
+          alive: nodeId === 'node-a' ? true : null,
           is_lease_holder: holder === 'node-a',
           is_self: nodeId === 'node-a',
         },
         {
           node_id: 'node-b',
-          role: 'leader',
-          control_url: 'http://standby.example:8082',
-          alive: true,
+          control_url: '127.0.0.1:8092',
+          alive: nodeId === 'node-b' ? true : null,
           is_lease_holder: holder === 'node-b',
           is_self: nodeId === 'node-b',
         },
       ],
     });
-    let payload = fleet('node-b', 'node-a'); // this node is a STANDBY
+    let payload = fleet('node-b', 'node-a'); // this node is a FOLLOWER, node-a leads
     await page.route('**/api/v1/cluster/status', async (route) => {
       await route.fulfill({
         status: 200,
@@ -231,23 +234,28 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     await signIn(page);
     const banner = page.locator('#leader-banner');
     await expect(banner).toBeVisible();
-    await expect(banner).toContainText('node-b'); // which node is not the leader
-    await expect(banner.locator('a')).toHaveAttribute(
-      'href',
-      'http://leader.example:8081', // ...and where the leader is
-    );
+    await expect(banner).toContainText('node-a'); // WHO leads ...
+    await expect(banner.locator('a')).toHaveCount(0); // ... and no dead jump link
 
     // A language switch must re-render it: the text interpolates the node id, so
     // the banner deliberately does NOT use `data-i18n` (there is no variable
     // interpolation in `applyStaticI18n`).
     await page.selectOption('#lang-select', 'zh');
-    await expect(banner).toContainText('node-b');
-    await expect(banner).toContainText('不是 leader');
+    await expect(banner).toContainText('node-a');
+    await expect(banner).toContainText('raft leader');
     await page.selectOption('#lang-select', 'en');
 
     // On the leader ITSELF there must be no banner. Reloading re-runs login and
     // the banner refresh (the ticket is in sessionStorage for this tab).
     payload = fleet('node-a', 'node-a');
+    await page.reload();
+    await page.locator('#login-overlay').waitFor({ state: 'hidden' });
+    await expect(page.locator('#leader-banner')).toHaveCount(0);
+
+    // ...and NEITHER must there be one while this node does not know who leads
+    // (`lease_holder: null` — a cold cluster or a lost quorum). `null` means "not known",
+    // and a banner is a claim: it must not be rendered in either direction.
+    payload = { ...fleet('node-b', 'node-a'), lease_holder: null };
     await page.reload();
     await page.locator('#login-overlay').waitFor({ state: 'hidden' });
     await expect(page.locator('#leader-banner')).toHaveCount(0);
@@ -262,14 +270,14 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
   // already tolerates the failure (`catch { return; }`), while the health page let
   // it take the whole page down.
   //
-  // The 502 here is `cluster_unavailable` = "cannot read the cluster registry (Redis
-  // unreachable?)", NOT the single-node answer: single-node mode is
-  // `200 {cluster:false}` (asserted in T9.5 above, `cluster_api.rs:92-95`), so the
-  // UI must show it as a degradation and must NOT print the "HYDRA_ROLE unset" copy.
+  // The 502 here is `cluster_unavailable` = "could not answer the cluster status route", NOT the
+  // single-node answer: single-node mode is `200 {cluster:false}` (asserted in T9.5 above), so the
+  // UI must show it as a degradation and must NOT print the "cluster mode is not enabled" copy —
+  // which is a DIFFERENT fact ("no member list on this node") from "this node could not answer".
   //
-  // Falsification: restore `Promise.all` and the `.stat` count below fails (the grid
-  // still holds its skeleton) while the "HYDRA_ROLE" assertion also fails (the
-  // cluster panel never renders at all).
+  // Falsification: restore `Promise.all` and the `.stat` count below fails (the grid still holds
+  // its skeleton) while the "clusterNotEnabled" assertion also fails (the cluster panel never
+  // renders at all).
   test('T9.5c a failed cluster probe does not blank the Health page', async ({ page }) => {
     await page.route('**/api/v1/cluster/status', (route) =>
       route.fulfill({
@@ -278,7 +286,7 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
         body: JSON.stringify({
           error: {
             code: 'cluster_unavailable',
-            message: 'cannot read the cluster registry (Redis unreachable?)',
+            message: 'could not read this node\'s cluster status',
           },
         }),
       }));
@@ -292,9 +300,11 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
 
     // 2) The cluster probe failure is visible AS a failure...
     await expect(page.locator('#cluster-stats')).toContainText(/unavailable/i);
-    await expect(page.locator('#cluster-nodes')).toContainText(/cannot read the cluster registry/i);
+    await expect(page.locator('#cluster-nodes')).toContainText(/could not read this node's cluster status/i);
     // ...and is not misreported as single-node mode.
-    await expect(page.locator('#cluster-nodes')).not.toContainText(/HYDRA_ROLE/);
+    // The "not enabled" copy names the MEMBER LIST (ADR-0001 retired HYDRA_ROLE), so neither the
+    // retired name nor that copy may appear when the failure is "could not ask".
+    await expect(page.locator('#cluster-nodes')).not.toContainText(/HYDRA_CLUSTER_PEERS|HYDRA_ROLE|not enabled/i);
     await expect(page.locator('#cluster-stats .skeleton')).toHaveCount(0);
 
     // 3) The raw-JSON view carries BOTH outcomes, labelled.
