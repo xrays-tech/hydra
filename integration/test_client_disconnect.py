@@ -42,6 +42,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -190,7 +191,7 @@ def admin(method, path, body=None):
 
 def start_node():
     env = dict(os.environ)
-    env.update(usage_env())
+    env.update(usage_env("clickhouse", MOCK.url))
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
@@ -242,28 +243,22 @@ def seed():
     time.sleep(0.3)
 
 
+MOCK = MockClickHouse()
+
+
 def usage_rows():
-    """(count, last row as a dict) from the SQLite usage table."""
-    db = os.path.join(DIR, "dc.db")
-    try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            conn.row_factory = sqlite3.Row
-            # The SQLite sink's columns are the NEUTRAL names from migration 0005 on
-            # (`tokens_in`/`tokens_out`); there is no `trace_id` column here (that one exists only
-            # in the ClickHouse schema — the first version of this query assumed it).
-            rows = conn.execute(
-                "SELECT tenant_id, provider_id, model_key, status_code, tokens_in, tokens_out,"
-                " error FROM usage_record ORDER BY rowid").fetchall()
-            return len(rows), (dict(rows[-1]) if rows else {})
-        finally:
-            conn.close()
-    except Exception as e:
-        return -1, {"error": f"<{type(e).__name__}: {e}>"}
+    """(count, last row as a dict) as WRITTEN to the ClickHouse double (ADR-0002 T3.10).
+
+    The rows come from a real HTTP server the gateway posted to, so this stays a measurement of
+    what the node recorded. (It used to read the local SQLite table; the ClickHouse schema carries
+    the same neutral `tokens_in`/`tokens_out` counters plus `trace_id`.)
+    """
+    rows = MOCK.rows
+    return len(rows), (rows[-1] if rows else {})
 
 
 def wait_for_rows(want, budget=15.0):
-    """The SQLite sink flushes on a 5 s tick (or a full batch), so a row appears only after that."""
+    """The sink flushes on a size OR time threshold, so a row appears only after one of them."""
     deadline = time.time() + budget
     last = (-1, {})
     while time.time() < deadline:
@@ -341,6 +336,7 @@ def main():
     upstream.daemon_threads = True
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
+    MOCK.start()
     node = start_node()
     try:
         if not wait_healthy():
@@ -428,6 +424,7 @@ def main():
     finally:
         stop(node)
         upstream.shutdown()
+        MOCK.stop()
 
     print()
     if failures:

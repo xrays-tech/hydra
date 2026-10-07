@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -180,16 +181,14 @@ def seed(admin_port=ADMIN, models=("slow2", "slow3")):
     time.sleep(0.3)
 
 
-def usage_rows(db_path):
-    """Rows in the SQLite usage table, or None when the file/table is absent."""
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
-            return conn.execute("SELECT COUNT(*) FROM usage_record").fetchone()[0]
-        finally:
-            conn.close()
-    except Exception as e:
-        return f"<{type(e).__name__}: {e}>"
+def usage_rows(mock):
+    """Rows the node has WRITTEN, counted at the ClickHouse double (ADR-0002 T3.10).
+
+    This leg used to read the local SQLite table; that store is retired, and counting rows at the
+    double keeps the claim the same one — "the row that was still buffered when SIGTERM arrived was
+    persisted" — instead of softening it into "a log line said so".
+    """
+    return len(mock.rows)
 
 
 def main():
@@ -391,19 +390,24 @@ def main():
             node5.kill()
 
     # ---- N3: the buffered usage row survives the shutdown ---------------------
-    node3 = start_node("flush", {"HYDRA_SHUTDOWN_DRAIN_SECS": "5"}, ADMIN + 20, DATA + 20)
-    db3 = os.path.join(DIR, "flush.db")
+    MOCK_N3 = MockClickHouse()
+    MOCK_N3.start()
+    node3 = start_node(
+        "flush",
+        {"HYDRA_SHUTDOWN_DRAIN_SECS": "5", **usage_env("clickhouse", MOCK_N3.url)},
+        ADMIN + 20,
+        DATA + 20,
+    )
     try:
         if not wait_healthy(ADMIN + 20):
             check("N3: the third node became healthy", False, "never healthy")
         else:
             seed(ADMIN + 20, models=("slow2",))
             st3, _, _ = proxied("slow2", port=DATA + 20)
-            before = usage_rows(db3)
+            before = usage_rows(MOCK_N3)
             node3.send_signal(signal.SIGTERM)      # immediately: the batch is still buffered
             rc3 = node3.wait(timeout=30)
-            time.sleep(0.3)
-            after = usage_rows(db3)
+            after = len(MOCK_N3.wait_for_rows(before + 1, timeout=10))
             announce("N3 the persisted usage rows", f"request HTTP {st3}; rows before SIGTERM="
                      f"{before} after exit={after}; exit={rc3}")
             check("N3: the usage row that was still BUFFERED when SIGTERM arrived is persisted "
@@ -413,6 +417,7 @@ def main():
     finally:
         if node3.poll() is None:
             node3.kill()
+        MOCK_N3.stop()
         upstream.shutdown()
 
     print()

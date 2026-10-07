@@ -39,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +203,9 @@ def metric(name):
     return [l for l in body.splitlines() if l.startswith(name) and not l.startswith("#")]
 
 
+MOCK = MockClickHouse()
+
+
 def start_node():
     env = dict(os.environ)
     env.update(usage_env())
@@ -211,7 +215,11 @@ def start_node():
         "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, 'streaming.db')}?mode=rwc",
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS": str(IDLE_SECS),
-        "HYDRA_USAGE_SINK": "sqlite",
+        # Usage goes to a real HTTP ClickHouse double that RECORDS the rows (ADR-0002 T3.10):
+        # S4 asserts "a streamed request is metered", and reading that out of the local table stops
+        # being possible once SQLite is retired — while asserting on a log line would be a
+        # different, weaker claim.
+        **usage_env("clickhouse", MOCK.url),
         "RUST_LOG": "warn",
     })
     log = open(os.path.join(DIR, "node.log"), "w")
@@ -257,14 +265,8 @@ def seed():
 
 
 def usage_rows():
-    db = os.path.join(DIR, "streaming.db")
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
-    try:
-        return con.execute("SELECT COUNT(*) FROM usage_record").fetchone()[0]
-    except sqlite3.DatabaseError:
-        return -1
-    finally:
-        con.close()
+    """Rows the node has WRITTEN, counted at the ClickHouse double."""
+    return len(MOCK.rows)
 
 
 def main():
@@ -276,6 +278,7 @@ def main():
     upstream = ThreadingHTTPServer(("127.0.0.1", UPSTREAM), SseUpstream)
     upstream.daemon_threads = True
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    MOCK.start()
     node = start_node()
     try:
         if not wait_healthy():
@@ -362,6 +365,7 @@ def main():
     finally:
         stop(node)
         upstream.shutdown()
+        MOCK.stop()
 
     print()
     if failures:

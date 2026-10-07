@@ -31,6 +31,8 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta, timezone
+
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -190,6 +192,15 @@ def set_enabled(enabled):
     return st
 
 
+# The window a read drill asks for is computed from NOW, not hard-coded: the first version used a
+# fixed `since=2026-09-01T00:00:00Z`, which silently aged out of the 31-day ceiling
+# (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`) and turned these legs red on a DATE rather than on a
+# change (measured 2026-10-07: 36 days -> 400 window_too_large). A fixture that is a date is a
+# fixture that expires.
+SINCE = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+SINCE_OLD = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+UNTIL = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def main():
     if not os.path.exists(BIN):
         print(f"[boundaries] CANNOT VERIFY: {BIN} is not built", file=sys.stderr)
@@ -247,7 +258,7 @@ def main():
         st, text = tenant("POST", "/auth/cache/invalidate", body={})
         check("§7.1 step 3: the recovery `invalidate` still works while suspended",
               st == 200, f"HTTP {st} {text[:70]}")
-        for path in ("/usage?since=2026-09-01T00:00:00Z", "/sub-tenants", "/sub-tenant-routes"):
+        for path in (f"/usage?since={SINCE}", "/sub-tenants", "/sub-tenant-routes"):
             st, text = tenant("GET", path)
             check(f"§7.1: the read route {path.split('?')[0]} still works while suspended",
                   st == 200, f"HTTP {st} {text[:60]}")
@@ -302,7 +313,7 @@ def main():
         Upstream.allowed = True
 
         # ---- §7.5 no `tenant_id` query parameter ------------------------------
-        base = "/usage?since=2026-09-01T00:00:00Z"
+        base = f"/usage?since={SINCE}"
         st_a, text_a = tenant("GET", base)
         st_b, text_b = tenant("GET", f"{base}&tenant_id=t2")
         try:
@@ -317,7 +328,7 @@ def main():
               st_a == 200 and owner_a == "t1" and owner_b == "t1", f"{owner_a!r} vs {owner_b!r}")
 
         # ---- §7.5 an empty window is `as_of: null`, not an error --------------
-        st, text = tenant("GET", "/usage?since=2026-09-01T00:00:00Z&until=2026-09-01T00:00:01Z")
+        st, text = tenant("GET", f"/usage?since={SINCE}&until={UNTIL}")
         try:
             empty = json.loads(text)
         except Exception:

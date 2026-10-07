@@ -32,6 +32,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
+
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -166,6 +168,15 @@ def envelope_ok(status, headers, text, expect_code=None, where=""):
         check(f"{where}: code is `{expect_code}` as documented", code == expect_code, f"code={code}")
 
 
+# The window a read drill asks for is computed from NOW, not hard-coded: the first version used a
+# fixed `since=2026-09-01T00:00:00Z`, which silently aged out of the 31-day ceiling
+# (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`) and turned these legs red on a DATE rather than on a
+# change (measured 2026-10-07: 36 days -> 400 window_too_large). A fixture that is a date is a
+# fixture that expires.
+SINCE = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+SINCE_OLD = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+UNTIL = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def main():
     if not os.path.exists(BIN):
         print(f"[tenant-contract] CANNOT VERIFY: {BIN} is not built", file=sys.stderr)
@@ -220,7 +231,7 @@ def main():
               len(set(msgs.values())) == 1, f"{msgs}")
 
         # ---- §4.4 the nine routes, and the method convention --------------------
-        read_routes = [("GET", "/whoami"), ("GET", "/usage?since=2026-09-01T00:00:00Z"),
+        read_routes = [("GET", "/whoami"), ("GET", f"/usage?since={SINCE}"),
                        ("GET", "/sub-tenants"), ("GET", "/sub-tenant-routes")]
         for method, path in read_routes:
             st, _, text = tenant(method, path)
@@ -309,9 +320,9 @@ def main():
         # ---- §5.3 parameter validation -----------------------------------------
         for path, code, why in (
             ("/usage", "invalid_since", "§5.3 `since` is required"),
-            ("/usage?since=2026-09-01T00:00:00Z&group_by=tenant", "invalid_group_by",
+            (f"/usage?since={SINCE}&group_by=tenant", "invalid_group_by",
              "§5.3 `group_by` whitelist"),
-            ("/usage?since=2026-01-01T00:00:00Z&until=2026-09-01T00:00:00Z", "window_too_large",
+            (f"/usage?since={SINCE_OLD}&until={UNTIL}", "window_too_large",
              "§5.3 window ceiling (31 days)"),
         ):
             st, hdrs, text = tenant("GET", path)
