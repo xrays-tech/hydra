@@ -157,9 +157,21 @@ def db_file(label):
     return os.path.join(DIR, f"{label}.db")
 
 
-def start(label, key_file_bytes=None, inline=None, db=None, extra=None):
+def base_env():
+    """The environment EVERY node launch in this drill starts from.
+
+    ONE owner on purpose. S7 builds its own env because it must fail before the health wait,
+    and when it did that from `dict(os.environ)` alone it lost the usage sink that ADR-0002
+    D-1 made mandatory: the node then refused to start over the MISSING SINK, so the error
+    never named the key file and S7 ("the error names the path") failed on the wrong message.
+    """
     env = dict(os.environ)
     env.update(usage_env())
+    return env
+
+
+def start(label, key_file_bytes=None, inline=None, db=None, extra=None):
+    env = base_env()
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
@@ -320,7 +332,7 @@ def main():
           "variables it wants",
           (not ok6) and rc6 is not None and rc6 != 0 and "HYDRA_ENCRYPTION_KEY" in log6,
           f"started={ok6} exit={rc6} :: {next((l for l in log6.splitlines() if 'master key' in l), '<no line>')[:130]}")
-    env7 = dict(os.environ)
+    env7 = base_env()
     proc7 = subprocess.run(
         [BIN], capture_output=True, text=True, timeout=40,
         env={**env7, "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",

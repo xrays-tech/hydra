@@ -111,12 +111,17 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
 # 4. Disposable instance.
 echo "==> playwright ${PW_VERSION} (matches the CI pin: ${MATCHES_CI}); browsers: ${PLAYWRIGHT_BROWSERS_PATH:-~/.cache/ms-playwright}"
 echo "==> starting hydra on ${ADMIN_URL} (data plane 127.0.0.1:${DATA_PORT})"
+# `HYDRA_USAGE_SINK=none` is required since ADR-0002 D-1 (there is no default) and it belongs
+# INSIDE the assignment chain: an earlier version put `export HYDRA_USAGE_SINK=none` on its own
+# line in the middle of the chain, which TERMINATED it — the four assignments above became a bare
+# command and the launch ran with the DEFAULT listen address (0.0.0.0:8080 rather than the port
+# printed on the line above), so the suite died on "address already in use" and a CI run would
+# have exercised a different port than the one it announced.
 HYDRA_ADMIN_TOKEN="$TOKEN" \
 HYDRA_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
 HYDRA_LISTEN="127.0.0.1:${DATA_PORT}" \
 HYDRA_DB_URL="sqlite://$ROOT/$SCRATCH/e2e.db?mode=rwc" \
-# Required since ADR-0002 D-1; this script is not about metering, so usage is off.
-export HYDRA_USAGE_SINK=none
+HYDRA_USAGE_SINK=none \
 HYDRA_ENCRYPTION_KEY="${HYDRA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}" \
 RUST_LOG="${RUST_LOG:-warn}" \
   ./target/debug/hydra > "$SCRATCH/hydra.log" 2>&1 &

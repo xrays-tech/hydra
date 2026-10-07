@@ -37,10 +37,14 @@ bad() { echo "   FAIL: $*" >&2; fail=1; }
 
 start() { # start <label> [flags...]
   local label="$1"; shift
+  # `HYDRA_USAGE_SINK=none` is required since ADR-0002 D-1 (no default) and must sit INSIDE the
+  # `env` assignment chain: a `#` comment or an `export` on its own line in the middle of the
+  # chain TERMINATES it, so the caller's `HOST/PORT/DATABASE` assignments are dropped and the
+  # node starts on its default port — which is how this entry failed with "the first process
+  # never served the data port".
   env HYDRA_ADMIN_TOKEN="$TOKEN" HYDRA_ADMIN_ADDR="127.0.0.1:$ADMIN" HYDRA_LISTEN="127.0.0.1:$LISTEN" \
       HYDRA_DB_URL="sqlite://$DB?mode=rwc" \
-      # Required since ADR-0002 D-1; this script is not about metering, so usage is off.
-      export HYDRA_USAGE_SINK=none
+      HYDRA_USAGE_SINK=none \
       HYDRA_ENCRYPTION_KEY="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
       HYDRA_SHUTDOWN_DRAIN_SECS=1 \
       RUST_LOG=info "$BIN" "$@" > "$DIR/$label.log" 2>&1 &

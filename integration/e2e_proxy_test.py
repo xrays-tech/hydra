@@ -12,6 +12,8 @@ Prerequisites: python3 (stdlib only). The Hydra binary is started via cargo run.
 """
 import base64, json, os, signal, subprocess, sys, time, urllib.request, urllib.error
 
+from _usage_env import usage_env  # the ONE owner of "which usage sink a drill's node starts with"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Env-overridable: the defaults collide with a running dev stack (or with another
 # check on the same box), and a harness that cannot run next to a stack is a
@@ -110,7 +112,12 @@ def main():
         # (unconditional fail-closed, crypto.rs `KeyMissing` -> main.rs). The
         # old token here was 14 chars and the key was not set at all, so this
         # harness could never boot the server it was meant to exercise.
-        env = {**os.environ,
+        #
+        # The sink must be named EXPLICITLY since ADR-0002 D-1 (no default) — and it comes from
+        # the shared `_usage_env` owner rather than a literal here, so this drill cannot drift
+        # from the other 39. It is a proxy-path suite (mock auth + mock LLM + failover), so
+        # `none` is the honest choice: nothing here reads a metering row.
+        env = {**os.environ, **usage_env(),
                "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
                "HYDRA_ENCRYPTION_KEY": _master_key(),
                "HYDRA_DB_URL": f"sqlite:{DB_FILE}?mode=rwc",

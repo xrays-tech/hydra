@@ -54,10 +54,16 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
 DB_URL="sqlite://$ROOT/$SCRATCH/it.db?mode=rwc"
 DB_PATH="${DB_URL#sqlite://}"; DB_PATH="${DB_PATH%%\?*}"
 
+# `HYDRA_USAGE_SINK=none` (required since ADR-0002 D-1: there is NO default) is hard-set rather
+# than overridable, and it sits INSIDE the assignment chain — a `#` comment between two
+# backslash-continued assignments ENDS the chain, which silently dropped every assignment above
+# and started this node on the default port. This drill asserts nothing about metering, so `none`
+# is also the honest value: it cannot make the node demand a cargo feature this build lacks.
 HYDRA_ADMIN_TOKEN="$TOKEN" \
 HYDRA_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
 HYDRA_LISTEN="127.0.0.1:${DATA_PORT}" \
 HYDRA_DB_URL="$DB_URL" \
+HYDRA_USAGE_SINK=none \
 HYDRA_ENCRYPTION_KEY="${HYDRA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}" \
 RUST_LOG="${RUST_LOG:-warn}" \
   ./target/debug/hydra > "$SCRATCH/hydra.log" 2>&1 &
