@@ -228,9 +228,16 @@ hydra/
     │   ├── metrics.rs         ← 自托管 /metrics handler（prometheus crate）
     │   └── ui.rs              ← 内嵌静态资源（include_dir）
     ├── usage/
-    │   ├── mod.rs             ← UsageSink trait + UsageRecord
-    │   ├── sqlite.rs          ← 默认 SQLite Sink
-    │   └── clickhouse.rs      ← 可选 ClickHouse Sink (feature flag)
+    │   ├── mod.rs             ← UsageBackend trait + REGISTRY（唯一描述符表，ADR-0002）
+    │   ├── engine.rs          ← 有界 channel + 批量 flush + 排空/丢弃计数
+    │   ├── query.rs           ← UsageQuery trait + 按维度分组
+    │   ├── testing.rs         ← 记录型测试替身（#[cfg(test)]，不在 REGISTRY 里）
+    │   └── backends/
+    │       ├── clickhouse/    ← 交付后端：mod.rs（sink+reader）+ transport.rs（CH 传输）
+    │       ├── none/          ← 显式「不计量」，读契约 Unavailable
+    │       └── tdengine/      ← 候选后端（ADR-0002 首个新插入；非交付）
+    │       （`usage/sqlite.rs` 与 `usage/clickhouse.rs` 是旧布局：
+    │        SQLite sink 已删，ClickHouse 已搬进 backends/clickhouse/）
     └── limit/
         ├── mod.rs             ← RateLimiter（内存滑动窗口）
         ├── matcher.rs         ← LimitRole 匹配逻辑

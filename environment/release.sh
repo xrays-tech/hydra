@@ -26,11 +26,14 @@ STAGE_DIR="$ROOT/environment/bin"
 echo ">> [1/2] building $BIN_NAME (release, full feature set) from $PKG_DIR..."
 # Run from the package dir so `--features … --bin hydra` resolves for the [[bin]]
 # hydra target (required-features = ["server"]), matching build.sh — the same
-# feature set, so this binary can serve a cluster deployment too. usage-clickhouse
-# compiles BOTH sinks (sqlite + clickhouse) into one binary;
-# HYDRA_USAGE_SINK=sqlite|clickhouse selects at runtime. `arachne` is required for
-# cluster mode: without it the binary REFUSES to boot when HYDRA_CLUSTER_PEERS is
-# set, so a recipe that omits it cannot run the shipped compose manifests.
+# feature set, so this binary can serve a cluster deployment too. `usage-clickhouse`
+# is the ONLY usage backend that needs a feature: the retired `sqlite` sink was deleted
+# with ADR-0002 (2026-10-07) and `HYDRA_USAGE_SINK=sqlite` is now REFUSED BY NAME at
+# startup, so the runtime choice is `clickhouse` or `none` — this comment claimed
+# "BOTH sinks (sqlite + clickhouse)" for a while after the sink itself was gone.
+# `arachne` is required for cluster mode: without it the binary REFUSES to boot when
+# HYDRA_CLUSTER_PEERS is set, so a recipe that omits it cannot run the shipped compose
+# manifests.
 ( cd "$PKG_DIR" && cargo build --release --features server,cluster-redis,arachne,usage-clickhouse --bin "$BIN_NAME" )
 
 SRC="$ROOT/target/release/$BIN_NAME"

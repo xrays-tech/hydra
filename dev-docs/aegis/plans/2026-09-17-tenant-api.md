@@ -1014,8 +1014,14 @@ node scripts/check_i18n.js && node --test scripts/check_i18n.test.cjs && bash sc
 # 全量要求"为空"是**永远无法变绿**的门禁，会逼开发者删掉合法断言或干脆不再信任它。
 rg 'unwrap\(\)|expect\(|panic!|unimplemented!|todo!' \
    crates/hydra-core/src/tenant_api.rs crates/hydra-server/src/tenant_api/ \
-   crates/hydra-server/src/usage_query.rs crates/hydra-server/src/clickhouse.rs
-# 期望为空。**基线例外（已记录）**：`crates/hydra-server/src/main.rs` 里 `cert_store` 的
+   crates/hydra-server/src/usage/backends/clickhouse/mod.rs \
+   crates/hydra-server/src/usage/backends/clickhouse/transport.rs
+# 期望为空。**两个路径已由 ADR-0002 T1.3 搬家**（2026-10-07）：`usage_query.rs` 的读侧现为
+# `usage/backends/clickhouse/mod.rs`，`clickhouse.rs` 的传输现为
+# `usage/backends/clickhouse/transport.rs`。原来的坐标留在这里会变成死引用，而这正是
+# `.acceptance/findings-disposition.py` 的 C-2 用来钉住"限域"的那条断言 —— 它按旧路径报红
+# （2026-10-07 门禁实测），因为**两边写的是同一串坐标**；现在两边一起改到今天的路径。
+# **基线例外（已记录）**：`crates/hydra-server/src/main.rs` 里 `cert_store` 的
 #   .expect("the cert store is built whenever a TLS listener is configured")
 # 是既有生产代码、不属本次改动，**不得**为过门禁而改它。
 #

@@ -20,7 +20,8 @@
 //!
 //! ## Why the decoder belongs here rather than next to the transport
 //!
-//! `hydra-server/src/clickhouse.rs` is gated on `usage-clickhouse`, and that
+//! `hydra-server/src/usage/backends/clickhouse/transport.rs` (moved there from
+//! `src/clickhouse.rs` by ADR-0002 T1.3) is gated on `usage-clickhouse`, and that
 //! feature is **not** implied by `server` (CI adds it explicitly for exactly
 //! this reason). If decoding lived there, the two most dangerous negative tests
 //! ("a quoted 64-bit integer must still decode", "an empty-string `last_seen`
