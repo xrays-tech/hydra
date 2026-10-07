@@ -380,40 +380,34 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_startup_knobs.py
 
-      # The tenant SDK against a REAL node and a REAL bus: `200 applied` (2/2 nodes),
-      # `202 pending` via wait=none, and `503 unavailable` when the bus is cut under a
-      # running edge (a dead Redis URL cannot produce that state — the node refuses to
-      # start). Its own 787-line suite runs against mocks only.
-      - name: Tenant SDK against a live cluster (applied / pending / unavailable)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
-          python3 integration/test_sdk_live.py --cluster
-
-      # The TypeScript SDK on the same bus, plus the CROSS-SDK parity leg: two
-      # implementations of one documented contract must report the same fleet state and
-      # the same node counts for the same node.
-      - name: Tenant TypeScript SDK against a live cluster (+ parity with the Python SDK)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
-          cd tools/hydra-ts && npm install && npm run build && cd ../..
-          python3 integration/test_sdk_ts_live.py --cluster
-
-      # The Go SDK on the same bus, plus THREE-WAY parity: all three SDKs must agree
-      # about the same node's fleet state and node counts.
-      - name: Tenant Go SDK against a live cluster (+ three-way parity)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
-          cd tools/hydra-ts && npm install && npm run build && cd ../..
-          python3 integration/test_sdk_go_live.py --cluster
+      # The three "SDK against a live cluster" steps (Python, TypeScript, Go) were RETIRED on
+      # 2026-10-07, in the same class as `test_cluster_ha.py` and `test_replica_fidelity.py`.
+      #
+      # WHY: their C1-C3 legs asserted the world ADR-0001 replaced — `200 applied` with an
+      # `event_id`, `202 pending` via `wait=none`, `503 unavailable` from "the edge" whose
+      # `/api/v1/health` is 404. But the drills started two PLAIN SINGLE-NODE instances
+      # (`HYDRA_REDIS_MODE=single`, no `HYDRA_CLUSTER_PEERS`), and such a node correctly answers
+      # `state: "single_node"` (documented in `admin-ui/api-docs.js`: "this node is the whole
+      # fleet"). Measured 2026-10-07: with the reported `single_node` body, `eventId: None`,
+      # 7 (Python) / 6 (TS) / 5 (Go) assertions failed, so these steps could never pass again
+      # while claiming to be about a cluster.
+      #
+      # WHERE THE COVERAGE LIVES NOW — nothing here is unverified, it is verified elsewhere:
+      #   * the live FLEET REPORT (`applied` with nodes_applied == nodes_total, and the measured
+      #     `202 pending` shape when a member is down) -> `integration/test_auth_cache_layers.py`,
+      #     a real 2-node cluster, which asserts the report itself and whose header records the
+      #     202 pending measurement (2026-10-05);
+      #   * the SDK's OWN handling of the three states, including raising on `pending` and the
+      #     `single_node` short-circuit -> the three SDK suites that run in the `sdks` job against
+      #     mocks: `tools/hydra-py/tests/test_client.py` (applied 35 / pending 19 / single_node 4
+      #     references), `tools/hydra-ts/test/client.test.ts` (13 / 18 / 5),
+      #     `tools/hydra-go/client_test.go` (10 / 20 / 4);
+      #   * each SDK against a REAL node, which is what the drills keep doing in their single-node
+      #     legs: `integration/test_sdk_live.py`, `test_sdk_ts_live.py`, `test_sdk_go_live.py`
+      #     (steps below, no flag).
+      # What is genuinely NOT covered any more: an SDK pointed at a multi-member raft fleet seeing
+      # a real `200 applied`/`202 pending` over HTTP. Recorded in ADR-0001's plan coverage table
+      # rather than left implied.
 
       # The TWO-LAYER auth verdict cache, measured with a counting auth upstream on a real
       # cluster: L1 per node, L2 written to Redis (`1`/`0` + tenant index), **L2 SHARED** so
@@ -424,7 +418,12 @@ jobs:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          # `arachne` is NOT optional here: this drill wires its nodes as a cluster
+          # (`HYDRA_CLUSTER_PEERS`), and since ADR-0001 a build without the control plane REFUSES
+          # to boot on that variable ("this build has no control plane: rebuild with
+          # --features arachne"). Built without it, the step reported exit 2 / CANNOT VERIFY and
+          # the missing feature looked like a broken drill.
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_auth_cache_layers.py
 
       # REPLICA FIDELITY is RETIRED (2026-10-05), in the same class as `test_cluster_ha.py`: its
@@ -462,7 +461,11 @@ jobs:
           # binary an earlier step left behind is how the round-143 gate went red (a parallel
           # `cargo test --features server` had relinked it feature-poor). `check_gate_entries`
           # enforces exactly that now, against the workflow.
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          # `arachne` is NOT optional here either: the two nodes are wired as a cluster
+          # (`HYDRA_CLUSTER_PEERS`), and since ADR-0001 a build without the control plane REFUSES
+          # to boot on that variable — so this step reported exit 2 / CANNOT VERIFY instead of
+          # exercising the shared windows it exists for.
+          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
           python3 integration/test_cluster_limits.py
 
       # The `#[ignore]`d ClickHouse suites: they need a LIVE ClickHouse (`CH_URL`) and Redis.
@@ -561,7 +564,15 @@ jobs:
       # Retry-After on a throttle, the failure-lockout isolation for valid tokens, and
       # the 0-falls-back-to-default rule. Needs no Redis.
       - name: tenant API rate limits
-        run: python3 integration/test_tenant_api_limits.py
+        run: |
+          # This drill runs a node with `HYDRA_USAGE_SINK=clickhouse` against a MOCK ClickHouse
+          # (`integration/_usage_env.py`), and since ADR-0002 the sink is mandatory and named —
+          # a `server`-only binary refuses to boot on that variable, which the drill reports as
+          # exit 2 (CANNOT VERIFY) rather than a failure. This job's first build is `server`
+          # alone, so build the production feature set here; the later steps that need it do the
+          # same for the same reason.
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_tenant_api_limits.py
 
       # The per-provider admission queue: the saturation bound (queue_depth never exceeds
       # max_queue_depth), the drop reasons, the gauges/counters, the passthrough opt-out,
@@ -626,7 +637,12 @@ jobs:
       # documented parameter validation. Round 88 pinned the §6 code→HTTP table statically;
       # this pins the behaviour. It immediately found one wrong example in §4.4.
       - name: tenant API contract (routes, methods, envelope, idempotency)
-        run: python3 integration/test_tenant_api_contract.py
+        run: |
+          # Needs `usage-clickhouse` compiled in: the drill's metering leg points the node at a
+          # MOCK ClickHouse by NAMING the sink (`_usage_env.py`), and ADR-0002 D-1 made naming it
+          # mandatory — a `server`-only binary refuses to boot, which the drill reports as exit 2.
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_tenant_api_contract.py
 
       # §7's BOUNDARIES, black-box: a suspended tenant keeps the whole self-service API
       # (the documented recovery path) while its client traffic is refused as 403
@@ -635,7 +651,11 @@ jobs:
       # pins the envelope DIFFERENCE the document now spells out (data plane: message+type,
       # no code/trace_id; tenant API: code+message+trace_id).
       - name: tenant API boundaries (§7)
-        run: python3 integration/test_tenant_api_boundaries.py
+        run: |
+          # Same reason as the contract step above: the drill names a mock ClickHouse sink, which
+          # a `server`-only binary cannot build (ADR-0002 D-1 removed the default).
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_tenant_api_boundaries.py
 
       # The STREAMING path — the gap round 63 recorded ("the load test used a single JSON
       # upstream, so real SSE was never measured"). §9.1 turns both failure modes into alert
@@ -644,7 +664,12 @@ jobs:
       # would pass a body comparison), a wedged stream cut at the idle bound with the client
       # left truncated, an upstream that dies mid-answer, and metering of streamed requests.
       - name: streaming path (SSE, idle bound, mid-stream death, metering)
-        run: python3 integration/test_streaming_path.py
+        run: |
+          # Same reason again: the "metering" half of this drill asserts a row at a MOCK
+          # ClickHouse, so the node must be started with a named sink (ADR-0002 D-1) and the
+          # binary must carry the feature that builds it.
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_streaming_path.py
 
       # The circuit breaker's documented operator workflow: the dead-set (`GET
       # /api/v1/breaker`), the §9.1 skip counter, traffic actually stopping, the documented
