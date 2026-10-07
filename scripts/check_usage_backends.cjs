@@ -21,6 +21,11 @@
  *     retired by user ruling, and a retired value that quietly reappears in the registry would
  *     undo that without a single test failing).
  *
+ * It also enforces the pattern's OTHER half, which the T4.3 anti-cheat showed was NOT enforced: the
+ * registry is the only place that may know a backend by name. A deliberate `if sink_kind ==
+ * "tdengine"` added to `main.rs` passed every guard — so the claim "`main` does not know any backend"
+ * was true by habit rather than by check, and it is checked now.
+ *
  * Exit codes: 0 every backend is consistent, 1 something disagrees, 2 CANNOT VERIFY (the
  * registry could not be read, or nothing was parsed — a guard that "passes" by finding nothing
  * is the failure mode this one exists to avoid).
@@ -52,6 +57,26 @@ const UNDOCUMENTED_OK = new Map(
  * delivered — so the exception is recorded here, with the document that DOES carry it, and printed on
  * every run like every other record in this repository.
  */
+/**
+ * Kinds whose NAME may not appear outside `src/usage/`.
+ *
+ * `clickhouse` and `tdengine` are distinctive words: a literal one outside the usage module means
+ * something is branching on a backend's identity, which is what the registry exists to prevent.
+ *
+ * `none` is deliberately NOT in this list, and `sqlite` needs a recorded occurrence: `none` is an
+ * ordinary English word (`Some("none") => false` parses a config value; `map_or("none", …)` labels an
+ * extraction source) and a rule that flagged it would teach people to ignore this guard. `sqlite`
+ * survives in one place — a test asserting the tenant-facing error text does not leak storage
+ * internals — and that occurrence is listed below with its reason, so a SECOND one cannot hide behind
+ * it.
+ */
+const KIND_LITERALS_OFF_LIMITS = ['clickhouse', 'tdengine'];
+
+/** Recorded occurrences that are not "knowing a backend by name", each with the reason. */
+const KIND_LITERAL_OK = [
+  ['tenant_api/handlers.rs', 'sqlite', 'an assertion that the TENANT-facing message does not leak storage internals'],
+];
+
 const CANDIDATE_ENV_DOC = new Map(
   Object.entries(
     JSON.parse(
@@ -71,6 +96,7 @@ function parseArgs(argv) {
     backendsDir:
       process.env.CUB_BACKENDS_DIR || path.join(ROOT, 'crates/hydra-server/src/usage/backends'),
     cargoToml: process.env.CUB_CARGO || path.join(ROOT, 'crates/hydra-server/Cargo.toml'),
+    root: process.env.CUB_ROOT || ROOT,
     docs: process.env.CUB_DOCS || path.join(ROOT, 'dev-docs/ops.md'),
     dump: false,
   };
@@ -79,6 +105,7 @@ function parseArgs(argv) {
     else if (arg.startsWith('--backends-dir=')) opts.backendsDir = arg.slice('--backends-dir='.length);
     else if (arg.startsWith('--cargo=')) opts.cargoToml = arg.slice('--cargo='.length);
     else if (arg.startsWith('--docs=')) opts.docs = arg.slice('--docs='.length);
+    else if (arg.startsWith('--root=')) opts.root = arg.slice('--root='.length);
     else if (arg === '--dump') opts.dump = true;
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else throw new Error(`unknown argument: ${arg}`);
@@ -198,6 +225,30 @@ function documentedNames(markdown) {
   return names;
 }
 
+/** Every `.rs` under `crates/hydra-server/src`, except the usage module itself. */
+function rustFilesOutsideUsage(root) {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name === 'usage' && path.basename(dir) === 'src') continue;
+        walk(full);
+      } else if (e.name.endsWith('.rs')) {
+        out.push(full);
+      }
+    }
+  };
+  walk(path.join(root, 'crates/hydra-server/src'));
+  return out;
+}
+
 function check(opts) {
   const problems = [];
   const notes = [];
@@ -260,6 +311,24 @@ function check(opts) {
   for (const kind of retired) {
     if (kinds.includes(kind)) {
       problems.push(`\`${kind}\` is in RETIRED_USAGE_SINKS and in REGISTRY — a retired value that is selectable again`);
+    }
+  }
+
+  // The registry owns the names. A literal kind outside `src/usage/` is a second owner.
+  for (const b of backends) {
+    if (b.missing || b.notFound) continue;
+    if (!KIND_LITERALS_OFF_LIMITS.includes(b.kind)) continue;
+    for (const file of rustFilesOutsideUsage(opts.root)) {
+      const rel = path.relative(ROOT, file).split(path.sep).join('/');
+      const src = fs.readFileSync(file, 'utf8');
+      const literal = `"${b.kind}"`;
+      if (!src.includes(literal)) continue;
+      if (KIND_LITERAL_OK.some(([f, k]) => rel.endsWith(f) && k === b.kind)) continue;
+      problems.push(
+        `${rel} names the backend \`${b.kind}\` as a literal — outside \`src/usage/\` the registry ` +
+          'is the ONLY thing that may know a backend by name (ADR-0002 §2.2); pass the configured ' +
+          'kind through `usage::open` instead (this is the T4.3 anti-cheat rule)',
+      );
     }
   }
 

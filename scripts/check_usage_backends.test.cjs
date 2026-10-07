@@ -205,6 +205,34 @@ test('a backend written as a flat <kind>.rs is a structural failure, not a silen
   assert.match(r.stderr, /flat `<kind>\.rs` is a second layout/);
 });
 
+test('a literal backend kind outside src/usage is a failure (the T4.3 anti-cheat rule)', () => {
+  const fx = fixture({
+    backends: { clickhouse: backend() },
+    registry: defaultRegistry(['clickhouse']),
+  });
+  // A `src/` tree with one file that knows the backend by name, exactly like the overstep that
+  // passed every guard before this rule existed.
+  const src = path.join(fx.dir, 'crates', 'hydra-server', 'src');
+  fs.mkdirSync(path.join(src, 'usage'), { recursive: true });
+  fs.writeFileSync(path.join(src, 'main.rs'), 'if sink_kind == "clickhouse" { }\n');
+  fs.mkdirSync(path.join(src, 'usage', 'backends'), { recursive: true });
+  const r = spawnSync(
+    process.execPath,
+    [
+      CHECKER,
+      `--registry=${fx.registry}`,
+      `--backends-dir=${fx.backendsDir}`,
+      `--cargo=${fx.cargo}`,
+      `--docs=${fx.docs}`,
+      `--root=${fx.dir}`,
+    ],
+    { encoding: 'utf8', env: { ...process.env } },
+  );
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /names the backend `clickhouse` as a literal/);
+  assert.match(r.stderr, /T4\.3 anti-cheat rule/);
+});
+
 test('the real tree passes, and names every backend', () => {
   const r = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', cwd: REPO });
   assert.equal(r.status, 0, r.stderr + r.stdout);

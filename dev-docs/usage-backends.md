@@ -190,6 +190,28 @@ curl -s -L -H "Authorization: Basic cm9vdDp3cm9uZ3Bhc3M=" -d "SHOW DATABASES" "$
 ② `VALUES` 元组里 `sub_tenant_id` 被**双重加引号**（`''st1''`）⇒ 服务器拒绝**每一批**、表始终为空而节点看起来健康；
 ③ 同秒塌陷（见矩阵行的硬限制）。②的教训已写进测试：那条断言改为比对**整个元组**，因为 `contains("'st1'")` 会放过 `''st1''`。
 
+### 5.3 T4.3 反证：越界一次，看看模式抓不抓得住（2026-10-07，实测）
+
+ADR-0002 的 Phase 4 判据之一是"故意越界，看守卫能不能发现"。实测做法：在 `main.rs` 里加一句
+
+```rust
+if sink_kind == "tdengine" { info!("the T4.3 anti-cheat marker is present"); }
+```
+
+**结果：`check_usage_backends` 与 `check_ci_wiring` 都放行（rc=0）。** 也就是说，"`main.rs` 不认识任何
+后端"这句话当时**只是习惯，不是被检查的**——文档写着的模式靠人自觉，而 T4.3 存在的意义正是量出这件事。
+
+**已修**：`check_usage_backends` 增加一条规则——**`src/usage/` 之外不得出现任何 "
+注册种类"的字面量**（`clickhouse` / `tdengine`；`none` 因为是普通英语单词、`sqlite` 因为有一处
+带记账的测试断言而排除在规则外，理由写在守卫里）。加规则后同一句越界**立刻变红**并点名：
+
+```
+crates/hydra-server/src/main.rs names the backend `tdengine` as a literal — outside `src/usage/`
+the registry is the ONLY thing that may know a backend by name (ADR-0002 §2.2) …
+```
+
+守卫自测 `11 → 12`（新增一条正是这句越界的回归）。**这条缺口是"模式还不够硬"的唯一一处，已闭合。**
+
 ## 6. 已知弱点（每次都得手写的部分）
 
 - **注册那一行**：静态表要求手动加一行（备选 `inventory`/`linkme` 自动注册被否，因为它把控制流藏起来、`grep` 不出"有哪些后端"）。守卫是补偿：**没有注册就红**。
