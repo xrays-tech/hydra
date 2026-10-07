@@ -11,9 +11,20 @@
 //!
 //! # What the request looks like
 //!
-//! `POST /rest/sql[/<db>]`, `Authorization: Basic <base64(user:password)>` (3.3.x has Basic only;
-//! token/`Bearer` auth arrived in 3.4.0.0 — see the note on `Auth`), and the SQL statement as the
-//! **body**, not as a query parameter.
+//! `POST /rest/sql[/<db>]`, `Authorization: Basic <base64(user:password)>`, and the SQL statement as
+//! the **body**, not as a query parameter.
+//!
+//! # Version, and the one thing that is deliberately absent
+//!
+//! Everything here is measured against **`tdengine/tdengine:3.3.6.13`** (the LTS line), and nothing
+//! in this backend needs a newer server: the statement form, the envelope, the framing and the read
+//! SQL are all 3.3 features.
+//!
+//! 3.4.0.0 added token authentication (`Authorization: Bearer <token>`). It is **not implemented**,
+//! on purpose: the image that could verify it is not reachable from here (every 3.4.x tag is refused
+//! by the registry mirror this project can see), and an unverifiable auth branch is exactly the kind
+//! of path that looks supported and is not. If a deployment needs it, it is one function — written
+//! where the Basic header is built, with a live test beside it.
 //!
 //! # Framing
 //!
@@ -361,23 +372,10 @@ mod tests {
 // The request
 // ===========================================================================
 
-/// A token for `Authorization: Bearer …`.
-///
-/// **UNVERIFIED here**: token authentication arrived in TDengine 3.4.0.0 and the only image
-/// available on this machine is 3.3.6.13 (the 3.4.x tags are refused by the configured registry
-/// mirror). The header is written the way the documentation describes it; the Basic path is the one
-/// that has been measured. A deployment that sets this on a 3.3 server gets taosAdapter's own
-/// refusal (`code != 0`), not a silent failure — which is the property that matters.
-pub const TOKEN_ENV: &str = "HYDRA_TDENGINE_TOKEN";
-
-/// The `Authorization` header value for this configuration.
+/// The `Authorization` header value for this configuration: HTTP Basic, or nothing when the URL
+/// carried no credentials.
 #[must_use]
-pub fn authorization_header(cfg: &TdengineConfig, token: Option<&str>) -> Option<String> {
-    if let Some(token) = token.filter(|t| !t.is_empty()) {
-        // Token auth wins when it is configured: it is the 3.4 way, and a deployment that sets both
-        // means the token.
-        return Some(format!("Bearer {token}"));
-    }
+pub fn authorization_header(cfg: &TdengineConfig) -> Option<String> {
     let user = cfg.user.as_deref()?;
     let password = cfg.password.as_deref().unwrap_or("");
     Some(format!(
@@ -431,14 +429,13 @@ pub async fn send(cfg: &TdengineConfig, sql: &str) -> Result<TdengineResponse, S
         Some(db) => format!("/rest/sql/{db}"),
         None => "/rest/sql".to_string(),
     };
-    let token = std::env::var(TOKEN_ENV).ok();
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=UTF-8\r\nConnection: close\r\n",
         cfg.host,
         cfg.port,
         sql.len()
     );
-    if let Some(auth) = authorization_header(cfg, token.as_deref()) {
+    if let Some(auth) = authorization_header(cfg) {
         request.push_str(&format!("Authorization: {auth}\r\n"));
     }
     request.push_str("\r\n");
@@ -580,26 +577,16 @@ mod request_tests {
     fn basic_auth_is_base64_of_user_and_password() {
         let cfg = parse_tdengine_url("http://root:taosdata@h:6041").expect("parses");
         assert_eq!(
-            authorization_header(&cfg, None).as_deref(),
+            authorization_header(&cfg).as_deref(),
             Some("Basic cm9vdDp0YW9zZGF0YQ=="),
             "the measured credential form (`curl -u root:taosdata` sends exactly this)"
-        );
-    }
-
-    /// 3.4's token auth, written but unmeasured here (see [`TOKEN_ENV`]).
-    #[test]
-    fn a_token_beats_basic_auth_when_it_is_set() {
-        let cfg = parse_tdengine_url("http://root:taosdata@h:6041").expect("parses");
-        assert_eq!(
-            authorization_header(&cfg, Some("tok")).as_deref(),
-            Some("Bearer tok")
         );
     }
 
     #[test]
     fn no_credentials_means_no_header() {
         let cfg = parse_tdengine_url("http://h:6041").expect("parses");
-        assert_eq!(authorization_header(&cfg, None), None);
+        assert_eq!(authorization_header(&cfg), None);
     }
 
     #[test]

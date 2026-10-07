@@ -23,11 +23,12 @@
 //! * Timestamps render as RFC3339 UTC (`"2026-10-07T05:57:42.173Z"`), and our fixed-width bound
 //!   strings (`'2026-10-07T00:00:00Z'`) match rows directly, so the window bounds pass through.
 //!
-//! # 3.4.0.0+
+//! # Version
 //!
-//! The target version is 3.4.0.0 or newer. The image available here is 3.3.6.13, so anything that
-//! only exists from 3.4 is **written but UNVERIFIED** — today that is exactly one thing: token
-//! (`Authorization: Bearer <token>`) authentication. The Basic path below is the measured one.
+//! Measured against **`tdengine/tdengine:3.3.6.13`** (LTS), and this backend needs nothing newer:
+//! every statement, envelope and framing detail above is a 3.3 feature. The token authentication
+//! 3.4.0.0 added is deliberately NOT implemented — an unverifiable auth branch would be a path that
+//! looks supported and is not (see `transport`'s header for the one-function note).
 
 pub(crate) mod transport;
 

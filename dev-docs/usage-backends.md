@@ -119,7 +119,7 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 |---|---|---|---|---|---|---|
 | `clickhouse` | **交付（唯一）** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，**前两个今天在 `ops.md` 没有文档**） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
 | `none` | **交付（D-2 已裁定保留）** | 无（总是编译） | 无 | 丢弃并计数 `sink_disabled` | `ReaderContract::Unavailable{why}` ⇒ `/usage` 回 503 `usage_store_unavailable` | ✅（故意没有存储）必须**显式**选择，启动打 WARN |
-| `tdengine` | **已实现（候选，非交付）；活实例测试通过** | `usage-tdengine` | `HYDRA_TDENGINE_URL`（`http://user:pass@host:6041/<db>`，Basic 认证；`HYDRA_TDENGINE_TOKEN` ⇒ `Bearer`，**3.4.0.0+ 才有、本机未实测**） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant>') VALUES (…),(…)`，**子表按租户自动创建**；启动时 `CREATE DATABASE/STABLE IF NOT EXISTS` | 同一个 `POST /rest/sql[/db]`，TDengine SQL（`CASE WHEN` 归空键、`last(ts)`、别名 `group_key`、`TO_CHAR` 做 day） | ⚠️ **能用，但有一条硬限制 ⇒ 只能是候选**：TDengine 的**主键就是 `ts`**，同租户同一秒的两条请求会**互相覆盖**（实测：`tokens_in` 111 被 999 覆盖、行数仍为 1；毫秒不同则两行都在）。本后端用 **trace id 派生的亚秒位**规避（确定性 ⇒ 重试仍幂等），但同一秒内两条哈希到同一毫秒的请求仍会塌（约 1/1000），而 TDengine **没有批次去重令牌**。要当计费存储必须换成毫秒级唯一的键。其余实测坑见 §5.1 |
+| `tdengine` | **已实现（候选，非交付）；活实例测试通过** | `usage-tdengine` | `HYDRA_TDENGINE_URL`（`http://user:pass@host:6041/<db>`，**Basic 认证**——实测过的唯一认证形式） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant>') VALUES (…),(…)`，**子表按租户自动创建**；启动时 `CREATE DATABASE/STABLE IF NOT EXISTS` | 同一个 `POST /rest/sql[/db]`，TDengine SQL（`CASE WHEN` 归空键、`last(ts)`、别名 `group_key`、`TO_CHAR` 做 day） | ⚠️ **能用，但有一条硬限制 ⇒ 只能是候选**：TDengine 的**主键就是 `ts`**，同租户同一秒的两条请求会**互相覆盖**（实测：`tokens_in` 111 被 999 覆盖、行数仍为 1；毫秒不同则两行都在）。本后端用 **trace id 派生的亚秒位**规避（确定性 ⇒ 重试仍幂等），但同一秒内两条哈希到同一毫秒的请求仍会塌（约 1/1000），而 TDengine **没有批次去重令牌**。要当计费存储必须换成毫秒级唯一的键。其余实测坑见 §5.1 |
 | `influxdb3` | 候选 | `usage-influxdb3` | 数据库令牌（`Authorization: Bearer …`，端口 **8181**） | `POST /api/v3/write_lp?db=…`，行协议（表**自动创建**，数据库要先建） | `POST /api/v3/query_sql?db=…`（SQL：`DATE_BIN(INTERVAL '1 day', time)`）或 `/api/v3/query_influxql` | ✅ SQL 可用、有 schema-on-write；注意 2026-09-15 起其 Docker `latest` 指向 3 Core（**部署要钉版本 tag**）；docs 页面**未标许可证**（仓库为 Apache-2.0 + MIT） |
 | `influxdb2` | 候选（老线） | `usage-influxdb2` | `org` + `bucket` + API token | `POST /api/v2/write?org=…&bucket=…`，行协议（bucket 必须先存在） | `POST /api/v2/query`，**Flux**（`aggregateWindow(every:1d)` + `group()`） | ⚠️ 读是 Flux，与本仓"窗口是字符串边界"的模型是**翻译**关系；OSS v2 的集群能力 **UNVERIFIED** |
 | `victoriametrics` | 候选（**需先做取舍**） | `usage-victoriametrics` | `HYDRA_…_URL`（单机 **8428**；集群插入 **8480** / 查询 **8481**，且路径要带 `/insert/<accountID>/`、`/select/<accountID>/`） | `POST /api/v1/import/prometheus`（文本）或 `/api/v1/write`（remote write v1）或 `/api/v1/import`（JSON lines）；无 DDL，metric+label 即 series | `GET/POST /api/v1/query` / `query_range`，**MetricsQL** | ❌/⚠️ **它没有 `GROUP BY`**：窗口是选择器里的 `[5m]` + 输出网格 `step`。要承载本仓的 5 个分组维度就得把它们做成 label，而"每请求一行、15 个字段"与时序标签模型是**不同的东西**（租户维度还会带来基数问题）。要接就必须先写下这个取舍，而不是假装它是同一件事。另：默认**无鉴权**（建议前置代理） |
@@ -141,7 +141,7 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 | 写入 | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('t1') VALUES (…)`；**子表自动创建**（`affected_rows: 1`）；一条语句里可跟多个 `VALUES` 元组（批量）；`NULL` 字面量可插入可空列 |
 | 成功应答 | `{"code":0,"column_meta":[…],"data":[[…]],"rows":N}` |
 | **错误应答** | **HTTP 200** + `{"code":<非零>,"desc":"…"}`。SQL 错误 `code:9750`（"Database not specified"）、**认证失败 `code:855`（"Authentication failure"）** |
-| 认证 | `Authorization: Basic <base64(user:password)>`（`Bearer`/token 认证要 3.4.0.0+，3.3.6 没有） |
+| 认证 | `Authorization: Basic <base64(user:password)>`（实测）。**3.4.0.0+ 另有 token/`Bearer` 认证，本后端刻意不用**：能验证它的镜像在本机不可达（3.4.x 的 tag 全被镜像源 `denied`），而未经验证的认证分支正是"看着支持、其实没有"的东西；需要时它是一个函数 + 一条活实例测试 |
 | 整数类型 | **JSON 数字**（`[[1,10,20]]`），不是 ClickHouse 那种字符串 |
 | 时间戳 | 回的是 RFC3339 UTC 毫秒：`"2026-10-07T05:57:42.173Z"`（我们写进去的 `NOW` 是本地时区，存储与回显都是 UTC） |
 | 窗口字面量 | `ts >= '2026-10-07T00:00:00Z'` **与** `ts >= '2026-10-07 00:00:00.000'` **都能匹配同一行** ⇒ 本仓"定宽字符串边界"可以直接透传 |
@@ -214,13 +214,16 @@ the registry is the ONLY thing that may know a backend by name (ADR-0002 §2.2) 
 
 ### 5.4 这条候选**尚未闭合的两件事**（如实记账）
 
-1. **`Bearer` token 认证（3.4.0.0+）已实现但本机未实测**：本沙箱能连的镜像源里 3.4.x 的 6 个 tag
-   全部 `denied`，只有 3.3.6.13 可用。所以 Basic 路径是实测的，token 路径是"按文档写、待补测"。
-   拿到 3.4 镜像后，`HYDRA_TDENGINE_TOKEN` 那条分支需要跑一次活实例验证。
-2. **活实例测试没有接进 CI**：它需要 TDengine 容器，而 `check_ci_wiring` 的"每个 `#[ignore]` 测试都必须
-   被执行"规则**只扫 `tests/*.rs`**，所以放在 `src/usage/backends/tdengine/mod.rs` 里的这条 `--ignored`
-   测试**不在它的地板之内**（守卫绿，但这条测试确实没人自动跑）。复现配方写在模块文档与 §5.1 里，
-   **手工执行**。⚠️ 这同时暴露了**守卫自身的一个洞**：lib 内的 `#[ignore]` 测试不受"必须被执行"约束。
+1. ~~`Bearer` token 认证已实现但本机未实测~~ → **已闭合（2026-10-07，用户裁定"不要强制要求 3.4.x"）**：
+   那条分支**不是留着等镜像，而是删掉了**——测不了的路径不留在代码里。本后端只需 3.3 特性，
+   实测基线是 `tdengine/tdengine:3.3.6.13`（LTS）；3.4 的 token 认证在 `transport` 的文档注释里
+   留了一句"需要时它就是一个函数 + 一条活实例测试"。
+2. **活实例测试仍未接进 CI**（**已从"看不见"变成"每次运行都点名"**）：它需要 TDengine 容器，而
+   `check_ci_wiring` 的"每个 `#[ignore]` 测试都必须被执行"规则只扫 `tests/*.rs` ⇒ 放在
+   `src/usage/backends/tdengine/mod.rs` 里的这条测试**不在它的地板之内**，而守卫照样绿。
+   **已修**：守卫现在会把 crate **内部**的 `#[ignore]` 测试**每次运行都列出来**（NOTE，不是 FAIL——
+   为它们强制一个 service container 是超出该守卫职权的成本），于是"这条测试没人自动跑"不再是
+   "没人注意到"。复现配方在模块文档与 §5.1，**手工执行**。
 
 ## 6. 已知弱点（每次都得手写的部分）
 

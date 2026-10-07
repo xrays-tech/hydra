@@ -638,6 +638,42 @@ for (const crate of fs.existsSync(cratesDir) ? fs.readdirSync(cratesDir) : []) {
 if (crateTests.length < MIN_CRATE_TESTS) {
   problems.push(`only ${crateTests.length} crate test file(s) found (< ${MIN_CRATE_TESTS}); the glob is probably wrong`);
 }
+
+// 4b. `#[ignore]`d tests that live INSIDE a crate's `src/` — outside every rule above.
+//
+// The rules in this file enumerate `crates/*/tests/*.rs`, so a `#[ignore]` test written in a `src/`
+// module is invisible to the floor: nothing requires a CI step to run it, and nothing says so. That
+// was measured on 2026-10-07, when the TDengine backend's live test (which needs a container) landed
+// in `src/usage/backends/tdengine/mod.rs` and the guard stayed green with nothing running it.
+//
+// Making it a FAILURE would demand a service container for every such test, which is a real cost this
+// guard is not entitled to decide. Making it a NOTE is not decoration either: it is printed on every
+// run, so "this ignore test is not covered" cannot be an accident of nobody looking.
+const libIgnored = [];
+for (const crate of fs.existsSync(cratesDir) ? fs.readdirSync(cratesDir) : []) {
+  const srcDir = path.join(cratesDir, crate, "src");
+  const walk = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".rs")) {
+        const text = fs.readFileSync(full, "utf8");
+        if (text.split("\n").some((l) => /^\s*#\[.*\bignore\b/.test(l))) {
+          libIgnored.push(path.relative(ROOT, full).split(path.sep).join("/"));
+        }
+      }
+    }
+  };
+  walk(srcDir);
+}
+if (libIgnored.length) {
+  notes.push(
+    `${libIgnored.length} crate-internal test file(s) contain a real #[ignore] and are OUTSIDE every rule here: ` +
+      libIgnored.join(", ") +
+      " — no step is required to run them (they are noted, not judged: requiring a service container for them is a cost this guard does not decide)",
+  );
+}
 const cargoTestCmds = commands.filter((c) => /\bcargo test\b/.test(c));
 if (!cargoTestCmds.length) problems.push("ci.yml never runs `cargo test`");
 // Rules 3 and 4 are answered per COMMAND, not per step: selecting a crate and running a target with
