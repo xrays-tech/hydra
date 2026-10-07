@@ -551,9 +551,17 @@ def main():
             # caught this: the writer was B, and the node holding the seed's writes was A. A dump that
             # mislabels which database it read is worse than no dump: the fact it produced ("the row
             # is missing") has to be attributed to the right node to mean anything.
+            #
+            # The variable is `node_role`, NOT `role`: this file has a module-level helper called
+            # `role(...)`, and assigning to that name anywhere inside `main()` makes it a LOCAL for
+            # the whole function — so the normal path died with
+            # `UnboundLocalError: cannot access local variable 'role'` at its first `role(...)` call,
+            # ~60 lines later. Caught by CI, not locally, because the only local check of this block
+            # was the forced-failure path, which returns before reaching that call: a diagnostic's own
+            # path is not the drill's normal path, and both have to be run.
             for who, port in (("A", A_ADMIN), ("B", B_ADMIN)):
-                role = "writer" if leader_probe(port) == 200 else "follower"
-                print(f"--- what {who}'s admin API serves back (its own database; {role}) ---",
+                node_role = "writer" if leader_probe(port) == 200 else "follower"
+                print(f"--- what {who}'s admin API serves back (its own database; {node_role}) ---",
                       file=sys.stderr)
                 for path in ("providers", "provider-models", "provider-keys", "tenants",
                              "tenant-providers", "tenant-models"):
