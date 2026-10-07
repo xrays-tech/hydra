@@ -993,6 +993,26 @@ FAIL  gate 5: a real request still flows through the data plane on the survivor 
 
 **状态**：**已知、未修、未定性到根因**。已排除的假设（下一轮不必重推）：跨节点传播、物化不换快照、部分实体只写本地不发布、等待时间不够、ClickHouse 凭据（那是另一条，已修并已在 CI 验证）。**下一步的决定性观察**：第二次捕获若呈**同一形状**（确认过的写在**接收方自己的库里**缺失），即可定性为确定性缺陷；在那之前不给修法。
 
+**第四次捕获（2026-10-07，commit `c625af9` 的 rerun 第 1 次）＝ 第二个真样本，形状与第三次完全相同，且这次两节点的库都读到了**：
+
+```
+seed: 12 条写入全部 201（tenant-providers 三条：t1/t2/t3）
+A（follower，接收并发布了 12 次）: /tenant-providers = [tp-t2, tp-t3]   ← tp-t1 不在
+B（writer）                      : /tenant-providers = [tp-t2, tp-t3]   ← 与 A 完全一致地缺同一行
+两边 /tenant-models = 三条都在（含引用 t1 的 tm-t1）；publish {result="ok"} 12；物化 succeeded ×2；无 PUBLISH FAILED
+```
+
+**⇒ 确定性缺陷，且不是传播问题**：两个库**一致地**缺同一行，说明**被发布出去的那棵树本身就没有它**；`tp-t1` 是 12 条里第 7 条，其后 5 条（含同为"新种类"的 `tm-t1`）全部健在。
+
+**机制（高置信，三条代码事实串起来，能解释全部观测）**：
+1. `ArachneConfigStore::current_hash()`（`cluster/arachne_store.rs:235`）用 **`get_stale`** 读 head ⇒ **可能读到更旧的 head**（本地副本滞后）。
+2. 物化的判定只比较"读到的 head 与我已物化的哈希**是否相同**"，不同就物化（`cluster/arachne_materialize.rs:161-179`）⇒ **没有新旧概念**，因此**旧树也会被应用**，而应用是"**SQLite 先行 + 内存快照替换**"（`ReplicaTarget::apply` → `apply_snapshot`）。
+3. 发布是**从当前本地配置构建树**（`store.rs` 的 `replication()`）。
+
+三者合起来：一次写提交进库并发布成功后，物化在某一 tick 读到**更旧的 head** 并把本地库/内存**回退**到那棵树 ⇒ **这次（以及此后未被再次写入的）行被从库里抹掉**；此后每次发布都从已回退的库构建 ⇒ **缺失被永久固化到最终 head**，于是两个节点一致地缺同一行。这也解释了 `config_version` 注释里那句"the two numbers always agree and nothing reads a stale one"——**它正是被 `get_stale` 违反的那条不变量**，以及节点自身那条 `provider 'p1' … no api_keys`（构建出的配置缺了更早写入的行）。
+
+**因此 B 现在是良定义的**（三个候选修法，取一即可，但要先有确定性复现）：① 物化的 head 读改为**非陈旧**（一致性读）；② **应用单调化**：只应用比当前更"新"的树（hash 本身无序 ⇒ 需要 raft 日志索引或版本号承载序）；③ **发布不得基于落后于 head 的库**（发布与物化串行化，或直接发布刚物化的那棵树）。**第一步**（不依赖 CI）：写一个**确定性单测**——让 head 读返回一个更旧的树，断言今天的实现会回退（即把缺陷钉成可复现的红），再据此选①/②/③。
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
