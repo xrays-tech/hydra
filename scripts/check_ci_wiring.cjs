@@ -30,6 +30,18 @@
 "use strict";
 const fs = require("fs");
 const path = require("path");
+const { records, audit } = require("./recorded_exceptions.cjs");
+
+// `scripts/*.sh` that no artifact CI runs, recorded WITH A REASON (rule 1b). The list is REPLACED by
+// `CIW_NOT_EXECUTED_OK` when that is set, so a fixture tree never inherits these records.
+const NOT_EXECUTED_IN_CI_OK = records(process.env.CIW_NOT_EXECUTED_OK, [
+  [
+    "e2e-local.sh",
+    "CI's `ui-e2e` job runs this same suite with its own inline steps and a RELEASE binary; this " +
+      "script is the local/debug runner (it resolves `target/debug/hydra` itself) and the local " +
+      "gate executes it. The duplicated recipe is a real cost, recorded here rather than hidden.",
+  ],
+]);
 
 // The root is overridable so the checks themselves can be falsified against a
 // throwaway skeleton (see `check_ci_wiring.test.cjs`): a guard whose predicates
@@ -520,6 +532,15 @@ function invokedByAutomation(base) {
   return invokes(gateText, base);
 }
 /**
+ * Does **ci.yml** invoke this script? Deliberately narrower than {@link invokedByAutomation}, which
+ * also counts the local gate: rule 1b's records are about the CANONICAL runner, so a record must
+ * survive a developer machine (where the gate runs the script and the rule needs no record) exactly
+ * as it survives a runner (where there is no gate file and the rule would otherwise red).
+ */
+function invokedByCiYml(base) {
+  return commands.some((c) => invokes(stripInlineComment(c).replace(/['"]/g, " "), base));
+}
+/**
  * Comment stripping that knows the file type. A mention inside a COMMENT is not a call — and this
  * rule's first version proved how sharp that edge is: `scripts/e2e-local.sh` was reported as wired
  * because THIS FILE's own explanatory comment names it, so the guard documented its own hole as the
@@ -584,11 +605,38 @@ for (const f of shellScripts) {
   }
   orphanScripts.push(f);
 }
-for (const f of orphanScripts) {
+// RULE 1b's recorded exceptions, through the shared algebra (`recorded_exceptions.cjs`): a record is
+// a CLAIM WITH A REASON and it EXPIRES — the moment a wired artifact invokes the script, keeping the
+// record would be the stale claim the algebra exists to catch.
+//
+// WHY A RECORD IS NEEDED AT ALL (measured 2026-10-07, the first CI run ever to reach this rule):
+// the local gate executes `scripts/e2e-local.sh`, so on a developer machine the rule sees it wired
+// and says nothing. On a runner `.acceptance/round10-gate.sh` does not exist — it is gitignored and
+// has never been tracked — so ci.yml alone decides, and ci.yml does not call it. One tree, two
+// verdicts, one per machine. The record states the CI verdict instead of leaving it to whichever
+// files happen to be on the box.
+const orphanAudit = audit({
+  records: NOT_EXECUTED_IN_CI_OK,
+  needed: orphanScripts,
+  // Positive polarity ("keep this record"): it still describes the tree while **ci.yml** does not
+  // invoke the script. Judged against ci.yml alone, so hiding the local gate file (a runner) or
+  // having it (a developer) cannot flip the verdict for the same tree.
+  applies: (name) => !invokedByCiYml(name),
+});
+for (const f of orphanAudit.unrecorded) {
   problems.push(
     `scripts/${f} is executed by NOTHING — not by ci.yml, not by ` +
       `${path.relative(ROOT, GATE_SCRIPT)} — and no wired file calls it as a helper`,
   );
+}
+for (const f of orphanAudit.stale) {
+  problems.push(
+    `scripts/${f} is RECORDED as not-executed-in-CI, but ci.yml invokes it now — remove the record ` +
+      `(NOT_EXECUTED_IN_CI_OK) instead of leaving a claim that no longer applies`,
+  );
+}
+for (const f of orphanAudit.used) {
+  console.log(`note  scripts/${f} is not executed by CI, recorded on purpose: ${NOT_EXECUTED_IN_CI_OK.get(f)}`);
 }
 if (shellScripts.length < MIN_SHELL_SCRIPTS) {
   problems.push(

@@ -69,6 +69,11 @@ function run(root, env = {}) {
         CI_WIRING_MIN_INTEGRATION: "0",
         CI_WIRING_MIN_TOOLS: "0",
         CI_WIRING_MIN_SHELL_SCRIPTS: "0",
+        // Rule 1b's recorded exceptions describe the REAL repository (a script the local gate runs
+        // and CI does not). A skeleton must not inherit them: `{}` REPLACES the built-in list, so a
+        // fixture without that script never trips the staleness check for a file it does not
+        // contain — and the cases that judge the record itself pass their own value below.
+        CIW_NOT_EXECUTED_OK: "{}",
         ...env,
       },
     });
@@ -1548,6 +1553,40 @@ const BLOCK_WITH_DASH = (realCommand) => [
     "45: CONTROL — the same script invoked by the local gate passes",
     r45.status === 0 && !/orphan\.sh is executed by NOTHING/.test(r45.out),
     "status=" + r45.status + " out=" + r45.out.trim().slice(0, 300),
+  );
+
+  // 45b: RECORDED — a script CI does not run can be exempted on purpose, and the reason is printed
+  //      every run. This is the case the REAL tree needs: the local gate runs `e2e-local.sh` and a
+  //      runner has no gate file, so without a record the same tree is green on one machine and red
+  //      on the other (measured 2026-10-07, the first CI run to reach rule 1b).
+  const RECORD_SKELETON = { "orphan.sh": "#!/bin/sh\n" };
+  const r45b = run(skel(RECORD_SKELETON), {
+    CIW_NOT_EXECUTED_OK: JSON.stringify({ "orphan.sh": "local-only runner; CI inlines the same suite" }),
+  });
+  assert(
+    "45b: a RECORDED not-executed-in-CI script passes",
+    r45b.status === 0 && !/orphan\.sh is executed by NOTHING/.test(r45b.out),
+    "status=" + r45b.status + " out=" + r45b.out.trim().slice(0, 300),
+  );
+  assert(
+    "...and the record's reason is printed, so the exemption is visible rather than silent",
+    /note {2}scripts\/orphan\.sh is not executed by CI, recorded on purpose: local-only runner/.test(r45b.out),
+    r45b.out.trim().slice(0, 300),
+  );
+
+  // 45c: FALSIFY — once ci.yml invokes it, the record is STALE. A record that cannot expire is a
+  //      claim about the past wearing the present tense. (The ci below keeps `c.test.sh` wired the
+  //      way `skel` wires it, so this case isolates the record's staleness.)
+  const r45c = run(skel(RECORD_SKELETON, {
+    ci: baseCi().replace(
+      "bash scripts/d.test.sh",
+      "bash scripts/d.test.sh\n      - run: bash scripts/c.test.sh\n      - run: bash scripts/orphan.sh",
+    ),
+  }), { CIW_NOT_EXECUTED_OK: JSON.stringify({ "orphan.sh": "local-only runner; CI inlines the same suite" }) });
+  assert(
+    "45c: FALSIFY — a record for a script that ci.yml DOES run is reported as stale",
+    r45c.status === 1 && /orphan\.sh is RECORDED as not-executed-in-CI, but ci.yml invokes it now/.test(r45c.out),
+    "status=" + r45c.status + " out=" + r45c.out.trim().slice(0, 300),
   );
 
   // 46: CONTROL — a helper a WIRED script calls is exempt, and the exemption is reported.
