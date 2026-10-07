@@ -1,6 +1,6 @@
 # ADR-0002 — 用量后端：只进 ClickHouse，且由一张描述符表拥有"有哪些后端"
 
-- **Status**：`proposed`（设计已定稿、待裁定项见 §3 的 **D-1/D-2/D-3/D-9**；裁定后本行改为 `accepted` 并进入实施）
+- **Status**：`accepted`（**2026-10-07 用户裁定 D-1/D-2/D-3/D-9**，见 §3；实施从 Phase 1 开始）
 - **Date**：`2026-10-07`
 - **Deciders**：用户（三条强制定义）；实施者为执行方
 - **Source Evidence**：用户原话「1，用量只进 clickhouse，绝对不进sqlite，完全屏蔽掉进入sqlite这条路。2，既然使用了 sink 模式来引入 clickhouse，那么实际上还可以扩展出 TDEngine 之类的其它指标用数据库。3，既然如此，这里就要用标准的设计模式来隔离变化，并且给每一个可能的选项一个标准的插入模式。」＋ 本次会话对代码/文档/守卫的逐条直读（下表 C1–C6 均给出证据）
@@ -42,15 +42,49 @@
 
 | # | 决策 | 备选（真实存在的） | 状态 |
 |---|---|---|---|
-| **D-1** | `HYDRA_USAGE_SINK` **没有默认值**：未设 ⇒ 启动**拒绝**，错误体列出可接受值并要求显式选择。**成本已量**：27 个演练 + `ui-e2e` + 2 个脚本今天都没设它（C8）⇒ 必须同时给「演练环境的 sink 配置」一个**唯一所有者**（共享 helper），否则下次再加一个变量又要改 27 处 | ① 默认 `clickhouse`（那需要一个 URL，缺 URL 时拒启——等于把「没说」变成「猜 clickhouse」，且同样要改那 27 处）；② 默认 `none`（**零改动、零破坏**，但生产会静默不计量——与「丢计费数据必须响亮」的既有立场直接冲突，已否决）；③ 保留 `sqlite` 作默认（**违反强制定义 1，已否决**） | **待裁定**（推荐：无默认 + 拒启 + 共享 helper） |
-| **D-2** | 保留一个**显式**的 `none`：不写任何后端、`/usage` 回既有的 503 `usage_store_unavailable`，启动打 WARN 并导出"未启用"的可见信号 | ① 不保留 `none`——用量必须落库，本地/实验部署也得起一个 ClickHouse；② 用退役的 `sqlite` 顶这个位置（**直接违反强制定义 1，已否决**） | **待裁定**（推荐：保留 `none`，但绝不作为默认） |
-| **D-3** | SQLite 的 `usage_record` 表 **保留**：迁移文件不动（**checksum 强制，改一字即破坏所有既有库** —— C9），代码不再写不再读，`ops.md` 标注"退役但仍在"，删表须单独裁定 | ① 新增一条迁移 `DROP TABLE`（不可逆，且用户库里可能还有没导出的历史用量）；② 保留写入但禁止读取（**半屏蔽**，正是本次要消灭的形状） | **待裁定**（推荐：保留 + 标注；删表另案） |
+| **D-1** | `HYDRA_USAGE_SINK` **没有默认值**：未设 ⇒ 启动**拒绝**，错误体列出可接受值并要求显式选择。**成本已量**：27 个演练 + `ui-e2e` + 2 个脚本今天都没设它（C8）⇒ 必须同时给「演练环境的 sink 配置」一个**唯一所有者**（共享 helper），否则下次再加一个变量又要改 27 处 | ① 默认 `clickhouse`（那需要一个 URL，缺 URL 时拒启——等于把「没说」变成「猜 clickhouse」，且同样要改那 27 处）；② 默认 `none`（**零改动、零破坏**，但生产会静默不计量——与「丢计费数据必须响亮」的既有立场直接冲突，已否决）；③ 保留 `sqlite` 作默认（**违反强制定义 1，已否决**） | **已裁定：是**（无默认 + 未设即拒启 + T2.7 的共享 helper） |
+| **D-2** | 保留一个**显式**的 `none`：不写任何后端、`/usage` 回既有的 503 `usage_store_unavailable`，启动打 WARN 并导出"未启用"的可见信号 | ① 不保留 `none`——用量必须落库，本地/实验部署也得起一个 ClickHouse；② 用退役的 `sqlite` 顶这个位置（**直接违反强制定义 1，已否决**） | **已裁定：保留**（显式 `none`，绝不作为默认） |
+| **D-3** | **已裁定：删表，不保留** —— 新增一条迁移 `0013_drop_usage_record.sql` 把 SQLite 的 `usage_record` 表**删掉**（§3.1 给出完整设计：迁移是唯一的删法、顺序、升级前导出的强制步骤、回滚只有一条路）。备选（① 保留表标注退役：被否决；② 半屏蔽=保留写入禁止读取：直接否决） | **已裁定（用户）** |
 | **D-4** | 旧数据**不做自动迁移**：升级后 Hydra 不再读 SQLite 用量，`ops.md` 给一次性导出说明（`sqlite3` → CSV/CH `INSERT`），并写明"升级后 `GET /usage` 只回答 ClickHouse 里的量" | ① 启动时自动把 SQLite 用量灌进 CH（一次性、不可测、可能重复计数）；② 双读合并（两个窗口口径不同，会造出没人验证过的数字） | 采纳（推荐，需在 §8 文档同步中落地） |
 | **D-5** | 描述符 = **静态表 + 函数指针**（`&'static [UsageBackend]`，`open: fn(&BackendConfig) -> Result<Backend, BackendError>`） | ① `inventory`/`linkme` 自动注册（少一行注册，多一个依赖 + 隐式控制流，`grep` 不出"有哪些后端"）；② 继续用 `match`（就是 C1/C7 的病） | 采纳（推荐） |
 | **D-6** | 目录重排为 `src/usage/{mod,engine}.rs` + `src/usage/backends/<kind>/{mod,transport}.rs`；`sink.rs`/`usage_query.rs`/`clickhouse.rs` 的内容迁入 | ① 原地保留三个文件，只在其上加一层描述符（改动小，但"一个后端一个模块"的插入模式就只是口号） | 采纳（推荐；迁移由编译器逐个点名，约 60 处引用） |
 | **D-7** | 读契约与写契约**同源**：读能力由同一个描述符给出；`none` 用 `ReaderContract::Unavailable{why}` 显式声明，`why` 必须点名要设哪个变量 | ① 读侧继续允许"某个 kind 没实现"（现状，静默 503 的原因不可见） | 采纳（推荐） |
 | **D-8** | 测试替身放 `usage::testing`（内存 sink/reader），**不进 `REGISTRY`** ⇒ env 无法选中它 | ① 注册成 `memory`（生产可以"看起来配好了"却把用量丢进内存）；② 每个测试各写自己的假实现（重复实现，且一致性套件无法复用） | 采纳（推荐） |
-| **D-9** | 本轮**只落**"强制定义 + 描述符表 + 插入模式 + 候选矩阵"；**TDengine 的实现另开一案**（用它作为模式的第一个"新插入"来证伪模式） | ① 本轮就把 TDengine 实现掉（范围翻倍，且会在模式还没被审过时就被一个后端塑形） | **待裁定**（推荐：模式先行，TDengine 作为下一个独立任务） |
+| **D-9** | 本轮**只落**"强制定义 + 描述符表 + 插入模式 + 候选矩阵"；**TDengine 的实现另开一案**（用它作为模式的第一个"新插入"来证伪模式） | ① 本轮就把 TDengine 实现掉（范围翻倍，且会在模式还没被审过时就被一个后端塑形） | **已裁定：另开**（模式先行；TDengine 作为模式的首个新插入，独立任务） |
+
+### 3.1 D-3 的执行设计（**不可逆**，按 Data Destruction Guard 记账）
+
+```text
+Data Destruction Guard:
+- Target Class        : persistent-state（实时库里的表）
+- Exact Target(s)     : SQLite 文件里的表 `usage_record`（含索引 `idx_usage_record_created`、
+                        `idx_usage_record_tenant`、`idx_usage_record_sub_tenant`）——
+                        **只此一张**；ClickHouse 里同名的 `usage_record` 是另一个库，不动
+- Environment        : 每个节点的本地 SQLite（`HYDRA_DB_URL`）
+- Why Irreversible    : `DROP TABLE` 之后行数据只存在于**升级前的备份**里。sqlx 的版本表
+                        `_sqlx_migrations` 会把该迁移记为"已应用"，而 revert 代码会让它变成
+                        "已应用但文件不存在" ⇒ sqlx 报错（VersionMissing），**不是**自动回滚
+- Backup / Rollback Note: 见下面的"升级前"三步；回滚 = 用升级前的备份换回文件，或手工删掉
+                        `_sqlx_migrations` 里那一行再换回旧二进制（两条都写进 ops.md）
+- Allowed Read-Only Next Steps: 导出/统计该表现有行数、检查它是否为空（决定是否需要导出）
+- Blocked Destructive Steps    : 未经裁定的任何其他删表/改表动作（本 ADR 只授权这一张表）
+- Confirmation Required: **已获得**（2026-10-07 用户裁定「D-3：删表不保留」）
+- Status              : confirmed → 进入实施（T2.8）
+```
+
+**四条执行要求**（缺一条就不许动）：
+
+1. **删法**：**只能**新增 `crates/hydra-server/migrations/0013_drop_usage_record.sql`（`DROP TABLE IF EXISTS usage_record;`）。
+   **绝不能改既有迁移**（checksum 强制，C9）。CH 侧同名表由 `environment/clickhouse/init.sql` 管，属性完全不同，**不动**。
+2. **顺序**：迁移在启动时于 sink 构建**之前**执行 ⇒ 删表与"删掉 SQLite 读写代码"**必须同一次发布**。任何"先删表、后撤代码"或反之的组合都会造出一个写向不存在表的二进制。
+3. **升级前必须做的事**（写进 `ops.md`，且在发行说明里点名）：这是一条**破坏性迁移**。
+   ① 先备份整个 DB 文件（`sqlite3 hydra.db "VACUUM INTO 'usage-backup.db'"`，`ops.md` §backup 已有此步）；
+   ② 需要历史用量就先导出（`sqlite3 -header -csv hydra.db "SELECT * FROM usage_record" > usage.csv`）；
+   ③ 升级后 `usage_record` **在 SQLite 里不存在**，`GET /usage` 只回答 ClickHouse 的量。
+4. **计数与测试同步**：`tests/migrate.rs` 的 `EIGHT_BUSINESS_TABLES`（含 `usage_record`）与
+   `the_sub_tenant_usage_index_exists` 必须跟着改（前者变 7 张表 + 一条"该表**不存在**"的断言，
+   后者退役——索引随表一起消失）。这条断言正是"删表**真的发生了**"的可执行证据。
+
 
 ## 4. 插入模式（每个候选后端的标准接入方式）
 
@@ -129,7 +163,7 @@
 | 想让某个部署"不计量" | 设 `HYDRA_USAGE_SINK=none`（若 D-2 通过），纯配置、可随时切回 |
 | 想恢复 SQLite 用量 | revert 相关提交（`SqliteSink`/`SqliteUsageQuery`/表都还在仓库与库里）——**数据从未被删**（D-3 保留表） |
 | 想把 CH 换成别的库 | 按 §4 加一行 + 一个模块；**不动核心**（这正是本 ADR 要买的东西） |
-| 表被删掉 | 只有 D-3 另行裁定后才会发生；那是不可逆的持久状态操作 |
+| **表已被删（D-3 已裁定执行）** | 这是**单向**的：sqlx 的版本表会把 `0013` 记为已应用，revert 代码只会得到 `VersionMissing`。回滚 = ① 用升级前的备份换回 DB 文件，或 ② 手工删掉 `_sqlx_migrations` 里 `0013` 那一行再换回旧二进制（两条都写进 `ops.md`） |
 
 ## 10. 证据与验收（本方案的判据）
 
@@ -137,6 +171,8 @@
 2. **描述符表是唯一所有者**：`grep -rn "HYDRA_USAGE_SINK" crates/` 只命中 `usage/mod.rs`（描述符/校验）与测试；`main.rs` 不再出现任何具体后端的名字。
 3. **插入模式有效（本 ADR 的核心验收）**：第二个后端（TDengine）的接入**只新增**文件与一行注册，**不改动**任何既有后端的文件、不改 `main.rs`、不改引擎；具体判据写进实施计划的 Phase 4（触碰文件清单必须全部是新增 + 该后端的测试/文档）。
 4. **守卫**：`check_usage_backends.cjs` 在"有人加了后端但没登记 env/feature/文档"时变红（反向证伪：故意删一行登记 ⇒ 红）。
+5. **删表确实发生（D-3 的可执行证据）**：`tests/migrate.rs` 断言全新库**没有** `usage_record` 表、且既有库升级后它**消失**；真二进制对既有库跑一次，`sqlite3 hydra.db ".tables"` 里不再出现该表，而 CH 侧同名表仍在（`SHOW CREATE TABLE usage_record` 照旧）。
+
 5. **既有契约不退化**：`GET /usage` 在 `none` 下的 503 `usage_store_unavailable`、CH 不可达时的 503（不是零）、`hydra_usage_records_dropped_total{reason}` 四词词表、`clickhouse_ddl_parity.rs`、四个真进程演练全部保持绿。
 
 ---

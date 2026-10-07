@@ -97,6 +97,14 @@ pub mod clickhouse;
 #[cfg(feature = "proxy")]
 pub mod tenant_api;
 
+/// **Which usage backends exist** (ADR-0002): one descriptor per backend, one `open()` that returns
+/// the writer and the reader together. `main` no longer knows any backend by name.
+///
+/// Gated on `db`: a backend is opened against the node's own database (every node has one, ADR-0001
+/// D-2), and the reader trait lives here too.
+#[cfg(feature = "db")]
+pub mod usage;
+
 /// The usage read capability behind `GET /tenant/{id}/api/v1/usage`.
 ///
 /// A separate trait rather than a method on `UsageSink` (which is a

@@ -21,21 +21,21 @@
 
 - 不动 `GET /api/v1/stats/usage`（进程内 Prometheus 计数器，与持久化用量是**两个有意的答案**；ADR-0002 §1 C6）。
 - 不动 ClickHouse 的 `init.sql` / `usage_record` 列语义 / 去重设置（`non_replicated_deduplication_window`）与它们的守卫。
-- 不删 SQLite 的 `usage_record` 表（D-3：需单独裁定，属不可逆持久状态操作）。
+- ~~不删 SQLite 的 `usage_record` 表~~ → **已裁定删除（D-3）**：见 T2.8 与 ADR §3.1（含 Data Destruction Guard 记账与回滚说明）。
 - 不改任何迁移文件（`sqlx::migrate!` 是 checksum 强制的：**连注释都不能改**；`0001_init.sql:84` 那句「默认 SQLite Sink」将永久留错，ADR C9 已记账）。
 - 不做旧数据的自动迁移（D-4：给一次性导出说明）。
 - 不改 `hydra_usage_records_dropped_total{reason}` 的四词词表（`none` 会**新增**一个 `sink_disabled`，属追加而非改名）。
 
 ---
 
-## Phase 0 — 裁定门（不写产品代码）
+## Phase 0 — 裁定门（**已关闭，2026-10-07**）
 
 | 项 | 需要裁定 | 推荐 |
 |---|---|---|
-| D-1 | `HYDRA_USAGE_SINK` 无默认值 + 未设即拒启 | 是（**成本已知**：27 个演练 + `ui-e2e` + 2 个脚本今天都没设该变量 ⇒ 必须同时做 T2.7 的共享 helper） |
-| D-2 | 是否保留显式 `none` | 保留（绝不作为默认） |
-| D-3 | SQLite `usage_record` 表保留还是删 | 保留（删表另案，需确认） |
-| D-9 | TDengine 本轮实现还是另开 | 另开（模式先行） |
+| D-1 | `HYDRA_USAGE_SINK` 无默认值 + 未设即拒启 | **裁定：是**（**成本已知**：27 个演练 + `ui-e2e` + 2 个脚本今天都没设该变量 ⇒ 必须同时做 T2.7 的共享 helper） |
+| D-2 | 是否保留显式 `none` | **裁定：保留**（绝不作为默认） |
+| D-3 | SQLite `usage_record` 表保留还是删 | **裁定：删表，不保留** ⇒ 新增迁移 `0013_drop_usage_record.sql`（ADR §3.1 的执行设计 + Data Destruction Guard 记账）；**不可逆**，升级前导出/备份写进 `ops.md` |
+| D-9 | TDengine 本轮实现还是另开 | **裁定：另开**（模式先行） |
 
 ---
 
@@ -66,6 +66,7 @@
 | **T2.5** | `src/usage/testing.rs`：记录型 sink（收集批次）+ 定值 reader。**不进 `REGISTRY`** | `cfg` 断言：`REGISTRY` 里没有 `memory`/`testing` 这类 kind（守卫 + 单测各一条） |
 | **T2.6** | 删集群模式那条"必须 clickhouse"的特例校验（只剩一个后端时它是同义反复） | 演练：集群起得来（三个成员 + CH）；`grep` 该文案零命中 |
 | **T2.7** | **演练环境的唯一所有者**：新增 `integration/_usage_env.py`（`usage_env() -> dict` 给出 `HYDRA_USAGE_SINK` 与后端所需的 URL），把 **27 个**今天不设该变量的演练 + CI 的 `ui-e2e` 作业（`ci.yml:1162-1171`）+ `scripts/e2e-local.sh:113-118` + `scripts/handover.test.sh:39-45` 全部改为从它取 | 反向证伪：把 `usage_env()` 改成一个非法值 ⇒ 27 个演练同时红（说明它们**真的**在用它，而不是各自还留着一份内联值）；`grep -c HYDRA_USAGE_SINK integration/*.py` 只剩 helper 一处 |
+| **T2.8** | **删表的迁移（唯一删法）**：新增 `crates/hydra-server/migrations/0013_drop_usage_record.sql`（`DROP TABLE IF EXISTS usage_record;`）；同步 `tests/migrate.rs`（`EIGHT_BUSINESS_TABLES` 去掉该表并**新增一条"它不存在"的断言**；`the_sub_tenant_usage_index_exists` 退役）。**不得改既有迁移**（checksum） | 全新库 `.tables` 无该表；升级既有库后它消失；`migrate.rs` 逐条绿；**反向证伪**：把 `0013` 从列表里拿掉 ⇒ 断言变红（证明"删表真的发生"是被测的，不是被假设的） |
 
 ---
 
@@ -84,6 +85,7 @@
 | **T3.9** | `ci.yml:479` 的 `--test clickhouse_sink --test usage_query --ignored`：CH 套件若改名/拆分，必须同步（`check_ci_wiring.cjs:666-674` 是目前**唯一**保持它接线的东西） | 改名后 `check_ci_wiring` 仍绿（否则会静默脱线：live-CH 覆盖消失而 CI 全绿） |
 | **T3.10** | 三个演练的计量腿改靶（`test_streaming_path.py` S4、`test_shutdown_drain.py` N3、`test_client_disconnect.py` C0/C1）：存储从 SQLite 换成 mock CH（照 `test_clickhouse_sink_wire.py`） | 三条判据**语义**不动：流式也计量、排空不丢在飞批次、客户端断开仍计量且与完整回答不可区分；**并且** `test_streaming_path.py:212` 那句 `HYDRA_USAGE_SINK: "sqlite"` 必须消失（`grep` 零命中） |
 | **T3.11** | `check_compose_grace.cjs` 的**证据出处**重挂：结论（SIGKILL 会丢在飞用量 ⇒ drain 必须够长）保留，出处从"SQLite `usage_record` 0 行 vs 20 行"改到 CH 侧演练（丢弃计数 + mock CH 行数） | 该守卫的注释与记录里不再引用一个**已无人测**的数字；新出处指向的断言**确实存在**（逐条点名） |
+| **T3.12** | `ops.md` 的**破坏性升级**流程：升级前备份 + 导出 `usage_record`（`VACUUM INTO` / `-csv` 两条命令）+ 升级后"该表已不存在、`/usage` 只答 ClickHouse"；**回滚只有两条路**（换回备份文件 / 手工删掉 `_sqlx_migrations` 里的 `0013` 行）；发行说明点名这是破坏性迁移 | 文档命令**可执行**（真跑一次导出）；回滚两条路各实际操作一次并记下结果 |
 
 ---
 

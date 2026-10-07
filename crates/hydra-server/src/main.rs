@@ -52,7 +52,6 @@ use hydra_server::proxy::breaker_wrap::{spawn_probe_task, CircuitBreaker};
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::{spawn_gc_task, RateLimiter};
 use hydra_server::proxy::{AppState, HydraProxy};
-use hydra_server::sink::build_sink;
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -554,11 +553,18 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let auth = Arc::new(HttpAuthChecker::new(auth_cache, auth_config)?);
     info!("auth checker initialised");
 
-    // (2d) Usage sink.
-    let ch_url = std::env::var("HYDRA_CLICKHOUSE_URL").ok();
-    let sink = build_sink(&sink_kind, pool.clone(), ch_url.as_deref())?;
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::from(sink);
-    info!(kind = %sink_kind, "usage sink built");
+    // (2d) The usage backend — ONE call for both halves (ADR-0002).
+    //
+    // The registry owns "which backends exist", what each one requires and whether it can read back
+    // what it writes; `open` refuses an unknown kind, a kind this binary cannot serve, and a missing
+    // variable, each with a message naming what to do. The reader used to be selected by a SECOND
+    // `match` over the same kind, kept in step with the writer's by a comment.
+    let usage_backend: hydra_server::usage::Backend = hydra_server::usage::open(
+        &sink_kind,
+        &hydra_server::usage::BackendConfig::new(pool.clone()),
+    )?;
+    let sink = usage_backend.sink.clone();
+    info!(kind = %sink_kind, notes = usage_backend.describe(), "usage backend open");
 
     // (2e) Build shared app state. In cluster mode the breaker announces its
     // local trips to the cluster (shared votes) and converges on the
@@ -714,12 +720,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // stream exists (see the note there), so keep a handle for the flush hook and
     // for the usage reader that both need it before then.
     let sink_for_flush = sink.clone();
-    let sink_kind_for_api = sink_kind.clone();
-    let pool_for_api = pool.clone();
-    // Same value the SINK was built from: one parse of `HYDRA_CLICKHOUSE_URL`,
-    // used by both the writer and the reader, so they cannot disagree about
-    // which store they are talking to.
-    let ch_url_for_api = ch_url.clone();
 
     // (2e-bis) Flush usage on SIGTERM/SIGINT.
     //
@@ -886,18 +886,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         tenant_api_cfg.live_nodes = Some(view);
     }
 
-    let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
-        match hydra_server::usage_query::select(
-            &sink_kind_for_api,
-            &pool_for_api,
-            ch_url_for_api.as_deref(),
-        ) {
-            Ok(q) => Some(q),
-            Err(e) => {
-                warn!(kind = %sink_kind_for_api, error = ?e, "no usage reader for this sink kind; GET /usage will report 503");
-                None
-            }
-        };
+    // The reader came from the SAME `open` call as the writer: a backend either reads back what it
+    // writes, or it declared why it cannot (`usage::ReaderContract`), and the registry refuses a
+    // descriptor whose declaration and behaviour disagree. `None` here is the documented
+    // `503 usage_store_unavailable` in the tenant handler, not an accident.
+    let usage = usage_backend.query.clone();
 
     let state = Arc::new(AppState {
         store: store.clone(),

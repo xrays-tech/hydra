@@ -112,17 +112,10 @@ impl std::fmt::Display for UsageQueryError {
     }
 }
 
-/// Why a sink kind could not be turned into a reader.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SelectError {
-    /// The kind is not `sqlite` or `clickhouse` — or it IS `clickhouse` in a
-    /// build without the `usage-clickhouse` feature, where the kind cannot occur
-    /// at all because `sink::build_sink` refuses it at startup. Reporting the
-    /// kind as unknown keeps the two guards from drifting apart.
-    UnknownKind(String),
-    /// `clickhouse` without a URL.
-    MissingUrl,
-}
+// `SelectError` stood here until 2026-10-07: "unknown kind" and "no URL" were the read side's own
+// error vocabulary, separate from the write side's. Both are now one type
+// (`crate::usage::BackendError`) produced by one place (`crate::usage::open`), which is what makes
+// "the writer was registered but the reader was forgotten" unrepresentable (ADR-0002).
 
 /// Read-only aggregate access to the metering store.
 ///
@@ -333,7 +326,8 @@ fn ch_group_expr(g: GroupBy) -> Option<&'static str> {
 impl ClickHouseUsageQuery {
     /// Built from the configured URL. Parsing stays in
     /// [`crate::clickhouse`], the one owner of what a ClickHouse URL means.
-    fn new(url: &str) -> Self {
+    #[must_use]
+    pub(crate) fn new(url: &str) -> Self {
         let mut cfg = crate::clickhouse::parse_clickhouse_url(url);
         // The reader has its own deadline (`HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS`),
         // independent of the writer's: a tenant waiting on a slow query must not
@@ -421,39 +415,9 @@ impl UsageQuery for ClickHouseUsageQuery {
     }
 }
 
-/// Choose the reader for a configured sink kind.
-///
-/// This is a **library function, not a `main.rs` branch**, so the choice that
-/// guards against the "report zero usage" failure is directly testable — the
-/// injection point lives in the binary and no integration test can reach it.
-///
-/// The signature is the same with and without `usage-clickhouse`; only the arm
-/// is gated. The pool is REQUIRED (it was an `Option` until 2026-10-05, whose
-/// `None` was the retired pool-less node — `SelectError::MissingPool` guarded a
-/// caller no deployment could produce); the `clickhouse` arm ignores it, exactly
-/// as `sink::build_sink` does. Passing the ClickHouse **URL** rather than a parsed config keeps
-/// this signature free of a `usage-clickhouse`-gated type (and of the
-/// `pub(crate)` visibility of that type), and leaves `clickhouse` the single
-/// owner of how a URL becomes a transport: this function never parses one.
-// Without `usage-clickhouse` there is no arm that reads the URL, but the
-// parameter stays in the signature: one call shape for `main` and for the tests,
-// in both feature combinations.
-#[cfg_attr(not(feature = "usage-clickhouse"), allow(unused_variables))]
-pub fn select(
-    sink_kind: &str,
-    pool: &SqlitePool,
-    ch_url: Option<&str>,
-) -> Result<std::sync::Arc<dyn UsageQuery>, SelectError> {
-    match sink_kind {
-        "sqlite" => Ok(std::sync::Arc::new(SqliteUsageQuery::new(pool.clone()))),
-        #[cfg(feature = "usage-clickhouse")]
-        "clickhouse" => {
-            let url = ch_url.ok_or(SelectError::MissingUrl)?;
-            Ok(std::sync::Arc::new(ClickHouseUsageQuery::new(url)))
-        }
-        other => Err(SelectError::UnknownKind(other.to_string())),
-    }
-}
+// `select(kind, pool, ch_url)` stood here until 2026-10-07 — the read half of two parallel matches,
+// kept in step with the write half by a comment. `crate::usage::open` now returns the writer and the
+// reader from one descriptor (ADR-0002 §2).
 
 /// Grouping is a whitelist; this keeps the response's own label consistent with
 /// the rows it contains.

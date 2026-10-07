@@ -847,44 +847,14 @@ fn json_opt_u64_into(out: &mut String, v: Option<u64>) {
 }
 
 // ===========================================================================
-// Config-driven selection (design §9.3)
+// Batching defaults (shared by every backend, design §9.2)
 // ===========================================================================
 
-/// Errors returned by [`build_sink`] when the requested configuration is
-/// unsatisfiable. Surfaced as a typed `Result` (never a panic) so startup code
-/// can report config problems cleanly.
-#[derive(Debug, thiserror::Error)]
-pub enum BuildSinkError {
-    /// `cfg_kind` did not match `"sqlite"` or `"clickhouse"`.
-    #[error("unknown sink kind '{kind}'")]
-    UnknownKind { kind: String },
-    /// `"clickhouse"` was requested but no URL was supplied.
-    #[error("sink kind 'clickhouse' requires a url")]
-    MissingClickHouseUrl,
-    /// `"clickhouse"` was requested but the `usage-clickhouse` cargo feature is
-    /// not enabled.
-    #[error("sink kind 'clickhouse' requires the 'usage-clickhouse' cargo feature")]
-    ClickHouseFeatureDisabled,
-    /// `"clickhouse"` was requested with an `https://` URL, which this transport
-    /// cannot serve (there is no TLS path).
-    ///
-    /// Refused at STARTUP rather than at the first write: the alternative is a
-    /// node that boots, serves traffic, and only then fails every usage flush —
-    /// and the credentials never leave either way, so failing early is strictly
-    /// better than failing late.
-    #[error(
-        "HYDRA_CLICKHOUSE_URL uses https:// but this build has no TLS transport for \
-         ClickHouse; refusing to start rather than send credentials and usage rows in \
-         PLAINTEXT — use http:// on a private network or through a tunnel, or terminate \
-         TLS in front of the database"
-    )]
-    ClickHouseTlsUnsupported,
-}
+/// Records buffered before a flush is forced (whichever comes first with the interval below).
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 256;
+/// Seconds between time-driven flushes when a batch never fills.
+pub(crate) const DEFAULT_FLUSH_SECS: u64 = 5;
 
-/// Default batch size for sinks constructed via [`build_sink`].
-const DEFAULT_BATCH_SIZE: usize = 256;
-/// Default flush interval (seconds) for sinks constructed via [`build_sink`].
-const DEFAULT_FLUSH_SECS: u64 = 5;
 /// Maximum time [`SqliteSink`] / [`ClickHouseSink`] `Drop` will wait for the
 /// background task to finish its final flush. Bounds graceful shutdown so a
 /// permanently-broken backend cannot hang shutdown indefinitely; if the wait
@@ -892,58 +862,11 @@ const DEFAULT_FLUSH_SECS: u64 = 5;
 /// recovers, and is aborted when the runtime shuts down).
 const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
-/// Select a [`UsageSink`] implementation from a configuration kind.
-///
-/// Returns a [`Result`] so invalid configuration is a handled startup error
-/// rather than a panic (validates external input per AGENTS.md; the sketch in
-/// the design doc returned `Box<dyn UsageSink>` directly, but a missing `url`
-/// cannot be recovered from without inventing a no-op placeholder sink, which
-/// 铁律 2 forbids — hence the typed error).
-///
-/// `pool` is REQUIRED since 2026-10-05, and it is the ClickHouse arm that ignores
-/// it: the parameter used to be an `Option` whose `None` was the retired
-/// pool-less node, so `BuildSinkError::MissingPool` existed for a caller no
-/// deployment could produce. A caller selecting `sqlite` always has the pool it
-/// was serving from; a caller selecting `clickhouse` passes the same one and that
-/// arm simply does not read it.
-#[cfg(feature = "db")]
-pub fn build_sink(
-    cfg_kind: &str,
-    pool: SqlitePool,
-    ch_url: Option<&str>,
-) -> Result<Box<dyn UsageSink>, BuildSinkError> {
-    match cfg_kind {
-        "sqlite" => Ok(Box::new(SqliteSink::new(
-            pool,
-            DEFAULT_BATCH_SIZE,
-            DEFAULT_FLUSH_SECS,
-        ))),
-        "clickhouse" => {
-            #[cfg(feature = "usage-clickhouse")]
-            {
-                let url = ch_url.ok_or(BuildSinkError::MissingClickHouseUrl)?;
-                // See `ClickHouseConfig::tls_requested`: the scheme used to be
-                // stripped and the connection made in the clear.
-                if url.trim().starts_with("https://") {
-                    return Err(BuildSinkError::ClickHouseTlsUnsupported);
-                }
-                Ok(Box::new(ClickHouseSink::new(
-                    url,
-                    DEFAULT_BATCH_SIZE,
-                    DEFAULT_FLUSH_SECS,
-                )))
-            }
-            #[cfg(not(feature = "usage-clickhouse"))]
-            {
-                let _ = ch_url;
-                Err(BuildSinkError::ClickHouseFeatureDisabled)
-            }
-        }
-        other => Err(BuildSinkError::UnknownKind {
-            kind: other.to_string(),
-        }),
-    }
-}
+// `build_sink` / `BuildSinkError` stood here until 2026-10-07. Selection is now owned by
+// `crate::usage::REGISTRY` (ADR-0002): one descriptor per backend, one `open()` that returns the
+// writer AND the reader, so the write side and the read side cannot drift apart (the previous two
+// parallel `match`es were kept consistent by a comment saying they had to be). The two defaults
+// above are still the single owner of "how big a batch is and how often it flushes".
 
 // ===========================================================================
 // Audit §3.9 — the batching engine must never stop draining its channel, and
@@ -1116,36 +1039,10 @@ mod audit_3_9_tests {
     /// `tx.send` concurrently during a retry — recorded in the plan as batch 6,
     /// not claimed here. An earlier version of this comment promised a
     /// falsification this test is unable to perform.
-    /// An `https://` ClickHouse URL is refused when the SINK IS BUILT, i.e. at
-    /// startup, not on the first flush. `send` refuses it too (see the clickhouse
-    /// module test), so the credential can never leave; this asserts the failure
-    /// is EARLY and loud.
-    #[cfg(feature = "usage-clickhouse")]
-    #[tokio::test]
-    async fn an_https_clickhouse_url_fails_at_build_time() {
-        // The pool is required and unread by this arm; these tests are about the URL scheme.
-        let pool = crate::db::test_pool().await;
-        let err = build_sink(
-            "clickhouse",
-            pool.clone(),
-            Some("https://user:pass@ch.example.com:8443"),
-        )
-        .err()
-        .expect("https:// must be refused before any traffic is served");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("https://") && msg.contains("PLAINTEXT"),
-            "the refusal must be actionable, got: {msg}"
-        );
-
-        // The plaintext form still builds (this is a scheme check, not a ban).
-        let ok = build_sink("clickhouse", pool, Some("http://127.0.0.1:8123"));
-        assert!(
-            ok.is_ok(),
-            "a plain http:// URL must keep working: {:?}",
-            ok.err().map(|e| e.to_string())
-        );
-    }
+    // The `https://` refusal test moved to `crate::usage::backends::clickhouse`'s descriptor: the
+    // rule belongs to the backend (it knows its transport has no TLS path), and it is now the
+    // descriptor's `open` that enforces it. Leaving a copy here would test a function that no longer
+    // exists — see `crate::usage::tests::an_https_clickhouse_url_is_refused_at_open`.
 
     #[tokio::test]
     async fn every_retry_sends_the_identical_batch_in_the_same_order() {

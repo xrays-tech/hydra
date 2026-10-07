@@ -31,7 +31,34 @@ use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::sink::UsageSink;
 use hydra_server::store::ConfigStore;
 use hydra_server::tenant_api::TenantApiConfig;
-use hydra_server::usage_query::{select, SqliteUsageQuery, UsageQuery};
+use hydra_server::usage::{self, EnvView};
+use hydra_server::usage_query::{SqliteUsageQuery, UsageQuery};
+
+/// The ONE selection path these tests exercise: `usage::open` — the same call `main` makes — then
+/// take its READER. There is no second switch for a test to disagree with production about
+/// (ADR-0002).
+///
+/// `ch_url` is injected as a FIXED environment rather than by mutating the process one: the registry
+/// replaces (never merges with) the process environment, so "this variable is unset" is testable on
+/// a machine that happens to have it set.
+fn reader(kind: &str, pool: &sqlx::SqlitePool, ch_url: Option<&str>) -> Arc<dyn UsageQuery> {
+    match open_backend(kind, pool, ch_url) {
+        Ok(b) => b.query.expect("this backend reads"),
+        Err(e) => panic!("{kind} must open: {e}"),
+    }
+}
+
+fn open_backend(
+    kind: &str,
+    pool: &sqlx::SqlitePool,
+    ch_url: Option<&str>,
+) -> Result<usage::Backend, usage::BackendError> {
+    let env = match ch_url {
+        Some(url) => EnvView::fixed(&[("HYDRA_CLICKHOUSE_URL", url)]),
+        None => EnvView::fixed(&[]),
+    };
+    usage::open(kind, &usage::BackendConfig::new(pool.clone()).with_env(env))
+}
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use serde_json::Value;
@@ -215,7 +242,7 @@ async fn usage_url(pool: &sqlx::SqlitePool) -> (String, reqwest::Client) {
 #[tokio::test]
 async fn select_sqlite_returns_the_sqlite_reader() {
     let pool = common::setup_pool().await;
-    let q = select("sqlite", &pool, None).expect("sqlite is selectable");
+    let q = reader("sqlite", &pool, None);
     assert_eq!(q.source(), "sqlite");
 }
 
@@ -227,8 +254,8 @@ async fn select_sqlite_returns_the_sqlite_reader() {
 #[tokio::test]
 async fn select_an_unknown_kind_is_an_error() {
     let pool = common::setup_pool().await;
-    assert!(select("nonsense", &pool, None).is_err());
-    assert!(select("", &pool, None).is_err());
+    assert!(open_backend("nonsense", &pool, None).is_err());
+    assert!(open_backend("", &pool, None).is_err());
 }
 
 /// With `usage-clickhouse` the kind is selectable and reports its own source.
@@ -238,8 +265,7 @@ async fn select_clickhouse_returns_the_clickhouse_reader() {
     // The pool is passed and ignored by this arm (see `select`): the node still HAS one — its
     // config lives there — and only its USAGE goes to ClickHouse.
     let pool = common::setup_pool().await;
-    let q = select("clickhouse", &pool, Some("http://127.0.0.1:8123"))
-        .expect("clickhouse is selectable with the feature");
+    let q = reader("clickhouse", &pool, Some("http://127.0.0.1:8123"));
     assert_eq!(q.source(), "clickhouse");
 }
 
@@ -249,19 +275,27 @@ async fn select_clickhouse_returns_the_clickhouse_reader() {
 #[tokio::test]
 async fn select_clickhouse_without_a_url_is_an_error() {
     let pool = common::setup_pool().await;
-    assert!(select("clickhouse", &pool, None).is_err());
+    assert!(open_backend("clickhouse", &pool, None).is_err());
 }
 
-/// Without the feature, `build_sink` already refuses `HYDRA_USAGE_SINK=clickhouse`
-/// at startup, so the kind must not be selectable here either — asserting that
-/// keeps the two guards from drifting apart.
+/// Without the feature, the backend cannot be opened at all — and the refusal names the feature to
+/// build with, so an operator is not left thinking the KIND is wrong (ADR-0002: the kind is known,
+/// the binary is not capable).
+///
+/// This leg used to exist because the write side and the read side were two separate `matches` that
+/// had to agree about the feature; there is now one descriptor, so the assertion is about the one
+/// place that decides.
 #[cfg(not(feature = "usage-clickhouse"))]
 #[tokio::test]
-async fn select_clickhouse_cannot_be_chosen_without_the_feature() {
+async fn clickhouse_cannot_be_opened_without_the_feature() {
     let pool = common::setup_pool().await;
+    let err = open_backend("clickhouse", &pool, Some("http://127.0.0.1:8123"))
+        .expect_err("a build without usage-clickhouse cannot serve this kind");
+    let msg = err.to_string();
+    assert!(msg.contains("usage-clickhouse"), "got: {msg}");
     assert!(
-        select("clickhouse", &pool, Some("http://127.0.0.1:8123")).is_err(),
-        "a build without usage-clickhouse must not hand out a ClickHouse reader"
+        msg.contains("--features usage-clickhouse"),
+        "the refusal must say how to fix the build, got: {msg}"
     );
 }
 
@@ -352,7 +386,7 @@ async fn sqlite_aggregate_matches_hand_written_sql() {
     )
     .await;
 
-    let q = select("sqlite", &pool, None).expect("select");
+    let q = reader("sqlite", &pool, None);
     let agg = q
         .aggregate(
             T,
@@ -435,7 +469,7 @@ async fn sqlite_group_by_model_matches_hand_written_sql() {
     )
     .await;
 
-    let q = select("sqlite", &pool, None).expect("select");
+    let q = reader("sqlite", &pool, None);
     let agg = q
         .aggregate(
             T,
@@ -570,7 +604,7 @@ async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
     )
     .await;
 
-    let q = select("sqlite", &pool, None).expect("select");
+    let q = reader("sqlite", &pool, None);
     let agg = q
         .aggregate(
             T,
@@ -596,7 +630,7 @@ async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
 async fn sqlite_empty_window_is_a_real_zero_with_no_as_of() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    let q = select("sqlite", &pool, None).expect("select");
+    let q = reader("sqlite", &pool, None);
     let agg = q
         .aggregate(
             T,
@@ -965,7 +999,7 @@ async fn fake_clickhouse_sequence(bodies: Vec<String>) -> (String, wiremock::Moc
 /// differs from the default.
 #[cfg(feature = "usage-clickhouse")]
 async fn build_ch_state(pool: &sqlx::SqlitePool, ch_url: &str) -> Arc<AppState> {
-    let usage = select("clickhouse", pool, Some(ch_url)).expect("clickhouse readable");
+    let usage = reader("clickhouse", pool, Some(ch_url));
     build_state(pool, TenantApiConfig::default(), Some(usage)).await
 }
 
@@ -1279,14 +1313,13 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
     // A tenant id built to break out of a string literal, plus a `&` that would
     // truncate the query string if the value were not encoded.
     let evil = "t1' OR 1=1 --&x=1";
-    // The pool is required but ignored by this arm: a node whose usage lives in ClickHouse still
-    // keeps its CONFIG in its own SQLite database.
-    let reader = select(
+    // A node whose usage lives in ClickHouse still keeps its CONFIG in its own SQLite database, so
+    // the backend is opened against a real (empty) pool.
+    let reader = reader(
         "clickhouse",
         &common::setup_pool().await,
         Some(&server.uri()),
-    )
-    .expect("select");
+    );
     let agg = reader
         .aggregate(
             evil,
@@ -1354,8 +1387,8 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
     );
     let (url, server) =
         fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), grouped.to_string()]).await;
-    let reader = select("clickhouse", &common::setup_pool().await, Some(&url)).expect("select");
-    let agg = reader
+    let ch_reader = reader("clickhouse", &common::setup_pool().await, Some(&url));
+    let agg = ch_reader
         .aggregate(
             "local",
             since,
@@ -1395,8 +1428,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
     );
     let (null_url, _null_server) =
         fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), null_key.to_string()]).await;
-    let null_reader =
-        select("clickhouse", &common::setup_pool().await, Some(&null_url)).expect("select");
+    let null_reader = reader("clickhouse", &common::setup_pool().await, Some(&null_url));
     let err = null_reader
         .aggregate(
             "local",
@@ -1432,8 +1464,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
     let tenant = std::env::var("CH_TENANT").unwrap_or_else(|_| "local".to_string());
 
     // The reader, exactly as `main` would inject it.
-    let reader = select("clickhouse", &common::setup_pool().await, Some(&ch))
-        .expect("live CH is selectable");
+    let reader = reader("clickhouse", &common::setup_pool().await, Some(&ch));
     let agg = reader
         .aggregate(
             &tenant,
