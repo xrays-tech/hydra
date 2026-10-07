@@ -521,8 +521,23 @@ def main():
             return 2
         seed()
         # Both members must serve the seeded config before anything is measured.
+        #
+        # The failure path reports EVIDENCE, not only a verdict. Measured 2026-10-07: this drill
+        # passes locally (also against a Redis shaped exactly like CI's: `redis:7-alpine --save ""
+        # --appendonly no --databases 64` on 6379) and timed out on a runner — and all it said was "a
+        # member never routed the tenant", with the seed's own responses discarded (they had
+        # SUCCEEDED, or `seed()` would have raised) and neither node's log printed. A CANNOT VERIFY
+        # that hides every observable turns the next investigation into a guess, so each member's
+        # answer and both log tails are printed here.
         if not wait_for(lambda: all(proxied(p, "count.local", "sk-t1")[0] == 200
                                     for p in (A_DATA, B_DATA)), budget=30):
+            for p in (A_DATA, B_DATA):
+                st, _headers, body, took = proxied(p, "count.local", "sk-t1")
+                print(f"--- data plane :{p} -> HTTP {st} after {took:.2f}s :: {body[:300]}",
+                      file=sys.stderr)
+            for label in ("cl-a", "cl-b"):
+                log = open(os.path.join(DIR, f"{label}.log"), errors="replace").read()
+                print(f"--- {label}.log (last 1200) ---\n{log[-1200:]}", file=sys.stderr)
             print("[cluster-limits] CANNOT VERIFY: a member never routed the tenant",
                   file=sys.stderr)
             return 2
