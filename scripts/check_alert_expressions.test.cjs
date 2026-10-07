@@ -97,15 +97,57 @@ function run({ expression, extraRows = 0, min = 1, labelMin = 0, registration = 
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cae-empty-"));
   fs.writeFileSync(path.join(dir, "ops.md"), "# Fixture with no alert table\n");
+  // `CAE_SRC` MUST point at a fixture this case owns, never at `os.tmpdir()`. Pointing a scanner at
+  // the whole temp directory hands its verdict to whatever else is on the machine: measured in CI
+  // on 2026-10-07 (the first run that reached this step), the runner's temp dir held an entry the
+  // process could not read, `walk()` threw, node exited 1, and this assertion — whose whole point
+  // is "2, never 0" — failed with `status=1` while passing on every developer machine.
+  const src = path.join(dir, "src");
+  fs.mkdirSync(src, { recursive: true });
+  fs.writeFileSync(path.join(src, "metrics.rs"), 'register_int_counter!("hydra_fixture_gauge", "h");\n');
   try {
     execFileSync("node", [SCRIPT], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, CAE_OPS: path.join(dir, "ops.md"), CAE_SRC: os.tmpdir(), CAE_MIN_REFS: "1" },
+      env: { ...process.env, CAE_OPS: path.join(dir, "ops.md"), CAE_SRC: src, CAE_MIN_REFS: "1" },
     });
     assert("a missing §9.1 table exits non-zero (2), never 0", false, "it exited 0");
   } catch (e) {
     assert("a missing §9.1 table exits non-zero (2), never 0", e.status === 2, `status=${e.status}`);
+    assert(
+      "...and says which document it could not find the table in",
+      /cannot find the `### 9\.1 Alerting` table in /.test((e.stdout ?? "") + (e.stderr ?? "")),
+      ((e.stdout ?? "") + (e.stderr ?? "")).trim().slice(0, 160),
+    );
+  }
+}
+{
+  // An UNREADABLE source tree is CANNOT VERIFY (2), not a crash. `node` exits 1 on an uncaught
+  // exception and 1 is this script's "violations found" verdict, so a checker that dies on an
+  // inaccessible directory reports a real problem in the alert document that does not exist.
+  // A regular FILE as `CAE_SRC` reproduces that deterministically on every platform (`readdir`
+  // on a file is ENOTDIR — no chmod, and no dependence on running as root or not).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cae-unreadable-"));
+  const src = path.join(dir, "not-a-directory.rs");
+  fs.writeFileSync(src, 'register_int_counter!("hydra_fixture_gauge", "h");\n');
+  // The document must be READABLE, or the case would red on "cannot read <ops.md>" instead — the
+  // source-tree failure is the one under test.
+  fs.writeFileSync(path.join(dir, "ops.md"), "# Fixture\n\n### 9.1 Alerting\n\n| A | `hydra_fixture_gauge > 0` | m |\n\n## 10 Next\n");
+  try {
+    execFileSync("node", [SCRIPT], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CAE_OPS: path.join(dir, "ops.md"), CAE_SRC: src, CAE_MIN_REFS: "1" },
+    });
+    assert("an unreadable source tree is CANNOT VERIFY (2), not a crash (1)", false, "it exited 0");
+  } catch (e) {
+    const out = (e.stdout ?? "") + (e.stderr ?? "");
+    assert("an unreadable source tree is CANNOT VERIFY (2), not a crash (1)", e.status === 2, `status=${e.status}`);
+    assert(
+      "...and names the path it could not read",
+      /cannot read the source tree/.test(out) && /not-a-directory\.rs/.test(out),
+      out.trim().slice(0, 200),
+    );
   }
 }
 

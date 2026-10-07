@@ -109,10 +109,28 @@ function main() {
     console.error(`cannot read ${OPS}: ${e.message}`);
     process.exit(2);
   }
+  const unreadable = [];
   const files = SRC_DIRS.flatMap((d) => {
     const full = path.isAbsolute(d) ? d : path.join(ROOT, d);
-    return fs.existsSync(full) ? walk(full) : [];
+    if (!fs.existsSync(full)) return [];
+    // A tree the checker cannot READ is CANNOT VERIFY (2), never a crash. `walk()` used to throw
+    // straight out of `main()`: node exits 1 on an uncaught exception, and 1 is this script's
+    // "violations found" verdict — so an unreadable directory would have been reported as a real
+    // alert-document problem. Measured in CI (2026-10-07, the first run that reached this step):
+    // the test suite pointed `CAE_SRC` at the whole `os.tmpdir()`, whose entries are not the
+    // test's to control, hit one it could not read, and the suite saw `status=1` where the
+    // asserted contract is 2.
+    try {
+      return walk(full);
+    } catch (e) {
+      unreadable.push(`${full}: ${e.code ?? e.message}`);
+      return [];
+    }
   });
+  if (unreadable.length > 0) {
+    console.error(`cannot read the source tree — nothing could be checked:\n  ${unreadable.join("\n  ")}`);
+    process.exit(2);
+  }
   if (files.length === 0) {
     console.error("no source files found — nothing could be checked");
     process.exit(2);
