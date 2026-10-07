@@ -134,11 +134,27 @@ class LoaderShapeTests(unittest.TestCase):
         for e in self.endpoints:
             self.assertEqual(set(e), {"method", "path", "body", "auth", "resp", "errors"}, e.get("path"))
 
-    def test_token_free_and_cluster_endpoints_are_visible(self):
+    def test_token_free_and_retired_cluster_endpoints_are_visible(self):
         auths = {str(e["auth"]) for e in self.endpoints}
         self.assertIn("False", auths)   # /healthz/leader
-        self.assertIn("cluster", auths)  # the internal control plane
         self.assertIn("True", auths)
+        self.assertIn("admin", auths)
+        # The `cluster` auth class is RETIRED (ADR-0001 T3.5/T4.1 deleted the `/api/v1/internal/*`
+        # family, and 2026-10-05 deleted the shared cluster token with it), and the PROBE ITSELF
+        # reports any endpoint still declaring that class as a violation — so the old assertion
+        # (`assertIn("cluster", …)`) demanded exactly what the probe exists to catch, in the same
+        # suite. What this test is FOR is "the loader sees every auth shape"; the shipped
+        # reference now proves that with `False` / `True` / `admin`, and the TOMBSTONE row for the
+        # deleted route must stay present — that is the other half of the loader's job — while no
+        # longer claiming the retired class.
+        self.assertNotIn("cluster", auths, "api-docs.js must not declare the retired auth class")
+        tomb = [e for e in self.endpoints if e["path"] == "/api/v1/internal/control"]
+        self.assertEqual(len(tomb), 1, "the retired internal route must stay documented as a tombstone")
+        self.assertEqual(str(tomb[0]["auth"]), "admin")
+        # The loader exposes method/path/body/auth/resp/errors only (asserted above), so the
+        # "this route is gone" wording is checked where it lives: the documented response lines.
+        self.assertIn("retired", " ".join(tomb[0]["resp"]).lower())
+        self.assertIn((404, "not_found"), {(x["status"], x["code"]) for x in tomb[0]["errors"]})
 
     def test_documented_error_codes_are_visible(self):
         codes = {(x["status"], x["code"]) for e in self.endpoints for x in e["errors"]}
