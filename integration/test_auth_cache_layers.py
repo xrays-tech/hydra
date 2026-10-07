@@ -395,9 +395,37 @@ def main():
         for port, label, who in ((A_DATA, "A_DATA", "the node leg A measures"),
                                  (B_DATA, "B_DATA", "the other node")):
             if not wait_for(lambda p=port: proxied(p)[0] == 200, budget=60):
+                # Same evidence dump the `cluster rate limits` drill prints on the same symptom
+                # (403 `tenant_forbidden` = "the MATERIALIZED config has no `tenant_providers` for
+                # this tenant"). This drill is now the one that catches it most often — it caught it
+                # on the run after that dump was added — so the four questions are answered HERE
+                # rather than only in the sibling drill: who holds the writer, what the seed's writes
+                # were answered with, what the admin API serves back, and whether each node's
+                # materialization loop actually ran.
                 print(f"[auth-cache] CANNOT VERIFY: {who} ({label}) never served the seeded tenant; "
                       f"last answer HTTP {proxied(port)[0]} — the auth cache is not what failed here",
                       file=sys.stderr)
+                print(f"--- /healthz/leader   A:{call('GET', f'http://127.0.0.1:{A_ADMIN}/healthz/leader')[0]}"
+                      f"   B:{call('GET', f'http://127.0.0.1:{B_ADMIN}/healthz/leader')[0]}"
+                      f"   C:{call('GET', f'http://127.0.0.1:{C_ADMIN}/healthz/leader')[0]}", file=sys.stderr)
+                for path in ("tenants", "providers", "provider-keys", "tenant-providers", "tenant-models"):
+                    st, out = admin(A_ADMIN, "GET", f"/{path}")
+                    print(f"--- GET /{path} -> HTTP {st} :: {str(out)[:200]}", file=sys.stderr)
+                for name, port in (("A", A_ADMIN), ("B", B_ADMIN), ("C", C_ADMIN)):
+                    # This drill's `call` returns (status, body) — TWO values, unlike the sibling
+                    # drill's three. The first version of this dump unpacked three and died with
+                    # `ValueError: not enough values to unpack`, i.e. the diagnostic would have
+                    # replaced the finding with its own traceback at the exact moment it was needed
+                    # (caught by forcing this path on a healthy cluster).
+                    _, body = call("GET", f"http://127.0.0.1:{port}/metrics", token=TOKEN)
+                    series = [l for l in body.splitlines()
+                              if l.startswith("hydra_replica_materialize_retries_total")]
+                    print(f"--- {name} materialization: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
+                for label in ("layers-a", "layers-b", "layers-c"):
+                    path = os.path.join(DIR, f"{label}.log")
+                    if os.path.exists(path):
+                        print(f"--- {label}.log (last 1500) ---\n"
+                              f"{open(path, errors='replace').read()[-1500:]}", file=sys.stderr)
                 return 2
         # Make the cache COLD on purpose: the warm-up above populated L1+L2, so "the first
         # request asks the auth service" can only be measured after a clear (the first
