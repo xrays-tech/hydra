@@ -418,14 +418,24 @@ def main():
                     # replaced the finding with its own traceback at the exact moment it was needed
                     # (caught by forcing this path on a healthy cluster).
                     _, body = call("GET", f"http://127.0.0.1:{port}/metrics", token=TOKEN)
-                    series = [l for l in body.splitlines()
-                              if l.startswith("hydra_replica_materialize_retries_total")]
-                    print(f"--- {name} materialization: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
+                    for name_ in ("hydra_replica_materialize_retries_total",
+                                  "hydra_arachne_publish_total",
+                                  "hydra_arachne_quorum_unavailable_total"):
+                        series = [l for l in body.splitlines() if l.startswith(name_)]
+                        print(f"--- {name} {name_}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
                 for label in ("layers-a", "layers-b", "layers-c"):
                     path = os.path.join(DIR, f"{label}.log")
                     if os.path.exists(path):
-                        print(f"--- {label}.log (last 1500) ---\n"
-                              f"{open(path, errors='replace').read()[-1500:]}", file=sys.stderr)
+                        text = open(path, errors="replace").read()
+                        # The publish failure's OWN line carries the reason and may be far above
+                        # the tail by the time this dump runs, so the whole file is scanned.
+                        publish_lines = [l for l in text.splitlines()
+                                         if "PUBLISH FAILED" in l or "not_leader" in l]
+                        print(f"--- {label}.log: publish failures ({len(publish_lines)}) ---",
+                              file=sys.stderr)
+                        for line in publish_lines[:3]:
+                            print(f"    {line[:400]}", file=sys.stderr)
+                        print(f"--- {label}.log (last 1500) ---\n{text[-1500:]}", file=sys.stderr)
                 return 2
         # Make the cache COLD on purpose: the warm-up above populated L1+L2, so "the first
         # request asks the auth service" can only be measured after a clear (the first

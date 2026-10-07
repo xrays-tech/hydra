@@ -555,12 +555,29 @@ def main():
             for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
                 series = metric(port, "hydra_replica_materialize_retries_total")
                 print(f"    {label}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
+            # The publish counters say WHY a publish failed, by label:
+            # `hydra_arachne_publish_total{result}` ∈ {ok, not_leader, quorum_unavailable, error,
+            # refused} and `hydra_arachne_quorum_unavailable_total{op}` (label verified in a
+            # live dump: `hydra_arachne_publish_total{result="ok"} 6`). A drill that only prints the
+            # materialization counter knows the loop ran but not whether the write ever reached the
+            # tree — and "the write never reached the tree" is the symptom under investigation.
+            print("--- publish on both nodes ---", file=sys.stderr)
+            for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
+                for name in ("hydra_arachne_publish_total", "hydra_arachne_quorum_unavailable_total"):
+                    series = metric(port, name)
+                    print(f"    {label} {name}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
             for p in (A_DATA, B_DATA):
                 st, _headers, body, took = proxied(p, "count.local", "sk-t1")
                 print(f"--- data plane :{p} -> HTTP {st} after {took:.2f}s :: {body[:300]}",
                       file=sys.stderr)
             for label in ("cl-a", "cl-b"):
                 log = open(os.path.join(DIR, f"{label}.log"), errors="replace").read()
+                # The whole file is scanned for the publish failure's own line — the tail may be
+                # long past it by the time this dump runs, and that line carries the reason.
+                publish_lines = [l for l in log.splitlines() if "PUBLISH FAILED" in l or "not_leader" in l]
+                print(f"--- {label}.log: publish failures ({len(publish_lines)}) ---", file=sys.stderr)
+                for line in publish_lines[:3]:
+                    print(f"    {line[:400]}", file=sys.stderr)
                 print(f"--- {label}.log (last 1200) ---\n{log[-1200:]}", file=sys.stderr)
             print("[cluster-limits] CANNOT VERIFY: a member never routed the tenant",
                   file=sys.stderr)
