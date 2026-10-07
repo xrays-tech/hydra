@@ -520,6 +520,40 @@ def main():
             status == 200,
             f"HTTP {status} {body if status != 200 else ''}",
         )
+        if status == 403 and isinstance(body, dict) and \
+                body.get("error", {}).get("message") == "tenant_forbidden":
+            # `tenant_forbidden` is `router.rs` and has exactly one source: the node's config has no
+            # `tenant_providers` entry for the tenant it just resolved. This assertion has failed
+            # intermittently on CI runners (measured 2026-10-07: green on most runs, red on a
+            # re-run of the same commit) and NOTHING in this drill printed why — while the admin leg
+            # directly above it answers 200 with providers, i.e. the node's DATABASE has the fixture.
+            # So the two candidate mechanisms are "the published tree never carried the row" and "the
+            # database has it but the runtime snapshot does not", and the observations that separate
+            # them are printed here: what the survivor's admin API serves per entity kind (its DB),
+            # what each node's publish/materialize counters say, and any publish failure in its log.
+            print("[arachne] gate 5 got tenant_forbidden — dumping the survivor's state",
+                  file=sys.stderr)
+            for path in ("providers", "provider-models", "provider-keys", "tenants",
+                         "tenant-providers", "tenant-models"):
+                st, out = http(survivor.admin_port, "GET", f"/api/v1{path}", token=ADMIN_TOKEN)
+                print(f"--- survivor GET /{path} -> HTTP {st} :: {str(out)[:220]}", file=sys.stderr)
+            for n in nodes:
+                for name in ("hydra_arachne_publish_total",
+                             "hydra_arachne_quorum_unavailable_total",
+                             "hydra_replica_materialize_retries_total"):
+                    st, out = http(n.admin_port, "GET", "/metrics", token=ADMIN_TOKEN)
+                    series = [l for l in (out or "").splitlines() if l.startswith(name)]
+                    print(f"--- {n.name} {name}: {series or 'NO SERIES (or node down)'}",
+                          file=sys.stderr)
+            for n in nodes:
+                if not os.path.exists(n.log_path):
+                    continue
+                text = open(n.log_path, errors="replace").read()
+                lines = [l for l in text.splitlines() if "PUBLISH FAILED" in l or "not_leader" in l]
+                print(f"--- {n.name}.log: publish failures ({len(lines)})", file=sys.stderr)
+                for line in lines[:3]:
+                    print(f"    {line[:400]}", file=sys.stderr)
+                print(f"--- {n.name}.log (last 1200) ---\n{text[-1200:]}", file=sys.stderr)
     finally:
         for n in nodes:
             n.kill()

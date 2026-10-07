@@ -952,6 +952,21 @@ FAIL  A: with a healthy quorum the tenant write answers 200 with a config_versio
 
 **因此当前状态是"绿但未定性"**：`ac32e4f` 的 run 全绿**不能**当作这条已修好；诊断已在位，复发时那条 `reason` 会直接落到作业日志里。也正因如此，本条目**没有**给任何"修法"——一个间歇问题在拿到原因字符串之前的任何补丁都只是把红变绿一次。
 
+**第二次捕获（2026-10-07，同一 commit `a518e8f` 的 rerun 第 4 次；狩猎脚本 `.acceptance/hunt-flake.sh`，一红即收网并把作业日志落盘）**：症状落在 `integration/test_arachne_control_plane.py` 的 **gate 5**：
+
+```
+PASS  gate 5: the survivor still serves its materialized config  — HTTP 200, 4 providers
+FAIL  gate 5: a real request still flows through the data plane on the survivor  — HTTP 403 tenant_forbidden
+```
+
+**一条读代码就能发现的结构性事实**：该演练**整条只发一次数据面请求**（`proxied()` 全文仅一个调用点，就是这条 gate 5）——在此之前它只经**管理面**断言"每个节点服务同一份配置"（gate 4 的 per-node id 集合）。也就是说**数据面在故障转移后从未被这条验收演练验证过**，这正是这个洞能一直活着的原因。
+
+**代码阅读排除掉的两个候选**（都不是"再猜一次"，而是直接读实现）：
+- 「物化只写库、不换快照」**不成立**：`ReplicaTarget::apply`（`cluster/arachne_materializer.rs:301`）在 apply 时确实调用 `self.store.apply_snapshot(HydratedWire { … })`；
+- 「某些实体只写本地、不发布」**不成立**：管理面写实体的路径都会走 `reload_best_effort`（`admin/handlers.rs` 十余处调用点）。
+
+**因此只剩两个候选，且区分它们只需要一次倾倒**：①发布出去的**树本身**就没有该行（部分发布）；②树里有、但该节点**数据面用的运行时快照**里没有。倾倒已接在 gate 5 的失败分支上：幸存者管理面六类实体的读回（= 它**库**里有什么）、三节点的 `hydra_arachne_publish_total` / `hydra_arachne_quorum_unavailable_total` / `hydra_replica_materialize_retries_total`、以及每份日志里 `PUBLISH FAILED` 的行（整份扫描，不只看尾部）。
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
