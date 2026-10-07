@@ -940,6 +940,18 @@ WARN hydra::store: config: provider 'p1' has weight 1 but no api_keys; it will b
 
 **读法**：`tenant_forbidden` 在 `router.rs` 只有一条来源 —— 节点**物化后的**路由配置里没有该租户的 `tenant_providers` 行。同一次运行的兄弟演练 `auth cache layers` 曾出现“鉴权已允许（L2 写入 `1`）却 403”的同一现象，本提交把它的前置改成“等**被测量**的那台**真的**服务该租户（60 s，超时即 CANNOT VERIFY 并打印证据）”。而物化本身是 **1 秒 ticker**（`main.rs`：`interval(Duration::from_secs(1))` 包住 `materializer.converge()`），所以 20–60 s 的滞后**不是预期**。
 
+**更正（同日，更重要的一条证据）**：我先写成“两次同形态 ⇒ 不是抖动”，**这是错的**。`76f1476` 的 `live-deps` 红在**另一个**步骤：`tenant write publish failure` 的 gate A —— **多数派健康时**租户写回 `503 config_not_published`：
+
+```
+FAIL  A: with a healthy quorum the tenant write answers 200 with a config_version
+      — HTTP 503 {'code': 'config_not_published', 'message': "the change was committed to this
+        node's datab…
+```
+
+而 `ac32e4f`（只多了一条"把原因打全"的诊断）**8 个作业全绿、`live-deps` 全步通过**。所以这是**间歇性**失败，不是确定性失败 —— 而且它把一个更精确的证词摆出来了：`StoreError::NotPublished { reason }` 的 `reason` 只有两种形状（`cannot encode the config tree: …` 或 `the head could not be committed: …`，见 `arachne_publish.rs`），**这条字符串才是机制**；演练原本把响应体截到 100 字符，正好把 `reason` 切掉（`ac32e4f` 已改为失败时打印完整响应体 + 三个节点各自的日志）。三个演练（`tenant write publish failure`、`cluster rate limits`、`auth cache layers`）看到的很可能是**同一个**底层现象：写在本地提交成功，却没进 raft 树 ⇒ 其他成员永远物化不到它。
+
+**因此当前状态是"绿但未定性"**：`ac32e4f` 的 run 全绿**不能**当作这条已修好；诊断已在位，复发时那条 `reason` 会直接落到作业日志里。也正因如此，本条目**没有**给任何"修法"——一个间歇问题在拿到原因字符串之前的任何补丁都只是把红变绿一次。
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
