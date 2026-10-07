@@ -922,6 +922,19 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **移植中抓到的产品缺陷（已修）**：T4.1 删注册表时，`main.rs` 里那个"刷新一次、同时喂两处"的任务被拆掉，替代品（成员表）**只接到了 admin 状态**，`TenantApiConfig::live_nodes` 从此一直是 `None`。后果：**租户自助** `DELETE /tenant/{id}/api/v1/auth/cache` 的收敛屏障拿到**空舰队** ⇒ 永远 `nodes_total: 0` + `pending`，而且 `lagging` 也是空的（租户连"谁没跟上"都看不到）；**admin 那条路不受影响**，所以两个入口对同一屏障报出不同答案，而只有安静的那个坏了。修法：把同一个 view 也交给租户 API（3 行）。由 `test_auth_cache_layers.py` 的 PREMISE 腿（要求舰队报告为 `applied`）在移植时抓出。
 
+### 决定 6（2026-10-05 用户裁定「做」）：把 `check_gate_entries` 的被测对象换成被跟踪的文件
+
+**发现**：该守卫读的是 `.acceptance/round10-gate.sh`，而 `.acceptance/` 是 **gitignored、从未被跟踪**的目录（`git ls-files .acceptance` 为空、`git log --diff-filter=A` 查不到）。于是**在 CI 的全新检出里它根本不存在** ⇒ 守卫 exit 2 ⇒ `scripts` 作业的这一步**一直是红的**，与代码无关；本地绿只是因为文件在本地（它是第 10 轮留下的本地产物）。实测：`CGE_ROOT=<空目录> node scripts/check_gate_entries.cjs` → exit 2。
+
+**改法**：被测对象改为**被跟踪的** `.github/workflows/ci.yml`，本地那份 gate 脚本**存在时照旧判**（缺席只打印 NOTE——它在全新检出里本来就不该存在）。顺带把规则**加强**了：
+①「跑二进制钻探的条目必须先有构建」现在是**按作业分组**的（不同 job 在不同 runner 上跑，`target/` 是空的；旧规则比较的是一个线性脚本里的先后，对 CI 没有意义）；
+②新增「**吞掉判定**」规则：跑钻探/守卫的步骤不得用 `|| echo`/`|| true`/`; echo` 吞掉失败——这正是第 10 轮那个"打了 RED 还 exit 0"的同类；
+③完整性规则从"`gate` 行没被解析"扩到"workflow 里点名了 `integration/*.py` 却不在任何已解析的 `run:` 块里"（折叠标量 `run: >`、`uses:` 内联脚本都会绕过所有规则）。
+
+**新对象立刻抓到两处真问题**（旧对象永远看不到）：`cluster rate limits` 与 `tenant usage read over ClickHouse` 两个步骤跑的是**自己文件头写明构建配方**的钻探，却不自己构建——继承上一步的二进制正是第 143 轮门禁报红的原因（并行的 `cargo test --features server` 把二进制重链成了缺特性的版本）。两步都改成自建（显式、各自自足）。
+
+**两种条件都实测**：真仓库树 OK（136 个步骤、8 处"钻探声明构建且其步骤确实构建"、40 个步骤跑读二进制的钻探 —— SELF-BUILD 11 / 同作业继承 29）；**CI 条件**（有 workflow、无 `.acceptance/`）同样 **exit 0** 并打印 NOTE。自测 23 → **25** 条（新增两条正是这次重设计的回归：workflow 本身会被判、以及 CI 条件必须通过）。
+
 ### 本轮新发现（尚未处理，登记在案）
 
 * **一个集群节点无法单独启动：新数据目录必须由多数派先"认领"**。`await_cluster_preflight` 的

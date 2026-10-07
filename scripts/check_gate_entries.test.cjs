@@ -19,11 +19,23 @@ const { spawnSync } = require('node:child_process');
 const GUARD = path.join(__dirname, 'check_gate_entries.cjs');
 const DOC_LINE = '#   cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra\n';
 
-/** A fixture tree: a gate script plus integration drills. */
-function fixture({ entry, drill = DOC_LINE, tail = 'echo "GATE COMPLETE" >> "$LOG"\nexit "$overall"\n', extraEntries = '' }) {
+/** A fixture tree: a WORKFLOW, a gate script, and integration drills.
+ *
+ * The guard's subject is the tracked workflow since 2026-10-05 (it used to read only the gitignored
+ * gate script, which made it FAIL IN CI while passing locally — its subject did not exist on a fresh
+ * checkout). Each case below is about ONE of the two sources, so the fixture writes a CLEAN filler
+ * workflow unless a case asks for a workflow of its own: otherwise every case would also report
+ * whatever the other source happened to contain.
+ */
+function fixture({ entry, drill = DOC_LINE, tail = 'echo "GATE COMPLETE" >> "$LOG"\nexit "$overall"\n', extraEntries = '', workflow = null }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cge-'));
   fs.mkdirSync(path.join(root, '.acceptance'), { recursive: true });
   fs.mkdirSync(path.join(root, 'integration'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.github', 'workflows'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, '.github', 'workflows', 'ci.yml'),
+    workflow === null ? cleanWorkflow() : workflow,
+  );
   // The head carries the LOG variable (the real script truncates and appends to it), and the default
   // tail writes the terminal marker: the guard checks that a truncated log cannot masquerade as a
   // finished run, so a fixture without a log would fail for a reason unrelated to the case.
@@ -37,6 +49,13 @@ function fixture({ entry, drill = DOC_LINE, tail = 'echo "GATE COMPLETE" >> "$LO
   fs.writeFileSync(path.join(root, 'integration', 'test_doc.py'), drill + 'print("ok")\n');
   fs.writeFileSync(path.join(root, 'integration', 'test_plain.py'), 'print("ok")\n');
   return root;
+}
+
+/** A workflow with enough clean steps for the entry floor, and no drill in any of them. */
+function cleanWorkflow(extra = '') {
+  const filler = Array.from({ length: 45 }, (_, i) =>
+    `      - name: filler ${i}\n        run: true\n`).join('');
+  return `name: ci\non: [push]\njobs:\n  check:\n    steps:\n${filler}${extra}`;
 }
 
 function run(root, env = {}) {
@@ -96,22 +115,39 @@ test('the judged floor refuses to pass when the rule reaches almost nothing', ()
   assert.match(r.out, /documented-build precondition/);
 });
 
-test('a gate script too short to be the real one is CANNOT VERIFY, never a pass', () => {
+test('a workflow too short to be the real one is CANNOT VERIFY, never a pass', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cge-small-'));
-  fs.mkdirSync(path.join(root, '.acceptance'), { recursive: true });
   fs.mkdirSync(path.join(root, 'integration'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.acceptance', 'round10-gate.sh'), 'gate "one" true\nexit "$overall"\n');
+  fs.mkdirSync(path.join(root, '.github', 'workflows'), { recursive: true });
   fs.writeFileSync(path.join(root, 'integration', 'test_doc.py'), DOC_LINE);
+  fs.writeFileSync(path.join(root, '.github', 'workflows', 'ci.yml'),
+    'name: ci\non: [push]\njobs:\n  check:\n    steps:\n      - name: one\n        run: true\n');
   const r = run(root);
   assert.equal(r.status, 2, `status=${r.status} ${r.out}`);
-  assert.match(r.out, /CANNOT VERIFY/);
+  assert.match(r.out, /only 1 workflow step\(s\) with a `run:` block parsed/);
 });
 
-test('a missing gate script is CANNOT VERIFY (not a silent pass)', () => {
+test('a missing WORKFLOW is CANNOT VERIFY (it is the subject, and it is tracked)', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cge-none-'));
+  fs.mkdirSync(path.join(root, 'integration'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'integration', 'test_plain.py'), 'print("ok")\n');
   const r = run(root);
   assert.equal(r.status, 2, `status=${r.status} ${r.out}`);
-  assert.match(r.out, /CANNOT VERIFY/);
+  assert.match(r.out, /CANNOT VERIFY: cannot read \.github\/workflows\/ci\.yml/);
+});
+
+test('a missing LOCAL gate script is a NOTE, not a failure (it is gitignored — the CI condition)', () => {
+  // This is the case that made the guard red in CI for as long as it existed: `.acceptance/` is
+  // gitignored, so on a fresh checkout the old subject was simply absent. A guard that refuses to
+  // judge is fine; one whose subject CANNOT exist where it runs is not.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cge-nogate-'));
+  fs.mkdirSync(path.join(root, 'integration'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.github', 'workflows'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'integration', 'test_plain.py'), 'print("ok")\n');
+  fs.writeFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), cleanWorkflow());
+  const r = run(root);
+  assert.equal(r.status, 0, `status=${r.status} ${r.out}`);
+  assert.match(r.out, /the local gate script is not present \(gitignored\)/);
 });
 
 /* Round 154: a drill that STARTS the prebuilt binary must run against a binary this gate run built.
@@ -126,7 +162,7 @@ test('an entry running a binary-starting drill with no earlier build is drift', 
   const r = run(root);
   assert.equal(r.status, 1, r.out);
   assert.match(r.out, /starts `target\/debug\/hydra`/);
-  assert.match(r.out, /NO entry before it builds that binary/);
+  assert.match(r.out, /no entry before it in its gate run builds that binary/);
 });
 
 test('CONTROL: an earlier entry that builds the binary is enough', () => {
@@ -137,7 +173,7 @@ test('CONTROL: an earlier entry that builds the binary is enough', () => {
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /1 entry\(ies\) run a drill that starts the prebuilt binary/);
+  assert.match(r.out, /1 step\(s\) run a drill that starts the prebuilt binary/);
 });
 
 test('CONTROL: an entry that builds the binary itself is enough', () => {
@@ -154,7 +190,7 @@ test('CONTROL: a drill that does NOT start the prebuilt binary is not judged', (
   const root = fixture({ entry: 'gate "plain" python3 integration/test_doc.py', drill: 'print("ok")\n' });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /0 entry\(ies\) run a drill that starts the prebuilt binary/);
+  assert.match(r.out, /0 step\(s\) run a drill that starts the prebuilt binary/);
 });
 
 test('the binary-dependency floor refuses to pass when the rule reaches nothing', () => {
@@ -180,7 +216,7 @@ test('the OK line reports the self-build/inherit split (inheriting entry)', () =
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /SELF-BUILD 0 \/ INHERITED 1/);
+  assert.match(r.out, /SELF-BUILD 0 \/ INHERITED-IN-JOB 1/);
 });
 
 test('the OK line reports the self-build/inherit split (self-building entry)', () => {
@@ -190,7 +226,7 @@ test('the OK line reports the self-build/inherit split (self-building entry)', (
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /SELF-BUILD 1 \/ INHERITED 0/);
+  assert.match(r.out, /SELF-BUILD 1 \/ INHERITED-IN-JOB 0/);
 });
 
 test('CONTROL: the split counts both shapes in one run', () => {
@@ -204,7 +240,37 @@ test('CONTROL: the split counts both shapes in one run', () => {
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /SELF-BUILD 1 \/ INHERITED 1/);
+  assert.match(r.out, /SELF-BUILD 1 \/ INHERITED-IN-JOB 1/);
+});
+
+/* 2026-10-05 — WHY THE SUBJECT CHANGED. The guard used to read only `.acceptance/round10-gate.sh`,
+ * which is gitignored and was never tracked, so in CI its subject did not exist: it returned CANNOT
+ * VERIFY and the `scripts` job ran RED for a reason unrelated to the code (measured: `CGE_ROOT=<empty>
+ * node scripts/check_gate_entries.cjs` → exit 2). These two cases pin the redesign from both sides. */
+test('the WORKFLOW is judged (a step that runs a documenting drill without building it is drift)', () => {
+  const root = fixture({
+    entry: 'gate "unrelated" true',
+    workflow: cleanWorkflow(
+      '      - name: cluster limits (no build)\n' +
+      '        run: python3 integration/test_doc.py\n'),
+  });
+  const r = run(root);
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /"cluster limits \(no build\)" .*does not build it/s);
+});
+
+test('the CI condition passes: workflow present, gitignored gate script ABSENT', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cge-ci-'));
+  fs.mkdirSync(path.join(root, 'integration'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.github', 'workflows'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'integration', 'test_doc.py'), DOC_LINE + 'print("ok")\n');
+  fs.writeFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), cleanWorkflow(
+    '      - name: builds and runs\n' +
+    '        run: cargo build -p hydra-server --features server --bin hydra && python3 integration/test_doc.py\n'));
+  const r = run(root);
+  assert.equal(r.status, 0, `status=${r.status} ${r.out}`);
+  assert.match(r.out, /1 drill\(s\) DOCUMENT a build/);
+  assert.match(r.out, /the local gate script is not present/);
 });
 
 /* Round 162: a BUILD terminated by `;` instead of `&&` swallows its failure, and the rest of the entry
@@ -265,7 +331,7 @@ test('a single-quoted entry is reported, not silently skipped', () => {
   });
   const r = run(root);
   assert.equal(r.status, 1, r.out);
-  assert.match(r.out, /looks like a gate entry/);
+  assert.match(r.out, /looks like an entry/);
   assert.match(r.out, /parser did not accept it/);
 });
 
@@ -276,7 +342,7 @@ test('a leading-space entry is reported too', () => {
   });
   const r = run(root);
   assert.equal(r.status, 1, r.out);
-  assert.match(r.out, /looks like a gate entry/);
+  assert.match(r.out, /looks like an entry/);
 });
 
 test('CONTROL: a column-zero double-quoted entry is parsed (no completeness finding)', () => {

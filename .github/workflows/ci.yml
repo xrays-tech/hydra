@@ -456,7 +456,14 @@ jobs:
       - name: cluster rate limits (shared windows, fail-open, reconnect — 6380)
         env:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: python3 integration/test_cluster_limits.py
+        run: |
+          set -o pipefail
+          # The drill documents this recipe in its header, so THIS step builds it: inheriting the
+          # binary an earlier step left behind is how the round-143 gate went red (a parallel
+          # `cargo test --features server` had relinked it feature-poor). `check_gate_entries`
+          # enforces exactly that now, against the workflow.
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_cluster_limits.py
 
       # The `#[ignore]`d ClickHouse suites: they need a LIVE ClickHouse (`CH_URL`) and Redis.
       # ⚠️ This step's `- name:`/list marker went missing in an earlier uncommitted edit, which
@@ -820,7 +827,12 @@ jobs:
       # than a zeroed 200. Same mock-only property and same feature requirement as above,
       # so it rides the binary that step just built.
       - name: tenant usage read over ClickHouse (mock store, no live deps)
-        run: python3 integration/test_usage_query_wire.py
+        run: |
+          set -o pipefail
+          # Same reason as the cluster-limits step: the drill documents the recipe, so this step
+          # provides it rather than riding whatever the previous step built.
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          python3 integration/test_usage_query_wire.py
 
       - name: Proxy E2E suite (mock auth + mock LLM + failover path)
         run: python3 integration/e2e_proxy_test.py
