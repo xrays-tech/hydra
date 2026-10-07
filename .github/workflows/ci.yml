@@ -244,18 +244,41 @@ jobs:
   # checked fact instead of a claim.
   live-deps:
     runs-on: ubuntu-latest
+    env:
+      # Credentials for the ClickHouse service below. They exist because the official image now
+      # REFUSES network access for an unauthenticated `default` user — see the service's comment.
+      # Every step that speaks to 8123 uses them, and so does `CH_URL` for the `#[ignore]`d suites.
+      CH_USER: hydra
+      CH_PASSWORD: hydra-ci-clickhouse
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.3
         ports:
           - 8123:8123
+        # REQUIRED, and the reason is measured rather than assumed: when neither CLICKHOUSE_USER nor
+        # CLICKHOUSE_PASSWORD is set, this image's `/entrypoint.sh` logs "disabling network access
+        # for user 'default'" and answers **403 Forbidden** to every HTTP query. The job then died
+        # on its first step (`curl: (22) The requested URL returned error: 403` — the `--fail` in
+        # that step turning ClickHouse's refusal into exit 22), while `/ping` kept answering, so the
+        # readiness loop passed and the refusal looked like a bad `init.sql`.
+        # `24.3` is a MOVING tag: the same workflow was green before the image hardened this, which
+        # is why the fix belongs here and not in the SQL.
+        # Verified on this exact tag, 2026-10-07: no credentials -> 403; with them -> 200, and
+        # `SHOW CREATE TABLE usage_record` still carries `non_replicated_deduplication_window`.
+        # The repo's own compose documents the same move for remote access
+        # (`environment/docker-compose.yml`: "Need remote access? Add CLICKHOUSE_USER/PASSWORD").
+        env:
+          CLICKHOUSE_USER: hydra
+          CLICKHOUSE_PASSWORD: hydra-ci-clickhouse
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
         # Same readiness command this repo's own compose uses for the same image
         # (`environment/docker-compose.yml`: "clickhouse-client is bundled in the
         # official image"). Verified inside a running 24.3 container: the image has
         # `wget` and `clickhouse-client`, and NO `curl` — so the `curl` calls in the
-        # steps below must stay on the RUNNER (they do).
+        # steps below must stay on the RUNNER (they do). It carries the credentials, because the
+        # health probe is itself a network query.
         options: >-
-          --health-cmd "clickhouse-client --query 'SELECT 1' || exit 1"
+          --health-cmd "clickhouse-client --user hydra --password hydra-ci-clickhouse --query 'SELECT 1' || exit 1"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
@@ -291,13 +314,15 @@ jobs:
           done
           # Executing the file through the HTTP interface proves it is valid
           # ClickHouse AND that this is the schema a fresh instance gets.
-          curl -sS --fail --data-binary @environment/clickhouse/init.sql http://127.0.0.1:8123/
-          curl -sS --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/
+          # The credentials are mandatory (see the service's comment): without them ClickHouse
+          # answers 403 here and `--fail` turns that into exit 22.
+          curl -sS -u "$CH_USER:$CH_PASSWORD" --fail --data-binary @environment/clickhouse/init.sql http://127.0.0.1:8123/
+          curl -sS -u "$CH_USER:$CH_PASSWORD" --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/
 
       - name: A fresh instance must carry the ClickHouse dedup window
         run: |
           set -euo pipefail
-          ddl="$(curl -sS --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/)"
+          ddl="$(curl -sS -u "$CH_USER:$CH_PASSWORD" --data-binary "SHOW CREATE TABLE usage_record" http://127.0.0.1:8123/)"
           if ! printf '%s' "$ddl" | grep -q 'non_replicated_deduplication_window'; then
             echo "::error::a fresh instance built from environment/clickhouse/init.sql has NO non_replicated_deduplication_window: insert_deduplication_token is accepted and SILENTLY IGNORED, so a re-sent batch double-counts usage/quota/billing"
             printf '%s\n' "$ddl"
@@ -477,9 +502,25 @@ jobs:
       # accepting "its directory is mentioned somewhere".
       - name: ClickHouse sink + usage query against a live instance (ignored tests)
         env:
-          CH_URL: http://127.0.0.1:8123
+          CH_URL: http://hydra:hydra-ci-clickhouse@127.0.0.1:8123
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test clickhouse_sink --test usage_query -- --ignored
+        run: |
+          set -euo pipefail
+          # SEED THE WINDOW the usage-query suite asks about, because that suite refuses to pass on
+          # an empty fixture — by design, and in so many words: "the hand-run and the reader are
+          # both reading the SAME table, so if that table is empty the comparison is 0 == 0 and the
+          # test passes without having measured anything. That is exactly what happened in CI: the
+          # `live-deps` job creates the schema from init.sql and inserts NOTHING". Its guard asserts
+          # `count() > 0` for tenant `local` in `2026-09-15`, so without this INSERT the step can
+          # never be green — it was wired but had never been reached (the ClickHouse 403 stopped the
+          # job at its first step). One unattributed row on purpose: it is what drives the
+          # `sub_tenant_id IS NULL` legs that pin the COALESCE.
+          curl -sS -u "$CH_USER:$CH_PASSWORD" --fail --data-binary @- http://127.0.0.1:8123/ <<'SQL'
+          INSERT INTO usage_record (tenant_id, provider_id, model_key, status_code, tokens_in, tokens_out, latency_ms, created_at)
+          VALUES ('local', 'ci-provider', 'ci-model', 200, 7, 3, 12, '2026-09-15T12:00:00Z')
+          SQL
+          curl -sS -u "$CH_USER:$CH_PASSWORD" --data-binary "SELECT count() FROM usage_record WHERE tenant_id = 'local' AND created_at >= '2026-09-15T00:00:00Z' AND created_at < '2026-09-16T00:00:00Z'" http://127.0.0.1:8123/
+          cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test clickhouse_sink --test usage_query -- --ignored
 
   # The three SDKs are shipped artifacts with their own tests, and NO job ran
   # them: the endpoints they call (a data-plane path that used to point at a

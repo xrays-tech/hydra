@@ -1092,6 +1092,39 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
 // C13 — live ClickHouse (`--ignored`; the measured ground truth)
 // ---------------------------------------------------------------------------
 
+/// POST one statement to ClickHouse over HTTP, carrying whatever credentials `CH_URL` holds.
+///
+/// reqwest does NOT turn URL userinfo (`http://user:pass@host:8123`) into an `Authorization`
+/// header, and the official `clickhouse-server` image answers **403** to an unauthenticated
+/// `default` user, so a hand-run query against a credentialed URL came back as an ERROR BODY —
+/// which this test then parsed as `"c": "0"`, making its own "is the fixture empty?" guard fire
+/// for a reason that had nothing to do with the fixture. Measured 2026-10-07 against a
+/// credentialed 24.3 instance: `reader totals=UsageTotals { requests: 0, … }` where the seeded
+/// instance answers 1.
+#[cfg(feature = "usage-clickhouse")]
+async fn ch_hand_run(ch: &str, sql: String) -> String {
+    // "http://user:pass@host:8123" -> ("user:pass", "http://host:8123"); no '@' -> (None, ch).
+    let (userinfo, host) = match ch.split_once('@') {
+        Some((before, after)) => match before.rsplit_once("//") {
+            Some((scheme, auth)) => (Some(auth.to_string()), format!("{scheme}//{after}")),
+            None => (Some(before.to_string()), after.to_string()),
+        },
+        None => (None, ch.to_string()),
+    };
+    let url = format!("{}/", host.trim_end_matches('/'));
+    let mut req = reqwest::Client::new().post(url).body(sql);
+    if let Some(userinfo) = userinfo {
+        let (user, pass) = userinfo.split_once(':').unwrap_or((userinfo.as_str(), ""));
+        req = req.basic_auth(user.to_string(), Some(pass.to_string()));
+    }
+    req.send()
+        .await
+        .expect("live CH")
+        .text()
+        .await
+        .expect("body")
+}
+
 /// Run against the bundled ClickHouse instance and compare with the same query
 /// run by hand, i.e. the "集群下可用且与直连 SQL 一致" evidence.
 ///
@@ -1099,6 +1132,8 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
 /// CH_URL=http://127.0.0.1:8123 cargo test -p hydra-server \
 ///   --features server,usage-clickhouse --test usage_query -- --ignored --nocapture
 /// ```
+///
+/// It also needs ROWS in the window it asks about — see the emptiness guard below.
 #[cfg(feature = "usage-clickhouse")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a live ClickHouse (CH_URL, default http://127.0.0.1:8123)"]
@@ -1128,15 +1163,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
              AND created_at < '2026-09-16T00:00:00Z' FORMAT JSONEachRow",
             tenant
         );
-        let body = reqwest::Client::new()
-            .post(format!("{ch}/"))
-            .body(q)
-            .send()
-            .await
-            .expect("live CH")
-            .text()
-            .await
-            .expect("body");
+        let body = ch_hand_run(&ch, q).await;
         let o: Value = serde_json::from_str(body.trim()).expect("one line");
         (
             o["c"].as_str().unwrap_or("0").parse().unwrap_or(0),
@@ -1176,15 +1203,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
     // hand-run proof that the bare column really does put `null` on the wire —
     // i.e. that the COALESCE is what makes the read survive real data.
     async fn hand_query(ch: &str, sql: String) -> String {
-        reqwest::Client::new()
-            .post(format!("{ch}/"))
-            .body(sql)
-            .send()
-            .await
-            .expect("live CH")
-            .text()
-            .await
-            .expect("body")
+        ch_hand_run(ch, sql).await
     }
     let grouped = reader
         .aggregate(
