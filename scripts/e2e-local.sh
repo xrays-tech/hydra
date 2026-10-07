@@ -115,6 +115,8 @@ HYDRA_ADMIN_TOKEN="$TOKEN" \
 HYDRA_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
 HYDRA_LISTEN="127.0.0.1:${DATA_PORT}" \
 HYDRA_DB_URL="sqlite://$ROOT/$SCRATCH/e2e.db?mode=rwc" \
+# Required since ADR-0002 D-1; this script is not about metering, so usage is off.
+export HYDRA_USAGE_SINK=none
 HYDRA_ENCRYPTION_KEY="${HYDRA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}" \
 RUST_LOG="${RUST_LOG:-warn}" \
   ./target/debug/hydra > "$SCRATCH/hydra.log" 2>&1 &

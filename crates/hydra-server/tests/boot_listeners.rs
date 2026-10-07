@@ -73,6 +73,10 @@ fn base_command(db: &TempDb, plain: u16, admin: u16) -> Command {
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{plain}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
+        // Required since ADR-0002 D-1 (there is no default: "where does the billing data go" is a
+        // decision). These legs are about LISTENERS, so usage is switched off explicitly —
+        // otherwise every one of them would fail on a startup refusal unrelated to what they test.
+        .env("HYDRA_USAGE_SINK", "none")
         .env("RUST_LOG", "info")
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null());

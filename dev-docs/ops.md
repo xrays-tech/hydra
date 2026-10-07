@@ -60,7 +60,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy **plaintext** listener. Always bound — the listener topology is derived from configuration only, never from whether tenants have certs (see `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`). |
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
-| `HYDRA_USAGE_SINK` | `sqlite` | `sqlite` or `clickhouse`. **Runtime switch — one binary contains BOTH sinks** when built with `--features server,usage-clickhouse` (the release scripts do this), so flipping the sink needs no rebuild. |
+| `HYDRA_USAGE_SINK` | ***(required — no default)*** | Where usage goes. Accepted values are the registered backends (`dev-docs/usage-backends.md` is the list's owner): `clickhouse` — the shared store every node writes to (needs `HYDRA_CLICKHOUSE_URL`, and a build with `--features usage-clickhouse`; the release scripts build it) — or `none`, which records **nothing** and says so at startup, counts every discarded record on `hydra_usage_records_dropped_total{reason="sink_disabled"}` and answers `503 usage_store_unavailable` on `GET /usage`. Unset ⇒ the process **refuses to start** (ADR-0002 D-1: "where does the billing data go" is a decision, not a guess). `sqlite` was retired on 2026-10-07 and is refused **by name**; it wrote usage into the node's own database, so a cluster's usage was scattered across nodes and the node answering `GET /usage` was usually not the one that recorded the request. |
 | `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. **Do not put a path in this URL** — the sink always POSTs to `/`; a path is *trimmed* rather than used (measured 2026-09-30: before that fix `http://host:8123/clickhouse` failed at connect with `invalid port value`, because the path was still glued to the port when it was parsed). **What the sink actually puts on the wire** (measured 2026-09-30 against a mock ClickHouse, `integration/test_clickhouse_sink_wire.py`): `POST /?<your params>&query=INSERT%20INTO%20usage_record%20(…)%20SETTINGS%20…%20FORMAT%20JSONEachRow`, with the usage **row values in the request BODY** as one JSON object per line — **not** as `param_*` query parameters (that binding form belongs to the usage *reader*, `usage_query.rs`). Useful when diagnosing from a network capture: the SQL appears percent-encoded in the URL, the row values do not, and `client_api_key` in the body is **masked** (`sk*******-1`), never the tenant's real key. |
 | `RUST_LOG` | `info` (set by the image + every compose file) | `tracing` env filter — `main.rs:172` uses `EnvFilter::from_default_env()`. **`HYDRA_LOG` is NOT read**: it was listed here as an alias until 2026-09-29 and has never existed in code (`grep -rn HYDRA_LOG crates/ scripts/ tools/ environment/` is empty). Measured 2026-09-29 on a live instance: started with **only** `HYDRA_LOG=debug` it logs **0 lines** (while `/health` and the API still answer 200), with `RUST_LOG=debug` it logs ~130 lines — so an operator reaching for the documented alias during an incident gets no extra logging. Also note `info` is a **deployment** default, not a binary default: with neither variable set the same instance logs **0 lines** (`from_default_env()` defaults to ERROR-level), and the shipped `Dockerfile`/compose files are what set `RUST_LOG=info`. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
@@ -116,7 +116,8 @@ Environment=HYDRA_ENCRYPTION_KEY=__set_via_environment_file__
 Environment=HYDRA_DB_URL=sqlite:///opt/hydra/data/hydra.db?mode=rwc
 Environment=HYDRA_LISTEN=0.0.0.0:8080
 Environment=HYDRA_ADMIN_ADDR=127.0.0.1:8081
-Environment=HYDRA_USAGE_SINK=sqlite
+Environment=HYDRA_USAGE_SINK=clickhouse
+Environment=HYDRA_CLICKHOUSE_URL=http://127.0.0.1:8123
 Environment=RUST_LOG=info,hydra=info
 # graceful: let in-flight requests drain
 KillSignal=SIGQUIT
@@ -277,8 +278,26 @@ snapshot was taken.
 > and from the host: a backup strategy that stores both in the same bucket protects
 > against neither theft nor loss.
 
-**Deliberately not covered here**: usage records live in ClickHouse when
-`HYDRA_USAGE_SINK=clickhouse` (back it up with ClickHouse's own tooling); a cluster
+### Destructive upgrade: the local usage table is DROPPED (migration 0013)
+
+Usage used to have a second home in the node's own SQLite database. ADR-0002 (user ruling D-3)
+retired that store **and dropped its table**, so from this release on:
+
+1. **Before upgrading**, if the rows matter: back the database up
+   (`sqlite3 hydra.db "VACUUM INTO 'usage-backup.db'"`, §"Backup") **and** export them
+   (`sqlite3 -header -csv hydra.db "SELECT * FROM usage_record" > usage.csv`).
+2. **After the first start** of the new binary the table — and every row in it — is GONE, and
+   `GET /usage` answers only what ClickHouse holds.
+3. **Rollback is one-way.** `sqlx::migrate!` records 0013 as applied, so reverting the *code* leaves
+   a migration that exists in the database and not in the binary (`VersionMissing`); the two ways
+   back are the file from step 1, or deleting that row from `_sqlx_migrations` by hand.
+4. A deployment that has not set `HYDRA_USAGE_SINK` will not start at all (there is no default) —
+   set `clickhouse` before upgrading, or `none` to run with metering off.
+
+**Deliberately not covered here**: usage records live in ClickHouse
+(`HYDRA_USAGE_SINK=clickhouse`; back it up with ClickHouse's own tooling). They used to have a
+second home in the node's own SQLite database, and migration `0013` **drops that table** — see
+§"Destructive upgrade" below for what to do before upgrading. A cluster
 replica rebuilds from the leader rather than from a backup (`db::restore_config`,
 design §11); `data/` permissions are §1.3.
 

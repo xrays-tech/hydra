@@ -1177,6 +1177,9 @@ jobs:
           HYDRA_ADMIN_TOKEN: dev-admin-token-2026
           HYDRA_ADMIN_ADDR: 127.0.0.1:8081
           HYDRA_DB_URL: sqlite://${{ github.workspace }}/e2e-ci.db?mode=rwc
+          # Required since ADR-0002 D-1 (no default: usage must be told where to go). The UI suite
+          # is not about metering, so usage is switched OFF explicitly.
+          HYDRA_USAGE_SINK: none
           # Required, fail-closed: provider api-keys are encrypted at rest.
           HYDRA_ENCRYPTION_KEY: ${{ secrets.HYDRA_E2E_ENCRYPTION_KEY || 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' }}
           RUST_LOG: info

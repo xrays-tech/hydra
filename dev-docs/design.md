@@ -937,18 +937,26 @@ pub struct UsageRecord {
 > **token 字段为 provider-中性命名**（§9.5）：不存 `total_tokens`——它是派生值
 > （`tokens_in + tokens_out`），无计费意义。
 
-### 9.2 默认实现：`SqliteSink`
+### 9.2 交付实现：`ClickHouseSink`（feature `usage-clickhouse`）
 
-- 写入 `usage_record` 表；
+> **2026-10-07 更正（ADR-0002）**：本节原先写的是「默认实现 = `SqliteSink`」，写入节点自己的
+> `usage_record` 表。**那个后端已退役并从代码中删除**：逐节点用量在集群里只能是错答案（回答
+> `GET /usage` 的节点通常不是记录请求的那个），而迁移 `0013` 把那张家用表**删掉了**。
+> 现在：`clickhouse` 是唯一交付后端，`none` 是显式的「不计量」，`HYDRA_USAGE_SINK` **必填、无默认**。
+> 后端如何插入（一个模块 + 一行注册 + 一个 feature + 一份 env 声明）见 `dev-docs/usage-backends.md`。
+
+- 写入 ClickHouse 的 `usage_record` 表（`environment/clickhouse/init.sql`），每批带
+  `insert_deduplication_token`，重发同一批不会重复计费；
 - **批量化降负载**：用 `tokio::sync::mpsc` channel 缓冲，后台任务按「每 N 条或每 T 秒」批量 `INSERT`；
-- 失败重试 + 指数退避，避免阻塞代理主流程。
+- 失败重试 + 指数退避，避免阻塞代理主流程；丢弃按原因计入
+  `hydra_usage_records_dropped_total{reason}`。
 
 ### 9.3 可选实现：`ClickHouseSink`（feature flag）
 
 - `Cargo.toml` feature `usage-clickhouse`（依赖极少：sink 走 ClickHouse 原生 HTTP 接口 `INSERT … FORMAT JSONEachRow`，不使用 `clickhouse` crate；`base64` 仅用于 URL userinfo 转 Basic Auth）；
 - 配置 `HYDRA_CLICKHOUSE_URL`：支持匿名 `http://host:8123`、**带凭据 `http://user:pass@host:8123`（转 Basic Auth）**、以及查询参数透传（`?database=dogress`、`?user=&password=`）；
 - 同样经 channel 异步批量写入；
-- 二者实现同一 `UsageSink` trait，启动按配置选择。**feature 开启时同一二进制内同时编译 `SqliteSink` 与 `ClickHouseSink`**，运行时由 `HYDRA_USAGE_SINK=sqlite|clickhouse` 切换，无需重编。
+- 实现同一 `UsageSink` trait；**后端由 `usage::REGISTRY` 唯一拥有**，`main.rs` 不认识任何具体后端（ADR-0002）。
 
 ### 9.4 用量解析（零拷贝 memchr 扫描 + 多 provider schema）
 

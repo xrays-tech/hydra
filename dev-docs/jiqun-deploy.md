@@ -77,7 +77,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | `HYDRA_ENCRYPTION_KEY` | `<base64-32B>` | 32 字节的 base64（`openssl rand 32 \| base64`），AES-256-GCM 主密钥：provider api-key 与证书私钥落库/进配置树时密封共用。**全集群必须一致**（任一节点不同则解密失败、fail-closed）。缺失即拒启动；丢失则库不可读 |
 | `HYDRA_REDIS_URL` | `redis://:<pass>@redis:6379/0` | Redis 地址（**数据面唯一必选外置依赖**，fail-closed）。按此 URL 必须可连：服务名 `redis`、端口 `6379`、`requirepass`/ACL 与 URL 密码一致。共享限流/熔断/L2/失效总线共用这一个 Redis |
 | `HYDRA_REDIS_MODE` | `single` | Redis 部署模式：只接受 `single`；**其它任何值（含拼错）快速失败**。**限定**：该开关**只在集群模式下被读取**——单节点默认下既不校验也不提及（`integration/test_startup_knobs.py` K12） |
-| `HYDRA_USAGE_SINK` | `clickhouse` | 用量 sink：`sqlite`（单节点默认）或 `clickhouse`。**集群必须 `clickhouse`**（fail-closed：逐节点 sqlite 用量在集群里无意义）。单二进制同时编入两种 sink，切值无需重编 |
+| `HYDRA_USAGE_SINK` | `clickhouse` | **必填、无默认**：`clickhouse`（共享用量存储）或 `none`（显式不计量）。`sqlite`（旧的单节点默认）已于 2026-10-07 退役并按名字拒绝：逐节点用量在集群里必然是错答案 |
 | `HYDRA_CLICKHOUSE_URL` | `http://<user>:<pass>@clickhouse:8123/?database=dogress` | ClickHouse HTTP 端点，`HYDRA_USAGE_SINK=clickhouse` 时必填。支持 `http://user:pass@host:8123`（HTTP Basic）与 `?user=&password=`；其余 query（如 `?database=dogress`）原样透传。要求该 ClickHouse 已建好对应用户/库与 `usage_record` 表 |
 | `RUST_LOG` | `info` | `tracing` 日志过滤级别（镜像默认已置 `info`，此项与镜像默认一致即可） |
 
@@ -169,7 +169,7 @@ curl -s "https://defing.do.top/v1/projects/dogress/branches/dev/config?format=en
 | 集群模式缺 `HYDRA_REDIS_URL` | 拒绝启动 |
 | 任何节点缺 `HYDRA_ADMIN_TOKEN` | 拒绝启动 |
 | 集群模式缺 `HYDRA_ENCRYPTION_KEY[_FILE]` | 拒绝启动（库不可读保护） |
-| 集群模式 `HYDRA_USAGE_SINK ≠ clickhouse` | 拒绝启动 |
+| 未设 `HYDRA_USAGE_SINK` | 拒绝启动（无默认，ADR-0002 D-1） |
 | 镜像未编入 `arachne` feature 而设了成员表 | 拒绝启动（换 `build.sh` 镜像） |
 | 成员表 <3 项 | 拒绝启动（`TooFewMembers`） |
 | `HYDRA_NODE_ID` 不在成员表里 | 拒绝启动（`SelfNotAMember`） |

@@ -30,8 +30,7 @@ use hydra_server::proxy::limiter::RateLimiter;
 use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::store::ConfigStore;
 use hydra_server::tenant_api::TenantApiConfig;
-use hydra_server::usage::backends::sqlite::SqliteUsageQuery;
-use hydra_server::usage::query::UsageQuery;
+use hydra_server::usage::query::{GroupBy, UsageQuery, UsageQueryError};
 use hydra_server::usage::UsageSink;
 use hydra_server::usage::{self, EnvView};
 
@@ -42,13 +41,6 @@ use hydra_server::usage::{self, EnvView};
 /// `ch_url` is injected as a FIXED environment rather than by mutating the process one: the registry
 /// replaces (never merges with) the process environment, so "this variable is unset" is testable on
 /// a machine that happens to have it set.
-fn reader(kind: &str, pool: &sqlx::SqlitePool, ch_url: Option<&str>) -> Arc<dyn UsageQuery> {
-    match open_backend(kind, pool, ch_url) {
-        Ok(b) => b.query.expect("this backend reads"),
-        Err(e) => panic!("{kind} must open: {e}"),
-    }
-}
-
 fn open_backend(
     kind: &str,
     pool: &sqlx::SqlitePool,
@@ -108,40 +100,6 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
     }
 }
 
-/// One metering row, written the way the sink writes it: `created_at` is an
-/// explicit fixed-width UTC string, never `datetime('now')`.
-#[allow(clippy::too_many_arguments)]
-async fn insert_usage(
-    pool: &sqlx::SqlitePool,
-    tenant: &str,
-    provider: &str,
-    model: &str,
-    status: i64,
-    tokens_in: Option<i64>,
-    tokens_out: Option<i64>,
-    cache_hit: Option<i64>,
-    created_at: &str,
-) {
-    sqlx::query(
-        "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, \
-         status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(tenant)
-    .bind(provider)
-    .bind(model)
-    .bind("sk-cli***")
-    .bind(status)
-    .bind(tokens_in)
-    .bind(tokens_out)
-    .bind(cache_hit)
-    .bind(12i64)
-    .bind(created_at)
-    .execute(pool)
-    .await
-    .expect("insert usage row");
-}
-
 /// The state a node would build, with the usage capability **injected** exactly
 /// as `main` injects it. `None` mirrors a node with no readable store.
 async fn build_state(
@@ -173,10 +131,100 @@ async fn build_state(
     )
 }
 
-/// A node whose usage store is the local SQLite pool.
+/// A node with a usage READER that always answers a real zero.
+///
+/// Replaces `build_sqlite_state`, which injected the retired SQLite reader. The legs that use it are
+/// about the HTTP layer — bound validation, the `group_by` whitelist, whose usage is read, the
+/// response envelope — so all they need is a reader that answers; store-specific behaviour has its
+/// own tests (the ClickHouse legs in this file, and the registry's).
+struct ZeroUsageQuery;
+
+impl UsageQuery for ZeroUsageQuery {
+    fn aggregate<'a>(
+        &'a self,
+        _tenant_id: &'a str,
+        _since: &'a str,
+        _until: &'a str,
+        _group_by: GroupBy,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<hydra_core::tenant_api::UsageAggregate, UsageQueryError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Ok(hydra_core::tenant_api::UsageAggregate {
+                rows: Vec::new(),
+                totals: hydra_core::tenant_api::UsageTotals::default(),
+                as_of: None,
+            })
+        })
+    }
+
+    fn source(&self) -> &'static str {
+        "testing"
+    }
+}
+
+/// A reader that answers ONE request for [`T`] and zero for anyone else.
+///
+/// The window legs need a reader that answers; the scoping leg needs one that can TELL the tenants
+/// apart, or "the `tenant_id` parameter is ignored" would pass on two identical zeros.
+struct OneTenantQuery;
+
+impl UsageQuery for OneTenantQuery {
+    fn aggregate<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        _since: &'a str,
+        _until: &'a str,
+        _group_by: GroupBy,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<hydra_core::tenant_api::UsageAggregate, UsageQueryError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let mine = tenant_id == T;
+        Box::pin(async move {
+            Ok(hydra_core::tenant_api::UsageAggregate {
+                rows: Vec::new(),
+                totals: hydra_core::tenant_api::UsageTotals {
+                    requests: u64::from(mine),
+                    tokens_in: if mine { 5 } else { 9999 },
+                    ..Default::default()
+                },
+                as_of: None,
+            })
+        })
+    }
+
+    fn source(&self) -> &'static str {
+        "testing"
+    }
+}
+
+/// A node whose usage reader always answers zero (see [`ZeroUsageQuery`]).
 async fn build_sqlite_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
-    let usage = Some(Arc::new(SqliteUsageQuery::new(pool.clone())) as Arc<dyn UsageQuery>);
+    let usage = Some(Arc::new(ZeroUsageQuery) as Arc<dyn UsageQuery>);
     build_state(pool, TenantApiConfig::default(), usage).await
+}
+
+/// Open the configured backend and take its READER — the ONE selection path `main` uses.
+///
+/// Gated on the feature because every caller of it is a ClickHouse leg: without `usage-clickhouse`
+/// there is no backend to open, and an ungated helper would be dead code (which `-D warnings`
+/// refuses).
+#[cfg(feature = "usage-clickhouse")]
+fn reader(kind: &str, pool: &sqlx::SqlitePool, ch_url: Option<&str>) -> Arc<dyn UsageQuery> {
+    match open_backend(kind, pool, ch_url) {
+        Ok(b) => b.query.expect("this backend reads"),
+        Err(e) => panic!("{kind} must open: {e}"),
+    }
 }
 
 fn start_proxy(state: Arc<AppState>) -> String {
@@ -241,18 +289,6 @@ async fn usage_url(pool: &sqlx::SqlitePool) -> (String, reqwest::Client) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn select_sqlite_returns_the_sqlite_reader() {
-    let pool = common::setup_pool().await;
-    let q = reader("sqlite", &pool, None);
-    assert_eq!(q.source(), "sqlite");
-}
-
-// `select_sqlite_without_a_pool_is_an_error` stood here: `select("sqlite", None, None)` had to be an
-// error, because the alternative was a reader answering a well-formed zero from no database at all.
-// The pool is a required argument since 2026-10-05, so the call cannot be written — the guard moved
-// into the signature, which is the version of it that cannot be forgotten.
-
-#[tokio::test]
 async fn select_an_unknown_kind_is_an_error() {
     let pool = common::setup_pool().await;
     assert!(open_backend("nonsense", &pool, None).is_err());
@@ -300,338 +336,13 @@ async fn clickhouse_cannot_be_opened_without_the_feature() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// T15 — the SQLite window, field by field, against hand-written SQL
-// ---------------------------------------------------------------------------
-
-/// The aggregate must equal what the same window returns when asked directly.
-/// This is the assertion that catches a wrong comparison operator (`>` vs `>=`),
-/// a wrong bound in the statement, or a `SUM` that leaks NULL.
 #[tokio::test]
-async fn sqlite_aggregate_matches_hand_written_sql() {
+async fn an_empty_window_is_a_real_zero_with_no_as_of() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    // Inside the window.
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(100),
-        Some(10),
-        Some(5),
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(200),
-        Some(20),
-        None,
-        "2026-09-16T11:00:00Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        T,
-        "p2",
-        "claude",
-        500,
-        Some(50),
-        Some(0),
-        Some(0),
-        "2026-09-16T12:00:00Z",
-    )
-    .await;
-    // Outside: one row before `since`, one exactly at `until` (exclusive).
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(999),
-        Some(999),
-        None,
-        "2026-09-15T23:59:59Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(888),
-        Some(888),
-        None,
-        "2026-09-17T00:00:00Z",
-    )
-    .await;
-    // Another tenant, same window: must never be counted.
-    insert_usage(
-        &pool,
-        "t2",
-        "p1",
-        "gpt-4o",
-        200,
-        Some(7777),
-        Some(7777),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-
-    let q = reader("sqlite", &pool, None);
-    let agg = q
-        .aggregate(
-            T,
-            "2026-09-16T00:00:00Z",
-            "2026-09-17T00:00:00Z",
-            hydra_server::usage::query::GroupBy::None,
-        )
-        .await
-        .expect("aggregate");
-
-    let handwritten: (i64, i64, i64, i64, i64, Option<String>) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), \
-         COALESCE(SUM(cache_hit_tokens),0), \
-         COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),0), MAX(created_at) \
-         FROM usage_record WHERE tenant_id = ? AND created_at >= ? AND created_at < ?",
-    )
-    .bind(T)
-    .bind("2026-09-16T00:00:00Z")
-    .bind("2026-09-17T00:00:00Z")
-    .fetch_one(&pool)
-    .await
-    .expect("hand-written");
-
-    assert_eq!(agg.totals.requests, handwritten.0 as u64);
-    assert_eq!(agg.totals.tokens_in, handwritten.1 as u64);
-    assert_eq!(agg.totals.tokens_out, handwritten.2 as u64);
-    assert_eq!(agg.totals.cache_hit_tokens, handwritten.3 as u64);
-    assert_eq!(agg.totals.errors, handwritten.4 as u64);
-    assert_eq!(agg.as_of, handwritten.5);
-    // Spell the interesting numbers out too: a query that returned 0 rows for
-    // BOTH sides would satisfy the equality above and prove nothing.
-    assert_eq!(agg.totals.requests, 3, "3 in-window rows");
-    assert_eq!(agg.totals.tokens_in, 350, "100 + 200 + 50");
-    assert_eq!(
-        agg.totals.cache_hit_tokens, 5,
-        "NULL must sum as 0, not poison the SUM"
-    );
-    assert_eq!(agg.totals.errors, 1, "one 5xx");
-    assert_eq!(agg.as_of.as_deref(), Some("2026-09-16T12:00:00Z"));
-}
-
-#[tokio::test]
-async fn sqlite_group_by_model_matches_hand_written_sql() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(100),
-        Some(10),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        T,
-        "p2",
-        "gpt-4o",
-        500,
-        Some(1),
-        Some(1),
-        None,
-        "2026-09-16T11:00:00Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "claude",
-        200,
-        Some(7),
-        Some(3),
-        Some(2),
-        "2026-09-16T12:00:00Z",
-    )
-    .await;
-
-    let q = reader("sqlite", &pool, None);
-    let agg = q
-        .aggregate(
-            T,
-            "2026-09-16T00:00:00Z",
-            "2026-09-17T00:00:00Z",
-            hydra_server::usage::query::GroupBy::Model,
-        )
-        .await
-        .expect("aggregate");
-
-    let handwritten: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT model_key, COUNT(*), COALESCE(SUM(tokens_in),0), \
-         COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),0) \
-         FROM usage_record WHERE tenant_id = ? AND created_at >= ? AND created_at < ? \
-         GROUP BY model_key ORDER BY model_key",
-    )
-    .bind(T)
-    .bind("2026-09-16T00:00:00Z")
-    .bind("2026-09-17T00:00:00Z")
-    .fetch_all(&pool)
-    .await
-    .expect("hand-written");
-
-    let rows = hydra_server::usage::query::rows_by_key(&agg);
-    assert_eq!(rows.len(), handwritten.len(), "row set must match");
-    for (key, requests, tokens_in, errors) in handwritten {
-        let got = rows
-            .get(&key)
-            .unwrap_or_else(|| panic!("missing group {key}"));
-        assert_eq!(got.requests, requests as u64, "{key}");
-        assert_eq!(got.tokens_in, tokens_in as u64, "{key}");
-        assert_eq!(got.errors, errors as u64, "{key}");
-    }
-    assert_eq!(rows["gpt-4o"].requests, 2);
-    assert_eq!(rows["claude"].tokens_in, 7);
-}
-
-/// Like [`insert_usage`] but sets the v3 `sub_tenant_id` (nullable).
-#[allow(clippy::too_many_arguments)]
-async fn insert_usage_sub(
-    pool: &sqlx::SqlitePool,
-    tenant: &str,
-    provider: &str,
-    model: &str,
-    sub_tenant_id: Option<&str>,
-    status: i64,
-    tokens_in: Option<i64>,
-    tokens_out: Option<i64>,
-    cache_hit: Option<i64>,
-    created_at: &str,
-) {
-    sqlx::query(
-        "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, \
-         sub_tenant_id, status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
-         created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(tenant)
-    .bind(provider)
-    .bind(model)
-    .bind("sk-cli***")
-    .bind(sub_tenant_id)
-    .bind(status)
-    .bind(tokens_in)
-    .bind(tokens_out)
-    .bind(cache_hit)
-    .bind(12i64)
-    .bind(created_at)
-    .execute(pool)
-    .await
-    .expect("insert usage row with sub_tenant_id");
-}
-
-/// v3: `group_by=sub_tenant` buckets rows by the recorded sub-tenant id; rows
-/// with no attribution (NULL) group under the empty key, and the totals still
-/// cover every row.
-#[tokio::test]
-async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    insert_usage_sub(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        Some("st1"),
-        200,
-        Some(100),
-        Some(10),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-    insert_usage_sub(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        Some("st1"),
-        200,
-        Some(5),
-        Some(1),
-        None,
-        "2026-09-16T11:00:00Z",
-    )
-    .await;
-    insert_usage_sub(
-        &pool,
-        T,
-        "p2",
-        "claude",
-        Some("st2"),
-        500,
-        Some(1),
-        Some(1),
-        None,
-        "2026-09-16T12:00:00Z",
-    )
-    .await;
-    // No attribution (NULL) must still be counted, under the empty key.
-    insert_usage_sub(
-        &pool,
-        T,
-        "p2",
-        "claude",
-        None,
-        200,
-        Some(7),
-        Some(3),
-        None,
-        "2026-09-16T13:00:00Z",
-    )
-    .await;
-
-    let q = reader("sqlite", &pool, None);
-    let agg = q
-        .aggregate(
-            T,
-            "2026-09-16T00:00:00Z",
-            "2026-09-17T00:00:00Z",
-            hydra_server::usage::query::GroupBy::SubTenant,
-        )
-        .await
-        .expect("aggregate");
-
-    let rows = hydra_server::usage::query::rows_by_key(&agg);
-    assert_eq!(rows["st1"].requests, 2);
-    assert_eq!(rows["st1"].tokens_in, 105);
-    assert_eq!(rows["st2"].requests, 1);
-    assert_eq!(rows["st2"].errors, 1);
-    assert_eq!(rows[""].requests, 1, "unattributed rows group under ''");
-    assert_eq!(agg.totals.requests, 4, "totals still cover every row");
-}
-
-/// A tenant with no rows in the window gets a real zero *and* `as_of: null` —
-/// this is the one place a zero is the correct answer.
-#[tokio::test]
-async fn sqlite_empty_window_is_a_real_zero_with_no_as_of() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    let q = reader("sqlite", &pool, None);
+    // The reader this node has (see `ZeroUsageQuery`): an empty window must be a real zero with no
+    // `as_of`, which is a contract claim about the read path rather than about any one store.
+    let q: Arc<dyn UsageQuery> = Arc::new(ZeroUsageQuery);
     let agg = q
         .aggregate(
             T,
@@ -660,96 +371,43 @@ async fn sqlite_empty_window_is_a_real_zero_with_no_as_of() {
 /// nothing (this test originally used one, and its own premise was false).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_space_separated_since_is_normalised_instead_of_overcounting() {
+    // The claim is that a historical space-separated bound is NORMALISED rather than compared
+    // literally — the literal comparison would widen the window and overcount. It used to be
+    // measured by seeding rows either side of the bound; the local table is gone (ADR-0002 D-3), so
+    // it is measured where the endpoint still exposes it: the echoed bounds must be the canonical
+    // form, and both spellings must produce the SAME answer.
     let pool = common::setup_pool().await;
-    // Before the bound, but on the SAME day as it: the row the raw form wrongly
-    // includes.
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(1000),
-        Some(0),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-    // After the bound.
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(5),
-        Some(0),
-        None,
-        "2026-09-16T14:00:00Z",
-    )
-    .await;
-    // The previous day, which neither form includes.
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(555),
-        Some(0),
-        None,
-        "2026-09-15T23:59:59Z",
-    )
-    .await;
     let (root, c) = usage_url(&pool).await;
-
-    // (a) The endpoint accepts the historical space-separated form…
-    let url = format!(
-        "{root}/tenant/{T}/api/v1/usage?since=2026-09-16%2012:00:00&until=2026-09-17T00:00:00Z"
+    let space = format!(
+        "{root}/tenant/{T}/api/v1/usage?since=2026-09-16 00:00:00Z&until=2026-09-17T00:00:00Z"
     );
-    let (status, v) = get_json(&c, &url, TOKEN).await;
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(
-        v["since"], "2026-09-16T12:00:00Z",
-        "the response must echo the NORMALISED bound: {v}"
+    let canonical = format!(
+        "{root}/tenant/{T}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17T00:00:00Z"
     );
-    assert_eq!(v["totals"]["requests"], 1, "only the 14:00 row: {v}");
-    assert_eq!(v["totals"]["tokens_in"], 5, "{v}");
 
-    // (b) …and the counter-example: the raw form matches the 10:00 row too,
-    //     because 'T' > ' ' makes it compare greater than any row of the day.
-    let naive: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM usage_record WHERE tenant_id = ? AND created_at >= ? AND created_at < ?",
-    )
-    .bind(T)
-    .bind("2026-09-16 12:00:00")
-    .bind("2026-09-17T00:00:00Z")
-    .fetch_one(&pool)
-    .await
-    .expect("naive");
+    let (s_space, v_space) = get_json(&c, &space, TOKEN).await;
+    let (_s_canon, v_canon) = get_json(&c, &canonical, TOKEN).await;
+    assert_eq!(s_space, 200, "{v_space}");
     assert_eq!(
-        (naive.0, v["totals"]["requests"].as_i64().unwrap_or(-1)),
-        (2, 1),
-        "the premise of this test: an un-normalised bound overcounts within the day"
+        v_space["since"], "2026-09-16T00:00:00Z",
+        "the space-separated form must be normalised to the fixed-width form: {v_space}"
+    );
+    assert_eq!(
+        v_space["since"], v_canon["since"],
+        "both spellings must name the same window: {v_space} vs {v_canon}"
+    );
+    assert_eq!(
+        v_space["until"], v_canon["until"],
+        "…at both ends: {v_space} vs {v_canon}"
     );
 }
 
 /// Epoch seconds and milliseconds are accepted too, and land on the same window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn epoch_bounds_are_accepted_and_normalised() {
+    // Same claim as the space-separated leg, for the epoch spellings: the bound is normalised to the
+    // canonical form (asserted on the echoed window), not compared as written.
     let pool = common::setup_pool().await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(5),
-        Some(0),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
     let (root, c) = usage_url(&pool).await;
     for since in ["1789516800", "1789516800000"] {
         let url =
@@ -757,7 +415,6 @@ async fn epoch_bounds_are_accepted_and_normalised() {
         let (status, v) = get_json(&c, &url, TOKEN).await;
         assert_eq!(status, 200, "since={since}: {v}");
         assert_eq!(v["since"], "2026-09-16T00:00:00Z", "since={since}: {v}");
-        assert_eq!(v["totals"]["requests"], 1, "since={since}: {v}");
     }
 }
 
@@ -839,33 +496,17 @@ async fn an_unknown_group_by_is_rejected_rather_than_interpolated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_id_query_parameter_cannot_change_whose_usage_is_read() {
     let pool = common::setup_pool().await;
-    insert_usage(
-        &pool,
-        T,
-        "p1",
-        "gpt-4o",
-        200,
-        Some(5),
-        Some(0),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
-    insert_usage(
-        &pool,
-        "t2",
-        "p1",
-        "gpt-4o",
-        200,
-        Some(9999),
-        Some(0),
-        None,
-        "2026-09-16T10:00:00Z",
-    )
-    .await;
     seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
     seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
-    let root = start_proxy(build_sqlite_state(&pool).await);
+    // A reader that answers 1/5 tokens for `T` and 9999 for anyone else: without that difference the
+    // claim would pass on two identical zeros, which is the shape of a test that proves nothing.
+    let state = build_state(
+        &pool,
+        TenantApiConfig::default(),
+        Some(Arc::new(OneTenantQuery) as Arc<dyn UsageQuery>),
+    )
+    .await;
+    let root = start_proxy(state);
     let c = client();
     let url = format!(
         "{root}/tenant/{T}/api/v1/usage?tenant_id=t2&since=2026-09-16T00:00:00Z&until=2026-09-17T00:00:00Z"
@@ -873,7 +514,10 @@ async fn a_tenant_id_query_parameter_cannot_change_whose_usage_is_read() {
     let (status, v) = get_json(&c, &url, TOKEN).await;
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["tenant_id"], T, "the token decides: {v}");
-    assert_eq!(v["totals"]["tokens_in"], 5, "not t2's 9999: {v}");
+    assert_eq!(
+        v["totals"]["tokens_in"], 5,
+        "the reader was asked about the AUTHENTICATED tenant, not about `?tenant_id=t2`: {v}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -893,7 +537,10 @@ async fn the_response_carries_its_window_source_and_echoed_bounds() {
     assert_eq!(v["since"], "2026-09-16T00:00:00Z", "{v}");
     assert_eq!(v["until"], "2026-09-17T00:00:00Z", "{v}");
     assert_eq!(v["as_of"], Value::Null, "no rows ⇒ no as_of: {v}");
-    assert_eq!(v["source"], "sqlite", "the reader names itself: {v}");
+    assert_eq!(
+        v["source"], "testing",
+        "the envelope reports the reader that answered, and this node's reader says `testing`: {v}"
+    );
     assert_eq!(v["group_by"], "model", "{v}");
     for field in [
         "requests",
@@ -905,13 +552,9 @@ async fn the_response_carries_its_window_source_and_echoed_bounds() {
         assert_eq!(v["totals"][field], 0, "totals.{field} must be present: {v}");
     }
     assert!(v["rows"].is_array(), "{v}");
-    // A tenant's own control-plane call must never be billed to it: E3 does not
-    // write a usage row.
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM usage_record")
-        .fetch_one(&pool)
-        .await
-        .expect("count");
-    assert_eq!(n, 0, "querying usage must not itself create usage");
+    // "A read does not itself create usage" is NOT asserted here any more: the local table it was
+    // checked against is gone (ADR-0002 D-3). The claim lives in `integration/test_usage_query_wire.py`,
+    // which asserts that the read path sends no INSERT at all — a stronger form of the same thing.
 }
 
 /// `until` is optional and defaults to now, so the documented "usage after a

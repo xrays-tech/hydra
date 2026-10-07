@@ -1,6 +1,6 @@
 # ADR-0002 — 用量后端：只进 ClickHouse，且由一张描述符表拥有"有哪些后端"
 
-- **Status**：`accepted`（**2026-10-07 用户裁定 D-1/D-2/D-3/D-9**，见 §3；实施从 Phase 1 开始）
+- **Status**：`accepted` **并已实施**（2026-10-07：D-1/D-2/D-3/D-9 用户裁定；Phase 1 描述符表 + T1.4 守卫 + T2.4/T2.5 + **Phase 2 的破坏性一步（删 SQLite、删表、必填无默认）**均已落地，见 §10 的提交清单）
 - **Date**：`2026-10-07`
 - **Deciders**：用户（三条强制定义）；实施者为执行方
 - **Source Evidence**：用户原话「1，用量只进 clickhouse，绝对不进sqlite，完全屏蔽掉进入sqlite这条路。2，既然使用了 sink 模式来引入 clickhouse，那么实际上还可以扩展出 TDEngine 之类的其它指标用数据库。3，既然如此，这里就要用标准的设计模式来隔离变化，并且给每一个可能的选项一个标准的插入模式。」＋ 本次会话对代码/文档/守卫的逐条直读（下表 C1–C6 均给出证据）
@@ -145,6 +145,16 @@ Data Destruction Guard:
 | `tests/tenant_api.rs:1653` | 断言 `source == "sqlite"` | 改为注入的 reader 标签（`usage::testing`） |
 
 **证据出处需要重挂的守卫**：`scripts/check_compose_grace.cjs` 的 `stop_grace_period` 结论（「SIGKILL 会丢在飞用量 ⇒ drain 必须够长」）**仍然成立**，但它引用的**测量介质**（SQLite `usage_record` 的 0 行 vs 20 行）随本次退役消失 ⇒ 必须把出处改挂到 CH 侧演练（丢弃计数 + mock CH 行数），否则这条守卫会引用一个不再被任何东西测过的数字。
+
+**已执行（2026-10-07）**：`usage/backends/sqlite/` 删除；`RETIRED_USAGE_SINKS = ["sqlite"]`（启动错误带退役原因与替代，而不是"未知取值"）；
+`DEFAULT_USAGE_SINK` 删除，未设 `HYDRA_USAGE_SINK` **拒启并列出注册表中的取值**；集群那条"必须 clickhouse"的特例校验随它存在的理由一起删除
+（`none` 在集群里也是合法选择，只是会大声说明本集群不计量）；`proxy::AppState::for_tests` 不再默认注入 reader；
+迁移 `0013_drop_usage_record.sql` 删表（`tests/migrate.rs` 的 `usage_record_is_gone` 是可执行证据）；
+`tests/usage_query.rs` 的 4 条 SQLite-SQL 腿删除、4 条存储无关腿改靶（并给"token 决定读谁的用量"配了一个**能区分租户**的 reader，否则它会通过于两个相同的零）；
+`tests/streaming_usage_persistence.rs` 改用记录型 sink（"流式也计量"这条 P1 判据保留）；演练的默认 sink 翻成 `none`，两个读 `/usage` 的演练改指 `_mock_clickhouse.py`；
+`ui-e2e` 作业与 `e2e-local.sh` / `handover.test.sh` 补 `HYDRA_USAGE_SINK=none`（否则它们起不来）。
+
+**一处仍然存在的错话（无法修正，C9）**：`migrations/0001_init.sql:84` 的注释写着"用量记录（默认 SQLite Sink）"。迁移文件是 checksum 强制的，改它就破坏所有既有库 —— 所以那句错话会一直在，只能由 `0013` 的注释与本文档对照说明。
 
 **明确不再覆盖的一项**（不粉饰）：`usage_record` 表在 SQLite 上的**行级写入形状**（列名、掩码 key、`tokens_in/out` 的中性列）没有替代者——那张表不再被写。它的 DDL 与 CH 侧列一致性仍由 `clickhouse_ddl_parity.rs`（对照 CH 的 `init.sql`）与迁移文件的既有测试守着，但"SQLite 行长得对不对"从此无人断言，因为**没有 SQLite 行**。
 

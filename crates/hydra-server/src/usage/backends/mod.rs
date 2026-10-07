@@ -9,4 +9,3 @@
 
 pub mod clickhouse;
 pub mod none;
-pub mod sqlite;

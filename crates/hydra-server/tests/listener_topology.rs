@@ -280,6 +280,9 @@ fn base_command(db: &TempDb, plain: u16, admin: u16) -> Command {
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{plain}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
+        // Required since ADR-0002 D-1: these legs are about the LISTENER topology, so usage is
+        // switched off explicitly rather than failing on an unrelated startup refusal.
+        .env("HYDRA_USAGE_SINK", "none")
         .env("RUST_LOG", "info")
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null());
@@ -455,6 +458,9 @@ async fn an_unbindable_entry_port_is_loud() {
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{held_port}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
+        // Required since ADR-0002 D-1: these legs are about the LISTENER topology, so usage is
+        // switched off explicitly rather than failing on an unrelated startup refusal.
+        .env("HYDRA_USAGE_SINK", "none")
         .env("RUST_LOG", "info")
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null());

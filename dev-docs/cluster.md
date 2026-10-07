@@ -53,7 +53,7 @@
 | `HYDRA_CLUSTER_ID` | **建议显式** | 集群身份。默认 = **成员表内容的哈希** ⇒ **改成员表就会改身份**，而每个节点的数据目录记录着旧身份，于是全部拒绝启动。**要在将来做成员变更，就从第一天起显式设一个人类可读的名字**（见 §6.3，含实测报错） |
 | `HYDRA_REDIS_URL` | **是** | 数据面骨干（fail-closed，集群模式缺它就拒绝启动） |
 | `HYDRA_REDIS_MODE` | 否（默认 `single`） | 只接受 `single`；其它任何值**快速失败**。**限定**：这个开关**只在集群模式下被读取**，单节点默认下既不校验也不提及（由 `integration/test_startup_knobs.py` 的 K12 钉住） |
-| `HYDRA_USAGE_SINK` | **是** | 集群下必须 `clickhouse`：每节点各自的 SQLite 用量记录在集群里没有意义 |
+| `HYDRA_USAGE_SINK` | **是** | 必填、无默认：`clickhouse`（共享存储）或 `none`（显式不计量）。集群下逐节点用量必然错，所以前者是实际选择 |
 | `HYDRA_ADMIN_TOKEN` | **是** | 每个节点都要，因为**每个节点都提供管理 API** |
 | `HYDRA_ENCRYPTION_KEY` | **是** | **全集群必须一致**（provider key 与证书私钥共用同一主密钥） |
 
@@ -74,7 +74,7 @@
 | `HYDRA_FAILOVER_GRACE_MS`（从未接线） | 无需替代（切换由选举决定） |
 | `HYDRA_FORWARD_TIMEOUT_SECS` | 无需替代：Hydra 侧零转发 |
 
-**集群启动 fail-closed 检查**：缺 `HYDRA_REDIS_URL` / `HYDRA_ADMIN_TOKEN`、`HYDRA_USAGE_SINK≠clickhouse`、
+**集群启动 fail-closed 检查**：缺 `HYDRA_REDIS_URL` / `HYDRA_ADMIN_TOKEN`、未设 `HYDRA_USAGE_SINK`、
 成员表 <3 项或自身不在表里、二进制没编 `arachne` feature ⇒ **拒绝启动**。
 （单节点模式只受 `HYDRA_ADMIN_TOKEN` 与用量 sink 的约束。）
 

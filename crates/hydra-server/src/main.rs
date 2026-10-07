@@ -61,7 +61,6 @@ use tracing::{error, info, warn};
 const DEFAULT_DB_URL: &str = "sqlite:hydra.db?mode=rwc";
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
-const DEFAULT_USAGE_SINK: &str = "sqlite";
 
 /// `HYDRA_BREAKER_QUORUM`: minimum live votes for a provider to be
 /// cluster-dead (default 1 = any live vote). A missing, unparseable or
@@ -312,15 +311,24 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // variable (the member list decides), no control channel to point at, and no stateless role.
     // What replaced them is the pair above: cluster mode requires the control plane, and it
     // requires an admin token, because every node now serves its own admin API.
-    let sink_kind =
-        std::env::var("HYDRA_USAGE_SINK").unwrap_or_else(|_| DEFAULT_USAGE_SINK.to_string());
-    if role.is_cluster() && sink_kind != "clickhouse" {
-        return Err(format!(
-            "cluster mode requires HYDRA_USAGE_SINK=clickhouse (per-node sqlite usage is \
-             meaningless in a cluster), got '{sink_kind}'"
-        )
-        .into());
-    }
+    // REQUIRED, with no default (ADR-0002 D-1): "where does the billing data go" is a decision, and
+    // every value this product could guess is wrong for someone. The list of accepted values comes
+    // from the registry, so this message cannot rot into naming a backend that no longer exists.
+    //
+    // The old cluster-mode check ("cluster mode requires clickhouse") is GONE with the SQLite store
+    // it existed for: `none` is a legitimate — if loudly-announced — choice everywhere, including a
+    // cluster, and there is no longer a per-node store to forget to switch off.
+    let sink_kind = match std::env::var("HYDRA_USAGE_SINK") {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(format!(
+                "HYDRA_USAGE_SINK is not set; there is no default. Set it to one of: {} \
+                 (`none` records nothing at all and says so at startup)",
+                hydra_server::usage::known_kinds()
+            )
+            .into())
+        }
+    };
 
     // (2b) Master key for provider-key encryption-at-rest (fail-closed: the
     //      process refuses to start without HYDRA_ENCRYPTION_KEY[_FILE]).

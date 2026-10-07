@@ -4,7 +4,7 @@ mod common;
 
 use sqlx::Row;
 
-const EIGHT_BUSINESS_TABLES: &[&str] = &[
+const SEVEN_BUSINESS_TABLES: &[&str] = &[
     "provider",
     "provider_model",
     "provider_key",
@@ -12,11 +12,17 @@ const EIGHT_BUSINESS_TABLES: &[&str] = &[
     "tenant_provider",
     "tenant_model",
     "limit_role",
-    "usage_record",
 ];
 
-/// T1.1 — after migrate, `sqlite_master` contains all 8 business tables plus
-/// the `_sqlx_migrations` bookkeeping table.
+/// The table the SQLite usage store used, DROPPED by migration 0013 (ADR-0002 D-3).
+///
+/// Named here because its ABSENCE is the claim: a migration that silently stopped running, or a
+/// database restored from a pre-0013 backup, would otherwise go unnoticed until someone wondered
+/// why usage was being written locally again.
+const DROPPED_USAGE_TABLE: &str = "usage_record";
+
+/// T1.1 — after migrate, `sqlite_master` contains all 7 business tables plus
+/// the `_sqlx_migrations` bookkeeping table — and NOT the dropped usage table.
 #[tokio::test]
 async fn migrate_creates_all_tables() {
     let pool = common::setup_pool().await;
@@ -29,7 +35,7 @@ async fn migrate_creates_all_tables() {
     let mut names: Vec<String> = rows.iter().map(|r| r.get::<String, _>(0)).collect();
     names.sort();
 
-    for expected in EIGHT_BUSINESS_TABLES
+    for expected in SEVEN_BUSINESS_TABLES
         .iter()
         .chain(std::iter::once(&"_sqlx_migrations"))
     {
@@ -40,44 +46,45 @@ async fn migrate_creates_all_tables() {
     }
 }
 
-/// The sub-tenant usage index (migration 0012) must actually exist.
+// `the_sub_tenant_usage_index_exists` stood here, asserting `idx_usage_record_sub_tenant` on
+// `(tenant_id, sub_tenant_id, created_at)`. Migration 0013 drops the table, and an index cannot
+// outlive it, so the subject is gone rather than unasserted — `usage_record_is_gone` below asserts
+// the outcome that matters now.
+
+/// Migration 0013 must have DROPPED the local usage table (ADR-0002 D-3).
 ///
-/// `usage_record`'s original index leads with `(tenant_id, created_at)`, which is
-/// the right shape for a whole-tenant read but not for the per-sub-tenant reads
-/// and aggregations the tenant API serves: those have to re-scan the tenant's
-/// rows in the window. 0012 adds `(tenant_id, sub_tenant_id, created_at)`.
-///
-/// Asserting on `sqlite_master` rather than on the migration file means this
-/// catches the migration being dropped, renamed, or silently not embedded by
-/// `sqlx::migrate!` — "the file is in the repo" is not the claim.
+/// The ruling was "delete it, do not keep it", and this is the executable form: a fresh database
+/// must not have the table at all. (The migrations that CREATED and extended it are history and
+/// stay untouched — `sqlx::migrate!` checksums them, so editing them would break every existing
+/// database; a new migration is the only way to remove anything.)
 #[tokio::test]
-async fn the_sub_tenant_usage_index_exists() {
+async fn usage_record_is_gone() {
     let pool = common::setup_pool().await;
-    let rows = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_record' \
-         ORDER BY name",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("query sqlite_master indexes");
-    let names: Vec<String> = rows.iter().map(|r| r.get::<String, _>(0)).collect();
+    let rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .bind(DROPPED_USAGE_TABLE)
+        .fetch_all(&pool)
+        .await
+        .expect("query sqlite_master");
     assert!(
-        names.iter().any(|n| n == "idx_usage_record_sub_tenant"),
-        "migration 0012 must create idx_usage_record_sub_tenant, indexes were: {names:?}"
+        rows.is_empty(),
+        "migration 0013 must DROP {DROPPED_USAGE_TABLE}; it is still present in a fresh database"
     );
 
-    // And it must be on the columns the queries actually filter by, in order.
-    let sql: String = sqlx::query(
-        "SELECT sql FROM sqlite_master WHERE type = 'index' \
-         AND name = 'idx_usage_record_sub_tenant'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("index row")
-    .get(0);
-    for col in ["tenant_id", "sub_tenant_id", "created_at"] {
-        assert!(sql.contains(col), "index must cover {col}: {sql}");
-    }
+    // And the indexes that belonged to it went with it (SQLite drops them with the table) — a
+    // leftover index would mean the DROP did not run against the schema this test thinks it has.
+    let leftovers: Vec<String> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
+            .bind(DROPPED_USAGE_TABLE)
+            .fetch_all(&pool)
+            .await
+            .expect("query sqlite_master indexes")
+            .iter()
+            .map(|r| r.get::<String, _>(0))
+            .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the dropped table's indexes must go with it, found: {leftovers:?}"
+    );
 }
 
 /// T2.1 — `foreign_keys=ON` on the in-memory pool; `journal_mode=WAL` (which

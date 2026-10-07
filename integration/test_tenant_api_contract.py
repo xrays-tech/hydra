@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,9 +90,16 @@ def tenant(method, path, token=T1_TOKEN, body=None, host="contract.local", raw_b
                 host=host, raw_body=raw_body)
 
 
+# The node READS usage through ClickHouse, so the drill needs something that answers — and it has
+# to answer the way ClickHouse does (an aggregate over an empty window is one row of zeros, not an
+# empty body; see `_mock_clickhouse.py`). Before ADR-0002 this came for free from the node's own
+# SQLite database.
+MOCK = MockClickHouse()
+
+
 def start_node():
     env = dict(os.environ)
-    env.update(usage_env())
+    env.update(usage_env("clickhouse", MOCK.url))
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
@@ -183,6 +191,7 @@ def main():
         return 2
     shutil.rmtree(DIR, ignore_errors=True)
     os.makedirs(DIR, exist_ok=True)
+    MOCK.start()
     node = start_node()
     try:
         if not wait_healthy():
@@ -346,6 +355,7 @@ def main():
               st == 200 and "QQ" not in ids and "QQ2" not in ids, f"names={ids}")
     finally:
         stop(node)
+        MOCK.stop()
 
     print()
     if failures:

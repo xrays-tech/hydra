@@ -102,6 +102,75 @@ async fn build_state(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppSt
     )
 }
 
+/// A usage reader that always answers a real zero.
+///
+/// `for_tests` deliberately gives a node NO reader (ADR-0002 D-3 retired the local SQLite usage
+/// store, and "which store answers" belongs to the configured backend). The legs that need
+/// `GET /usage` to answer are about the tenant GATE, so they inject this.
+struct ZeroUsageQuery;
+
+impl hydra_server::usage::query::UsageQuery for ZeroUsageQuery {
+    fn aggregate<'a>(
+        &'a self,
+        _tenant_id: &'a str,
+        _since: &'a str,
+        _until: &'a str,
+        _group_by: hydra_server::usage::query::GroupBy,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        hydra_core::tenant_api::UsageAggregate,
+                        hydra_server::usage::query::UsageQueryError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Ok(hydra_core::tenant_api::UsageAggregate {
+                rows: Vec::new(),
+                totals: hydra_core::tenant_api::UsageTotals::default(),
+                as_of: None,
+            })
+        })
+    }
+
+    fn source(&self) -> &'static str {
+        "testing"
+    }
+}
+
+/// As [`build_state`], with the zero reader injected so `GET /usage` answers.
+async fn build_state_with_usage(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppState> {
+    let base = build_state(pool, cfg).await;
+    // The state is an `Arc<AppState>`; the reader is part of it, so it is injected at construction
+    // instead. Rebuild through the same path with the extra argument.
+    let _ = base;
+    let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
+        Arc::new(StaticKeyProvider::new([7u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), kp)
+        .await
+        .expect("ConfigStore::load");
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker::new"),
+    );
+    AppState::for_tests_with_usage(
+        store,
+        auth,
+        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
+        Arc::new(RateLimiter::new()),
+        Arc::new(NoopSink) as Arc<dyn UsageSink>,
+        ProxyConfig::default(),
+        TenantApiConfig::default(),
+        Some(Arc::new(ZeroUsageQuery) as Arc<dyn hydra_server::usage::query::UsageQuery>),
+    )
+}
+
 fn start_proxy(state: Arc<AppState>) -> String {
     let port = common::ephemeral_port();
     let listen = format!("127.0.0.1:{port}");
@@ -1606,8 +1675,22 @@ async fn an_out_of_range_timeout_ms_is_rejected() {
 ///
 /// E1 alone was covered; this pins all three, because the contract document for
 /// tenants states all three and a document is only as good as its test.
+/// The window a read asks for is computed from NOW: a hard-coded `since` ages out of the 31-day
+/// ceiling (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`) and turns the leg red on a date rather than on
+/// a change — measured 2026-10-07 on two drills that did exactly that.
+fn window() -> (String, String) {
+    let now = chrono::Utc::now();
+    (
+        (now - chrono::Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
+    let (since, until) = window();
     let pool = common::setup_pool().await;
     seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let mut t = hydra_server::db::get_tenant(&pool, "t1")
@@ -1618,7 +1701,7 @@ async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
         .await
         .expect("disable");
     // A cached allow, so E2 has something real to clear.
-    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let state = build_state_with_usage(&pool, TenantApiConfig::default()).await;
     state
         .auth
         .cache()
@@ -1646,11 +1729,14 @@ async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
         &root,
         "t1",
         TENANT_TOKEN,
-        "usage?since=2026-09-01T00:00:00Z&until=2026-09-02T00:00:00Z",
+        &format!("usage?since={since}&until={until}"),
     )
     .await;
     assert_eq!(s3, 200, "and must be able to read its own usage: {v3}");
-    assert_eq!(v3["source"], "sqlite", "{v3}");
+    assert_eq!(
+        v3["source"], "testing",
+        "the reader that answered is named in the envelope: {v3}"
+    );
 }
 
 /// A raw GET against a tenant path, for the cases that need a URL the

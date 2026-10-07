@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,7 +63,7 @@ def call(method, url, token=None, body=None, timeout=5):
 
 def start(label, admin, data, rate, invalidate):
     env = dict(os.environ)
-    env.update(usage_env())
+    env.update(usage_env("clickhouse", MOCK.url))
     env.update({
         "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin}",
         "HYDRA_LISTEN": f"127.0.0.1:{data}",
@@ -85,6 +86,12 @@ def wait_healthy(admin, budget=25.0):
             return True
         time.sleep(0.25)
     return False
+
+
+# `GET /usage` is how this drill spends the tenant's request budget, and the handler checks the
+# READER before it validates the window — so a node with no reader answers 503 instead of the 400
+# the legs expect. A ClickHouse double gives the node a reader; nothing is written to it.
+MOCK = MockClickHouse()
 
 
 def bring_up(label, admin, data, rate, invalidate):
@@ -143,6 +150,7 @@ def main():
         print(f"   (killed leftover instance(s) of OUR build: {killed})")
     time.sleep(0.5)
 
+    MOCK.start()
     procs = []
     try:
         # A: the authorised-request cap, and the documented "counts rejected requests" clause
@@ -187,6 +195,7 @@ def main():
         st, _, _ = call("GET", "http://127.0.0.1:18497/tenant/t1/api/v1/whoami", token=TENANT_TOKEN)
         check("a 0 cap falls back to the documented default (the request is served)", st == 200, f"HTTP {st}")
     finally:
+        MOCK.stop()
         for p in procs:
             if p.poll() is None:
                 p.send_signal(signal.SIGKILL)

@@ -113,7 +113,7 @@ docker compose -f environment/docker-compose.cluster.yml start hydra-a  # 以成
 ```
 
 > 集群必须项：`HYDRA_CLUSTER_PEERS`（三个节点的值逐字相同）、**每台各自的** `HYDRA_NODE_ID` 与
-> `HYDRA_ARACHNE_LISTEN`（且后者必须与成员表里自己那一项一致）、`HYDRA_USAGE_SINK=clickhouse`
+> `HYDRA_ARACHNE_LISTEN`（且后者必须与成员表里自己那一项一致）、`HYDRA_USAGE_SINK`（必填）
 > （fail-closed）、`HYDRA_REDIS_URL`、`HYDRA_ADMIN_TOKEN`（每个节点都要）、
 > `HYDRA_ENCRYPTION_KEY`（全集群一致）。**建议显式设 `HYDRA_CLUSTER_ID`**，否则将来无法改成员表
 > （原因见 `cluster.md` §6.3）。
@@ -333,7 +333,7 @@ kubectl -n hydra delete pod hydra-<writer> --grace-period=0 --force
 | `HYDRA_REDIS_MODE` | — | 只接受 `single` | 其它值（含拼错）快速失败；单节点默认下不读取 |
 | `HYDRA_ADMIN_TOKEN` | 必填 | **每台必填** | 每个节点都有自己的管理 API |
 | `HYDRA_ENCRYPTION_KEY` | 必填 | 必填，全集群一致 | 主密钥（provider key/证书私钥） |
-| `HYDRA_USAGE_SINK` | `sqlite` 默认 | **必须 `clickhouse`** | fail-closed（逐节点 sqlite 用量在集群里无意义） |
+| `HYDRA_USAGE_SINK` | **必填，无默认** | `clickhouse`（共享用量存储，集群的实际选择）或 `none`（显式不计量）。`sqlite` 已于 2026-10-07 退役并**按名字**拒绝 | 逐节点用量在集群里必然是错答案；`none` 在集群里也是合法选择，但启动会大声说明本集群不计量 |
 | `HYDRA_DB_URL` | `sqlite:hydra.db?mode=rwc` | 每台独立数据卷 | 本地 SQLite 是可重建的物化状态 |
 | `HYDRA_ARACHNE_DATA_DIR` | — | 默认 `/app/data/arachne` | raft 数据目录，**必须在持久卷上** |
 | `HYDRA_LISTEN` / `HYDRA_ADMIN_ADDR` | `0.0.0.0:8080` / `127.0.0.1:8081` | 同左（集群里管理口要 `0.0.0.0` 才能被探针访问） | 代理（明文，恒定）/ 管理端口 |

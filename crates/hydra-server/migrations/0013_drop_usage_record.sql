@@ -1,0 +1,28 @@
+-- ===========================================================================
+-- 0013 — DROP the SQLite usage table (ADR-0002 D-3, user ruling "delete it")
+-- ===========================================================================
+--
+-- READ THIS BEFORE UPGRADING: **this migration is destructive and irreversible.**
+--
+-- Why it exists at all: from 2026-10-07 usage goes ONLY to ClickHouse, and the
+-- local table stopped being written and read in the same release. Leaving it
+-- behind was the alternative ("keep it, mark it retired"), and it was ruled out:
+-- a table nothing writes is a table that looks like a configuration mistake, and
+-- keeping it invites exactly the per-node usage store this change removes.
+--
+-- What an operator must do FIRST, in order:
+--   1. back up the database file (`sqlite3 hydra.db "VACUUM INTO 'usage-backup.db'"`,
+--      see dev-docs/ops.md §"Backup");
+--   2. export the usage rows if they are still needed
+--      (`sqlite3 -header -csv hydra.db "SELECT * FROM usage_record" > usage.csv`);
+--   3. then upgrade. After the first start of the new binary the table — and every
+--      row in it — is gone, and `GET /usage` answers only what ClickHouse holds.
+--
+-- Rollback, and it is one-way: `sqlx::migrate!` records this migration as applied,
+-- so reverting the CODE leaves a version that exists in the database and not in the
+-- binary (`VersionMissing`) — the file from step 1 is the way back, or deleting
+-- this row from `_sqlx_migrations` by hand.
+--
+-- The ClickHouse table of the same name is NOT touched: it is a different database
+-- and stays the one usage store.
+DROP TABLE IF EXISTS usage_record;

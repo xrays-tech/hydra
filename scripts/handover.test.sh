@@ -39,6 +39,8 @@ start() { # start <label> [flags...]
   local label="$1"; shift
   env HYDRA_ADMIN_TOKEN="$TOKEN" HYDRA_ADMIN_ADDR="127.0.0.1:$ADMIN" HYDRA_LISTEN="127.0.0.1:$LISTEN" \
       HYDRA_DB_URL="sqlite://$DB?mode=rwc" \
+      # Required since ADR-0002 D-1; this script is not about metering, so usage is off.
+      export HYDRA_USAGE_SINK=none
       HYDRA_ENCRYPTION_KEY="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
       HYDRA_SHUTDOWN_DRAIN_SECS=1 \
       RUST_LOG=info "$BIN" "$@" > "$DIR/$label.log" 2>&1 &

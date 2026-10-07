@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """A REAL HTTP ClickHouse double for drills that assert what was written (ADR-0002 T3.10).
 
+It answers READS the way ClickHouse does — an aggregate over an empty window returns one row of
+zeros (NOT an empty body, which the reader correctly treats as a decode failure) — so a drill that
+reads `/usage` is measuring the real reader.
+
 This is not a mock of Hydra: the drill still starts the real binary, which still goes through the
 real writer, the real transport and real HTTP. What stands in is only the database, and it RECORDS
 what it was sent — so "the usage row landed" stays a measurement. That matters because the three
@@ -50,9 +54,10 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = (parse_qs(parsed.query).get("query") or [""])[0]
         server = self.server
+        upper = query.strip().upper()
         with server.lock:
             server.requests.append({"path": self.path, "query": query, "body": raw.decode("utf-8", "replace")})
-            if query.strip().upper().startswith("INSERT"):
+            if upper.startswith("INSERT"):
                 server.inserts += 1
                 for line in raw.decode("utf-8", "replace").splitlines():
                     line = line.strip()
@@ -62,6 +67,28 @@ class _Handler(BaseHTTPRequestHandler):
                         server.rows.append(json.loads(line))
                     except json.JSONDecodeError:
                         server.bad_lines.append(line)
+                return self._respond(200)
+            if upper.startswith("SELECT"):
+                # AGGREGATE queries over an empty window do NOT return an empty body: ClickHouse's
+                # `count()`/`sum()` with no GROUP BY returns exactly ONE row (of zeros here), and
+                # the reader treats an empty body as a DECODE FAILURE on purpose ("I could not read
+                # the store" must never look like "you used nothing").
+                #
+                # Measured 2026-10-07: answering with an empty body made three drill legs report
+                # `decode_error: totals: Malformed("empty body")` — the double was wrong, not the
+                # reader. `last_seen: ""` is what ClickHouse returns for `MAX(created_at)` over no
+                # rows, and the reader maps it to `as_of: null`.
+                if "GROUP BY" in upper:
+                    return self._respond(200, "")  # zero grouped rows is the honest answer
+                totals = {
+                    "requests": "0",
+                    "tokens_in": "0",
+                    "tokens_out": "0",
+                    "cache_hit_tokens": "0",
+                    "errors": "0",
+                    "last_seen": "",
+                }
+                return self._respond(200, json.dumps(totals) + "\n")
         self._respond(200)
 
     def do_GET(self) -> None:  # noqa: N802

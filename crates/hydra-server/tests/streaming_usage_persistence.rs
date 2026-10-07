@@ -2,7 +2,7 @@
 //!
 //! Proves that streaming SSE responses through the real Pingora proxy have
 //! their usage tokens correctly extracted (by `UsageScanner`) and persisted
-//! (by `SqliteSink`) into the `usage_record` table — closing the gap between
+//! (by the usage sink) — closing the gap between
 //! the pure-core scanner tests and the real proxy+sink pipeline.
 //!
 //! Both format paths are covered:
@@ -12,9 +12,9 @@
 //!   `message_delta` in ONE mock body (the BUG-1 scenario) → prompt=42,
 //!   completion=13, cached=7, total=55 in SQLite.
 //!
-//! Deterministic flush strategy: `SqliteSink` with `batch_size=1` so each
+//! Deterministic observation strategy: a recording sink so each
 //! record flushes immediately when the background task polls the channel,
-//! combined with a bounded retry loop polling `usage_record` (no bare sleeps).
+//! combined with a bounded retry loop polling the sink (no bare sleeps).
 
 #![cfg(feature = "db")]
 
@@ -25,6 +25,7 @@ use std::time::Duration;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{
     LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
+    UsageRecord,
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
@@ -34,11 +35,9 @@ use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
 use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::store::ConfigStore;
-use hydra_server::usage::backends::sqlite::SqliteSink;
 use hydra_server::usage::UsageSink;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
-use sqlx::Row;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -217,40 +216,57 @@ struct UsageRow {
     model_key: String,
 }
 
-/// Poll `usage_record` until at least one row exists (retry loop, ~5s timeout),
-/// then return the token values from the most recent row. This makes the test
-/// deterministic: no bare sleeps, no timing assumptions.
-async fn wait_for_usage_row(pool: &sqlx::SqlitePool) -> UsageRow {
-    for _ in 0..100 {
-        let count: i64 = sqlx::query("SELECT COUNT(*) AS c FROM usage_record")
-            .fetch_one(pool)
-            .await
-            .expect("count usage_record")
-            .get::<i64, _>("c");
-        if count > 0 {
-            let row = sqlx::query(
-                "SELECT tokens_in, tokens_out, cache_hit_tokens, model_key \
-                 FROM usage_record ORDER BY id DESC LIMIT 1",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("select usage_record");
-            return UsageRow {
-                prompt: row.get("tokens_in"),
-                completion: row.get("tokens_out"),
-                cached: row.get("cache_hit_tokens"),
-                model_key: row.get("model_key"),
-            };
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("no usage_record row appeared after 5s — sink did not flush");
+/// A sink that KEEPS the records the proxy hands it.
+///
+/// This test used to write through a real `SqliteSink` and poll the `usage_record` table. That
+/// store is retired (ADR-0002 D-3), and the property under test is "the streaming path produces a
+/// usage record with the tokens the upstream reported" — a claim about the proxy's logging path,
+/// for which the sink is the instrument, not the subject. The sink still goes through the shared
+/// batching engine (`run_channel_sink`), so a record that never reaches the backend would still
+/// show up here as a failure.
+#[derive(Clone, Default)]
+struct RecordingSink {
+    delivered: std::sync::Arc<std::sync::Mutex<Vec<UsageRecord>>>,
 }
 
-/// Build the full AppState from a seeded pool, using a REAL `SqliteSink`
-/// (batch_size=1 → each record flushes immediately; flush_secs=3600 → only
-/// batch-size triggers, no timer dependency) backed by the same pool.
-async fn build_state_with_sqlite_sink(pool: sqlx::SqlitePool) -> std::sync::Arc<AppState> {
+impl RecordingSink {
+    /// Poll until a record has been delivered (no bare sleeps; ~5 s budget).
+    async fn wait_for_a_record(&self) -> UsageRow {
+        for _ in 0..100 {
+            if let Some(r) = self
+                .delivered
+                .lock()
+                .expect("delivered mutex")
+                .last()
+                .cloned()
+            {
+                return UsageRow {
+                    prompt: r.tokens_in.map(|v| v as i64),
+                    completion: r.tokens_out.map(|v| v as i64),
+                    cached: r.cache_hit_tokens.map(|v| v as i64),
+                    model_key: r.model_key,
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no usage record reached the sink after 5s — the streaming path did not meter");
+    }
+}
+
+impl UsageSink for RecordingSink {
+    fn record(
+        &self,
+        record: UsageRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.delivered.lock().expect("delivered mutex").push(record);
+        Box::pin(async {})
+    }
+}
+
+/// Build the full AppState from a seeded pool, with the recording sink as the usage store.
+async fn build_state_with_recording_sink(
+    pool: sqlx::SqlitePool,
+) -> (std::sync::Arc<AppState>, RecordingSink) {
     let key_provider: std::sync::Arc<dyn KeyProvider> =
         std::sync::Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider)
@@ -265,11 +281,9 @@ async fn build_state_with_sqlite_sink(pool: sqlx::SqlitePool) -> std::sync::Arc<
     );
     let breaker = std::sync::Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = std::sync::Arc::new(RateLimiter::new());
-    // batch_size=1: each record triggers an immediate flush in the background
-    // task (no waiting for a timer). flush_secs=3600: only the size threshold
-    // fires within the test window.
-    let sink: std::sync::Arc<dyn UsageSink> = std::sync::Arc::new(SqliteSink::new(pool, 1, 3600));
-    AppState::for_tests(
+    let recording = RecordingSink::default();
+    let sink: std::sync::Arc<dyn UsageSink> = std::sync::Arc::new(recording.clone());
+    let state = AppState::for_tests(
         store,
         auth,
         breaker,
@@ -277,7 +291,8 @@ async fn build_state_with_sqlite_sink(pool: sqlx::SqlitePool) -> std::sync::Arc<
         sink,
         ProxyConfig::default(),
         hydra_server::tenant_api::TenantApiConfig::default(),
-    )
+    );
+    (state, recording)
 }
 
 // ===========================================================================
@@ -321,7 +336,7 @@ async fn openai_streaming_usage_persists_to_sqlite() {
         "gpt-4",
     )
     .await;
-    let state = build_state_with_sqlite_sink(pool.clone()).await;
+    let (state, sink) = build_state_with_recording_sink(pool.clone()).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -339,7 +354,7 @@ async fn openai_streaming_usage_persists_to_sqlite() {
 
     // Poll the DB until the sink flushes the usage record (batch_size=1 →
     // immediate flush once the bg task drains the channel).
-    let row = wait_for_usage_row(&pool).await;
+    let row = sink.wait_for_a_record().await;
     assert_eq!(row.model_key, "gpt-4");
     assert_eq!(row.prompt, Some(10), "tokens_in from OpenAI usage");
     assert_eq!(row.completion, Some(5), "tokens_out from OpenAI usage");
@@ -392,7 +407,7 @@ async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
         "claude-3-5-sonnet-test",
     )
     .await;
-    let state = build_state_with_sqlite_sink(pool.clone()).await;
+    let (state, sink) = build_state_with_recording_sink(pool.clone()).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/messages");
     let client = test_client();
@@ -406,7 +421,7 @@ async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
         "SSE body should contain message_stop"
     );
 
-    let row = wait_for_usage_row(&pool).await;
+    let row = sink.wait_for_a_record().await;
     assert_eq!(row.model_key, "claude-3-5-sonnet-test");
     assert_eq!(row.prompt, Some(42), "input_tokens → tokens_in");
     assert_eq!(

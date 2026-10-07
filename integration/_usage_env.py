@@ -30,11 +30,11 @@ import os
 
 # The value a drill's node gets unless it asks for something else.
 #
-# It is `sqlite` TODAY and becomes `none` in the same commit that retires SQLite (ADR-0002 Phase 2):
-# the three drills that assert usage ROWS read them out of SQLite until they are re-pointed at
-# `_mock_clickhouse.py`, so flipping it earlier would break them for the wrong reason. Keeping the
-# flip next to the retirement is what makes this helper the transition instead of a second surprise.
-DEFAULT_KIND = "sqlite"
+# `none`, because SQLite is retired (ADR-0002 D-3) and a drill that does not read usage should not
+# make the node write it — nor point a sink at a ClickHouse that is not running, which is what the
+# twelve drills with a dead URL as a boot dependency have to do. A drill that ASSERTS usage rows
+# asks for `clickhouse` explicitly and pairs it with `_mock_clickhouse.py`.
+DEFAULT_KIND = "none"
 
 
 def usage_env(kind: str | None = None, url: str | None = None, *, dead: bool = False) -> dict:

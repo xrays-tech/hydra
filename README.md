@@ -46,7 +46,7 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 - **External auth**: each tenant points to its own `auth_url`; Hydra caches verdicts 5 min and exposes an invalidation endpoint (the tenant decides欠费/封禁).
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.
-- **Usage recording**: pluggable sink (SQLite default, ClickHouse optional); **granular token breakdown**: `prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_tokens` (OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`); **latency metrics**: `forward_latency_ms` (Hydra overhead before provider call) + `ttft_ms` (time to first token). All numeric fields default to 0 (no NULLs).
+- **Usage recording**: pluggable sink (**ClickHouse** — the shared store — or `none` to switch metering off; the retired per-node SQLite sink was removed 2026-10-07); **granular token breakdown**: `prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_tokens` (OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`); **latency metrics**: `forward_latency_ms` (Hydra overhead before provider call) + `ttft_ms` (time to first token). All numeric fields default to 0 (no NULLs).
 - **Per-tenant TLS**: SNI-based certificate selection with hot-reload (BoringSSL/OpenSSL).
 - **Admin REST + UI**: full CRUD for all config entities, Prometheus `/metrics`, embedded dashboard.
 
@@ -84,7 +84,7 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | `HYDRA_ADMIN_ADDR`   | `127.0.0.1:8081`                 | Admin REST + UI + `/metrics` listen address          |
 | `HYDRA_ADMIN_TOKEN`  | —                                | Bearer token gating `/api/v1/*` (**required for admin**) |
 | `HYDRA_ENCRYPTION_KEY` | —                              | Base64 of 32 bytes; encrypts provider api-keys at rest (**required**, fail-closed). Generate: `openssl rand 32 \| base64`. |
-| `HYDRA_USAGE_SINK`   | `sqlite`                         | `sqlite` or `clickhouse`                             |
+| `HYDRA_USAGE_SINK`   | — (**required**)                 | `clickhouse` (shared store) or `none` (no metering)   |
 | `HYDRA_CLICKHOUSE_URL` | —                              | ClickHouse HTTP endpoint (when sink=clickhouse)      |
 | `RUST_LOG`           | `info`                           | Log level                                            |
 

@@ -33,6 +33,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 
+from _mock_clickhouse import MockClickHouse
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,9 +126,16 @@ def proxied(key=CLIENT_KEY):
                 body={"model": "echo", "messages": [{"role": "user", "content": "hi"}]})
 
 
+# The node READS usage through ClickHouse, so the drill needs something that answers — and it has
+# to answer the way ClickHouse does (an aggregate over an empty window is one row of zeros, not an
+# empty body; see `_mock_clickhouse.py`). Before ADR-0002 this came for free from the node's own
+# SQLite database.
+MOCK = MockClickHouse()
+
+
 def start_node():
     env = dict(os.environ)
-    env.update(usage_env())
+    env.update(usage_env("clickhouse", MOCK.url))
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
@@ -209,6 +217,7 @@ def main():
     os.makedirs(DIR, exist_ok=True)
     upstream = ThreadingHTTPServer(("127.0.0.1", UPSTREAM), Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    MOCK.start()
     node = start_node()
     try:
         if not wait_healthy():
@@ -338,6 +347,7 @@ def main():
               f"HTTP {st} as_of={empty.get('as_of')!r} requests={empty.get('requests')!r}")
     finally:
         stop(node)
+        MOCK.stop()
         upstream.shutdown()
 
     print()

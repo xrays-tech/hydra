@@ -25,6 +25,12 @@ pub use engine::UsageSink;
 pub use query::UsageQuery;
 
 pub mod backends;
+/// The shared batching engine. It has exactly ONE user today (the ClickHouse backend), so a build
+/// without `usage-clickhouse` compiles it unused — which is what the attribute says, rather than
+/// deleting the machinery that the next backend is supposed to reuse (ADR-0002 §4 step 2: a backend
+/// gets the delivery policy for free; re-implementing it would be a second policy with its own
+/// drop-accounting, and the drop counters are what an operator alerts on).
+#[cfg_attr(not(feature = "usage-clickhouse"), allow(dead_code, unused_imports))]
 pub mod engine;
 pub mod query;
 
@@ -201,6 +207,13 @@ pub enum BackendError {
         feature: &'static str,
     },
 
+    #[error("HYDRA_USAGE_SINK={kind} was RETIRED and is refused: {why}. Set {instead}")]
+    Retired {
+        kind: &'static str,
+        why: &'static str,
+        instead: &'static str,
+    },
+
     /// The configuration is present but unusable. `message` is the backend's own actionable text
     /// (it knows what its transport can and cannot do).
     #[error("{kind}: {message}")]
@@ -209,13 +222,33 @@ pub enum BackendError {
 
 /// Every backend this build knows, in the order they are listed to an operator.
 pub static REGISTRY: &[&UsageBackend] = &[
-    // Row 1 is the RETIRED single-node store, kept until Phase 2 deletes it (its descriptor exists
-    // so that "sqlite" is still a known value rather than an unknown one while it is being retired).
-    &backends::sqlite::DESCRIPTOR,
+    // The shared store every cluster node writes to (ADR-0002: the only delivered backend).
     &backends::clickhouse::DESCRIPTOR,
     // Switching usage OFF is a registered choice, not an absence of one (ADR-0002 D-2).
     &backends::none::DESCRIPTOR,
 ];
+
+/// Values that were usage backends and are NOT any more (ADR-0002 D-3, user ruling: the table is
+/// dropped, not kept).
+///
+/// They are listed so a deployment that still sets one is TOLD what happened and what to set
+/// instead, rather than being told the value is not a backend (which reads like a typo). The
+/// reconciliation guard (`scripts/check_usage_backends.cjs`) checks that nothing here can be
+/// selected again.
+pub static RETIRED_USAGE_SINKS: &[RetiredSink] = &[RetiredSink {
+    kind: "sqlite",
+    why:
+        "it wrote usage into the node's OWN database, so a cluster's usage was scattered across \
+          nodes and the node answering GET /usage was usually not the one that recorded the request",
+    instead: "clickhouse (the shared store) — or none to record nothing at all",
+}];
+
+/// A retired `HYDRA_USAGE_SINK` value.
+pub struct RetiredSink {
+    pub kind: &'static str,
+    pub why: &'static str,
+    pub instead: &'static str,
+}
 
 /// The descriptors, as a list of kinds — for error messages and for guards.
 #[must_use]
@@ -229,6 +262,15 @@ pub fn known_kinds() -> String {
 
 /// Look a backend up by its `HYDRA_USAGE_SINK` value.
 pub fn descriptor(kind: &str) -> Result<&'static UsageBackend, BackendError> {
+    if let Some(retired) = RETIRED_USAGE_SINKS.iter().find(|r| r.kind == kind) {
+        // Checked FIRST: "sqlite" is not a typo, it is a value this product used to ship, and the
+        // operator needs the difference (and the replacement) rather than a list of valid values.
+        return Err(BackendError::Retired {
+            kind: retired.kind,
+            why: retired.why,
+            instead: retired.instead,
+        });
+    }
     REGISTRY
         .iter()
         .find(|b| b.kind == kind)
@@ -444,8 +486,11 @@ mod tests {
     #[tokio::test]
     async fn opening_a_backend_returns_the_writer_and_the_reader() {
         let cfg = BackendConfig::new(pool().await).with_env(EnvView::fixed(&[]));
-        let opened = open("sqlite", &cfg).expect("the sqlite backend opens");
-        assert_eq!(opened.query.expect("it reads").source(), "sqlite");
+        let opened = open("none", &cfg).expect("the none backend opens");
+        assert!(
+            opened.query.is_none(),
+            "a backend that declares it cannot read must not hand back a reader"
+        );
     }
 
     /// The declared read contract and what `open` returned must agree, in BOTH directions: a

@@ -537,14 +537,15 @@ v3 的做法是往 `AppState` 放一个 `usage_backend: UsageBackend { Sqlite, C
 
 ```
 main.rs 启动时按 sink kind 选择唯一实现，注入 AppState：
-  sink_kind == "sqlite"      → Arc<SqliteUsageQuery>      (pool: SqlitePool)
+  ADR-0002 起：`usage::open(kind)` 一次给出 (写, 读)，后端由 `usage::REGISTRY` 唯一拥有
+  （`sqlite` 已退役；`clickhouse` 需要 URL；`none` 显式声明读不了 ⇒ /usage 回 503）
   sink_kind == "clickhouse"  → Arc<ClickHouseUsageQuery>  (cfg: 共享解析出的 CH 配置)
 AppState.usage: Arc<dyn UsageQuery>
 ```
 
 - E3 里**没有分支**：只有一个 `self.state.usage.aggregate(tenant_id, since, until, group_by)` 调用。
 - "返回假 0"的风险从"运行时分支写错"降级为"启动时注入错实现"——单点、可被一条启动断言测试覆盖（§10.2 T14：断言注入的实现与 `sink_kind` 一致，两种组合各一条）。
-- **为什么不能省掉这个字段、只按"有没有 pool"判断**（v3 的论据仍然成立）：集群下 leader 也**有**本地 SQLite（`main.rs:285-293` 只按 `role == Edge` 决定 pool），而那份 `usage_record` **一行都没写过**（sink 是 ClickHouse）→ 只按 pool 判断会让 leader 拿空表返回 `{"requests":0}`。
+- **为什么不能省掉这个字段、只按"有没有 pool"判断**：**2026-10-07 起这个问题消失了** —— 本地用量表已被删除（ADR-0002 D-3），每个节点都有本地库但**没有任何**用量行，"有没有 pool"不再与"能不能读用量"相关。读能力现在由**描述符**给出（`ReaderContract::SameBackend | Unavailable{why}`），`main` 与测试都从 `usage::open` 拿。原论据（集群下 leader 也有本地 SQLite，而那份 `usage_record` 一行都没写过 ⇒ 按 pool 判断会拿空表返回 `{"requests":0}`）记录在此，作为当初为什么必须有这个字段的凭据。
 - **集群下也不需要转发**：ClickHouse 是**共享外部存储**，任何节点（含 edge）查到的都是同一份数据 → E3 在全部角色上可用，且与 §6.2"本设计不需要任何转发"的结论一致。
 - `source` 字段由实现自身填写（`"sqlite"` / `"clickhouse"`），而不是由调用方推断——同一份能力对象同时回答"数据从哪来"。
 
