@@ -96,7 +96,7 @@
 | 今日覆盖 | 处置 | 之后由谁承担 |
 |---|---|---|
 | `sqlite_sink.rs` 10 条：批量/退避/关闭排空/行内容 | **改靶**：引擎是共享的（`run_channel_sink`），把靶子从 `SqliteSink` 换成 `usage::testing` 的记录型后端 | 同一批断言 + `usage::conformance` 套件 |
-| `usage_query.rs` 13 条 sqlite 腿：窗口口径/分组/边界归一/响应形状 | **拆**：与存储无关的（边界校验、`group_by` 白名单、`tenant_id` 参数、响应信封、`since` 归一）改用 `usage::testing` 的 reader 驱动；**与 SQLite SQL 有关的（T15"逐字段对手写 SQL"）随存储一起消失** | 前者：同一批 HTTP 断言；后者：CH 侧已有 12 条，**并需补 1 条"CH 聚合 == 手跑 SQL"的活实例测试**（`--ignored`，CLI 基线本就有） |
+| `usage_query.rs` 14 条 sqlite 腿（该文件 31 条的其余部分为 12 条 CH 腿 + 5 条 kind 分派腿）：窗口口径/分组/边界归一/响应形状 | **拆**：与存储无关的（边界校验、`group_by` 白名单、`tenant_id` 参数、响应信封、`since` 归一）改用 `usage::testing` 的 reader 驱动；**与 SQLite SQL 有关的（T15"逐字段对手写 SQL"）随存储一起消失** | 前者：同一批 HTTP 断言；后者：CH 侧已有 12 条，**并需补 1 条"CH 聚合 == 手跑 SQL"的活实例测试**（`--ignored`，CLI 基线本就有） |
 | `streaming_usage_persistence.rs` 2 条：流式请求也记账 | 改靶到记录型后端（断言"流式路径调到 `record`"），落库侧交由 CH 线缆测试 | 同上 |
 | 引擎的"通道满/保留上限/关闭未排空"四种丢弃计数 | 与 sink 无关，**保留**；靶子换成记录型后端 | 不变 |
 | `for_tests()` 默认可用 reader | 改为**显式注入**（没有 reader 就是"这个节点没有可读的用量存储"，即真实的 503 契约） | `usage::testing` |

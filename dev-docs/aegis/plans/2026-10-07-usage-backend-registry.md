@@ -74,8 +74,8 @@
 | # | 落点 | 判据 / 移交 |
 |---|---|---|
 | **T3.1** | `tests/sqlite_sink.rs`（10 条）改靶到 `usage::testing` 的记录型后端，成为**引擎一致性套件** `usage::conformance` | 10 条断言的语义逐条保留（批量按大小/按时间、退避重试、关闭排空、`Drop` 不可依赖、掩码 key 等） |
-| **T3.2** | `tests/usage_query.rs`（31 条）拆：① 存储无关的 13 条（窗口边界归一、`group_by` 白名单、`tenant_id` 参数不可改归属、响应信封与 `as_of`、无 reader ⇒ 503）改由 `usage::testing` 的 reader 驱动；② 与 SQLite SQL 绑定的（`sqlite_*` 对手写 SQL 的逐字段比对）**删除**并在文档记账 | CH 侧的 12 条已有；T3.5 核对 `live_clickhouse_aggregate_matches_a_hand_run_query`（`--ignored`）是否逐字段覆盖了被删的那一类，缺则补 |
-| **T3.3** | `tests/streaming_usage_persistence.rs`（2 条）改靶：断言"流式路径确实调用了 `record`"，落库形状交给 CH 线缆测试 | 流式仍计量这一条**不能丢**（它曾是 P1） |
+| **T3.2** | `tests/usage_query.rs`（31 条 = 14 条 SQLite 腿 + 12 条 CH 腿 + 5 条 kind 分派腿）拆：① 存储无关的腿（窗口边界归一、`group_by` 白名单、`tenant_id` 参数不可改归属、响应信封与 `as_of`、无 reader ⇒ 503）改由 `usage::testing` 的 reader 驱动；② 与 SQLite SQL 绑定的（`sqlite_*` 对手写 SQL 的逐字段比对）**删除**并在文档记账 | CH 侧的 12 条已有；T3.5 核对 `live_clickhouse_aggregate_matches_a_hand_run_query`（`--ignored`）是否逐字段覆盖了被删的那一类，缺则补 |
+| **T3.3** | `tests/streaming_usage_persistence.rs`（2 条，整份文件的前提）改靶：断言"流式路径确实调用了 `record`"，落库形状交给 CH 线缆测试 | 流式仍计量这一条**不能丢**（它曾是 P1） |
 | **T3.4** | `AppState::for_tests()`：去掉默认注入的 SQLite reader，改为 `None`；需要 reader 的用例显式用 `for_tests_with_usage(…, Some(usage::testing::reader()))`（20 处站点逐个看，不批量替换） | 每个站点要么无 reader（503 契约），要么显式注入 |
 | **T3.5** | 文档同步（ADR-0002 §8 的清单）：`ops.md`（§1.1 默认列 → 必填无默认、§9/§9.1、§12）、`design.md`（§9.2/§9.3/SQLite DDL 段/模块图）、`deployment.md`、`cluster.md`、`jiqun-deploy.md`、`design-tenant-api.md`（§547 的论据改挂读契约）、`admin-ui/api-docs.js`、`README*`；`usage-backends.md` 补 SQLite 的退役行 | 逐处 grep 校对：不再有"默认 sqlite"、"集群必须 clickhouse"（该措辞在只剩一个后端后失效）这类句子 |
 | **T3.6** | 守卫同步：`check_documented_defaults`（移入"必填无默认"名单）、`check_documented_env`、`check_compose_env`、`check_e2e_contracts`（若演练用到 sink 值）、`check_usage_backends`（新增 `sqlite` 退役行） | 全部守卫绿；`check_usage_backends` 的反向证伪逐条实测 |
