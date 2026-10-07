@@ -967,6 +967,32 @@ FAIL  gate 5: a real request still flows through the data plane on the survivor 
 
 **因此只剩两个候选，且区分它们只需要一次倾倒**：①发布出去的**树本身**就没有该行（部分发布）；②树里有、但该节点**数据面用的运行时快照**里没有。倾倒已接在 gate 5 的失败分支上：幸存者管理面六类实体的读回（= 它**库**里有什么）、三节点的 `hydra_arachne_publish_total` / `hydra_arachne_quorum_unavailable_total` / `hydra_replica_materialize_retries_total`、以及每份日志里 `PUBLISH FAILED` 的行（整份扫描，不只看尾部）。
 
+**第三次捕获（2026-10-07，commit `9c7051b` 的 rerun 第 5 次；`live-deps` 的 `cluster rate limits` 步骤）——两个候选都被它回答了一半，而且答案比两个候选都更早一步**：
+
+```
+--- which member held the raft writer ---      /healthz/leader   A:503   B:200        ⇒ 写者是 B
+--- seed POST statuses (12 writes) ---         全部 201（含 tenant-providers 三次：t1、t2、t3）
+--- what A's admin API serves back (A 自己的库) ---
+    A GET /tenant-providers -> HTTP 200 :: [{tp-t2,t2},{tp-t3,t3}]     ← **tp-t1 不在**
+    A GET /tenant-models    -> HTTP 200 :: [{tm-t1},{tm-t2},{tm-t3}]   ← 三条都在
+--- publish on both nodes ---                  cl-a: {result="ok"} 12 ; cl-b: 无序列
+--- materialization on both nodes ---          两边都是 attempt 2 / succeeded 2
+--- cl-a.log / cl-b.log: publish failures      0 / 0
+--- data plane :18861 / :18871 -> HTTP 403 tenant_forbidden
+```
+
+**读法（这是目前最硬的一条）**：12 次写入全部 201、12 次发布全部报 `ok`、两边物化都 `succeeded`、没有任何 `PUBLISH FAILED`——**而那条行在"亲手接收它并发布了 12 次的那台节点的库里就不存在"**（A 是接收方与发布方，B 是写者；两条数据面因此都回 403）。所以问题**不在跨节点传播（候选①②都还不到）**，而在**本节点的写入/物化闭环**：一次被确认的写没有留在配置里。同一份日志里还有第二处同形的矛盾：节点自己 WARN `provider 'p1' has weight 1 but no api_keys`（= 它**构建出来的配置**里缺 provider-keys），而同一时刻管理面读回显示这行**在库里**。
+**由此新增的排除项**：不是"等得不够"（30 s、两侧都 403、而且是库本身缺行，不是数据面滞后）。**倾倒里的一处自我更正**：第一版读回查的是 `A_ADMIN` 却标成 "writer"，而写者是 B——倾倒**报错了它读的是谁的库**，等于把最有价值的事实贴到错误的节点上；现在两个节点都读、且各自标注角色（follower/writer）。
+
+### CI 红了：三分钟判断是不是这条已知间歇
+
+**症状**（`live-deps` 作业内，出现在 `cluster rate limits` / `auth cache layers` / `tenant write publish failure` / `arachne control plane` 任一步）：
+`HTTP 403 {"message":"tenant_forbidden"}`、或 `503 config_not_published`（多数派健康时）、或 `CANNOT VERIFY: a member never served the seeded tenant` / `a member never routed the tenant`。
+
+**判断步骤**：① 看步骤名与消息形状是否命中上面任一条；② 若是，**不要先怀疑本次改动**——它是同一族间歇（本地 100/100，CI 上同一 commit 重跑也时红时绿）；③ 取证用 `.acceptance/hunt-flake.sh <run-id> [样本数]`（重跑同一 commit、一红即把作业日志落盘到 `.cargo-cache/flake-hunt/failed-N.log`；`gh run rerun` 在 run 未定型时会拒绝，脚本已处理）；④ 日志里直接读四段：`which member held the raft writer`、`seed POST statuses`、两个节点各自的 `GET /<实体>` 读回、`publish`/`materialization` 计数器。
+
+**状态**：**已知、未修、未定性到根因**。已排除的假设（下一轮不必重推）：跨节点传播、物化不换快照、部分实体只写本地不发布、等待时间不够、ClickHouse 凭据（那是另一条，已修并已在 CI 验证）。**下一步的决定性观察**：第二次捕获若呈**同一形状**（确认过的写在**接收方自己的库里**缺失），即可定性为确定性缺陷；在那之前不给修法。
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。

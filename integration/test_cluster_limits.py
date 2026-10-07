@@ -546,11 +546,19 @@ def main():
                   file=sys.stderr)
             print(f"--- seed POST statuses ({len(SEED_LOG)} writes) ---", file=sys.stderr)
             print("    " + ", ".join(f"{p}:{st}" for p, st in SEED_LOG), file=sys.stderr)
-            print("--- what the admin API serves back (writer) ---", file=sys.stderr)
-            for path in ("providers", "provider-models", "provider-keys", "tenants",
-                         "tenant-providers", "tenant-models"):
-                st, out = admin("GET", f"/{path}")
-                print(f"    GET /{path} -> HTTP {st} :: {out[:220]}", file=sys.stderr)
+            # BOTH nodes' databases, and each labelled with its role. The first version queried
+            # `A_ADMIN` only and CALLED it "the writer" — which was wrong twice over on the run that
+            # caught this: the writer was B, and the node holding the seed's writes was A. A dump that
+            # mislabels which database it read is worse than no dump: the fact it produced ("the row
+            # is missing") has to be attributed to the right node to mean anything.
+            for who, port in (("A", A_ADMIN), ("B", B_ADMIN)):
+                role = "writer" if leader_probe(port) == 200 else "follower"
+                print(f"--- what {who}'s admin API serves back (its own database; {role}) ---",
+                      file=sys.stderr)
+                for path in ("providers", "provider-models", "provider-keys", "tenants",
+                             "tenant-providers", "tenant-models"):
+                    st, out = admin("GET", f"/{path}", port=port)
+                    print(f"    {who} GET /{path} -> HTTP {st} :: {str(out)[:200]}", file=sys.stderr)
             print("--- materialization on both nodes ---", file=sys.stderr)
             for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
                 series = metric(port, "hydra_replica_materialize_retries_total")
