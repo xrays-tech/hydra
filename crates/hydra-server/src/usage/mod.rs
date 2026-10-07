@@ -270,36 +270,13 @@ fn check_contract(backend: &UsageBackend, mut opened: Backend) -> Result<Backend
     }
 }
 
-/// Fixtures shared by the tests of every module that moves records around.
+/// The in-repo test harness: a backend-shaped sink that records, and a fixed reader.
 ///
-/// One owner for "what a usage record looks like in a test": the engine tests and the ClickHouse
-/// backend's tests both need one, and two copies would drift the moment a column is added.
+/// Compiled for tests only, and deliberately **not** in [`REGISTRY`] — no `HYDRA_USAGE_SINK` value
+/// can select it, so a deployment cannot look configured while dropping its usage into memory
+/// (ADR-0002 D-8).
 #[cfg(test)]
-pub(crate) mod testing {
-    use hydra_core::model::UsageRecord;
-
-    #[must_use]
-    pub(crate) fn record(trace: &str) -> UsageRecord {
-        UsageRecord {
-            tenant_id: "t".into(),
-            provider_id: "p".into(),
-            model_key: "m".into(),
-            client_api_key_masked: None,
-            sub_tenant_id: None,
-            status_code: 200,
-            tokens_in: Some(1),
-            tokens_out: Some(1),
-            cache_hit_tokens: None,
-            latency_ms: 1,
-            forward_latency_ms: None,
-            ttft_ms: None,
-            upstream_host: None,
-            error: None,
-            trace_id: trace.into(),
-            created_at: "2026-09-15T00:00:00Z".into(),
-        }
-    }
-}
+pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {

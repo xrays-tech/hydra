@@ -696,4 +696,216 @@ mod tests {
             "every record must survive a temporary backend outage: {got:?}"
         );
     }
+
+    // =====================================================================
+    // The engine's delivery contract, driven through a backend-shaped sink
+    // =====================================================================
+    //
+    // These seven cases were `tests/sqlite_sink.rs` until 2026-10-07. They were written against
+    // `SqliteSink` because that was the only sink a test could point at a real store; when ADR-0002
+    // retires SQLite, testing the engine through "whatever backend exists" would make the engine's
+    // coverage depend on that backend. They now drive `usage::testing::RecordingSink`, which is
+    // wired exactly like the real backends (same `run_channel_sink`, same `drain_on_drop`) and
+    // records instead of writing.
+    //
+    // What did NOT come along, and why: `sink_persists_new_metrics_columns` and
+    // `sink_new_metrics_null_when_absent` asserted the SQLite ROW shape (three nullable columns
+    // round-tripping, `None` stored as SQL NULL). That subject disappears with the table — the
+    // honest accounting is in ADR-0002 §7, and the ClickHouse side has its own row-shape coverage.
+
+    /// `record()` ×N → the engine delivers them on the time flush (fewer than `batch_size`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_reach_the_backend_on_the_time_flush() {
+        let sink = crate::usage::testing::RecordingSink::new(100, 1);
+        for i in 0..5 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        for _ in 0..50 {
+            if sink.delivered().len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            sink.delivered().len(),
+            5,
+            "the time flush must deliver every buffered record"
+        );
+        sink.shutdown().await;
+    }
+
+    /// Reaching `batch_size` flushes immediately, without waiting for the interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_size_triggers_an_immediate_flush() {
+        // A flush interval far beyond the test: only the size threshold can fire.
+        let sink = crate::usage::testing::RecordingSink::new(4, 3600);
+        for i in 0..4 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        for _ in 0..50 {
+            if !sink.delivered().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(sink.batch_count(), 1, "one batch, flushed by size");
+        assert_eq!(sink.delivered().len(), 4);
+        sink.shutdown().await;
+    }
+
+    /// Below `batch_size`, the interval still flushes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_interval_flushes_below_batch_size() {
+        let sink = crate::usage::testing::RecordingSink::new(1000, 1);
+        for i in 0..3 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        for _ in 0..50 {
+            if sink.delivered().len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            sink.delivered().len(),
+            3,
+            "the interval must fire even when batch_size was never reached"
+        );
+        sink.shutdown().await;
+    }
+
+    /// A backend that refuses for a while: `record()` never blocks, the batch is retried until it
+    /// lands, and nothing leaks (exactly the batch size arrives, not more).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusing_backend_does_not_block_callers_and_the_batch_lands_once() {
+        // batch_size=2 so the first two records flush at once and hit the refusals.
+        let sink = crate::usage::testing::RecordingSink::with_failures(3, 2, 3600);
+
+        let t0 = std::time::Instant::now();
+        for i in 0..2 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "record() must stay non-blocking while the backend refuses ({:?})",
+            t0.elapsed()
+        );
+
+        for _ in 0..100 {
+            if sink.delivered().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            sink.delivered().len(),
+            2,
+            "after the refusals stop, the SAME batch must be delivered exactly once"
+        );
+        assert_eq!(sink.attempts_refused(3), 3, "three refusals were exercised");
+
+        // And every retry of that ONE flush carried the same batch id: a fresh id per attempt would
+        // make ClickHouse's `insert_deduplication_token` useless and double-count a re-sent batch.
+        let ids = sink.attempt_batch_ids();
+        assert!(
+            ids.len() >= 4,
+            "at least the three refusals plus the success: {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id == &ids[0]),
+            "one flush = one batch id, reused by every retry: {ids:?}"
+        );
+        sink.shutdown().await;
+    }
+
+    /// The sink does NOT mask: whatever the caller put in `client_api_key_masked` is what the
+    /// backend receives (the proxy lifecycle owns the masking, design §9.5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_backend_receives_the_masked_key_the_caller_supplied() {
+        let masked = hydra_core::rewrite::mask_key("sk-abcd1234wxyz0987");
+        assert!(
+            !masked.contains("abcd1234wxyz"),
+            "precondition: the caller masked it"
+        );
+        let sink = crate::usage::testing::RecordingSink::new(1, 3600);
+        let mut r = rec("masked");
+        r.client_api_key_masked = Some(masked.clone());
+        sink.record(r).await;
+        for _ in 0..50 {
+            if !sink.delivered().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let got = sink.delivered();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].client_api_key_masked.as_deref(),
+            Some(masked.as_str()),
+            "the sink must store exactly what the caller passed, never re-mask"
+        );
+        sink.shutdown().await;
+    }
+
+    /// `Drop` drains: records buffered below the thresholds are flushed when the sink goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_drains_the_buffer() {
+        let sink = crate::usage::testing::RecordingSink::new(1000, 3600);
+        for i in 0..5 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        assert_eq!(
+            sink.delivered().len(),
+            0,
+            "precondition: nothing flushed yet"
+        );
+        let batches = sink.batches_handle();
+        drop(sink);
+        assert_eq!(
+            delivered_count(&batches),
+            5,
+            "Drop must flush the buffered records (the path that survives a panic-free shutdown)"
+        );
+    }
+
+    /// The explicit `shutdown()` drains without relying on `Drop`, and is idempotent: the SIGTERM
+    /// handler drives this path (pingora's `run_forever` ends in `process::exit`, so no destructor
+    /// runs on a real shutdown).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_without_drop_and_is_idempotent() {
+        let sink = crate::usage::testing::RecordingSink::new(1000, 3600);
+        let batches = sink.batches_handle();
+        for i in 0..4 {
+            sink.record(rec(&format!("t{i}"))).await;
+        }
+        assert_eq!(
+            delivered_count(&batches),
+            0,
+            "precondition: nothing flushed yet"
+        );
+
+        sink.shutdown().await;
+        assert_eq!(delivered_count(&batches), 4, "shutdown() must drain");
+
+        // Idempotent: a second call and the eventual Drop must neither hang nor duplicate.
+        sink.shutdown().await;
+        assert_eq!(delivered_count(&batches), 4);
+        drop(sink);
+        assert_eq!(
+            delivered_count(&batches),
+            4,
+            "Drop after shutdown must not deliver anything a second time"
+        );
+    }
+
+    /// Records delivered to a harness whose sink has been dropped (the sink cannot be read then, so
+    /// the shared handle is).
+    fn delivered_count(batches: &crate::usage::testing::DeliveredBatches) -> usize {
+        batches
+            .lock()
+            .expect("batches")
+            .iter()
+            .map(|(_, b)| b.len())
+            .sum()
+    }
 }
