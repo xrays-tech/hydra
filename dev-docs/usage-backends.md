@@ -119,7 +119,7 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 |---|---|---|---|---|---|---|
 | `clickhouse` | **交付（唯一）** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，**前两个今天在 `ops.md` 没有文档**） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
 | `none` | **交付（D-2 已裁定保留）** | 无（总是编译） | 无 | 丢弃并计数 `sink_disabled` | `ReaderContract::Unavailable{why}` ⇒ `/usage` 回 503 `usage_store_unavailable` | ✅（故意没有存储）必须**显式**选择，启动打 WARN |
-| `tdengine` | 候选（模式的首个新插入，D-9） | `usage-tdengine` | `HYDRA_TDENGINE_URL`（taosAdapter REST，默认端口 **6041**） | **请求体是 SQL 文本**（不是 JSON/行协议）：`INSERT INTO db.tb VALUES(…)`；或用超级表自动建子表 `INSERT INTO t USING st TAGS(…) VALUES(…)`；或走 schemaless `/influxdb/v1/write?db=` | 同一个 `POST /rest/sql[/db_name]`，**TDengine SQL**；窗口用 `INTERVAL(10s)` | ⚠️ **能用，但有一个必须处理的陷阱**：taosAdapter **默认对多数错误仍回 HTTP 200、错误在 body 里**（要 `httpCodeServerError` 才回非 200）⇒ "读失败必须是 Err 而不是零"这条**必须靠解析 body 的 code 实现**，否则正好落进本设计最反对的形状。另有：URL 里的 `db_name` 只是 SQL 的默认库前缀；OSS 下 REST 的 TLS 是否可用 **UNVERIFIED**（文档把 taosAdapter 的 `[ssl]` 标为 Enterprise）；AGPL-3.0 是**网络服务条款**型 copyleft，选型前必须过法务 |
+| `tdengine` | **候选 → 事实已实测（2026-10-07，D-9 裁定的首个新插入）** | `usage-tdengine`（待建） | `HYDRA_TDENGINE_URL`（taosAdapter REST，默认端口 **6041**） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant'>) VALUES (…)`，可多行 VALUES；**子表由这条语句自动创建**；`CREATE DATABASE` 与 `CREATE STABLE` 仍需先做 | 同一个 `POST /rest/sql[/db]`，**TDengine SQL** | ⚠️ **能用，但有 5 条实测的坑（见 §5.1）**：① 错误一律 **HTTP 200 + `code`**，**连认证失败也是 200**（`code:855`）⇒ 不解析 `code` 的后端会把"没写进去"报成成功；② 没有 `if()`/`coalesce()`/`ifnull()`/`nvl()`，空键归一要用 `CASE WHEN … IS NULL THEN '' ELSE … END`；③ `key` 是保留字（别名必须换）；④ `max(ts)` 报类型错，用 `last(ts)`；⑤ 整数回的是 **JSON 数字**（与 ClickHouse 的字符串相反）。AGPL-3.0（网络服务条款型 copyleft），选型前过法务 |
 | `influxdb3` | 候选 | `usage-influxdb3` | 数据库令牌（`Authorization: Bearer …`，端口 **8181**） | `POST /api/v3/write_lp?db=…`，行协议（表**自动创建**，数据库要先建） | `POST /api/v3/query_sql?db=…`（SQL：`DATE_BIN(INTERVAL '1 day', time)`）或 `/api/v3/query_influxql` | ✅ SQL 可用、有 schema-on-write；注意 2026-09-15 起其 Docker `latest` 指向 3 Core（**部署要钉版本 tag**）；docs 页面**未标许可证**（仓库为 Apache-2.0 + MIT） |
 | `influxdb2` | 候选（老线） | `usage-influxdb2` | `org` + `bucket` + API token | `POST /api/v2/write?org=…&bucket=…`，行协议（bucket 必须先存在） | `POST /api/v2/query`，**Flux**（`aggregateWindow(every:1d)` + `group()`） | ⚠️ 读是 Flux，与本仓"窗口是字符串边界"的模型是**翻译**关系；OSS v2 的集群能力 **UNVERIFIED** |
 | `victoriametrics` | 候选（**需先做取舍**） | `usage-victoriametrics` | `HYDRA_…_URL`（单机 **8428**；集群插入 **8480** / 查询 **8481**，且路径要带 `/insert/<accountID>/`、`/select/<accountID>/`） | `POST /api/v1/import/prometheus`（文本）或 `/api/v1/write`（remote write v1）或 `/api/v1/import`（JSON lines）；无 DDL，metric+label 即 series | `GET/POST /api/v1/query` / `query_range`，**MetricsQL** | ❌/⚠️ **它没有 `GROUP BY`**：窗口是选择器里的 `[5m]` + 输出网格 `step`。要承载本仓的 5 个分组维度就得把它们做成 label，而"每请求一行、15 个字段"与时序标签模型是**不同的东西**（租户维度还会带来基数问题）。要接就必须先写下这个取舍，而不是假装它是同一件事。另：默认**无鉴权**（建议前置代理） |
@@ -128,6 +128,45 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 
 **矩阵里的事实出处**：每个候选的端点/端口/鉴权/载荷/窗口语法均取自各自官方文档（TDengine REST API、VictoriaMetrics single-server/cluster、InfluxDB v2 与 v3 的 write/query API、PostgreSQL 协议 + TimescaleDB `time_bucket`/`create_hypertable`），
 **标注 `UNVERIFIED` 的项在实现该后端前必须实测掉**（本仓的规矩：候选事实不许当既成事实写进设计）。
+
+### 5.1 TDengine：候选事实的实测记录（2026-10-07）
+
+**为什么先测**：ADR-0002 §4 第 1 步要求"候选事实必须实测掉，不许当既成事实"。下面是逐条实测的
+结果，用来指导实现，也用来让下一个人**不必再猜**。环境：`tdengine/tdengine:3.3.6.13`（LTS 线）
+容器，只把 6041 绑到环回；复现命令见本节末。
+
+| 事实 | 实测结果 |
+|---|---|
+| DDL | `CREATE DATABASE`、`CREATE STABLE` 必须先做（`{"code":0,...,"data":[[0]],"rows":1}`） |
+| 写入 | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('t1') VALUES (…)`；**子表自动创建**（`affected_rows: 1`）；一条语句里可跟多个 `VALUES` 元组（批量）；`NULL` 字面量可插入可空列 |
+| 成功应答 | `{"code":0,"column_meta":[…],"data":[[…]],"rows":N}` |
+| **错误应答** | **HTTP 200** + `{"code":<非零>,"desc":"…"}`。SQL 错误 `code:9750`（"Database not specified"）、**认证失败 `code:855`（"Authentication failure"）** |
+| 认证 | `Authorization: Basic <base64(user:password)>`（`Bearer`/token 认证要 3.4.0.0+，3.3.6 没有） |
+| 整数类型 | **JSON 数字**（`[[1,10,20]]`），不是 ClickHouse 那种字符串 |
+| 时间戳 | 回的是 RFC3339 UTC 毫秒：`"2026-10-07T05:57:42.173Z"`（我们写进去的 `NOW` 是本地时区，存储与回显都是 UTC） |
+| 窗口字面量 | `ts >= '2026-10-07T00:00:00Z'` **与** `ts >= '2026-10-07 00:00:00.000'` **都能匹配同一行** ⇒ 本仓"定宽字符串边界"可以直接透传 |
+| 空窗口 | `count(*)` 回**一行零**（`[[0]]`）；带 `GROUP BY` 的读回 `rows:0, data:[]` |
+| 保留字 | **`key` 是保留字**（`SELECT model_key AS key` 报 9728）⇒ 分组别名用 `group_key` |
+| 缺失函数 | `if()`、`coalesce()`、`ifnull()`、`nvl()` **都不存在**（`Func not exists`, code 884）⇒ 空键归一用 `CASE WHEN x IS NULL THEN '' ELSE x END`（实测得到 `["st1",1],["",2]`） |
+| 聚合函数 | `count(*)`/`sum()`/`CASE WHEN` 可用；**`max(ts)` 报 `Invalid parameter data type : max`** ⇒ 用 `last(ts)` |
+| db 前缀 | `POST /rest/sql/<db>` 可以指定默认库（否则 SQL 里的表名必须带库前缀） |
+
+**因此实现时必须做的三件事**（每一件都对应上表里的一条坑）：① 传输层**解析 body 的 `code`**，
+非零一律当作 `Err`——**200 不是成功**，而"认证失败也是 200"意味着不解析就会把没人接收的写入报成
+成功；② 读 SQL 用 `CASE WHEN … IS NULL`、`last(ts)`、别名 `group_key`；③ 解码器接受 JSON 数字
+（并且**不**接受字符串就当零——非数字仍是失败）。
+
+**复现**（本机实测所用）：
+
+```bash
+docker run -d --name hydra-tdengine -p 127.0.0.1:6041:6041 tdengine/tdengine:3.3.6.13
+B=http://127.0.0.1:6041; A='Authorization: Basic cm9vdDp0YW9zZGF0YQ=='
+curl -s -L -H "$A" -d "CREATE DATABASE IF NOT EXISTS hydra_usage" "$B/rest/sql"
+curl -s -L -H "$A" -d "CREATE STABLE IF NOT EXISTS hydra_usage.usage_record (ts TIMESTAMP, tenant_id NCHAR(64), provider_id NCHAR(64), model_key NCHAR(128), client_api_key NCHAR(64), sub_tenant_id NCHAR(64), status_code INT, tokens_in BIGINT, tokens_out BIGINT, cache_hit_tokens BIGINT, latency_ms BIGINT, forward_latency_ms BIGINT, ttft_ms BIGINT, upstream_host NCHAR(128), err NCHAR(256)) TAGS (tenant_tag NCHAR(64))" "$B/rest/sql"
+curl -s -L -H "$A" -d "INSERT INTO hydra_usage.t_t1 USING hydra_usage.usage_record TAGS ('t1') VALUES (NOW,'t1','p1','gpt-4o','sk****1',NULL,200,10,20,NULL,5,NULL,NULL,NULL,NULL)" "$B/rest/sql"
+# 反证：把密码写错，看它是不是 200（它确实回 200 + code:855）
+curl -s -L -H "Authorization: Basic cm9vdDp3cm9uZ3Bhc3M=" -d "SHOW DATABASES" "$B/rest/sql"
+```
 
 ## 6. 已知弱点（每次都得手写的部分）
 
