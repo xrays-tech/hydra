@@ -49,7 +49,7 @@
 | **T1.2 ✅(2026-10-07)** | 引擎搬迁：`sink.rs` 的 channel/批量/退避/`MAX_RETAINED`/丢弃计数 → `src/usage/engine.rs`（连同 `UsageSink` trait）。**不保留 `sink.rs` 的转发影子** | `src/usage/engine.rs` 的引擎测试原样通过；`grep -rn "crate::sink::\|hydra_server::sink::"` 归零（约 22 处引用逐个改，编译器点名） |
 | **T1.3 ✅(2026-10-07)** | ClickHouse 收成一个后端模块：`src/usage/backends/clickhouse/{mod.rs,transport.rs}`（`sink.rs` 的 CH 写 + `usage_query.rs` 的 CH 读 + `clickhouse.rs` 的传输与 URL 解析），导出 `DESCRIPTOR` | `tests/clickhouse_sink.rs`、`tests/clickhouse_ddl_parity.rs`、`integration/test_clickhouse_sink_wire.py`（16 条）、`tests/usage_query.rs` 的 12 条 CH 腿全绿；**线上报文形状零变化**（wire 演练是这条的判据） |
 | **T1.4 ✅(2026-10-07)** | `scripts/check_usage_backends.cjs` + `.test.cjs`：解析 `REGISTRY` 源码。规则：① kind 唯一且非空；② 每个 `feature` 在 `Cargo.toml [features]` 存在；③ 每个 `requires.name` 在 `ops.md` 环境表出现；④ `sqlite` 必须出现在退役取值表；⑤ 每个后端模块被一致性套件点名；⑥ 解析出 0 行 ⇒ **失败**（防空转） | 反向证伪逐条实测（删一行注册/改错 feature 名/删文档行 ⇒ 红并点名）；CI `scripts` 作业接入 |
-| **T1.5** | `dev-docs/usage-backends.md`：插入模式七步 + 矩阵（此时只有 ClickHouse 一行 + 候选若干）；ADR-0002 状态随裁定推进 | 文档与 `REGISTRY` 逐行一致（T1.4 的守卫检查"矩阵里有的 kind，注册表里也有"，反之亦然） |
+| **T1.5** ✅（✅ 2026-10-07） | `dev-docs/usage-backends.md`：插入模式七步 + 矩阵（此时只有 ClickHouse 一行 + 候选若干）；ADR-0002 状态随裁定推进 | 文档与 `REGISTRY` 逐行一致（T1.4 的守卫检查"矩阵里有的 kind，注册表里也有"，反之亦然） |
 
 **搬家（T1.2/T1.3）实测抓到的两件事（都已修，值得记）**：
 
@@ -108,14 +108,14 @@
 | **T3.1 ✅(2026-10-07)** | `tests/sqlite_sink.rs`（10 条）改靶到 `usage::testing` 的记录型后端，成为**引擎一致性套件** `usage::conformance` | 10 条断言的语义逐条保留（批量按大小/按时间、退避重试、关闭排空、`Drop` 不可依赖、掩码 key 等） |
 | **T3.2** ✅(2026-10-07) | `tests/usage_query.rs`（31 条 = 14 条 SQLite 腿 + 12 条 CH 腿 + 5 条 kind 分派腿）拆：① 存储无关的腿（窗口边界归一、`group_by` 白名单、`tenant_id` 参数不可改归属、响应信封与 `as_of`、无 reader ⇒ 503）改由 `usage::testing` 的 reader 驱动；② 与 SQLite SQL 绑定的（`sqlite_*` 对手写 SQL 的逐字段比对）**删除**并在文档记账 | CH 侧的 12 条已有；T3.5 核对 `live_clickhouse_aggregate_matches_a_hand_run_query`（`--ignored`）是否逐字段覆盖了被删的那一类，缺则补 |
 | **T3.3** ✅(2026-10-07) | `tests/streaming_usage_persistence.rs`（2 条，整份文件的前提）改靶：断言"流式路径确实调用了 `record`"，落库形状交给 CH 线缆测试 | 流式仍计量这一条**不能丢**（它曾是 P1） |
-| **T3.4** | `AppState::for_tests()`：去掉默认注入的 SQLite reader，改为 `None`；需要 reader 的用例显式用 `for_tests_with_usage(…, Some(usage::testing::reader()))`（20 处站点逐个看，不批量替换） | 每个站点要么无 reader（503 契约），要么显式注入 |
+| **T3.4** ✅（✅ 2026-10-07） | `AppState::for_tests()`：去掉默认注入的 SQLite reader，改为 `None`；需要 reader 的用例显式用 `for_tests_with_usage(…, Some(usage::testing::reader()))`（20 处站点逐个看，不批量替换） | 每个站点要么无 reader（503 契约），要么显式注入 |
 | **T3.5** ✅(2026-10-07) | 文档同步（ADR-0002 §8 的清单）：`ops.md`（§1.1 默认列 → 必填无默认、§9/§9.1、§12）、`design.md`（§9.2/§9.3/SQLite DDL 段/模块图）、`deployment.md`、`cluster.md`、`jiqun-deploy.md`、`design-tenant-api.md`（§547 的论据改挂读契约）、`admin-ui/api-docs.js`、`README*`；`usage-backends.md` 补 SQLite 的退役行 | 逐处 grep 校对：不再有"默认 sqlite"、"集群必须 clickhouse"（该措辞在只剩一个后端后失效）这类句子 |
 | **T3.6** ✅(2026-10-07) | 守卫同步：`check_documented_defaults`（移入"必填无默认"名单）、`check_documented_env`、`check_compose_env`、`check_e2e_contracts`（若演练用到 sink 值）、`check_usage_backends`（新增 `sqlite` 退役行） | 全部守卫绿；`check_usage_backends` 的反向证伪逐条实测 |
-| **T3.7** | `ops.md` 补"历史 SQLite 用量"的一次性导出说明（D-4），并写明升级后 `/usage` 只回答 CH 里的量 | 文档可执行（给具体命令），不假装有自动迁移 |
-| **T3.8** | `tests/clickhouse_ddl_parity.rs:136` **硬编码 `src/sink.rs`** 的路径随 D-6 搬家改写（它解析那里的 CH INSERT 列名） | 该测试仍 4/4 绿；**且它是"搬家"这件事的传感器**：若搬家时忘了改它，一个纯 ClickHouse 的守卫会先红 |
-| **T3.9** | `ci.yml:479` 的 `--test clickhouse_sink --test usage_query --ignored`：CH 套件若改名/拆分，必须同步（`check_ci_wiring.cjs:666-674` 是目前**唯一**保持它接线的东西） | 改名后 `check_ci_wiring` 仍绿（否则会静默脱线：live-CH 覆盖消失而 CI 全绿） |
+| **T3.7** ✅（✅ 2026-10-07） | `ops.md` 补"历史 SQLite 用量"的一次性导出说明（D-4），并写明升级后 `/usage` 只回答 CH 里的量 | 文档可执行（给具体命令），不假装有自动迁移 |
+| **T3.8** ✅（✅ 2026-10-07） | `tests/clickhouse_ddl_parity.rs:136` **硬编码 `src/sink.rs`** 的路径随 D-6 搬家改写（它解析那里的 CH INSERT 列名） | 该测试仍 4/4 绿；**且它是"搬家"这件事的传感器**：若搬家时忘了改它，一个纯 ClickHouse 的守卫会先红 |
+| **T3.9** ✅（✅ 无需改动：CH 套件未改名，守卫已覆盖） | `ci.yml:479` 的 `--test clickhouse_sink --test usage_query --ignored`：CH 套件若改名/拆分，必须同步（`check_ci_wiring.cjs:666-674` 是目前**唯一**保持它接线的东西） | 改名后 `check_ci_wiring` 仍绿（否则会静默脱线：live-CH 覆盖消失而 CI 全绿） |
 | **T3.10** ✅(2026-10-07) | 三个演练的计量腿改靶（`test_streaming_path.py` S4、`test_shutdown_drain.py` N3、`test_client_disconnect.py` C0/C1）：存储从 SQLite 换成 mock CH（照 `test_clickhouse_sink_wire.py`） | 三条判据**语义**不动：流式也计量、排空不丢在飞批次、客户端断开仍计量且与完整回答不可区分；**并且** `test_streaming_path.py:212` 那句 `HYDRA_USAGE_SINK: "sqlite"` 必须消失（`grep` 零命中） |
-| **T3.11** | `check_compose_grace.cjs` 的**证据出处**重挂：结论（SIGKILL 会丢在飞用量 ⇒ drain 必须够长）保留，出处从"SQLite `usage_record` 0 行 vs 20 行"改到 CH 侧演练（丢弃计数 + mock CH 行数） | 该守卫的注释与记录里不再引用一个**已无人测**的数字；新出处指向的断言**确实存在**（逐条点名） |
+| **T3.11** ✅（✅ 2026-10-07） | `check_compose_grace.cjs` 的**证据出处**重挂：结论（SIGKILL 会丢在飞用量 ⇒ drain 必须够长）保留，出处从"SQLite `usage_record` 0 行 vs 20 行"改到 CH 侧演练（丢弃计数 + mock CH 行数） | 该守卫的注释与记录里不再引用一个**已无人测**的数字；新出处指向的断言**确实存在**（逐条点名） |
 | **T3.12** ✅(2026-10-07) | `ops.md` 的**破坏性升级**流程：升级前备份 + 导出 `usage_record`（`VACUUM INTO` / `-csv` 两条命令）+ 升级后"该表已不存在、`/usage` 只答 ClickHouse"；**回滚只有两条路**（换回备份文件 / 手工删掉 `_sqlx_migrations` 里的 `0013` 行）；发行说明点名这是破坏性迁移 | 文档命令**可执行**（真跑一次导出）；回滚两条路各实际操作一次并记下结果 |
 
 ---
