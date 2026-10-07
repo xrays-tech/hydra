@@ -383,11 +383,22 @@ def main():
                 break
             time.sleep(0.5)
         seed()
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            if proxied(B_DATA)[0] == 200:
-                break
-            time.sleep(0.5)
+        # BOTH nodes must actually SERVE the seeded tenant before anything is measured, and an expiry
+        # has to be REPORTED. This used to warm up `B_DATA` only (`proxied(B_DATA)[0] == 200`) and
+        # then fall through SILENTLY when the 20 s budget ran out — so leg A, which requests `A_DATA`,
+        # could measure a node whose routing config had not caught up. Measured on a CI runner
+        # (2026-10-07): leg A's first request answered **403 `tenant_forbidden`** while the very same
+        # request had just been ALLOWED by the auth service and cached as `1` in L2.
+        # `tenant_forbidden` is `router.rs` — "no `tenant_providers` entry for this tenant" — i.e. the
+        # DATA plane lagging behind the fleet report the PREMISE below asserts, not an auth-cache
+        # fault. The drill's subject is the cache, so its precondition has to be a SERVING node.
+        for port, label, who in ((A_DATA, "A_DATA", "the node leg A measures"),
+                                 (B_DATA, "B_DATA", "the other node")):
+            if not wait_for(lambda p=port: proxied(p)[0] == 200, budget=60):
+                print(f"[auth-cache] CANNOT VERIFY: {who} ({label}) never served the seeded tenant; "
+                      f"last answer HTTP {proxied(port)[0]} — the auth cache is not what failed here",
+                      file=sys.stderr)
+                return 2
         # Make the cache COLD on purpose: the warm-up above populated L1+L2, so "the first
         # request asks the auth service" can only be measured after a clear (the first
         # version asserted it against a warm cache and was wrong).
