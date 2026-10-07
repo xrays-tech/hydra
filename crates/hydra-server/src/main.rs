@@ -1373,7 +1373,7 @@ fn spawn_listener_self_check(plain: String) {
 /// then drain) and ends in `process::exit(0)`, which runs no destructors — so
 /// without an explicit hook here every routine restart silently discarded the
 /// whole sink buffer.
-fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::sink::UsageSink>) {
+fn spawn_sink_flush_on_shutdown(sink: Arc<dyn hydra_server::usage::UsageSink>) {
     use tokio::signal::unix::{signal, SignalKind};
 
     tokio::spawn(async move {

@@ -218,7 +218,7 @@ struct RecordingSink {
     inner: Arc<std::sync::Mutex<Vec<UsageRecord>>>,
 }
 
-impl hydra_server::sink::UsageSink for RecordingSink {
+impl hydra_server::usage::UsageSink for RecordingSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let store = self.inner.clone();
         Box::pin(async move {

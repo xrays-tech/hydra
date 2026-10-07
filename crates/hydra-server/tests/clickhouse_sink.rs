@@ -14,7 +14,8 @@
 #![cfg(feature = "usage-clickhouse")]
 
 use hydra_core::model::UsageRecord;
-use hydra_server::sink::{build_clickhouse_json_row, ClickHouseSink, UsageSink};
+use hydra_server::usage::backends::clickhouse::{build_clickhouse_json_row, ClickHouseSink};
+use hydra_server::usage::UsageSink;
 
 fn sample() -> UsageRecord {
     UsageRecord {

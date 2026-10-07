@@ -1,37 +1,9 @@
-//! The **single owner of "how to talk to ClickHouse"**.
+//! ClickHouse transport: URL/credential interpretation, request shape, deadlines, status
+//! classification (moved verbatim from `src/clickhouse.rs`, ADR-0002 T1.3).
 //!
-//! Both the usage *writer* (`sink.rs`'s batched `INSERT`) and the usage
-//! *reader* (the tenant API's aggregate `SELECT`) go through this module, so the
-//! URL/credential interpretation, the request-line shape, the deadlines and the
-//! status classification exist exactly once. Before this module existed the
-//! reader would have had to re-implement all of it — the second owner the design
-//! forbids.
+//! The single owner of "how to talk to ClickHouse". The writer and the reader in this backend both
+//! go through here; nothing else in the crate knows ClickHouse's HTTP interface.
 //!
-//! ## Why a hand-written HTTP request on raw TCP
-//!
-//! The `clickhouse` crate pinned in `Cargo.toml` is an empty placeholder on
-//! crates.io, and `Cargo.toml` is owned by another lane. ClickHouse's HTTP
-//! interface is first-class and stable, so this module speaks it directly with
-//! `tokio` (already a `runtime` dependency). Switching to a real driver later is
-//! a change confined to [`send`].
-//!
-//! ## Deadlines are load-bearing
-//!
-//! ClickHouse answering a connection and then never replying used to pin the
-//! single flush task forever: the bounded channel filled and every subsequent
-//! usage record was dropped (audit §3.9). Every step below is therefore
-//! deadline-bound, the response read is additionally size-capped and does not
-//! wait for EOF, and the two deadlines live in [`ClickHouseConfig`] so a caller
-//! can choose its own values (the writer uses the measured defaults; the reader
-//! uses the query timeout) **without changing this module**.
-//!
-//! ## Feature gating
-//!
-//! The whole module is gated on `usage-clickhouse`, which `server` does **not**
-//! imply. Without it `sink_kind == "clickhouse"` cannot occur at all:
-//! `sink::build_sink` fails at startup for that kind. So the gates around the
-//! users of this module describe a *compile-time* split, not a runtime branch.
-
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -437,6 +409,7 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "usage-clickhouse")]
 #[cfg(test)]
 mod tests {
     use super::*;

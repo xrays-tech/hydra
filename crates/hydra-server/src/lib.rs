@@ -75,20 +75,6 @@ pub mod redis;
 /// `HttpAuthChecker` (reqwest) + admin `ServeHttp` HTTP helpers.
 #[cfg(feature = "http-client")]
 pub mod http;
-/// `UsageSink` trait + `SqliteSink` / `ClickHouseSink` adapters.
-#[cfg(feature = "runtime")]
-pub mod sink;
-
-// The single owner of "how to talk to ClickHouse" (URL/credentials, request
-// shape, deadlines, status classification). Shared by the usage writer
-// (`sink.rs`) and the tenant API usage reader (`usage_query.rs`).
-//
-// Gated because the whole module depends on `tokio::io` and on ClickHouse's
-// HTTP interface; `usage-clickhouse` is NOT implied by `server`, and without it
-// `sink_kind == "clickhouse"` cannot occur at all (`build_sink` refuses it).
-#[cfg(feature = "usage-clickhouse")]
-pub mod clickhouse;
-
 /// Tenant self-service API: the reserved `/tenant/` prefix on the DATA-PLANE
 /// listener, gated by the tenant access token.
 ///
@@ -104,14 +90,6 @@ pub mod tenant_api;
 /// D-2), and the reader trait lives here too.
 #[cfg(feature = "db")]
 pub mod usage;
-
-/// The usage read capability behind `GET /tenant/{id}/api/v1/usage`.
-///
-/// A separate trait rather than a method on `UsageSink` (which is a
-/// fire-and-forget write channel); the ClickHouse implementation arrives with
-/// the `usage-clickhouse` feature.
-#[cfg(feature = "db")]
-pub mod usage_query;
 
 // --- W4: Pingora proxy shell ----------------------------------------------
 /// Downstream listener topology — the single owner of "which port speaks which

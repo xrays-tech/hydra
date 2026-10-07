@@ -42,7 +42,7 @@ const TOKEN: &str = "metrics-test-token";
 /// Minimal no-op usage sink (production sinks tested separately).
 struct NoopSink;
 
-impl hydra_server::sink::UsageSink for NoopSink {
+impl hydra_server::usage::UsageSink for NoopSink {
     fn record(&self, _record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -285,7 +285,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
 
     let proxy_state = AppState::for_tests(
         store.clone(),

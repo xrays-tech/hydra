@@ -36,7 +36,7 @@
 //! Routing, the gate, and the response shape. Business logic is delegated: the
 //! cache primitives to [`crate::http::AuthCache`], cache-clearing fan-out and its
 //! convergence barrier to [`crate::cluster::events::InvalidationStream`], and
-//! usage reads to [`crate::usage_query::UsageQuery`]. The interception in
+//! usage reads to [`crate::usage::query::UsageQuery`]. The interception in
 //! `proxy::request_filter` is one call into [`dispatch`].
 
 pub mod auth;

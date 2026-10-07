@@ -39,17 +39,29 @@
 
 ---
 
-## Phase 1 — 描述符表（**行为完全不变**，可独立 revert）
+## Phase 1 — 描述符表（**行为完全不变**，可独立 revert）— **T1.1/T1.2/T1.3 已完成（2026-10-07）**
 
 这一阶段不删任何后端、不改任何线上行为；它的价值是让 Phase 2 变成"删一行"而不是"改两处 match"。
 
 | # | 落点 | 判据 |
 |---|---|---|
-| **T1.1** | 新增 `crates/hydra-server/src/usage/mod.rs`：`UsageBackend { kind, feature, requires, open, reads, notes }`、`REGISTRY: &[UsageBackend]`、`open(kind, &BackendConfig) -> Result<Backend, BackendError>`、`BackendError::{UnknownKind, MissingEnv, FeatureDisabled, Retired, OpenFailed}`、`ReaderContract::{SameBackend, Unavailable{why}}`。错误文案**通用**（禁止各后端自己拼） | 单测：查表命中/未知 kind 列出已知集合/缺 env 点名变量与用途/退役 kind 点名替代/`REGISTRY` 无重复 kind；`main.rs` 两处调用改为 `usage::open` 且**行为不变**（sqlite 仍在、仍是默认） |
-| **T1.2** | 引擎搬迁：`sink.rs` 的 channel/批量/退避/`MAX_RETAINED`/丢弃计数 → `src/usage/engine.rs`（连同 `UsageSink` trait）。**不保留 `sink.rs` 的转发影子** | `src/usage/engine.rs` 的引擎测试原样通过；`grep -rn "crate::sink::\|hydra_server::sink::"` 归零（约 22 处引用逐个改，编译器点名） |
-| **T1.3** | ClickHouse 收成一个后端模块：`src/usage/backends/clickhouse/{mod.rs,transport.rs}`（`sink.rs` 的 CH 写 + `usage_query.rs` 的 CH 读 + `clickhouse.rs` 的传输与 URL 解析），导出 `DESCRIPTOR` | `tests/clickhouse_sink.rs`、`tests/clickhouse_ddl_parity.rs`、`integration/test_clickhouse_sink_wire.py`（16 条）、`tests/usage_query.rs` 的 12 条 CH 腿全绿；**线上报文形状零变化**（wire 演练是这条的判据） |
+| **T1.1 ✅(2026-10-07)** | 新增 `crates/hydra-server/src/usage/mod.rs`：`UsageBackend { kind, feature, requires, open, reads, notes }`、`REGISTRY: &[UsageBackend]`、`open(kind, &BackendConfig) -> Result<Backend, BackendError>`、`BackendError::{UnknownKind, MissingEnv, FeatureDisabled, Retired, OpenFailed}`、`ReaderContract::{SameBackend, Unavailable{why}}`。错误文案**通用**（禁止各后端自己拼） | 单测：查表命中/未知 kind 列出已知集合/缺 env 点名变量与用途/退役 kind 点名替代/`REGISTRY` 无重复 kind；`main.rs` 两处调用改为 `usage::open` 且**行为不变**（sqlite 仍在、仍是默认） |
+| **T1.2 ✅(2026-10-07)** | 引擎搬迁：`sink.rs` 的 channel/批量/退避/`MAX_RETAINED`/丢弃计数 → `src/usage/engine.rs`（连同 `UsageSink` trait）。**不保留 `sink.rs` 的转发影子** | `src/usage/engine.rs` 的引擎测试原样通过；`grep -rn "crate::sink::\|hydra_server::sink::"` 归零（约 22 处引用逐个改，编译器点名） |
+| **T1.3 ✅(2026-10-07)** | ClickHouse 收成一个后端模块：`src/usage/backends/clickhouse/{mod.rs,transport.rs}`（`sink.rs` 的 CH 写 + `usage_query.rs` 的 CH 读 + `clickhouse.rs` 的传输与 URL 解析），导出 `DESCRIPTOR` | `tests/clickhouse_sink.rs`、`tests/clickhouse_ddl_parity.rs`、`integration/test_clickhouse_sink_wire.py`（16 条）、`tests/usage_query.rs` 的 12 条 CH 腿全绿；**线上报文形状零变化**（wire 演练是这条的判据） |
 | **T1.4** | `scripts/check_usage_backends.cjs` + `.test.cjs`：解析 `REGISTRY` 源码。规则：① kind 唯一且非空；② 每个 `feature` 在 `Cargo.toml [features]` 存在；③ 每个 `requires.name` 在 `ops.md` 环境表出现；④ `sqlite` 必须出现在退役取值表；⑤ 每个后端模块被一致性套件点名；⑥ 解析出 0 行 ⇒ **失败**（防空转） | 反向证伪逐条实测（删一行注册/改错 feature 名/删文档行 ⇒ 红并点名）；CI `scripts` 作业接入 |
 | **T1.5** | `dev-docs/usage-backends.md`：插入模式七步 + 矩阵（此时只有 ClickHouse 一行 + 候选若干）；ADR-0002 状态随裁定推进 | 文档与 `REGISTRY` 逐行一致（T1.4 的守卫检查"矩阵里有的 kind，注册表里也有"，反之亦然） |
+
+**搬家（T1.2/T1.3）实测抓到的两件事（都已修，值得记）**：
+
+1. **`clickhouse_ddl_parity.rs` 如预期变红**：它硬编码 `crates/hydra-server/src/sink.rs` 来解析 CH 的
+   INSERT 列名，文件一搬就 `cannot read …`。这正是 ADR §8 写下的"搬家传感器"，已改为一个具名常量
+   `INSERT_SOURCE` 指向新位置（并被三处失败文案共用）。**没有它，一个"纯搬家"会让一条纯 ClickHouse
+   的守卫静默失去对象**。
+2. **`transport` 模块的 feature 门在搬家后丢了**：原来门在 `lib.rs` 的 `pub mod clickhouse;` 上，
+   而**搬进子模块不会继承那道门** ⇒ 一次 `--features server`（不含 `usage-clickhouse`）的测试里
+   多跑了 **25 条 transport 测试**（`server` 档 497 → 522）。修法：`transport` 自己声明
+   `#[cfg(feature = "usage-clickhouse")]`，连同该模块里只在特性下使用的 import 一起门控。
+   **这条正是"数字会说话"的例子**：`--features server` 的测试数必须回到 497，多出来的 25 条就是 bug。
 
 **Phase 1 的验收**：全套测试/守卫/演练与改动前**同一组数字**（只有新增测试变多），且 `git diff` 不含任何行为分支变化。
 

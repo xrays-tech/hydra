@@ -23,6 +23,10 @@
 
 use std::path::PathBuf;
 
+/// Where the ClickHouse usage INSERT lives. A constant so the parse below and every failure message
+/// name the same file (the messages used to say `src/sink.rs` in three places).
+const INSERT_SOURCE: &str = "crates/hydra-server/src/usage/backends/clickhouse/mod.rs";
+
 fn repo_file(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -127,16 +131,19 @@ fn both_usage_record_ddls_declare_the_same_columns() {
     );
 }
 
-/// The column names the SINK writes, parsed from `src/sink.rs`'s
+/// The column names the SINK writes, parsed from the ClickHouse backend's
 /// `INSERT INTO usage_record (…)` statement.
 ///
 /// The statement spans several source lines with `\` continuations, so the parse
 /// splits on commas and trims the continuation markers.
 fn insert_columns() -> Vec<String> {
-    let src = without_comments(&repo_file("crates/hydra-server/src/sink.rs"));
+    // Moved 2026-10-07 with the ClickHouse backend (`src/sink.rs` → this module, ADR-0002 T1.3):
+    // this test is the canary for that file moving, and it fired exactly as the plan said it would.
+    // If the INSERT moves again, this path must move with it — the failure is `cannot read …`.
+    let src = without_comments(&repo_file(INSERT_SOURCE));
     let start = src
         .find("INSERT INTO usage_record (")
-        .expect("the usage INSERT statement in src/sink.rs");
+        .expect("the usage INSERT statement in the ClickHouse backend");
     let rest = &src[start..];
     let open = rest.find('(').expect("column list opens");
     let close = rest.find(')').expect("column list closes");
@@ -177,11 +184,11 @@ fn the_usage_insert_names_exactly_the_ddl_columns() {
     ins_cols.sort();
     assert!(
         !ins_cols.is_empty(),
-        "the INSERT parse found no columns — the pattern in src/sink.rs changed"
+        "the INSERT parse found no columns — the pattern in the ClickHouse backend changed"
     );
     assert_eq!(
         ins_cols, ddl_cols,
-        "src/sink.rs's INSERT and environment/clickhouse/init.sql name different usage_record columns"
+        "the ClickHouse INSERT and environment/clickhouse/init.sql name different usage_record columns"
     );
 }
 

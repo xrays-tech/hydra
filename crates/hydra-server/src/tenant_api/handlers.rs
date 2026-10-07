@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `whoami` (T5) | the config snapshot, through the row the gate already resolved |
 //! | `invalidate` (T6) | [`crate::http::AuthCache`] plus the invalidation stream and its barrier |
-//! | `usage` (T8) | [`crate::usage_query::UsageQuery`] |
+//! | `usage` (T8) | [`crate::usage::query::UsageQuery`] |
 //! | `sub-tenants` / `sub-tenant-routes` (T7) | the config snapshot, filtered to the tenant |
 //!
 //! Nothing here re-implements a primitive: routing and the gate live in
@@ -434,8 +434,8 @@ pub async fn usage(
         // the column name is interpolated into SQL, so an unknown value must
         // never reach a query builder.
         let group_by = match get("group_by") {
-            None => crate::usage_query::GroupBy::None,
-            Some(v) => match crate::usage_query::GroupBy::parse(v) {
+            None => crate::usage::query::GroupBy::None,
+            Some(v) => match crate::usage::query::GroupBy::parse(v) {
                 Some(g) => g,
                 None => {
                     return super::respond_error(
@@ -450,7 +450,7 @@ pub async fn usage(
             },
         };
 
-        let group_by_label = crate::usage_query::group_by_label(group_by);
+        let group_by_label = crate::usage::query::group_by_label(group_by);
         let started = std::time::Instant::now();
         let window = match super::time_bound::resolve(
             get("since"),
@@ -495,15 +495,15 @@ pub async fn usage(
                 // operator. Turning any of these into a zeroed 200 is exactly the
                 // silent lie the capability exists to prevent.
                 let (result, message) = match &e {
-                    crate::usage_query::UsageQueryError::StoreUnavailable(_) => (
+                    crate::usage::query::UsageQueryError::StoreUnavailable(_) => (
                         "store_unavailable",
                         "the usage store could not be read; retry or contact the operator",
                     ),
-                    crate::usage_query::UsageQueryError::Decode(_) => (
+                    crate::usage::query::UsageQueryError::Decode(_) => (
                         "decode_error",
                         "the usage store could not be read; retry or contact the operator",
                     ),
-                    crate::usage_query::UsageQueryError::ResultTooLarge(_) => (
+                    crate::usage::query::UsageQueryError::ResultTooLarge(_) => (
                         "result_too_large",
                         "the usage result exceeded the gateway's response-size cap; narrow since/until or reduce group_by",
                     ),

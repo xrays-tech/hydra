@@ -28,11 +28,12 @@ use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
 use hydra_server::proxy::{AppState, HydraProxy};
-use hydra_server::sink::UsageSink;
 use hydra_server::store::ConfigStore;
 use hydra_server::tenant_api::TenantApiConfig;
+use hydra_server::usage::backends::sqlite::SqliteUsageQuery;
+use hydra_server::usage::query::UsageQuery;
+use hydra_server::usage::UsageSink;
 use hydra_server::usage::{self, EnvView};
-use hydra_server::usage_query::{SqliteUsageQuery, UsageQuery};
 
 /// The ONE selection path these tests exercise: `usage::open` — the same call `main` makes — then
 /// take its READER. There is no second switch for a test to disagree with production about
@@ -392,7 +393,7 @@ async fn sqlite_aggregate_matches_hand_written_sql() {
             T,
             "2026-09-16T00:00:00Z",
             "2026-09-17T00:00:00Z",
-            hydra_server::usage_query::GroupBy::None,
+            hydra_server::usage::query::GroupBy::None,
         )
         .await
         .expect("aggregate");
@@ -475,7 +476,7 @@ async fn sqlite_group_by_model_matches_hand_written_sql() {
             T,
             "2026-09-16T00:00:00Z",
             "2026-09-17T00:00:00Z",
-            hydra_server::usage_query::GroupBy::Model,
+            hydra_server::usage::query::GroupBy::Model,
         )
         .await
         .expect("aggregate");
@@ -493,7 +494,7 @@ async fn sqlite_group_by_model_matches_hand_written_sql() {
     .await
     .expect("hand-written");
 
-    let rows = hydra_server::usage_query::rows_by_key(&agg);
+    let rows = hydra_server::usage::query::rows_by_key(&agg);
     assert_eq!(rows.len(), handwritten.len(), "row set must match");
     for (key, requests, tokens_in, errors) in handwritten {
         let got = rows
@@ -610,12 +611,12 @@ async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
             T,
             "2026-09-16T00:00:00Z",
             "2026-09-17T00:00:00Z",
-            hydra_server::usage_query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::SubTenant,
         )
         .await
         .expect("aggregate");
 
-    let rows = hydra_server::usage_query::rows_by_key(&agg);
+    let rows = hydra_server::usage::query::rows_by_key(&agg);
     assert_eq!(rows["st1"].requests, 2);
     assert_eq!(rows["st1"].tokens_in, 105);
     assert_eq!(rows["st2"].requests, 1);
@@ -636,7 +637,7 @@ async fn sqlite_empty_window_is_a_real_zero_with_no_as_of() {
             T,
             "2026-09-16T00:00:00Z",
             "2026-09-17T00:00:00Z",
-            hydra_server::usage_query::GroupBy::None,
+            hydra_server::usage::query::GroupBy::None,
         )
         .await
         .expect("aggregate");
@@ -1325,7 +1326,7 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
             evil,
             "2026-09-15T00:00:00Z",
             "2026-09-16T00:00:00Z",
-            hydra_server::usage_query::GroupBy::None,
+            hydra_server::usage::query::GroupBy::None,
         )
         .await
         .expect("the double always answers 200");
@@ -1393,7 +1394,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
             "local",
             since,
             until,
-            hydra_server::usage_query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::SubTenant,
         )
         .await
         .expect("both answers decode");
@@ -1434,12 +1435,12 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
             "local",
             since,
             until,
-            hydra_server::usage_query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::SubTenant,
         )
         .await
         .expect_err("a null group key must fail the read, not vanish from it");
     assert!(
-        matches!(err, hydra_server::usage_query::UsageQueryError::Decode(_)),
+        matches!(err, hydra_server::usage::query::UsageQueryError::Decode(_)),
         "{err:?}"
     );
 }
@@ -1470,7 +1471,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
             &tenant,
             "2026-09-15T00:00:00Z",
             "2026-09-16T00:00:00Z",
-            hydra_server::usage_query::GroupBy::Model,
+            hydra_server::usage::query::GroupBy::Model,
         )
         .await
         .expect("live ClickHouse read");
@@ -1547,7 +1548,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
             &tenant,
             "2026-09-15T00:00:00Z",
             "2026-09-16T00:00:00Z",
-            hydra_server::usage_query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::SubTenant,
         )
         .await
         .expect("a window of unattributed rows must be answered, not failed");

@@ -44,7 +44,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// A minimal no-op usage sink (real trait impl, like the W4 spike test).
 struct NoopSink;
-impl hydra_server::sink::UsageSink for NoopSink {
+impl hydra_server::usage::UsageSink for NoopSink {
     fn record(&self, _record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -162,7 +162,7 @@ async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store.clone(),
         auth,

@@ -53,7 +53,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// separately). Terminate-mode behaviour does not depend on the sink.
 struct NoopSink;
 
-impl hydra_server::sink::UsageSink for NoopSink {
+impl hydra_server::usage::UsageSink for NoopSink {
     fn record(&self, _record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -222,7 +222,7 @@ async fn build_state_with_proxy_config(
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     AppState::for_tests(
         store,
         auth,
@@ -598,7 +598,7 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
         .unwrap(),
     );
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
         auth,
@@ -1102,7 +1102,7 @@ async fn rate_limit_429_even_when_routing_would_503() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
         auth,
@@ -1333,7 +1333,7 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
         .unwrap(),
     );
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
         auth,
@@ -1702,7 +1702,7 @@ struct RecordingSink {
     inner: Arc<std::sync::Mutex<Vec<UsageRecord>>>,
 }
 
-impl hydra_server::sink::UsageSink for RecordingSink {
+impl hydra_server::usage::UsageSink for RecordingSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let store = self.inner.clone();
         Box::pin(async move {
@@ -3040,7 +3040,7 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
         )
         .unwrap(),
     );
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
         auth,
@@ -4021,7 +4021,7 @@ async fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<App
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     AppState::for_tests(
         store,
         auth,

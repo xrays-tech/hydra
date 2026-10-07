@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use hydra_core::model::UsageRecord;
 use hydra_core::rewrite::mask_key;
-use hydra_server::sink::{SqliteSink, UsageSink};
+use hydra_server::usage::backends::sqlite::SqliteSink;
+use hydra_server::usage::UsageSink;
 use hydra_server::usage::{self, EnvView};
 use sqlx::Row;
 

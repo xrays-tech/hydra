@@ -82,8 +82,8 @@ use crate::proxy::ctx::RequestContext;
 use crate::proxy::limiter::CountVerdict;
 use crate::proxy::peer::parse_endpoint;
 use crate::proxy::provider_client::ProviderClient;
-use crate::sink::UsageSink;
 use crate::store::ConfigStore;
+use crate::usage::engine::UsageSink;
 
 pub mod breaker_wrap;
 pub mod config;
@@ -159,7 +159,7 @@ pub struct AppState {
     /// sink kind. `None` means "this node has no usage store it can read", which
     /// the endpoint reports as 503 rather than answering a well-formed zero.
     #[cfg(feature = "db")]
-    pub usage: Option<Arc<dyn crate::usage_query::UsageQuery>>,
+    pub usage: Option<Arc<dyn crate::usage::query::UsageQuery>>,
     /// Placeholder so non-`db` builds keep a uniform shape.
     #[cfg(not(feature = "db"))]
     #[allow(dead_code)]
@@ -193,9 +193,11 @@ impl AppState {
         // to read), not about the database's existence: it used to be built by `.map()` over the
         // pool's own `Option`, which conflated the two.
         #[cfg(feature = "db")]
-        let usage = Some(Arc::new(crate::usage_query::SqliteUsageQuery::new(
-            store.pool().clone(),
-        )) as Arc<dyn crate::usage_query::UsageQuery>);
+        let usage = Some(
+            Arc::new(crate::usage::backends::sqlite::SqliteUsageQuery::new(
+                store.pool().clone(),
+            )) as Arc<dyn crate::usage::query::UsageQuery>,
+        );
         Self::for_tests_with_usage(
             store,
             auth,
@@ -213,7 +215,7 @@ impl AppState {
     /// value** instead of being derived from the store's pool.
     ///
     /// This is not a second selection path: callers get the reader from
-    /// [`crate::usage_query::select`], the same function `main` uses, so a test
+    /// [`crate::usage::query::select`], the same function `main` uses, so a test
     /// cannot inject a combination the binary could not build. It exists because
     /// the ClickHouse cases need a reader pointed at a process-level double, and
     /// the store's pool is the wrong store for them.
@@ -227,7 +229,7 @@ impl AppState {
         sink: Arc<dyn UsageSink>,
         proxy: ProxyConfig,
         tenant_api: crate::tenant_api::TenantApiConfig,
-        #[cfg(feature = "db")] usage: Option<Arc<dyn crate::usage_query::UsageQuery>>,
+        #[cfg(feature = "db")] usage: Option<Arc<dyn crate::usage::query::UsageQuery>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
