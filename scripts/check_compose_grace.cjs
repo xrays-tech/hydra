@@ -9,7 +9,14 @@
  *     measured wall-clock shutdown: **25s on SIGTERM**, **35s on SIGQUIT**;
  *   * a SIGKILLed drain loses the buffered usage records — control run: the same
  *     20 proxied requests left **0** rows in `usage_record` under SIGKILL and
- *     **20** rows when the drain completed;
+ *     **20** rows when the drain completed. **Where that evidence lives now
+ *     (2026-10-07)**: the rows then came from the node's own SQLite table, which
+ *     ADR-0002 retired and migration `0013` DROPPED, so this sentence no longer
+ *     names a store that exists. The claim is unchanged and is still measured, by
+ *     the drills that count rows at a real HTTP ClickHouse
+ *     (`integration/test_shutdown_drain.py` N3: "the usage row that was still
+ *     BUFFERED when SIGTERM arrived is persisted after the process is gone") and
+ *     by the same measurement run by hand at the time;
  *   * Docker's default stop grace is **10s** (`docker stop` / `compose down` /
  *     `restart` send SIGTERM, wait 10s, then SIGKILL) — so every routine
  *     container restart was cutting the drain short. None of the shipped compose
@@ -312,7 +319,7 @@ function main(argv) {
   }
   console.error(`${summary}: FAIL`);
   for (const r of bad) console.error(`[compose-grace]   ${r.label} · ${r.name}: ${r.why}`);
-  console.error('[compose-grace] a SIGKILLed drain loses buffered usage (measured: 20 requests -> 0 rows)');
+  console.error('[compose-grace] a SIGKILLed drain loses buffered usage (measured: 20 requests -> 0 rows, counted in the usage store of the day; see the header for where that is measured now)');
   return 1;
 }
 
