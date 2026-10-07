@@ -437,6 +437,9 @@ def role(rid, **kw):
     return body
 
 
+SEED_LOG = []
+
+
 def seed():
     rows = [
         ("providers", {"id": "p1", "key": "p1", "name": "P",
@@ -464,6 +467,7 @@ def seed():
         ]
     for path, body in rows:
         st, out = admin("POST", f"/{path}", body)
+        SEED_LOG.append((path, st))
         if st not in (200, 201):
             raise SystemExit(f"[cluster-limits] CANNOT VERIFY: seeding {path} -> {st} {out[:140]}")
 
@@ -531,6 +535,26 @@ def main():
         # answer and both log tails are printed here.
         if not wait_for(lambda: all(proxied(p, "count.local", "sk-t1")[0] == 200
                                     for p in (A_DATA, B_DATA)), budget=30):
+            # The four questions that decide WHICH side is broken, answered from the runner itself:
+            # who held the writer, what the seed's writes were answered with, what the WRITER's admin
+            # API serves back, and whether the materialization loop actually ran.
+            # (`hydra_replica_materialize_retries_total` is labelled `outcome`
+            # ∈ {attempt, succeeded, failed, throttled} — a loop stuck retrying shows up as
+            # failed/throttled with no `succeeded`, and a loop that never ran shows no series.)
+            print("--- which member held the raft writer ---", file=sys.stderr)
+            print(f"    /healthz/leader   A:{leader_probe(A_ADMIN)}   B:{leader_probe(B_ADMIN)}",
+                  file=sys.stderr)
+            print(f"--- seed POST statuses ({len(SEED_LOG)} writes) ---", file=sys.stderr)
+            print("    " + ", ".join(f"{p}:{st}" for p, st in SEED_LOG), file=sys.stderr)
+            print("--- what the admin API serves back (writer) ---", file=sys.stderr)
+            for path in ("providers", "provider-models", "provider-keys", "tenants",
+                         "tenant-providers", "tenant-models"):
+                st, out = admin("GET", f"/{path}")
+                print(f"    GET /{path} -> HTTP {st} :: {out[:220]}", file=sys.stderr)
+            print("--- materialization on both nodes ---", file=sys.stderr)
+            for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
+                series = metric(port, "hydra_replica_materialize_retries_total")
+                print(f"    {label}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
             for p in (A_DATA, B_DATA):
                 st, _headers, body, took = proxied(p, "count.local", "sk-t1")
                 print(f"--- data plane :{p} -> HTTP {st} after {took:.2f}s :: {body[:300]}",
