@@ -115,6 +115,10 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 
 ## 5. 后端矩阵
 
+**先读这句**：`feature` 列只在**已登记**的行（`clickhouse` / `none` / `tdengine`）指真实存在的东西——守卫会核对 `Cargo.toml`。
+标"候选"的行（`influxdb3` / `influxdb2` / `victoriametrics`）的 feature 名是**约定名**：实测 `Cargo.toml` 里 grep 不到它们，
+那几行是**选项空间**（接入前必须先写取舍），不是可用的后端。别照着候选行写 `--features usage-influxdb3`，构建会直接失败。
+
 | kind | 状态 | feature | env | 写 | 读 | 读契约可行性 |
 |---|---|---|---|---|---|---|
 | `clickhouse` | **交付（唯一）** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，**前两个今天在 `ops.md` 没有文档**） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
