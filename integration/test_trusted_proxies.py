@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "trusted-proxy-test")
@@ -55,6 +56,7 @@ def check(label, ok, detail=""):
 
 def start(label, admin, data, trusted):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin}",
         "HYDRA_LISTEN": f"127.0.0.1:{data}",

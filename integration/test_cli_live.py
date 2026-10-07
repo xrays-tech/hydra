@@ -34,6 +34,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "cli-live")
@@ -55,6 +56,7 @@ def check(label, ok, detail=""):
 def run_cli(args, env_extra=None, timeout=60):
     """Run the documented CLI the documented way: env config + subcommand args."""
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({"HYDRA_BASE_URL": f"http://127.0.0.1:{ADMIN}", "HYDRA_ADMIN_TOKEN": TOKEN})
     if env_extra:
         env.update(env_extra)
@@ -106,6 +108,7 @@ class AuthMock(BaseHTTPRequestHandler):
 
 def start_node():
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",

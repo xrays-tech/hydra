@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "auth-hop-test")
@@ -164,6 +165,7 @@ def proxied(key="sk-authhop-1", timeout=30):
 
 def start_node(extra=None, db="authhop"):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",

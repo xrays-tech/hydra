@@ -35,6 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "auth-cache-layers-test")
@@ -247,6 +248,7 @@ def tenant_invalidate(data_port):
 
 def node_env(admin_port, data_port, label, extra):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN,
         "HYDRA_CLUSTER_PEERS": MEMBERS, "HYDRA_CLUSTER_ID": "auth-layers-drill",

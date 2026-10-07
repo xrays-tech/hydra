@@ -41,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
@@ -145,6 +146,7 @@ class Node:
         self.raft_port = free_port()
         self.db = os.path.join(data_dir, f"{name}.db")
         self.env = dict(os.environ)
+        self.env.update(usage_env())
         self.env.update(
             {
                 "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,

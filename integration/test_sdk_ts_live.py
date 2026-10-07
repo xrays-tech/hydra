@@ -42,6 +42,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "sdk-ts-live")
@@ -258,6 +259,7 @@ def ts(mode, base, token, tenant="t1", timeout=60):
 
 def node_env(admin, data, label, extra=None):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin}",
         "HYDRA_LISTEN": f"127.0.0.1:{data}",

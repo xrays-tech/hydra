@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # integration/ -> repo root
 DIR = os.path.join(ROOT, ".acceptance", "cert-reload-test")
@@ -133,6 +134,7 @@ def start_hydra():
         if run(["bash", "-c", f"ss -ltn | grep -q ':{port} '"]).returncode == 0:
             raise SystemExit(f"port {port} is still taken — refusing to measure a stale instance")
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{PLAIN}", "HYDRA_TLS_LISTEN": f"127.0.0.1:{TLS}",

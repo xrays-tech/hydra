@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "sdk-go-live")
@@ -306,6 +307,7 @@ def go_env():
     driver therefore builds with GOWORK=off: an ordinary consumer module that pulls the
     SDK in by path. GOPROXY=off keeps it offline (the SDK has no dependencies)."""
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "GOWORK": "off", "GOFLAGS": "", "GOPROXY": "off",
         # The harness sandbox has a READ-ONLY `/`, so the default `~/.cache/go-build`
@@ -380,6 +382,7 @@ def py_result(base, token, tenant="t1"):
 
 def node_env(admin, data, label, extra=None):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin}",
         "HYDRA_LISTEN": f"127.0.0.1:{data}",

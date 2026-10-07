@@ -65,6 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "cluster-limits-test")
@@ -344,6 +345,7 @@ def proxied(data_port, host, key):
 
 def start_node(redis_url, label, admin_port, data_port, raft_port):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
         "HYDRA_CLUSTER_PEERS": MEMBERS, "HYDRA_CLUSTER_ID": "cluster-limits-drill",

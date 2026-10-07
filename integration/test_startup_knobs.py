@@ -94,6 +94,7 @@ import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "startup-knobs-test")
@@ -225,6 +226,7 @@ def base_env():
     for the wrong reason).
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("HYDRA_")}
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
         "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",

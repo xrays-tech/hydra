@@ -49,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "usage-query-wire-test")
@@ -273,6 +274,7 @@ def metric_value(name, labels):
 
 def start_node(label, ch_url, admin_port, data_port, extra=None):
     env = dict(os.environ)
+    env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin_port}",
         "HYDRA_LISTEN": f"127.0.0.1:{data_port}",
