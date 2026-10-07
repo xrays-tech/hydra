@@ -226,6 +226,10 @@ pub static REGISTRY: &[&UsageBackend] = &[
     &backends::clickhouse::DESCRIPTOR,
     // Switching usage OFF is a registered choice, not an absence of one (ADR-0002 D-2).
     &backends::none::DESCRIPTOR,
+    // ADR-0002's first NEW backend: the row below is the whole insertion, and the proof that
+    // "adding a metrics database" is one module + one feature + one line. It is NOT a delivered
+    // backend: the repository ships ClickHouse (see `dev-docs/usage-backends.md` §5).
+    &backends::tdengine::DESCRIPTOR,
 ];
 
 /// Values that were usage backends and are NOT any more (ADR-0002 D-3, user ruling: the table is

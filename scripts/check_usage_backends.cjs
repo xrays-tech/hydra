@@ -42,6 +42,29 @@ const UNDOCUMENTED_OK = new Map(
   Object.entries(JSON.parse(process.env.CUB_UNDOCUMENTED_OK || '{}')),
 );
 
+/**
+ * Variables of a CANDIDATE backend: one that exists to demonstrate the insertion pattern and is not
+ * part of what the repository delivers (`dev-docs/usage-backends.md` §5).
+ *
+ * The operator runbook documents the PRODUCT; a candidate's variables belong in the backend matrix,
+ * which is where an implementer looks. Making the guard demand a runbook row would either force
+ * non-delivered configuration into the operator's reference or force the candidate to lie about being
+ * delivered — so the exception is recorded here, with the document that DOES carry it, and printed on
+ * every run like every other record in this repository.
+ */
+const CANDIDATE_ENV_DOC = new Map(
+  Object.entries(
+    JSON.parse(
+      process.env.CUB_CANDIDATE_ENV_DOC ||
+        JSON.stringify({
+          HYDRA_TDENGINE_URL: 'dev-docs/usage-backends.md §5.1 (candidate: measured there, not delivered)',
+          HYDRA_TDENGINE_CONNECT_TIMEOUT_MS: 'dev-docs/usage-backends.md §5.1 (candidate)',
+          HYDRA_TDENGINE_IO_TIMEOUT_MS: 'dev-docs/usage-backends.md §5.1 (candidate)',
+        }),
+    ),
+  ),
+);
+
 function parseArgs(argv) {
   const opts = {
     registry: process.env.CUB_REGISTRY || path.join(ROOT, 'crates/hydra-server/src/usage/mod.rs'),
@@ -211,12 +234,19 @@ function check(opts) {
       problems.push(`${b.module}: declares feature \`${b.feature}\`, which is not a feature of crates/hydra-server/Cargo.toml`);
     }
     for (const name of b.requires) {
-      if (!docs.has(name)) {
-        problems.push(`${b.module}: requires \`${name}\`, which the operator runbook (dev-docs/ops.md) does not document — the refusal would name a variable nobody has heard of`);
+      if (docs.has(name)) continue;
+      if (CANDIDATE_ENV_DOC.has(name)) {
+        notes.push(`${b.module}: \`${name}\` is documented for a CANDIDATE backend — ${CANDIDATE_ENV_DOC.get(name)}`);
+        continue;
       }
+      problems.push(`${b.module}: requires \`${name}\`, which the operator runbook (dev-docs/ops.md) does not document — the refusal would name a variable nobody has heard of`);
     }
     for (const name of b.recognises) {
       if (docs.has(name)) continue;
+      if (CANDIDATE_ENV_DOC.has(name)) {
+        notes.push(`${b.module}: \`${name}\` is documented for a CANDIDATE backend — ${CANDIDATE_ENV_DOC.get(name)}`);
+        continue;
+      }
       if (UNDOCUMENTED_OK.has(name)) {
         notes.push(`${b.module}: \`${name}\` is undocumented on purpose — ${UNDOCUMENTED_OK.get(name)}`);
         continue;

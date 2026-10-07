@@ -9,3 +9,8 @@
 
 pub mod clickhouse;
 pub mod none;
+/// The TDengine candidate (ADR-0002 §5): in a build without its feature, only the descriptor is
+/// reachable — so the rest of the module is dead code there, which is what the attribute says rather
+/// than leaving a reader to wonder whether the backend is compiled.
+#[cfg_attr(not(feature = "usage-tdengine"), allow(dead_code, unused_imports))]
+pub mod tdengine;

@@ -129,6 +129,13 @@ arachne = ["runtime", "db", "proxy", "dep:arachne-kv"]
 # the active one is chosen at runtime by HYDRA_USAGE_SINK.
 usage-clickhouse = ["dep:base64"]
 
+# TDengine usage backend (ADR-0002 §5.1): taosAdapter over HTTP, implemented as the pattern's first
+# new insertion. It needs NO dependency of its own — the transport is a small HTTP/1.1 POST over
+# `tokio` (already a `runtime` dep) and the base64 for Basic auth is written out — which is what
+# makes "a backend is one module + one feature + one registry row" true rather than aspirational.
+# Not a delivered backend: see `dev-docs/usage-backends.md`.
+usage-tdengine = []
+
 # Redis backbone (cluster P2+): leader lease, shared rate limits / breaker,
 # auth-cache L2 and the invalidation stream all ride one Redis. Opt-in so the
 # default single-node build keeps zero external deps. `fred` is the fixed

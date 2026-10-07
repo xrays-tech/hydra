@@ -208,5 +208,5 @@ test('a backend written as a flat <kind>.rs is a structural failure, not a silen
 test('the real tree passes, and names every backend', () => {
   const r = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', cwd: REPO });
   assert.equal(r.status, 0, r.stderr + r.stdout);
-  assert.match(r.stdout, /sqlite, clickhouse, none/);
+  assert.match(r.stdout, /clickhouse, none, tdengine/);
 });

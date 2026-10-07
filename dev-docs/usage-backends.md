@@ -119,7 +119,7 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 |---|---|---|---|---|---|---|
 | `clickhouse` | **交付（唯一）** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，**前两个今天在 `ops.md` 没有文档**） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
 | `none` | **交付（D-2 已裁定保留）** | 无（总是编译） | 无 | 丢弃并计数 `sink_disabled` | `ReaderContract::Unavailable{why}` ⇒ `/usage` 回 503 `usage_store_unavailable` | ✅（故意没有存储）必须**显式**选择，启动打 WARN |
-| `tdengine` | **候选 → 事实已实测（2026-10-07，D-9 裁定的首个新插入）** | `usage-tdengine`（待建） | `HYDRA_TDENGINE_URL`（taosAdapter REST，默认端口 **6041**） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant'>) VALUES (…)`，可多行 VALUES；**子表由这条语句自动创建**；`CREATE DATABASE` 与 `CREATE STABLE` 仍需先做 | 同一个 `POST /rest/sql[/db]`，**TDengine SQL** | ⚠️ **能用，但有 5 条实测的坑（见 §5.1）**：① 错误一律 **HTTP 200 + `code`**，**连认证失败也是 200**（`code:855`）⇒ 不解析 `code` 的后端会把"没写进去"报成成功；② 没有 `if()`/`coalesce()`/`ifnull()`/`nvl()`，空键归一要用 `CASE WHEN … IS NULL THEN '' ELSE … END`；③ `key` 是保留字（别名必须换）；④ `max(ts)` 报类型错，用 `last(ts)`；⑤ 整数回的是 **JSON 数字**（与 ClickHouse 的字符串相反）。AGPL-3.0（网络服务条款型 copyleft），选型前过法务 |
+| `tdengine` | **已实现（候选，非交付）；活实例测试通过** | `usage-tdengine` | `HYDRA_TDENGINE_URL`（`http://user:pass@host:6041/<db>`，Basic 认证；`HYDRA_TDENGINE_TOKEN` ⇒ `Bearer`，**3.4.0.0+ 才有、本机未实测**） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant>') VALUES (…),(…)`，**子表按租户自动创建**；启动时 `CREATE DATABASE/STABLE IF NOT EXISTS` | 同一个 `POST /rest/sql[/db]`，TDengine SQL（`CASE WHEN` 归空键、`last(ts)`、别名 `group_key`、`TO_CHAR` 做 day） | ⚠️ **能用，但有一条硬限制 ⇒ 只能是候选**：TDengine 的**主键就是 `ts`**，同租户同一秒的两条请求会**互相覆盖**（实测：`tokens_in` 111 被 999 覆盖、行数仍为 1；毫秒不同则两行都在）。本后端用 **trace id 派生的亚秒位**规避（确定性 ⇒ 重试仍幂等），但同一秒内两条哈希到同一毫秒的请求仍会塌（约 1/1000），而 TDengine **没有批次去重令牌**。要当计费存储必须换成毫秒级唯一的键。其余实测坑见 §5.1 |
 | `influxdb3` | 候选 | `usage-influxdb3` | 数据库令牌（`Authorization: Bearer …`，端口 **8181**） | `POST /api/v3/write_lp?db=…`，行协议（表**自动创建**，数据库要先建） | `POST /api/v3/query_sql?db=…`（SQL：`DATE_BIN(INTERVAL '1 day', time)`）或 `/api/v3/query_influxql` | ✅ SQL 可用、有 schema-on-write；注意 2026-09-15 起其 Docker `latest` 指向 3 Core（**部署要钉版本 tag**）；docs 页面**未标许可证**（仓库为 Apache-2.0 + MIT） |
 | `influxdb2` | 候选（老线） | `usage-influxdb2` | `org` + `bucket` + API token | `POST /api/v2/write?org=…&bucket=…`，行协议（bucket 必须先存在） | `POST /api/v2/query`，**Flux**（`aggregateWindow(every:1d)` + `group()`） | ⚠️ 读是 Flux，与本仓"窗口是字符串边界"的模型是**翻译**关系；OSS v2 的集群能力 **UNVERIFIED** |
 | `victoriametrics` | 候选（**需先做取舍**） | `usage-victoriametrics` | `HYDRA_…_URL`（单机 **8428**；集群插入 **8480** / 查询 **8481**，且路径要带 `/insert/<accountID>/`、`/select/<accountID>/`） | `POST /api/v1/import/prometheus`（文本）或 `/api/v1/write`（remote write v1）或 `/api/v1/import`（JSON lines）；无 DDL，metric+label 即 series | `GET/POST /api/v1/query` / `query_range`，**MetricsQL** | ❌/⚠️ **它没有 `GROUP BY`**：窗口是选择器里的 `[5m]` + 输出网格 `step`。要承载本仓的 5 个分组维度就得把它们做成 label，而"每请求一行、15 个字段"与时序标签模型是**不同的东西**（租户维度还会带来基数问题）。要接就必须先写下这个取舍，而不是假装它是同一件事。另：默认**无鉴权**（建议前置代理） |
@@ -150,6 +150,9 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 | 缺失函数 | `if()`、`coalesce()`、`ifnull()`、`nvl()` **都不存在**（`Func not exists`, code 884）⇒ 空键归一用 `CASE WHEN x IS NULL THEN '' ELSE x END`（实测得到 `["st1",1],["",2]`） |
 | 聚合函数 | `count(*)`/`sum()`/`CASE WHEN` 可用；**`max(ts)` 报 `Invalid parameter data type : max`** ⇒ 用 `last(ts)` |
 | db 前缀 | `POST /rest/sql/<db>` 可以指定默认库（否则 SQL 里的表名必须带库前缀） |
+| **应答分帧** | taosAdapter 回 **`Transfer-Encoding: chunked`**（实测：活实例测试第一次报 `4a\r\n{…}` —— `curl` 会透明解码，所以只看 curl 记录写出的传输层会把尺寸行当成 body） |
+| **主键 = `ts`** | 同租户同一秒的两条请求**互相覆盖**（`tokens_in` 111→999、行数 1）；毫秒不同则两行都在。`DELETE FROM … WHERE ts >= … AND ts < …` 可用（清理窗口用） |
+| 无去重令牌 | 与 ClickHouse 的 `insert_deduplication_token` 相对：TDengine 没有批次级去重，只有 `ts` 覆盖语义 |
 
 **因此实现时必须做的三件事**（每一件都对应上表里的一条坑）：① 传输层**解析 body 的 `code`**，
 非零一律当作 `Err`——**200 不是成功**，而"认证失败也是 200"意味着不解析就会把没人接收的写入报成
@@ -167,6 +170,25 @@ curl -s -L -H "$A" -d "INSERT INTO hydra_usage.t_t1 USING hydra_usage.usage_reco
 # 反证：把密码写错，看它是不是 200（它确实回 200 + code:855）
 curl -s -L -H "Authorization: Basic cm9vdDp3cm9uZ3Bhc3M=" -d "SHOW DATABASES" "$B/rest/sql"
 ```
+
+### 5.2 TDengine 后端：第一条"新插入"的实测结果（2026-10-07）
+
+按 §3 的七步模式接入，结果是**只新增文件 + 一行注册 + 一个 feature**：
+
+| 落点 | 内容 |
+|---|---|
+| `src/usage/backends/tdengine/mod.rs` | 描述符 + 写（DDL 引导、按租户分组的批量 `INSERT … USING … TAGS`）+ 读（totals/分组/空窗口，自带解码器） |
+| `src/usage/backends/tdengine/transport.rs` | URL 解析、`POST /rest/sql`、**chunked 解帧**、**解析 body 的 `code`**（200 不是成功） |
+| `Cargo.toml` | `usage-tdengine = []` —— **零新依赖**（HTTP/1.1 走已有的 `tokio`，Basic 的 base64 自己写） |
+| `src/usage/mod.rs` | `&backends::tdengine::DESCRIPTOR,` **一行** |
+
+**没有改动**：`main.rs`、`usage/engine.rs`、`usage/query.rs`、任何既有后端、任何既有测试。
+活实例测试（`--ignored`，需要真 taosAdapter）通过：引导建库建表、三个租户的行写进去并按标签隔离、
+聚合与分组读回、空窗口是真零、错密码/坏语句都被 `code` 抓住。
+
+**实现期由活实例测试抓出的三个 bug（都不是猜的）**：① 传输层没解 chunked ⇒ 把尺寸行当 JSON；
+② `VALUES` 元组里 `sub_tenant_id` 被**双重加引号**（`''st1''`）⇒ 服务器拒绝**每一批**、表始终为空而节点看起来健康；
+③ 同秒塌陷（见矩阵行的硬限制）。②的教训已写进测试：那条断言改为比对**整个元组**，因为 `contains("'st1'")` 会放过 `''st1''`。
 
 ## 6. 已知弱点（每次都得手写的部分）
 
