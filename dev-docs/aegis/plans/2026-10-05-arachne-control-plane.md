@@ -923,6 +923,27 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **移植中抓到的产品缺陷（已修）**：T4.1 删注册表时，`main.rs` 里那个"刷新一次、同时喂两处"的任务被拆掉，替代品（成员表）**只接到了 admin 状态**，`TenantApiConfig::live_nodes` 从此一直是 `None`。后果：**租户自助** `DELETE /tenant/{id}/api/v1/auth/cache` 的收敛屏障拿到**空舰队** ⇒ 永远 `nodes_total: 0` + `pending`，而且 `lagging` 也是空的（租户连"谁没跟上"都看不到）；**admin 那条路不受影响**，所以两个入口对同一屏障报出不同答案，而只有安静的那个坏了。修法：把同一个 view 也交给租户 API（3 行）。由 `test_auth_cache_layers.py` 的 PREMISE 腿（要求舰队报告为 `applied`）在移植时抓出。
 
+### 观察（2026-10-07，**未定性**）：CI 上 `cluster rate limits` 的 `tenant_forbidden` —— 数据面物化只落了一部分
+
+**背景**：CI 自 2026-09-20 起没跑过，2026-10-07 恢复后逐个作业修（见提交清单）。`live-deps` 作业里 `cluster rate limits` 是**最后一条**红的，而且它在 CI 里**从来没有通过过**（此前那次是更早的 ClickHouse 403 挡住了它），本地（含与 CI 同形的 Redis：`redis:7-alpine --save "" --appendonly no --databases 64`，端口 6379）**始终通过**。
+
+**实测证据**（由本次提交给该演练补上的诊断打印，`cd0e119` 起）：
+```
+--- data plane :18861 -> HTTP 403 after 0.00s :: {"error":{"message":"tenant_forbidden",...}}
+--- data plane :18871 -> HTTP 403 after 0.00s :: {"error":{"message":"tenant_forbidden",...}}
+--- cl-a.log (last 1200) ---
+WARN hydra::store: config: provider 'p1' has weight 1 but no api_keys; it will be filtered out at candidate time   (×2)
+--- cl-b.log (last 1200) ---
+（空）
+```
+两次 CI 运行（`397d2e6`、`23b66ae`）**同一处、同样形态**，所以不是抖动。
+
+**读法**：`tenant_forbidden` 在 `router.rs` 只有一条来源 —— 节点**物化后的**路由配置里没有该租户的 `tenant_providers` 行。同一次运行的兄弟演练 `auth cache layers` 曾出现“鉴权已允许（L2 写入 `1`）却 403”的同一现象，本提交把它的前置改成“等**被测量**的那台**真的**服务该租户（60 s，超时即 CANNOT VERIFY 并打印证据）”。而物化本身是 **1 秒 ticker**（`main.rs`：`interval(Duration::from_secs(1))` 包住 `materializer.converge()`），所以 20–60 s 的滞后**不是预期**。
+
+**目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
+
+**同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
+
 ### 决定 6（2026-10-05 用户裁定「做」）：把 `check_gate_entries` 的被测对象换成被跟踪的文件
 
 **发现**：该守卫读的是 `.acceptance/round10-gate.sh`，而 `.acceptance/` 是 **gitignored、从未被跟踪**的目录（`git ls-files .acceptance` 为空、`git log --diff-filter=A` 查不到）。于是**在 CI 的全新检出里它根本不存在** ⇒ 守卫 exit 2 ⇒ `scripts` 作业的这一步**一直是红的**，与代码无关；本地绿只是因为文件在本地（它是第 10 轮留下的本地产物）。实测：`CGE_ROOT=<空目录> node scripts/check_gate_entries.cjs` → exit 2。
