@@ -95,12 +95,16 @@ async fn a_proven_safe_trim_leaves_the_consumer_cache_alone() {
         .await;
     assert_eq!(auth.cache().len(), 1, "seeded verdict before trim");
 
-    // An empty store is fine: the published events target ANOTHER tenant, so they
-    // cannot clear the seeded `t1` verdict — only a generation bump can.
-    let store = hydra_server::store::ConfigStore::from_snapshot(
+    // A store whose database holds no config and no fidelity rows is fine: the
+    // published events target ANOTHER tenant, so they cannot clear the seeded `t1`
+    // verdict — only a generation bump can.
+    let store = hydra_server::store::ConfigStore::from_data(
+        common::setup_pool().await,
         hydra_core::config::ConfigData::default(),
         Arc::new(hydra_server::crypto::StaticKeyProvider::new([1u8; 32], 1)),
-    );
+    )
+    .await
+    .expect("from_data");
     spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
 
     // Publish first, then WAIT until the consumer's watermark covers the last id:

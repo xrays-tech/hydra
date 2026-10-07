@@ -384,18 +384,27 @@ async fn a_tenant_without_a_token_is_never_authenticated() {
     }
 }
 
-/// T20 (gate layer): before the first snapshot a node holds no token hashes at
-/// all, so the gate must fail CLOSED with 503 — never pass a request through
-/// because it "could not check".
+/// T20 (gate layer): before the first snapshot a node holds no configuration at
+/// all (version 0), so the gate must fail CLOSED with 503 — never pass a request
+/// through because it "could not check", and never call the token wrong (401)
+/// when there is nothing to judge it against.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn before_the_first_snapshot_the_gate_fails_closed_with_503() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
         Arc::new(StaticKeyProvider::new([7u8; 32], 1));
-    // `from_snapshot` is the edge shape: no replication content until the first
-    // snapshot arrives.
-    let store = ConfigStore::from_snapshot(hydra_core::config::ConfigData::default(), kp);
+    // The state this test is about: a node whose IN-MEMORY snapshot holds nothing yet, while the
+    // database it was seeded through is not what it is serving from (`version() == 0`). That is the
+    // window between process start and the first materialization, and it is what the gate answers
+    // 503 for.
+    let store = ConfigStore::from_data(
+        common::setup_pool().await,
+        hydra_core::config::ConfigData::default(),
+        kp,
+    )
+    .await
+    .expect("from_data");
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -705,15 +714,22 @@ async fn the_reported_base_url_is_actually_usable() {
 /// the replicated snapshot — this is the evidence behind "E1 needs no DB and no
 /// forwarding", and it is why an edge can serve the whole tenant API locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn whoami_works_on_an_edge_from_the_snapshot_alone() {
+async fn whoami_works_from_a_materialized_snapshot_alone() {
     use hydra_server::cluster::content::FidelityRows;
     use hydra_server::cluster::snapshot::HydratedWire;
 
     let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
         Arc::new(StaticKeyProvider::new([7u8; 32], 1));
 
-    // The replica shape: a store with NO pool, fed one snapshot.
-    let store = ConfigStore::from_snapshot(hydra_core::config::ConfigData::default(), kp);
+    // The replica shape: a store whose own database holds nothing, fed one snapshot — its config
+    // comes from the materializer, not from its tables, and the read-only endpoints must not care.
+    let store = ConfigStore::from_data(
+        common::setup_pool().await,
+        hydra_core::config::ConfigData::default(),
+        kp,
+    )
+    .await
+    .expect("from_data");
     let mut cfg = hydra_core::config::ConfigData::default();
     let t = Tenant {
         id: "t1".into(),
@@ -1903,15 +1919,22 @@ async fn a_suspended_tenant_can_still_list_its_sub_tenants() {
 /// makes `whoami` work on an edge, and the whole point of "snapshot-fed": an
 /// edge with no DB serves the tenant's own sub-tenant view locally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_read_only_endpoints_work_on_an_edge_from_the_snapshot_alone() {
+async fn the_read_only_endpoints_work_from_a_materialized_snapshot_alone() {
     use hydra_server::cluster::content::FidelityRows;
     use hydra_server::cluster::snapshot::HydratedWire;
 
     let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
         Arc::new(StaticKeyProvider::new([7u8; 32], 1));
 
-    // The replica shape: a store with NO pool, fed one snapshot.
-    let store = ConfigStore::from_snapshot(hydra_core::config::ConfigData::default(), kp);
+    // The replica shape: a store whose own database holds nothing, fed one snapshot — its config
+    // comes from the materializer, not from its tables, and the read-only endpoints must not care.
+    let store = ConfigStore::from_data(
+        common::setup_pool().await,
+        hydra_core::config::ConfigData::default(),
+        kp,
+    )
+    .await
+    .expect("from_data");
     let mut cfg = hydra_core::config::ConfigData::default();
     let t = Tenant {
         id: "t1".into(),

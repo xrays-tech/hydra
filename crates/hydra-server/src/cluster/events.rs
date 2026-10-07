@@ -1461,10 +1461,13 @@ mod tests {
             )
             .expect("checker"),
         );
-        let store = crate::store::ConfigStore::from_snapshot(
+        let store = crate::store::ConfigStore::from_data(
+            crate::db::test_pool().await,
             hydra_core::config::ConfigData::default(),
             std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
-        );
+        )
+        .await
+        .expect("from_data");
 
         // 250 keys cached, then 250 single-key invalidations to apply.
         const N: usize = 250;
@@ -1523,15 +1526,19 @@ mod tests {
             .await;
         assert_eq!(auth.cache().len(), 1, "seeded verdict before trim");
 
-        // An empty store is fine: the published events target ANOTHER tenant, so
-        // they cannot clear the seeded `t1` verdict — only the generation bump
+        // An empty store (its database holds no config and no fidelity rows) is
+        // fine: the published events target ANOTHER tenant, so they cannot clear
+        // the seeded `t1` verdict — only the generation bump
         // can. (A `(None, [])` event is itself a whole-cache clear and would
         // clear it directly; that path is covered by
         // `apply_invalidation_to_local_cache`.)
-        let store = crate::store::ConfigStore::from_snapshot(
+        let store = crate::store::ConfigStore::from_data(
+            crate::db::test_pool().await,
             hydra_core::config::ConfigData::default(),
             std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
-        );
+        )
+        .await
+        .expect("from_data");
 
         spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
         spawn_trim_task(stream.clone(), 2, Duration::from_millis(20), None);

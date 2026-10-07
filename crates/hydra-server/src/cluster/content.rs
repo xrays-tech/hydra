@@ -72,18 +72,30 @@ pub struct FidelityRows {
 pub struct ReplicationContent {
     pub version: u64,
     pub cfg: Arc<ConfigData>,
-    /// PRIVATE on purpose: the only production constructors are [`Self::load`]
-    /// (leader/standby, from the DB) and [`Self::from_hydrated`] (replica, from
-    /// a wire that already passed the version check).
+    /// PRIVATE on purpose: the two constructors are [`Self::load`] (this node's
+    /// own database) and [`Self::from_hydrated`] (a tree materialized from the
+    /// control plane).
     ///
-    /// An EMPTY `FidelityRows` would instruct a replica to wipe its fidelity
-    /// tables and insert nothing — cluster-wide silent data loss. Do NOT claim
-    /// the type system rules that out: `FidelityRows` has `pub` fields and
-    /// `from_hydrated` accepts any value, so an empty set IS constructible. The
-    /// real guards are three, and all three are required: (1) only `load`
-    /// populates `replication`, (2) `ConfigStore::from_snapshot` (edge, no pool)
-    /// leaves it `None`, and (3) `internal_control` answers 503 `not_ready` for
-    /// `None` — so a default/empty content can never be SERVED as a snapshot.
+    /// An EMPTY `FidelityRows` would instruct every node that materializes this
+    /// tree to wipe its fidelity tables and insert nothing — cluster-wide silent
+    /// data loss. Do NOT claim the type system rules that out: `FidelityRows`
+    /// has `pub` fields and `from_hydrated` accepts any value, so an empty set
+    /// IS constructible.
+    ///
+    /// Three guards were listed here, and two were retired on 2026-10-05 with the
+    /// code they described: `ConfigStore::from_snapshot` (the `edge` store that
+    /// left `replication` empty, so the guard was really "a store with no
+    /// database") and `internal_control` (the snapshot wire, deleted with the
+    /// edge role: no node SERVES its `ReplicationContent` to another any more —
+    /// replication is materialization from this tree). What is left is the guard
+    /// that was always the load-bearing one: content is built at CONSTRUCTION
+    /// from the node's own database (`ConfigStore::assemble`), so the fidelity
+    /// rows this struct carries are the rows that node's database holds.
+    ///
+    /// The residual risk is unchanged and is NOT closed by any type: a node whose
+    /// database holds no fidelity rows, and that publishes anyway
+    /// (`ConfigStore::reload_all_with(force = true)`), publishes an empty
+    /// fidelity entity, and every materializer would apply it.
     fidelity: FidelityRows,
 }
 

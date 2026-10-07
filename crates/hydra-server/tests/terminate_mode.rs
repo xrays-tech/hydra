@@ -3921,7 +3921,7 @@ async fn non_route_strategy_reject_refuses_a_model_less_body() {
 // never apply). These tests drive a real model-less request through the proxy
 // and assert the narrowing and its fail-closed semantics.
 //
-// The `ConfigData` is built by hand and injected via `ConfigStore::from_snapshot`
+// The `ConfigData` is built by hand and injected via `ConfigStore::from_data`
 // because the DB loader's sub-tenant projection is a separate (T3) lane; this
 // keeps the passthrough tests independent of it.
 // ===========================================================================
@@ -4003,9 +4003,15 @@ fn sub_tenant_route_cfg(
 }
 
 /// Build an `AppState` from a hand-crafted `ConfigData` (bypasses the DB loader).
-fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<AppState> {
+///
+/// The store is `from_data` over a migrated in-memory database: the config this test drives is
+/// injected, but every `ConfigStore` now owns a real pool, and reading the version watermark is a
+/// query against it — hence `async`.
+async fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<AppState> {
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
-    let store = ConfigStore::from_snapshot(cfg, key_provider);
+    let store = ConfigStore::from_data(common::setup_pool().await, cfg, key_provider)
+        .await
+        .expect("from_data");
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -4069,7 +4075,7 @@ async fn passthrough_sub_tenant_default_route_narrows_to_provider() {
         non_route_strategy: NonRouteStrategy::Passthrough,
         ..ProxyConfig::default()
     };
-    let state = build_state_from_config(cfg, proxy);
+    let state = build_state_from_config(cfg, proxy).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
@@ -4139,7 +4145,7 @@ async fn passthrough_sub_tenant_default_route_fail_closed_503() {
         non_route_strategy: NonRouteStrategy::Passthrough,
         ..ProxyConfig::default()
     };
-    let state = build_state_from_config(cfg, proxy);
+    let state = build_state_from_config(cfg, proxy).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();

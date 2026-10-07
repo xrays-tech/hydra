@@ -858,9 +858,6 @@ pub enum BuildSinkError {
     /// `cfg_kind` did not match `"sqlite"` or `"clickhouse"`.
     #[error("unknown sink kind '{kind}'")]
     UnknownKind { kind: String },
-    /// `"sqlite"` was requested but no `SqlitePool` was supplied.
-    #[error("sink kind 'sqlite' requires a SqlitePool")]
-    MissingPool,
     /// `"clickhouse"` was requested but no URL was supplied.
     #[error("sink kind 'clickhouse' requires a url")]
     MissingClickHouseUrl,
@@ -899,24 +896,28 @@ const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Returns a [`Result`] so invalid configuration is a handled startup error
 /// rather than a panic (validates external input per AGENTS.md; the sketch in
-/// the design doc returned `Box<dyn UsageSink>` directly, but a missing
-/// `pool`/`url` cannot be recovered from without inventing a no-op placeholder
-/// sink, which 铁律 2 forbids — hence the typed error).
+/// the design doc returned `Box<dyn UsageSink>` directly, but a missing `url`
+/// cannot be recovered from without inventing a no-op placeholder sink, which
+/// 铁律 2 forbids — hence the typed error).
+///
+/// `pool` is REQUIRED since 2026-10-05, and it is the ClickHouse arm that ignores
+/// it: the parameter used to be an `Option` whose `None` was the retired
+/// pool-less node, so `BuildSinkError::MissingPool` existed for a caller no
+/// deployment could produce. A caller selecting `sqlite` always has the pool it
+/// was serving from; a caller selecting `clickhouse` passes the same one and that
+/// arm simply does not read it.
 #[cfg(feature = "db")]
 pub fn build_sink(
     cfg_kind: &str,
-    pool: Option<SqlitePool>,
+    pool: SqlitePool,
     ch_url: Option<&str>,
 ) -> Result<Box<dyn UsageSink>, BuildSinkError> {
     match cfg_kind {
-        "sqlite" => {
-            let pool = pool.ok_or(BuildSinkError::MissingPool)?;
-            Ok(Box::new(SqliteSink::new(
-                pool,
-                DEFAULT_BATCH_SIZE,
-                DEFAULT_FLUSH_SECS,
-            )))
-        }
+        "sqlite" => Ok(Box::new(SqliteSink::new(
+            pool,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_FLUSH_SECS,
+        ))),
         "clickhouse" => {
             #[cfg(feature = "usage-clickhouse")]
             {
@@ -1122,9 +1123,11 @@ mod audit_3_9_tests {
     #[cfg(feature = "usage-clickhouse")]
     #[tokio::test]
     async fn an_https_clickhouse_url_fails_at_build_time() {
+        // The pool is required and unread by this arm; these tests are about the URL scheme.
+        let pool = crate::db::test_pool().await;
         let err = build_sink(
             "clickhouse",
-            None,
+            pool.clone(),
             Some("https://user:pass@ch.example.com:8443"),
         )
         .err()
@@ -1136,7 +1139,7 @@ mod audit_3_9_tests {
         );
 
         // The plaintext form still builds (this is a scheme check, not a ban).
-        let ok = build_sink("clickhouse", None, Some("http://127.0.0.1:8123"));
+        let ok = build_sink("clickhouse", pool, Some("http://127.0.0.1:8123"));
         assert!(
             ok.is_ok(),
             "a plain http:// URL must keep working: {:?}",

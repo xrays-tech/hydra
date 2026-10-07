@@ -87,11 +87,7 @@ async fn a_replica_materialized_from_the_tree_keeps_the_cert_private_key() {
     let leader = ConfigStore::load(leader_pool.clone(), key_provider.clone())
         .await
         .expect("load the leader store");
-    let content = leader
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("replication content");
+    let content = Arc::clone(&leader.replication());
 
     // Fixture check, so a failure below cannot be blamed on the seed: the leader
     // itself holds the private key in memory.
@@ -162,11 +158,7 @@ async fn the_cert_entity_carries_no_plaintext_private_key() {
     let leader = ConfigStore::load(leader_pool, key_provider.clone())
         .await
         .expect("load");
-    let content = leader
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("replication content");
+    let content = Arc::clone(&leader.replication());
 
     let tree =
         encode_config(&content.cfg, content.fidelity(), key_provider.as_ref()).expect("encode");

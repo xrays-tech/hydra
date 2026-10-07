@@ -278,17 +278,12 @@ impl ReplicaTarget {
 #[async_trait::async_trait]
 impl MaterializeTarget for ReplicaTarget {
     async fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
-        // A store built by `ConfigStore::from_snapshot` (the retired edge mode) has no database to
-        // rebuild. Refused rather than silently applied in memory: the node would serve a config it
-        // could not reproduce after a restart, which is the whole point of materializing.
-        let Some(pool) = self.store.pool() else {
-            return Err(
-                "this node has no local config database, so it cannot materialize a tree; a \
-                 snapshot-fed store is not a valid target"
-                    .to_string(),
-            );
-        };
-
+        // Rebuilt INTO the node's own database, so a restart reproduces what it serves — the whole
+        // point of materializing rather than applying in memory. There is no "this node has no
+        // database to rebuild" refusal here: every node has one (ADR-0001 D-2 retired the `edge`
+        // role, and with it the pool-less store that refusal existed for). Deleted 2026-10-05,
+        // together with the test that had to build a store no configuration produces.
+        let pool = self.store.pool();
         let version = self.store.version() + 1;
         crate::db::restore_config(
             pool,
@@ -905,29 +900,12 @@ mod tests {
         );
     }
 
-    /// A store with no database cannot materialize, and says so instead of pretending.
-    ///
-    /// `ConfigStore::from_snapshot` is the retired edge shape: no local config database by design.
-    /// Applying in memory only would leave a node that serves a config it cannot reproduce after a
-    /// restart — the opposite of what materializing is for.
-    #[tokio::test]
-    async fn a_target_without_a_database_refuses_rather_than_applying_in_memory_only() {
-        let replica_store = ConfigStore::from_snapshot(ConfigData::default(), Arc::new(kp()));
-        let target = ReplicaTarget::new(replica_store.clone(), Arc::new(kp()));
-
-        let got = target
-            .apply(Arc::new(rich_config()), Arc::new(FidelityRows::default()))
-            .await;
-        let reason = got.expect_err("a pool-less store must be refused");
-        assert!(
-            reason.contains("no local config database"),
-            "the refusal must name the reason, got: {reason}"
-        );
-        assert!(
-            replica_store.snapshot().tenants_by_domain.is_empty(),
-            "nothing may be installed when the target refuses"
-        );
-    }
+    // `a_target_without_a_database_refuses_rather_than_applying_in_memory_only` stood here. It
+    // built a pool-less store through the deleted `ConfigStore::from_snapshot` and asserted that
+    // `ReplicaTarget::apply` refused it with "no local config database". Neither the store nor the
+    // refusal exists any more: every node has a database to materialize into (ADR-0001 D-2), and the
+    // guard went with the possibility. Deleting the test rather than renaming it keeps the count
+    // honest — it covered a shape the type no longer permits.
 
     /// THE CUTOVER, end to end: a local config change is PUBLISHED, and another node picks it up.
     ///

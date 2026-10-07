@@ -298,7 +298,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     );
 
     let admin_state = Arc::new(AdminState::new(
-        Some(pool),
+        pool,
         store,
         auth,
         breaker,

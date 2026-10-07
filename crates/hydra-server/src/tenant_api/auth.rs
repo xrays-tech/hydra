@@ -39,8 +39,14 @@ pub enum AuthError {
     /// The two are deliberately indistinguishable: telling a caller which half
     /// failed turns the gate into an oracle for tokens that exist.
     Unauthorized,
-    /// This node holds no configuration yet (an edge before its first snapshot).
-    /// Fail closed — a gate that cannot check must not pass anything.
+    /// The gate has nothing to judge the request against, and fails closed rather than passing it
+    /// or calling the token wrong. Two states say it:
+    ///
+    /// - the node holds no configuration at all (version 0): a node that has just started or joined,
+    ///   before the materializer applies the head. The tenant contract documents this as a retryable
+    ///   503 — see `tenant-api-integration.md`;
+    /// - the snapshot names a token digest with no matching tenant row: a config that cannot be
+    ///   trusted, so nothing is authenticated against it.
     NotReady,
 }
 
@@ -63,10 +69,21 @@ pub struct AuthenticatedTenant {
 /// the running result is folded rather than branched away.
 pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTenant, AuthError> {
     let present = sha256_hex_string(bearer.as_bytes());
-    let guard = store.replication();
-    let Some(content) = guard.as_ref() else {
+    // ONE atomic read: the hashes, the tenant rows and the version all come from the same
+    // generation (see `AuthenticatedTenant`).
+    let content = store.replication();
+
+    // "This node holds no configuration yet" is version 0 — the watermark for "nothing has ever been
+    // applied" (`ConfigStore::version`, F-4). This guard used to read `let Some(content) = … else
+    // { NotReady }`, because the only empty store was the pool-less one built by the deleted
+    // `from_snapshot`; the CONDITION did not go away with the constructor, only its old spelling
+    // did. It is reachable for real: a node that has just started, or just joined, serves this
+    // window (bounded by one materializer tick) until the head is applied, and the tenant contract
+    // promises it 503 `not_ready` — retryable — rather than 401, which would say "your token is
+    // wrong" about a node that has no configuration to judge it by.
+    if content.version == 0 {
         return Err(AuthError::NotReady);
-    };
+    }
     let hashes = &content.fidelity().tenant_token_hashes;
 
     // Fold over every row, so the work does not depend on where a match is.
@@ -147,16 +164,28 @@ mod tests {
         assert!(!constant_time_eq(&d, &d[..63]));
     }
 
-    #[test]
-    fn a_store_without_configuration_is_not_ready_not_unauthorized() {
-        // The edge shape: `from_snapshot` holds no replication content until the
-        // first snapshot lands, so the gate cannot check anything. A gate that
-        // cannot check must fail closed AND say so — 401 would claim "your token
-        // is wrong", which is a different statement.
-        let store = ConfigStore::from_snapshot(ConfigData::default(), kp());
+    /// A node that has materialized NO config yet is `not ready`, not `unauthorized` — asserted on
+    /// the constructor production actually uses.
+    ///
+    /// This replaces `a_store_without_configuration_is_not_ready_not_unauthorized`, which built its
+    /// store with `from_snapshot`: that constructor is gone (a store always has a database), so the
+    /// test now takes its empty store from [`ConfigStore::load`] over an empty database — the state
+    /// a real node is in before its first materialization. The EXPECTATION is unchanged, because the
+    /// contract it protects is unchanged; what changed is that the premise is now reachable.
+    #[tokio::test]
+    async fn a_node_that_has_materialized_nothing_is_not_ready_not_unauthorized() {
+        let store = ConfigStore::load(crate::db::test_pool().await, kp())
+            .await
+            .expect("load");
+        assert_eq!(
+            store.version(),
+            0,
+            "an empty database carries no watermark: this is what 'nothing materialized' looks like"
+        );
         assert_eq!(
             authenticate(&store, "anything").err(),
-            Some(AuthError::NotReady)
+            Some(AuthError::NotReady),
+            "a gate with no configuration to judge by says so (503, retryable) instead of calling              the token wrong (401)"
         );
     }
 
@@ -169,11 +198,12 @@ mod tests {
     // so no test-only constructor is added to `ConfigStore`.
 
     /// Build a store whose replication content holds the given tenant rows and
-    /// token hashes, so `authenticate` has a real (non-`None`) snapshot to read.
+    /// token hashes, so `authenticate` has a real snapshot to read.
     ///
-    /// Reuses the production `apply_snapshot` path — no test-only `ConfigStore`
-    /// constructor.
-    fn store_with_tenant_hashes(
+    /// Reuses the production `apply_snapshot` path to install the content, and
+    /// `ConfigStore::from_data` only for the initial (empty) store — which now needs a pool, so this
+    /// helper is async like every other store construction in the codebase.
+    async fn store_with_tenant_hashes(
         tenants: &[(String, String)],
         hashes: Vec<(String, String)>,
     ) -> ConfigStore {
@@ -206,7 +236,10 @@ mod tests {
             sub_tenants: Vec::new(),
             sub_tenant_routes: Vec::new(),
         };
-        let store = ConfigStore::from_snapshot(ConfigData::default(), kp());
+        let store =
+            ConfigStore::from_data(crate::db::test_pool().await, ConfigData::default(), kp())
+                .await
+                .expect("from_data");
         store.apply_snapshot(HydratedWire {
             version: 1,
             cfg,
@@ -217,8 +250,8 @@ mod tests {
 
     /// Two tenants configured with the same token hash must fail CLOSED (a 401
     /// `Unauthorized`), not silently resolve to whichever row iterates last.
-    #[test]
-    fn a_duplicate_token_hash_is_unauthorized_not_whichever_row_iterates_last() {
+    #[tokio::test]
+    async fn a_duplicate_token_hash_is_unauthorized_not_whichever_row_iterates_last() {
         let hash = sha256_hex_string(b"shared-secret-token");
         let store = store_with_tenant_hashes(
             &[
@@ -226,7 +259,8 @@ mod tests {
                 ("t2".into(), "other.example".into()),
             ],
             vec![("t1".into(), hash.clone()), ("t2".into(), hash.clone())],
-        );
+        )
+        .await;
         // The token matches two rows: the gate must refuse it, indistinguishable
         // from a wrong token.
         assert_eq!(
@@ -243,12 +277,13 @@ mod tests {
 
     /// The ordinary single-match path still succeeds: exactly one tenant owns the
     /// hash, the gate resolves it and reports the version it was decided on.
-    #[test]
-    fn a_single_match_still_resolves_to_its_tenant() {
+    #[tokio::test]
+    async fn a_single_match_still_resolves_to_its_tenant() {
         let store = store_with_tenant_hashes(
             &[("t1".into(), "acme.example".into())],
             vec![("t1".into(), sha256_hex_string(b"only-this-tenant"))],
-        );
+        )
+        .await;
         let authed = authenticate(&store, "only-this-tenant").expect("must resolve");
         assert_eq!(authed.tenant.id, "t1");
         assert_eq!(authed.config_version, 1);

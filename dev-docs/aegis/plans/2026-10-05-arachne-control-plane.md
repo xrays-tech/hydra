@@ -935,6 +935,65 @@ grep -rni "arachne" crates/hydra-server/src/redis/ crates/hydra-server/src/proxy
 
 **两种条件都实测**：真仓库树 OK（136 个步骤、8 处"钻探声明构建且其步骤确实构建"、40 个步骤跑读二进制的钻探 —— SELF-BUILD 11 / 同作业继承 29）；**CI 条件**（有 workflow、无 `.acceptance/`）同样 **exit 0** 并打印 NOTE。自测 23 → **25** 条（新增两条正是这次重设计的回归：workflow 本身会被判、以及 CI 条件必须通过）。
 
+### 决定 7（2026-10-07 用户裁定「清」）：把"没有本地数据库"这条路删干净
+
+用户原话：「清」。指的是上一轮被登记、但只删了一半的东西：`edge` 角色退役后，**"这个节点没有本地
+数据库"这一整类形状已经无法由任何配置产生**，而代码里还留着以它为条件的类型、分支、错误变体和测试。
+
+**先测了它到底有多大**：删掉一个构造器（`ConfigStore::from_snapshot`）之前，它**是三个"空"状态的唯一
+生产者**——`ConfigStore.pool: Option<SqlitePool>`、`ConfigStore.replication: ArcSwapOption<..>`
+（写入点只有三处：`load`、`apply_snapshot`、`reload_all_with`，**三处都写 `Some`**）、
+`AdminState.pool: Option<SqlitePool>`；再往下还有两条"不可能的 caller error"：`BuildSinkError::MissingPool`
+与 `SelectError::MissingPool`。`main.rs` 里那半句 `let pool = if false { None } else { … }` 是它们
+的"许可证"：它让无池分支一直参与编译，于是每个读者都得自己证明那个分支走不到。
+
+| 删掉的 | 换成 |
+|---|---|
+| `let pool = if false { None } else { … }` | `let pool = { … }`（每个节点必有库，ADR-0001 D-2） |
+| `ConfigStore.pool: Option<SqlitePool>` + `pool() -> &SqlitePool` 的说明 | `pool: SqlitePool`；`pool()` 直接返回 |
+| `ConfigStore.replication: ArcSwapOption`（`version()` 的 `map_or(0,…)`、publisher 的 `if let Some`） | `ArcSwap<ReplicationContent>`：内容在**构造时**就建好（`assemble`），所以它永远在 |
+| `ConfigStore::from_snapshot(cfg, kp)`（无池） | `ConfigStore::from_data(pool, cfg, kp)`，与 `load` 共用**同一个** `assemble`（版本水位、fidelity 装载都只有一份实现） |
+| `StoreError::NoDatabase`、`reload_all_without_db_errors` | 二者一起删（无库的 store 不再是本进程能进入的状态） |
+| `AdminState.pool: Option<..>`、`db()` 里的 `.expect("admin SQLite pool (leader mode only)")`、`/health` 的 `db: "n/a"` | `SqlitePool`；`db()` 返回 `&self.pool`；`/health` 的探针**永远跑**（"n/a" 曾把一个真的坏库显示成"不适用"） |
+| `BuildSinkError::MissingPool` / `SelectError::MissingPool` | `build_sink`/`select` 的 `pool` 参数改为必填（`clickhouse` 那条臂不读它，与 `ch_url` 的 `Option` 形状不同——那是"两种 kind 各用其中一个参数"，不是角色残留） |
+| `ReplicaTarget::apply` 的"没有本地库就拒绝"、其中文/英文两条拒绝文案与其测试 | 删。它断言的是一个类型已经不允许的形状 |
+| `tenant_api` 两个只读端点的 `503 not_ready`（"this node has no configuration yet"） | 删。它们在**闸门之后**执行，而闸门已经要求"某条 fidelity 摘要有对应租户行"⇒ 走到那里时快照不可能是空的 |
+
+**一处"意图"必须留下，但换了载体（这是本轮最值得记的一条）**：`tenant_api::authenticate` 里
+`let Some(content) = … else { NotReady }` 的**条件**没有随构造器消失——"本节点还没有任何配置"是**真实可达
+的**状态（刚启动/刚加入的节点，在物化器落下 head 之前）。它现在的表述是 `content.version == 0`
+（`ConfigStore::version` 已经把这个水位定义成"什么都还没应用"，F-4 的同一口径），于是租户契约
+**一字未改**：`tenant-api-integration.md` 里那几条"503 `not_ready` = 本节点还没物化配置（启动窗口）"
+**本来就是对的**——只是原文注释把它挂在了一个 `None` 上。
+**如果当时按"删掉不可达分支"的字面理解把它一并删掉**，这个状态就会变成 **401**（"你的令牌是错的"），
+而这**恰恰是产品今天的行为**：`ConfigStore::load` 在空库上给出的是 `Some(空内容)`，折半查表匹配不到任何摘要
+⇒ 401。也就是说：**测试测的旧形状比生产更保守**。改成 `version == 0` 既保留了契约，又让前提变得可达。
+
+**测试账（如实记）**：删 3 条（`reload_all_without_db_errors`、`a_target_without_a_database_refuses_rather_than_applying_in_memory_only`、
+`select_sqlite_without_a_pool_is_an_error`）与 `sink_trait_swap_by_config` 里的 1 条腿（`MissingPool`，
+换成了 `clickhouse` 缺 URL 的腿）；改写 2 条改用**生产构造器**断言同一个契约
+（`a_node_that_has_materialized_nothing_is_not_ready_not_unauthorized`←原 `a_store_without_configuration_is_not_ready_not_unauthorized`、
+`from_data_serves_and_applies`←原 `from_snapshot_serves_and_applies`，其第一条断言原本就是
+`store.pool().is_none()`）；改名 2 条（"edge from the snapshot alone" → "from a materialized snapshot alone"）。
+**15 个 `from_snapshot` 调用点**全部改为"真库 + `from_data`"；为此在 `db.rs` 加了
+`#[cfg(test)] pub(crate) fn test_pool()`，让 crate 内单测的 `:memory:` 配方**只有一个 owner**
+（集成测试那边一直有 `common::setup_pool`）。
+
+**未覆盖的一项（不粉饰）**：`sink_trait_swap_by_config` 现在有一条腿按特性二选一断言拒绝变体
+（`usage-clickhouse` ⇒ `MissingClickHouseUrl`，否则 `ClickHouseFeatureDisabled`）——旧的那条 `MissingPool`
+腿没有等价替代，因为它断言的状态已经不成立。
+
+**顺带修红的一处守卫（本轮自己造成的）**：`node scripts/check_public_claims.cjs` 在真树上 **exit 1**。
+页面（`docs/index.html`，`7e95422` 2026-10-06 写入）声明 `814 = 258 core + 556 server`，而套件实测
+**751 = 260 core + 491 server**。这不是外部漂移：`git diff 7e95422..HEAD -- crates/hydra-server`
+显示本轮退役动作删掉了 **73 个 `#[test]`/`#[tokio::test]`（新增 18）**、`tests/` 下删 **38（新增 10）**
+——`cluster/forward.rs` 与 `tenant_config/forward.rs` 两个测试模块随 D-6 乙-full 整块消失，正是
+`--features server` 那一档掉 60 余条的主因。CI 的 `check` 作业跑的就是这条守卫（用同两个套件的日志），
+所以它**从退役那一刻起就是红的**，而我此前的"全绿"报告漏了它（第二次同类漏报，第一次是
+`check_tenant_error_codes`）。处置用守卫自己的刷新路径：`--measure --write` ⇒
+`751 Rust tests (260 core + 491 server), dated 2026-10-07`，两处声明（统计带 + 正确性门禁）同时更新；
+`--measure` 复查 **OK**。
+
 ### 本轮新发现（尚未处理，登记在案）
 
 * **一个集群节点无法单独启动：新数据目录必须由多数派先"认领"**。`await_cluster_preflight` 的

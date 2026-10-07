@@ -2581,16 +2581,16 @@ struct HealthBody {
 
 pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
     let snap = state.store.snapshot();
-    // Edge nodes have no local DB (cluster P0b) — skip the DB probe.
-    let (db_status, providers_count) = match &state.pool {
-        Some(pool) => match crate::db::list_providers(pool).await {
-            Ok(rows) => ("ok", rows.len()),
-            Err(e) => {
-                tracing::warn!(target: "hydra::admin", trace_id, error = %e, "health db probe failed");
-                ("error", snap.providers.len())
-            }
-        },
-        None => ("n/a", snap.providers.len()),
+    // Every node has a local database, so the probe always runs. Until 2026-10-05 a `None` pool
+    // short-circuited it to `db: "n/a"` — a status an operator could only ever see on the retired
+    // `edge` role, and one that hid a database which really was broken (the probe is how a
+    // corrupted or unreachable DB shows up on `/health` at all).
+    let (db_status, providers_count) = match crate::db::list_providers(&state.pool).await {
+        Ok(rows) => ("ok", rows.len()),
+        Err(e) => {
+            tracing::warn!(target: "hydra::admin", trace_id, error = %e, "health db probe failed");
+            ("error", snap.providers.len())
+        }
     };
     ok_json(
         200,

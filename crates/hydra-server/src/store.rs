@@ -45,10 +45,6 @@ pub enum StoreError {
     /// published (the caller keeps the previous one).
     #[error("fatal config validation: {0}")]
     FatalValidation(String),
-    /// The store was built snapshot-fed (edge mode) and has no local DB to
-    /// rebuild from; `apply_snapshot` is the only mutation path.
-    #[error("config store has no local database (edge/snapshot-fed mode)")]
-    NoDatabase,
     /// The config committed to the LOCAL database but could not be published to
     /// the control plane (Arachne), so the rest of the cluster will not see it.
     ///
@@ -292,9 +288,17 @@ pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<ArcSwap<ConfigData>>,
-    /// Local SQLite pool (leader/all mode). `None` on snapshot-fed stores
-    /// (edge mode — no local config DB by design, cluster P0b).
-    pool: Option<SqlitePool>,
+    /// The node's local SQLite pool.
+    ///
+    /// It used to be `Option`, because an `edge` node had no local config database by design
+    /// (cluster P0b) and `from_snapshot` built one without a pool. That role was retired with the
+    /// homogeneous topology (ADR-0001 D-2), and with it the possibility: **every node has a local
+    /// database**, `main.rs` builds the store from `HYDRA_DB_URL` unconditionally, and the
+    /// `if false { None } else { … }` that had kept the two shapes compiling was the last thing
+    /// pretending otherwise. The guards that answered "no local database" —
+    /// `tenant_api::local_write`'s `not_ready` and `ReplicaTarget::apply`'s refusal — were therefore
+    /// unreachable, and are gone with the type: a check that cannot fail is not a check.
+    pool: SqlitePool,
     swrr: Arc<DashMap<(String, String), SwrrState>>,
     key_provider: Arc<dyn KeyProvider>,
     /// The replicated bytes, version included (cluster P1/P2). The generation
@@ -302,11 +306,19 @@ pub struct ConfigStore {
     /// content changed" are one statement, and [`Self::version`] DERIVES from it
     /// (a second `AtomicU64` would be a second owner — review C16).
     ///
-    /// `Arc<ArcSwapOption<..>>`: the outer `Arc` is required because
-    /// `ArcSwapAny` is not `Clone` and `ConfigStore` is `#[derive(Clone)]`; the
-    /// `Option` is required because an edge store built by [`Self::from_snapshot`]
-    /// has no fidelity rows until its first [`Self::apply_snapshot`].
-    replication: Arc<arc_swap::ArcSwapOption<ReplicationContent>>,
+    /// `Arc<ArcSwap<..>>`: the outer `Arc` is required because `ArcSwapAny` is not `Clone` and
+    /// `ConfigStore` is `#[derive(Clone)]`.
+    ///
+    /// It was an `ArcSwapOption` until 2026-10-05, on the theory that a store could exist "before
+    /// its first snapshot". No path produces that state: [`Self::assemble`] builds the content at
+    /// CONSTRUCTION (from the pool), [`Self::apply_snapshot`] replaces it, and the None was written
+    /// by exactly one function — the deleted `from_snapshot` (the `edge` role). The `None` branch
+    /// that readers had to handle was therefore about a shape no configuration can build, and the
+    /// guards it fed (a `503 not_ready` in the tenant API, a skipped publish in
+    /// [`Self::reload_all_with`]) could not fire: an EMPTY store is `Some(empty content at version
+    /// 0)`, which is what a brand-new node actually holds, and it is a different state — one the
+    /// code now has to answer for on its merits instead of pattern-matching it away.
+    replication: Arc<arc_swap::ArcSwap<ReplicationContent>>,
     /// Snapshot-change hooks (审核四 P3). Every swap path funnels through
     /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
     /// be forgotten by one of the writers.
@@ -329,6 +341,34 @@ impl ConfigStore {
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
         let cfg = build_config(&pool, key_provider.as_ref()).await?;
+        Self::assemble(pool, cfg, key_provider).await
+    }
+
+    /// A store serving a config built IN MEMORY, materialized into `pool` — the seam the tests use
+    /// to drive the store with a `ConfigData` they assembled by hand, in place of the deleted
+    /// `from_snapshot` (which took no pool, because the `edge` role had none).
+    ///
+    /// It takes the pool for the same reason every other path does: the store's claim is "the
+    /// config THIS NODE serves is in THIS NODE's database", and a store built without one could not
+    /// honour it — the fidelity rows, the version watermark and every `pool()` reader would have
+    /// been describing a database that does not exist. Everything else is shared verbatim with
+    /// [`Self::load`] (see [`Self::assemble`]), so a test store cannot end up with a shape
+    /// production never builds.
+    pub async fn from_data(
+        pool: SqlitePool,
+        cfg: ConfigData,
+        key_provider: Arc<dyn KeyProvider>,
+    ) -> Result<Self, StoreError> {
+        Self::assemble(pool, cfg, key_provider).await
+    }
+
+    /// The ONE construction path: an already-built config, plus the pool it is (or is about to be)
+    /// materialized into.
+    async fn assemble(
+        pool: SqlitePool,
+        cfg: ConfigData,
+        key_provider: Arc<dyn KeyProvider>,
+    ) -> Result<Self, StoreError> {
         // Resume the config version from the DB instead of restarting at 1:
         // a restarted leader otherwise serves a LOW version watermark and
         // peers (`since` comparison) never re-sync from it — even when its
@@ -378,46 +418,24 @@ impl ConfigStore {
             ReplicationContent::load(&pool, key_provider.as_ref(), cfg.clone(), version).await?;
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
-            pool: Some(pool),
+            pool,
             swrr: Arc::new(DashMap::new()),
             key_provider,
-            replication: Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(content)))),
+            replication: Arc::new(arc_swap::ArcSwap::from_pointee(content)),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "arachne")]
             publisher: None,
         })
     }
 
-    /// Build a store without a local DB (edge mode, cluster P0b): starts from
-    /// a shipped snapshot (initially empty; the control client replaces it via
-    /// [`Self::apply_snapshot`] once wired).
-    ///
-    /// Version 0 = "this node holds nothing yet", so the first poll asks with
-    /// `?since=0` and is always sent a full snapshot. Starting at 1 would let a
-    /// node that has never synced claim to be current with a leader whose own
-    /// first version is 1 (see [`Self::load`]).
-    #[must_use]
-    pub fn from_snapshot(cfg: ConfigData, key_provider: Arc<dyn KeyProvider>) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(cfg)),
-            pool: None,
-            swrr: Arc::new(DashMap::new()),
-            key_provider,
-            // No pool on an edge ⇒ no fidelity rows yet. Left `None` on purpose:
-            // only the first `apply_snapshot` (from a verified wire) fills it.
-            replication: Arc::new(arc_swap::ArcSwapOption::empty()),
-            hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
-            #[cfg(feature = "arachne")]
-            publisher: None,
-        }
-    }
-
     /// The current replication content, version included (one atomic load).
     ///
-    /// `None` until a node has content: on an edge that means "before the first
-    /// `apply_snapshot`".
+    /// NEVER absent: a store is built with content ([`Self::assemble`]) and every later swap
+    /// ([`Self::apply_snapshot`], [`Self::reload_all_with`]) replaces it. "This node holds no
+    /// config yet" is the EMPTY content at version 0, not a missing one — see the field's note for
+    /// why that distinction had to become the caller's problem rather than a `None` to match on.
     #[must_use]
-    pub fn replication(&self) -> Guard<Option<Arc<ReplicationContent>>> {
+    pub fn replication(&self) -> Guard<Arc<ReplicationContent>> {
         self.replication.load()
     }
 
@@ -434,18 +452,20 @@ impl ConfigStore {
         &self.swrr
     }
 
-    /// The local SQLite pool, when present (leader/all mode). `None` on
-    /// snapshot-fed edge stores.
+    /// The local SQLite pool: every node has one (see the field's note).
     #[must_use]
-    pub fn pool(&self) -> Option<&SqlitePool> {
-        self.pool.as_ref()
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Current config version (cluster P1): the `since` watermark for the
-    /// control channel and the local last-applied version on edges.
+    /// control channel and the local last-applied version.
+    ///
+    /// Version 0 means "nothing applied yet" — the content is present but empty (see
+    /// [`Self::replication`]), NOT absent.
     #[must_use]
     pub fn version(&self) -> u64 {
-        self.replication.load().as_deref().map_or(0, |c| c.version)
+        self.replication.load().version
     }
 
     /// Register a hook that runs after **every** snapshot swap.
@@ -479,8 +499,8 @@ impl ConfigStore {
         }
     }
 
-    /// Atomically apply a snapshot received from the control plane (edge /
-    /// standby, cluster P1). Same COW semantics as [`Self::reload_all`]:
+    /// Atomically apply a snapshot received from the control plane (the materializer, ADR-0001
+    /// §3). Same COW semantics as [`Self::reload_all`]:
     /// the swap is lock-free for readers and the SWRR map is cleared so stale
     /// per-`(tenant, model)` weights never survive a config change. The store
     /// adopts the control-plane `version` (monotonic across the cluster).
@@ -491,7 +511,7 @@ impl ConfigStore {
             hydrated.fidelity,
         );
         self.inner.store(Arc::new(hydrated.cfg));
-        self.replication.store(Some(Arc::new(content)));
+        self.replication.store(Arc::new(content));
         self.swrr.clear();
         self.notify(&self.snapshot());
     }
@@ -501,8 +521,7 @@ impl ConfigStore {
     /// On a **fatal** validation issue the old snapshot is kept (`Err`
     /// returned, `inner` untouched). On success the new snapshot is published
     /// (version bumped) and the SWRR map is cleared so per-`(tenant, model)`
-    /// weights are rebuilt lazily on the next request. Snapshot-fed stores
-    /// (edge) have no DB to reload from and return [`StoreError::NoDatabase`].
+    /// weights are rebuilt lazily on the next request.
     /// Returns whether the REPLICATION CONTENT actually changed (plan T6).
     pub async fn reload_all(&self) -> Result<bool, StoreError> {
         self.reload_all_with(false).await
@@ -515,7 +534,7 @@ impl ConfigStore {
     /// that touched no replicated column) rebuild every replica for nothing.
     /// `force` restores the operator's "push this out anyway".
     pub async fn reload_all_with(&self, force: bool) -> Result<bool, StoreError> {
-        let pool = self.pool.clone().ok_or(StoreError::NoDatabase)?;
+        let pool = self.pool.clone();
         let kp = self.key_provider.clone();
         let new_cfg = build_config(&pool, kp.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
@@ -529,7 +548,7 @@ impl ConfigStore {
         // exists to remove).
         let prev_version = self.version();
         let candidate = ReplicationContent::load(&pool, kp.as_ref(), new_cfg, prev_version).await?;
-        let changed = force || self.replication.load().as_deref() != Some(&candidate);
+        let changed = force || self.replication.load().as_ref() != &candidate;
 
         if !changed {
             tracing::debug!(version = prev_version, "reload: no replicated change");
@@ -542,11 +561,11 @@ impl ConfigStore {
         // the in-memory one reads as "this node is behind".
         db::set_config_version(&pool, new_content.version).await?;
         self.inner.store(new_content.cfg.clone());
-        self.replication.store(Some(Arc::new(new_content)));
+        self.replication.store(Arc::new(new_content));
         self.swrr.clear();
         // Followers of the snapshot (the TLS cert store) re-resolve here, so a
         // cert written through the admin API is live on the very next
-        // handshake — on every node role, including edge.
+        // handshake — on every node, the write and the apply being independent paths.
         self.notify(&self.snapshot());
 
         // ...and now the CLUSTER. Order (local swap, then publish) is deliberate: the SQLite
@@ -560,12 +579,10 @@ impl ConfigStore {
         #[cfg(feature = "arachne")]
         if let Some(publisher) = &self.publisher {
             let content = self.replication();
-            if let Some(content) = content.as_deref() {
-                publisher
-                    .publish(&content.cfg, content.fidelity())
-                    .await
-                    .map_err(|reason| StoreError::NotPublished { reason })?;
-            }
+            publisher
+                .publish(&content.cfg, content.fidelity())
+                .await
+                .map_err(|reason| StoreError::NotPublished { reason })?;
         }
         Ok(true)
     }
@@ -661,7 +678,7 @@ mod tests {
     ///
     /// This is the invariant that keeps the TLS cert store honest (审核四 P3).
     /// Re-resolving certs from the admin write path only is how the cluster
-    /// path was missed: an edge applies snapshots through
+    /// path was missed: a node applies snapshots through
     /// [`ConfigStore::apply_snapshot`] and never touches an admin handler, so a
     /// cert pushed through the control plane stayed invisible to the TLS
     /// callback until the process restarted. Both paths are asserted here, so a
@@ -684,7 +701,7 @@ mod tests {
                 .push(cfg.tenants_by_domain.len() as u64);
         }));
 
-        // Control-plane path (edge / standby): one config version.
+        // Control-plane path (materialized snapshot): one config version.
         store.apply_snapshot(hydrated(7, ConfigData::default()));
         // Local rebuild path (admin write, `POST /api/v1/reload`). The content
         // must ACTUALLY change: the generation now advances — and followers are
@@ -761,14 +778,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_snapshot_serves_and_applies() {
+    /// A store built from a hand-made `ConfigData` serves it, swaps it, and is backed by the pool it
+    /// was handed.
+    ///
+    /// This replaces `from_snapshot_serves_and_applies`, whose first assertion was
+    /// `store.pool().is_none()` — the store type itself asserted the retired "no local database"
+    /// shape. The rest of the test is unchanged, because the behavior under test (serve, then
+    /// replace on `apply_snapshot`, clearing SWRR) was never about that shape.
+    #[tokio::test]
+    async fn from_data_serves_and_applies() {
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
         let mut c1 = ConfigData::default();
         cfg_with_tenant(&mut c1);
-        let store = ConfigStore::from_snapshot(c1, kp());
-        assert!(store.pool().is_none(), "snapshot-fed store has no DB");
-        // A snapshot-fed store starts at version 0: it holds nothing yet, so its
-        // first control poll asks with `?since=0` and is sent a full snapshot.
+        let store = ConfigStore::from_data(pool, c1, kp())
+            .await
+            .expect("from_data");
+        // The store's pool is a real handle to a real (empty) database, which is the point: it is
+        // the database `version()` reports on and the one every `pool()` reader queries.
+        assert!(
+            !crate::db::config_content_exists(store.pool())
+                .await
+                .expect("content probe"),
+            "a config injected in memory is NOT in the database until a write puts it there"
+        );
+        // Version 0: the database carries no watermark yet, so this node's first control poll asks
+        // with `?since=0` and is sent a full snapshot.
         assert_eq!(store.version(), 0);
 
         // Initial snapshot is served.
@@ -796,12 +833,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reload_all_without_db_errors() {
-        let store = ConfigStore::from_snapshot(ConfigData::default(), kp());
-        assert!(matches!(
-            store.reload_all().await,
-            Err(StoreError::NoDatabase)
-        ));
-    }
+    // `reload_all_without_db_errors` stood here: it built a pool-less store and asserted
+    // `StoreError::NoDatabase`. Both the constructor and the variant are gone — a store without a
+    // database is not a state this process can be in — so the test went with them rather than
+    // being rewritten to assert something else under the same name.
 }

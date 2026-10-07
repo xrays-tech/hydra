@@ -278,7 +278,7 @@ async fn a_data_plane_write_is_applied_by_the_node_that_received_it() {
             .any(|s| s.id == st_id),
         "the sub-tenant must be in this node's snapshot"
     );
-    let pool = state.store.pool().expect("this node has a database");
+    let pool = state.store.pool();
     let rows = hydra_server::db::list_sub_tenants(pool)
         .await
         .expect("list sub-tenants");

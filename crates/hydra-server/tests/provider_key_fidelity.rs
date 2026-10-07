@@ -89,11 +89,7 @@ async fn replica_keeps_leader_provider_key_identity() {
     let leader_store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
         .await
         .expect("load");
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("replication content");
+    let content = Arc::clone(&leader_store.replication());
 
     let mut leader_ids: Vec<String> = content
         .fidelity()
@@ -189,11 +185,7 @@ async fn rematerializing_does_not_renumber_provider_keys() {
     let leader_store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
         .await
         .expect("load");
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("content");
+    let content = Arc::clone(&leader_store.replication());
 
     let replica_pool = common::setup_pool().await;
     let mut seen: Vec<Vec<String>> = Vec::new();
@@ -244,11 +236,7 @@ async fn hydrated_runtime_config_exposes_the_provider_keys() {
     let leader_store = ConfigStore::load(leader_pool.clone(), key_provider.clone())
         .await
         .expect("load");
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("content");
+    let content = Arc::clone(&leader_store.replication());
     let hydrated = HydratedWire {
         version: content.version,
         cfg: (*content.cfg).clone(),

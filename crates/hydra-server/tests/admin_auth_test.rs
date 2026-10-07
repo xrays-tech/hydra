@@ -46,7 +46,7 @@ async fn admin_state() -> Arc<AdminState> {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     Arc::new(AdminState::new(
-        Some(pool),
+        pool,
         store,
         auth,
         breaker,

@@ -336,15 +336,16 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let key_provider: Arc<dyn crypto::KeyProvider> = Arc::new(static_kp);
 
     // (2a) DB pool + migrations. EVERY node has one (ADR-0001 D-2: a node that cannot materialize
-    // the config tree into its own database cannot serve it).
-    let pool = if false {
-        None
-    } else {
+    // the config tree into its own database cannot serve it) — so this is not an `Option`, and until
+    // 2026-10-05 it was: `let pool = if false { None } else { … }` kept a pool-less arm compiling
+    // for a role that no longer exists, and every reader downstream had to prove for themselves
+    // that the arm could not be taken.
+    let pool = {
         let db_url = std::env::var("HYDRA_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string());
         let p = db::init_pool(&db_url).await?;
         db::run_migrate(&p).await?;
         info!(db_url = %db_url, "database pool ready");
-        Some(p)
+        p
     };
 
     // (2b) One-shot master-key rotation (`HYDRA_RESEAL_SECRETS=1`).
@@ -372,11 +373,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         std::process::exit(1);
     }
     if reseal_requested() {
-        let Some(p) = &pool else {
-            error!("HYDRA_RESEAL_SECRETS=1 needs a local database (this is an edge node)");
-            std::process::exit(1);
-        };
-        match db::reseal_secrets(p, key_provider.as_ref()).await {
+        match db::reseal_secrets(&pool, key_provider.as_ref()).await {
             Ok(report) => {
                 println!(
                     "reseal: provider_keys={} tenant_certs={} already_current={} failed={}",
@@ -397,26 +394,16 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         }
     }
 
-    // (2c) Config store (initial snapshot).
-    let store = match &pool {
-        Some(p) => {
-            let s = ConfigStore::load(p.clone(), key_provider.clone()).await?;
-            // (2c') Migration-0007 transition: backfill legacy path-based
-            // tenant certs into PEM content (best-effort; path fallback keeps
-            // serving on failure), so the DB becomes self-contained and the
-            // shared cert volume can be dropped in cluster deployments.
-            db::backfill_legacy_certs(p, key_provider.as_ref()).await;
-            info!("legacy cert backfill finished");
-            s
-        }
-        None => {
-            info!("edge mode: no local SQLite; config arrives via the control plane");
-            ConfigStore::from_snapshot(
-                hydra_core::config::ConfigData::default(),
-                key_provider.clone(),
-            )
-        }
-    };
+    // (2c) Config store (initial snapshot). ONE path: every node loads its config from its own
+    // database (ADR-0001 D-2). The `match &pool` that used to be here had an edge arm that built a
+    // snapshot-fed store with no database at all — the role is retired, and with it the branch.
+    let store = ConfigStore::load(pool.clone(), key_provider.clone()).await?;
+    // (2c') Migration-0007 transition: backfill legacy path-based
+    // tenant certs into PEM content (best-effort; path fallback keeps
+    // serving on failure), so the DB becomes self-contained and the
+    // shared cert volume can be dropped in cluster deployments.
+    db::backfill_legacy_certs(&pool, key_provider.as_ref()).await;
+    info!("legacy cert backfill finished");
     info!("config store loaded");
 
     // (2c-arachne) The two halves of the Arachne control plane that touch the config store
@@ -902,7 +889,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     let usage: Option<Arc<dyn hydra_server::usage_query::UsageQuery>> =
         match hydra_server::usage_query::select(
             &sink_kind_for_api,
-            pool_for_api.as_ref(),
+            &pool_for_api,
             ch_url_for_api.as_deref(),
         ) {
             Ok(q) => Some(q),
@@ -999,7 +986,7 @@ struct BootstrapComponents {
     // `cluster` used to be carried here for the admin service's cluster token. That token is deleted
     // (2026-10-05), and `ClusterConfig` is read inside `bootstrap` itself — so the field is gone
     // rather than kept as dead weight that a reader would have to check.
-    pool: Option<sqlx::SqlitePool>,
+    pool: sqlx::SqlitePool,
     store: ConfigStore,
     auth: Arc<HttpAuthChecker>,
     breaker: Arc<CircuitBreaker>,

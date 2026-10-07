@@ -215,29 +215,30 @@ async fn usage_url(pool: &sqlx::SqlitePool) -> (String, reqwest::Client) {
 #[tokio::test]
 async fn select_sqlite_returns_the_sqlite_reader() {
     let pool = common::setup_pool().await;
-    let q = select("sqlite", Some(&pool), None).expect("sqlite is selectable");
+    let q = select("sqlite", &pool, None).expect("sqlite is selectable");
     assert_eq!(q.source(), "sqlite");
 }
 
-/// A `sqlite` node without a pool must NOT fall back to something that answers
-/// zero: that is precisely the "well-formed zero" the capability exists to stop.
-#[tokio::test]
-async fn select_sqlite_without_a_pool_is_an_error() {
-    assert!(select("sqlite", None, None).is_err());
-}
+// `select_sqlite_without_a_pool_is_an_error` stood here: `select("sqlite", None, None)` had to be an
+// error, because the alternative was a reader answering a well-formed zero from no database at all.
+// The pool is a required argument since 2026-10-05, so the call cannot be written — the guard moved
+// into the signature, which is the version of it that cannot be forgotten.
 
 #[tokio::test]
 async fn select_an_unknown_kind_is_an_error() {
     let pool = common::setup_pool().await;
-    assert!(select("nonsense", Some(&pool), None).is_err());
-    assert!(select("", Some(&pool), None).is_err());
+    assert!(select("nonsense", &pool, None).is_err());
+    assert!(select("", &pool, None).is_err());
 }
 
 /// With `usage-clickhouse` the kind is selectable and reports its own source.
 #[cfg(feature = "usage-clickhouse")]
 #[tokio::test]
 async fn select_clickhouse_returns_the_clickhouse_reader() {
-    let q = select("clickhouse", None, Some("http://127.0.0.1:8123"))
+    // The pool is passed and ignored by this arm (see `select`): the node still HAS one — its
+    // config lives there — and only its USAGE goes to ClickHouse.
+    let pool = common::setup_pool().await;
+    let q = select("clickhouse", &pool, Some("http://127.0.0.1:8123"))
         .expect("clickhouse is selectable with the feature");
     assert_eq!(q.source(), "clickhouse");
 }
@@ -247,7 +248,8 @@ async fn select_clickhouse_returns_the_clickhouse_reader() {
 #[cfg(feature = "usage-clickhouse")]
 #[tokio::test]
 async fn select_clickhouse_without_a_url_is_an_error() {
-    assert!(select("clickhouse", None, None).is_err());
+    let pool = common::setup_pool().await;
+    assert!(select("clickhouse", &pool, None).is_err());
 }
 
 /// Without the feature, `build_sink` already refuses `HYDRA_USAGE_SINK=clickhouse`
@@ -258,7 +260,7 @@ async fn select_clickhouse_without_a_url_is_an_error() {
 async fn select_clickhouse_cannot_be_chosen_without_the_feature() {
     let pool = common::setup_pool().await;
     assert!(
-        select("clickhouse", Some(&pool), Some("http://127.0.0.1:8123")).is_err(),
+        select("clickhouse", &pool, Some("http://127.0.0.1:8123")).is_err(),
         "a build without usage-clickhouse must not hand out a ClickHouse reader"
     );
 }
@@ -350,7 +352,7 @@ async fn sqlite_aggregate_matches_hand_written_sql() {
     )
     .await;
 
-    let q = select("sqlite", Some(&pool), None).expect("select");
+    let q = select("sqlite", &pool, None).expect("select");
     let agg = q
         .aggregate(
             T,
@@ -433,7 +435,7 @@ async fn sqlite_group_by_model_matches_hand_written_sql() {
     )
     .await;
 
-    let q = select("sqlite", Some(&pool), None).expect("select");
+    let q = select("sqlite", &pool, None).expect("select");
     let agg = q
         .aggregate(
             T,
@@ -568,7 +570,7 @@ async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
     )
     .await;
 
-    let q = select("sqlite", Some(&pool), None).expect("select");
+    let q = select("sqlite", &pool, None).expect("select");
     let agg = q
         .aggregate(
             T,
@@ -594,7 +596,7 @@ async fn sqlite_group_by_sub_tenant_buckets_by_attribution() {
 async fn sqlite_empty_window_is_a_real_zero_with_no_as_of() {
     let pool = common::setup_pool().await;
     seed_tenant(&pool, T, "acme.example", Some(TOKEN)).await;
-    let q = select("sqlite", Some(&pool), None).expect("select");
+    let q = select("sqlite", &pool, None).expect("select");
     let agg = q
         .aggregate(
             T,
@@ -959,10 +961,11 @@ async fn fake_clickhouse_sequence(bodies: Vec<String>) -> (String, wiremock::Moc
 }
 
 /// A ClickHouse-backed node: the gate reads the local SQLite config, the usage
-/// read goes to the double — exactly the edge-node shape of C13.
+/// read goes to the double — the shape C13 describes, where only the USAGE store
+/// differs from the default.
 #[cfg(feature = "usage-clickhouse")]
 async fn build_ch_state(pool: &sqlx::SqlitePool, ch_url: &str) -> Arc<AppState> {
-    let usage = select("clickhouse", None, Some(ch_url)).expect("clickhouse readable");
+    let usage = select("clickhouse", pool, Some(ch_url)).expect("clickhouse readable");
     build_state(pool, TenantApiConfig::default(), Some(usage)).await
 }
 
@@ -1276,7 +1279,14 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
     // A tenant id built to break out of a string literal, plus a `&` that would
     // truncate the query string if the value were not encoded.
     let evil = "t1' OR 1=1 --&x=1";
-    let reader = select("clickhouse", None, Some(&server.uri())).expect("select");
+    // The pool is required but ignored by this arm: a node whose usage lives in ClickHouse still
+    // keeps its CONFIG in its own SQLite database.
+    let reader = select(
+        "clickhouse",
+        &common::setup_pool().await,
+        Some(&server.uri()),
+    )
+    .expect("select");
     let agg = reader
         .aggregate(
             evil,
@@ -1344,7 +1354,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
     );
     let (url, server) =
         fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), grouped.to_string()]).await;
-    let reader = select("clickhouse", None, Some(&url)).expect("select");
+    let reader = select("clickhouse", &common::setup_pool().await, Some(&url)).expect("select");
     let agg = reader
         .aggregate(
             "local",
@@ -1385,7 +1395,8 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
     );
     let (null_url, _null_server) =
         fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), null_key.to_string()]).await;
-    let null_reader = select("clickhouse", None, Some(&null_url)).expect("select");
+    let null_reader =
+        select("clickhouse", &common::setup_pool().await, Some(&null_url)).expect("select");
     let err = null_reader
         .aggregate(
             "local",
@@ -1421,7 +1432,8 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
     let tenant = std::env::var("CH_TENANT").unwrap_or_else(|_| "local".to_string());
 
     // The reader, exactly as `main` would inject it.
-    let reader = select("clickhouse", None, Some(&ch)).expect("live CH is selectable");
+    let reader = select("clickhouse", &common::setup_pool().await, Some(&ch))
+        .expect("live CH is selectable");
     let agg = reader
         .aggregate(
             &tenant,

@@ -28,7 +28,7 @@
 //! |---|---|
 //! | no/invalid token | `401 unauthorized` (the two are indistinguishable on purpose) |
 //! | token valid, URL tenant id different | `403 tenant_id_mismatch` |
-//! | this node holds no config yet | `503 not_ready` |
+//! | this node holds no config yet (`ConfigStore::version() == 0`) | `503 not_ready` |
 //! | path under the prefix, not a route | `404 not_found` |
 //!
 //! ## What this module owns
@@ -492,8 +492,8 @@ async fn run_gate(
         }
         Err(auth::AuthError::NotReady) => {
             // Not an auth FAILURE: nothing was refused, this node simply has no
-            // configuration yet. Counting it would let a caller that can reach an
-            // un-snapshotted edge burn its own failure budget.
+            // configuration yet. Counting it would let a caller that reaches a node that has not
+            // materialized anything burn its own failure budget.
             return respond_error(
                 session,
                 ctx,

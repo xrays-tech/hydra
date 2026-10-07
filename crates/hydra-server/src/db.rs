@@ -2143,3 +2143,20 @@ pub async fn set_config_version(pool: &SqlitePool, version: u64) -> Result<(), s
 mod restore;
 
 pub use restore::restore_config;
+
+/// A migrated in-memory SQLite pool, for unit tests inside this crate.
+///
+/// The same recipe as `tests/common/mod.rs::setup_pool` — which the integration tests use and the
+/// crate's own `#[cfg(test)]` modules cannot reach — and it lives here so the recipe has ONE owner:
+/// `init_pool` pins a `:memory:` pool to a single connection, which is what makes the migrations
+/// visible to every later query in the test.
+#[cfg(test)]
+pub(crate) async fn test_pool() -> SqlitePool {
+    let pool = init_pool("sqlite::memory:")
+        .await
+        .expect("init_pool should connect to :memory:");
+    run_migrate(&pool)
+        .await
+        .expect("run_migrate should create the schema");
+    pool
+}

@@ -353,13 +353,13 @@ async fn sink_new_metrics_null_when_absent() {
 // ---------------------------------------------------------------------------
 
 /// `build_sink("sqlite", pool, _)` → a usable `SqliteSink` behind `dyn UsageSink`.
-/// Unknown kinds and missing required args return typed errors (no panic).
+/// Unknown kinds, and a `clickhouse` selection with no URL, return typed errors (no panic).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sink_trait_swap_by_config() {
     let pool = common::setup_pool().await;
 
     // sqlite selection → SqliteSink behind the trait object.
-    let boxed = build_sink("sqlite", Some(pool.clone()), None).expect("sqlite sink builds");
+    let boxed = build_sink("sqlite", pool.clone(), None).expect("sqlite sink builds");
     boxed.record(rec(0)).await;
     drop(boxed);
 
@@ -371,20 +371,34 @@ async fn sink_trait_swap_by_config() {
     }
     assert_eq!(count_usage(&pool).await, 1);
 
-    // Missing required pool → typed error (not a panic). (`matches!` avoids the
-    // `Debug` bound that `unwrap_err` would require on `dyn UsageSink`.)
+    // A `clickhouse` selection is refused AT BUILD TIME, with a typed error (not a panic) — which
+    // error depends on the build: with the `usage-clickhouse` feature the refusal is the missing
+    // URL, and without it the kind cannot be served at all, so the feature guard wins.
+    // (`matches!` avoids the `Debug` bound that `unwrap_err` would require on `dyn UsageSink`.)
+    // The pool is passed because the signature requires one; this arm does not read it. There used
+    // to be a `build_sink("sqlite", None, None) == Err(MissingPool)` leg here, for the pool-less
+    // node that no longer exists.
+    #[cfg(feature = "usage-clickhouse")]
     assert!(
         matches!(
-            build_sink("sqlite", None, None),
-            Err(BuildSinkError::MissingPool)
+            build_sink("clickhouse", pool.clone(), None),
+            Err(BuildSinkError::MissingClickHouseUrl)
         ),
-        "sqlite without a pool should be MissingPool"
+        "clickhouse without a url should be MissingClickHouseUrl"
+    );
+    #[cfg(not(feature = "usage-clickhouse"))]
+    assert!(
+        matches!(
+            build_sink("clickhouse", pool.clone(), None),
+            Err(BuildSinkError::ClickHouseFeatureDisabled)
+        ),
+        "clickhouse without the feature should be ClickHouseFeatureDisabled"
     );
 
     // Unknown kind → typed error.
     assert!(
         matches!(
-            build_sink("flat-file", None, None),
+            build_sink("flat-file", pool.clone(), None),
             Err(BuildSinkError::UnknownKind { .. })
         ),
         "unknown kind should be UnknownKind"

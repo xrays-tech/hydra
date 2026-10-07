@@ -187,13 +187,15 @@ impl AppState {
         proxy: ProxyConfig,
         tenant_api: crate::tenant_api::TenantApiConfig,
     ) -> Arc<Self> {
-        // "Is there a local DB?" has ONE owner -- `ConfigStore::pool()` -- rather
-        // than a second copy on `AppState` that could drift from it.
+        // "Is this node's usage readable from SQLite?" has ONE owner -- `ConfigStore::pool()`, which
+        // every node now has -- rather than a second copy on `AppState` that could drift from it.
+        // The `Option` on `usage` is about the READER (a ClickHouse-sinked node has no SQLite rows
+        // to read), not about the database's existence: it used to be built by `.map()` over the
+        // pool's own `Option`, which conflated the two.
         #[cfg(feature = "db")]
-        let usage = store.pool().map(|p| {
-            Arc::new(crate::usage_query::SqliteUsageQuery::new(p.clone()))
-                as Arc<dyn crate::usage_query::UsageQuery>
-        });
+        let usage = Some(Arc::new(crate::usage_query::SqliteUsageQuery::new(
+            store.pool().clone(),
+        )) as Arc<dyn crate::usage_query::UsageQuery>);
         Self::for_tests_with_usage(
             store,
             auth,

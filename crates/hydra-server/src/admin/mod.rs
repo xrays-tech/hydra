@@ -199,11 +199,11 @@ impl AdminService {
 }
 
 pub struct AdminState {
-    /// The node's SQLite pool. `None` only when the store was built without a
-    /// local database — every cluster node HAS one now (ADR-0001 D-2 retired the
-    /// edge role that used to be the `None` case), so no CRUD handler should meet
-    /// a `None` pool on a served route.
-    pub pool: Option<SqlitePool>,
+    /// The node's SQLite pool. Not an `Option`: every node has one (ADR-0001 D-2 retired the `edge`
+    /// role that used to be the `None` case), so the `/health` probe and `db()` no longer have a
+    /// "no local database" answer to give — `/health` no longer reports `db: "n/a"` and `db()` no
+    /// longer carries an `expect` that could only fire on a node that cannot exist.
+    pub pool: SqlitePool,
     pub store: ConfigStore,
     pub auth: Arc<HttpAuthChecker>,
     pub breaker: Arc<CircuitBreaker>,
@@ -327,7 +327,7 @@ impl AdminState {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: Option<SqlitePool>,
+        pool: SqlitePool,
         store: ConfigStore,
         auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
@@ -398,14 +398,10 @@ impl AdminState {
         self
     }
 
-    /// The leader-mode SQLite pool. Only leader/all admin routes reach this —
-    /// edge mode short-circuits in the router before any CRUD dispatch, so the
-    /// `expect` never fires on edge nodes.
+    /// The node's SQLite pool, for the CRUD handlers.
     #[must_use]
     pub fn db(&self) -> &SqlitePool {
-        self.pool
-            .as_ref()
-            .expect("admin SQLite pool (leader mode only)")
+        &self.pool
     }
 }
 

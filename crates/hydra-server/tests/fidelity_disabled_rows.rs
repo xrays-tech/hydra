@@ -118,11 +118,7 @@ async fn replica_materialization_keeps_disabled_limit_roles_and_bindings() {
 
     // The wire is built from the leader's replication content (which carries the
     // FULL rows) and hydrated as a replica would.
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("the leader has replication content");
+    let content = Arc::clone(&leader_store.replication());
     assert_eq!(
         content.fidelity().limit_roles.len(),
         2,
@@ -183,11 +179,7 @@ async fn rematerializing_the_same_content_is_stable() {
         .await
         .expect("load");
 
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("content");
+    let content = Arc::clone(&leader_store.replication());
 
     let replica_pool = common::setup_pool().await;
     for _ in 0..2 {
@@ -376,11 +368,7 @@ async fn replica_materialization_keeps_disabled_sub_tenants_and_routes() {
 
     // The wire is built from the leader's replication content (FULL rows) and
     // hydrated as a replica would.
-    let content = leader_store
-        .replication()
-        .as_deref()
-        .cloned()
-        .expect("the leader has replication content");
+    let content = Arc::clone(&leader_store.replication());
     assert_eq!(
         content.fidelity().sub_tenants.len(),
         2,

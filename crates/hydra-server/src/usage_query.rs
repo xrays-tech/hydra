@@ -120,8 +120,6 @@ pub enum SelectError {
     /// at all because `sink::build_sink` refuses it at startup. Reporting the
     /// kind as unknown keeps the two guards from drifting apart.
     UnknownKind(String),
-    /// `sqlite` without a pool.
-    MissingPool,
     /// `clickhouse` without a URL.
     MissingUrl,
 }
@@ -430,7 +428,10 @@ impl UsageQuery for ClickHouseUsageQuery {
 /// injection point lives in the binary and no integration test can reach it.
 ///
 /// The signature is the same with and without `usage-clickhouse`; only the arm
-/// is gated. Passing the ClickHouse **URL** rather than a parsed config keeps
+/// is gated. The pool is REQUIRED (it was an `Option` until 2026-10-05, whose
+/// `None` was the retired pool-less node — `SelectError::MissingPool` guarded a
+/// caller no deployment could produce); the `clickhouse` arm ignores it, exactly
+/// as `sink::build_sink` does. Passing the ClickHouse **URL** rather than a parsed config keeps
 /// this signature free of a `usage-clickhouse`-gated type (and of the
 /// `pub(crate)` visibility of that type), and leaves `clickhouse` the single
 /// owner of how a URL becomes a transport: this function never parses one.
@@ -440,14 +441,11 @@ impl UsageQuery for ClickHouseUsageQuery {
 #[cfg_attr(not(feature = "usage-clickhouse"), allow(unused_variables))]
 pub fn select(
     sink_kind: &str,
-    pool: Option<&SqlitePool>,
+    pool: &SqlitePool,
     ch_url: Option<&str>,
 ) -> Result<std::sync::Arc<dyn UsageQuery>, SelectError> {
     match sink_kind {
-        "sqlite" => {
-            let pool = pool.ok_or(SelectError::MissingPool)?;
-            Ok(std::sync::Arc::new(SqliteUsageQuery::new(pool.clone())))
-        }
+        "sqlite" => Ok(std::sync::Arc::new(SqliteUsageQuery::new(pool.clone()))),
         #[cfg(feature = "usage-clickhouse")]
         "clickhouse" => {
             let url = ch_url.ok_or(SelectError::MissingUrl)?;

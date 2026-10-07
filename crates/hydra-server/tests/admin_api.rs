@@ -64,7 +64,7 @@ async fn admin_state_with(auth_fail_per_min: u32) -> Arc<AdminState> {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let mut state = AdminState::new(
-        Some(pool),
+        pool,
         store,
         auth,
         breaker,
@@ -1664,7 +1664,12 @@ async fn empty_body_delete_invalidates_all_local() {
             },
         );
     }
-    let store = ConfigStore::from_snapshot(data, kp);
+    // The store's OWN database is a migrated in-memory one: this test drives the snapshot it
+    // injected, not the tables, but a store no longer exists without a database behind it.
+    let db = common::setup_pool().await;
+    let store = ConfigStore::from_data(db.clone(), data, kp)
+        .await
+        .expect("from_data");
 
     // Auth cache seeded with one entry per tenant.
     let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
@@ -1681,7 +1686,7 @@ async fn empty_body_delete_invalidates_all_local() {
     let auth = Arc::new(HttpAuthChecker::new(cache, AuthConfig::default()).expect("checker"));
 
     let mut state = AdminState::new(
-        None,
+        db,
         store,
         auth.clone(),
         Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
@@ -1873,7 +1878,7 @@ async fn concurrency_snapshot_reports_live_gates() {
     drop(_idle_permit); // p-idle back to inflight=0
 
     let state = Arc::new(AdminState::new(
-        Some(pool),
+        pool,
         store,
         auth,
         breaker,
@@ -2448,8 +2453,9 @@ async fn tenant_model_catalog_requires_admin_token() {
 /// Existence-guard regression at the handler: a snapshot whose models_by_key
 /// references a provider MISSING from cfg.providers (an orphan row — reachable
 /// at load, config::validate only Warns) must be silently dropped via
-/// cfg.providers.get(P) — never a bare index panic. Built snapshot-fed because
-/// the DB FK + ON DELETE CASCADE cannot produce orphans (design §2.3 note).
+/// cfg.providers.get(P) — never a bare index panic. The config is injected in
+/// memory because the DB FK + ON DELETE CASCADE cannot produce orphans
+/// (design §2.3 note); the store still owns a real (empty) database.
 #[tokio::test]
 async fn tenant_model_catalog_orphan_provider_row_dropped() {
     use std::collections::{HashMap, HashSet};
@@ -2516,7 +2522,10 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
     );
 
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
-    let store = ConfigStore::from_snapshot(cfg, key_provider.clone());
+    let db = common::setup_pool().await;
+    let store = ConfigStore::from_data(db.clone(), cfg, key_provider.clone())
+        .await
+        .expect("from_data");
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -2526,7 +2535,7 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
     );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let state = Arc::new(AdminState::new(
-        None,
+        db,
         store,
         auth,
         breaker,
@@ -3003,12 +3012,16 @@ async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
     // Integration-test database 41 (see tests/common/mod.rs for the partition).
     let pool = common::real_redis_pool(41).await;
 
+    let db = common::setup_pool().await;
     let mut state = AdminState::new(
-        None,
-        ConfigStore::from_snapshot(
+        db.clone(),
+        ConfigStore::from_data(
+            db,
             ConfigData::default(),
             Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
-        ),
+        )
+        .await
+        .expect("from_data"),
         Arc::new(
             HttpAuthChecker::new(
                 AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),

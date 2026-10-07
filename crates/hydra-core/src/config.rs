@@ -96,13 +96,15 @@ impl ConfigData {
     /// 从 `tenants_by_domain` 重建 `tenants_by_id`（唯一写入口）。
     ///
     /// 纯函数：无 I/O、不确定输入之外的状态。两个调用点都必须经过它 ——
-    /// `store.rs::build_config`（leader 加载）与 `cluster/snapshot.rs::SnapshotWire::hydrate`
-    /// （副本从线缆反序列化之后）。因为它们共用同一个实现，派生规则不可能分叉，
-    /// 也不需要 `WIRE_VERSION` 变更：`serde(skip)` 之后两侧都由本函数产生。
+    /// `store.rs::build_config`（节点从自己的数据库加载）与
+    /// `cluster/snapshot.rs` 的物化路径（副本从控制面重建之后）。因为它们共用同一个实现，
+    /// 派生规则不可能分叉，也不需要 `WIRE_VERSION` 变更：`serde(skip)` 之后两侧都由本函数产生。
     ///
-    /// 空的 `tenants_by_domain`（尚未收到第一帧快照的 edge）产生空索引，这是正确的：
-    /// 此时 `ConfigStore::replication()` 为 `None`，令牌闸门回 503 `not_ready`，
-    /// 而不是把有效令牌误判为 403。
+    /// 空的 `tenants_by_domain`（尚未物化出任何配置的节点）产生空索引，这是正确的：
+    /// 此时 `ConfigStore::version()` 为 0（"什么都还没应用"），令牌闸门回 503 `not_ready`，
+    /// 而不是把有效令牌误判为 403 —— 也不是 401，那等于说"你的令牌是错的"。
+    /// （2026-10-05 更正：原文写的是"`replication()` 为 `None`"，那是已删除的 edge store 的形状；
+    /// 条件本身没变，变的是它现在由版本水位表示。）
     pub fn reindex_tenants(&mut self) {
         self.tenants_by_id.clear();
         self.tenants_by_id.extend(

@@ -582,10 +582,9 @@ struct SubTenantRoutesView {
 /// `GET /tenant/{tenant_id}/api/v1/sub-tenants`
 ///
 /// Read-only and snapshot-fed: it reads ONLY the replication snapshot
-/// (`store.replication()`), never the database, so an edge with no local DB
-/// serves it exactly like [`whoami`]. Only the rows whose `tenant_id` equals the
-/// authenticated tenant are returned — a tenant can never read another tenant's
-/// sub-tenants.
+/// (`store.replication()`), never the database, so a node that has not yet written this row itself
+/// serves it exactly like [`whoami`]. Only the rows whose `tenant_id` equals the authenticated
+/// tenant are returned — a tenant can never read another tenant's sub-tenants.
 pub async fn list_sub_tenants(
     state: &AppState,
     session: &mut Session,
@@ -594,20 +593,15 @@ pub async fn list_sub_tenants(
 ) -> pingora_core::Result<bool> {
     // ONE atomic read: the rows and the version they are attributed to come from
     // the SAME guard, so a response can never mix data from one generation with
-    // the version of another. The gate already authenticated (which requires a
-    // snapshot), so `None` is not expected; fail closed rather than invent an
-    // empty list.
-    let guard = state.store.replication();
-    let Some(content) = guard.as_ref() else {
-        return super::respond_error(
-            session,
-            ctx,
-            503,
-            "not_ready",
-            "this node has no configuration yet",
-        )
-        .await;
-    };
+    // the version of another.
+    //
+    // A `let Some(content) = ... else { 503 not_ready }` stood here until 2026-10-05, guarding the
+    // `None` that only the deleted `from_snapshot` store could hold. Content is now built with every
+    // store (see `ConfigStore::replication`), and a node that has not materialized a config yet
+    // holds an EMPTY one — which this endpoint answers honestly: the gate above requires a token
+    // that a tenant row and its fidelity row both name, so an empty snapshot cannot reach here, and
+    // its sub-tenant list is empty because the snapshot says so.
+    let content = state.store.replication();
     let tenant_id = &auth.tenant.id;
     let sub_tenants: Vec<SubTenant> = content
         .cfg
@@ -635,17 +629,7 @@ pub async fn list_sub_tenant_routes(
     ctx: &mut RequestContext,
     auth: &Authenticated,
 ) -> pingora_core::Result<bool> {
-    let guard = state.store.replication();
-    let Some(content) = guard.as_ref() else {
-        return super::respond_error(
-            session,
-            ctx,
-            503,
-            "not_ready",
-            "this node has no configuration yet",
-        )
-        .await;
-    };
+    let content = state.store.replication();
     let tenant_id = &auth.tenant.id;
     let own_sub_tenants: HashSet<&str> = content
         .cfg
@@ -841,18 +825,11 @@ async fn local_write(
     tenant_id: &str,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
-    // D8: a single-node node always has a local DB. An absent pool means this
-    // is not the writer (e.g. an edge that should have forwarded) — fail closed.
-    let Some(pool) = state.store.pool() else {
-        return super::respond_error(
-            session,
-            ctx,
-            503,
-            "not_ready",
-            "this node has no local database to apply the write",
-        )
-        .await;
-    };
+    // Every node has a local database (ADR-0001 D-2: the `edge` role that did not is retired), so
+    // the `not_ready` guard that used to stand here could not fire. Deleted 2026-10-05 rather than
+    // kept as decoration: a first-time reader had to work out whether it was reachable, and a test
+    // had to construct a store no configuration can produce in order to cover it.
+    let pool = state.store.pool();
     // The current config (provider / model / tenant membership) the write is
     // validated against — the same snapshot the gate read.
     let cfg = std::sync::Arc::clone(&*state.store.snapshot());
