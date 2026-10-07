@@ -8,4 +8,5 @@
 //! [`super::REGISTRY`](crate::usage::REGISTRY), and its tests — see `dev-docs/usage-backends.md`.
 
 pub mod clickhouse;
+pub mod none;
 pub mod sqlite;

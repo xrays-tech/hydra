@@ -113,6 +113,9 @@ pub struct Backend {
     /// The descriptor's operator-facing note, carried so the startup log can say what this
     /// deployment actually does with usage (the kind alone does not).
     pub notes: &'static str,
+    /// The descriptor's read contract, carried for the same reason: `main` warns uniformly when a
+    /// deployment has no readable usage store, without knowing which backend said so.
+    pub reads: ReaderContract,
 }
 
 /// Hand-written because `dyn UsageSink` / `dyn UsageQuery` are not `Debug` (and should not have to
@@ -206,8 +209,12 @@ pub enum BackendError {
 
 /// Every backend this build knows, in the order they are listed to an operator.
 pub static REGISTRY: &[&UsageBackend] = &[
+    // Row 1 is the RETIRED single-node store, kept until Phase 2 deletes it (its descriptor exists
+    // so that "sqlite" is still a known value rather than an unknown one while it is being retired).
     &backends::sqlite::DESCRIPTOR,
     &backends::clickhouse::DESCRIPTOR,
+    // Switching usage OFF is a registered choice, not an absence of one (ADR-0002 D-2).
+    &backends::none::DESCRIPTOR,
 ];
 
 /// The descriptors, as a list of kinds — for error messages and for guards.
@@ -252,6 +259,7 @@ pub fn open(kind: &str, cfg: &BackendConfig) -> Result<Backend, BackendError> {
 /// liar in the registry where an operator could select it.
 fn check_contract(backend: &UsageBackend, mut opened: Backend) -> Result<Backend, BackendError> {
     opened.notes = backend.notes;
+    opened.reads = backend.reads;
     match (backend.reads, opened.query.is_some()) {
         (ReaderContract::SameBackend, false) => Err(BackendError::Invalid {
             kind: backend.kind,
@@ -387,6 +395,37 @@ mod tests {
         assert!(err.to_string().contains("--features usage-clickhouse"));
     }
 
+    /// `none` is a REGISTERED choice, and it says out loud that it cannot read: no store, no
+    /// reader, and a reason the tenant API can hand the caller (ADR-0002 D-2).
+    #[tokio::test]
+    async fn the_none_backend_records_nothing_and_says_why() {
+        let cfg = BackendConfig::new(pool().await).with_env(EnvView::fixed(&[]));
+        let opened = open("none", &cfg).expect("none opens");
+        assert!(opened.query.is_none(), "there is no store to read");
+        match opened.reads {
+            ReaderContract::Unavailable { why } => {
+                assert!(
+                    why.contains("HYDRA_USAGE_SINK=none") && why.contains("clickhouse"),
+                    "the reason must name the value that was set and the one to set instead: {why}"
+                );
+            }
+            ReaderContract::SameBackend => panic!("none has no reader"),
+        }
+
+        // Every record handed to it is COUNTED as lost, on the series an operator already alerts on
+        // for real drops — "we meter nothing" must not be quieter than a dropped batch.
+        let before = crate::admin::metrics::usage_dropped_total("sink_disabled");
+        opened
+            .sink
+            .record(crate::usage::testing::record("none-1"))
+            .await;
+        let after = crate::admin::metrics::usage_dropped_total("sink_disabled");
+        assert!(
+            after > before,
+            "a disabled sink must count what it discards ({before} -> {after})"
+        );
+    }
+
     /// `Fixed` REPLACES the process environment. A test that asserts "unset ⇒ refused" would
     /// otherwise pass or fail depending on the machine it runs on.
     #[test]
@@ -431,6 +470,7 @@ mod tests {
                 sink: Arc::new(SilentSink),
                 query: None,
                 notes: "test-only",
+                reads: ReaderContract::SameBackend,
             },
         )
         .expect_err("a promised reader that did not appear must be refused");
@@ -448,6 +488,7 @@ mod tests {
                 sink: Arc::new(SilentSink),
                 query: Some(Arc::new(SilentQuery)),
                 notes: "test-only",
+                reads: ReaderContract::SameBackend,
             },
         )
         .expect_err("an unconsulted reader must be refused");

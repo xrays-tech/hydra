@@ -117,9 +117,23 @@ function stringConstants(source) {
   return out;
 }
 
-/** One backend's declaration, read out of its own module. */
+/**
+ * One backend's declaration, read out of its own module.
+ *
+ * The layout is part of the pattern (`dev-docs/usage-backends.md` §3 step 2: one module per
+ * backend, `<kind>/mod.rs` plus an optional `transport.rs`), so a flat `<kind>.rs` is reported as a
+ * structural failure rather than quietly accepted — two layouts is how "one module per backend"
+ * stops being true.
+ */
 function readBackend(dir, module) {
   const file = path.join(dir, module, 'mod.rs');
+  if (!fs.existsSync(file)) {
+    return {
+      module,
+      file,
+      notFound: true,
+    };
+  }
   const src = read(file, `the ${module} backend`);
   const consts = stringConstants(src);
   const kind = src.match(/kind:\s*"([a-z0-9_]+)"/);
@@ -182,6 +196,13 @@ function check(opts) {
 
   const backends = modules.map((m) => readBackend(opts.backendsDir, m));
   for (const b of backends) {
+    if (b.notFound) {
+      problems.push(
+        `${b.module}: no ${path.relative(ROOT, b.file)} — a backend is one module, \`<kind>/mod.rs\` ` +
+          '(dev-docs/usage-backends.md §3 step 2); a flat `<kind>.rs` is a second layout',
+      );
+      continue;
+    }
     if (b.missing) {
       problems.push(`${b.module}: no \`kind\`/\`feature\` in ${path.relative(ROOT, b.file)} — a descriptor the guard cannot read is a backend nobody can audit`);
       continue;

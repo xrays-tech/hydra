@@ -564,7 +564,17 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         &hydra_server::usage::BackendConfig::new(pool.clone()),
     )?;
     let sink = usage_backend.sink.clone();
-    info!(kind = %sink_kind, notes = usage_backend.describe(), "usage backend open");
+    // A backend that says it cannot read usage is a deliberate deployment choice, so it is reported
+    // where an operator will see it — at startup, with the reason the tenant API will give — rather
+    // than discovered later from a 503.
+    match usage_backend.reads {
+        hydra_server::usage::ReaderContract::Unavailable { why } => {
+            warn!(kind = %sink_kind, "{}", why);
+        }
+        hydra_server::usage::ReaderContract::SameBackend => {
+            info!(kind = %sink_kind, notes = usage_backend.describe(), "usage backend open");
+        }
+    }
 
     // (2e) Build shared app state. In cluster mode the breaker announces its
     // local trips to the cluster (shared votes) and converges on the

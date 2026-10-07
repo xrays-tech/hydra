@@ -592,6 +592,7 @@ fn open(cfg: &BackendConfig) -> Result<Backend, BackendError> {
             )),
             query: Some(Arc::new(ClickHouseUsageQuery::new(&url))),
             notes: "",
+            reads: ReaderContract::SameBackend,
         })
     }
     #[cfg(not(feature = "usage-clickhouse"))]

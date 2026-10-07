@@ -196,8 +196,17 @@ test('a backend module whose descriptor the guard cannot read is a failure, not 
   assert.match(r.stderr, /no `kind`\/`feature`/);
 });
 
-test('the real tree passes, and names both backends', () => {
+test('a backend written as a flat <kind>.rs is a structural failure, not a silent accept', () => {
+  const fx = fixture({ backends: {} });
+  fs.mkdirSync(fx.backendsDir, { recursive: true });
+  fs.writeFileSync(path.join(fx.backendsDir, 'clickhouse.rs'), backend());
+  const r = run(fx);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /flat `<kind>\.rs` is a second layout/);
+});
+
+test('the real tree passes, and names every backend', () => {
   const r = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', cwd: REPO });
   assert.equal(r.status, 0, r.stderr + r.stdout);
-  assert.match(r.stdout, /sqlite, clickhouse/);
+  assert.match(r.stdout, /sqlite, clickhouse, none/);
 });

@@ -374,5 +374,6 @@ fn open(cfg: &BackendConfig) -> Result<Backend, BackendError> {
         query: Some(Arc::new(query)),
         // `open` overwrites this from the descriptor, so the note has ONE owner.
         notes: "",
+        reads: ReaderContract::SameBackend,
     })
 }
