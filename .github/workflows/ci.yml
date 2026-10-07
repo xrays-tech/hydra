@@ -930,6 +930,17 @@ jobs:
       - name: documented env checker tests
         run: node --test scripts/check_documented_env.test.cjs
 
+      # ADR-0002: a usage backend is ONE row in `usage::REGISTRY`, and that row has to agree with
+      # the cargo feature that compiles it, the runbook rows for the variables it needs, the knobs
+      # it reads with a default, and the list of values that are retired and must not come back.
+      # Its first run found `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS` documented nowhere but inside another
+      # row's prose; both ClickHouse timeout knobs have real rows now.
+      - name: usage backends are declared consistently (ADR-0002)
+        run: node scripts/check_usage_backends.cjs
+
+      - name: usage backend checker tests
+        run: node --test scripts/check_usage_backends.test.cjs
+
       # ...and the VALUE matters as much as the name: the table's defaults are what an
       # operator sizes `terminationGracePeriodSeconds`, timeouts and memory from. Every
       # number in it was hand-written and nothing compared it to the code until now

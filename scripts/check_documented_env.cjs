@@ -93,7 +93,6 @@ const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_FAILOVER_GRACE_MS', 'documented but never wired (round 166), and now listed among the retired names in ops.md §13.3b'],
   ['HYDRA_RATE_LIMIT_FAIL_MODE', 'ops.md says it does not exist at all (`grep -rn RATE_LIMIT_FAIL_MODE crates/` is empty)'],
   ['HYDRA_ENCRYPTION_KEY_FILE', 'a real knob, mentioned inside the `HYDRA_ENCRYPTION_KEY` row; read at `crypto.rs:142` (verified this round)'],
-  ['HYDRA_CLICKHOUSE_IO_TIMEOUT_MS', 'a real knob, mentioned inside the `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` row; read at `clickhouse.rs:135`'],
   ['HYDRA_ENCRYPTION_KEY_PREVIOUS_VERSION', 'read at `crypto.rs:186`; named in the rotation procedure example'],
   ['HYDRA_BREAKER_QUORUM', 'read at `main.rs:73`; named in the breaker prose and in the not-wired list'],
 ]);

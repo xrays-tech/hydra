@@ -73,6 +73,8 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS` | `31` | E3 window ceiling. Not cosmetic: the ClickHouse table's key leads with `created_at`, so a wide window scans every tenant's rows in it. |
 | `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
 | `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
+| `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS` | `15000` | Deadline for ONE write attempt (the response to an `INSERT`). A flush that trips it is **retried** with the same `insert_deduplication_token`, so a slow ClickHouse costs latency inside the flush budget rather than a lost batch; the buffer keeps up to `MAX_RETAINED` (10 000) rows in the meantime. |
+| `HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS` | `3000` | Deadline for the TCP connect to ClickHouse. Distinct from the write deadline on purpose: a black-holed host must fail the batch quickly so the retry/backoff loop can report it (`hydra_usage_records_dropped_total`) instead of holding the flush for the full write budget. |
 
 > **Known listener limitation (recorded here, not hidden in a test):** the startup
 > planner compares listener addresses as **strings**, so the *same port on different
