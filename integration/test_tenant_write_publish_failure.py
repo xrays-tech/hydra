@@ -290,6 +290,25 @@ def main():
         check("A: with a healthy quorum the tenant write answers 200 with a config_version",
               status == 200 and isinstance(body, dict) and "config_version" in body,
               f"HTTP {status} {str(body)[:100]}")
+        if status != 200:
+            # The 503 carries WHY the publish failed (`StoreError::NotPublished { reason }`: either
+            # "cannot encode the config tree: …" or "the head could not be committed: …"), and the
+            # drill truncated the body to 100 characters — cutting the reason off exactly when it is
+            # the only thing worth reading. Measured on a CI runner (2026-10-07): gate A answered 503
+            # `config_not_published` with a HEALTHY quorum, which is the same symptom two other
+            # live-deps drills saw as `tenant_forbidden` — a write that commits locally but never
+            # reaches the raft tree, so no other member ever materializes it.
+            # The full body and all three node logs go out here.
+            print(f"--- gate A raw body (untruncated) ---\n{json.dumps(body)[:2000]}", file=sys.stderr)
+            for n in nodes:
+                # `log_path` is where `Node.start` writes the node's own stdout/stderr (its data
+                # directory), not `DIR` — the first version of this block looked in the wrong place
+                # and would have printed nothing at the one moment it mattered.
+                if os.path.exists(n.log_path):
+                    text = open(n.log_path, errors="replace").read()
+                    print(f"--- {n.name}.log (last 2000) ---\n{text[-2000:]}", file=sys.stderr)
+            print("[pubfail] gate A failed with a healthy quorum: the reason is above",
+                  file=sys.stderr)
 
         # ---------------------------------------------------------------- B/C/D
         killed = [n for n in nodes if n is not entry]
