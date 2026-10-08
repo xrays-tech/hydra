@@ -989,6 +989,8 @@ FAIL  gate 5: a real request still flows through the data plane on the survivor 
 **症状**（`live-deps` 作业内，出现在 `cluster rate limits` / `auth cache layers` / `tenant write publish failure` / `arachne control plane` 任一步）：
 `HTTP 403 {"message":"tenant_forbidden"}`、或 `503 config_not_published`（多数派健康时）、或 `CANNOT VERIFY: a member never served the seeded tenant` / `a member never routed the tenant`。
 
+**第二种形状（2026-10-08，`d5c6b91`，已定性并落地，见下面「第五次捕获」）**：`cluster rate limits` 的 **C3** —— 令牌维度 `first(a)=200 second(b)=200` + `keys=[]` + `dim="tokens"` 的拒绝计数为空，而**同一次运行**里 C2/C4（count 维度的共享窗口、fail-open、恢复）全部 PASS。⇒ Redis 健康，缺的是 token 样本。它**不是**上面那一族：判据是「count 腿全过而只有 tokens 腿空」。复发时先读 C3 自己打印的**记账延迟毫秒数**：很大 ⇒ `logging` 阶段被饿住；配合节点日志里有没有 `token-usage record failed` 区分「晚」与「丢」。
+
 **判断步骤**：① 看步骤名与消息形状是否命中上面任一条；② 若是，**不要先怀疑本次改动**——它是同一族间歇（本地 100/100，CI 上同一 commit 重跑也时红时绿）；③ 取证用 `.acceptance/hunt-flake.sh <run-id> [样本数]`（重跑同一 commit、一红即把作业日志落盘到 `.cargo-cache/flake-hunt/failed-N.log`；`gh run rerun` 在 run 未定型时会拒绝，脚本已处理）；④ 日志里直接读四段：`which member held the raft writer`、`seed POST statuses`、两个节点各自的 `GET /<实体>` 读回、`publish`/`materialization` 计数器。
 
 **状态**：**已知、未修、未定性到根因**。已排除的假设（下一轮不必重推）：跨节点传播、物化不换快照、部分实体只写本地不发布、等待时间不够、ClickHouse 凭据（那是另一条，已修并已在 CI 验证）。**下一步的决定性观察**：第二次捕获若呈**同一形状**（确认过的写在**接收方自己的库里**缺失），即可定性为确定性缺陷；在那之前不给修法。
@@ -1143,6 +1145,24 @@ arm B 承压 : 1/5 失败 —— 失败的是 gate 1「a new leader was elected 
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
+
+### 第五次捕获（2026-10-08，`d5c6b91`）：**新形态** —— `cluster rate limits` 的 C3 令牌窗口，已定性并修掉
+
+**症状**（`live-deps`）：`FAIL C3: the token ceiling is crossed by usage recorded on the OTHER node — first(a)=200 second(b)=200`、`FAIL C3: ...and the token window lives in Redis under its own key — keys=[]`、`dim="tokens"` 的拒绝计数为空；而**同一次运行**里 C2/C4（count 维度的共享窗口、fail-open、恢复）全部 PASS。⇒ 不是上面那一族（丢失形态/选举）：Redis 是健康的，缺的只是 token 样本。（同日 `dynamic` 事件的那些 run **只有 build/deploy/report-build-status 三个作业、不跑 `live-deps`**，所以它们绿**不能**当作 flake 证据——差一点被这样误用。）
+
+**取证与两次自我更正（本条最该记住的部分）**：
+1. **代码事实一**：token 记账在 `logging` 阶段，也就是**响应已经发给客户端之后**（completion tokens 只有在响应存在之后才知道；流式更是要等流结束才有 usage）。所以「下一次请求，无论在哪台节点，都会被拒」**不是产品承诺**——零延迟的后续请求本来就可能抢在记账之前。演练原来那句 `next-request semantics` 是**过度断言**：它把一次时序差写成了缺陷，这正是它会在 CI 上红、而本地多次全绿的原因。
+2. **我第一次归因是错的，且已更正**：我先把 `keys=[]` 归因成「记账排在 ClickHouse 用量写入之后，继承了分析库延迟」，据此**换了顺序**（把记账提到 sink 之前），并在注释里写下「实测 0.10 s」。**两处都错**：那个 0.10 s 是 drill 自己的 `redis_cmd` 里 `time.sleep(0.05)` × 两条命令（`keys_matching` 实测 **100.51 ms**），是**探测开销**，不是产品延迟；而 `UsageSink::record` 的契约写着「MUST return immediately，实现内部缓冲、异步刷写」，A/B 也证明换序前后都是 **0.4 ms**。⇒ **换序已撤回**（`proxy.rs` 的 diff 现在只剩注释，非注释改动为 **0**）。
+3. **真正被证明的是一条测量盲区**：C3 原来用 `keys_matching` 探测，分辨率 100 ms，而它要看的差距正好落在 10–200 ms——**这道门看不见它自己要抓的东西**。
+
+**落地的三件事（都有据可依）**：
+- **演练**（`integration/test_cluster_limits.py`）：C3 改为先**等共享样本可见**（上限 5 s）再断言 B 拒绝；样本永不出现即在**它自己那条断言**上红（并指向新的 WARN 行），不再伪装成「B 放行」。探测换成新的 `keys_matching_fast`（一条已 SELECT 的连接、每命令一次读、无 sleep），分辨率从 100 ms 降到 <1 ms，并**每次运行都打印实测记账延迟**（本地 **0.4–0.5 ms**）；超过 `TOKEN_CHARGE_TARGET_S = 0.25 s` 时大声 NOTE 但**不判红**（与选举那条 target/allowance 同一套做法：品质信号要看得见，但不由毫秒级超时判红）。
+- **可观测**（`redis/rate_limit.rs`）：`RedisRateLimiter::add_tokens` 原本 `let _: Result<i64,_> = …` **把 Redis 错误整个吞掉**——丢一个样本就是少算 token 配额（fail-open 方向），而且发生在响应之后，**没有任何用户可见症状**。现在 `warn!("redis token-usage record failed; the token budget was NOT charged")`。
+- **措辞**：`proxy.rs`（7b 与 logging 两处）、`proxy/limiter.rs` 的 trait 文档、`design.md` §10.3 的表格行都改成「记账落盘**之后**到达的下一次请求被拒；抢在写入之前的后续请求仍会通过」，并指明演练会打印这个差距。
+
+**证伪（必须的，已实测）**：把 C3 的探测模式换成永不存在的 role ⇒ `FAIL C3: … keys=[] after waiting 5001.5 ms`、**exit=1、15 s 结束**（等待有界、不挂死、归因正确）。正常跑：`CLUSTER LIMITS: PASSED`、`after 0.4–0.5 ms`；`cargo clippy`（lib+bins）无告警；`redis::rate_limit` 单测 **6/6**。
+
+**仍未定性的部分（不含糊）**：CI 那次 `keys=[]` 是**真的**——那次读发生在 B 收到 200 之后，而**仅仅读到它本身就至少 100 ms**（两条命令各 50 ms），样本仍不在 ⇒ 记账晚了 **≥100 ms** 或丢了。本地空闲机上只有 0.4 ms，**机制未定**：可能是满载 runner 把 `logging` 阶段饿住（与已知的选举 liveness 同族），也可能是一次丢失的 Redis 写（现在会被那条 WARN 抓到）。**复发时的判据**：节点日志里**没有** `token-usage record failed` ⇒ 是被饿住/延迟（读 C3 打印的毫秒数）；**有** ⇒ 是丢写，去查 fred 的错误路径。
 
 ### 决定 6（2026-10-05 用户裁定「做」）：把 `check_gate_entries` 的被测对象换成被跟踪的文件
 

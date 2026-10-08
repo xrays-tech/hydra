@@ -312,7 +312,13 @@ impl RedisRateLimiter {
                 // time (see ADD_TOKENS_SCRIPT). The token count lives in the
                 // member so the sum and the eviction can both be consistent.
                 let member = format!("{now}:{tokens}:{}-{}", self.instance, member_salt());
-                let _: Result<i64, _> = self
+                // NOT silent (2026-10-05): this used to drop the error on the floor. A lost
+                // sample under-counts the token budget — the fail-open direction, and the one
+                // the count window cannot absorb because it is a different dimension. It also
+                // happens AFTER the response is gone, so nothing else can report it: no 4xx, no
+                // client-visible symptom, and the next request is simply admitted. The request
+                // itself must never fail over accounting, so this stays a warning.
+                let recorded: Result<i64, _> = self
                     .pool
                     .eval(
                         ADD_TOKENS_SCRIPT,
@@ -320,6 +326,14 @@ impl RedisRateLimiter {
                         vec![now.to_string(), window_ms(role).to_string(), member],
                     )
                     .await;
+                if let Err(e) = recorded {
+                    warn!(
+                        error = %e,
+                        role = %key.role_id,
+                        tokens,
+                        "redis token-usage record failed; the token budget was NOT charged"
+                    );
+                }
             }
         }
     }
