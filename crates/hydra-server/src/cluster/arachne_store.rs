@@ -240,13 +240,16 @@ impl ArachneConfigStore {
     /// (ADR-0001 plan, "观察": twelve writes all 201, twelve publishes `{result="ok"}`, both
     /// materializers `succeeded`, and one written row absent from BOTH databases).
     ///
-    /// **Switching this to `get` was tried and REJECTED by measurement** (2026-10-07): it makes the
-    /// cluster's own acceptance drill fail 3/3 locally (`gate 5` data plane twice, `gate 1` leader
-    /// election once) against 2/3 passing with `get_stale`, because a quorum-confirmed read per
-    /// materializer tick (1 s, forwarded to the leader from every follower) perturbs elections. So the
-    /// defect is NOT fixed here; the remaining candidates are an ordered watermark the apply can
-    /// compare (hashes carry no order), or serialising publish against materialization. See the plan's
-    /// entry before changing this line.
+    /// **Switching this to `get` was tried and reverted, and the measurement behind that is
+    /// CONFOUNDED — treat it as unsettled** (2026-10-07): with `get` the cluster's own acceptance drill
+    /// failed 3/3 locally (`gate 5` data plane twice, `gate 1` leader election once), but those runs
+    /// shared the machine with cargo builds and test suites, while the reverted baseline then passed
+    /// 5/5 on an idle box — and that drill (three real nodes, a killed leader) is timing-sensitive. The
+    /// plausible cost is real and has to be re-measured on an idle machine: a quorum-confirmed read per
+    /// materializer tick (1 s, forwarded to the leader from every follower) adds heartbeat/forward
+    /// traffic. The defect is NOT fixed here; the other candidates are an ordered watermark the apply
+    /// can compare (hashes carry no order), or serialising publish against materialization. Record the
+    /// numbers where the plan records its other attempts.
     ///
     /// # Errors
     /// [`StoreError`] when the cluster cannot answer.
