@@ -1089,7 +1089,7 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **验证**（全部实测）：对 0.3.1 **零改动编译通过**；`--lib` **303/303**（带 `HYDRA_TEST_REDIS_URL`；events 那几个失败是没设 Redis 的假警报）；`arachne_three_nodes` **5/5**（含新判据测试）、`arachne_store` **6/6**；**空闲验收演练 5/5 通过**；上游点名的三条集群演练（`test_cluster_limits` / `test_auth_cache_layers` / `test_tenant_write_publish_failure`）**全部 PASSED**；**CI `da622f4` 8/8 全绿**——其中 `live-deps`（承载那三条原本间歇的演练）在**修复前的 `a697bf0` 是红的**，在此提交转绿（一对真实的 before/after）。
 
-#### alive-partition 配方：已解封 + 我们的适配版配方（尚未落地）
+#### alive-partition 配方：已解封 + 我们的适配版配方（**已落地**，见下方 2026-10-08 的结果）
 
 **工具已就绪**：上游发布了 `arachne-kv-testsupport` 0.3.1（`dev-dependencies` 已接、**测试目标编译通过**，且实测公开 API 就是配方所需四件：`InMemoryTransportFactory`、`firewall(from,to)`、`firewall_drop_count()`、`block_on`）。**只进 dev 树**，不会进网关二进制。
 
@@ -1105,6 +1105,16 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 5. **注意**：绝不能用"杀进程/关监听"来模拟隔离（那是崩溃语义，会把测试悄悄变成崩溃测试）——这正是配方强调 alive-vs-crash 的原因。
 
 **为什么这一步没有当场落地**：这套脚手架估 150–250 行、需要多个编译回合，而本轮余量不足以**写完并验证**。按"不留未验证代码"的规矩，把它写成可机械执行的配方，而不是塞进树里一个没人验过的测试。
+
+**已落地（2026-10-08）：`crates/hydra-server/tests/arachne_alive_partition.rs`，1 passed（0.98–1.25 s；连跑 5/5）；`clippy --all-targets -D warnings` 干净。**
+
+**与配方的一处实质偏离（必须写明）**：上游 0.3.1 的传输**只有 `firewall`、没有解除**，而节点的 tx/rx 在 `Runtime::new` 时一次性交付——重建 factory 不会把已在运行的节点重新接线 ⇒ **"解除隔离后追上 h2"这一步做不了，已从范围里去掉**。去掉它不削弱本条：这条补的是 **alive vs crash** 这个维度，而"追上"方向由"节点重启后自我重建"（`tests/arachne_three_nodes.rs`）与故障切换演练覆盖，需要滞后副本才可达的拒绝分支由物化器单测覆盖。另两处工程决定：`slog = "2"` 进 `[dev-dependencies]`（`Runtime::new` 要 `&slog::Logger`，生产由上游 `assemble_cluster` 提供；lockfile 里已有 2.8.2，不引入新下载、不改公开页计数——该 target 在 `--features server` 下为空）；隔离对象固定选 **follower**（3 成员里隔离 follower ⇒ 多数派保住 leader，h2 的提交不夹带一次改选）。
+
+**断言的实质（不是"活着就行"）**：被隔离节点的运行时任务**未结束**（`is_finished()`，运行时 panic 会被抓到）、本地 head 仍是 h1、`materialized()` 仍是 h1、快照仍服务 p1 且**不含** p2、它**自己的库**仍有 p1 而无 p2、**一次收敛 pass 返回 `NoChange`**（规则新增的拒绝路径不得把"只是失联"的节点误伤成自我清空）；多数派两节点都到 h2 并服务 p2。守卫 `firewall_drop_count() > 0` 在**任何结论之前**断言。
+
+**顺带发现并修掉的覆盖缺口（这条比测试本身更值得留）**：整族 `crates/hydra-server/tests/arachne_*.rs` 都写着 `#![cfg(feature = "arachne")]`，而 CI 的三个测试作业（`check` / `optional-features` / `alt-features`）用的 feature 集**不含 `arachne`** ⇒ 这些 target 在那里**编译成空**：「文件存在」从来不等于「会跑」，而**没有任何守卫管这件事**——`check_ci_wiring.cjs` 只对 `#[ignore]` 的测试要求 CI 步骤，被 feature gate 掉的 target 既不是 `#[ignore]` 也不在任何规则内。后果是 ADR-0001 的**整个控制面测试族**（含上一轮那条"拒绝分支"的因果测试）**从未在 CI 里跑过**，只是手动绿着。实测整族 **23 个测试、12 s 全绿**（`arachne_alive_partition` 1 + `arachne_three_nodes` 5 + `arachne_cluster` 1 + `arachne_leader_watch` 6 + `arachne_store` 6 + `arachne_cert_fidelity` 2 + `arachne_derivation_fidelity` 2）⇒ 已接进 CI `live-deps` 作业的**第一步**（该作业是唯一带 `arachne` 的作业；必须排在 drills 之前，因为这一族占 17601–18803 的真实回环端口，而 drill 用 18800/18801），并镜像到本地门禁的同名条目。`check_ci_wiring` / `check_gate_entries` 及各自自测（1/1、25/25）均绿。
+
+**证伪实测（两段，各把测试弄红一次）**：① 去掉 `firewall` ⇒ 先红在守卫（`the firewall never dropped a message within 5 s — this test would be measuring nothing`）——守卫承重；② 连守卫一起强制为真 ⇒ 红在**实质断言**（被隔离节点 head 已是 h2 `31fb73ce…`，而断言要求 h1 `dc5574cd…`）——那些断言不是摆设。两段都恢复后回到 green。
 
 **上游给出的隔离配方（2026-10-07）：可用性已核实——**照做不了，卡在一个未发布的 crate**。** 上游给的完整配方是：3 节点写好 h1 → **双向隔离 n3**（n1/n2 仍成多数派并继续推进 h2）→ 断言 n3 **仍活着**、只服务它**已应用过的旧状态**（`(h1, i1)`，且 `i1 ≤` 多数派当前索引）→ 解除隔离后 n3 追上 h2、索引上升。关键手法是**alive vs crash**：用内存传输里的 `firewall(from,to)` **静默丢包但保持通道存活**（真网络等价物是 DROP 包/挂起连接，**绝不能杀进程或关监听**——那会变成崩溃语义，就不是陈旧读测试了）。他们还明确写了 **coverage boundary**：隔离节点读到的是"它自己已经应用过的 head"，索引不会倒退，所以**这条配方不覆盖拒绝分支**；拒绝分支只能由**滞后的副本**触发——与我们的结论一致（也与我们 falsification 的结果一致：值未变 ⇒ 快路径短路）。
 **核实结果**：`firewall` / `InMemoryTransportFactory` 来自 **`arachne-kv-testsupport`**，而该 crate **未发布到 crates.io**（稀疏索引查不到；`firewall` 在全套已发布 crate 里只出现在他们自己的测试文件里）。⇒ 这条配方目前**无法在我们侧执行**。可学的还有他们测试里的**非空转守卫**：`factory.firewall_drop_count() > 0`，先证明"真的在丢包"再断言结果（与我们这次"证伪后撤掉空转测试"是同一纪律）。

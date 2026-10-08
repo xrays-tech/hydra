@@ -220,5 +220,10 @@ arachne-kv = { version = "0.3", optional = true }
 # Test-support only, and dev-only by upstream design: it must never enter a runtime dependency tree.
 # The isolation recipe in ADR-0001’s plan (alive-but-partitioned node) needs its in-memory transport.
 arachne-kv-testsupport = "0.3"
+# `Runtime::new` takes a `&slog::Logger`. Production gets one from Arachne's own `assemble_cluster`
+# facade, so this is needed only by a test that builds the runtime ITSELF — i.e. by the
+# alive-partition test, which must own the transport to be able to firewall it. Same major version the
+# control-plane crates already pull in, so nothing new enters the lockfile.
+slog = "2"
 wiremock = "0.6"
 tokio-test = "0.4"
