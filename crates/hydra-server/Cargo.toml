@@ -217,5 +217,8 @@ arachne-kv = { version = "0.3", optional = true }
 # see the `usage-clickhouse` feature comment above)
 
 [dev-dependencies]
+# Test-support only, and dev-only by upstream design: it must never enter a runtime dependency tree.
+# The isolation recipe in ADR-0001’s plan (alive-but-partitioned node) needs its in-memory transport.
+arachne-kv-testsupport = "0.3"
 wiremock = "0.6"
 tokio-test = "0.4"

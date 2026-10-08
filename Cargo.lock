@@ -194,6 +194,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b051684f54676e01f8c934763592918a1b81401936d9fa80b5ab4fdb0f4182c"
 
 [[package]]
+name = "arachne-kv-testsupport"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70f69d2e361b0881797b7d7d655f8ee73fcbf7179d41f70af98b1b16302e3a07"
+dependencies = [
+ "arachne-kv-seam",
+ "tokio",
+]
+
+[[package]]
 name = "arachne-kv-transport-tonic"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1400,10 +1410,6 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
- "allocator-api2",
-]
 
 [[package]]
 name = "hashbrown"
@@ -1432,6 +1438,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -1561,6 +1572,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "arachne-kv",
+ "arachne-kv-testsupport",
  "arc-swap",
  "async-trait",
  "base64",
@@ -2576,7 +2588,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.14.5",
+ "hashbrown 0.17.1",
  "parking_lot",
  "rand 0.8.7",
 ]
