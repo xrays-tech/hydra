@@ -207,6 +207,34 @@ fn is_not_found(e: &sqlx::Error) -> bool {
 /// Best-effort: a fatal validation failure is logged but does **not** fail an
 /// already-committed write (design §5.3 keeps the old snapshot; the next
 /// successful reload recovers).
+/// The validation warnings that belong to ONE limit role, for the write response (decision D-17).
+///
+/// The warnings were already produced at write time — `reload_all` validates and logs them — but a
+/// scripted operator sees only `201` and has to go read the leader's log to learn that, say, the role
+/// it just created can never match. `ValidationIssue::subject` makes them filterable; issues with no
+/// subject are about the configuration as a whole and are deliberately NOT returned here (returning
+/// them would make every write look noisy and train operators to ignore the field).
+fn warnings_for(state: &AdminState, subject: &str) -> Vec<String> {
+    hydra_core::config::validate(&state.store.snapshot())
+        .into_iter()
+        .filter(|i| i.subject.as_deref() == Some(subject))
+        .map(|i| i.message)
+        .collect()
+}
+
+/// A limit role plus its warnings, as the write endpoints answer. `warnings` is ALWAYS present
+/// (possibly empty) so a script can read it without sniffing for the key.
+fn limit_role_body(state: &AdminState, role: &LimitRole) -> serde_json::Value {
+    let mut body = serde_json::to_value(role).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut body {
+        map.insert(
+            "warnings".to_string(),
+            serde_json::json!(warnings_for(state, &role.id)),
+        );
+    }
+    body
+}
+
 async fn reload_best_effort(state: &AdminState, trace_id: &str) -> Option<Resp> {
     let _guard = state.reload_lock.lock().await;
     if let Err(e) = state.store.reload_all().await {
@@ -1527,7 +1555,7 @@ pub(super) async fn limit_role_collection(
         if let Some(r) = reload_best_effort(state, trace_id).await {
             return r;
         }
-        ok_json(201, &r)
+        ok_json(201, &limit_role_body(state, &r))
     } else {
         method_not_allowed(trace_id)
     }
@@ -1565,7 +1593,7 @@ pub(super) async fn limit_role_item(
                     if let Some(r) = reload_best_effort(state, trace_id).await {
                         return r;
                     }
-                    ok_json(200, &r)
+                    ok_json(200, &limit_role_body(state, &r))
                 }
                 Err(_) => err_json(404, "not_found", "role not found", trace_id),
             }

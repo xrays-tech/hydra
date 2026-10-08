@@ -201,7 +201,7 @@ impl TdengineSink {
 impl UsageSink for TdengineSink {
     fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if let Some(tx) = self.tx.lock().expect("tx mutex").as_ref() {
+            if let Some(tx) = crate::lock_gate(&self.tx).as_ref() {
                 if let Err(e) = tx.try_send(record) {
                     let (reason, dropped) = match e {
                         mpsc::error::TrySendError::Full(r) => {
@@ -229,8 +229,8 @@ impl UsageSink for TdengineSink {
 
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let tx = self.tx.lock().expect("tx mutex").take();
-            let join = self.join.lock().expect("join mutex").take();
+            let tx = crate::lock_gate(&self.tx).take();
+            let join = crate::lock_gate(&self.join).take();
             if let (Some(tx), Some(join)) = (tx, join) {
                 drop(tx);
                 let _ = tokio::time::timeout(MAX_FLUSH_RETRY_WINDOW, join).await;
@@ -241,8 +241,8 @@ impl UsageSink for TdengineSink {
 
 impl Drop for TdengineSink {
     fn drop(&mut self) {
-        let tx = self.tx.lock().expect("tx mutex").take();
-        let join = self.join.lock().expect("join mutex").take();
+        let tx = crate::lock_gate(&self.tx).take();
+        let join = crate::lock_gate(&self.join).take();
         drain_on_drop(tx, join);
     }
 }

@@ -995,7 +995,7 @@ pub struct UsageRecord {
    ⚠️ **2026-09-30 按代码更正**：本文原先写"仅取前 4 + 后 4 字符（`sk-abcd…wxyz`）"，而实际规则是
    **长度 ≥ 20 ⇒ 前 10 + 后 4**（中间替换为 `*`，即 22 字符的 key 会保留 14 个字符，而不是 8 个）、
    **长度 6–19 ⇒ 前 2 + 后 2**、**长度 < 6 ⇒ 全星**。这条差异影响"用掩码就安全"的判断：掩码形式写进
-   `limit_role.matching_key` 时，一段长 key 的 14 个字符会被存下来。
+   `limit_role.matching_key` 时，一段长 key 的 14 个字符会被存下来（**2026-10-08 起不再如此**：计数桶的 KEY 维度改为**原始 key 的摘要**（`hydra_core::limit::bucket_key`/`key_bucket_id`，32 hex），集群模式的 Redis 键名与任何派生标签里都不再出现客户 key 的任何字符——决策 D-15②；代价是升级时桶名变化 ⇒ 现有窗口会重置一次）。
 
 ---
 
@@ -1005,7 +1005,7 @@ pub struct UsageRecord {
 
 对每个请求，从 `ConfigData.limit_roles`（仅 `enabled=1`）中找出所有匹配项：
 
-- `matching_key` 为 NULL **或** 等于客户端 api-key（**原始形式或掩码形式均可**；**推荐写掩码**）；
+- `matching_key` 为 NULL **或** 等于客户端 api-key（**原始形式、掩码形式、或 `sha256:<64 hex>` 摘要形式**均可；**推荐写摘要**——2026-10-08 决策 D-16③：`matching_key` 是明文列且会复制到每个节点与每份备份，摘要形式匹配同一把 key 而不存任何可还原的东西；摘要算法与格式为 `sha256:` + 小写 hex，见 `hydra_core::limit::key_digest`）；
   ⚠️ **2026-09-30 实测并已修复。** 限流门原先只把上下文建成 `MatchCtx { api_key:
   Some(&mask_key(&api_key)) }`（`proxy.rs`，**掩码**形式），所以写**原始** key 的角色**永不触发**
   （leader/edge 实测全 200 —— 一个看起来配好、实则不生效的配额）。修复后 `MatchCtx` 同时携带

@@ -216,6 +216,10 @@ pub enum Severity {
 pub struct ValidationIssue {
     pub severity: Severity,
     pub message: String,
+    /// WHICH entity the issue is about, when that is known (decision D-17): the admin write path
+    /// returns the warnings for the row it just wrote, and it can only filter by subject if the issue
+    /// says which row it belongs to. `None` means "about the configuration as a whole".
+    pub subject: Option<String>,
 }
 
 impl ValidationIssue {
@@ -223,6 +227,18 @@ impl ValidationIssue {
         Self {
             severity: Severity::Warn,
             message,
+            subject: None,
+        }
+    }
+
+    /// A warning about ONE entity. The subject is what lets `POST/PUT /api/v1/limit-roles` answer with
+    /// "and here is what is wrong with what you just wrote" instead of leaving it in the leader's log
+    /// (decision D-17).
+    fn warn_about(subject: String, message: String) -> Self {
+        Self {
+            severity: Severity::Warn,
+            message,
+            subject: Some(subject),
         }
     }
 }
@@ -318,10 +334,13 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
     // limit roles → must constrain at least one dimension.
     for role in &cfg.limit_roles {
         if role.limit_count.is_none() && role.limit_token.is_none() {
-            issues.push(ValidationIssue::warn(format!(
-                "limit_role '{}' has both limit_count and limit_token NULL",
-                role.id
-            )));
+            issues.push(ValidationIssue::warn_about(
+                role.id.clone(),
+                format!(
+                    "limit_role '{}' has both limit_count and limit_token NULL",
+                    role.id
+                ),
+            ));
         }
         // `matching_provider` can never match: the pre-gate builds its `MatchCtx`
         // BEFORE routing, so `provider` is always `None` there, while
@@ -335,7 +354,7 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
         // implemented (per-candidate checks) or rejected at the admin write boundary
         // is a product decision — see the plan's D-11.
         if role.matching_provider.is_some() {
-            issues.push(ValidationIssue::warn(format!(
+            issues.push(ValidationIssue::warn_about(role.id.clone(), format!(
                 "limit_role '{}' declares matching_provider '{}', which CANNOT match: the                  limit pre-gate runs before routing, so no provider is known yet and this                  role is skipped entirely (its limits never apply)",
                 role.id,
                 role.matching_provider.as_deref().unwrap_or_default()
@@ -353,37 +372,43 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
         // nothing about this one. A WARNING, not an error: a deliberately shared quota between two
         // tenants is legitimate, it just must not be accidental or silent.
         if role.matching_key.is_some() && role.matching_tenant.is_none() {
-            issues.push(ValidationIssue::warn(format!(
+            issues.push(ValidationIssue::warn_about(role.id.clone(), format!(
                 "limit_role '{}' scopes on matching_key but has matching_tenant NULL: its window is \
-                 shared by EVERY tenant that accepts that key (the bucket is (role_id, mask(key))), \
+                 shared by EVERY tenant that accepts that key (the bucket is (role_id, digest(key))), \
                  so one tenant's traffic can exhaust another's budget",
                 role.id
             )));
         }
-        // What the VALUE of `matching_key` costs — one warning per role, because the two forms have
-        // opposite costs and the documentation alone was the only place either was mentioned.
+        // What the VALUE of `matching_key` costs — one warning per role, because the forms have
+        // different costs and the documentation alone was the only place any of them was mentioned.
         if let Some(key) = role.matching_key.as_deref() {
-            if !key.is_empty() && crate::rewrite::mask_key(key) != key {
-                // A non-mask value is (by the matching rules) a raw client key.
-                issues.push(ValidationIssue::warn(format!(
+            // `is_key_digest` is load-bearing (2026-10-08, decision D-16③): a `sha256:<hex>` value is
+            // neither `mask_key(k) == k` nor a raw key, so without it this branch warned about the very
+            // form it now RECOMMENDS. Caught by the test, not by reading — the warning text below says
+            // "write the digest form" while the guard fired ON the digest form.
+            if !key.is_empty()
+                && crate::rewrite::mask_key(key) != key
+                && !crate::limit::is_key_digest(key)
+            {
+                // A non-mask, non-digest value is (by the matching rules) a raw client key.
+                issues.push(ValidationIssue::warn_about(role.id.clone(), format!(
                     "limit_role '{}' stores what looks like a RAW client key in `matching_key`: that \
                      column is kept and replicated in PLAINTEXT (unlike provider api-keys, which are \
                      sealed with the master key) and is returned by `GET /api/v1/limit-roles`, so a \
                      live credential ends up in every node's database, in every backup and in every \
-                     admin response. The MASK form matches the same key without storing it (the mask \
-                     is what the usage rows carry); whether the column should be sealed is plan item \
-                     D-16",
+                     admin response. Write the DIGEST form instead (`sha256:<64 hex>`, decision D-16③): \
+                     it matches the same key and stores nothing recoverable. The MASK form also works \
+                     (it is what the usage rows carry) and, since D-15②, two keys that share a mask no \
+                     longer share a window either",
                     role.id
                 )));
-            } else if !key.is_empty() {
-                // ...and the masked form has the opposite cost: the mask is not a unique identity.
-                issues.push(ValidationIssue::warn(format!(
-                    "limit_role '{}' matches on the MASKED form '{}': any OTHER client key whose \
-                     mask is that same string shares this window (the window is (role_id, mask(key)), \
-                     regardless of tenant), so unrelated keys silently share one budget",
-                    role.id, key
-                )));
             }
+            // The mask-collision warning that used to sit here is DELETED (2026-10-08, decision
+            // D-15②): it said that any other key whose mask is the same string shares this window,
+            // because the window was `(role_id, mask(key))`. The window is now keyed by a DIGEST of
+            // the raw key, so two keys that share a mask have two windows — the warning's condition
+            // cannot occur, and a warning that cannot fire is noise that trains operators to skip the
+            // list. `hydra-core/tests/validate.rs` pins its absence so it cannot come back by accident.
         }
     }
 

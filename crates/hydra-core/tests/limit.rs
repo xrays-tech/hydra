@@ -6,7 +6,9 @@
 
 use std::time::{Duration, Instant};
 
-use hydra_core::limit::{bucket_key, match_roles, MatchCtx, SlidingWindow};
+use hydra_core::limit::{
+    bucket_key, key_bucket_id, key_digest, match_roles, MatchCtx, SlidingWindow,
+};
 use hydra_core::model::LimitRole;
 use hydra_core::rewrite::mask_key;
 use pretty_assertions::assert_eq;
@@ -372,8 +374,8 @@ fn the_key_bucket_keeps_its_identity_from_the_raw_key_too() {
     let b = bucket_key(&only_raw_b);
     assert_eq!(
         a,
-        mask_key(raw_a),
-        "a raw-only context is bucketed by the mask"
+        key_bucket_id(raw_a),
+        "a raw-only context is bucketed by a DIGEST of the key (D-15②)"
     );
     assert_ne!(
         a, "",
@@ -385,13 +387,14 @@ fn the_key_bucket_keeps_its_identity_from_the_raw_key_too() {
     );
     assert_ne!(a, b, "two clients must not share a bucket");
 
-    // A context that carries the documented masked form is unchanged (the production shape).
+    // The production shape carries BOTH forms; the RAW key decides the bucket, so the mask cannot
+    // make two clients collide.
     let masked = MatchCtx {
         api_key: Some("sk-bucket********aaaa"),
         api_key_raw: Some(raw_a),
         ..only_raw_a
     };
-    assert_eq!(bucket_key(&masked), "sk-bucket********aaaa");
+    assert_eq!(bucket_key(&masked), key_bucket_id(raw_a));
     // ...and with neither key present the component is empty, i.e. the old behaviour is preserved
     // for key-less contexts (only reachable for roles whose `matching_key` is NULL).
     let neither = MatchCtx {
@@ -400,4 +403,100 @@ fn the_key_bucket_keeps_its_identity_from_the_raw_key_too() {
         ..only_raw_a
     };
     assert_eq!(bucket_key(&neither), "");
+}
+
+/// Decision D-15② (2026-10-08): two DIFFERENT client keys whose masks are identical must get two
+/// windows.
+///
+/// Measured before the fix: `sk-fidelity-limited` and `skzzzzzzzzzzzzzzzed` produce the SAME mask
+/// (10 leading + 4 trailing characters are what `mask_key` keeps), and the window was keyed by that
+/// mask — so once the first key's window was spent, the second key was refused on its very FIRST
+/// request. One customer eating another's quota, with no log line and no metric.
+#[test]
+fn two_keys_that_share_a_mask_get_two_buckets() {
+    const A: &str = "sk-fidelity-limited";
+    const B: &str = "skzzzzzzzzzzzzzzzed";
+    let (mask_a, mask_b) = (mask_key(A), mask_key(B));
+    assert_eq!(
+        mask_a, mask_b,
+        "the premise of this test: two different keys, one mask"
+    );
+    let c_a = MatchCtx {
+        api_key: Some(&mask_a),
+        api_key_raw: Some(A),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    let c_b = MatchCtx {
+        api_key: Some(&mask_b),
+        api_key_raw: Some(B),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    assert_ne!(
+        bucket_key(&c_a),
+        bucket_key(&c_b),
+        "same mask, different keys ⇒ DIFFERENT windows (the shared-quota bug)"
+    );
+    assert_eq!(bucket_key(&c_a), key_bucket_id(A));
+    assert!(
+        !bucket_key(&c_a).contains(mask_a.as_str()),
+        "the mask must not appear in a bucket name — it becomes a Redis key in cluster mode: {}",
+        bucket_key(&c_a)
+    );
+}
+
+/// Decision D-16③ (2026-10-08): a role may state `matching_key` as `sha256:<hex>`, so the limit can be
+/// configured WITHOUT the credential being stored anywhere — `limit_role.matching_key` is a plaintext
+/// column replicated to every node. The raw and masked forms keep working.
+#[test]
+fn matching_key_accepts_a_digest_without_storing_the_key() {
+    const RAW: &str = "sk-digest-form-0001";
+    const OTHER: &str = "sk-digest-form-0002";
+    let mask = mask_key(RAW);
+    let mut role = role_all_null("r-digest", true);
+    role.matching_key = Some(key_digest(RAW));
+    assert!(
+        !role
+            .matching_key
+            .as_deref()
+            .unwrap_or_default()
+            .contains(RAW),
+        "the configured value must not contain the key itself"
+    );
+
+    let presented = MatchCtx {
+        api_key: Some(&mask),
+        api_key_raw: Some(RAW),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    assert_eq!(
+        match_roles(&[role.clone()], &presented).len(),
+        1,
+        "the key that was digested must match"
+    );
+
+    let other = MatchCtx {
+        api_key: Some(&mask_key(OTHER)),
+        api_key_raw: Some(OTHER),
+        model: None,
+        tenant: None,
+        provider: None,
+    };
+    assert!(
+        match_roles(&[role.clone()], &other).is_empty(),
+        "a DIFFERENT key must not match a digest role"
+    );
+
+    // The historical forms are untouched.
+    let mut raw_form = role_all_null("r-raw", true);
+    raw_form.matching_key = Some(RAW.into());
+    assert_eq!(match_roles(&[raw_form], &presented).len(), 1);
+    let mut mask_form = role_all_null("r-mask", true);
+    mask_form.matching_key = Some(mask.clone());
+    assert_eq!(match_roles(&[mask_form], &presented).len(), 1);
 }

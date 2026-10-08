@@ -53,7 +53,12 @@ pub mod crypto;
 ///
 /// Use it whenever the guarded value is a plain snapshot; keep `.expect(...)` where a poisoned lock
 /// really does mean an invariant was broken mid-update.
-#[cfg(feature = "db")]
+///
+/// The gate names BOTH users (2026-10-08, decision D-13): the request path and the config store are
+/// `db`, and the TDengine usage backend — the only other `lock().expect(…)` site in the tree — is
+/// `usage-tdengine`, a feature that implies no database feature. Gating on `db` alone would make that
+/// combination fail to compile the moment it used the helper.
+#[cfg(any(feature = "db", feature = "usage-tdengine"))]
 pub(crate) fn lock_gate<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

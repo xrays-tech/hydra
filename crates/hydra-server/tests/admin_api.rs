@@ -1070,6 +1070,60 @@ async fn tenant_provider_and_model_crud_http() {
     assert_eq!(r.status(), 409);
 }
 
+/// Decision D-17 (2026-10-08): the write answer carries the warnings for the row it just wrote.
+///
+/// Before this, `201` was silent about a role that can never match — the warning went to the node log
+/// only (see `ops.md` §4), so a script that created roles could not tell a sound role from one whose
+/// `matching_provider` dimension is inert. The array is ALWAYS present so a caller can read it without
+/// sniffing for the key; the empty case is asserted too, because "always present" is the contract.
+#[tokio::test]
+async fn limit_role_write_returns_the_warnings_for_that_role() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    // `matching_provider` is the documented inert dimension: the pre-gate runs before routing.
+    let inert = r#"{"id":"r-inert","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":"p1","limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(inert),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let body = r.text().await.expect("body");
+    assert!(
+        body.contains("\"warnings\""),
+        "the write answer must carry `warnings`: {body}"
+    );
+    assert!(
+        body.contains("CANNOT match"),
+        "the inert-dimension warning must be IN the response, not only in the log: {body}"
+    );
+    assert!(
+        body.contains("r-inert"),
+        "and it must name the role that was just written: {body}"
+    );
+
+    // CONTROL: a sound role answers with an EMPTY array — the field is always there.
+    let clean = r#"{"id":"r-clean","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":null,"limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(clean),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let body = r.text().await.expect("body");
+    assert!(
+        body.contains("\"warnings\":[]"),
+        "a clean write must answer with an empty array: {body}"
+    );
+}
+
 // ===========================================================================
 // §2.7 — limit-role CRUD (window CHECK)
 // ===========================================================================

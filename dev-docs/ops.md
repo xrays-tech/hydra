@@ -580,18 +580,26 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   a mask is a raw client key: that column is kept and replicated in **plaintext** (unlike provider
 >   api-keys, which are sealed) and is returned by `GET /api/v1/limit-roles`, so a live credential ends
 >   up in every node's database, every backup and every admin response — the node says so by name at
->   config load. The **mask** form has the opposite cost and also warns: the window is
->   `(role_id, mask(key))` **regardless of tenant**, so any other key whose mask is that same string
->   silently shares the budget, even inside one tenant.
+>   config load. **The digest form (`sha256:<64 hex>`) is the one to use since 2026-10-08 (decision
+>   D-16③)**: it matches the same key and stores nothing recoverable — `printf %s "$KEY" | sha256sum`
+>   and prefix the hex with `sha256:`. The **mask** form also works and no longer carries a shared-window
+>   cost: as of D-15② the window is keyed by a **digest** of the presented key, so two different keys
+>   whose masks are identical have two separate windows (before that they shared one — measured: the
+>   second key was refused on its first request once the first key's window was spent).
 > * **where those config warnings appear** (measured 2026-09-30, `integration/test_limit_roles_enforcement.py` L9):
 >   at **startup**, on **every config load**, and — because the admin write path reloads — **immediately
 >   when you write the role** (`POST`/`PUT /api/v1/limit-roles` answers `201`/`200` and the warning is in
->   the node log right after it; no explicit `POST /reload` needed). They are **not** in the HTTP
->   response body, and a **materializing node does not re-validate** the tree it receives (`apply_snapshot` loads
+>   the node log right after it; no explicit `POST /reload` needed). **Since 2026-10-08 (decision D-17)
+>   the write response ALSO carries them**: `POST`/`PUT /api/v1/limit-roles` answers with a `warnings`
+>   array — **always present, possibly empty** — holding exactly the warnings whose subject is the role
+>   you just wrote, so a script no longer has to read the leader's log to learn that the role it created
+>   can never match (`crates/hydra-server/tests/admin_api.rs::limit_role_write_returns_the_warnings_for_that_role`
+>   pins both the non-empty and the empty case). Warnings about the configuration as a whole (no subject)
+>   are still log-only, and a **materializing node does not re-validate** the tree it receives (`apply_snapshot` loads
 >   without validation, by design: the WRITER validated it before publishing) — so scripts that create roles
 >   should check the log of the node that received the write, not assume a clean `201` means a sound role.
 > * **always set `matching_tenant` on a key-scoped role.** The window belongs to
->   `(role_id, mask(key))` and nothing else, so a role with `matching_key` set and
+>   `(role_id, digest(presented key))` and nothing else, so a role with `matching_key` set and
 >   `matching_tenant` NULL is a **cross-tenant** budget: two tenants whose auth backends both accept
 >   the same key string share it, and one tenant's traffic can refuse the other's very first request.
 >   Startup validation now warns by name (`limit_role 'r-x' scopes on matching_key but has

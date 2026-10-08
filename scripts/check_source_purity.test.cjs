@@ -23,21 +23,30 @@ const REPO = path.resolve(__dirname, '..');
 const CLAIM_ZH = '<div class="lab" data-l="zh">生产代码无 unwrap / panic / unsafe</div>';
 const CLAIM_EN = '<div class="lab" data-l="en">unsafe / unwrap / panic in production code</div>';
 
-function fixture({ lib = '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { 1 }\n', main = '#![forbid(unsafe_code)]\n\nfn main() {}\n', docs = `${CLAIM_ZH}\n${CLAIM_EN}\n`, manifest = '[[bin]]\nname = "demo"\npath = "src/main.rs"\n' } = {}) {
+function fixture({ lib = '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { 1 }\n', main = '#![forbid(unsafe_code)]\n\nfn main() {}\n', docs = `${CLAIM_ZH}\n${CLAIM_EN}\n`, manifest = '[[bin]]\nname = "demo"\npath = "src/main.rs"\n', extra = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'purity-'));
   const crate = path.join(dir, 'crates', 'demo');
   fs.mkdirSync(path.join(crate, 'src'), { recursive: true });
   fs.writeFileSync(path.join(crate, 'Cargo.toml'), `[package]\nname = "demo"\n\n${manifest}`);
   fs.writeFileSync(path.join(crate, 'src', 'lib.rs'), lib);
   fs.writeFileSync(path.join(crate, 'src', 'main.rs'), main);
+  for (const [name, body] of Object.entries(extra)) fs.writeFileSync(path.join(crate, 'src', name), body);
   const docsPath = path.join(dir, 'index.html');
   fs.writeFileSync(docsPath, docs);
   return { dir, crate, docs: docsPath };
 }
 
-function run(fx, extraArgs = []) {
+function run(fx, extraArgs = [], env = {}) {
   const args = [`--src-root=${path.join(fx.dir, 'crates')}`, `--docs=${fx.docs}`, ...extraArgs];
-  const res = spawnSync(process.execPath, [CHECKER, ...args], { encoding: 'utf8' });
+  const res = spawnSync(process.execPath, [CHECKER, ...args], {
+    encoding: 'utf8',
+    // `PURITY_EXPECT_OK: '{}'` REPLACES the repository's registrations: a fixture tree does not contain
+    // `main.rs:1166` or `provider_client.rs:131`, so without this every case would report the two
+    // repository records as stale — the exact failure mode `recorded_exceptions.cjs` documents
+    // ("getting this wrong cost every guard a round of 'nine existing assertions turned red at once'").
+    // Cases that exercise the registration pass their own value through `env`.
+    env: { ...process.env, PURITY_EXPECT_OK: '{}', ...env },
+  });
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
@@ -165,12 +174,52 @@ test('reworded public claim fails so the guard cannot silently stop matching', (
   assert.match(half.stderr, /zh: ok, en: MISSING/);
 });
 
-test('expect() is reported as information, never as a violation', () => {
-  const r = run(fixture({ lib: '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { let o: Option<u8> = None; o.expect("infallible") }\n' }));
+/* Decision D-13 (2026-10-08): `expect` is NOT banned outright — the docs' "must be empty" recipe was
+ * never executable — but every remaining production site must be REGISTERED with a reason, so the set
+ * cannot grow in silence. This replaced a test that asserted `expect` is "reported as information, never
+ * as a violation", i.e. the behaviour that made the old number unactionable. */
+test('expect() must be REGISTERED: unregistered is a finding, registered is reported', () => {
+  const fx = fixture({ lib: '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { let o: Option<u8> = None; o.expect("infallible") }\n' });
+
+  const unregistered = run(fx);
+  assert.equal(unregistered.status, 1, unregistered.stdout);
+  assert.match(unregistered.stderr, /UNREGISTERED site/);
+  const key = (unregistered.stdout + unregistered.stderr).match(/Its key is "([^"]+)"/)[1];
+  assert.match(key, /^demo\/src\/lib\.rs@[0-9a-f]{8}$/, key);
+
+  const registered = run(fx, [], { PURITY_EXPECT_OK: JSON.stringify({ [key]: 'the Option cannot be None here' }) });
+  assert.equal(registered.status, 0, registered.stderr);
+  assert.match(registered.stdout, /1 production \.expect\(\.\.\.\) site\(s\), every one REGISTERED/);
+  assert.ok(registered.stdout.includes(key), registered.stdout);
+
+  // A registration whose site is gone is a stale claim, not a licence to keep the line around.
+  const stale = run(fx, [], { PURITY_EXPECT_OK: JSON.stringify({ 'demo/src/lib.rs@deadbeef': 'long gone' }) });
+  assert.equal(stale.status, 1, stale.stdout);
+  assert.match(stale.stderr, /is a stale claim/);
+});
+
+/* The number this guard printed was not the thing it claimed (2026-10-08): a module declared
+ * `#[cfg(test)]` in its PARENT (`usage/testing.rs`, declared in `usage/mod.rs:332`) is not production
+ * code, yet its ten `.expect(...)` sites were counted as production. The exemption is verified, not
+ * assumed: the attribute block above the `mod <stem>;` line must actually contain `cfg(...test...)`. */
+test('a module declared #[cfg(test)] is excluded, and the exclusion is verified', () => {
+  const fx = fixture({
+    lib: '#![forbid(unsafe_code)]\n\n#[cfg(test)]\npub mod helper;\n\npub fn f() -> u8 { 1 }\n',
+    extra: { 'helper.rs': 'pub fn g() -> u8 { let o: Option<u8> = None; o.expect("infallible") }\n' },
+  });
+  const r = run(fx);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /1 production \.expect\(\.\.\.\) site\(s\)/);
-  assert.match(r.stdout, /demo\/src\/lib\.rs:3/);
-  assert.match(r.stdout, /plan D-13/);
+  assert.match(r.stdout, /0 production \.expect\(\.\.\.\) site\(s\)|every one REGISTERED/);
+  assert.match(r.stdout, /1 further \.expect\(\.\.\.\) site\(s\) in TEST-ONLY modules, excluded as non-production/);
+  assert.match(r.stdout, /demo\/src\/helper\.rs \(declared demo\/src\/lib\.rs:3\)/);
+
+  // Lose the gate and the SAME file becomes production code again, so its site must be registered.
+  const ungated = run(fixture({
+    lib: '#![forbid(unsafe_code)]\n\npub mod helper;\n\npub fn f() -> u8 { 1 }\n',
+    extra: { 'helper.rs': 'pub fn g() -> u8 { let o: Option<u8> = None; o.expect("infallible") }\n' },
+  }));
+  assert.equal(ungated.status, 1, ungated.stdout);
+  assert.match(ungated.stderr, /UNREGISTERED site/);
 });
 
 test('a missing crates root is exit 2 (cannot scan), never a silent pass', () => {

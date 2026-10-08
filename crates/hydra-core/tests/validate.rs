@@ -75,7 +75,7 @@ fn validate_limit_role_with_a_provider_dimension_is_reported_as_dead() {
 /// A key-scoped role with no tenant scope is a CROSS-TENANT budget, and it must be named.
 ///
 /// Measured 2026-09-30 (round 116 made the raw-key form match, so roles that used to be silently
-/// inert became live): the window belongs to `(role_id, mask(key))`, so two tenants whose auth
+/// inert became live): the window belongs to `(role_id, digest(key))`, so two tenants whose auth
 /// backends accept the same key string share one budget — one tenant's traffic can exhaust the
 /// other's. `validate` warned about the dead `matching_provider` dimension and said nothing here.
 ///
@@ -131,7 +131,11 @@ fn validate_reports_what_the_matching_key_value_costs() {
         "a raw key in `matching_key` must be named, got {warns:?}"
     );
 
-    // (b) the MASK form: no plaintext, but the mask is not a unique identity.
+    // (b) the MASK form: no warning any more. The warning that used to sit here said any other key
+    // whose mask is the same string SHARES the window, because the window was `(role_id, mask(key))`.
+    // Decision D-15② keyed the window by a DIGEST of the raw key, so two keys that share a mask have
+    // two windows — the condition cannot occur, and the warning was deleted with its premise. This
+    // assertion is what keeps it from being re-added by someone reading an old note.
     let mut cfg2 = clean_config();
     let mut masked = limit_role("r-mask", Some(600), None);
     masked.matching_key = Some("sk***************ed".to_string());
@@ -139,22 +143,31 @@ fn validate_reports_what_the_matching_key_value_costs() {
     cfg2.limit_roles.push(masked);
     let warns2 = warn_messages(&validate(&cfg2));
     assert!(
-        warns2
-            .iter()
-            .any(|m| m.contains("r-mask") && m.contains("MASKED form") && m.contains("share")),
-        "the masked form must be named as a shared identity, got {warns2:?}"
+        !warns2.iter().any(|m| m.contains("r-mask")),
+        "the masked form must NOT be warned about any more (D-15② fixed what it described), got {warns2:?}"
     );
 
-    // CONTROL: no `matching_key` ⇒ neither warning (so they fire on the value, not on every role).
+    // (c) the DIGEST form (decision D-16③): the recommended one — nothing recoverable is stored.
+    let mut cfg4 = clean_config();
+    let mut digest = limit_role("r-digest", Some(600), None);
+    digest.matching_key = Some(::hydra_core::limit::key_digest("sk-live-customer-key-0001"));
+    digest.matching_tenant = Some("t1".to_string());
+    cfg4.limit_roles.push(digest);
+    let warns4 = warn_messages(&validate(&cfg4));
+    assert!(
+        !warns4.iter().any(|m| m.contains("r-digest")),
+        "the digest form stores nothing recoverable and must not be warned about, got {warns4:?}"
+    );
+
+    // CONTROL: no `matching_key` ⇒ no warning either (so the raw warning fires on the value, not on
+    // every role).
     let mut cfg3 = clean_config();
     cfg3.limit_roles
         .push(limit_role("r-plain", Some(600), None));
     let warns3 = warn_messages(&validate(&cfg3));
     assert!(
-        !warns3
-            .iter()
-            .any(|m| m.contains("RAW client key") || m.contains("MASKED form")),
-        "a role without `matching_key` must not produce either warning, got {warns3:?}"
+        !warns3.iter().any(|m| m.contains("RAW client key")),
+        "a role without `matching_key` must not produce the raw-key warning, got {warns3:?}"
     );
 }
 

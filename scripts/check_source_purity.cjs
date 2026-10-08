@@ -88,7 +88,76 @@ function parseArgs(argv) {
 // count was defensible under a different pattern — mentions, `require` calls and test files give
 // three different answers. Run it; do not write its output down. The point is that ONE lexer is right
 // and every hand-rolled copy had the same class of bug (see that file's header).
+const crypto = require('crypto');
 const { stripComments, stripTestItems } = require('./rust_blank.cjs');
+const { records, audit } = require('./recorded_exceptions.cjs');
+
+/**
+ * The `.expect(...)` sites production is ALLOWED to keep, one record each, keyed by
+ * `<crate>/src/<path>@<sha1-8 of the line>` (decision **D-13**, adjudicated 2026-10-08).
+ *
+ * The policy the docs state was "no `unwrap`/`expect`/`panic` in production code", and the recipe given
+ * with it ("`rg 'unwrap\(\)|expect\(' … must be empty") was never executable — measured then and now.
+ * D-13 asked which side to move, and the answer taken is the narrow one: `unwrap`, panicking macros and
+ * `unsafe` stay FORBIDDEN, and `expect` is allowed only for an invariant the code cannot violate, with
+ * every remaining site REGISTERED here and its reason written down. An unregistered site is a finding;
+ * a registration whose site disappeared is a stale claim. So the set cannot grow — or rot — in silence.
+ */
+const EXPECT_SITE_OK = records(process.env.PURITY_EXPECT_OK, [
+  [
+    'hydra-server/src/main.rs@d9758f50',
+    'cert store at the TLS listener (main.rs:1163-1166): the store is built UNCONDITIONALLY whenever a ' +
+      'TLS feature is compiled in (main.rs:510-517), and this branch is only reached with a TLS ' +
+      'listener configured — so the Option is None only in a build that cannot reach this line. There ' +
+      'is also no caller to return an error to: this is bootstrap, before any request exists.',
+  ],
+  [
+    'hydra-server/src/proxy/provider_client.rs@8e38d65c',
+    'the reqwest client (provider_client.rs:128-131): the builder uses CONSTANT settings and no ' +
+      'redirect policy, and a failed build is retried once with an identical builder — a failure that ' +
+      'survives that retry is a property of the constant set, not of request data, and it happens at ' +
+      'client construction where there is no request to fail.',
+  ],
+]);
+
+/** One registered `expect` site's identity: the file, plus a fingerprint of the line itself. */
+function expectKey(relFile, text) {
+  return `${relFile}@${crypto.createHash('sha1').update(text).digest('hex').slice(0, 8)}`;
+}
+
+/**
+ * Is `file` a module whose DECLARATION carries `cfg(test)`? Then it is not production code, however
+ * many `expect`s it contains — `usage/testing.rs` is the case that forced this (2026-10-08): its `mod`
+ * line in `usage/mod.rs` is `#[cfg(test)]`, its only users are `#[cfg(test)]` blocks, and this guard
+ * was counting its ten sites as "production", i.e. the number it printed was not the thing it claimed.
+ *
+ * The declaration is FOUND, not assumed: the attribute block directly above `mod <stem>;` must contain
+ * `cfg(...test...)`, so a module that loses its gate stops being exempt on the next run.
+ */
+function testOnlyModule(cratesRoot, file) {
+  const stem = path.basename(file, '.rs');
+  const dir = path.dirname(file);
+  const candidates = [
+    path.join(path.dirname(dir), `${path.basename(dir)}.rs`),
+    path.join(dir, 'mod.rs'),
+    path.join(dir, 'lib.rs'),
+    path.join(dir, 'main.rs'),
+  ].filter((c) => fs.existsSync(c));
+  const declRe = new RegExp(`^\\s*(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+${stem}\\s*;`);
+  for (const cand of candidates) {
+    const lines = fs.readFileSync(cand, 'utf8').split('\n');
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!declRe.test(lines[i])) continue;
+      for (let j = i - 1; j >= 0; j -= 1) {
+        const t = lines[j].trim();
+        if (t === '' || t.startsWith('//')) continue;
+        if (!t.startsWith('#[')) break;
+        if (/\bcfg\b/.test(t) && /\btest\b/.test(t)) return `${path.relative(cratesRoot, cand)}:${j + 1}`;
+      }
+    }
+  }
+  return null;
+}
 
 function walkRustFiles(dir, acc = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -182,14 +251,39 @@ function main(argv) {
 
   const problems = [];
   const allExpects = [];
+  const testOnlyExpects = [];
   let violations = 0;
   for (const file of files) {
     const res = scanFile(file);
     violations += res.violations.length;
-    allExpects.push(...res.expects);
     for (const v of res.violations) {
       problems.push(`${path.relative(cratesRoot, v.file)}:${v.line}: ${v.kind}: ${v.text.slice(0, 110)}`);
     }
+    if (res.expects.length === 0) continue;
+    const declaredAt = testOnlyModule(cratesRoot, file);
+    if (declaredAt) testOnlyExpects.push(...res.expects.map((e) => ({ ...e, declaredAt })));
+    else allExpects.push(...res.expects);
+  }
+  // D-13: every remaining production site must be REGISTERED (see EXPECT_SITE_OK).
+  const expectSites = allExpects.map((e) => ({ ...e, key: expectKey(path.relative(cratesRoot, e.file), e.text) }));
+  const expectAudit = audit({
+    records: EXPECT_SITE_OK,
+    needed: expectSites.map((e) => e.key),
+    applies: (key) => expectSites.some((e) => e.key === key),
+  });
+  for (const key of expectAudit.unrecorded) {
+    const e = expectSites.find((x) => x.key === key);
+    problems.push(
+      `${path.relative(cratesRoot, e.file)}:${e.line}: .expect(...) at an UNREGISTERED site — production ` +
+        `keeps only invariants the code cannot violate, each REGISTERED in EXPECT_SITE_OK with its reason ` +
+        `(decision D-13). Its key is "${key}"; register it there, or return a Result/Option instead`,
+    );
+  }
+  for (const key of expectAudit.stale) {
+    problems.push(
+      `EXPECT_SITE_OK records ${key}, but no production site matches that line any more (it changed, moved ` +
+        `or is gone) — a recorded decision that cannot expire is a stale claim`,
+    );
   }
 
   const missingLint = [];
@@ -205,13 +299,31 @@ function main(argv) {
   const claimEn = /unsafe \/ unwrap \/ panic in production code/.test(html);
 
   const info = `[purity] scanned ${files.length} file(s) under ${path.relative(ROOT, cratesRoot)}/*/src (outside #[cfg(test)] items); ${roots.length} crate root(s)`;
-  if (violations === 0 && missingLint.length === 0 && claimZh && claimEn) {
+  // `problems.length === 0` is load-bearing and was MISSING when the D-13 registration landed
+  // (2026-10-08): the branch asked only about `violations`, so the new "unregistered .expect site"
+  // and "stale registration" findings were pushed into `problems` and then ignored — the guard printed
+  // OK and exited 0 while holding findings it had just produced. It is caught here rather than by luck:
+  // the first run after wiring the registration reported `2 production sites, every one REGISTERED`
+  // although neither real key was in the map yet.
+  if (problems.length === 0 && violations === 0 && missingLint.length === 0 && claimZh && claimEn) {
     console.log(`${info}: clean`);
     console.log(`[purity] OK: 0 unsafe / 0 unwrap() / 0 panicking macros in production code`);
     console.log(`[purity] OK: ${FORBID} present on every crate root (${roots.map((r) => path.relative(cratesRoot, r)).join(', ')})`);
     console.log(`[purity] OK: ${path.relative(ROOT, opts.docs)} still claims "no unwrap / panic / unsafe" in production (zh + en)`);
-    console.log(`[purity] info: ${allExpects.length} production .expect(...) site(s) — allowed by the claim (it names unwrap/panic/unsafe only); policy question tracked as plan D-13:`);
-    for (const e of allExpects) console.log(`[purity]   ${path.relative(cratesRoot, e.file)}:${e.line}: ${e.text.slice(0, 100)}`);
+    console.log(
+      `[purity] info: ${allExpects.length} production .expect(...) site(s), every one REGISTERED in ` +
+        `EXPECT_SITE_OK with its reason (decision D-13: unwrap/panic/unsafe stay forbidden; expect is ` +
+        `allowed for invariants the code cannot violate, and an unregistered site is a finding):`,
+    );
+    for (const e of expectSites) console.log(`[purity]   ${e.key}  (${path.relative(cratesRoot, e.file)}:${e.line})`);
+    if (testOnlyExpects.length > 0) {
+      // Named, not merely subtracted: a reader must be able to see WHICH code was left out and why.
+      const where = [...new Set(testOnlyExpects.map((e) => `${path.relative(cratesRoot, e.file)} (declared ${e.declaredAt})`))];
+      console.log(
+        `[purity] info: ${testOnlyExpects.length} further .expect(...) site(s) in TEST-ONLY modules, ` +
+          `excluded as non-production: ${where.join(', ')}`,
+      );
+    }
     return 0;
   }
 

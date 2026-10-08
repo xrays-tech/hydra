@@ -68,7 +68,26 @@ __pycache__/
 
 # Temporary local tooling (sqlx-cli bootstrap cache; deleted after .sqlx regen)
 /.cargo-cache/
-/.acceptance/
+
+# The acceptance EVIDENCE CHAIN is version-controlled (decision D-5, option ②). It used to be the whole
+# directory (`/.acceptance/`), so a fresh clone had NO gate and CI could not reference one: `git ls-files
+# .acceptance` was 0 while the plan and §4 both told an operator to run `.acceptance/round10-gate.sh`.
+#
+# Git cannot re-include a file whose PARENT directory is excluded, so the directory is un-ignored first
+# and its contents are filtered instead. Shell/Python only: the scratch state stays out (`.log`,
+# `e2e-local/`, `tmp-pw/`, `pw-browsers/`, `gate-manifest.txt`, round data).
+/.acceptance/*
+!/.acceptance/*.sh
+!/.acceptance/*.py
+# …except the drafts. These are one-off probes and stale copies whose value is their OUTPUT, which the
+# plan already records; tracking them would put ~12 dead scripts in every clone. Add one back the day a
+# record cites it as the way to reproduce something.
+/.acceptance/bak-*.py
+/.acceptance/extract_*.py
+/.acceptance/tmp-*.py
+/.acceptance/tmp-*.sh
+/.acceptance/round*-probe*.sh
+/.acceptance/round*-probe*.py
 
 # Playwright (the e2e suite writes these into the repo root; `.dockerignore`
 # already excluded them, but an unclean `git status` after a local e2e run is

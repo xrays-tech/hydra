@@ -85,32 +85,85 @@ impl std::fmt::Debug for MatchCtx<'_> {
     }
 }
 
-/// The KEY-dimension component of a request-count bucket.
+/// The canonical configuration form for a client key: `sha256:<64 lowercase hex>`.
 ///
-/// `api_key` is the masked form (and the identity the bucket is documented to use). A caller that
-/// supplies ONLY `api_key_raw` — legal since that field exists, and the shape its own doc comment
-/// describes — used to contribute `""` to the bucket (`bucket_for` did `ctx.api_key.unwrap_or("")`),
-/// which silently turned "one window per client" into "one window for every client of that role":
-/// the second client would be refused by the first client's spent window, with no log and no metric.
-/// Masking the raw key HERE keeps the identity per client and keeps raw keys out of bucket names
-/// (they become Redis key names in cluster mode).
+/// Decision D-16③ (2026-10-08): a role may state its `matching_key` as this digest instead of the
+/// customer's key (or its mask), so the configuration stops being a place where a live credential
+/// lives. `matching_key` is a PLAIN column — unlike provider api-keys it is not sealed with the master
+/// key — and it is replicated to every node, carried in every backup and echoed by
+/// `GET /api/v1/limit-roles` (all four hops measured in round 117), so the difference matters.
+pub const KEY_DIGEST_PREFIX: &str = "sha256:";
+
+/// The digest form of a client key, i.e. exactly what a role may put in `matching_key`.
+#[must_use]
+pub fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    format!("{KEY_DIGEST_PREFIX}{:x}", h.finalize())
+}
+
+/// Is `s` a well-formed [`key_digest`]? (Lowercase hex, 64 digits, after the prefix.)
+#[must_use]
+pub fn is_key_digest(s: &str) -> bool {
+    s.strip_prefix(KEY_DIGEST_PREFIX).is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The KEY component of a request-count bucket: a **digest** of the client key.
 ///
-/// Both limiter implementations call this, so the invariant has one owner instead of two copies
-/// that can drift apart.
+/// Decision D-15② (2026-10-08). It used to be the MASK (`mask_key`), and that was wrong in two
+/// directions, both measured:
+///   * **it leaked**: in cluster mode this string becomes a Redis key name (`hydra:{rl:…}:count`), so
+///     the first and last characters of a customer's credential sat in the keyspace — and in any
+///     metric label derived from it;
+///   * **it collided**: a mask keeps 10 leading and 4 trailing characters, so two different keys with
+///     the same mask shared ONE budget. Measured then: `sk-fidelity-limited` and `skzzzzzzzzzzzzzzzed`
+///     have the same mask, and once the first key's window was spent the second was refused on its
+///     very first request — one customer eating another's quota, silently.
+///
+/// A digest of the RAW key is per-key distinct and carries no recoverable secret; the mask remains
+/// what a role may MATCH on, which is a different question from what identifies the window.
+#[must_use]
 pub fn bucket_key(ctx: &MatchCtx<'_>) -> String {
-    match (ctx.api_key, ctx.api_key_raw) {
-        (Some(masked), _) => masked.to_string(),
-        (None, Some(raw)) => crate::rewrite::mask_key(raw),
+    match (ctx.api_key_raw, ctx.api_key) {
+        (Some(raw), _) => key_bucket_id(raw),
+        (None, Some(masked)) => key_bucket_id(masked),
         (None, None) => String::new(),
     }
 }
 
-/// Match the key dimension against EITHER the masked or the raw client key (see
-/// [`MatchCtx::api_key_raw`]).
+/// The 32-hex-character bucket identity of one key: `sha256(key)` truncated. Truncation is safe here
+/// (this is an identity, not a signature: no adversary chooses the input to collide with a target
+/// budget) and keeps Redis key names and window maps short.
+#[must_use]
+pub fn key_bucket_id(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    hex[..32].to_string()
+}
+
+/// Match the key dimension against the raw client key, its mask, or its DIGEST.
+///
+/// The first two forms are the historical ones (see [`MatchCtx::api_key_raw`]); the third is decision
+/// D-16③: a role whose `matching_key` is a `sha256:` digest matches when the presented key hashes to
+/// it, so the operator can configure the limit without storing the credential anywhere.
 fn key_dim_matches(role_dim: Option<&str>, ctx: &MatchCtx) -> bool {
     match role_dim {
         None => true,
-        Some(wanted) => ctx.api_key == Some(wanted) || ctx.api_key_raw == Some(wanted),
+        Some(wanted) => {
+            ctx.api_key == Some(wanted)
+                || ctx.api_key_raw == Some(wanted)
+                || (is_key_digest(wanted)
+                    && (ctx.api_key_raw.map(key_digest).as_deref() == Some(wanted)
+                        || ctx.api_key.map(key_digest).as_deref() == Some(wanted)))
+        }
     }
 }
 
@@ -118,7 +171,7 @@ fn key_dim_matches(role_dim: Option<&str>, ctx: &MatchCtx) -> bool {
 ///
 /// A role matches when **every** non-`None` `matching_*` field equals the
 /// corresponding `ctx` value; a `None` field is match-all (design §10.1: "为
-/// NULL 或 等于"). The `matching_key` dimension accepts the raw OR the masked
+/// NULL 或 等于"). The `matching_key` dimension accepts the raw, the masked OR the digest
 /// client key (`key_dim_matches`) — see [`MatchCtx::api_key_raw`] for why. A role value of `Some(x)` does **not** match a `ctx`
 /// dimension that is `None` — "unknown" is never equal to a specific value.
 /// Disabled roles (`enabled == false`) never match (design §10.1: only

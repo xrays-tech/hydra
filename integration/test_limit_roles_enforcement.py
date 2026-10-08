@@ -24,7 +24,8 @@ Cases (throwaway node + a mock upstream that reports `usage`):
      name, and the window really is shared — t2's first request on the same key is refused by
      t1's usage; the control (same role scoped to t1) leaves t2 untouched and stays quiet
   L9 (where the config warnings appear): a role written through the admin API is warned about by the
-     WRITE path itself (it reloads), not only at startup — and the mask form warns about its own cost
+     WRITE path itself (it reloads), not only at startup — and the MASK form is SILENT since D-15②
+     (its "two keys share a window" cost is gone: the window is keyed by a digest of the raw key)
   L8 (one request, one config generation): a role rolled away WHILE a request is in flight and
      put back afterwards still accounts that request's usage (the restored role's token window
      refuses the next request) — before the fix the accounting phase re-read the store and the
@@ -443,16 +444,24 @@ def main():
               and "r-nowarn-probe" in log_after_write
               and "RAW client key" in log_after_write,
               f"POST={st_noreload}, new log: {log_after_write.strip()[-160:] or '<nothing>'}")
-        # ...and the MASK form warns too (its own cost: the mask is not a unique identity).
+        # ...and the MASK form must now be SILENT (decision D-15②, 2026-10-08). It used to warn that
+        # "any other key whose mask is that same string shares this window", which was true while the
+        # window was `(role_id, mask(key))`. The window is keyed by a digest of the raw key now, so two
+        # keys that share a mask have two windows — the warning's condition cannot occur and it was
+        # deleted with its premise. Asserting the ABSENCE is what keeps it from being re-added by
+        # someone reading an old note.
         before_mask = len(open(os.path.join(DIR, "node.log"), errors="replace").read())
-        admin("POST", "/limit-roles",
-              role("r-maskform-probe", matching_key="sk***************ed", matching_tenant="t1"))
+        st_mask = admin("POST", "/limit-roles",
+                        role("r-maskform-probe", matching_key="sk***************ed", matching_tenant="t1"))[0]
         log_after_mask = open(os.path.join(DIR, "node.log"), errors="replace").read()[before_mask:]
         mask_line = next((l for l in log_after_mask.splitlines()
                           if "r-maskform-probe" in l and "MASKED form" in l), None)
-        announce("L9 the mask-form warning", (mask_line or "<none>")[:150])
-        check("L9: ...and the MASK form is named as a shared identity",
-              mask_line is not None, f"warning: {mask_line[:120] if mask_line else '<none found>'}")
+        announce("L9 the mask form's log (must be empty)",
+                 (mask_line or "<nothing>")[:150])
+        check("L9: the MASK form is NOT warned about any more — its shared-window cost is FIXED "
+              "(D-15② keys the window by a digest of the key, not by the mask)",
+              st_mask in (200, 201) and mask_line is None,
+              f"POST={st_mask}, log: {mask_line[:120] if mask_line else '<nothing, as expected>'}")
         admin("DELETE", "/limit-roles/r-nowarn-probe")
         admin("DELETE", "/limit-roles/r-maskform-probe")
         admin("POST", "/reload", {})
