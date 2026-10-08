@@ -1118,6 +1118,16 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **存储格式断代：不适用**（用户裁定 2026-10-07：**本仓没有既有部署**）。上游 v0.3.0 把 `FORMAT_VERSION` 1→2、旧 data dir **fail-stop 且无就地迁移**——这只对真实部署成立；我们的测试与演练都新建目录，本地 compose 栈是可弃的 dev 容器（需要时重建即可，不写迁移 runbook，因为没有人需要执行它）。
 
+**修复后 CI 上唯一一次红是"选举时限超 40 毫秒"（2026-10-07，`c1e6f7a` 纯文档提交的运行）**：
+
+```
+FAIL  gate 1: a new leader was elected within 3s  — 3.04s
+（其余全绿：gate 4 三节点同配置 ✓、gate 5「幸存者仍服务其物化配置 — 4 providers」✓、
+  gate 5「数据面真实请求 — HTTP 200」✓、发布与 503 各腿 ✓）
+```
+
+**两件事因此确定**：① **丢失形态在修复后唯一一次红里完全没有出现**（这正是排序针对的那条）；② 红的是**品质指标**而非缺陷——3.04 s 是超了 40 毫秒。**用户裁定（2026-10-07）：「3 s 是品质承诺，不用过于严苛」** ⇒ 产品承诺保留（仍写 3 s 为目标），但**演练不应因这种毫秒级超出判红**。落地方式：`integration/test_arachne_control_plane.py` 新增 `FAILOVER_ALLOWANCE_S = 5.0`（演练容忍值），断言消息改为「within 5s (target 3s)」，并在超出目标但在容忍内时明确打印「over the ADR's 3 s target, inside the drill's allowance」。它仍能抓住这道门存在的意义：旧租约世界那种 17 s 的晋升、以及永不选出 leader。（**验证状态如实标注**：改动本身经 `py_compile` 与阅读确认；端到端复跑撞上了正在后台运行的本地门禁——它的 `build the binary under test` 条目用 `--features server` 重链了二进制，即本仓文档记录的 relink 陷阱——门禁结束后补跑。）
+
 **承压 A/B（`.acceptance/ab-index-order.sh`，修复在位，空闲 vs 13/14 核被占满，各 5 次）**：
 
 ```
