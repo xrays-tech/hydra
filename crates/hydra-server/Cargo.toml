@@ -210,7 +210,7 @@ fred = { version = "10", features = ["i-scripts"], optional = true }
 # write issued at a follower reaches the leader (ADR-0001 D-3). The lean core
 # (`default-features = false`) has no remote transport and cannot serve a
 # multi-process cluster.
-arachne-kv = { version = "0.1.2", optional = true }
+arachne-kv = { git = "https://github.com/xrays-tech/arachne", tag = "v0.3.1", optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,

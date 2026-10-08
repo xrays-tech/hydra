@@ -90,6 +90,23 @@ fn is_tree_name(raw: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Is the head we just read OLDER than the tree this node already applied?
+///
+/// The log index comes from `get_stale_with_index` (upstream v0.3.0; the ask is in
+/// `dev-docs/upstream/arachne-kv-commit-index-request.md`). Upstream assigns it in log order and
+/// guarantees it is monotone per key, so `head@index` with `index < applied` is a STALE READ — the read
+/// is documented "not monotone (propsol N1)" — and applying it would REPLACE this node's database and
+/// snapshot, rolling back over writes it already published. Later publishes then build from the
+/// rolled-back database, which is how the loss becomes permanent in the head (ADR-0001 plan, "观察").
+///
+/// `None` on either side means "no order to compare": no head has ever been published, or this node has
+/// not applied anything yet. Both are the `>=` side of the rule, deliberately — refusing to materialize
+/// on a missing index would make an upstream that reports no index a node that never converges.
+#[must_use]
+pub fn is_stale_generation(index: Option<u64>, applied: Option<u64>) -> bool {
+    matches!((index, applied), (Some(i), Some(a)) if i < a)
+}
+
 /// The per-node materialization gate.
 ///
 /// Holds only what the decision needs: which tree this node last **successfully**

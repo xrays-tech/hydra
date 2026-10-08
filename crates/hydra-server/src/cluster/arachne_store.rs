@@ -227,6 +227,32 @@ impl ArachneConfigStore {
         Ok(ReadOutcome::Tree(Arc::new(tree)))
     }
 
+    /// The head and the **log index** of the entry that wrote it: the tree's GENERATION.
+    ///
+    /// `get_stale_with_index` (upstream v0.3.0, asked for in
+    /// `dev-docs/upstream/arachne-kv-commit-index-request.md`) is what makes ordering possible without a
+    /// quorum: the value it returns may be arbitrarily old, but it now says HOW old, and the index is
+    /// assigned by the consensus layer in log order, so it is comparable across nodes.
+    ///
+    /// Upstream's constraints, honoured here: the index belongs to THIS key's origin, so entity keys are
+    /// never cross-compared against the head's; and the `>=` rule is only sound for keys with no DELETE
+    /// in their history — our tree is replace-by-put and never deletes an entity, which is what makes
+    /// `ctl/head` a legal ordered key.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the cluster cannot answer.
+    pub async fn current_head_with_index(&self) -> Result<Option<(String, u64)>, StoreError> {
+        match self
+            .handle
+            .get_stale_with_index(ctl_head().as_bytes())
+            .await
+        {
+            Ok(Some((v, index))) => Ok(Some((String::from_utf8_lossy(&v).into_owned(), index))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
     /// The head's value, or `None` when nothing was ever published.
     ///
     /// **Read with `get_stale`, and that is a known, measured hazard — not an oversight.** The

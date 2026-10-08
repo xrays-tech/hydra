@@ -470,3 +470,37 @@ async fn a_write_that_cannot_be_published_is_refused_rather_than_accepted() {
 
     shutdown(nodes).await;
 }
+
+/// The ordering predicate, deterministically — no cluster, no timing.
+///
+/// A head whose log index is LOWER than the generation this node has applied is a STALE READ: the read
+/// upstream provides is "arbitrarily old (N1)", so it can answer with an older head, and applying that
+/// would REPLACE this node's database and snapshot with an older tree — rolling back over writes it had
+/// already published, which later publishes then propagate into the head as a permanent loss
+/// (ADR-0001 plan, "观察"). Falsification: delete the `<` in `is_stale_generation` and the first
+/// assertion below goes red.
+#[test]
+fn a_lower_log_index_is_a_stale_generation_and_is_refused() {
+    use hydra_server::cluster::arachne_materialize::is_stale_generation;
+
+    assert!(
+        is_stale_generation(Some(4), Some(5)),
+        "an older index must be refused"
+    );
+    assert!(
+        !is_stale_generation(Some(5), Some(5)),
+        "the same generation is not older — re-materializing it is a no-op the gate handles"
+    );
+    assert!(
+        !is_stale_generation(Some(6), Some(5)),
+        "a newer index applies"
+    );
+    assert!(
+        !is_stale_generation(None, Some(5)),
+        "an upstream that reports no index must not freeze a node: None is not an order"
+    );
+    assert!(
+        !is_stale_generation(Some(5), None),
+        "a node that has applied nothing has no generation to be older than"
+    );
+}

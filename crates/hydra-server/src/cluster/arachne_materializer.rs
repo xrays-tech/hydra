@@ -105,6 +105,12 @@ pub struct Materializer {
     /// Needed to open the sealed fidelity rows. Held rather than passed per call so a
     /// materializer cannot be driven without the key that unseals its own replica.
     key_provider: Arc<dyn crate::crypto::KeyProvider>,
+    /// The log index of the head this node last APPLIED — the generation ordering compares against.
+    ///
+    /// Held here rather than in the gate so the gate's decision signature (and its eleven unit tests)
+    /// stay unchanged: the index is an input to "should I even ask the gate?", which is the
+    /// materializer's question, not the gate's.
+    applied_index: Option<u64>,
 }
 
 impl Materializer {
@@ -121,6 +127,9 @@ impl Materializer {
             gate: MaterializeGate::new(),
             target,
             key_provider,
+            // Nothing applied yet: the first tree this node materializes has no predecessor to be
+            // older than.
+            applied_index: None,
         }
     }
 
@@ -143,13 +152,30 @@ impl Materializer {
     /// failure is recorded in the gate (which starts a backoff) and does NOT move the
     /// watermark.
     pub async fn converge(&mut self) -> Result<Converged, MaterializeError> {
-        let head = self
-            .store
-            .current_hash()
-            .await
-            .map_err(|e| MaterializeError::Head {
-                reason: e.to_string(),
-            })?;
+        // The head WITH its log index: the value may be arbitrarily stale (upstream: "arbitrary old,
+        // N1"), but the index says how old, which is the ordering this node needs before it REPLACES
+        // its own database and snapshot with the tree that value names.
+        let (head, head_index) = match self.store.current_head_with_index().await {
+            Ok(Some((hash, index))) => (Some(hash), Some(index)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                return Err(MaterializeError::Head {
+                    reason: e.to_string(),
+                })
+            }
+        };
+        if crate::cluster::arachne_materialize::is_stale_generation(head_index, self.applied_index)
+        {
+            // A stale read answered with an older tree. Keep serving what we have; the next tick reads
+            // again, and a fresher answer is applied then.
+            tracing::debug!(
+                head = head.as_deref().unwrap_or("-"),
+                index = head_index.unwrap_or(0),
+                applied = self.applied_index.unwrap_or(0),
+                "head read is OLDER than the applied generation; refusing to roll back"
+            );
+            return Ok(Converged::NoChange);
+        }
 
         let plan = self
             .gate
@@ -193,6 +219,7 @@ impl Materializer {
                                 });
                             }
                             self.gate.succeeded(&hash);
+                            self.applied_index = head_index;
                             tracing::info!(hash = %hash, "config materialized");
                             Ok(Converged::Applied { hash })
                         }
