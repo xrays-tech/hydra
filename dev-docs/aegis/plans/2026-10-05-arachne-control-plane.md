@@ -1089,6 +1089,9 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **证据强度如实标注**：空闲 5/5 **在修复前也是 5/5** ⇒ 它是回归检查；真正的鉴别条件是**承压**（改动前约 1/3 失败、"①那条错修法"空闲都 4/5 失败）与**端到端强制陈旧读**。`is_stale_generation` 有确定性单测（旧 index 必拒；falsification＝删掉 `<` 即红），端到端强制那条**仍缺**；承压 A/B 见 `.acceptance/ab-index-order.sh`。
 
+**端到端"强制陈旧读"的尝试与自查（2026-10-07，**未落地**）**：写了一版 e2e 测试——真实集群 + 真实 `get_stale_with_index` + 真实拒绝分支，只注入"已应用代次更高"这个前提（`#[cfg(test)] force_applied_index`）。**反向证伪把它否掉了**：把判定函数强制为 false 之后，**该测试依然通过**。原因是我的注入不够：head 的**值没变**（仍是那棵已物化的树），所以 `converge` 是经 gate 的"读到的就是已物化的那个 hash"路径返回 `NoChange`，**从未走到 `is_stale_generation`**。而真实集群里 `put` **只会把索引推高**（上游正是这么保证单调的）⇒ 用真实 store **无法**产出"不同的、更旧的哈希 + 更低的索引"这一组合——那只能由**滞后的本地副本**产生。
+⇒ 结论：**真正的 e2e 强制需要给"读 head"加一个接缝**（注入 `(hash, index)` 对），而不是注入 `applied_index`；这是一个小规模的生产代码重构（把 head 读抽成可替换的窄 trait，`Materializer::new` 仍接收具体 store、内部包装，测试用 `#[cfg(test)]` 构造器换入脚本化的读序列）。**测试已撤掉**（一个恒绿的测试比没有测试更糟），接缝的形状写在这里备下一次。
+
 **存储格式断代：不适用**（用户裁定 2026-10-07：**本仓没有既有部署**）。上游 v0.3.0 把 `FORMAT_VERSION` 1→2、旧 data dir **fail-stop 且无就地迁移**——这只对真实部署成立；我们的测试与演练都新建目录，本地 compose 栈是可弃的 dev 容器（需要时重建即可，不写迁移 runbook，因为没有人需要执行它）。
 
 **承压 A/B（`.acceptance/ab-index-order.sh`，修复在位，空闲 vs 13/14 核被占满，各 5 次）**：
