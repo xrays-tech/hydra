@@ -98,8 +98,36 @@ pub trait MaterializeTarget: Send + Sync {
 }
 
 /// The per-node loop: gate + store + target.
+/// Where the materializer reads the head FROM — one method, so the ordering can be tested with a
+/// scripted sequence.
+///
+/// Why a seam is needed at all: the refusal branch triggers on "an older hash at a LOWER index", and no
+/// real cluster can produce that combination — `put` only ever raises a key's index (upstream's
+/// monotonicity guarantee, which is the whole point of the ordering). Only a LAGGING REPLICA does, so a
+/// test has to inject the sequence. The production path is untouched: `Materializer::new` wraps the
+/// concrete store, which is what every caller passes today.
+#[async_trait::async_trait]
+pub trait HeadSource: Send + Sync {
+    /// The head value and the log index of the entry that wrote it.
+    ///
+    /// # Errors
+    /// A reason the head could not be read.
+    async fn head_with_index(&self) -> Result<Option<(String, u64)>, String>;
+}
+
+#[async_trait::async_trait]
+impl HeadSource for ArachneConfigStore {
+    async fn head_with_index(&self) -> Result<Option<(String, u64)>, String> {
+        self.current_head_with_index()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 pub struct Materializer {
     store: ArachneConfigStore,
+    /// The head read, behind the seam above.
+    head_source: Arc<dyn HeadSource>,
     gate: MaterializeGate,
     target: Arc<dyn MaterializeTarget>,
     /// Needed to open the sealed fidelity rows. Held rather than passed per call so a
@@ -123,12 +151,34 @@ impl Materializer {
         key_provider: Arc<dyn crate::crypto::KeyProvider>,
     ) -> Self {
         Self {
+            // Built from the same store the caller handed us, so every existing call site keeps the
+            // production behaviour it had.
+            head_source: Arc::new(store.clone()),
             store,
             gate: MaterializeGate::new(),
             target,
             key_provider,
             // Nothing applied yet: the first tree this node materializes has no predecessor to be
             // older than.
+            applied_index: None,
+        }
+    }
+
+    /// Test-only: build over a scripted head read, with the real store still doing the tree read and
+    /// the real target still receiving the apply — only the (hash, index) sequence is injected.
+    #[cfg(test)]
+    pub(crate) fn with_head_source(
+        head_source: Arc<dyn HeadSource>,
+        store: ArachneConfigStore,
+        target: Arc<dyn MaterializeTarget>,
+        key_provider: Arc<dyn crate::crypto::KeyProvider>,
+    ) -> Self {
+        Self {
+            store,
+            head_source,
+            gate: MaterializeGate::new(),
+            target,
+            key_provider,
             applied_index: None,
         }
     }
@@ -155,14 +205,10 @@ impl Materializer {
         // The head WITH its log index: the value may be arbitrarily stale (upstream: "arbitrary old,
         // N1"), but the index says how old, which is the ordering this node needs before it REPLACES
         // its own database and snapshot with the tree that value names.
-        let (head, head_index) = match self.store.current_head_with_index().await {
+        let (head, head_index) = match self.head_source.head_with_index().await {
             Ok(Some((hash, index))) => (Some(hash), Some(index)),
             Ok(None) => (None, None),
-            Err(e) => {
-                return Err(MaterializeError::Head {
-                    reason: e.to_string(),
-                })
-            }
+            Err(reason) => return Err(MaterializeError::Head { reason }),
         };
         if crate::cluster::arachne_materialize::is_stale_generation(head_index, self.applied_index)
         {
@@ -429,6 +475,9 @@ mod tests {
     /// sharing a port would fail with "Address already in use" — which is how the fifth one below
     /// was caught when the real-target test first borrowed `PORTS[3]`.
     const PORTS: [u16; 7] = [18401, 18402, 18403, 18404, 18405, 18406, 18407];
+    /// Disjoint from all seven: these tests run CONCURRENTLY and a raft member must bind the
+    /// address its peers were told about (reusing a port fails with "Address already in use").
+    const PORT_STALE_SEAM: u16 = 18432;
 
     fn data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hydra-mat-{tag}-{}", std::process::id()));
@@ -1085,6 +1134,95 @@ mod tests {
             ctl.current_hash().await.expect("read head"),
             None,
             "nothing may be published when the tree cannot be encoded"
+        );
+    }
+
+    /// A head read that hands out a scripted sequence — the ONE thing a real cluster cannot produce.
+    struct ScriptedHead {
+        seq: Mutex<std::collections::VecDeque<(String, u64)>>,
+        last: Mutex<Option<(String, u64)>>,
+    }
+
+    impl ScriptedHead {
+        fn new(seq: Vec<(String, u64)>) -> Self {
+            Self {
+                seq: Mutex::new(seq.into()),
+                last: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HeadSource for ScriptedHead {
+        async fn head_with_index(&self) -> Result<Option<(String, u64)>, String> {
+            if let Some(next) = self.seq.lock().expect("lock").pop_front() {
+                *self.last.lock().expect("lock") = Some(next.clone());
+                return Ok(Some(next));
+            }
+            // Exhausted: keep answering the last value, so a stray extra converge cannot turn the test
+            // into a different scenario.
+            Ok(self.last.lock().expect("lock").clone())
+        }
+    }
+
+    /// END-TO-END causal proof for the ordering: an OLDER hash at a LOWER index is refused, and the node
+    /// keeps serving what it applied.
+    ///
+    /// Real here: both trees (published to a real cluster), the store's tree read, the apply, the
+    /// predicate, the refusal, and the state that survives it. Injected: the two indices in the scripted
+    /// head read — because a real cluster CANNOT produce this pair (`put` only ever raises a key's index;
+    /// that monotonicity is the guarantee the ordering rides on), so only a lagging replica does, and a
+    /// test has to stand in for it.
+    ///
+    /// Falsification: force `is_stale_generation` to `false` and the refusal disappears — the older tree
+    /// is applied, `applied_count` becomes 2 and the served hash changes, so both assertions below fail.
+    /// (Measured, not assumed: an earlier version of this test injected only the applied generation and
+    /// stayed GREEN under that falsification, which is why the seam exists.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_hash_at_a_lower_index_is_refused_and_nothing_is_reapplied() {
+        let node = node("stale-seam", PORT_STALE_SEAM).await;
+        wait_writable(&node).await;
+        let store = ArachneConfigStore::new(node.handle.clone());
+
+        // Two REAL trees, published the normal way.
+        let first = publish(&store, &config(&[("t1", "d1")])).await;
+        let second = publish(&store, &config(&[("t1", "d1"), ("t2", "d2")])).await;
+        assert_ne!(first, second, "fixture: two different trees");
+
+        // The script: apply `second` at index 10, then read `first` at index 5 — a stale replica answering
+        // the head read with an older tree.
+        let head = Arc::new(ScriptedHead::new(vec![
+            (second.clone(), 10),
+            (first.clone(), 5),
+        ]));
+        let target = Arc::new(RecordingTarget::default());
+        let mut mat =
+            Materializer::with_head_source(head, store.clone(), target.clone(), Arc::new(kp()));
+
+        assert_eq!(
+            mat.converge().await.expect("first converge"),
+            Converged::Applied {
+                hash: second.clone()
+            },
+            "the newer tree is materialized first"
+        );
+        assert_eq!(target.applied_count(), 1);
+
+        assert_eq!(
+            mat.converge().await.expect("a stale head is not an error"),
+            Converged::NoChange,
+            "an older tree at a LOWER index must be refused: applying it would replace this node's \
+             database and snapshot with an older config"
+        );
+        assert_eq!(
+            target.applied_count(),
+            1,
+            "and nothing is applied a second time"
+        );
+        assert_eq!(
+            mat.materialized(),
+            Some(second.as_str()),
+            "the node keeps serving the tree it had"
         );
     }
 }
