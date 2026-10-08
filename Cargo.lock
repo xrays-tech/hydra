@@ -172,7 +172,8 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "arachne-kv"
 version = "0.3.1"
-source = "git+https://github.com/xrays-tech/arachne?tag=v0.3.1#80934ade5927d111d92a010f20d9cc19aeaf1cb3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee40d8c26cd8ade6445a330a9d69e896ea4cad747cf3efb2159ecb93e018a347"
 dependencies = [
  "arachne-kv-seam",
  "arachne-kv-transport-tonic",
@@ -189,12 +190,14 @@ dependencies = [
 [[package]]
 name = "arachne-kv-seam"
 version = "0.3.1"
-source = "git+https://github.com/xrays-tech/arachne?tag=v0.3.1#80934ade5927d111d92a010f20d9cc19aeaf1cb3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b051684f54676e01f8c934763592918a1b81401936d9fa80b5ab4fdb0f4182c"
 
 [[package]]
 name = "arachne-kv-transport-tonic"
 version = "0.3.1"
-source = "git+https://github.com/xrays-tech/arachne?tag=v0.3.1#80934ade5927d111d92a010f20d9cc19aeaf1cb3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b02bfb3cfcf0c6052e48b00204b85e02cfceff6f8a304268f13bafb6e2c4c541"
 dependencies = [
  "arachne-kv-seam",
  "http",
@@ -982,7 +985,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1856,7 +1859,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2966,7 +2969,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3304,7 +3307,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3948,10 +3951,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3960,7 +3963,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

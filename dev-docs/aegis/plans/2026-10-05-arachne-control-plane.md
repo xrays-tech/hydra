@@ -1081,11 +1081,13 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 **上游交付**：`Handle::get_stale_with_index(&key) -> Result<Option<(Vec<u8>, u64)>>`（v0.3.0/v0.3.1）。index 是**写下该值的条目的日志索引**，由共识层按日志序分配 ⇒ **跨节点可比**、**按 key 单调**、**与值原子读出**（即便陈旧也自洽）；公开 API 里不出现 0。上游附带三条约束：实体键的 origin **不得**与 head 的交叉比较；`>=` 规则**只对无删除历史的键**成立（删除后陈旧节点仍可能返回删除前的值，而 `None` 不带索引）；`get_stale_with_index` **仍是陈旧读**，只是现在告诉你多旧。
 
 **因此落地的东西比原设计小得多**（三处，均不涉及格式改动）：
-* `Cargo.toml`：`arachne-kv` 0.1.2 → **`github.com/xrays-tech/arachne` 的 v0.3.1 tag**（crates.io 上只有 0.1.0/0.1.1/0.1.2/0.2.0——实测；tag 钉到 commit `80934ade`，记录在 `Cargo.lock`）；
+* `Cargo.toml`：`arachne-kv` 0.1.2 → **0.3.1**。取用方式先经 git tag、后改回 crates.io：当时实时拉稀疏索引只有 0.1.0/0.1.1/0.1.2/0.2.0，于是按 `tag = "v0.3.1"` 钉到 commit `80934ade`；**同日上游发布后**（他们的更正：四个 crate 都发了），复查索引已见 **0.3.1**，于是切回 `version = "0.3"`（`cargo update` 一次即可；git tag 那条路仍然有效，只是不再是唯一来源）。切换后全量 lib **303/303** 通过；
 * `ArachneConfigStore::current_head_with_index()`：head + 其代次。上游三条约束写在注释里（尤其"我们的树 replace-by-put、从不删实体 ⇒ `ctl/head` 是合法有序键"）；
 * `is_stale_generation(index, applied)` **纯函数** + 物化器**读到更低代次就拒绝、保持当前服务内容**；`applied_index` 放在 `Materializer` 而非 gate ⇒ **gate 的 11 个单测一行未动**。
 
 **验证**（全部实测）：对 0.3.1 **零改动编译通过**；`--lib` **303/303**（带 `HYDRA_TEST_REDIS_URL`；events 那几个失败是没设 Redis 的假警报）；`arachne_three_nodes` **5/5**（含新判据测试）、`arachne_store` **6/6**；**空闲验收演练 5/5 通过**；上游点名的三条集群演练（`test_cluster_limits` / `test_auth_cache_layers` / `test_tenant_write_publish_failure`）**全部 PASSED**；**CI `da622f4` 8/8 全绿**——其中 `live-deps`（承载那三条原本间歇的演练）在**修复前的 `a697bf0` 是红的**，在此提交转绿（一对真实的 before/after）。
+
+**端到端"强制陈旧读"的尝试：被它自己的 falsification 否掉（测试已撤，接缝已命名）**。写了一版 e2e 测试——真实集群 + 真实 `get_stale_with_index` + 真实拒绝分支，只注入"已应用代次更高"这个前提（`#[cfg(test)] force_applied_index`）。**把判定函数强制为 false 后，该测试依然通过** ⇒ 它在测量空集：我只注入了代次，**head 的值没变**（仍是那棵已物化的树），于是 `converge` 走的是 gate 的"读到的就是我服务的那棵"路径返回 `NoChange`，**从未走到 `is_stale_generation`**。而真实集群里 `put` **只会把索引推高**（上游的单调性保证）⇒ 用真实 store 产不出"**不同的、更旧的哈希 + 更低的索引**"这一组合——那只能来自**滞后的本地副本**。按"恒绿的测试比没有测试更糟"撤掉，并把真正需要的接缝写下来：**给"读 head"加一个可替换的窄接缝**（测试注入脚本化的 `(hash, index)` 序列）；另一种更省的选择是给拒绝分支加一个**指标**（生产里也有用：它正是"刚刚拒绝了一次陈旧读"的信号），测试断言该指标被触发——但前提仍是能制造出更低索引，所以接缝仍是根本。
 
 **证据强度如实标注**：空闲 5/5 **在修复前也是 5/5** ⇒ 它是回归检查；真正的鉴别条件是**承压**（改动前约 1/3 失败、"①那条错修法"空闲都 4/5 失败）与**端到端强制陈旧读**。`is_stale_generation` 有确定性单测（旧 index 必拒；falsification＝删掉 `<` 即红），端到端强制那条**仍缺**；承压 A/B 见 `.acceptance/ab-index-order.sh`。
 
