@@ -1075,6 +1075,21 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **因此剩下的是取舍，而不是实现细节**（供裁定）：
 * **(甲) 向上游要一个原语**：让 `put`（或读）带出提交索引/日志位置，②就能用一次性、廉价的序，且不需要任何 quorum 读。这是唯一能让 ② 又正确又不扰动的路径。**已裁定并落档**：请求正文在 `dev-docs/upstream/arachne-kv-commit-index-request.md` —— 英文、可直接粘贴给上游，含上面两次实测、四条被排除的绕行（用 get / 用陈旧 head 推序 / 记住见过的值 / 读两次一致）、具体签名（`put -> Result<Index>` 或 `get_stale_with_index`），以及"只要一个原语就够、不要更强的读语义"的 non-goals。
+
+#### ② 已交付并验证（2026-10-07，commit `da622f4`）——上游给了索引，方案比原设计小得多
+
+**上游交付**：`Handle::get_stale_with_index(&key) -> Result<Option<(Vec<u8>, u64)>>`（v0.3.0/v0.3.1）。index 是**写下该值的条目的日志索引**，由共识层按日志序分配 ⇒ **跨节点可比**、**按 key 单调**、**与值原子读出**（即便陈旧也自洽）；公开 API 里不出现 0。上游附带三条约束：实体键的 origin **不得**与 head 的交叉比较；`>=` 规则**只对无删除历史的键**成立（删除后陈旧节点仍可能返回删除前的值，而 `None` 不带索引）；`get_stale_with_index` **仍是陈旧读**，只是现在告诉你多旧。
+
+**因此落地的东西比原设计小得多**（三处，均不涉及格式改动）：
+* `Cargo.toml`：`arachne-kv` 0.1.2 → **`github.com/xrays-tech/arachne` 的 v0.3.1 tag**（crates.io 上只有 0.1.0/0.1.1/0.1.2/0.2.0——实测；tag 钉到 commit `80934ade`，记录在 `Cargo.lock`）；
+* `ArachneConfigStore::current_head_with_index()`：head + 其代次。上游三条约束写在注释里（尤其"我们的树 replace-by-put、从不删实体 ⇒ `ctl/head` 是合法有序键"）；
+* `is_stale_generation(index, applied)` **纯函数** + 物化器**读到更低代次就拒绝、保持当前服务内容**；`applied_index` 放在 `Materializer` 而非 gate ⇒ **gate 的 11 个单测一行未动**。
+
+**验证**（全部实测）：对 0.3.1 **零改动编译通过**；`--lib` **303/303**（带 `HYDRA_TEST_REDIS_URL`；events 那几个失败是没设 Redis 的假警报）；`arachne_three_nodes` **5/5**（含新判据测试）、`arachne_store` **6/6**；**空闲验收演练 5/5 通过**；上游点名的三条集群演练（`test_cluster_limits` / `test_auth_cache_layers` / `test_tenant_write_publish_failure`）**全部 PASSED**；**CI `da622f4` 8/8 全绿**——其中 `live-deps`（承载那三条原本间歇的演练）在**修复前的 `a697bf0` 是红的**，在此提交转绿（一对真实的 before/after）。
+
+**证据强度如实标注**：空闲 5/5 **在修复前也是 5/5** ⇒ 它是回归检查；真正的鉴别条件是**承压**（改动前约 1/3 失败、"①那条错修法"空闲都 4/5 失败）与**端到端强制陈旧读**。`is_stale_generation` 有确定性单测（旧 index 必拒；falsification＝删掉 `<` 即红），端到端强制那条**仍缺**；承压 A/B 见 `.acceptance/ab-index-order.sh`。
+
+**存储格式断代：不适用**（用户裁定 2026-10-07：**本仓没有既有部署**）。上游 v0.3.0 把 `FORMAT_VERSION` 1→2、旧 data dir **fail-stop 且无就地迁移**——这只对真实部署成立；我们的测试与演练都新建目录，本地 compose 栈是可弃的 dev 容器（需要时重建即可，不写迁移 runbook，因为没有人需要执行它）。
 * **(乙) 维持现状（已交付的部分）**：hazard 与两次实测都写在代码注释与本节；写路径在"本地提交但发布失败"时**本来就大声回 503 `config_not_published`**，而"两个库一致缺一行"这种静默形态目前只在 CI/承压机器上出现（本地空闲 0/5、有负载约 1/3，门会变）。
 * **(丙) 物化侧不做顺序、改做"破坏性更小"的应用**：**已否**——树是权威，缺失的实体就是"被删掉的配置"，改成合并会让删除永远生效不了。
 
