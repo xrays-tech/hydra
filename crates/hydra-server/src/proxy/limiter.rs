@@ -49,7 +49,10 @@ pub trait Limiter: Send + Sync {
     /// and NOTHING ever read it back, so a token quota was documented and
     /// configurable but never enforced on any request. Unlike the count gate,
     /// this is advisory-by-one-request (the window is only known after the
-    /// response), which is exactly the design's next-request semantics.
+    /// response), which is exactly the design's next-request semantics — with
+    /// the precision that the charge lands in the `logging` phase, so the
+    /// refusal applies to requests arriving AFTER it, not to a follow-up that
+    /// overtakes the write.
     fn check_tokens<'a>(
         &'a self,
         roles: &'a [LimitRole],

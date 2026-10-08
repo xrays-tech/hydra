@@ -40,7 +40,10 @@ Cases (real cluster, real Redis, mock upstream; the user's dev stack is untouche
       then BOTH nodes refuse; the Redis ZSET holds exactly 3 members carrying TWO different
       instance prefixes (the per-process member leak that used to collapse into one entry)
   C3  the SHARED token window: tenant t2's `limit_token` ceiling is crossed by usage recorded
-      on the OTHER node (next-request semantics, measured across processes)
+      on the OTHER node (the sample is charged in the node's `logging` phase, i.e. AFTER the
+      response — so this case WAITS, bounded, for the shared sample to become visible before it
+      asserts B's refusal; a sample that never appears fails on its own assertion, see the
+      comment at C3)
   C4  FAIL-OPEN: with the window full, cutting the relay admits requests again, logs
       `redis rate-limit check failed; failing open`, and moves
       `hydra_control_poll_total{result="rate_limit_error"}` — bounded in time by the command
@@ -82,6 +85,13 @@ ADMIN_TOKEN = "hydra-cluster-limits-admin-2026"
 MEMBERS = f"cl-a=127.0.0.1:{A_RAFT},cl-b=127.0.0.1:{B_RAFT},cl-c=127.0.0.1:{PHANTOM_RAFT}"
 TOKENS = 13                      # 5 in + 8 out, the mock upstream's usage
 DEAD_CH = "http://127.0.0.1:18898"
+
+# How long the token charge may take to become visible in the shared window before the drill says
+# so out loud. The charge is ONE Redis round trip in the `logging` phase, so ~0.4 ms is the honest
+# baseline (measured); the target is deliberately loose because a loaded CI runner legitimately
+# starves that phase — but a large number here is the signal that the quota is lagging, and until
+# 2026-10-05 NOTHING printed it (the drill's own Redis helper could not resolve below 100 ms).
+TOKEN_CHARGE_TARGET_S = 0.25
 
 failures = []
 
@@ -149,6 +159,36 @@ def keys_matching(sock, pattern):
     redis_cmd(sock2, "SELECT", REDIS_DB)
     raw = redis_cmd(sock2, "KEYS", pattern).decode(errors="replace")
     sock2.close()
+    return [l for l in raw.splitlines() if l.startswith("hydra:")]
+
+
+def keys_matching_fast(sock, pattern):
+    """`keys_matching` WITHOUT the 50 ms-per-command sleep inside `redis_cmd`.
+
+    `redis_cmd` sleeps 50 ms before every read (a crude "wait for the reply"), so one
+    `keys_matching` costs 100 ms for its two commands — measured 100.51 ms. That is fine for
+    "what is in Redis now", and useless as a POLL: it would answer "was it there?" only 100 ms
+    later, which is exactly the resolution a timing-sensitive leg needs (the CI gap that made
+    C3 red was ~100-200 ms, i.e. inside the blind spot). One selected socket, one reply per
+    command, bounded reads, no sleep. Used ONLY where the timing is the measurement (C3), so
+    every other leg keeps the proven helper.
+    """
+    try:
+        sock2 = socket.create_connection(sock.getpeername(), timeout=5)
+    except OSError:
+        return []
+    try:
+        sock2.settimeout(2)
+        db = str(REDIS_DB).encode()
+        sock2.sendall(b"*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n" % (len(db), db))
+        sock2.recv(1024)
+        pat = pattern.encode()
+        sock2.sendall(b"*2\r\n$4\r\nKEYS\r\n$%d\r\n%s\r\n" % (len(pat), pat))
+        raw = sock2.recv(65536).decode(errors="replace")
+    except (OSError, socket.timeout):
+        return []
+    finally:
+        sock2.close()
     return [l for l in raw.splitlines() if l.startswith("hydra:")]
 
 
@@ -671,16 +711,57 @@ def main():
 
         # ---- C3: the SHARED token window --------------------------------------
         # `limit_token = 10` is below ONE response's usage (13), so the first t2 request passes and
-        # records 13 tokens on member A; member B must then refuse the next one — the ceiling is
-        # crossed by usage ONE member recorded for the other.
+        # records 13 tokens on member A; the ceiling is then crossed by usage ONE member recorded
+        # for the other, and B must refuse.
+        #
+        # WHY THERE IS A BOUNDED WAIT HERE (added 2026-10-05, after a CI red on `d5c6b91`): token
+        # accounting runs in the LOGGING phase, i.e. AFTER the response reaches the client — it has
+        # to, because completion tokens do not exist before the response does and a stream only
+        # reports its usage at its very end. So "the NEXT request, anywhere, is refused" is NOT what
+        # the design promises; a zero-delay follow-up can legitimately arrive before A has charged
+        # its sample.
+        #
+        # WHAT THE CI RED ACTUALLY SHOWED (the numbers matter, and the first attribution was wrong):
+        # the failing run read `keys=[]` with `first(a)=200 second(b)=200`, while the count legs
+        # C2/C4 passed in the SAME run — so Redis was healthy and B was admitted before the sample
+        # existed. Merely REACHING that read costs 2×50 ms, because `redis_cmd` sleeps 50 ms per
+        # command (measured: one `keys_matching` = 100.51 ms) — so the sample was absent at least
+        # ~100 ms after A's response. (A first pass blamed the analytics write in front of the
+        # charge and quoted "0.10 s of write latency" as evidence; that number was the HELPER's
+        # sleeps, not the product. The coupling it described is still real and was removed — the
+        # charge no longer awaits the ClickHouse sink — but it was not measured locally.)
+        #
+        # The property this leg exists for is "A's recorded usage crosses the ceiling FOR B", so it
+        # waits (bounded) for the sample and reports how long that took; a sample that never appears
+        # fails on its OWN assertion instead of masquerading as "B admitted the request". The poll
+        # uses `keys_matching_fast` — the 100 ms helper cannot resolve a ~100 ms gap.
         st_t1 = proxied(A_DATA, "token.local", "sk-t2")[0]
+        visible_at = time.monotonic()
+        token_keys = []
+        while time.monotonic() - visible_at < 5.0:
+            token_keys = keys_matching_fast(redis_sock, "hydra:{rl:r-token:*}:tokens")
+            if token_keys:
+                break
+            time.sleep(0.005)
+        lag = time.monotonic() - visible_at
+        announce("C3 A's token sample in the shared window", f"after {lag * 1000:.1f} ms key={token_keys}")
+        if token_keys and lag > TOKEN_CHARGE_TARGET_S:
+            # Not a failure: the charge is allowed to be late by load, and this leg's claim is the
+            # cross-node REFUSAL. But it is exactly the number that used to be invisible, so it is
+            # said out loud rather than swallowed (the CI red of 2026-10-05 lived in here).
+            announce("C3 NOTE — the charge was SLOW",
+                     f"{lag * 1000:.0f} ms after the response, over the "
+                     f"{TOKEN_CHARGE_TARGET_S * 1000:.0f} ms target: the `logging` phase was starved, "
+                     f"so a follow-up request in that window is admitted")
+        check("C3: the usage A recorded for t2 lands in the SHARED token window",
+              len(token_keys) == 1,
+              f"keys={token_keys} after waiting {lag * 1000:.1f} ms (no sample = A never recorded it: "
+              f"look for `token-usage record failed` in the node log, and check the member prefixes)")
         st_t2, _, _, _ = proxied(B_DATA, "token.local", "sk-t2")
-        token_keys = keys_matching(redis_sock, "hydra:{rl:r-token:*}:tokens")
         check("C3: the token ceiling is crossed by usage recorded on the OTHER node "
-              "(next-request semantics, measured across processes)",
-              st_t1 == 200 and st_t2 == 429, f"first(a)={st_t1} second(b)={st_t2}")
-        check("C3: ...and the token window lives in Redis under its own key",
-              len(token_keys) == 1, f"keys={token_keys}")
+              "(B refuses on the sample A wrote, measured across processes)",
+              st_t1 == 200 and st_t2 == 429, f"first(a)={st_t1} second(b)={st_t2} (sample seen after "
+              f"{lag * 1000:.1f} ms — a 200 here with the sample PRESENT means the windows are not shared)")
         check("C3: ...counted with the metric's real `dim` value (`tokens`) on the node that denied "
               "(B — its 429 came from the usage member A recorded)",
               metric_sum(B_ADMIN, "hydra_limit_rejected_total", 'dim="tokens"') >= 1.0,

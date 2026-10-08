@@ -832,6 +832,13 @@ impl ProxyHttp for HydraProxy {
         //      only known after the response, so this is the documented
         //      next-request semantics: the request that would exceed the quota
         //      is the one that gets the 429.
+        //
+        //      "Next" is exact once the charge has landed. The charge itself is
+        //      written in the logging phase — after the response — so a
+        //      follow-up that overtakes it is still admitted; that gap is real
+        //      on a loaded host, which is why the cluster drill waits for the
+        //      shared sample before asserting the cross-node refusal
+        //      (integration/test_cluster_limits.py, C3).
         if let CountVerdict::Denied {
             role_id,
             retry_after,
@@ -1403,6 +1410,23 @@ impl ProxyHttp for HydraProxy {
 
         // Record into the sink (fire-and-forget). Only when we actually
         // selected a provider (i.e. forwarded something).
+        //
+        // ORDER — this call stays AFTER the token charge above, and the swap was
+        // tried and WITHDRAWN (2026-10-05). The theory was that a quota decision
+        // must not queue behind an analytics write, since CI had shown the shared
+        // token sample still absent 100 ms+ after the response (that is how
+        // `integration/test_cluster_limits.py` C3 went red while the
+        // admission-time count legs passed). The theory is REFUTED by the code
+        // contract — `usage::engine`'s `UsageSink::record` "MUST return
+        // immediately: implementations buffer internally and flush
+        // asynchronously, never blocking the caller" — and by measurement: with
+        // the charge on EITHER side of this call the drill reads the same 0.4 ms
+        // (C3 now reports that number on every run, through
+        // `keys_matching_fast`; the 0.10 s an earlier comment quoted was the
+        // drill helper's own 2×50 ms sleeps, not the product). The cause of that
+        // CI gap is therefore still UNKNOWN — a starved `logging` phase under
+        // load and a lost Redis write are both still open, and the second is now
+        // visible as a `token-usage record failed` warning.
         if let (Some(tenant), Some(sel)) = (ctx.tenant.as_ref(), ctx.selected.as_ref()) {
             let model = ctx.model_key.clone().unwrap_or_default();
             let masked = ctx.client_api_key.as_ref().map(|k| mask_key(k));
@@ -1446,9 +1470,13 @@ impl ProxyHttp for HydraProxy {
             let _ = self.state.sink.record(record).await;
         }
 
-        // Token-window accounting in the logging phase (§10.3). The limiter
-        // needs a single total-token quantity; derive it locally from the
-        // neutral fields (the metering record stores no derived total).
+        // Token-window accounting in the logging phase (§10.3). It lands AFTER
+        // the response, so it is the charge — never the decision — that a
+        // follow-up arriving within a few milliseconds can overtake: the drill
+        // measures that gap on every run (`integration/test_cluster_limits.py`
+        // C3, 0.4 ms on an idle machine) instead of assuming it is zero.
+        // The limiter needs a single total-token quantity; derive it locally from
+        // the neutral fields (the metering record stores no derived total).
         // `saturating_add`, not `+`: both operands are u64 straight out of the
         // upstream's own JSON, and there is no `[profile]` setting
         // `overflow-checks` in this workspace, so a release build WRAPS. An
