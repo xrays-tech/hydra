@@ -30,7 +30,16 @@
 // --- W2: persistence & config store ---------------------------------------
 /// At-rest encryption for persisted secrets (provider upstream api-keys).
 /// Gated on `db` (the encrypt-on-write / decrypt-on-read boundary is `db.rs`).
+///
+/// The `#[cfg]` below is LOAD-BEARING and was restored on 2026-10-08: `lock_gate` (round 201) had been
+/// inserted between this doc comment and its item, taking the attribute with it, so `crypto` was
+/// compiled in EVERY configuration while its dependencies (`aes-gcm`, `base64`, `rand`) are pulled in
+/// by `db` alone — a bare `runtime` slice would have failed inside `crypto.rs` instead of leaving the
+/// module out. Every configuration CI builds implies `db` today (`proxy` → `db`, `server` → `db`), so
+/// the breakage was latent rather than visible.
 #[cfg(feature = "db")]
+pub mod crypto;
+
 /// Lock a mutex, recovering from poisoning instead of panicking.
 ///
 /// SINGLE OWNER (round 201): this started as a private helper in `proxy::admission` after a review
@@ -44,11 +53,11 @@
 ///
 /// Use it whenever the guarded value is a plain snapshot; keep `.expect(...)` where a poisoned lock
 /// really does mean an invariant was broken mid-update.
+#[cfg(feature = "db")]
 pub(crate) fn lock_gate<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub mod crypto;
 /// sqlx pool, migrations, and the repo layer.
 #[cfg(feature = "db")]
 pub mod db;

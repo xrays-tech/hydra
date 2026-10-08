@@ -465,7 +465,15 @@ function main() {
     console.log(
       `OK  (${enKeys.length} en keys, ${langs.length} locales (${langs.join(', ')}), ` +
         `code↔en consistent; ${stats.files} UI file(s) scanned, ` +
-        `${stats.unscannedJudged} file(s) deliberately unscanned and recorded ` +
+        // BOTH numbers (round 208). `unscannedJudged` is what the scanner does not read;
+        // `unscannedRecorded` was computed for exactly this sentence in round 196 and then never
+        // printed, so the line asserted the pairing ("and recorded") while showing only the names —
+        // it IMPLIED that every skipped file carries a reason instead of saying how many do. The two
+        // coincide whenever the audit passes (it fails on an unrecorded or stale file), which is
+        // precisely why the sentence could get away with one of them; printing both removes the
+        // implication, and a divergence would now be visible in the OK line itself.
+        `${stats.unscannedJudged} file(s) not scanned, ` +
+        `${stats.unscannedRecorded} recorded ` +
         `(${[...UNSCANNED_UI_OK.keys()].join(', ') || 'none'}), ` +
         `${stats.tKeys} t() literal(s) checked)`,
     );

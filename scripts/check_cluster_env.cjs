@@ -51,6 +51,7 @@
  * Exit codes: 0 clean, 1 a violation, 2 CANNOT VERIFY (the table is unparseable, or a scan that
  * should have matched something matched nothing — an empty scan is not a pass).
  */
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { records, audit } = require('./recorded_exceptions.cjs');
@@ -90,33 +91,86 @@ const NOT_CLUSTER_ONLY = records(process.env.CLUSTER_ENV_NOT_CLUSTER_ONLY, [
 ]);
 
 /**
- * The NON-literal env reads under `src/cluster/`, keyed by SITE (`<file>#<ordinal>`, one-based),
- * with the reason. A name the guard cannot see is a name the completeness rule cannot judge, so each
- * such site must be a recorded decision — and the record expires if that site disappears.
+ * The NON-literal env reads under `src/cluster/`, keyed by SITE, with the reason. A name the guard
+ * cannot see is a name the completeness rule cannot judge, so each such site must be a recorded
+ * decision — and the record expires if that site disappears.
  *
  * The key is the site, NOT the file (round 194, found by an adversarial review of the guard itself):
  * the first version recorded the FILE, so the reason written for the `CLUSTER_ONLY_ENV` loop —
  * "it reads exactly the table, by construction" — silently vouched for every future
  * `std::env::var(<expression>)` in that same file, including one reading a name that is not in the
  * table at all (measured with a fixture: `env::var(SECRET_KNOB)` with `HYDRA_SECRET_KNOB` absent
- * from the table passed with exit 0 and an OK line claiming every read was accounted for). Ordinals
- * instead of line numbers so ordinary edits above a site do not churn the record.
+ * from the table passed with exit 0 and an OK line claiming every read was accounted for).
+ *
+ * AND THE KEY IS THE SITE'S OWN TEXT, not its ordinal (round 208, the second adversarial review of
+ * this guard). `#<ordinal>` was "the site" only positionally: `applies()` asked whether the file still
+ * had AT LEAST that many non-literal sites, never whether the one it now pointed at was the one the
+ * reason was written about. Measured with a fixture before this change: a single recorded site whose
+ * text was REPLACED by `std::env::var(format!("HYDRA_{}", "CLUSTER_PEERS"))` — an indirection that can
+ * hide a cluster-only name, which is the whole reason the rule exists — still reported
+ * "1 non-literal read(s) (all recorded) … OK" with exit 0.
+ *
+ * So the identity is a fingerprint of the site's comment-free text: `<file>@<8 hex>`, with `#2`, `#3`
+ * … appended when a file contains the SAME text twice (identical lines are indistinguishable by
+ * content, and one record must still cover exactly one site). This keeps the property the ordinal
+ * scheme was chosen for — moving a site down its file does NOT churn the record, because its text did
+ * not change — while closing the hole: editing that line changes its key, so the old record expires
+ * and the new site has to be judged by a human. A stale record prints the file's current keys, so
+ * updating one is mechanical.
  */
 const NON_LITERAL_READ_OK = records(process.env.CLUSTER_ENV_NON_LITERAL_OK, [
   [
-    'crates/hydra-server/src/cluster/mod.rs#1',
-    'the CLUSTER_ONLY_ENV loop in NodeRole::from_env: it reads exactly the table, by construction',
+    'crates/hydra-server/src/cluster/mod.rs@c78d022d',
+    'the table loop in NodeRole::from_env: it iterates CLUSTER_ONLY_ENV chained with ' +
+      'RETIRED_CLUSTER_ENV — both declared in that file, in that scope — and reads each element by ' +
+      'value, so the indirection cannot name anything the table does not already contain',
   ],
   [
-    'crates/hydra-server/src/cluster/arachne_node.rs#1',
+    'crates/hydra-server/src/cluster/arachne_node.rs@f00be949',
     'cluster_enabled(): the single read behind the cluster/single-node decision (ADR-0001). It reads PEERS_ENV, a constant declared in that file and nowhere else, so the indirection cannot hide a cluster-only name — that name is the one thing it exists to read. DEFERRED (tracked by plan T1.3 / T4.2): replacing the HYDRA_ROLE-based decision with this one, adding HYDRA_CLUSTER_PEERS and HYDRA_ARACHNE_LISTEN to the table, and removing the seven retired names all happen in the wiring step; until then the two new variables are deliberately absent from the table rather than listed while nothing reads them through it.',
   ],
 ]);
 
-/** `{key, file, ordinal}` for one recorded non-literal site. */
-function parseSiteKey(key) {
-  const m = String(key).match(/^(.*)#(\d+)$/);
-  return m ? { file: m[1], ordinal: Number(m[2]) } : null;
+/**
+ * How many lines ABOVE the `env::var(…)` line belong to the site's identity.
+ *
+ * One line is not enough, and the measurement that proved it is in this file's history: a fixture whose
+ * site read `let _ = std::env::var(name);` was recorded, and REPLACING the line above it —
+ * `let name = "HYDRA_ANYTHING";` becoming `let name = format!("HYDRA_{}", "CLUSTER_PEERS");` — kept the
+ * record green, because the `env::var` line itself was byte-identical. The judgement a record makes is
+ * about the EXPRESSION passed in, and in Rust that expression is usually built on the lines just above.
+ *
+ * The limit, stated rather than implied: a change MORE than {@link CONTEXT_LINES} lines above the site
+ * does not change the key (e.g. rebinding the same identifier further up). This is a fingerprint of the
+ * site and its immediate context, not a dataflow analysis; it closes the measured hole (the line that
+ * builds the argument) without pretending to be one.
+ */
+const CONTEXT_LINES = 3;
+
+/** The site's own text: the `env::var` line plus up to {@link CONTEXT_LINES} non-blank lines above it. */
+function siteText(lines, index) {
+  const parts = [];
+  for (let k = Math.max(0, index - CONTEXT_LINES); k <= index; k += 1) {
+    const line = lines[k].trim();
+    if (line) parts.push(line);
+  }
+  return parts.join('\n');
+}
+
+/** The identity of one non-literal site: its FILE, plus a fingerprint of {@link siteText}.
+ *
+ * `duplicateOrdinal` separates sites whose context is identical (a file may read the environment twice
+ * through the same shape): identical text is indistinguishable by content, and one record must still
+ * cover exactly one site, so the second and later copies get `#2`, `#3`, … */
+function siteKey(file, text, duplicateOrdinal = 1) {
+  const digest = crypto.createHash('sha1').update(text).digest('hex').slice(0, 8);
+  return `${file}@${digest}${duplicateOrdinal > 1 ? `#${duplicateOrdinal}` : ''}`;
+}
+
+/** The file a site key belongs to, for messages (`<file>@<8 hex>[#n]` → `<file>`). */
+function siteFileOf(key) {
+  const m = String(key).match(/^(.*)@[0-9a-f]{8}(?:#\d+)?$/);
+  return m ? m[1] : null;
 }
 
 class ScanError extends Error {
@@ -187,7 +241,10 @@ function envReads(files, root) {
     const rel = path.relative(root, file);
     // Match on the COMMENT-FREE, TEST-FREE copy: a comment (leading OR trailing) is never
     // evidence of execution, and a `#[cfg(test)]` read is not the product reading the knob.
-    for (const [i, line] of stripCommentsAndTestItems(fs.readFileSync(file, 'utf8')).split('\n').entries()) {
+    // Split once: a site's identity includes the lines ABOVE it (`siteText`), so the loop needs the
+    // whole comment-free, test-free file, not one line at a time.
+    const lines = stripCommentsAndTestItems(fs.readFileSync(file, 'utf8')).split('\n');
+    for (const [i, line] of lines.entries()) {
       // `env::vars()` / `env::vars_os()` walk the WHOLE environment, so the guard can no more name
       // what they read than it can for `env::var(<expression>)` — round 195: they matched nothing at
       // all here, i.e. an unrecorded whole-environment read was invisible to every rule in this file.
@@ -200,7 +257,9 @@ function envReads(files, root) {
           literals.get(lit[1]).push(at);
         } else {
           if (!nonLiteral.has(rel)) nonLiteral.set(rel, []);
-          nonLiteral.get(rel).push(at);
+          // The site's OWN text (plus its immediate context) travels with it: the record's identity
+          // is a fingerprint of that (`siteText`), not of its position in the file.
+          nonLiteral.get(rel).push({ at, text: siteText(lines, i) });
         }
       }
     }
@@ -276,32 +335,47 @@ function main(argv) {
   // R3 NO INVISIBLE READS: a read the guard cannot name is a read the completeness rule cannot judge,
   // so every such SITE carries a recorded reason (and the record expires when the site goes away).
   const nonLiteralKeys = [];
+  /** key → `file:line` (for messages). */
+  const siteAt = new Map();
+  /** file → its CURRENT keys with their locations, so a stale record prints what to write instead. */
+  const keysByFile = new Map();
   for (const [file, sites] of nonLiteralFiles) {
-    for (let i = 1; i <= sites.length; i += 1) nonLiteralKeys.push(`${file}#${i}`);
+    const seen = new Map();
+    const here = [];
+    for (const site of sites) {
+      const n = (seen.get(site.text) || 0) + 1;
+      seen.set(site.text, n);
+      const key = siteKey(file, site.text, n);
+      siteAt.set(key, site.at);
+      here.push(`${key} (${site.at})`);
+      nonLiteralKeys.push(key);
+    }
+    keysByFile.set(file, here);
   }
   const nonLiteralAudit = audit({
     records: NON_LITERAL_READ_OK,
     needed: nonLiteralKeys,
-    applies: (key) => {
-      const site = parseSiteKey(key);
-      return Boolean(site) && (nonLiteralFiles.get(site.file) || []).length >= site.ordinal;
-    },
+    // IDENTITY, not position (round 208): the record applies only while a site with EXACTLY that text
+    // is present. The previous predicate asked whether the file still had at least that many sites,
+    // which is satisfied by ANY site — measured: replacing the recorded line's text kept it green.
+    applies: (key) => siteAt.has(key),
   });
   for (const key of nonLiteralAudit.unrecorded) {
-    const site = parseSiteKey(key);
-    const at = site ? nonLiteralFiles.get(site.file)[site.ordinal - 1] : key;
     problems.push(
-      `${at} reads the environment through a NON-literal argument — the completeness rule cannot ` +
-        `see which name that is, so this SITE must be recorded in NON_LITERAL_READ_OK with the ` +
-        `reason the indirection cannot hide a cluster-only name`,
+      `${siteAt.get(key)} reads the environment through a NON-literal argument — the completeness ` +
+        `rule cannot see which name that is, so this SITE must be recorded in NON_LITERAL_READ_OK ` +
+        `with the reason the indirection cannot hide a cluster-only name. Its key is "${key}" ` +
+        `(a fingerprint of that line: change the line and the record expires, which is the point)`,
     );
   }
   for (const key of nonLiteralAudit.stale) {
-    const site = parseSiteKey(key);
+    const file = siteFileOf(key);
+    const now = file ? keysByFile.get(file) || [] : [];
     problems.push(
-      `NON_LITERAL_READ_OK records ${key}, but that site is gone (${site ? site.file : key} now has ` +
-        `${site ? (nonLiteralFiles.get(site.file) || []).length : 0} non-literal read(s)) ` +
-        `— a recorded decision that cannot expire is a stale claim`,
+      `NON_LITERAL_READ_OK records ${key}, but no site in that file reads the environment through ` +
+        `exactly that text any more (the line CHANGED, or the site is gone) — a recorded decision ` +
+        `that cannot expire is a stale claim. Current non-literal site(s) in that file: ` +
+        `${now.length ? now.join(', ') : '(none)'}`,
     );
   }
   for (const name of table) {

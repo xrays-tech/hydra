@@ -517,7 +517,10 @@ function t(key) { return lookup(I18N[LANG], key) ?? lookup(I18N.en, key) ?? key;
     // say what it leaned on), so the assertion is about findings, not about the string appearing:
     // a recorded file must produce no issue line and no stale-record line.
     res.status === 0 && !/STALE-UNSCANNED|UNSCANNED-UI-FILE/.test(res.out)
-      && /deliberately unscanned and recorded \(widget\.vue\)/.test(res.out),
+      // Round 208: the OK line separates the two sets it used to merge — how many files were NOT
+      // SCANNED, and how many of those are RECORDED. The file must still be named, and the counts must
+      // both be there: one skipped file, one record.
+      && /1 file\(s\) not scanned, 1 recorded \(widget\.vue\)/.test(res.out),
     `status=${res.status} ${res.out.trim().slice(0, 200)}`,
   );
 }

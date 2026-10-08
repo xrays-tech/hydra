@@ -25,7 +25,7 @@ const REPO = path.resolve(__dirname, '..');
  * A fake repository root: the owner file (table + the reads under `src/cluster/`), plus a
  * `src/main.rs` holding the reads that satisfy the "must earn its place" direction.
  */
-function fixture({ table = ['HYDRA_REDIS_URL', 'HYDRA_NODE_ID'], clusterReads = ['HYDRA_REDIS_URL', 'HYDRA_NODE_ID'], crateReads = null, nonLiteral = false, wholeEnv = false } = {}) {
+function fixture({ table = ['HYDRA_REDIS_URL', 'HYDRA_NODE_ID'], clusterReads = ['HYDRA_REDIS_URL', 'HYDRA_NODE_ID'], crateReads = null, nonLiteral = false, wholeEnv = false, siteBody = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cluster-env-'));
   const owner = path.join(dir, 'crates/hydra-server/src/cluster/mod.rs');
   fs.mkdirSync(path.dirname(owner), { recursive: true });
@@ -35,7 +35,10 @@ function fixture({ table = ['HYDRA_REDIS_URL', 'HYDRA_NODE_ID'], clusterReads = 
   // `nonLiteral: N` writes N sites, so a case can pin that ONE record covers ONE site (not a file).
   const count = nonLiteral === true ? 1 : Number(nonLiteral) || 0;
   let indirect = '';
-  for (let i = 1; i <= count; i += 1) {
+  // `siteBody` writes ONE site verbatim, so a case can control the lines that BUILD the argument —
+  // which is what the site's identity fingerprints (round 208).
+  if (siteBody !== null) indirect = `\n${siteBody}\n`;
+  for (let i = siteBody === null ? 1 : count + 1; i <= count; i += 1) {
     indirect += `\nfn by_name_${i}() {\n    let name = "HYDRA_ANYTHING_${i}";\n    let _ = std::env::var(name);\n}\n`;
   }
   // A whole-environment sweep: the guard cannot name what it reads either (round 195).
@@ -73,6 +76,16 @@ function run(dir, { env = {} } = {}) {
     },
   });
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
+}
+
+/**
+ * The keys the guard prints for its unrecorded sites — harvested the way an operator would, from the
+ * failure message itself. Keeping the harvest in the test also keeps that message usable: if it stops
+ * naming a paste-ready key, every record case below fails to record anything.
+ */
+function harvestKeys(dir) {
+  const r = run(dir);
+  return [...(r.stdout + r.stderr).matchAll(/Its key is "([^"]+)"/g)].map((m) => m[1]);
 }
 
 test('CONTROL: a complete table with reads everywhere passes and names the table', () => {
@@ -142,23 +155,26 @@ test('a non-HYDRA literal read under src/cluster/ is judged like any other (roun
 });
 
 test('a NON-literal env read must be recorded (the completeness rule cannot see the name)', () => {
-  const r = run(fixture({ nonLiteral: true }));
+  const dir = fixture({ nonLiteral: true });
+  const r = run(dir);
   assert.equal(r.status, 1, `${r.status} ${r.stdout}`);
   assert.match(r.stderr, /cluster\/mod\.rs:\d+ reads the environment through a NON-literal argument/);
   assert.match(r.stderr, /NON_LITERAL_READ_OK/);
+  // Round 208: the message must hand over the EXACT key to write, because the key is a fingerprint of
+  // the site and cannot be guessed by hand.
+  const keys = harvestKeys(dir);
+  assert.equal(keys.length, 1, JSON.stringify(keys));
+  assert.match(keys[0], /^crates\/hydra-server\/src\/cluster\/mod\.rs@[0-9a-f]{8}$/);
 
-  const ok = run(fixture({ nonLiteral: true }), {
-    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ 'crates/hydra-server/src/cluster/mod.rs#1': 'a loop over the table itself' }) },
-  });
+  const record = { [keys[0]]: 'a loop over the table itself' };
+  const ok = run(fixture({ nonLiteral: true }), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(record) } });
   assert.equal(ok.status, 0, `${ok.status} ${ok.stderr}`);
   assert.match(ok.stdout, /1 non-literal read\(s\) \(all recorded\)/);
 
   // The record expires when the indirection goes away: keeping it would be an unexpirable decision.
-  const stale = run(fixture(), {
-    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ 'crates/hydra-server/src/cluster/mod.rs#1': 'a loop over the table itself' }) },
-  });
+  const stale = run(fixture(), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(record) } });
   assert.equal(stale.status, 1, `${stale.status} ${stale.stdout}`);
-  assert.match(stale.stderr, /NON_LITERAL_READ_OK records .*cluster\/mod\.rs#1, but that site is gone/);
+  assert.match(stale.stderr, /NON_LITERAL_READ_OK records .*cluster\/mod\.rs@[0-9a-f]{8}, but no site in that file reads/);
 });
 
 /* Round 194, adversarial review of this guard: the non-literal records were keyed by FILE, so the
@@ -166,7 +182,10 @@ test('a NON-literal env read must be recorded (the completeness rule cannot see 
  * file — a `env::var(SECRET_KNOB)` reading a name that is not in the table passed with exit 0 and an
  * OK line claiming every read was accounted for. Keyed by SITE, one record covers one site. */
 test('one non-literal record covers ONE site, not the whole file (round 194)', () => {
-  const recorded = { 'crates/hydra-server/src/cluster/mod.rs#1': 'the table loop' };
+  const twoSites = fixture({ nonLiteral: 2 });
+  const keys = harvestKeys(twoSites);
+  assert.equal(keys.length, 2, JSON.stringify(keys));
+  const recorded = { [keys[0]]: 'the table loop' };
 
   // Two sites, one record: the second is unrecorded and must be reported BY SITE.
   const two = run(fixture({ nonLiteral: 2 }), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(recorded) } });
@@ -176,15 +195,86 @@ test('one non-literal record covers ONE site, not the whole file (round 194)', (
 
   // CONTROL: both recorded, and the OK line stops claiming more than it checked.
   const both = run(fixture({ nonLiteral: 2 }), {
-    env: {
-      CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({
-        'crates/hydra-server/src/cluster/mod.rs#1': 'the table loop',
-        'crates/hydra-server/src/cluster/mod.rs#2': 'a second indirection, recorded on purpose',
-      }),
-    },
+    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ ...recorded, [keys[1]]: 'a second indirection, recorded on purpose' }) },
   });
   assert.equal(both.status, 0, `${both.status} ${both.stderr}`);
   assert.match(both.stdout, /2 non-literal read\(s\) \(all recorded\)/);
+});
+
+/* Round 208, the SECOND adversarial review of this guard: the key was `<file>#<ordinal>`, and
+ * `applies()` asked only whether the file still had AT LEAST that many non-literal sites — never
+ * whether the one it now pointed at was the one the reason was written about. Measured before this
+ * fix: replacing the recorded site's text with `std::env::var(format!("HYDRA_{}", "CLUSTER_PEERS"))`
+ * — an indirection that CAN hide a cluster-only name, which is the whole reason the rule exists —
+ * still printed "1 non-literal read(s) (all recorded) … OK" and exited 0. */
+test('a record expires when the SITE IT DESCRIBED changes, not only when the file shrinks (round 208)', () => {
+  const benign = 'fn by_name() {\n    let name = "HYDRA_ANYTHING";\n    let _ = std::env::var(name);\n}';
+  const sneaky = 'fn by_name() {\n    let name = format!("HYDRA_{}", "CLUSTER_PEERS");\n    let _ = std::env::var(name);\n}';
+  const [key] = harvestKeys(fixture({ siteBody: benign }));
+  assert.match(key, /^crates\/hydra-server\/src\/cluster\/mod\.rs@[0-9a-f]{8}$/, key);
+  const record = { [key]: 'it reads a constant declared in this file' };
+
+  // CONTROL: the site untouched ⇒ the record still applies.
+  const same = run(fixture({ siteBody: benign }), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(record) } });
+  assert.equal(same.status, 0, `${same.status} ${same.stderr}`);
+
+  // The SAME number of sites and a byte-identical `env::var` line — only the line that BUILDS the
+  // argument differs. The positional key matched here; the fingerprint must not.
+  const replaced = run(fixture({ siteBody: sneaky }), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(record) } });
+  assert.equal(replaced.status, 1, `${replaced.status} ${replaced.stdout}`);
+  assert.match(replaced.stderr, /NON_LITERAL_READ_OK records .*mod\.rs@[0-9a-f]{8}, but no site in that file reads/);
+  assert.match(replaced.stderr, /reads the environment through a NON-literal argument/);
+
+  // …and the OLD key shape is not a key at all any more, so a positional record cannot linger.
+  const ordinal = run(fixture({ siteBody: benign }), {
+    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ 'crates/hydra-server/src/cluster/mod.rs#1': 'the old positional key' }) },
+  });
+  assert.equal(ordinal.status, 1, `${ordinal.status} ${ordinal.stdout}`);
+});
+
+test('moving the site (unrelated code above it) does NOT expire the record (round 208)', () => {
+  const benign = 'fn by_name() {\n    let name = "HYDRA_ANYTHING";\n    let _ = std::env::var(name);\n}';
+  const [key] = harvestKeys(fixture({ siteBody: benign }));
+  const record = { [key]: 'it reads a constant declared in this file' };
+  // An unrelated function ABOVE the site — outside the 3-line context window — leaves the site's own
+  // text untouched, so the record keeps applying. That is the property the ordinal scheme was chosen
+  // for (no churn on unrelated edits), and a CONTENT identity preserves it.
+  const moved = run(fixture({ siteBody: `fn unrelated() {\n    let _ = 1;\n}\n\n${benign}` }), {
+    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify(record) },
+  });
+  assert.equal(moved.status, 0, `${moved.status} ${moved.stderr}`);
+});
+
+test('two byte-identical sites still need TWO records (round 208: the `#2` suffix)', () => {
+  // Identical text is indistinguishable by content, and one record must still cover one site — so the
+  // second copy of the same shape gets `#2`. The three padding lines make both context windows equal.
+  const body = [
+    'fn f() {',
+    '    let pad = 1;',
+    '    let pad = 1;',
+    '    let pad = 1;',
+    '    let name = "HYDRA_ANYTHING";',
+    '    let _ = std::env::var(name);',
+    '    let pad = 1;',
+    '    let pad = 1;',
+    '    let pad = 1;',
+    '    let name = "HYDRA_ANYTHING";',
+    '    let _ = std::env::var(name);',
+    '}',
+  ].join('\n');
+  const keys = harvestKeys(fixture({ siteBody: body }));
+  assert.equal(keys.length, 2, JSON.stringify(keys));
+  assert.match(keys[0], /@[0-9a-f]{8}$/);
+  assert.equal(keys[1], `${keys[0]}#2`);
+
+  const one = run(fixture({ siteBody: body }), { env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ [keys[0]]: 'the first copy' }) } });
+  assert.equal(one.status, 1, `${one.status} ${one.stdout}`);
+  assert.match(one.stderr, /2 non-literal read\(s\) \(1 UNRECORDED\)/);
+
+  const both = run(fixture({ siteBody: body }), {
+    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ [keys[0]]: 'the first copy', [keys[1]]: 'the second copy, recorded on purpose' }) },
+  });
+  assert.equal(both.status, 0, `${both.status} ${both.stderr}`);
 });
 
 /* The OK line used to assert "the fallback ERROR names: <table>" — a chain this file never reads.
@@ -205,8 +295,11 @@ test('a whole-environment sweep (env::vars) is a non-literal site that must be r
   assert.equal(r.status, 1, `${r.status} ${r.stdout}`);
   assert.match(r.stderr, /cluster\/mod\.rs:\d+ reads the environment through a NON-literal argument/);
 
+  const dir = fixture({ wholeEnv: true });
+  const [key] = harvestKeys(dir);
+  assert.match(key, /^crates\/hydra-server\/src\/cluster\/mod\.rs@[0-9a-f]{8}$/, key);
   const ok = run(fixture({ wholeEnv: true }), {
-    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ 'crates/hydra-server/src/cluster/mod.rs#1': 'a sweep, recorded on purpose' }) },
+    env: { CLUSTER_ENV_NON_LITERAL_OK: JSON.stringify({ [key]: 'a sweep, recorded on purpose' }) },
   });
   assert.equal(ok.status, 0, `${ok.status} ${ok.stderr}`);
   assert.match(ok.stdout, /1 non-literal read\(s\) \(all recorded\)/);

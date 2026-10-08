@@ -82,10 +82,12 @@ function parseArgs(argv) {
  * A real violation has to be code, so blanking string interiors cannot hide one.
  */
 // The Rust text-blanking lexer (comments / strings / char literals / whole `#[cfg(test)]`
-// items) lives in `rust_blank.cjs` — a single owner, shared by SEVEN guards (re-measure with
-// `grep -rln "rust_blank.cjs" scripts/*.cjs`; this said "three" until round 199, i.e. exactly the
-// drifting count the surrounding comments warn about)
-// being right, and each hand-rolled copy had the same class of bug (see that file's header).
+// items) lives in `rust_blank.cjs` — a single owner, shared by the guards `grep -l
+// "require('./rust_blank.cjs')" scripts/check_*.cjs` lists. That command is given INSTEAD OF A NUMBER
+// on purpose (round 208): this line said "three" until round 199 and "SEVEN" until round 208, and each
+// count was defensible under a different pattern — mentions, `require` calls and test files give
+// three different answers. Run it; do not write its output down. The point is that ONE lexer is right
+// and every hand-rolled copy had the same class of bug (see that file's header).
 const { stripComments, stripTestItems } = require('./rust_blank.cjs');
 
 function walkRustFiles(dir, acc = []) {
