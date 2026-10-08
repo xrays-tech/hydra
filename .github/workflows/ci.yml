@@ -329,6 +329,29 @@ jobs:
             exit 1
           fi
 
+      # The arachne Rust tests, which NO OTHER JOB RUNS. They carry
+      # `#![cfg(feature = "arachne")]`, and the `check` / `optional-features` / `alt-features` jobs
+      # test WITHOUT that feature, so those targets compile EMPTY there: the files existing never
+      # meant they ran, and no guard enforces the difference (`check_ci_wiring.cjs` only demands a
+      # step for `#[ignore]`d tests, and a feature-gated target is not `#[ignore]`d). That is how the
+      # whole ADR-0001 control-plane family — including the causal test for the stale-head refusal —
+      # stayed CI-invisible while being green by hand. Measured: 23 tests, 12 s.
+      #
+      # It runs in THIS job because this is the only one that builds with `arachne`, and it runs
+      # BEFORE the drills: some of these tests bind real loopback ports (17601-18803) and the drills
+      # use neighbouring ones (18800/18801), so no drill may be holding a port when they start.
+      # `arachne_alive_partition` is the one that is deliberately NOT a crash test: three raft runtimes
+      # in ONE process over upstream's in-memory transport, where `firewall(from,to)` drops messages
+      # while keeping both channels alive — the case ADR-0001 §12's ordering rule could break by
+      # turning a merely-partitioned node into a self-inflicted config wipeout.
+      - name: Arachne control plane, in-process Rust tests
+        run: |
+          set -o pipefail
+          cargo test -p hydra-server --features server,cluster-redis,arachne \
+            --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch \
+            --test arachne_store --test arachne_three_nodes \
+            --test arachne_cert_fidelity --test arachne_derivation_fidelity
+
       # Cluster HA, end to end (ADR-0001 gates 1/3/4/5): three REAL hydra processes that are all
       # raft members — a management write aimed at ANY of them is accepted, `kill -9` on the leader
       # promotes a new one within 3s with never two claimants, every node ends up serving the same
