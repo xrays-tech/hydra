@@ -1282,6 +1282,18 @@ arm B 承压 : 1/5 失败 —— 失败的是 gate 1「a new leader was elected 
 
 **这一轮的一个额外发现（社区面）**：舰队视图 `/api/v1/cluster/status` 以前从注册表读「成员 + 每个成员是否存活 + 谁持租约」。注册表没了之后，**单个节点再也无法知道对端是否存活**（没有心跳表，也没有节点间 RPC），所以 `alive` 变成**三态**（本节点 `true`、对端 `null`），Admin UI 把 `null` 渲染为「未知」——把健康对端显示成「下线」是**没人测量过的断言**。
 
+### 决定 8（2026-10-08）：浏览器配方收归一个所有者，并修掉合并暴露出的**死诊断**
+
+**背景（第 168 轮 ★D 留下的代价）**：`scripts/e2e-local.sh` 与 CI 的 `ui-e2e` 作业各有一份「起实例 → seed → 跑套件 → 收尾」的配方，两份的差异只有「二进制从哪来（release vs debug）」与「runner 谁装」。这份重复被 `check_ci_wiring.cjs` 的 `NOT_EXECUTED_IN_CI_OK` 当**已记录的例外**收着，理由里写着"duplicated recipe is a real cost"。本轮还清。
+
+**合并**：脚本成为唯一所有者；CI 只提供真正属于 CI 的部分（release 二进制、`npx playwright install --with-deps chromium`、产物上传），差量由两个入口参数承载——`E2E_BIN`（调用方负责构建 ⇒ 跳过新鲜度探测与 `--features server` 重建）与 `E2E_PLAYWRIGHT_BIN`（用调用方装好的固定版 runner；两棵树各自钉版本，此模式下强制 `NODE_PATH` 指向 scratch 反而错）。**被删掉的重复**：CI 的 `Verify prerequisites`（脚本本来就会因缺 jq/curl 而死）、`Start hydra`、`Seed fixtures`、`Playwright`、`Stop hydra`（脚本 trap 负责，含失败路径）——作业 **12 步 → 8 步**。那条记录随之**删除**（记录代数会抓"不再成立的记录"）。
+
+**守卫必须学会一件事，而且改的是规则、不是绕过**：规则 2（"ci.yml 跑没跑 `playwright test`"）现在**看穿一层脚本委派**，否则"把配方收归一个所有者"本身会被判成 `ci.yml never runs playwright test`——**守卫会因修好它自己记录的那个洞而报红**。同时 `invokes()` 补上**直接执行**（`run: ./scripts/x.sh`）：实测该写法此前被算作"executed by NOTHING"（它只认 `bash …` 这类带 runner 的形状），而"读文件不算跑文件"的锐边保留（`grep -q foo scripts/x.sh` 仍不算）。自测 **+5**：委派算数 / 委派脚本里没有套件仍红（不可洗白）/ 委派脚本里的**注释**不算 / 直接执行算 / 仅读取不算。**诚实标注一处限制**（写进守卫注释与脚本注释）：这是**文本**语料，只能证明"套件从 CI 可达"，不能证明可达的那个脚本真跑了它——脚本用的是 `"$PW_BIN"` 变量间接，任何文本规则都跟不进去；真正满足该规则的一行是它的 `echo "==> playwright test $*"`（与它取代的内联写法同样弱：ci.yml 里一句 `echo` 当时也能满足）。**因此那行 echo 是承重的，别"顺手清理"**。
+
+**合并当场的证伪抓到的东西：这套诊断是死代码。** `set -euo pipefail` 下裸的 `playwright test` 失败会**当场终止脚本**，于是它下面那句 `rc=$?` 与「打印实例日志最后 30 行」**永远不执行**——脚本 exit 1 且不给任何服务端上下文。**实测（修前）**：`-g ZZZ-no-such-test` ⇒ exit 1、那句标记出现 **0** 次；**修后**（两个分支都改成 `|| rc=$?`）⇒ 同样命令 exit 1、标记出现 **1** 次并打印日志。**必须现在修**：上一个提交刚把 CI 的诊断搬进这个脚本，CI 自己那份内联打印已经没了。
+
+**验证（全部实测）**：门禁态套件 **20 passed (30.3s)**、CI 态套件（`E2E_BIN`+`E2E_PLAYWRIGHT_BIN`）**20 passed (30.1s)**；`KEEP=1` 下 `.acceptance/e2e-local/hydra.log` 确实留在 CI 现在上传的那个路径上，`KEEP=0` 仍清理现场；`bash -n` 干净；`check_ci_wiring` exit 0（自测 1/1）、`check_gate_entries` exit 0（自测 25/25）、`recorded_exceptions` 8/8；**本地门禁 99 条目 `OVERALL=GREEN`**；**CI `8a6c9ee` 8/8 全绿**，`ui-e2e` 日志逐行为证：`using the caller's Playwright: ./node_modules/.bin/playwright (1.55.0)`、`E2E_BIN: running against target/release/hydra — no rebuild`、**`20 passed (31.7s)`**。
+
 ## 风险 / Risks
 
 | # | 风险 | 概率 | 影响 | 对冲 |
