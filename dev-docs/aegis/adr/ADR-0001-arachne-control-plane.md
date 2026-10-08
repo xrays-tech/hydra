@@ -221,6 +221,28 @@ Hydra 的集群协调今天建立在「Redis 是可靠的单点协调者 + 时�
 
 ---
 
+## 12. 修正（2026-10-07）：配置的顺序由 `ctl/head` 的 log index 给出
+
+**决定**：物化只在 `incoming_index >= applied_index` 时应用（判定收在纯函数 `is_stale_generation`）；更低者**拒绝**、继续服务当前配置。`applied_index` 是上一次成功应用记下的代次，它与 `head` 的值由**同一次**读一并给出（`get_stale_with_index`，上游 arachne-kv v0.3.0；我们要这个原语的请求原文在
+`dev-docs/upstream/arachne-kv-commit-index-request.md`）。
+
+**为什么必须有序**：树名是**内容哈希**，两棵树之间不含任何"谁更新"的信息；而应用是**替换式**的（本地 SQLite 与内存 `ConfigData` 一起换）。于是"读到更旧的 head"就等于**回滚**，而回滚后的库会成为**下一次发布的输入** ⇒ 缺失被固化进 `head`、整集群一致地丢掉同一行。实测形态（CI 两次捕获）：12 条写全 201、12 次发布 `{result="ok"}`、两边物化 `succeeded`、无任何发布失败，**而某一行在两个节点的库里都不存在**；本地空闲 0/5、承压约 1/3，修复后承压 10 次未再复现。
+
+**被否的替代（各带实测，勿重推）**：
+
+| 替代 | 结论与证据 |
+|---|---|
+| 把这次读改成线性一致（`get`） | **否**。物化路径：空闲 **4/5 失败 vs 0/5**——要求 quorum 的节点在少数派下**学不到新配置**，只能一直服务更旧的配置（失败形态是 `404 unknown_domain` + provider 更少） |
+| 用陈旧 head 推一个自增版本 | **否**。会让 `head` **倒退**，把同一缺陷换个地方重演 |
+| 记住"见过的 head"、禁止回头 | **否**。**破坏合法回滚**：重新发布旧内容时 `head` 确实会回到一个见过的值 |
+| 读两次、要求一致才应用 | **否**。陈旧副本可以**自洽地**陈旧，两次相同仍是旧值 |
+
+**上游约束（规则成立的前提，必须保持不破）**：① index 只属于**该键**的 origin ⇒ **绝不跨键比较**（实体键的 origin 不得与 `head` 的相比）；② `>=` 只对**无删除历史**的键成立 ⇒ 本设计要求配置树保持 **replace-by-put、永不删除实体**——这条同时意味着"用删除来收缩配置"在这套设计下不可用，需要收缩时应改用"写空/置 disabled 并让读者忽略"的形状。
+
+**验证**：谓词真值表单测；**拒绝分支的因果测试**（`falsification` 实测：无排序 ⇒ `Applied{…}`（回滚），有排序 ⇒ `NoChange`）；空闲验收演练 5/5、三条集群演练 PASS、CI 8/8（承载这些演练的 `live-deps` 由红转绿）；承压 10 次未见目标形态。**选举时限**：3 s 是**品质目标**而非硬判定（用户裁定 2026-10-07）；演练容忍至 5 s 并会打印"over target, inside allowance"，仍能抓住旧租约世界那种 17 s 晋升与"永不选出 leader"。
+
+---
+
 ## Boundary
 
 This ADR is an advisory Aegis Method Pack record. It does not grant completion authority or replace project-authoritative architecture sources.
