@@ -240,16 +240,20 @@ impl ArachneConfigStore {
     /// (ADR-0001 plan, "观察": twelve writes all 201, twelve publishes `{result="ok"}`, both
     /// materializers `succeeded`, and one written row absent from BOTH databases).
     ///
-    /// **Switching this to `get` was tried and reverted, and the measurement behind that is
-    /// CONFOUNDED — treat it as unsettled** (2026-10-07): with `get` the cluster's own acceptance drill
-    /// failed 3/3 locally (`gate 5` data plane twice, `gate 1` leader election once), but those runs
-    /// shared the machine with cargo builds and test suites, while the reverted baseline then passed
-    /// 5/5 on an idle box — and that drill (three real nodes, a killed leader) is timing-sensitive. The
-    /// plausible cost is real and has to be re-measured on an idle machine: a quorum-confirmed read per
-    /// materializer tick (1 s, forwarded to the leader from every follower) adds heartbeat/forward
-    /// traffic. The defect is NOT fixed here; the other candidates are an ordered watermark the apply
-    /// can compare (hashes carry no order), or serialising publish against materialization. Record the
-    /// numbers where the plan records its other attempts.
+    /// **Switching this to `get` was tried, measured and reverted — and `get` turned out to be the
+    /// wrong direction** (2026-10-07). Idle machine, 5 runs per arm, the cluster's own acceptance
+    /// drill: with `get` **4/5 FAILED**, with `get_stale` **0/5**. The failure MODE is the reason, not
+    /// the rate: the survivor of a lost quorum answered the data plane with
+    /// `404 {"message":"unknown_domain"}` while listing one provider fewer than a healthy node — a node
+    /// that insists on a quorum-confirmed head read can no longer LEARN about newer config and keeps
+    /// serving an older one. This stale read is load-bearing for exactly that reason: it is how a
+    /// minority node still follows the head. (An earlier "3/3 vs 2/3" reading was confounded by running
+    /// the arms alongside cargo builds on the same box; the A/B above is the clean one.)
+    ///
+    /// So the hazard is real and the fix is NOT a stronger read: it is to make the APPLY monotone
+    /// (nothing here orders two tree hashes, so that needs an index or version carried with the tree)
+    /// or to stop a publish from racing materialization. Measure any attempt with that same A/B before
+    /// landing it.
     ///
     /// # Errors
     /// [`StoreError`] when the cluster cannot answer.

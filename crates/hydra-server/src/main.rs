@@ -444,9 +444,10 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
                 // ADR-0001 §10 F-5). That read is `get_stale`, i.e. NOT monotone, and what the gate
                 // does with the value is an APPLY that replaces this node's database and snapshot —
                 // a known hazard with a measured shape; read `ArachneConfigStore::current_hash`'s
-                // comment before touching either side: making the read linearizable was tried, an A/B on a
-                // LOADED box rejected it (3/3 drill failures) and an idle baseline then passed 5/5, so
-                // that A/B has to be re-run on an idle machine before either conclusion is trusted.
+                // comment before touching either side — the "obvious" fix (make that read
+                // linearizable) was tried and REJECTED by a clean idle-machine A/B: 4/5 acceptance
+                // failures against 0/5, because a node that needs a quorum to read the head can no
+                // longer learn about newer config while it is in a minority.
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
