@@ -1087,6 +1087,11 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **验证**（全部实测）：对 0.3.1 **零改动编译通过**；`--lib` **303/303**（带 `HYDRA_TEST_REDIS_URL`；events 那几个失败是没设 Redis 的假警报）；`arachne_three_nodes` **5/5**（含新判据测试）、`arachne_store` **6/6**；**空闲验收演练 5/5 通过**；上游点名的三条集群演练（`test_cluster_limits` / `test_auth_cache_layers` / `test_tenant_write_publish_failure`）**全部 PASSED**；**CI `da622f4` 8/8 全绿**——其中 `live-deps`（承载那三条原本间歇的演练）在**修复前的 `a697bf0` 是红的**，在此提交转绿（一对真实的 before/after）。
 
+**上游给出的隔离配方（2026-10-07）：可用性已核实——**照做不了，卡在一个未发布的 crate**。** 上游给的完整配方是：3 节点写好 h1 → **双向隔离 n3**（n1/n2 仍成多数派并继续推进 h2）→ 断言 n3 **仍活着**、只服务它**已应用过的旧状态**（`(h1, i1)`，且 `i1 ≤` 多数派当前索引）→ 解除隔离后 n3 追上 h2、索引上升。关键手法是**alive vs crash**：用内存传输里的 `firewall(from,to)` **静默丢包但保持通道存活**（真网络等价物是 DROP 包/挂起连接，**绝不能杀进程或关监听**——那会变成崩溃语义，就不是陈旧读测试了）。他们还明确写了 **coverage boundary**：隔离节点读到的是"它自己已经应用过的 head"，索引不会倒退，所以**这条配方不覆盖拒绝分支**；拒绝分支只能由**滞后的副本**触发——与我们的结论一致（也与我们 falsification 的结果一致：值未变 ⇒ 快路径短路）。
+**核实结果**：`firewall` / `InMemoryTransportFactory` 来自 **`arachne-kv-testsupport`**，而该 crate **未发布到 crates.io**（稀疏索引查不到；`firewall` 在全套已发布 crate 里只出现在他们自己的测试文件里）。⇒ 这条配方目前**无法在我们侧执行**。可学的还有他们测试里的**非空转守卫**：`factory.firewall_drop_count() > 0`，先证明"真的在丢包"再断言结果（与我们这次"证伪后撤掉空转测试"是同一纪律）。
+
+**因此下一步的顺序改为**：㈠ **先做我们自己的 head 读接缝**（拒绝分支的因果证明，完全属于我们、不依赖任何未发布 crate）；㈡ 再向**上游请求发布 `arachne-kv-testsupport`**（或把 `InMemoryTransportFactory`+`firewall` 放到公开 feature 下）——那条隔离配方带来的是**新覆盖**（alive partition vs 我们现有"杀两节点"的**崩溃**语义），值得补，但要有工具才行。
+
 **端到端"强制陈旧读"的尝试：被它自己的 falsification 否掉（测试已撤，接缝已命名）**。写了一版 e2e 测试——真实集群 + 真实 `get_stale_with_index` + 真实拒绝分支，只注入"已应用代次更高"这个前提（`#[cfg(test)] force_applied_index`）。**把判定函数强制为 false 后，该测试依然通过** ⇒ 它在测量空集：我只注入了代次，**head 的值没变**（仍是那棵已物化的树），于是 `converge` 走的是 gate 的"读到的就是我服务的那棵"路径返回 `NoChange`，**从未走到 `is_stale_generation`**。而真实集群里 `put` **只会把索引推高**（上游的单调性保证）⇒ 用真实 store 产不出"**不同的、更旧的哈希 + 更低的索引**"这一组合——那只能来自**滞后的本地副本**。按"恒绿的测试比没有测试更糟"撤掉，并把真正需要的接缝写下来：**给"读 head"加一个可替换的窄接缝**（测试注入脚本化的 `(hash, index)` 序列）；另一种更省的选择是给拒绝分支加一个**指标**（生产里也有用：它正是"刚刚拒绝了一次陈旧读"的信号），测试断言该指标被触发——但前提仍是能制造出更低索引，所以接缝仍是根本。
 
 **证据强度如实标注**：空闲 5/5 **在修复前也是 5/5** ⇒ 它是回归检查；真正的鉴别条件是**承压**（改动前约 1/3 失败、"①那条错修法"空闲都 4/5 失败）与**端到端强制陈旧读**。`is_stale_generation` 有确定性单测（旧 index 必拒；falsification＝删掉 `<` 即红），端到端强制那条**仍缺**；承压 A/B 见 `.acceptance/ab-index-order.sh`。
