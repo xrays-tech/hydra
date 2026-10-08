@@ -229,6 +229,25 @@ impl ArachneConfigStore {
 
     /// The head's value, or `None` when nothing was ever published.
     ///
+    /// **Read with `get_stale`, and that is a known, measured hazard — not an oversight.** The
+    /// library documents its two reads as `get` = "linearizable read (default) … a quorum-confirmed
+    /// read on the leader" (ReadIndex) and `get_stale` = "arbitrary stale read allowed; direct local
+    /// state-machine read; **not monotone** (propsol N1)". The materializer does not merely display
+    /// this value: it hands the tree it names to `ReplicaTarget::apply`, which REPLACES this node's
+    /// SQLite config and its in-memory snapshot. A non-monotone read can therefore roll a node back
+    /// over writes it already accepted and published, and because later publishes are built from the
+    /// rolled-back database, the loss can become permanent — which is the shape of two CI samples
+    /// (ADR-0001 plan, "观察": twelve writes all 201, twelve publishes `{result="ok"}`, both
+    /// materializers `succeeded`, and one written row absent from BOTH databases).
+    ///
+    /// **Switching this to `get` was tried and REJECTED by measurement** (2026-10-07): it makes the
+    /// cluster's own acceptance drill fail 3/3 locally (`gate 5` data plane twice, `gate 1` leader
+    /// election once) against 2/3 passing with `get_stale`, because a quorum-confirmed read per
+    /// materializer tick (1 s, forwarded to the leader from every follower) perturbs elections. So the
+    /// defect is NOT fixed here; the remaining candidates are an ordered watermark the apply can
+    /// compare (hashes carry no order), or serialising publish against materialization. See the plan's
+    /// entry before changing this line.
+    ///
     /// # Errors
     /// [`StoreError`] when the cluster cannot answer.
     pub async fn current_hash(&self) -> Result<Option<String>, StoreError> {

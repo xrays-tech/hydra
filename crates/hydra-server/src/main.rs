@@ -439,9 +439,13 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             let target = Arc::new(ReplicaTarget::new(store.clone(), key_provider.clone()));
             let mut materializer = Materializer::new(ctl_store, target, key_provider.clone());
             tokio::spawn(async move {
-                // One local `get_stale(head)` per tick in the steady state, so the interval is
-                // what bounds propagation latency (the measured follower convergence is
-                // milliseconds; ADR-0001 §10 F-5).
+                // One head read per tick in the steady state, so the interval is what bounds
+                // propagation latency (the measured follower convergence is milliseconds;
+                // ADR-0001 §10 F-5). That read is `get_stale`, i.e. NOT monotone, and what the gate
+                // does with the value is an APPLY that replaces this node's database and snapshot —
+                // a known hazard with a measured shape; read `ArachneConfigStore::current_hash`'s
+                // comment before touching either side, because making the read linearizable was
+                // tried and broke leader-election timing in the acceptance drill.
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
