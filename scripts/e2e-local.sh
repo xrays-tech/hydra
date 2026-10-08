@@ -27,6 +27,23 @@
 #   scripts/e2e-local.sh                    # whole suite
 #   scripts/e2e-local.sh -g "T2.2c|T2.2d"   # any `playwright test` argument
 #   KEEP=1 scripts/e2e-local.sh             # keep the scratch dir for inspection
+#
+# ONE OWNER (2026-10-08): this script IS the browser recipe — start → seed → suite → stop — and CI's
+# `ui-e2e` job now runs it instead of carrying its own inline copy (build → nohup → readiness loop →
+# seed → npx playwright → stop). Two callers with two copies is how the recorded exception in
+# `check_ci_wiring.cjs` came to exist; that record is now deleted because the duplication is gone.
+# CI drives the SAME script with two overrides, which is all it ever needed:
+#   E2E_BIN=target/release/hydra          the caller owns the build (release in CI, debug locally)
+#   E2E_PLAYWRIGHT_BIN=./node_modules/.bin/playwright
+#                                         use the caller's already-installed pinned runner (CI installs
+#                                         1.55.0 + Chromium with --with-deps, which this script cannot
+#                                         do locally), instead of the scratch install below. The specs
+#                                         `require('@playwright/test')`, so in this mode the module must
+#                                         resolve the way the caller installed it: CI installs it at the
+#                                         repo root, where the specs live, and plain Node resolution finds
+#                                         it. A runner installed OUT of tree needs NODE_PATH — measured:
+#                                         without it the suite says "No tests found" and prints a
+#                                         `require` stack, so the failure is loud rather than a wrong pass.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,16 +75,27 @@ die() { echo "e2e-local: $*" >&2; exit 1; }
 command -v jq >/dev/null || die "jq is required by tests/e2e/seed.sh"
 command -v curl >/dev/null || die "curl is required"
 
-# 1. Runner (installed under the ignored scratch dir, reused afterwards).
-installed_version="$("$RUNNER/node_modules/.bin/playwright" --version 2>/dev/null | awk '{print $2}' || true)"
-if [ ! -x "$RUNNER/node_modules/.bin/playwright" ] || [ "$installed_version" != "$PW_VERSION" ]; then
-  echo "==> installing @playwright/test@${PW_VERSION} into $RUNNER (have: ${installed_version:-none})"
-  mkdir -p "$RUNNER"
-  printf '{"name":"pw-scratch","private":true}\n' > "$RUNNER/package.json"
-  ( cd "$RUNNER" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
-      npm_config_cache="$ROOT/.acceptance/tmp-npm-cache" \
-      npm install --no-save --no-package-lock "@playwright/test@${PW_VERSION}" >/dev/null ) \
-    || die "npm install failed (offline?)"
+# 1. Runner. `E2E_PLAYWRIGHT_BIN` = the caller installed it (CI: pinned 1.55.0 + Chromium by
+#    `npx playwright install --with-deps chromium`); otherwise install the version/browser pair below
+#    into the ignored scratch dir and reuse it.
+if [ -n "${E2E_PLAYWRIGHT_BIN:-}" ]; then
+  PW_BIN="$E2E_PLAYWRIGHT_BIN"
+  [ -x "$PW_BIN" ] || die "E2E_PLAYWRIGHT_BIN=$PW_BIN is not executable (the caller owns the install)"
+  PW_VERSION="$("$PW_BIN" --version | awk '{print $2}')"
+  MATCHES_CI="caller-provided"
+  echo "==> using the caller's Playwright: $PW_BIN (${PW_VERSION:-unknown}); browsers: ${PLAYWRIGHT_BROWSERS_PATH:-~/.cache/ms-playwright}"
+else
+  installed_version="$("$RUNNER/node_modules/.bin/playwright" --version 2>/dev/null | awk '{print $2}' || true)"
+  if [ ! -x "$RUNNER/node_modules/.bin/playwright" ] || [ "$installed_version" != "$PW_VERSION" ]; then
+    echo "==> installing @playwright/test@${PW_VERSION} into $RUNNER (have: ${installed_version:-none})"
+    mkdir -p "$RUNNER"
+    printf '{"name":"pw-scratch","private":true}\n' > "$RUNNER/package.json"
+    ( cd "$RUNNER" && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+        npm_config_cache="$ROOT/.acceptance/tmp-npm-cache" \
+        npm install --no-save --no-package-lock "@playwright/test@${PW_VERSION}" >/dev/null ) \
+      || die "npm install failed (offline?)"
+  fi
+  PW_BIN="$RUNNER/node_modules/.bin/playwright"
 fi
 
 # 2. Binary: rebuild when it is missing or older than the newest Rust source.
@@ -84,23 +112,27 @@ fi
 # not the tree. That is exactly the round-143 incident, which cost a RED gate for a reason unrelated
 # to the code; the hatch is the difference between "wire the e2e suite into the gate" being safe and
 # being a fresh copy of that bug.
+BIN="${E2E_BIN:-target/debug/hydra}"
 needs_build=0
-if [ "${E2E_SKIP_BUILD:-0}" = 1 ]; then
-  [ -x target/debug/hydra ] || die "E2E_SKIP_BUILD=1 but target/debug/hydra does not exist"
-  echo "==> E2E_SKIP_BUILD=1: running against the existing target/debug/hydra (no rebuild)"
+if [ -n "${E2E_BIN:-}" ]; then
+  [ -x "$BIN" ] || die "E2E_BIN=$BIN does not exist (the caller owns the build)"
+  echo "==> E2E_BIN: running against $BIN — no rebuild and no freshness probe, the caller built it"
+elif [ "${E2E_SKIP_BUILD:-0}" = 1 ]; then
+  [ -x "$BIN" ] || die "E2E_SKIP_BUILD=1 but $BIN does not exist"
+  echo "==> E2E_SKIP_BUILD=1: running against the existing $BIN (no rebuild)"
 else
-  [ -x target/debug/hydra ] || needs_build=1
+  [ -x "$BIN" ] || needs_build=1
   if [ "$needs_build" = 0 ]; then
     newest_src=$(find crates admin-ui Cargo.toml \
         \( -name '*.rs' -o -name '*.toml' -o -name '*.sql' -o -name '*.js' -o -name '*.html' -o -name '*.css' \) \
-        -newer target/debug/hydra -print -quit 2>/dev/null)
+        -newer "$BIN" -print -quit 2>/dev/null)
     if [ -n "$newest_src" ]; then
       needs_build=1
-      echo "==> rebuilding: $newest_src is newer than target/debug/hydra (the binary embeds admin-ui/** and migrations/*.sql)"
+      echo "==> rebuilding: $newest_src is newer than $BIN (the binary embeds admin-ui/** and migrations/*.sql)"
     fi
   fi
   if [ "$needs_build" = 1 ]; then
-    echo "==> building target/debug/hydra"
+    echo "==> building $BIN"
     cargo build -p hydra-server --features server --bin hydra >/dev/null || die "cargo build failed"
   fi
 fi
@@ -124,7 +156,7 @@ HYDRA_DB_URL="sqlite://$ROOT/$SCRATCH/e2e.db?mode=rwc" \
 HYDRA_USAGE_SINK=none \
 HYDRA_ENCRYPTION_KEY="${HYDRA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}" \
 RUST_LOG="${RUST_LOG:-warn}" \
-  ./target/debug/hydra > "$SCRATCH/hydra.log" 2>&1 &
+  "$BIN" > "$SCRATCH/hydra.log" 2>&1 &
 HYDRA_PID=$!
 cleanup() {
   kill "$HYDRA_PID" 2>/dev/null || true
@@ -147,9 +179,25 @@ HYDRA_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" HYDRA_ADMIN_TOKEN="$TOKEN" ./tests/e2
   || { tail -20 "$SCRATCH/hydra.log"; die "seed.sh failed"; }
 
 # 6. The suite.
+# NOTE: the line below is what tells `check_ci_wiring.cjs`'s rule 2 that CI can reach the suite (the
+# actual invocation goes through `$PW_BIN`, which no textual rule can follow). Removing or rewording it
+# reddens that guard with "ci.yml never runs `playwright test`" — the guard says so in its own comment.
 echo "==> playwright test $*"
-NODE_PATH="$ROOT/$RUNNER/node_modules" HYDRA_BASE="$ADMIN_URL" HYDRA_ADMIN_TOKEN="$TOKEN" \
-  "$RUNNER/node_modules/.bin/playwright" test --config=playwright.config.cjs "$@"
-rc=$?
+# The runner is the caller's when they supplied one (CI), so `NODE_PATH` must NOT be forced at the
+# scratch install in that case: the two trees have different, independently pinned versions.
+#
+# `|| rc=$?` IS LOAD-BEARING, and its absence was measured (2026-10-08): under `set -e` a bare failing
+# `playwright test` terminates the script ON THAT LINE, so the `rc=$?` below it never ran and the
+# "last 30 lines of the instance log" print was DEAD CODE — exactly the diagnostic this script exists
+# to provide (and the one CI now depends on, since its inline copy of this recipe is gone). Falsified
+# before the fix: a suite that finds no tests exited 1 with NO instance log at all.
+rc=0
+if [ -n "${E2E_PLAYWRIGHT_BIN:-}" ]; then
+  HYDRA_BASE="$ADMIN_URL" HYDRA_ADMIN_TOKEN="$TOKEN" \
+    "$PW_BIN" test --config=playwright.config.cjs "$@" || rc=$?
+else
+  NODE_PATH="$ROOT/$RUNNER/node_modules" HYDRA_BASE="$ADMIN_URL" HYDRA_ADMIN_TOKEN="$TOKEN" \
+    "$PW_BIN" test --config=playwright.config.cjs "$@" || rc=$?
+fi
 [ "$rc" = 0 ] || { echo "--- last 30 lines of the instance log ---"; tail -30 "$SCRATCH/hydra.log"; }
 exit "$rc"

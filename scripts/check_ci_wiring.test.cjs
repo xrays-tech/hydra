@@ -636,6 +636,57 @@ const ignoredExtra = { "crates/hydra-server/tests/usage_query.rs": "#[test]\n#[i
     "status=" + r.status + " out=" + r.out.trim().slice(0, 200),
   );
 }
+/* 24b. Rule 2 sees through ONE level of script delegation (2026-10-08).
+ *
+ * The browser recipe now has one owner, `scripts/e2e-local.sh`, and CI reaches the suite by running
+ * that script — the change the recorded exception about that script asked for. A rule that read only
+ * ci.yml's own text reported "ci.yml never runs `playwright test`" for exactly that change, i.e. it
+ * punished the fix. These three cases pin the new corpus in both directions: delegation counts, a
+ * script that does not run the suite does NOT count (no laundering), and a mention inside a COMMENT in
+ * the delegated script does not count either (the same sharp edge this file already documents at
+ * `stripFileComments`).
+ */
+// NOTE the leading "\n": `baseCi()`'s last element carries no trailing newline (it is `join`ed), so
+// appending without one GLUES the new step onto the previous line — and then the checker sees a single
+// `run:` body whose second half is not in command position, which is what the first version of this
+// fixture did (it reported the delegation as unwired for a reason that was in the fixture).
+const delegatedCi = () =>
+  baseCi().replace("      - run: npx playwright test --config=playwright.config.cjs\n", "") +
+  "\n      - run: ./scripts/e2e-local.sh\n";
+const delegatedSkeleton = (scriptBody) =>
+  skeleton({
+    ci: delegatedCi(),
+    scripts: { ...wiredScripts, "e2e-local.sh": scriptBody },
+    crateTests,
+    e2e: ["a.spec.cjs", "b.spec.cjs", "c.spec.cjs"],
+    playwright: "module.exports = { testDir: './tests/e2e' };\n",
+  });
+{
+  const r = run(delegatedSkeleton("#!/usr/bin/env bash\nnpx playwright test --config=playwright.config.cjs\n"));
+  assert(
+    "a step that DELEGATES to a script which runs playwright test satisfies rule 2",
+    r.status === 0,
+    "status=" + r.status + " out=" + r.out.trim().slice(0, 200),
+  );
+}
+{
+  const r = run(delegatedSkeleton("#!/usr/bin/env bash\necho starting hydra\n"));
+  assert(
+    "...but a delegated script that does NOT run the suite still fails rule 2 (no laundering)",
+    r.status !== 0 && /never runs `playwright test`/.test(r.out),
+    "status=" + r.status + " out=" + r.out.trim().slice(0, 200),
+  );
+}
+{
+  const r = run(
+    delegatedSkeleton("#!/usr/bin/env bash\n# we used to run: npx playwright test --config=playwright.config.cjs\necho hi\n"),
+  );
+  assert(
+    "...and a COMMENT inside the delegated script does not count either",
+    r.status !== 0 && /never runs `playwright test`/.test(r.out),
+    "status=" + r.status + " out=" + r.out.trim().slice(0, 200),
+  );
+}
 {
   // The walk floor itself, with an explicit value.
   const root = skeleton({
@@ -1621,6 +1672,32 @@ const BLOCK_WITH_DASH = (realCommand) => [
     "48: a mention inside a JS block comment does not count either",
     r48.status === 1 && /scripts\/orphan\.sh is executed by NOTHING/.test(r48.out),
     "status=" + r48.status + " out=" + r48.out.trim().slice(0, 220),
+  );
+
+  // 47b: DIRECT EXECUTION counts (2026-10-08). `run: ./scripts/orphan.sh` is how a step runs an
+  //      executable script, and until this case existed every accepted shape required a runner word
+  //      (`bash …`) or a glob — so the shape CI actually uses for the browser recipe was reported as
+  //      "executed by NOTHING", i.e. the rule fired on the change that closed its own recorded gap.
+  //      `baseCi(extra)` APPENDS a line, so `d.test.sh` keeps its caller and cannot orphan this case.
+  const directSkeleton = (runLine) =>
+    skeleton({
+      ci: baseCi(runLine),
+      scripts: { ...wiredScripts, "orphan.sh": "#!/bin/sh\n" },
+      crateTests,
+      e2e: ["a.spec.cjs", "b.spec.cjs", "c.spec.cjs"],
+      playwright: "module.exports = { testDir: './tests/e2e' };\n",
+    });
+  const r47b = run(directSkeleton("      - run: ./scripts/orphan.sh"));
+  assert(
+    "47b: DIRECT execution (`./scripts/orphan.sh`) counts as running it",
+    r47b.status === 0 && !/orphan\.sh is executed by NOTHING/.test(r47b.out),
+    "status=" + r47b.status + " out=" + r47b.out.trim().slice(0, 300),
+  );
+  const r47c = run(directSkeleton("      - run: grep -q foo scripts/orphan.sh"));
+  assert(
+    "47c: ...but READING it (`grep -q foo scripts/orphan.sh`) still does not",
+    r47c.status === 1 && /scripts\/orphan\.sh is executed by NOTHING/.test(r47c.out),
+    "status=" + r47c.status + " out=" + r47c.out.trim().slice(0, 220),
   );
 
   // 49: the floor, with its own explicit value.

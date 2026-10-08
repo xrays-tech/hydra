@@ -34,14 +34,14 @@ const { records, audit } = require("./recorded_exceptions.cjs");
 
 // `scripts/*.sh` that no artifact CI runs, recorded WITH A REASON (rule 1b). The list is REPLACED by
 // `CIW_NOT_EXECUTED_OK` when that is set, so a fixture tree never inherits these records.
-const NOT_EXECUTED_IN_CI_OK = records(process.env.CIW_NOT_EXECUTED_OK, [
-  [
-    "e2e-local.sh",
-    "CI's `ui-e2e` job runs this same suite with its own inline steps and a RELEASE binary; this " +
-      "script is the local/debug runner (it resolves `target/debug/hydra` itself) and the local " +
-      "gate executes it. The duplicated recipe is a real cost, recorded here rather than hidden.",
-  ],
-]);
+//
+// `e2e-local.sh` WAS the one entry, and it is GONE (2026-10-08) because the thing it recorded is fixed:
+// CI's `ui-e2e` job no longer carries its own inline copy of the browser recipe (build → start →
+// seed → playwright → stop), it runs the script, so there is one owner instead of two. Rule 2 sees the
+// suite through that delegation (see `suiteCorpus`). An empty list is the honest state: nothing under
+// `scripts/*.sh` is unreachable now, and `recorded_exceptions.cjs` flags a record that no longer
+// applies, so leaving it would have been a stale claim rather than caution.
+const NOT_EXECUTED_IN_CI_OK = records(process.env.CIW_NOT_EXECUTED_OK, []);
 
 // The root is overridable so the checks themselves can be falsified against a
 // throwaway skeleton (see `check_ci_wiring.test.cjs`): a guard whose predicates
@@ -476,6 +476,20 @@ function invokes(command, file) {
   for (const g of command.matchAll(globRe)) {
     if (globMatchesBasename(g[3], file)) return true;
   }
+  // DIRECT execution: `./scripts/x.sh`, with optional `VAR=value` prefixes, at the start of a line or
+  // after a shell separator. A runner word is NOT required for this shape — an executable script with a
+  // shebang is run by naming it, which is how CI and the local gate both invoke one.
+  //
+  // Measured 2026-10-08: the browser recipe moved into `scripts/e2e-local.sh` and CI's step became
+  // `run: ./scripts/e2e-local.sh`; every pattern above demanded a runner (`bash …`) or a glob, so the
+  // helper reported that script as "executed by NOTHING" — the rule fired on the very change that
+  // closed its recorded gap. The sharp edge stays intact: the file token must sit in COMMAND POSITION,
+  // so `grep -q foo scripts/x.sh` (a read) and `echo scripts/x.sh` are still not execution, and no
+  // pattern here can cross a space except through the `VAR=value` prefix form.
+  const directRe = new RegExp(
+    `(?:^|&&|\\|\\||;|\\|)\\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\\S*)\\s+)*\\.?/?\\S*${esc}(?:\\s|;|$)`,
+  );
+  if (command.split("\n").some((l) => directRe.test(l))) return true;
   return false;
 }
 
@@ -659,7 +673,35 @@ if (!testDir) problems.push("playwright.config.cjs declares no testDir, so what 
 else if (path.normalize(path.relative(ROOT, specDir)) !== testDir) {
   problems.push(`e2e specs live in ${path.relative(ROOT, specDir)} but playwright testDir is ${testDir}`);
 }
-if (!commands.some((c) => c.includes("playwright test"))) problems.push("ci.yml never runs `playwright test`");
+/**
+ * Rule 2's corpus: `ci.yml`'s own commands PLUS the shell scripts those commands invoke.
+ *
+ * Why the delegation is resolved (2026-10-08): the browser recipe now has ONE owner,
+ * `scripts/e2e-local.sh`, and CI reaches the suite by running that script — which is precisely what the
+ * recorded exception about that script asked for. A rule that read only ci.yml's text would report
+ * "ci.yml never runs `playwright test`" for the change that closed the recorded gap, i.e. it would
+ * punish the fix. One level of indirection is what the tree has, and it is resolved only for ENABLED
+ * steps (`commands` already excludes `if: false`), with comments stripped by file type so a mention
+ * inside a comment cannot launder a rule (the sharp edge this file already documents).
+ *
+ * KNOWN LIMIT, stated rather than implied: this is a TEXT corpus, so it proves the suite is REACHABLE
+ * from CI, not that the reachable script really runs it. The script invokes the runner through
+ * `"$PW_BIN"` (variable indirection no textual pattern follows), and the line that satisfies this rule
+ * is its `echo "==> playwright test $*"`. That is no weaker than the inline form it replaces — an
+ * `echo` in a CI step satisfied that one too — and the evidence for "the suite ran" is its own
+ * 20-test output. So do not "tidy away" that echo line: it is load-bearing for this guard.
+ */
+const suiteCorpus = (() => {
+  const parts = commands.slice();
+  for (const c of commands) {
+    for (const m of stripInlineComment(c).matchAll(/(?:^|[\s'"])(?:\.\/)?(scripts\/[A-Za-z0-9._-]+\.sh)/g)) {
+      const p = path.join(ROOT, m[1]);
+      if (fs.existsSync(p)) parts.push(stripFileComments(m[1], fs.readFileSync(p, "utf8")));
+    }
+  }
+  return parts.join("\n");
+})();
+if (!suiteCorpus.includes("playwright test")) problems.push("ci.yml never runs `playwright test`");
 
 /* 3+4. crate test files, and the `#[ignore]` ones --------------------------- */
 const cratesDir = path.join(ROOT, "crates");

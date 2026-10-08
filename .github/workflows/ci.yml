@@ -1252,76 +1252,42 @@ jobs:
           npm install --save-dev @playwright/test@1.55.0
           npx playwright install --with-deps chromium
 
-      - name: Verify prerequisites
-        run: |
-          set -euo pipefail
-          # tests/e2e/seed.sh calls jq 8x; assert rather than assume.
-          command -v jq >/dev/null || { echo "::error::jq is required by tests/e2e/seed.sh"; exit 1; }
-          command -v curl >/dev/null || { echo "::error::curl is required"; exit 1; }
-
-      - name: Start hydra
+      # ONE OWNER for the browser recipe (2026-10-08). This job used to carry its own copy of it —
+      # start the instance with a readiness loop, seed, `npx playwright test`, kill the pid — while
+      # `scripts/e2e-local.sh` carried another for local runs, which is exactly the duplication the
+      # recorded exception in `check_ci_wiring.cjs` named as its cost. The recipe now lives only in
+      # the script (start → seed → suite → stop, with the instance log printed on failure), and this
+      # job supplies what is genuinely CI-specific: a RELEASE binary, the pinned runner + Chromium
+      # with system deps, and an artifact upload. The two overrides are the whole difference:
+      # `E2E_BIN` (the caller built it) and `E2E_PLAYWRIGHT_BIN` (the caller installed the runner).
+      # `KEEP=1` is for the diagnostics step below: without it the script removes its scratch dir on
+      # exit and the failing instance's log would be gone.
+      - name: Admin UI suite — the recipe lives in scripts/e2e-local.sh
         env:
-          # >= MIN_ADMIN_TOKEN_LEN (16): a 15-byte token makes bootstrap exit(1),
-          # which would make this whole job unreachable.
+          E2E_BIN: target/release/hydra
+          E2E_PLAYWRIGHT_BIN: ./node_modules/.bin/playwright
+          E2E_ADMIN_PORT: "8081"
+          E2E_DATA_PORT: "8080"
+          # >= MIN_ADMIN_TOKEN_LEN (16): a 15-byte token makes bootstrap exit(1), which would make this
+          # whole job unreachable.
           HYDRA_ADMIN_TOKEN: dev-admin-token-2026
-          HYDRA_ADMIN_ADDR: 127.0.0.1:8081
-          HYDRA_DB_URL: sqlite://${{ github.workspace }}/e2e-ci.db?mode=rwc
-          # Required since ADR-0002 D-1 (no default: usage must be told where to go). The UI suite
-          # is not about metering, so usage is switched OFF explicitly.
-          HYDRA_USAGE_SINK: none
           # Required, fail-closed: provider api-keys are encrypted at rest.
           HYDRA_ENCRYPTION_KEY: ${{ secrets.HYDRA_E2E_ENCRYPTION_KEY || 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' }}
           RUST_LOG: info
-        run: |
-          set -euo pipefail
-          # `nohup` so the runner does not reap the process when this step's
-          # shell exits.
-          nohup ./target/release/hydra >/tmp/hydra-e2e.log 2>&1 &
-          echo $! >/tmp/hydra-e2e.pid
-          for _ in $(seq 1 60); do
-            kill -0 "$(cat /tmp/hydra-e2e.pid)" 2>/dev/null \
-              || { echo "::error::hydra exited"; tail -50 /tmp/hydra-e2e.log; exit 1; }
-            # `/healthz` is token-FREE only in edge_mode; with the default role
-            # `all` it sits behind the admin-token gate, so an unauthenticated
-            # probe gets 401 and `curl -f` exits 22 forever. This is exactly
-            # what the repo's own leader healthcheck does.
-            if curl -fsS -H "Authorization: Bearer dev-admin-token-2026" \
-                 http://127.0.0.1:8081/api/v1/health >/dev/null 2>&1; then
-              echo "hydra is up"; exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::hydra did not become ready"; tail -50 /tmp/hydra-e2e.log; exit 1
-
-      - name: Seed fixtures
-        env:
-          HYDRA_ADMIN_ADDR: 127.0.0.1:8081
-          HYDRA_ADMIN_TOKEN: dev-admin-token-2026
-        run: ./tests/e2e/seed.sh
-
-      - name: Playwright (chromium)
-        env:
-          HYDRA_BASE: http://127.0.0.1:8081
-          HYDRA_ADMIN_TOKEN: dev-admin-token-2026
-        run: npx playwright test --config=playwright.config.cjs
+          KEEP: "1"
+        run: ./scripts/e2e-local.sh
 
       # A red ui-e2e job must be diagnosable from its OWN evidence: without the
       # hydra log and the Playwright report, the only thing CI shows is a failed
-      # assertion with no server-side context.
+      # assertion with no server-side context. The log path moved with the recipe:
+      # the script writes it into its own ignored scratch dir (`KEEP=1` above).
       - name: Upload e2e diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ui-e2e-diagnostics
           path: |
-            /tmp/hydra-e2e.log
+            .acceptance/e2e-local/hydra.log
             test-results/
           if-no-files-found: warn
           retention-days: 7
-
-      - name: Stop hydra
-        if: always()
-        run: |
-          if [ -f /tmp/hydra-e2e.pid ]; then
-            kill "$(cat /tmp/hydra-e2e.pid)" 2>/dev/null || true
-          fi
