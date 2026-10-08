@@ -1051,6 +1051,16 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **范围诚实说明**：② 是一个**功能级**改动（toc 格式 + 发布路径 + 物化流程 + 兼容与测试），不是一行补丁；上面六步是目前能给出的最小可行设计。
 
+#### ② 动工前的两个设计约束（2026-10-07 选定 B 方案后立刻查到，**尚未动代码**）
+
+选 B（只做 1/2/5：toc 携带序、发布侧线性读、确定性测试）后，第一件事是读 toc 的 codec 与既有测试，结果有两条**推翻了我上面"缺字段即视为 0"的写法**：
+
+1. **格式版本不是"缺字段"而是"另一个版本号"**：`TOC_FORMAT` 当前是 **3**，而解码器对非 3 的格式是**直接拒绝**（`the table of contents declares format {found}; this build speaks {TOC_FORMAT}`）。所以加 revision 不能靠"字段缺失"，而必须 **bump 到 4，并让解码器同时接受 3**（format 3 ⇒ revision = 0），否则**既有部署的树在升级后读不出来**。这是一次**显式的兼容分支**，必须连同"旧 3 必须仍能解"的测试一起写。
+2. **"内容不变 ⇒ 树名不变"是被测试钉住的性质**：`tests/arachne_store.rs::an_unchanged_publish_does_not_rewrite_entities` 断言同一内容两次发布得到**同一个哈希**，理由是"否则每个 follower 都会看到一个虚假的新树"。若每次发布都 `revision += 1`，这个性质**立刻被破坏**：每次空发布都会挪动 head ⇒ **全集群重新物化一遍**（`restore_config` 一次事务）。
+   ⇒ 发布方必须**在实体集合与当前 toc 一致时短路**：直接返回当前哈希（不写 head、不增 revision）。这既保住上面那条性质，也让 revision 只在**内容真的变了**时才前进——而"内容真的变了"正是需要排序的情形。
+
+**因此修订后的 B 方案**（仍然只做 1/2/5，不动物化主流程）：㈠ toc 加 `revision: u64`、`TOC_FORMAT` 3→4、解码器接受 {3,4}（3 ⇒ rev 0）+ 兼容与往返测试；㈡ `publish_inner` 里先用**线性一致的 `get`** 读 head（**每次发布一次**，与①"每秒一次"不同量级）→ 读当前 toc → **实体集合相同则直接返回当前哈希**（短路），否则 `revision = 当前 + 1` 再写；㈢ 确定性测试：同一内容两次发布 ⇒ **同哈希且 revision 不变**（保性质）、内容变化 ⇒ revision 严格 +1、format-3 字节仍可解且 rev=0。物化侧的"先读后决定 + 拒绝更低 revision"（第 3 步）**留到 B 验收通过之后**再做。
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
