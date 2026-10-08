@@ -1061,6 +1061,24 @@ FAIL  gate 5: a real request still flows through the data plane  — HTTP 404 {"
 
 **因此修订后的 B 方案**（仍然只做 1/2/5，不动物化主流程）：㈠ toc 加 `revision: u64`、`TOC_FORMAT` 3→4、解码器接受 {3,4}（3 ⇒ rev 0）+ 兼容与往返测试；㈡ `publish_inner` 里先用**线性一致的 `get`** 读 head（**每次发布一次**，与①"每秒一次"不同量级）→ 读当前 toc → **实体集合相同则直接返回当前哈希**（短路），否则 `revision = 当前 + 1` 再写；㈢ 确定性测试：同一内容两次发布 ⇒ **同哈希且 revision 不变**（保性质）、内容变化 ⇒ revision 严格 +1、format-3 字节仍可解且 rev=0。物化侧的"先读后决定 + 拒绝更低 revision"（第 3 步）**留到 B 验收通过之后**再做。
 
+#### B 的实施结果（2026-10-07）：㈠㈢ 实测通过、㈡ **被集群套件否掉**，整体已回退
+
+**做了什么**：按上面 ㈠㈡㈢ 全部写完（toc 的 revision/格式 4/兼容 3、`Cursor::u64`、`toc_for`/`toc_of` 接 revision、发布侧线性读 head + 读当前 toc + 内容未变短路 + revision 递增），并跑受影响套件。
+
+**通过的（可复现）**：
+* `tests/arachne_store.rs` **8/8**，含新增两条——`a_toc_carries_a_revision_and_still_reads_the_format_before_it`（往返 + **手写 format-3 字节仍解出 rev 0**）、`a_publish_advances_the_revision_only_when_the_content_changes`（同内容 ⇒ 同哈希且 **rev 不变**；内容变化 ⇒ rev **恰好 +1**）；
+* **被钉住的性质没破**：既有的 `an_unchanged_publish_does_not_rewrite_entities` 仍绿 ⇒ 短路设计达成了"空发布不动 head"。
+
+**被否掉的（关键）**：`tests/arachne_three_nodes.rs` **2 个失败** —— `a_write_on_a_non_leader_node_reaches_every_node`、`a_management_write_on_any_node_is_accepted_and_the_cluster_converges`；**回退后 4/4 通过**。即**发布侧那一次线性一致读，在集群 bring-up/换主期间会让写入失败**——与①（物化侧每 tick 一次）**同一个陷阱、换了一条路径**。
+
+**⇒ 结论：② 与① 被同一个缺失原语挡住**。`arachne-kv` 既不给提交索引（`put` 返回 `()`），也不给"廉价且随时可用"的权威读：`get` 需要 quorum 确认（bring-up/少数派期间失败），`get_stale` 又非单调。而"序"必须**权威**才成立（用陈旧 head 推 revision 会让 head 倒退，等于把缺陷换个地方重演），"记住见过的 head"又被合法回滚否掉（见上）。
+
+**因此剩下的是取舍，而不是实现细节**（供裁定）：
+* **(甲) 向上游要一个原语**：让 `put`（或读）带出提交索引/日志位置，②就能用一次性、廉价的序，且不需要任何 quorum 读。这是唯一能让 ② 又正确又不扰动的路径。
+* **(乙) 维持现状（已交付的部分）**：hazard 与两次实测都写在代码注释与本节；写路径在"本地提交但发布失败"时**本来就大声回 503 `config_not_published`**，而"两个库一致缺一行"这种静默形态目前只在 CI/承压机器上出现（本地空闲 0/5、有负载约 1/3，门会变）。
+* **(丙) 物化侧不做顺序、改做"破坏性更小"的应用**：**已否**——树是权威，缺失的实体就是"被删掉的配置"，改成合并会让删除永远生效不了。
+
+
 **目前能说的与不能说的**：cl-a 至少物化出了 `providers`（否则不会有那条 WARN），却缺 `provider_keys` / `tenant_providers`；cl-b 一行日志都没有 —— 与“**部分物化 / 跟随者没有收敛**”一致，但**尚未定性**：可能是物化循环被阻塞或在重试（`hydra_replica_materialize_retries_total` 是下一个该读的序列），也可能是 seed 的写在发布侧只落了一部分。**下一步的诊断层**（一次 CI 循环即可）：让该演练打印 `seed()` 每次 POST 的状态码、写入侧 `GET` 回来的配置树、以及两节点的 `hydra_replica_materialize_retries_total`。**在拿到这些之前不要猜**：本地不可复现，所以任何"修法"都会是未经验证的。
 
 **同时记录本次已经定性并修掉的部分**（同一次 CI 恢复工作）：ClickHouse 服务容器缺凭据导致 `init.sql` 一律 403（官方镜像禁用未认证 `default` 的网络访问，`24.3` 是移动标签）；`--ignored` 的 `usage_query` 需要**播种**窗口（该测试自己就写着 CI 的 fixture 是空的），且它的手工对照查询必须带凭据（reqwest 不会把 URL userinfo 变成 `Authorization`）。这三处已在 CI 上跑过并通过（`Create usage_record …` ✓、`A fresh instance must carry … dedup window` ✓）。
