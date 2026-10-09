@@ -1359,52 +1359,73 @@ impl ProxyHttp for HydraProxy {
         ctx.usage = usage.clone();
 
         // Metrics (§17): request counter + latency histogram + token usage.
-        // Increment for every proxied request that selected a provider.
-        if let (Some(tenant), Some(sel)) = (ctx.tenant.as_ref(), ctx.selected.as_ref()) {
-            let model = ctx.model_key.clone().unwrap_or_default();
-            crate::admin::metrics::record_request(&tenant.id, &sel.provider_id, &model, status);
-            crate::admin::metrics::record_request_duration(
-                &tenant.id,
-                &sel.provider_id,
-                &model,
-                ctx.started_at.elapsed().as_secs_f64(),
-            );
-            if let Some(u) = usage.as_ref() {
-                if let Some(p) = u.tokens_in {
-                    crate::admin::metrics::record_tokens(
-                        &tenant.id,
-                        &sel.provider_id,
-                        &model,
-                        "prompt",
-                        p,
-                    );
-                }
-                if let Some(c) = u.tokens_out {
-                    crate::admin::metrics::record_tokens(
-                        &tenant.id,
-                        &sel.provider_id,
-                        &model,
-                        "completion",
-                        c,
-                    );
-                }
-                if let Some(cached) = u.cache_hit_tokens {
-                    crate::admin::metrics::record_cached_tokens(
-                        &tenant.id,
-                        &sel.provider_id,
-                        &model,
-                        cached,
-                    );
-                }
-            }
-            // TTFT histogram (only when a first chunk was observed).
-            if let Some(ttft_ms) = ctx.ttft_ms {
-                crate::admin::metrics::record_ttft(
-                    &tenant.id,
-                    &sel.provider_id,
-                    &model,
-                    ttft_ms as f64 / 1000.0,
+        //
+        // One sample per proxied request that resolved to a tenant — including
+        // failure paths (all candidates failed, routing error, timeout, capacity
+        // exhausted) where no provider was selected. When no provider was
+        // selected the `provider` label is the empty string `""`, keeping the
+        // label cardinality unchanged.
+        //
+        // Two categories are NOT recorded:
+        // - `tenant=None` (auth / tenant-resolution failure): the request never
+        //   became a "proxied" request from the tenant's perspective.
+        // - Tenant-API requests (`tenant_api_endpoint` is Some): they set
+        //   `ctx.tenant` for attribution but deliberately leave `ctx.selected`
+        //   unset (see `tenant_api::dispatch`); a tenant's own control-plane
+        //   call must not be billed to it.
+        if ctx.tenant_api_endpoint.is_none() {
+            if let Some(tenant) = ctx.tenant.as_ref() {
+                let model = ctx.model_key.clone().unwrap_or_default();
+                let provider = ctx.selected.as_ref().map_or("", |s| s.provider_id.as_str());
+                let elapsed = ctx.started_at.elapsed().as_secs_f64();
+
+                crate::admin::metrics::record_request(&tenant.id, provider, &model, status);
+                crate::admin::metrics::record_request_duration(
+                    &tenant.id, provider, &model, elapsed,
                 );
+
+                // Token usage + TTFT are only meaningful when a provider was
+                // actually selected (i.e. the upstream answered with a streamable
+                // response).
+                if let Some(sel) = ctx.selected.as_ref() {
+                    if let Some(u) = usage.as_ref() {
+                        if let Some(p) = u.tokens_in {
+                            crate::admin::metrics::record_tokens(
+                                &tenant.id,
+                                &sel.provider_id,
+                                &model,
+                                "prompt",
+                                p,
+                            );
+                        }
+                        if let Some(c) = u.tokens_out {
+                            crate::admin::metrics::record_tokens(
+                                &tenant.id,
+                                &sel.provider_id,
+                                &model,
+                                "completion",
+                                c,
+                            );
+                        }
+                        if let Some(cached) = u.cache_hit_tokens {
+                            crate::admin::metrics::record_cached_tokens(
+                                &tenant.id,
+                                &sel.provider_id,
+                                &model,
+                                cached,
+                            );
+                        }
+                    }
+                    // TTFT histogram (only when a first chunk was observed).
+                    if let Some(ttft_ms) = ctx.ttft_ms {
+                        crate::admin::metrics::record_ttft(
+                            &tenant.id,
+                            &sel.provider_id,
+                            &model,
+                            ttft_ms as f64 / 1000.0,
+                        );
+                    }
+                }
             }
         }
 

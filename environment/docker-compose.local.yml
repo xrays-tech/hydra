@@ -272,13 +272,14 @@ services:
             ttft_ms            Nullable(UInt32),
             upstream_host      Nullable(String),
             error              Nullable(String),
-            created_at         String
-          ) ENGINE = MergeTree() ORDER BY (created_at, tenant_id, provider_id) SETTINGS non_replicated_deduplication_window = 1000"
+            created_at         String,
+            dedup_key          String COMMENT 'row-level idempotency key (per-request trace id), re-sends of one logical event share it and are collapsed by ReplacingMergeTree'
+          ) ENGINE = ReplacingMergeTree() ORDER BY (dedup_key, tenant_id, provider_id) SETTINGS non_replicated_deduplication_window = 1000"
         clickhouse-client --host clickhouse --query "
           ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000"
         clickhouse-client --host clickhouse --query "
           ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)"
-        echo "[clickhouse-init] usage_record ready (v3: sub_tenant_id present)"
+        echo "[clickhouse-init] usage_record ready (v4: row-level idempotency via dedup_key + ReplacingMergeTree)"
     depends_on:
       clickhouse: { condition: service_healthy }
     restart: "no"

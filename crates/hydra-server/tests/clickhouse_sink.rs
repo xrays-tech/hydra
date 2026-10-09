@@ -39,7 +39,8 @@ fn sample() -> UsageRecord {
 }
 
 // The `usage_record` columns, in declaration order
-// (environment/clickhouse/init.sql — provider-neutral token columns).
+// (environment/clickhouse/init.sql — provider-neutral token columns plus the
+// row-level idempotency key `dedup_key`).
 const USAGE_COLUMNS: &[&str] = &[
     "tenant_id",
     "provider_id",
@@ -56,6 +57,7 @@ const USAGE_COLUMNS: &[&str] = &[
     "upstream_host",
     "error",
     "created_at",
+    "dedup_key",
 ];
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,13 @@ fn clickhouse_json_row_matches_usage_record_schema() {
     assert!(
         json.contains("\"ttft_ms\":180"),
         "ttft_ms Some must be a bare number: {json}"
+    );
+    // The row-level idempotency key is the per-request trace id (the sample's is
+    // "trace-1"), so a re-sent copy of the same event — even in a different batch —
+    // recomputes the SAME key and is collapsed by the table's ReplacingMergeTree.
+    assert!(
+        json.contains("\"dedup_key\":\"trace-1\""),
+        "dedup_key must be the trace id (row-level idempotency): {json}"
     );
 }
 
@@ -200,9 +209,19 @@ async fn clickhouse_sink_writes_batch() {
 
     let before = count(client.clone(), url.clone()).await;
 
+    // Two DISTINCT events, not two copies of one event: since 2026-10-09 the table
+    // carries row-level idempotency (`dedup_key` = trace_id), and ClickHouse's
+    // default `optimize_on_insert` collapses same-key rows within one inserted part —
+    // two records with the SAME trace_id are now ONE logical event and would land as
+    // one row. This test's job is "the sink writes the rows", so it pushes two
+    // different events and expects +2.
+    let mut a = sample();
+    a.trace_id = "trace-a".into();
+    let mut b = sample();
+    b.trace_id = "trace-b".into();
     let sink = ClickHouseSink::new(&url, 2, 1);
-    sink.record(sample()).await;
-    sink.record(sample()).await;
+    sink.record(a).await;
+    sink.record(b).await;
     // Drop flushes; give the one-shot flush a moment to finish.
     drop(sink);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

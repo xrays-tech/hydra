@@ -349,10 +349,15 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
         // listed, persisted and shown in the admin UI, and it enforces nothing.
         // (The accounting path DOES pass a provider, so such a role also produces a
         // window that is written and never read.) This is a WARNING rather than a
-        // hard error on purpose: existing configs must not stop validating, but the
-        // trap must stop being silent. Whether the dimension should instead be
-        // implemented (per-candidate checks) or rejected at the admin write boundary
-        // is a product decision — see the plan's D-11.
+        // hard error on purpose: configs that predate the decision below must not stop
+        // validating, but the trap must stop being silent.
+        //
+        // Decision D-11 (2026-10-09): the dimension is REJECTED at the admin write boundary —
+        // `POST /limit-roles` and `PUT /limit-roles/:id` answer 400
+        // (`matching_provider_cannot_match`) instead of persisting a role that can never fire.
+        // This Warn remains the defense for what that boundary cannot see: rows already in a
+        // legacy database, file-loaded configs and restored snapshots still validate (and warn) —
+        // they just can no longer be WRITTEN through the admin API.
         if role.matching_provider.is_some() {
             issues.push(ValidationIssue::warn_about(role.id.clone(), format!(
                 "limit_role '{}' declares matching_provider '{}', which CANNOT match: the                  limit pre-gate runs before routing, so no provider is known yet and this                  role is skipped entirely (its limits never apply)",

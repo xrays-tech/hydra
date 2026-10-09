@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""`limit_roles` ENFORCEMENT, black-box — plus the measured evidence for decision item D-11.
+"""`limit_roles` ENFORCEMENT, black-box — plus decision item D-11 (the write boundary
+refuses the dead `matching_provider` dimension with 400).
 
 `ops.md` §4 documents the whole feature: roles live in the `limit_roles` table, each carries
 `matching_*` dimensions (NULL = match-all), a `limit_count` and/or `limit_token` ceiling and a
@@ -17,9 +18,10 @@ Cases (throwaway node + a mock upstream that reports `usage`):
      different MODEL does not fire for this model
   L4 a soft-disabled role (`enabled=false`) matches nothing
   L5 `limit_token` fires on the NEXT request once the recorded usage crosses the ceiling
-  L6 **D-11 evidence**: a role whose only dimension is `matching_provider` never fires —
-     measured (the code says it "CANNOT match" because the pre-limit gate runs BEFORE routing,
-     where no provider is chosen yet)
+  L6 **D-11 (decided 2026-10-09)**: a role that declares `matching_provider` is REFUSED by the
+     admin write boundary with 400 and nothing is persisted — the dimension can never match
+     (the pre-limit gate runs BEFORE routing, where no provider is chosen yet), so persisting it
+     would be a role that enforces nothing while looking like it does
   L7 (round-120 promise): a key-scoped role with `matching_tenant` NULL makes the node WARN by
      name, and the window really is shared — t2's first request on the same key is refused by
      t1's usage; the control (same role scoped to t1) leaves t2 untouched and stays quiet
@@ -373,19 +375,22 @@ def main():
         admin("POST", "/reload", {})
         time.sleep(0.2)
 
-        # ---- L6: D-11 evidence — matching_provider never fires -----------------
-        put_role(role("r-prov", matching_provider="p1", limit_count=1))
-        codes_prov = [proxied("echo")[0] for _ in range(3)]
-        log = open(os.path.join(DIR, "node.log"), errors="replace").read()
-        announce("L6 a role whose only dimension is matching_provider", f"codes={codes_prov}")
-        announce("L6 the node's own warning",
-                 next((l for l in log.splitlines() if "matching_provider" in l), "<none>")[:150])
-        check("L6 (D-11): such a role does NOT enforce anything — the gate runs before routing, "
-              "where no provider has been chosen yet",
-              codes_prov == [200, 200, 200], f"codes={codes_prov}")
-        warn6 = next((l for l in log.splitlines() if "matching_provider" in l), None)
-        check("L6 (D-11): ...and the node says so at startup/config load",
-              warn6 is not None, f"warning line: {warn6[:120] if warn6 else '<none found>'}")
+        # ---- L6: D-11 (decided 2026-10-09) — the write boundary REFUSES the dead dimension ----
+        # The dimension can never match (the pre-gate runs BEFORE routing, where no provider is
+        # known yet), so a role that declares it enforces NOTHING while looking like it does.
+        # The original L6 measured that half ("never fires" + the node's Warn). Decision D-11
+        # pins the fix: the admin write boundary refuses the row with 400 and persists nothing,
+        # instead of the old "201 plus a Warn a script never reads".
+        st_prov, out_prov = admin("POST", "/limit-roles",
+                                  role("r-prov", matching_provider="p1", limit_count=1))
+        announce("L6 a role whose only dimension is matching_provider", f"POST -> {st_prov}")
+        check("L6 (D-11): the write is REFUSED with 400 — the dimension can never match (the "
+              "pre-gate runs before routing, so the role would be skipped entirely)",
+              st_prov == 400 and "matching_provider_cannot_match" in out_prov,
+              f"HTTP {st_prov} {out_prov[:120]}")
+        st_get, _ = admin("GET", "/limit-roles/r-prov")
+        check("L6 (D-11): ...and nothing was persisted (the role does not exist)",
+              st_get == 404, f"GET /limit-roles/r-prov -> HTTP {st_get}")
         # ---- L7: a key-scoped role with NO tenant scope is a CROSS-TENANT budget ----
         # Round 120 added a startup warning for this and `ops.md` §4 now states the consequence
         # ("its window is shared by EVERY tenant that accepts that key"). Both halves are measured
@@ -523,9 +528,9 @@ def main():
         print(f"LIMIT ROLES: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print("LIMIT ROLES: PASSED (count + token ceilings, Retry-After, most-restrictive rule, "
-          "dimension scoping, soft-disable, the measured D-11 finding, the round-120 cross-tenant "
-          "warning + its documented consequence, one-config-generation-per-request, and where the "
-          "config warnings appear (write path included)")
+          "dimension scoping, soft-disable, the D-11 write-boundary refusal, the round-120 "
+          "cross-tenant warning + its documented consequence, one-config-generation-per-request, "
+          "and where the config warnings appear (write path included)")
     return 0
 
 

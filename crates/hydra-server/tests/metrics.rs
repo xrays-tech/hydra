@@ -486,3 +486,175 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         .expect("stats endpoint reachable");
     assert_eq!(anon.status(), 401, "stats/usage without token must be 401");
 }
+
+/// A request that resolved a tenant but exhausted all candidates (upstream
+/// 5xx) must still produce a `hydra_requests_total` sample with
+/// `provider=""` and `status="5xx"`. Before the 2026-10-09 fix this path was
+/// invisible to the counter, making `status=~"5.."` alerts dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_candidates_failed_produces_empty_provider_sample() {
+    // --- wiremock upstreams: auth OK, upstream 500 --------------------------
+    let auth_server = MockServer::start().await;
+    let upstream_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
+        .mount(&auth_server)
+        .await;
+
+    // The upstream returns 500 → all candidates fail → `ctx.selected` stays `None`.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(r#"{"error":"upstream boom"}"#))
+        .mount(&upstream_server)
+        .await;
+
+    // --- seed + build shared state (same shape as the success test) ---------
+    let pool = common::setup_pool().await;
+    seed(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream_server.uri(),
+    )
+    .await;
+
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("ConfigStore::load");
+
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
+    let limiter = Arc::new(RateLimiter::new());
+    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
+
+    let proxy_state = AppState::for_tests(
+        store.clone(),
+        auth.clone(),
+        breaker.clone(),
+        limiter,
+        sink,
+        ProxyConfig::default(),
+        hydra_server::tenant_api::TenantApiConfig::default(),
+    );
+
+    let admin_state = Arc::new(AdminState::new(
+        pool,
+        store,
+        auth,
+        breaker,
+        key_provider,
+        Some(TOKEN.to_string()),
+        hydra_server::proxy::admission::AdmissionControl::new(),
+        None,
+    ));
+
+    // --- start Pingora -------------------------------------------------------
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+    let proxy_url_for = |port: u16| format!("http://localhost:{port}/v1/chat/completions");
+
+    let mut attempts = 0u32;
+    let (_proxy_port, admin_port) = loop {
+        attempts += 1;
+        let proxy_port = ephemeral_port();
+        let admin_port = ephemeral_port();
+        let proxy_addr = format!("127.0.0.1:{proxy_port}");
+        let admin_addr = format!("127.0.0.1:{admin_port}");
+
+        let mut server = Server::new(Some(Opt::default())).expect("Server::new");
+        server.bootstrap();
+        let mut proxy_svc = pingora_proxy::http_proxy_service(
+            &server.configuration,
+            HydraProxy::new(proxy_state.clone()),
+        );
+        proxy_svc.add_tcp(&proxy_addr);
+        server.add_service(proxy_svc);
+        let mut admin_svc =
+            ListenService::new("admin".to_string(), AdminService::new(admin_state.clone()));
+        admin_svc.add_tcp(&admin_addr);
+        server.add_service(admin_svc);
+        std::thread::spawn(move || server.run_forever());
+
+        let mut last_err = None;
+        let mut ready = false;
+        for _ in 0..25 {
+            match client
+                .post(proxy_url_for(proxy_port))
+                .header("authorization", "Bearer test-client-key")
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    // The proxy must forward the upstream 500 (all candidates
+                    // exhausted → last_status is forwarded verbatim).
+                    assert!(
+                        r.status().is_server_error(),
+                        "expected 5xx from all-candidates-failed path, got {}",
+                        r.status()
+                    );
+                    ready = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        if ready {
+            break (proxy_port, admin_port);
+        }
+        assert!(
+            attempts < 3,
+            "proxy never ready after {attempts} attempts (last error: {last_err:?})"
+        );
+        eprintln!("attempt {attempts}: proxy never became ready; retrying");
+    };
+
+    // --- query /metrics and assert the failure sample -----------------------
+    let metrics_url = format!("http://127.0.0.1:{admin_port}/metrics");
+    let resp = {
+        let mut last_err = None;
+        let mut ok = None;
+        for _ in 0..50 {
+            match client.get(&metrics_url).bearer_auth(TOKEN).send().await {
+                Ok(r) => {
+                    ok = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        ok.unwrap_or_else(|| panic!("admin never ready: {last_err:?}"))
+    };
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.expect("metrics body");
+
+    // The all-candidates-failed request must produce a sample with
+    // provider="" and a 5xx status. Prometheus sorts labels alphabetically:
+    // model, provider, status, tenant.
+    assert!(
+        text.contains(
+            r#"hydra_requests_total{model="gpt-4",provider="",status="500",tenant="t1"}"#
+        ),
+        "expected hydra_requests_total with provider=\"\" and status=\"500\" in:\n{text}"
+    );
+}

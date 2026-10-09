@@ -322,7 +322,7 @@ CREATE TABLE limit_role (
     matching_key     TEXT,                 -- 匹配客户端 api-key（NULL=全部）；**封存存放**：形如 `sealed:v1:…`（决策 D-16①），NULL 仍表示"匹配全部"
     matching_model   TEXT,                 -- 匹配 model（NULL=全部）
     matching_tenant  TEXT,                 -- 匹配租户 id（NULL=全部）
-    matching_provider TEXT,                -- 匹配供应商 id（NULL=全部）
+    matching_provider TEXT,                -- 匹配供应商 id（NULL=全部）。**写入即拒**：该维度在限流前置门禁（路由前）无法匹配，管理写入非 NULL 直接 400 `matching_provider_cannot_match`（决策 D-11，2026-10-09；仅 legacy 行残留并由 config::validate Warn）
     limit_count      INTEGER,              -- 限额请求数（NULL=不限）
     limit_token      INTEGER,              -- 限额 token（NULL=不限）
     window           TEXT NOT NULL CHECK (window IN ('m', 'h', 'd')),
@@ -1024,7 +1024,7 @@ pub struct UsageRecord {
   **D-15②/D-16①③**（均已落地）。
 - `matching_model` 为 NULL **或** 等于请求 model_key；
 - `matching_tenant` 为 NULL **或** 等于租户 id；
-- `matching_provider` 为 NULL **或** 等于选中 provider id（注：provider 在路由后确定，故 provider 维度的 token 限流在 `logging` 阶段二次检查/记账）。
+- `matching_provider` —— **已死维度（决策 D-11，2026-10-09）**：前置门禁在路由之前运行，`provider` 未知、永不相等，该维度任何非 NULL 值都不可能匹配。管理写入（POST/PUT）非 NULL 直接 400 `matching_provider_cannot_match`；存量 config 由 `config::validate` Warn 点名。实际只可能为 NULL（匹配全部）。
 
 多个匹配项**叠加生效**（取最严）。
 

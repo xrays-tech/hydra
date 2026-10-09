@@ -1043,11 +1043,13 @@ db 映射的端到端测试（形状已指明：文件库 + 持写锁的连接�
 - 记账侧却带着 provider 写窗口（`proxy.rs:1435-1445` 的 `provider: Some(&sel.provider_id)` + `add_tokens`）⇒ 单向窗口；
 - 该维度**可以被配置并落库**（`migrations/0001_init.sql:76`、`db.rs:1289/1346`、`admin/handlers.rs:1438` 的 `POST /limit-roles` **无任何校验**），全仓**没有**任何非 `None` 的 `matching_provider` 测试用法。
 - **方向：免费额度（该限流永不生效），且静默**（无警告、无校验、无指标）。修法二选一并显式化：①让检查也能表达该维度（候选集合已知后逐候选构造带 provider 的 `MatchCtx` 再检查）；②若产品上不支持，`config::validate` 对该字段报错/Warn 且 admin 写入口拒绝。
+- **已修复（2026-10-09，D-11 决策落定为修法②）**：`config::validate` 对存量行保留具名 Warn（`crates/hydra-core/src/config.rs:356-362`），同时 admin 写入口（POST/PUT `/api/v1/limit-roles`）把**非 NULL `matching_provider` 直接 400 `matching_provider_cannot_match`**（`crates/hydra-server/src/admin/handlers.rs` 新增 `matching_provider_write_error`，先于任何 DB 写）。面向用户的配置表面随之移除：admin-ui 表单字段 + 表格列（`admin-ui/app.js`）、CLI `--matching-provider` 选项（`tools/hydra-cli`）均删除，i18n dead keys 清理。测试：新增 `tests/admin_api.rs::limit_role_write_rejects_the_inert_provider_dimension`（POST→400 不落库、PUT→400 原行不变、干净写入→201/200）；`integration/test_limit_roles_enforcement.py` L6 从「写入 + 断言永不触发 + Warn」改为「POST→400 + GET→404 未落库」。仍接受该维度的**非管理写入路径**（DB restore 恢复 legacy 备份、集群复制同步 legacy 行、文件加载配置）由保留的 Warn 兜底。
 
 ### P1-2 **全部候选失败**（以及鉴权拒绝、路由失败）的请求在指标与账务里**归零**
 - `logging` 的两条记录分支都以 `ctx.selected` 为前提（`proxy.rs:1321-1323`、`:1371-1372`），而 `selected` 只在 **2xx** 分支写入（`:1063-1067`）⇒ 上游集体 5xx/4xx/429、超时、容量不足、路由失败这些"客户端确实收到了答复"的请求**不产生任何 `hydra_requests_total` 样本**，`status=5xx` 这条曲线**恒为 0**。
 - 代码与两处文档直接矛盾：`design.md:1466` 写该指标是"请求总数（**含失败**）"，`metrics.rs:545` 写 "one per proxied request, **including fails**"。
 - **方向：计数为零次 ⇒ 告警盲区**（按 `status=~"5.."` 写的规则永不触发）。修法必须保持"租户 API 流量不进这一族"的既有区分（`design-tenant-api.md:961` 的自指防护）——具体往哪个指标族/标签写是**产品决策**。
+- **已修复（2026-10-09）**：`logging` 改为两层守卫——外层 `ctx.tenant_api_endpoint.is_none()` 排除租户 API 控制面请求（自指防护保持，`tenant_api` 设 `ctx.tenant_api_endpoint` 标记自己、不依赖 `selected`），内层 `ctx.tenant.is_some()` 才计数；失败路径（全候选失败/路由失败/超时/容量不足）现在也产生一条 `hydra_requests_total` 样本，`provider` 标签在未选中任何 provider 时为空串 `""`（标签基数不变），`status=5xx` 不再恒 0。`design.md`/`metrics.rs` 的"含失败"表述自此与代码一致。新增集成测试 `tests/metrics.rs::all_candidates_failed_produces_empty_provider_sample`。残留观察项：`hydra_requests_total` 是否被外部按营收口径消费（原始修法选择的依据）不变。
 
 ### P2-1 非 2xx 时**丢弃上游错误体**且不消费响应（连接无法回池）
 `proxy.rs:1119-1146` 的非 2xx 分支既不读也不转发 `resp`，客户端只拿到 Hydra 拼的通用 JSON；注释却自称 "forwarded verbatim when they carry a useful code"。**方向：可用性/可诊断性**（上游的 `x-request-id`、"model not found"、"context length exceeded" 全被替换成 `all_proxies_failed`），并让错误风暴期的连接无法复用（机制推断，未实跑）。修法：有界（如 64 KiB）读取上游 body 并在后置分支作为 detail 回传，顺带让连接可回池。

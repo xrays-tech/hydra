@@ -194,7 +194,7 @@
 
 - **edge 失去 provider 健康感知**：所有 `provider_id` 维度的状态都在 router。edge 无法在 hop 前对"全 provider 都 dead"的租户早拒。当前 1-tier 中 `router::resolve` 在 `request_filter` 内过滤 dead-set，未发送任何上游字节就能 503；2-tier 必须先把请求（含 body）送到 router 才能判定。**坏 provider 的请求代价从 0 字节涨到 full body hop。**
 - **breaker 触发与恢复的观测点**：当前 `fail_to_connect`/`error_while_proxy` 直接喂 breaker；2-tier 这些 hook 在 router 进程的客户端调用栈里，需要重新实现（不是 Pingora 的 hook 了，是 hyper 调用结果的处理）。
-- **rate-limit 的 provider 维度**：`limit_role.matching_provider` 在路由后才能评估（§10.3）。1-tier 在 `logging` 阶段同一进程补记账；2-tier 也行，但 token 维度的限流信息现在跨了进程边界（router 算出用量 → 用量要回到 edge 记？还是 router 直接记？后者要求 router 也持 RateLimiter 状态）。
+- **rate-limit 的 provider 维度**：`limit_role.matching_provider` 在路由后才能评估（§10.3）。1-tier 在 `logging` 阶段同一进程补记账；2-tier 也行，但 token 维度的限流信息现在跨了进程边界（router 算出用量 → 用量要回到 edge 记？还是 router 直接记？后者要求 router 也持 RateLimiter 状态）。※ **该维度已被决策 D-11 作废（2026-10-09）**：前置门禁在路由前运行、provider 未知，非 NULL 永不匹配，管理写入 400 拒绝 —— 本讨论成为历史。
 
 ### 6.7 Pingora 在 edge 是否还"值回票价"？
 

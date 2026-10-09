@@ -321,6 +321,16 @@ def main():
               row.get("client_api_key") == "sk*******-1"
               and "sk-tenant-1" not in reqbody,
               f"client_api_key={row.get('client_api_key')!r}")
+        # The row-level idempotency key: the per-request trace id (derived in
+        # clickhouse_dedup_key). A re-sent copy of this event — even in a different batch —
+        # recomputes the SAME key and is collapsed by the table's ReplacingMergeTree, so an
+        # equivalent re-send is counted once. The value is the `X-Hydra-Trace-Id` the proxy
+        # generated (`hydra-…`); pin the shape so a regression that drops or renames the column
+        # turns this leg red.
+        check("W2: the row carries a `dedup_key` (row-level idempotency, the per-request trace id)",
+              isinstance(row.get("dedup_key"), str)
+              and row["dedup_key"].startswith("hydra-"),
+              f"dedup_key={row.get('dedup_key')!r}")
     finally:
         stop(node_a)
         close_server(ch_a)

@@ -198,7 +198,7 @@ hydra-admin tenant-providers delete tp1 -y
 
 #### limit-roles
 
-Rate-limit roles matched by tenant / key / model / provider.
+Rate-limit roles matched by tenant / key / model.
 
 ```bash
 hydra-admin limit-roles create \

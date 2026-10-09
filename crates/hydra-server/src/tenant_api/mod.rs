@@ -337,10 +337,14 @@ pub async fn dispatch(
         return Ok(true);
     };
 
-    // Attribute the request for logs/metrics. `ctx.selected` stays None, which is
-    // what keeps this request out of `hydra_requests_total` and out of the usage
-    // record: a tenant's own control-plane call must not be billed to it, and
-    // querying usage must not itself count as usage.
+    // Attribute the request for logs/metrics. Two things keep it out of the
+    // business metrics:
+    // - `ctx.tenant_api_endpoint` is set (above): `logging` now keys its request
+    //   counter on `tenant_api_endpoint.is_none()`, so this request never enters
+    //   `hydra_requests_total` regardless of `ctx.selected`.
+    // - `ctx.selected` stays None: which keeps it out of the usage record.
+    // A tenant's own control-plane call must not be billed to it, and querying
+    // usage must not itself count as usage.
     ctx.tenant = Some(authenticated.tenant.clone());
 
     // 4. Route. All five endpoints are served; a path under the reserved prefix

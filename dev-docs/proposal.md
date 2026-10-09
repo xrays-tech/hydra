@@ -43,7 +43,7 @@ LimitRole：访问限制
   matching_key： 匹配的api-key（留空表示匹配所有api-key）
   matching_model：匹配model（留空表示匹配所有的模型）
   matching_tenant：匹配租户（留空表示匹配所有的租户）
-  matching_provider：匹配供应商（留空表示匹配所有供应商）
+  matching_provider：匹配供应商（留空表示匹配所有供应商）※ **决策 D-11（2026-10-09）后该维度已死**：限流前置门禁在路由前运行、provider 未知 ⇒ 非 NULL 永不匹配，管理写入直接 400 `matching_provider_cannot_match`
   limit_count：限额请求书
   limit_token：限额token
   window：限额窗口（m分钟，h小时，d天）

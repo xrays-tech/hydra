@@ -608,8 +608,13 @@ fn metrics() -> Option<&'static Metrics> {
 // record_* helpers (instrumentation call-sites)
 // ---------------------------------------------------------------------------
 
-/// Increment `hydra_requests_total` (one per proxied request, including fails).
-#[allow(dead_code)]
+/// Increment `hydra_requests_total`.
+///
+/// One sample per proxied request that resolved to a tenant, including failure
+/// paths (all candidates failed, routing error, timeout, capacity exhausted).
+/// When no provider was selected the `provider` label is the empty string `""`.
+/// Requests that never resolved a tenant (auth / tenant-resolution failure)
+/// are not recorded.
 pub fn record_request(tenant: &str, provider: &str, model: &str, status: u16) {
     if let Some(m) = metrics() {
         m.requests
@@ -619,7 +624,10 @@ pub fn record_request(tenant: &str, provider: &str, model: &str, status: u16) {
 }
 
 /// Observe end-to-end request latency in seconds.
-#[allow(dead_code)]
+///
+/// Recorded for every proxied request that resolved to a tenant (same
+/// boundary as `record_request`): the `provider` label is `""` when no
+/// provider was selected.
 pub fn record_request_duration(tenant: &str, provider: &str, model: &str, secs: f64) {
     if let Some(m) = metrics() {
         m.request_duration

@@ -182,7 +182,7 @@ TLS ：https://<任意能连到数据面的主机名>/tenant/{tenant_id}/api/v1/
 
 **落点（必须早于 (3) 的 `:396`）**：`request_filter` 开头新增一次前缀判定，命中则 `return tenant_api::dispatch(...).await`（`Ok(true)` 短路，Pingora 不再拨上游）；未命中则现有流程**零改动**。
 
-**短路后的日志/指标语义**（容易踩）：`logging`（`proxy.rs:1029-1157`）只在 `ctx.tenant.is_some() && ctx.selected.is_some()` 时写用量记录与 `hydra_requests_total`。租户 API 请求要**设 `ctx.tenant`（便于归因）但绝不设 `ctx.selected`** → 不产生用量记录、不污染业务指标；状态码写 `ctx.status_code`。计费口径因此天然干净：**租户自助请求不进 `usage_record`，也不会被计入自己的 token 用量**（否则租户查用量会把查询本身算进去，形成自指噪声）。
+**短路后的日志/指标语义**（容易踩）：`logging`（`proxy.rs:1361-1430`）对 `hydra_requests_total`/`hydra_request_duration_seconds` 用**两层守卫**——外层 `ctx.tenant_api_endpoint.is_none()` 排除租户 API 控制面请求（`tenant_api` 设了 `ctx.tenant` 便于归因、且设 `ctx.tenant_api_endpoint` 标记自己），内层 `ctx.tenant.is_some()` 才计数；失败路径（全候选失败/路由失败/超时）也会计一条、`provider` 标签为空串。用量记录仍以 `ctx.selected.is_some()` 为前提（**租户 API 请求故意不设 `ctx.selected`** → 不产生用量记录）。状态码写 `ctx.status_code`。计费口径因此天然干净：**租户自助请求不进 `usage_record`，也不会被计入自己的 token 用量**（否则租户查用量会把查询本身算进去，形成自指噪声）。
 
 ### 3.3 身份模型：两个来源的裁决
 

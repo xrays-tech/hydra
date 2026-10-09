@@ -260,9 +260,12 @@ where
     //
     // RESIDUAL, stated plainly: a batch that outlives the retry window is put
     // back in the buffer and re-flushed on a later tick under a NEW id, so a lost
-    // ack spanning that boundary can still duplicate rows. Closing that needs
-    // ROW-level idempotency (a stable per-row key + `ReplacingMergeTree`), which is
-    // a schema migration — see dev-docs/ops.md.
+    // ack spanning that boundary can still duplicate rows — the batch-level token
+    // cannot catch it. Since 2026-10-09 the ClickHouse table CLOSES this at the ROW
+    // level: `ReplacingMergeTree` with a stable per-row `dedup_key` (the trace id)
+    // collapses any duplicate the token misses — but only on tables created from
+    // the current `environment/clickhouse/init.sql`; a pre-existing `MergeTree`
+    // instance must be rebuilt first (see dev-docs/ops.md).
     let batch_id = new_batch_id();
     loop {
         if buffer.is_empty() {

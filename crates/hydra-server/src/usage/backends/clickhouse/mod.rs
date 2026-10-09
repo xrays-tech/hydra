@@ -223,23 +223,35 @@ impl Drop for ClickHouseSink {
 }
 
 /// The `INSERT` statement. Column list matches the ClickHouse `usage_record`
-/// schema (environment/clickhouse/init.sql) — provider-neutral token columns.
+/// schema (environment/clickhouse/init.sql) — provider-neutral token columns
+/// plus the row-level idempotency key `dedup_key`.
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT_PREFIX: &str =
     "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, sub_tenant_id, \
      status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
-     forward_latency_ms, ttft_ms, upstream_host, error, created_at)";
+     forward_latency_ms, ttft_ms, upstream_host, error, created_at, dedup_key)";
 
 /// The insert statement for one batch, carrying ClickHouse's
 /// `insert_deduplication_token` so a RETRY of the same batch cannot double-count.
 ///
 /// Why this exists: an `INSERT` whose response is lost (read timeout, connection
 /// reset while the reply is in flight) is classified as "the batch did not land"
-/// and retried — but the insert may well have COMMITTED, and the table is a plain
-/// `MergeTree`, so every retry added a duplicate set of usage rows. Duplicates
-/// inflate tenant usage/quota/billing and are invisible after the fact.
+/// and retried — but the insert may well have COMMITTED, so a naive retry adds a
+/// duplicate set of usage rows. Duplicates inflate tenant usage/quota/billing and
+/// are invisible after the fact.
 ///
-/// Two halves are required, and BOTH are verified against ClickHouse 24.3:
+/// This is the BATCH-level half of idempotency. It is a cheap fast path (a lost
+/// re-send inside the window is dropped at insert time, no merge needed). It is
+/// NOT sufficient on its own: the token is per-batch, so a batch re-sent after
+/// the 1000-insert `non_replicated_deduplication_window` expires, or a batch whose
+/// composition changes on retry, gets a NEW token and slips past the dedup. The
+/// ROW-level backstop is the `dedup_key` column written alongside (see
+/// [`clickhouse_dedup_key`]): an equivalent re-send — even in a different batch —
+/// carries the same key, and the table's `ReplacingMergeTree` collapses it. Both
+/// halves are kept.
+///
+/// Two halves of the BATCH dedup are required, and BOTH are verified against
+/// ClickHouse 24.3:
 /// 1. the target table must carry `non_replicated_deduplication_window`
 ///    (`environment/clickhouse/init.sql`; existing instances need
 ///    `ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000`,
@@ -305,6 +317,61 @@ async fn insert_batch_clickhouse_http(
     }
 }
 
+/// The row-level idempotency key for one record: a stable id per LOGICAL EVENT
+/// (one proxied request), written to the `dedup_key` column so `ReplacingMergeTree`
+/// can collapse a re-sent copy of the same event.
+///
+/// **Derivation — anchored on `trace_id`.** `trace_id` is the right anchor because:
+///  * it is per-request: every proxied request is handed a fresh id at context
+///    init (`proxy::new_trace_id`, `proxy/ctx.rs` — `hydra-<nanos>-<…>`), so two
+///    different events get two different trace ids (a nanosecond clock mixed with
+///    the thread id);
+///  * it is never empty on the production path (always `hydra-…`), and there is
+///    exactly ONE usage record per request (`proxy.rs` builds the `UsageRecord`
+///    once per response and calls `sink.record` once);
+///  * a retry re-sends the SAME in-memory record (the engine retains the batch and
+///    the inserter is called again with it), so its `trace_id` — and therefore this
+///    key — is byte-for-byte unchanged across retries, no matter how the batch is
+///    re-composed. That is exactly what the per-batch token cannot guarantee.
+///
+/// **Uniqueness — a re-send folds, a different event does not.**
+///  * same event, re-sent  → same `trace_id` → same key → `ReplacingMergeTree`
+///    collapses the duplicate (counted once);
+///  * different events     → different `trace_id` → different key → both kept.
+///    The only way two events could share a key is a `new_trace_id` collision —
+///    two requests in the SAME nanosecond on threads with equal-length ids. That is
+///    already astronomically rare, and the table's `ORDER BY (dedup_key,
+///    tenant_id, provider_id)` (init.sql) tightens it further: a collision would
+///    ALSO have to share tenant AND provider to fold, which distinct requests do
+///    not.
+///
+/// **Empty-`trace_id` fallback (defensive).** The current proxy always sets
+/// `trace_id`, but this backend is generic over `UsageRecord`. If a record ever
+/// arrives with an empty `trace_id`, fall back to a synthetic key over the fields
+/// a re-send preserves. Two genuinely different events differ in at least one of
+/// them (the second-resolution `created_at`, the token counts, or the latency), so
+/// they do not fold; and two records identical in ALL of them are, for billing
+/// purposes, one event recorded twice — collapsing them is the desired behaviour.
+#[cfg(feature = "usage-clickhouse")]
+fn clickhouse_dedup_key(r: &UsageRecord) -> String {
+    if r.trace_id.is_empty() {
+        // Synthetic, `syn:`-prefixed so it is distinguishable from a real trace id
+        // in the table. No field can contain `|`, so the join is unambiguous.
+        format!(
+            "syn:{}|{}|{}|{}|{}|{}|{}",
+            r.tenant_id,
+            r.created_at,
+            r.status_code,
+            r.tokens_in.unwrap_or(0),
+            r.tokens_out.unwrap_or(0),
+            r.cache_hit_tokens.unwrap_or(0),
+            r.latency_ms,
+        )
+    } else {
+        r.trace_id.clone()
+    }
+}
+
 /// Append one `UsageRecord` as a single JSON object (`{...}`) to `out`, with no
 /// trailing newline. Exposed for deterministic schema testing (T4.2).
 #[cfg(feature = "usage-clickhouse")]
@@ -359,6 +426,11 @@ fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
     }
     out.push_str(",\"created_at\":");
     json_string_into(out, &r.created_at);
+    // Last column, mirroring the INSERT list: the row-level idempotency key.
+    // (JSONEachRow maps fields by NAME, so order is not load-bearing for the
+    // insert — it is kept in step with the column list so a drift is visible here.)
+    out.push_str(",\"dedup_key\":");
+    json_string_into(out, &clickhouse_dedup_key(r));
     out.push('}');
 }
 
@@ -670,6 +742,83 @@ mod statement_tests {
             sql.matches('x').count(),
             128,
             "the token must be truncated to 128 chars"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the row-level idempotency key (`dedup_key`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "usage-clickhouse")]
+#[cfg(test)]
+mod dedup_key_tests {
+    use super::*;
+    use hydra_core::model::UsageRecord;
+
+    fn rec(trace: &str) -> UsageRecord {
+        crate::usage::testing::record(trace)
+    }
+
+    /// A non-empty `trace_id` IS the key, verbatim: one request = one record = one
+    /// stable key, and keeping the trace id visible in the table stays debuggable.
+    #[test]
+    fn a_nonempty_trace_id_is_the_dedup_key() {
+        assert_eq!(
+            clickhouse_dedup_key(&rec("hydra-abc123-4")),
+            "hydra-abc123-4"
+        );
+    }
+
+    /// A retry re-sends the SAME record, so the key must be identical to it — the property the
+    /// per-batch token cannot guarantee. A clone stands in for "the same record handed to the
+    /// inserter again on the next attempt".
+    #[test]
+    fn the_key_is_stable_across_a_resend_of_the_same_record() {
+        let original = rec("hydra-stable-9");
+        let resend = original.clone();
+        assert_eq!(
+            clickhouse_dedup_key(&original),
+            clickhouse_dedup_key(&resend)
+        );
+    }
+
+    /// Two different events must not collapse: distinct trace ids yield distinct keys, so the
+    /// `ReplacingMergeTree` keeps both (no under-counting).
+    #[test]
+    fn distinct_events_get_distinct_keys() {
+        assert_ne!(
+            clickhouse_dedup_key(&rec("hydra-event-a")),
+            clickhouse_dedup_key(&rec("hydra-event-b"))
+        );
+    }
+
+    /// Defensive: the current proxy always sets `trace_id`, but this backend is generic over
+    /// `UsageRecord`. An empty trace id must still produce a (non-empty, marked) key, never an
+    /// empty `dedup_key` (which would make every such row a single mergeable key).
+    #[test]
+    fn an_empty_trace_id_falls_back_to_a_synthetic_key() {
+        let key = clickhouse_dedup_key(&rec(""));
+        assert!(
+            key.starts_with("syn:"),
+            "synthetic key must be marked: {key}"
+        );
+        assert!(!key.is_empty());
+    }
+
+    /// Two records that differ only in a re-send-irrelevant way (a different provider) but share a
+    /// trace id still get the same KEY here — the provider/tenant disambiguation lives in the table's
+    /// `ORDER BY (dedup_key, tenant_id, provider_id)`, not in this function. Pin that split: the key
+    /// alone must not try to encode what the primary key already does.
+    #[test]
+    fn the_key_is_the_event_identity_not_the_partition() {
+        let a = rec("hydra-shared-trace");
+        let mut b = a.clone();
+        b.provider_id = "other-provider".to_string();
+        assert_eq!(
+            clickhouse_dedup_key(&a),
+            clickhouse_dedup_key(&b),
+            "provider/tenant disambiguation belongs to the ORDER BY, not the key"
         );
     }
 }

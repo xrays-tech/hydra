@@ -1522,6 +1522,32 @@ pub(super) async fn tenant_model_catalog(
 // Limit roles
 // ===========================================================================
 
+/// Decision D-11 (2026-10-09): the `matching_provider` dimension is REFUSED at the admin write
+/// boundary — `POST /limit-roles` and `PUT /limit-roles/:id` both answer 400 for it.
+///
+/// The dimension can never match: the pre-gate builds its `MatchCtx` BEFORE routing, so
+/// `provider` is always `None` there, while `limit::dim_matches` requires equality with the
+/// configured value — a role that declares it is skipped by BOTH the count and the token check
+/// (its limits never apply) while remaining listed, persisted and shown in the admin UI. The old
+/// behavior (201 + a Warn in the node log) was SILENT: a script never reads the log, so the
+/// operator believed a provider was capped when nothing was enforced. The write boundary is the
+/// one place EVERY writer is caught; `config::validate` keeps its Warn for rows the boundary
+/// cannot see (legacy databases, file-loaded configs, restores).
+fn matching_provider_write_error(provider: &str, trace_id: &str) -> Resp {
+    err_json(
+        400,
+        "matching_provider_cannot_match",
+        &format!(
+            "matching_provider '{}' CANNOT match: the limit pre-gate runs before routing, so \
+             no provider is known yet when roles are matched — a role with this dimension is \
+             skipped entirely (its limits never apply). Set matching_provider to null \
+             (decision D-11, 2026-10-09)",
+            provider
+        ),
+        trace_id,
+    )
+}
+
 pub(super) async fn limit_role_collection(
     state: &AdminState,
     session: &mut ServerSession,
@@ -1542,6 +1568,10 @@ pub(super) async fn limit_role_collection(
             Ok(r) => r,
             Err(resp) => return resp,
         };
+        // D-11 (2026-10-09): refuse the dead dimension BEFORE anything is persisted.
+        if let Some(provider) = r.matching_provider.as_deref() {
+            return matching_provider_write_error(provider, trace_id);
+        }
         if r.id.is_empty() {
             r.id = gen_id();
         }
@@ -1584,6 +1614,10 @@ pub(super) async fn limit_role_item(
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
+            // D-11 (2026-10-09): refuse the dead dimension BEFORE anything is persisted.
+            if let Some(provider) = r.matching_provider.as_deref() {
+                return matching_provider_write_error(provider, trace_id);
+            }
             r.id = id.to_string();
             match crate::db::update_limit_role(state.db(), state.key_provider.as_ref(), &r).await {
                 Ok(()) => {}

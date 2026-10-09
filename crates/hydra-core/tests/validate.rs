@@ -49,10 +49,11 @@ fn provider(id: &str, endpoint: &str, weight: i32) -> Provider {
 /// The pre-gate builds its `MatchCtx` before routing (`proxy.rs`), so `provider`
 /// is `None` there, while `limit::dim_matches` requires equality with the
 /// configured value — the role is skipped by BOTH the count and the token check.
-/// It is still listed, persisted and editable in the admin API, so a silent skip
-/// means an operator believes a provider is capped when nothing is enforced. (The
-/// accounting path DOES pass a provider, so such a role also creates a window that
-/// is written and never read.)
+/// The admin write boundary now refuses the dimension with 400 (decision D-11,
+/// 2026-10-09), but a row that carries it (legacy database, file-loaded config) is
+/// still listed and served, so a silent skip there means an operator believes a
+/// provider is capped when nothing is enforced. (The accounting path DOES pass a
+/// provider, so such a role also creates a window that is written and never read.)
 ///
 /// Falsification: delete the `matching_provider.is_some()` warning in `config.rs`
 /// and this fails.

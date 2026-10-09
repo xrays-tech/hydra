@@ -524,7 +524,12 @@ Limits are configured as **roles** in the `limit_roles` table. Each role carries
 `matching_*` dimensions (any `NULL` = match-all on that dimension), a
 `limit_count` and/or `limit_token` ceiling, and a `window` (`m` / `h` / `d`).
 The matcher selects roles for a request; the most restrictive surviving role
-applies.
+applies. **Note (decision D-11, 2026-10-09): `matching_provider` can never
+match** — the limit pre-gate runs before routing, so no provider is known when
+roles are matched — and the admin write boundary now **refuses** a non-NULL
+value with `400 matching_provider_cannot_match` (POST and PUT). Legacy rows that
+already carry it are still loaded and warned by name at config load; the only
+writable value is `null` (match-all).
 
 ### 4.1 Common recipes
 
@@ -613,8 +618,11 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   the write response ALSO carries them**: `POST`/`PUT /api/v1/limit-roles` answers with a `warnings`
 >   array — **always present, possibly empty** — holding exactly the warnings whose subject is the role
 >   you just wrote, so a script no longer has to read the leader's log to learn that the role it created
->   can never match (`crates/hydra-server/tests/admin_api.rs::limit_role_write_returns_the_warnings_for_that_role`
->   pins both the non-empty and the empty case). Warnings about the configuration as a whole (no subject)
+>   is unsound (e.g. a key-scoped role without a tenant scope is a shared cross-tenant budget;
+>   `crates/hydra-server/tests/admin_api.rs::limit_role_write_returns_the_warnings_for_that_role`
+>   pins both the non-empty and the empty case). The former "can never match" example — a role with a
+>   non-NULL `matching_provider` — is no longer writable at all: the write boundary refuses it with
+>   `400 matching_provider_cannot_match` (decision D-11, 2026-10-09). Warnings about the configuration as a whole (no subject)
 >   are still log-only, and a **materializing node does not re-validate** the tree it receives (`apply_snapshot` loads
 >   without validation, by design: the WRITER validated it before publishing) — so scripts that create roles
 >   should check the log of the node that received the write, not assume a clean `201` means a sound role.
@@ -627,9 +635,11 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   treatment the inert `matching_provider` dimension already had (D-11), a warning rather than an
 >   error because a deliberately shared budget is legitimate, it just must not be accidental.
 >
-> `matching_model`, `matching_tenant` and `matching_provider` are **exact** matches (not prefixes
-> like the sub-tenant and operator key-prefix mechanisms), and `matching_provider` is inert because
-> the pre-routing gate runs before a provider is chosen (recorded as decision item D-11). The two
+> `matching_model` and `matching_tenant` are **exact** matches (not prefixes like the sub-tenant and
+> operator key-prefix mechanisms). `matching_provider` is inert — the pre-routing gate runs before a
+> provider is chosen — and **decision D-11 (2026-10-09) made the admin write boundary refuse any
+> non-NULL value** with `400 matching_provider_cannot_match`; the config-load Warn remains as the
+> backstop for legacy/file-loaded/restored rows. The two
 > items this note used to leave open are both CLOSED and implemented (2026-10-08): the counting
 > bucket keys on a digest of the raw key (**D-15②**) and the `matching_key` column is sealed at rest
 > with legacy rows re-sealed by the loader (**D-16①**); the digest FORM (**D-16③**) is the one to
@@ -906,12 +916,25 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 > `ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000`
 > (verified on the bundled instance: without it a re-sent batch produced a second row,
 > with it the second insert is a no-op).
-> **Residual, stated plainly:** this deduplicates a re-sent *batch*. A batch that
-> outlives the retry window is re-flushed later under a **new** token, and a batch
-> whose composition changed between attempts also gets a new token — so a lost ack
-> spanning either boundary can still duplicate rows. Closing that needs **row-level**
-> idempotency (a stable per-row key + `ReplacingMergeTree`, with the read path
-> deduplicating), i.e. a schema migration; it is recorded, not silently assumed.
+> **Residual, stated plainly (updated 2026-10-09):** batch-level dedup protects only a
+> re-sent *batch* under the same token. A batch that outlives the retry window is
+> re-flushed later under a **new** token, and a batch whose composition changed between
+> attempts also gets a new token — so a lost ack spanning either boundary can still
+> duplicate rows on a table that only has batch-level protection. **Since 2026-10-09 the
+> schema carries row-level idempotency too** (decision P2-1): the table is
+> `ReplacingMergeTree() ORDER BY (dedup_key, tenant_id, provider_id)` with a
+> stable per-row `dedup_key` (the per-request trace id), so a duplicated row written by
+> any retry collapses to one. **No version column is used** — every copy of one
+> `dedup_key` is byte-identical (a retry re-sends the very same in-memory
+> `UsageRecord`), and `created_at` cannot serve as a version anyway: it is a
+> `String`, and ClickHouse rejects a String version column (verified live on 24.3,
+> `Code: 169 BAD_TYPE_OF_FIELD` — if a future change ever lets the same key carry
+> different content, add an Int*/DateTime version column and switch to
+> `ReplacingMergeTree(version)`). **Fresh** instances get it from `environment/clickhouse/init.sql`
+> and the inline DDL in `environment/docker-compose.local.yml`. An **already-initialised**
+> `MergeTree` instance is NOT migrated automatically — a new binary writes a `dedup_key`
+> column the old table does not have, so it must be rebuilt first (new table + copy +
+> rename), see the migration steps below.
 
 ### 5.5 Sub-tenant configuration (admin API)
 

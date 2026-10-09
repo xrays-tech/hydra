@@ -1072,23 +1072,32 @@ async fn tenant_provider_and_model_crud_http() {
 
 /// Decision D-17 (2026-10-08): the write answer carries the warnings for the row it just wrote.
 ///
-/// Before this, `201` was silent about a role that can never match — the warning went to the node log
+/// Before this, `201` was silent about a role that carries a warning — the warning went to the node log
 /// only (see `ops.md` §4), so a script that created roles could not tell a sound role from one whose
-/// `matching_provider` dimension is inert. The array is ALWAYS present so a caller can read it without
+/// budget is shared across tenants. The array is ALWAYS present so a caller can read it without
 /// sniffing for the key; the empty case is asserted too, because "always present" is the contract.
+///
+/// The example changed with decision D-11 (2026-10-09): the inert `matching_provider` dimension —
+/// this test's original example — is now REJECTED at the write boundary (400) instead of written
+/// with a warning; `limit_role_write_rejects_the_inert_provider_dimension` pins that refusal. The
+/// cross-tenant warning (`matching_key` without `matching_tenant`) is the warning the admin write
+/// path still produces, so it carries the D-17 assertion here. A DIGEST-form key is used on
+/// purpose: it is the only key form that produces exactly this one warning (the raw-key and
+/// mask-form warnings are separate issues).
 #[tokio::test]
 async fn limit_role_write_returns_the_warnings_for_that_role() {
     let state = admin_state().await;
     let port = start_admin(state);
 
-    // `matching_provider` is the documented inert dimension: the pre-gate runs before routing.
-    let inert = r#"{"id":"r-inert","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":"p1","limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    // `matching_key` (digest form) WITHOUT `matching_tenant`: the window is shared by every
+    // tenant that accepts the key — a warning the write path still produces.
+    let cross = r#"{"id":"r-cross","name":"r","matching_key":"sha256:0000000000000000000000000000000000000000000000000000000000000000","matching_model":null,"matching_tenant":null,"matching_provider":null,"limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
     let r = req(
         port,
         reqwest::Method::POST,
         "/api/v1/limit-roles",
         Some(TOKEN),
-        Some(inert),
+        Some(cross),
     )
     .await;
     assert_eq!(r.status(), 201);
@@ -1098,11 +1107,11 @@ async fn limit_role_write_returns_the_warnings_for_that_role() {
         "the write answer must carry `warnings`: {body}"
     );
     assert!(
-        body.contains("CANNOT match"),
-        "the inert-dimension warning must be IN the response, not only in the log: {body}"
+        body.contains("matching_tenant NULL"),
+        "the cross-tenant warning must be IN the response, not only in the log: {body}"
     );
     assert!(
-        body.contains("r-inert"),
+        body.contains("r-cross"),
         "and it must name the role that was just written: {body}"
     );
 
@@ -1122,6 +1131,117 @@ async fn limit_role_write_returns_the_warnings_for_that_role() {
         body.contains("\"warnings\":[]"),
         "a clean write must answer with an empty array: {body}"
     );
+}
+
+/// Decision D-11 (2026-10-09): a limit role that declares the `matching_provider` dimension is
+/// REJECTED at the admin write boundary — POST and PUT alike — with 400
+/// `matching_provider_cannot_match`.
+///
+/// The dimension can never match: the pre-gate builds its `MatchCtx` BEFORE routing, so
+/// `provider` is always `None` there, while `limit::dim_matches` requires equality — a role that
+/// declares it is skipped by BOTH the count and the token check (its limits never apply) while
+/// remaining listed, persisted and shown in the admin UI. Writing it would persist a role that
+/// enforces nothing while looking like one; the old "201 plus a Warn in the node log" was SILENT
+/// (a script never reads the log), so the boundary refuses the row instead.
+///
+/// Falsification: delete either guard in `handlers.rs` (`limit_role_collection` / `limit_role_item`)
+/// and the corresponding half of this test fails (201/200 instead of 400, and the row appears).
+#[tokio::test]
+async fn limit_role_write_rejects_the_inert_provider_dimension() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    // POST: refused BEFORE anything is persisted.
+    let post = r#"{"id":"r-prov","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":"p1","limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(post),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.expect("body");
+    assert!(
+        body.contains("matching_provider_cannot_match"),
+        "the refusal must carry the D-11 error code: {body}"
+    );
+    // ...and nothing was persisted: the role is not listed.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let rows: Vec<serde_json::Value> = r.json().await.expect("list");
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.get("id").and_then(|v| v.as_str()) == Some("r-prov")),
+        "the refused role must not exist: {rows:?}"
+    );
+
+    // PUT: a sound role is created first, then the dead dimension is refused on top of it —
+    // and the role is left UNCHANGED.
+    let r1 = r#"{"id":"r1","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":null,"limit_count":100,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(r1),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let upd = r#"{"id":"r1","name":"r","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":"p1","limit_count":50,"limit_token":null,"window":"h","enabled":true,"created_at":"x"}"#;
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/limit-roles/r1",
+        Some(TOKEN),
+        Some(upd),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.expect("body");
+    assert!(
+        body.contains("matching_provider_cannot_match"),
+        "the PUT refusal must carry the D-11 error code: {body}"
+    );
+    // The refused PUT wrote nothing: the role is still exactly what it was.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/limit-roles/r1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let row: serde_json::Value = r.json().await.expect("role");
+    assert_eq!(
+        row.get("matching_provider")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        serde_json::Value::Null,
+        "the refused PUT must not have written the dead dimension: {row:?}"
+    );
+    assert_eq!(
+        row["limit_count"], 100,
+        "the refused PUT must not have written anything: {row:?}"
+    );
+    let r = req(
+        port,
+        reqwest::Method::DELETE,
+        "/api/v1/limit-roles/r1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 204);
 }
 
 // ===========================================================================
