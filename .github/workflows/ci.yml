@@ -348,6 +348,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p hydra-server --features server,cluster-redis,arachne \
+            --lib \
             --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch \
             --test arachne_store --test arachne_three_nodes \
             --test arachne_cert_fidelity --test arachne_derivation_fidelity

@@ -168,7 +168,23 @@ pub async fn build_config(
     }
 
     // limit_roles: only enabled roles (design §5.2 "启用的限流角色").
-    let limit_roles: Vec<LimitRole> = db::list_limit_roles(pool)
+    //
+    // `seal_legacy_limit_keys` runs BEFORE the read, and it is the whole of the D-16 migration: a
+    // `matching_key` written before 2026-10-08 is plaintext in the column, and this is the pass that
+    // rewrites it (the loader runs at boot and on every reload, so an upgrade needs no operator
+    // step). It is a separate call because it WRITES — see its own docs for why the reader cannot do
+    // it. Note the order: sealing first means the rows this loader reads are already in the form a
+    // replica will end up storing, so leader and replica cannot disagree about it.
+    let resealed = db::seal_legacy_limit_keys(pool, kp).await?;
+    if resealed > 0 {
+        tracing::info!(
+            target: "hydra::store",
+            count = resealed,
+            "sealed {} legacy plaintext `limit_role.matching_key` value(s) (decision D-16)",
+            resealed
+        );
+    }
+    let limit_roles: Vec<LimitRole> = db::list_limit_roles(pool, kp)
         .await?
         .into_iter()
         .filter(|r| r.enabled)

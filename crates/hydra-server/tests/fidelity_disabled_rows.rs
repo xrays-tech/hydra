@@ -79,10 +79,10 @@ async fn seed_leader(pool: &sqlx::SqlitePool) {
     repo::insert_provider(pool, &provider("p1"))
         .await
         .expect("insert provider");
-    repo::insert_limit_role(pool, &role("r-on", true))
+    repo::insert_limit_role(pool, kp().as_ref(), &role("r-on", true))
         .await
         .expect("insert enabled role");
-    repo::insert_limit_role(pool, &role("r-off", false))
+    repo::insert_limit_role(pool, kp().as_ref(), &role("r-off", false))
         .await
         .expect("insert disabled role");
     repo::insert_provider_key_binding(pool, &binding("b-on", "sk_on_", "p1", true))
@@ -151,7 +151,9 @@ async fn replica_materialization_keeps_disabled_limit_roles_and_bindings() {
     .expect("restore_config");
 
     // THE ASSERTION THAT FAILS PRE-FIX: the replica holds every row.
-    let roles = repo::list_limit_roles(&replica_pool).await.expect("roles");
+    let roles = repo::list_limit_roles(&replica_pool, kp().as_ref())
+        .await
+        .expect("roles");
     assert_eq!(roles.len(), 2, "the replica must keep BOTH limit roles");
     assert!(
         roles.iter().any(|r| r.id == "r-off" && !r.enabled),
@@ -199,7 +201,9 @@ async fn rematerializing_the_same_content_is_stable() {
         .expect("restore_config");
     }
 
-    let roles = repo::list_limit_roles(&replica_pool).await.expect("roles");
+    let roles = repo::list_limit_roles(&replica_pool, kp().as_ref())
+        .await
+        .expect("roles");
     let bindings = repo::list_provider_key_bindings(&replica_pool)
         .await
         .expect("bindings");
@@ -236,7 +240,7 @@ async fn editing_a_disabled_row_advances_the_generation() {
     // runtime view entirely), so a `ConfigData`-based predicate would miss it.
     let mut role = role("r-off", false);
     role.window = "h".into();
-    repo::update_limit_role(&pool, &role)
+    repo::update_limit_role(&pool, kp().as_ref(), &role)
         .await
         .expect("update the disabled role");
     assert!(

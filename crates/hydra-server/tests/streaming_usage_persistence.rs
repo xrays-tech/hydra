@@ -134,6 +134,7 @@ async fn seed_routed(
     .expect("insert provider_key");
     repo::insert_limit_role(
         pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
         &LimitRole {
             id: "default".into(),
             name: "default".into(),

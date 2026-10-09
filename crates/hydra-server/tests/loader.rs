@@ -484,8 +484,12 @@ async fn loader_excludes_disabled_limit_roles() {
         enabled: false,
         ..on.clone()
     };
-    repo::insert_limit_role(&pool, &on).await.expect("on");
-    repo::insert_limit_role(&pool, &off).await.expect("off");
+    repo::insert_limit_role(&pool, &kp(), &on)
+        .await
+        .expect("on");
+    repo::insert_limit_role(&pool, &kp(), &off)
+        .await
+        .expect("off");
 
     let cfg = build_config(&pool, &kp()).await.expect("build");
     assert_eq!(cfg.limit_roles.len(), 1);

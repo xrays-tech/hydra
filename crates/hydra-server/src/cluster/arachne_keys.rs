@@ -68,7 +68,14 @@ use std::hash::{Hash, Hasher};
 /// [`cfg_entity`]). Same toc bytes, different KEYS: a build speaking 2 would look for entities
 /// where this one does not put them, so the two must refuse each other rather than half-read a
 /// tree.
-pub const TOC_FORMAT: u32 = 3;
+///
+/// **4** — a `limit_role` entity's `matching_key` became a SEALED envelope (`sealed:v1:…`, decision
+/// D-16) instead of the matching string itself. Same bytes, different MEANING, and the difference
+/// runs in the worst direction: a build speaking 3 would use the envelope TEXT as the value to match
+/// against, so a key-scoped role on that node would silently match nothing and **stop enforcing its
+/// limit**. That is exactly the case this constant exists for — the two builds refuse each other by
+/// name, and the older node keeps serving its last-known-good config until the upgrade completes.
+pub const TOC_FORMAT: u32 = 4;
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";
@@ -763,6 +770,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             entities.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
             "the round trip must preserve every kind AND their order"
+        );
+    }
+
+    /// The format number is PINNED here, so a change that makes one entity's bytes mean something
+    /// else has to come through this test — and read the list above, which is where each bump's
+    /// reason lives.
+    ///
+    /// This is not ceremony. Two of the four bumps (2 and 4) exist because a field changed MEANING
+    /// while its bytes stayed the same shape, and in both cases the silent outcome was a node
+    /// decoding a tree it should have refused: a tenant certificate private key written as NULL, and
+    /// (v4) a key-scoped limit role that stops being enforced because the matcher is handed the
+    /// envelope text instead of the key. A bump is the ONLY mechanism that turns that into a loud
+    /// refusal, and nothing else in the codebase notices that it was forgotten.
+    #[test]
+    fn the_toc_format_is_pinned_with_its_reason() {
+        assert_eq!(
+            TOC_FORMAT, 4,
+            "if you changed what an entity's bytes MEAN, bump this number AND add its entry to the \
+             doc above (the history is the reason the constant exists); if you did not, this test \
+             is the reminder that a bump happened and older builds now refuse this tree by name"
         );
     }
 

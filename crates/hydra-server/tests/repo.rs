@@ -445,8 +445,12 @@ async fn limit_role_crud() {
         enabled: true,
         created_at: now().into(),
     };
-    repo::insert_limit_role(&pool, &role).await.expect("insert");
-    let got = repo::get_limit_role(&pool, "lr1").await.expect("get");
+    repo::insert_limit_role(&pool, &kp(), &role)
+        .await
+        .expect("insert");
+    let got = repo::get_limit_role(&pool, &kp(), "lr1")
+        .await
+        .expect("get");
     assert_eq!(got, role);
 
     // window CHECK: invalid value.
@@ -483,13 +487,15 @@ async fn limit_role_crud() {
     let mut upd = role.clone();
     upd.limit_count = Some(500);
     upd.window = "h".into();
-    repo::update_limit_role(&pool, &upd).await.expect("update");
-    let got2 = repo::get_limit_role(&pool, "lr1").await.unwrap();
+    repo::update_limit_role(&pool, &kp(), &upd)
+        .await
+        .expect("update");
+    let got2 = repo::get_limit_role(&pool, &kp(), "lr1").await.unwrap();
     assert_eq!(got2.limit_count, Some(500));
     assert_eq!(got2.window, "h");
 
     repo::delete_limit_role(&pool, "lr1").await.expect("delete");
-    assert!(repo::get_limit_role(&pool, "lr1").await.is_err());
+    assert!(repo::get_limit_role(&pool, &kp(), "lr1").await.is_err());
 }
 
 /// T4.8 — complex round-trip: 1 tenant + 2 providers + models + keys + links,

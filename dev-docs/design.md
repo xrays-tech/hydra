@@ -319,7 +319,7 @@ CREATE TABLE tenant_model (
 CREATE TABLE limit_role (
     id               TEXT PRIMARY KEY,
     name             TEXT NOT NULL,
-    matching_key     TEXT,                 -- 匹配客户端 api-key（NULL=全部）
+    matching_key     TEXT,                 -- 匹配客户端 api-key（NULL=全部）；**封存存放**：形如 `sealed:v1:…`（决策 D-16①），NULL 仍表示"匹配全部"
     matching_model   TEXT,                 -- 匹配 model（NULL=全部）
     matching_tenant  TEXT,                 -- 匹配租户 id（NULL=全部）
     matching_provider TEXT,                -- 匹配供应商 id（NULL=全部）
@@ -1005,18 +1005,23 @@ pub struct UsageRecord {
 
 对每个请求，从 `ConfigData.limit_roles`（仅 `enabled=1`）中找出所有匹配项：
 
-- `matching_key` 为 NULL **或** 等于客户端 api-key（**原始形式、掩码形式、或 `sha256:<64 hex>` 摘要形式**均可；**推荐写摘要**——2026-10-08 决策 D-16③：`matching_key` 是明文列且会复制到每个节点与每份备份，摘要形式匹配同一把 key 而不存任何可还原的东西；摘要算法与格式为 `sha256:` + 小写 hex，见 `hydra_core::limit::key_digest`）；
+- `matching_key` 为 NULL **或** 等于客户端 api-key（**原始形式、掩码形式、或 `sha256:<64 hex>` 摘要形式**均可；**推荐写摘要**——2026-10-08 决策 D-16③：摘要形式匹配同一把 key 而不存**任何可还原的东西**（连持主密钥者也不能还原）；摘要算法与格式为 `sha256:` + 小写 hex，见 `hydra_core::limit::key_digest`）；
   ⚠️ **2026-09-30 实测并已修复。** 限流门原先只把上下文建成 `MatchCtx { api_key:
   Some(&mask_key(&api_key)) }`（`proxy.rs`，**掩码**形式），所以写**原始** key 的角色**永不触发**
   （leader/edge 实测全 200 —— 一个看起来配好、实则不生效的配额）。修复后 `MatchCtx` 同时携带
-  `api_key_raw`，`key_dim_matches` 接受**两种形式**（实测原始形式 `[200,200,429,429]`，掩码形式不变）；
-  **计数桶仍用掩码**，故原始 key 不会进入 Redis key 名或指标标签。遗留后果：掩码只留首/尾 ⇒
-  **两个不同 key 掩码相同即共用一个配额**（实测仍成立）。
-  ⚠️ **为什么推荐掩码而不是原始 key**：`limit_role.matching_key` 是**明文**列（`db.rs:1288/1311`，与
-  provider api-key 的 `kp.seal` 不同），随 `cluster/snapshot.rs:119` 的**明文** `LimitRole` 载荷发往每个
-  节点、由 `db/restore.rs:242` 原样落库，并经 `GET /api/v1/limit-roles` 与管理 UI 回显 —— 写原始 key
-  等于把**活凭据**明文放进每个节点的库、每份备份与每次管理面响应。详见 `ops.md` §4 与决策项
-  **D-15**（桶是否按原始 key 计）、**D-16**（该列是否封存）。
+  `api_key_raw`，`key_dim_matches` 接受**两种形式**（实测原始形式 `[200,200,429,429]`，掩码形式不变）。
+  **2026-10-08（决策 D-15②）起计数桶按"原始 key 的摘要"计**，故客户 key 的任何字符都不再进入 Redis key 名
+  或指标标签；**掩码相同不再共用配额**（升级代价：桶名变化 ⇒ 现有窗口重置一次）。
+  ⚠️ **该列自 2026-10-08（决策 D-16①，用户裁定"全封存 + 存量行读时自动封存"）起是封存列**：
+  写入走 `kp.seal`（`db.rs::seal_limit_key`），值形如 `sealed:v1:<版本>:<base64(nonce‖密文)>`；
+  配置树里也带同一封存形态（`cluster/arachne_entities.rs::sealed_limit_role`，用 `seal_deterministic`
+  以免内容寻址的树名每次发布都变），副本经 `db/restore.rs` 重新封存落库，**升级前写入的明文行由加载器
+  自动重新封存**（`db::seal_legacy_limit_keys`，无需人工步骤；主密钥轮换 `hydra --reseal` 也覆盖该列）。
+  **封存不覆盖的部分**：`GET /api/v1/limit-roles`（与管理 UI）仍**明文回显**，且持主密钥者能还原 ⇒
+  若要求"完全不可还原"，写**摘要形式**。**★配置树格式随之上到 `TOC_FORMAT = 4`**（`hydra_ctl` 键空间表
+  见 `cluster.md` §3）：实体字节**形状没变、语义变了** ⇒ 混版本集群互相**按名字拒绝**树，而不是让旧
+  版本把信封文本当匹配值（那会让按 key 限流的角色**静默不再生效**）。详见 `ops.md` §4 与决策项
+  **D-15②/D-16①③**（均已落地）。
 - `matching_model` 为 NULL **或** 等于请求 model_key；
 - `matching_tenant` 为 NULL **或** 等于租户 id；
 - `matching_provider` 为 NULL **或** 等于选中 provider id（注：provider 在路由后确定，故 provider 维度的 token 限流在 `logging` 阶段二次检查/记账）。

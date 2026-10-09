@@ -1529,7 +1529,7 @@ pub(super) async fn limit_role_collection(
     trace_id: &str,
 ) -> Resp {
     if method == "GET" {
-        match crate::db::list_limit_roles(state.db()).await {
+        match crate::db::list_limit_roles(state.db(), state.key_provider.as_ref()).await {
             Ok(rows) => ok_json(200, &rows),
             Err(e) => db_err_resp(e, trace_id),
         }
@@ -1548,7 +1548,7 @@ pub(super) async fn limit_role_collection(
         if r.created_at.is_empty() {
             r.created_at = now_ts();
         }
-        match crate::db::insert_limit_role(state.db(), &r).await {
+        match crate::db::insert_limit_role(state.db(), state.key_provider.as_ref(), &r).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -1569,7 +1569,8 @@ pub(super) async fn limit_role_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_limit_role(state.db(), id).await {
+        "GET" => match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await
+        {
             Ok(r) => ok_json(200, &r),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "role not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
@@ -1584,11 +1585,11 @@ pub(super) async fn limit_role_item(
                 Err(resp) => return resp,
             };
             r.id = id.to_string();
-            match crate::db::update_limit_role(state.db(), &r).await {
+            match crate::db::update_limit_role(state.db(), state.key_provider.as_ref(), &r).await {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            match crate::db::get_limit_role(state.db(), id).await {
+            match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await {
                 Ok(r) => {
                     if let Some(r) = reload_best_effort(state, trace_id).await {
                         return r;

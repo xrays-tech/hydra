@@ -391,15 +391,22 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
                 && !crate::limit::is_key_digest(key)
             {
                 // A non-mask, non-digest value is (by the matching rules) a raw client key.
+                //
+                // The wording changed on 2026-10-08 with decision D-16: the column is now SEALED at
+                // rest and in the config tree, so "kept and replicated in PLAINTEXT" became false —
+                // and a warning that overstates its case is how operators learn to disbelieve the
+                // list. What remains true, and is why the warning stays: the key is RECOVERABLE by
+                // whatever holds the master key, and the admin API still hands it back in the clear.
                 issues.push(ValidationIssue::warn_about(role.id.clone(), format!(
-                    "limit_role '{}' stores what looks like a RAW client key in `matching_key`: that \
-                     column is kept and replicated in PLAINTEXT (unlike provider api-keys, which are \
-                     sealed with the master key) and is returned by `GET /api/v1/limit-roles`, so a \
-                     live credential ends up in every node's database, in every backup and in every \
-                     admin response. Write the DIGEST form instead (`sha256:<64 hex>`, decision D-16③): \
-                     it matches the same key and stores nothing recoverable. The MASK form also works \
-                     (it is what the usage rows carry) and, since D-15②, two keys that share a mask no \
-                     longer share a window either",
+                    "limit_role '{}' stores what looks like a RAW client key in `matching_key`: the \
+                     column is sealed at rest and in the config tree (decision D-16), so the key is no \
+                     longer readable in a database file or a backup by itself — but it IS recoverable \
+                     by anything holding the master key, and `GET /api/v1/limit-roles` returns it in \
+                     the clear (the admin UI renders it), so the credential still leaves the node in \
+                     every admin response. Write the DIGEST form instead (`sha256:<64 hex>`, decision \
+                     D-16③): it matches the same key and stores nothing recoverable at all, not even \
+                     under the master key. The MASK form also works (it is what the usage rows carry) \
+                     and, since D-15②, two keys that share a mask no longer share a window either",
                     role.id
                 )));
             }

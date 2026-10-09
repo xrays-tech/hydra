@@ -89,9 +89,13 @@ impl std::fmt::Debug for MatchCtx<'_> {
 ///
 /// Decision D-16③ (2026-10-08): a role may state its `matching_key` as this digest instead of the
 /// customer's key (or its mask), so the configuration stops being a place where a live credential
-/// lives. `matching_key` is a PLAIN column — unlike provider api-keys it is not sealed with the master
-/// key — and it is replicated to every node, carried in every backup and echoed by
-/// `GET /api/v1/limit-roles` (all four hops measured in round 117), so the difference matters.
+/// lives.
+///
+/// The reason narrowed in round 210, when D-16① sealed the column (`crypto::Sealed`, with legacy
+/// rows re-sealed by the loader): `matching_key` used to be a PLAIN column, and it now travels as an
+/// envelope at rest, in the config tree and in a replica's database. What the digest still buys is
+/// the half sealing cannot: the key is not there to recover AT ALL, not even for a holder of the
+/// master key — and `GET /api/v1/limit-roles` still echoes the raw form in the clear.
 pub const KEY_DIGEST_PREFIX: &str = "sha256:";
 
 /// The digest form of a client key, i.e. exactly what a role may put in `matching_key`.

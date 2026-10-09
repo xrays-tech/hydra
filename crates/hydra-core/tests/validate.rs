@@ -110,14 +110,18 @@ fn validate_key_scoped_role_without_a_tenant_scope_is_reported_as_cross_tenant()
     );
 }
 
-/// The VALUE of `matching_key` also gets a warning, because the two forms have opposite costs and
-/// only the documentation mentioned either (round 135, product-review P3-4 / P2-2).
+/// The VALUE of `matching_key` also gets a warning, because the forms have different costs and
+/// only the documentation mentioned any of them (round 135, product-review P3-4 / P2-2; the raw-key
+/// wording was corrected in round 210 when decision D-16 sealed the column).
 ///
 /// Falsification: delete the `mask_key(key) != key` branch in `config.rs` and the first case fails;
 /// delete the `else` branch and the second does.
 #[test]
 fn validate_reports_what_the_matching_key_value_costs() {
-    // (a) a RAW key: stored and replicated in plaintext, returned by the admin API.
+    // (a) a RAW key: recoverable by whoever holds the master key, and echoed by the admin API. The
+    // warning NO LONGER says the column is plaintext — decision D-16 sealed it (2026-10-08), and a
+    // warning that overstates its case is one operators learn to skip. Both halves are asserted, so
+    // the text cannot drift back to the stale claim.
     let mut cfg = clean_config();
     let mut raw = limit_role("r-raw", Some(600), None);
     raw.matching_key = Some("sk-live-customer-key-0001".to_string());
@@ -127,8 +131,13 @@ fn validate_reports_what_the_matching_key_value_costs() {
     assert!(
         warns.iter().any(|m| m.contains("r-raw")
             && m.contains("RAW client key")
-            && m.contains("PLAINTEXT")),
-        "a raw key in `matching_key` must be named, got {warns:?}"
+            && m.contains("GET /api/v1/limit-roles")),
+        "a raw key in `matching_key` must be named, with the exposure that survives D-16, got {warns:?}"
+    );
+    assert!(
+        !warns.iter().any(|m| m.contains("PLAINTEXT")),
+        "the raw-key warning must not claim the column is PLAINTEXT any more (D-16 sealed it), got \
+         {warns:?}"
     );
 
     // (b) the MASK form: no warning any more. The warning that used to sit here said any other key

@@ -17,10 +17,10 @@
 //! A replica is not only `ConfigData`: it also needs the rows `ConfigData` is
 //! derived from (disabled `limit_role` rows, offline `provider_model` rows, row
 //! ids) plus the secret-bearing sets — [`FidelityTreeEntity`], the per-provider key
-//! entities and the cert entities. The rows that are not secret travel as plain
-//! JSON; provider api-keys, cert private keys and tenant token hashes travel
-//! [`Sealed`], the same treatment the snapshot wire gives them, and are opened only
-//! by a holder of the master key.
+//! entities, the limit-role entities and the cert entities. The rows that are not
+//! secret travel as plain JSON; provider api-keys, cert private keys, tenant token
+//! hashes and `limit_role.matching_key` travel sealed (see [`sealed_limit_role`]),
+//! and are opened only by a holder of the master key.
 //!
 //! ## Why the encoder holds a key provider — and why that is safe now
 //!
@@ -93,14 +93,15 @@ pub struct CertTreeEntity {
 ///
 /// ## Why the secrets stay sealed
 ///
-/// `provider_keys` hold provider API keys and `tenant_token_hashes` hold the fleet's
-/// authentication material. The existing wire SEALS both, and a tree that carried them in the
-/// clear would quietly undo that — so this type keeps the same split: the rows that are not
-/// secret travel as plain JSON, and the two that are travel as [`Sealed`] values that only the
-/// master key can open.
+/// `provider_keys` hold provider API keys, `tenant_token_hashes` hold the fleet's authentication
+/// material and `limit_roles` carry a `matching_key` that may be a live CLIENT key. The existing wire
+/// SEALS all of them, and a tree that carried them in the clear would quietly undo that — so this
+/// type keeps the same split: the rows that are not secret travel as plain JSON, and every secret
+/// column travels sealed. `limit_roles` is the one set where a SINGLE COLUMN is sealed rather than
+/// the whole row ([`sealed_limit_role`]), because D-16 seals the column, not the table.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FidelityTreeEntity {
-    /// Full `limit_role` rows, DISABLED included.
+    /// Full `limit_role` rows, DISABLED included, each with its `matching_key` sealed.
     pub limit_roles: Vec<LimitRole>,
     /// Full `provider_key_binding` rows, DISABLED included.
     pub key_prefix_bindings: Vec<ProviderKeyBinding>,
@@ -134,6 +135,94 @@ pub struct SealedProviderKey {
     pub sealed: Sealed,
 }
 
+/// Seal a `limit_role`'s `matching_key` for the tree: the row comes back with that ONE column
+/// replaced by its sealed text form (`sealed:v1:…`), every other column untouched.
+///
+/// ## Why the sealed form lives in `matching_key` instead of a sibling field
+///
+/// Decision D-16 (2026-10-08): the column is sealed. In the DATABASE the two possible values —
+/// envelope or pre-D-16 plaintext — are told apart by the value itself (`crypto::Sealed::
+/// from_text`), because there is only one column and it has held plaintext since the first release.
+/// The tree carries the SAME text form, so there is one rule for both carriers rather than a second
+/// "is this the tree's flavour of sealed?" question that only ever drifts.
+///
+/// `seal_deterministic`, not `seal`: the tree is content-addressed (its name is the hash of its
+/// bytes), so a fresh random nonce per publish would rename an UNCHANGED config — the trap
+/// documented at the top of this module, and the reason the provider keys above do the same.
+fn sealed_limit_role(
+    role: &LimitRole,
+    kp: &dyn KeyProvider,
+) -> Result<LimitRole, EntityCodecError> {
+    let Some(key) = role.matching_key.as_deref() else {
+        // NULL means "this role matches any key" (design §10.1) and must NOT become `Some("")`.
+        return Ok(role.clone());
+    };
+    let sealed =
+        kp.seal_deterministic(key.as_bytes())
+            .map_err(|e| EntityCodecError::Unsupported {
+                reason: format!(
+                    "cannot seal the matching key of limit role {}: {e}",
+                    role.id
+                ),
+            })?;
+    let mut out = role.clone();
+    out.matching_key = Some(sealed.to_text());
+    Ok(out)
+}
+
+/// The inverse of [`sealed_limit_role`]: open a row's `matching_key` after it came out of the tree.
+///
+/// ## Why the tree side has NO plaintext fallback, when the database side does
+///
+/// Anything this build decoded from an entity is an envelope, and a value that is not one is
+/// REFUSED by name. The compatibility question for trees is answered one level UP, on purpose:
+/// D-16 changed what a `limit_role` entity's bytes MEAN, so it is a `TOC_FORMAT` bump (`3 → 4`) and
+/// a tree written by an older build is refused by the toc before any entity is decoded. A fallback
+/// here would be a compat rule that cannot fire — and worse, it would keep a MIS-DECODED tree
+/// alive: an old build's plaintext and a new build's envelope live in the same field, so "accept
+/// both" is exactly how one node ends up matching against `sealed:v1:…` and silently stops
+/// enforcing the limit.
+///
+/// # Errors
+/// [`EntityCodecError::Crypto`] when the value is not an envelope at all, or is one the master key
+/// cannot open. Either way the caller keeps its last-known-good config.
+fn opened_limit_role(
+    role: &LimitRole,
+    path: &EntityPath,
+    kp: &dyn KeyProvider,
+) -> Result<LimitRole, EntityCodecError> {
+    let Some(stored) = role.matching_key.as_deref() else {
+        return Ok(role.clone());
+    };
+    let Some(sealed) = Sealed::from_text(stored) else {
+        return Err(EntityCodecError::Crypto {
+            path: path.to_key_segment(),
+            reason: format!(
+                "the matching key of limit role {} is not a sealed value; this build speaks \
+                 TOC_FORMAT {TOC_FORMAT}, where that column is always sealed (decision D-16)",
+                role.id
+            ),
+        });
+    };
+    let key = kp.open(&sealed).map_err(|e| EntityCodecError::Crypto {
+        path: path.to_key_segment(),
+        reason: format!(
+            "cannot open the matching key of limit role {}: {e}",
+            role.id
+        ),
+    })?;
+    let key = String::from_utf8(key).map_err(|_| EntityCodecError::Crypto {
+        path: path.to_key_segment(),
+        reason: format!(
+            "the matching key of limit role {} is not valid UTF-8 after unsealing",
+            role.id
+        ),
+    })?;
+    let mut out = role.clone();
+    out.matching_key = Some(key);
+    Ok(out)
+}
+
 impl FidelityTreeEntity {
     /// Open the sealed rows and reassemble the full set.
     ///
@@ -142,6 +231,11 @@ impl FidelityTreeEntity {
     /// rotated-away key is REFUSED, never guessed at, and the caller keeps its last-known-good
     /// config rather than installing something with secrets missing.
     pub fn rows(&self, kp: &dyn KeyProvider) -> Result<FidelityRows, EntityCodecError> {
+        let mut limit_roles = Vec::with_capacity(self.limit_roles.len());
+        for r in &self.limit_roles {
+            limit_roles.push(opened_limit_role(r, &EntityPath::Fidelity, kp)?);
+        }
+
         let mut provider_keys = Vec::with_capacity(self.sealed_provider_keys.len());
         for k in &self.sealed_provider_keys {
             let api_key = kp.open(&k.sealed).map_err(|e| EntityCodecError::Crypto {
@@ -174,7 +268,7 @@ impl FidelityTreeEntity {
         }
 
         Ok(FidelityRows {
-            limit_roles: self.limit_roles.clone(),
+            limit_roles,
             key_prefix_bindings: self.key_prefix_bindings.clone(),
             provider_keys,
             tenant_token_hashes,
@@ -207,6 +301,11 @@ impl FidelityTreeEntity {
         rows: &FidelityRows,
         kp: &dyn KeyProvider,
     ) -> Result<Self, EntityCodecError> {
+        let mut limit_roles = Vec::with_capacity(rows.limit_roles.len());
+        for r in &rows.limit_roles {
+            limit_roles.push(sealed_limit_role(r, kp)?);
+        }
+
         let mut sealed_provider_keys = Vec::with_capacity(rows.provider_keys.len());
         for k in &rows.provider_keys {
             let sealed = kp.seal_deterministic(k.api_key.as_bytes()).map_err(|e| {
@@ -231,7 +330,7 @@ impl FidelityTreeEntity {
             sealed_tenant_token_hashes.push((tenant_id.clone(), sealed));
         }
         Ok(Self {
-            limit_roles: rows.limit_roles.clone(),
+            limit_roles,
             key_prefix_bindings: rows.key_prefix_bindings.clone(),
             provider_models: rows.provider_models.clone(),
             tenant_providers: rows.tenant_providers.clone(),
@@ -418,7 +517,10 @@ fn config_entities(
     for role in &cfg.limit_roles {
         let path = EntityPath::LimitRole(role.id.clone());
         check(&path)?;
-        out.push(encode(&path, role)?);
+        // SEALED, like the provider keys above: `matching_key` may hold a live client key, and a
+        // tree that carried it in the clear would put the credential in every node's Arachne store
+        // — the exact thing decision D-16 was taken to stop. Deterministic for the same reason.
+        out.push(encode(&path, &sealed_limit_role(role, kp)?)?);
     }
     for binding in &cfg.key_prefix_bindings {
         let path = EntityPath::KeyBinding(binding.id.clone());
@@ -595,8 +697,10 @@ pub fn build_config_with_fidelity(
                     .insert(id.clone(), members.into_iter().collect());
             }
             EntityPath::LimitRole(_) => {
+                // Sealed on the way in (see `split_config`): the row's `matching_key` is an envelope
+                // here, and the matching engine needs the key itself.
                 let role = decode::<LimitRole>(path, bytes)?;
-                cfg.limit_roles.push(role);
+                cfg.limit_roles.push(opened_limit_role(&role, path, kp)?);
             }
             EntityPath::KeyBinding(_) => {
                 let binding = decode::<ProviderKeyBinding>(path, bytes)?;
@@ -737,6 +841,21 @@ mod tests {
         cfg.providers.insert("p1".into(), provider("p1"));
         cfg.provider_keys
             .insert("p1".into(), vec!["sk-one".into(), "sk-two".into()]);
+        // One enabled role with a client key: the `limit_role/<id>` entity carries the SAME secret
+        // the fidelity entity does, and it is a separate encoder path.
+        cfg.limit_roles.push(LimitRole {
+            id: "r-config".into(),
+            name: "config role".into(),
+            matching_key: Some(LIMIT_KEY.into()),
+            matching_model: None,
+            matching_tenant: None,
+            matching_provider: None,
+            limit_count: Some(10),
+            limit_token: None,
+            window: "m".into(),
+            enabled: true,
+            created_at: "2026-01-06T00:00:00Z".into(),
+        });
         cfg.models_by_key.insert(
             "gpt-x".into(),
             vec![ModelProvider {
@@ -769,7 +888,9 @@ mod tests {
                 LimitRole {
                     id: "r-enabled".into(),
                     name: "enabled role".into(),
-                    matching_key: None,
+                    // A live client key: the one column decision D-16 seals. It is here so the
+                    // "no plaintext secret" test below has something to fail on.
+                    matching_key: Some(LIMIT_KEY.into()),
                     matching_model: None,
                     matching_tenant: None,
                     matching_provider: None,
@@ -866,6 +987,9 @@ mod tests {
     fn kp() -> crate::crypto::StaticKeyProvider {
         crate::crypto::StaticKeyProvider::new([7u8; 32], 1)
     }
+
+    /// The client key the fixtures put in `matching_key` (decision D-16 sealed this column).
+    const LIMIT_KEY: &str = "sk-limit-role-secret";
 
     /// The whole reason the fidelity entity exists: a replica must be able to rebuild its
     /// SQLite tables BYTE-FAITHFULLY, which the derived maps cannot express.
@@ -971,6 +1095,106 @@ mod tests {
         assert!(
             got.is_err(),
             "the wrong master key must be refused, not silently accepted"
+        );
+    }
+
+    /// `limit_role.matching_key` must not reach the store in the clear — in EITHER carrier.
+    ///
+    /// The role travels twice: once as its own `limit_role/<id>` entity (the ENABLED rows, which is
+    /// what the matcher reads) and once inside the fidelity entity (FULL rows, disabled included).
+    /// Both were plain JSON until decision D-16① sealed the column, and a tree carrying a live client
+    /// key puts it in every node's Arachne store — the thing the decision exists to stop. Two encoder
+    /// paths means two chances to forget, so this test walks EVERY blob rather than the one it
+    /// remembers.
+    ///
+    /// The last part is the other half of the same decision: a PLAINTEXT value in a current-format
+    /// entity is refused rather than read. Compatibility with an older build lives in the TOC FORMAT
+    /// (D-16 bumped it), not in a per-field fallback — see [`opened_limit_role`] for why a fallback
+    /// there is the fail-open direction.
+    ///
+    /// Falsification: encode `role` directly in `split_config` (the pre-D-16 code) and the
+    /// `contains(LIMIT_KEY)` assertion fails; seal in the fidelity entity but not the per-role entity
+    /// and it fails on the other blob; read a plaintext value as plaintext (the pre-bump rule) and
+    /// the refusal assertion fails.
+    #[tokio::test]
+    async fn no_limit_role_entity_carries_a_plaintext_matching_key() {
+        let cfg = config();
+        let rows = fidelity();
+        let blobs = split_config(&cfg, &rows, &kp()).expect("split");
+
+        assert!(
+            cfg.limit_roles
+                .iter()
+                .any(|r| r.matching_key.as_deref() == Some(LIMIT_KEY)),
+            "fixture: the CONFIG entity path must carry a limit key"
+        );
+        assert!(
+            rows.limit_roles
+                .iter()
+                .any(|r| r.matching_key.as_deref() == Some(LIMIT_KEY)),
+            "fixture: the FIDELITY entity path must carry a limit key"
+        );
+
+        for blob in &blobs {
+            let text = String::from_utf8_lossy(&blob.bytes);
+            assert!(
+                !text.contains(LIMIT_KEY),
+                "entity {} carries a client key in the clear",
+                blob.path.to_key_segment()
+            );
+        }
+
+        // ...and both come back, through the key provider.
+        let tree = tree_of(&blobs).expect("tree");
+        let (rebuilt_cfg, rebuilt_rows) =
+            build_config_with_fidelity(&tree, &kp()).expect("rebuild");
+        assert_eq!(
+            rebuilt_cfg
+                .limit_roles
+                .iter()
+                .find(|r| r.id == "r-config")
+                .and_then(|r| r.matching_key.as_deref()),
+            Some(LIMIT_KEY),
+            "the config entity's key must survive the round trip"
+        );
+        assert_eq!(
+            rebuilt_rows
+                .limit_roles
+                .iter()
+                .find(|r| r.id == "r-enabled")
+                .and_then(|r| r.matching_key.as_deref()),
+            Some(LIMIT_KEY),
+            "the fidelity entity's key must survive the round trip"
+        );
+
+        // A different master key must refuse rather than hand back garbage — for THIS column too,
+        // because a silently-empty `matching_key` is not "no match", it is `None` = match-all.
+        let wrong = crate::crypto::StaticKeyProvider::new([9u8; 32], 1);
+        assert!(
+            build_config(&tree, &wrong).is_err(),
+            "the wrong master key must not yield a config whose limit roles lost their keys"
+        );
+
+        // A PLAINTEXT value in a current-format entity is REFUSED, not read. Compatibility with an
+        // older build is the TOC FORMAT's job (decision D-16 bumped it to 4), not a per-field
+        // fallback: an old build's plaintext and this build's envelope are the same field, so
+        // "accept both" is how a node ends up matching against `sealed:v1:…` and quietly stops
+        // enforcing a limit. Falsification: read it as plaintext (the pre-bump rule) and this fails.
+        let legacy_role = LimitRole {
+            id: "r-legacy".into(),
+            matching_key: Some(LIMIT_KEY.into()),
+            ..cfg.limit_roles[0].clone()
+        };
+        let legacy = tree_of(&[EntityBlob {
+            path: EntityPath::LimitRole("r-legacy".into()),
+            bytes: serde_json::to_vec(&legacy_role).expect("encode"),
+        }])
+        .expect("tree");
+        let refused = build_config(&legacy, &kp());
+        assert!(
+            matches!(refused, Err(EntityCodecError::Crypto { .. })),
+            "a plaintext matching key in a TOC_FORMAT {TOC_FORMAT} entity must be refused by \
+             name, got {refused:?}"
         );
     }
 

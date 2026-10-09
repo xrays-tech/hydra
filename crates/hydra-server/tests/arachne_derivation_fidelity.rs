@@ -146,7 +146,7 @@ async fn seed_disagreeing_orders(pool: &sqlx::SqlitePool) {
     seed_fk_targets(pool, LOWERCASE_DOMAIN).await;
     // `ORDER BY created_at, id`: the EARLIER row has the LATER id.
     for (id, created_at) in [("r-z", "2026-01-01"), ("r-a", "2026-06-01")] {
-        repo::insert_limit_role(pool, &role(id, created_at))
+        repo::insert_limit_role(pool, kp().as_ref(), &role(id, created_at))
             .await
             .expect("insert limit role");
     }

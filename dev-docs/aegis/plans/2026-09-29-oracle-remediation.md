@@ -6905,7 +6905,7 @@ D-13 记的是"生产代码里的 `expect` 到底禁不禁"（实测 **8 处**�
 > * **D-5 成立**：`.gitignore:71` 是 `/.acceptance/`（**整目录**）⇒ 取反**只能**是目录级白名单（先放开父目录再 `!` 白名单）；原措辞易被读成"按扩展名忽略"。
 
 | D-5 | 门禁脚本放哪（第十一轮 P1） | 移入 `scripts/gates/` / 保留 `.acceptance/` 但改 `.gitignore` 取反其 `.sh`+`.py` | 现状是**整套证据链不在版本控制里**，而计划与 §4 都推荐直接用它；两条路都改仓库策略，故不单方面动 |
-| D-16 | `limit_role.matching_key` 是**全仓唯一以明文存活的客户端凭据列**吗、要不要封存（第一百一十七轮，对抗性复审 F1 实测核对） | ① 用 `kp.seal` 封存该列（与 provider api-key 对齐）——但匹配发生在**配置加载时**，需要一个"读出来解封"的路径，且 `SnapshotWire` 的保真载荷与 `db/restore.rs` 也要跟着改；② 不封存，但**文档只推荐掩码形式**（第一百一十七轮已做，`ops.md` §4 + `design.md` §10.1/§9.5）并接受"写原始 key = 明文活凭据"；③ 让 `matching_key` 只接受**摘要**（presented key 求同一摘要再比），彻底不存密钥形态 | **实测（第一百一十七轮只读核对）**：`db.rs:1288`/`db.rs:1311` 是裸列（**没有** `kp.seal`，而同一文件的 provider api-key 在 `db.rs:568` 是 `kp.seal(...)`）；`cluster/snapshot.rs:119` 的 `FidelityWireRows.limit_roles` 是**明文** `LimitRole`（同载荷的 `sealed_provider_keys`/`tenant_token_hashes` 是密封的）；`db/restore.rs:242` 原样落库到**每个** edge；`GET /api/v1/limit-roles` 原样回显（drill 的前置断言就读的它）、admin UI 直接渲染。即：写原始 key ⇒ 活凭据明文进每个节点的库、每份备份与每次管理面响应 |
+| D-16 | `limit_role.matching_key` 是**全仓唯一以明文存活的客户端凭据列**吗、要不要封存（第一百一十七轮，对抗性复审 F1 实测核对） | ① 用 `kp.seal` 封存该列（与 provider api-key 对齐）——但匹配发生在**配置加载时**，需要一个"读出来解封"的路径，且 `SnapshotWire` 的保真载荷与 `db/restore.rs` 也要跟着改；② 不封存，但**文档只推荐掩码形式**（第一百一十七轮已做，`ops.md` §4 + `design.md` §10.1/§9.5）并接受"写原始 key = 明文活凭据"；③ 让 `matching_key` 只接受**摘要**（presented key 求同一摘要再比），彻底不存密钥形态 | **实测（第一百一十七轮只读核对）**：`db.rs:1288`/`db.rs:1311` 是裸列（**没有** `kp.seal`，而同一文件的 provider api-key 在 `db.rs:568` 是 `kp.seal(...)`）；`cluster/snapshot.rs:119` 的 `FidelityWireRows.limit_roles` 是**明文** `LimitRole`（同载荷的 `sealed_provider_keys`/`tenant_token_hashes` 是密封的）；`db/restore.rs:242` 原样落库到**每个** edge；`GET /api/v1/limit-roles` 原样回显（drill 的前置断言就读的它）、admin UI 直接渲染。即：写原始 key ⇒ 活凭据明文进每个节点的库、每份备份与每次管理面响应。 ★**已落地（2026-10-09，第二百一十轮）**：用户裁定 ①（全封存 + 存量行读时自动封存），本轮实施完毕 —— 封存形态是**单列文本信封** `sealed:v1:<版本>:<base64(nonce‖密文)>`（`crypto::Sealed::{to_text,from_text,open_text}`），三条写路径（`db::{insert,update}_limit_role`、`db/restore.rs`、配置树编码器 `sealed_limit_role`）全部走它，三条读路径（`get_limit_role`/`list_limit_roles[_on]`、树解码 `opened_limit_role`）解封；存量明文行由加载器 `db::seal_legacy_limit_keys`（读 + CAS 写）自动重封存，主密钥轮换 `reseal_secrets` 增加第三块 + `limit_keys_resealed`。**未选 ③**：摘要形式作为**形式**继续存在（D-16③ 已在第一百零九轮落地），但它与"封存"是两件事：封存保护库/备份/副本，摘要连持主密钥者也无法还原。详见 §2gl。 |
 
 | D-17 | **admin 写入的 HTTP 响应要不要回带该角色的校验告警**（第一百三十八轮实测：写入路径会 reload ⇒ 告警**已经**在写入那一刻进 leader 日志，但响应体里没有；`201` 干净不代表角色没问题） | ① 在 `POST/PUT /api/v1/limit-roles` 的响应里加一个 `warnings` 数组（对外形状**增量**变更，需同步 `ops.md`/admin 文档与 `check_e2e_contracts` 面）；② 只保留日志通道（现状），靠 `ops.md` §4 告诉脚本化运维去哪看；③ 让 `validate` 的错误也阻止写入（对既有配置是破坏性变更） | 现状＝②（本轮已把"去哪里看"写进 `ops.md`）；①是纯增量但不该单方面改对外形状，故记此待决策 |
 | D-6 | 租户面能否区分"与 operator 全局前缀重叠"（第十二轮复审 P2） | 折叠成通用 400 / 保留现状并写进契约 / 只在租户命名空间内给具体原因 | 现状是可被租户当布隆过滤器用来**枚举 operator 的全局前缀命名空间**（`sub_tenant.rs:357-363` → `400 key_prefix_overlap`）；改法都动租户可见语义，故不单方面改 |
@@ -7110,3 +7110,98 @@ HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 CH_URL=http://127.0.0.1:8123 \
 * **未做（如实标注）**：D-16 的**封存该列**（用 `kp.seal` 加密 `limit_role.matching_key`）没有做。③（摘要形式）让运维**可以**不存密钥形态，但**列本身仍是明文**——封存需要配置加载期的"读出来解封"路径 + 保真载荷 + `db/restore.rs` 三处联动，属独立一件事；D-16 因此**保持开**，只是从"要不要给一条不泄漏的路"降级为"要不要连历史遗留的明文行也加密"。
 
 **本轮门禁（实测）**：`.acceptance/round10-gate.sh` **99 条目、98 绿、1 红**，红的是 **`public claims`**——因为我新增了 3 条 Rust 测试（hydra-core 的桶身份与摘要匹配、hydra-server 的写入告警），而公开页的计数还是 774。**这是我的操作失误，且是门禁头部明写过的 pre-flight**（"if you added or removed a Rust test … run this FIRST: `cargo fmt --check && node scripts/check_public_claims.cjs --measure --write`"），我漏跑了。按 pre-flight 修：`--measure --write` 报 **777（262 core + 515 server）**并改写 `docs/index.html`，`--measure` 复核 **exit 0**。**其余 98 条的判定仍覆盖这份代码树（机械证明，不是推断）**：`node scripts/tree_manifest.cjs --check .acceptance/gate-manifest.txt` 报 **`OK (the source tree is unchanged: 379 file(s), docs-only changes: 3)`** —— 相对门禁收据只有 3 个文档（本轮计划、INDEX、`docs/index.html`）变化，**没有代码移动**（这正是第 201/207 轮用过的同一条判据）。CI 待推。
+
+**★D-16 裁定（2026-10-08，用户）：「① 全封存，存量行读时自动封存」** —— 即用 `kp.seal` 加密 `limit_role.matching_key`，并且**读到明文形态的存量行时自动重新封存**（迁移无需人工步骤）。实施未在本轮完成（本轮的预算是六项决策那批），**下一轮第一件事**；实施前的现场事实与落点（都已核对过）：
+* **写入点**：`crates/hydra-server/src/admin/handlers.rs` 的 POST/PUT 走 `crate::db::{insert,update}_limit_role(state.db(), &r)` —— 这两个函数**只拿到 `&SqlitePool`**，`key_provider` 不在那一层（`ConfigStore::load(pool, kp)` 才有）⇒ **第一步是让 key provider 到达写读这一层**（改签名 + 全部调用点 + 测试），否则封存只能做在 store 侧、而 admin 写入会绕过它（那正是"两个所有者"的老毛病）。
+* **读取点**：`db.rs:1311`（list）、`:1333`（get）、`list_limit_roles_on`（`cluster/content.rs:178` 用它建树）——**读路径同时服务"内存配置（匹配要用明文）"与"跨节点保真载荷"**，所以两者要么都解封后在树里再封一次、要么让树专用一个"取封存形态"的读取；`sealed_provider_keys` 就是树里自己封的先例（`cluster/arachne_entities.rs`），照它做即可。
+* **自动封存存量行**：读时若该值**不是**合法封存块（`Sealed` 解析失败）⇒ 按明文使用 + `UPDATE limit_role SET matching_key = <sealed>` 写回。要防的两个坑：①**每次读都尝试写**会把读变成写（用"只在解析失败时写"钉住）；②多节点并发写回同一行是幂等的（同样的明文 ⇒ `seal` 每次随机 nonce ⇒ 值不同但语义相同），日志要能看出发生过一次迁移。
+* **restore 路径**：`db/restore.rs:242/248` 落库时**绑定的是树里的值** ⇒ 树若带封存形态，这里直接落库即可（不解封），这也是"全封存"必须让树也带封存形态的原因。
+* **回显**：`GET /api/v1/limit-roles` 把整行序列化（`handlers.rs:1532-1534`）⇒ 解封后仍会**明文回显**。用户选的是①（封存），回显策略是**同一件事的第二个决定**：封存只保护"库/备份/replica"，不保护 admin API 的读数；我在实施时会同时给出"回显只显示掩码/摘要"的选项，默认**保持现状**（因为改回显是对外形状变更，需要你点头）。
+* **测试计划**：①新写入的行在库里**不是明文**（直接读裸列断言）；②存量明文行可读**且被重新封存**（读一次后裸列变封存块）；③端到端匹配不变（`admin_api` 的 limit_role 用例 + `hydra-core` 的三形态测试）；④restore 落库后成员库同样不存明文。
+
+## 2gl. 第二百一十轮：D-16 落地 —— `limit_role.matching_key` 全封存 + 存量行由加载器自动重封存（并补上"arachne 门控下的 `--lib` 测试无人执行"这个洞）
+
+**裁定**（第一百零九轮，用户原话）：「① 全封存，存量行读时自动封存」。本轮把 §2gk 末尾那份"实施前的现场事实与落点"逐条兑现，并把全仓所有"该列是明文"的公开说法改掉。**本轮有产品代码改动**（`crypto.rs`/`db.rs`/`db/restore.rs`/`store.rs`/`cluster/arachne_entities.rs`/`cluster/content.rs`/`admin/handlers.rs`/`main.rs` + `hydra-core` 的警告措辞与文档注释 + 门禁脚本与 CI 各一行）。
+
+### 2gl-A. 一个设计决定：封存形态是"值自己说自己"（单列文本信封），不是三列
+
+`provider_key` 把一把密钥摊在 `api_key_ciphertext`/`api_key_nonce`/`key_version` **三列**上，"这一行是不是密文"是**表结构**的属性。`limit_role.matching_key` 只有**一列 TEXT**，且从第一个版本起存的就是明文 ⇒ 加三列会让**同一把密钥有两个载体**（还可能两列同时有值），并且把"这行封存了吗"变成一个需要迁移才能回答的问题。所以封存形态做成**值自述**：
+
+* `crypto::Sealed::to_text`：`sealed:v1:<key_version>:<base64(nonce ‖ ciphertext)>`（`SEALED_TEXT_PREFIX` 是格式标签，将来换布局＝换标签，**不是**对既有字节的重新解释）；
+* `Sealed::from_text`：**只做结构解析**（前缀、版本、base64、长度 > nonce）——"这值像不像封存块"与"它能不能被打开"是**两个不同的问题**，故意分开；
+* `Sealed::open_text`：**唯一**执行"封存/明文"策略的地方 —— 是信封就 `kp.open`（**失败即报错**，绝不把密文当 key 返回）；不是信封就**按明文原样返回**（D-16 之前的行）。
+  * ★**这一条的限度是被"证伪"量出来的，不是推出来的**（见 2gl-F 的 ★②）：配置**加载器**在读之前就把列重封存了，所以"把非信封当错误"**不会**让加载器测试变红 —— 真正的承重者是**其它读者**：还没跑过迁移的节点上的 `GET /api/v1/limit-roles`、任何直接调 `db::list_limit_roles` 的代码、以及**旧版本写下的配置树**（滚动升级）。注释里原先写的"否则升级后读不了自己的配置"对**加载器这条路径**是**把话说大了**，已按实测改写。
+
+**为什么同一个文本形态也用在配置树上**：树里那一列改用兄弟字段（`SealedLimitRole{role, sealed}`）会立刻产生"树的风味"这个第二问题，而它只会与数据库那份**漂移**。用同一形态 ⇒ "它封存了吗"在全仓**只有一个所有者**（`Sealed::from_text`），旧树/旧行都按同一条规则读。
+
+### 2gl-B. 三条写路径、三条读路径（表）
+
+| 路径 | 位置 | 动作 |
+| --- | --- | --- |
+| admin POST | `db::insert_limit_role(pool, kp, r)` | `seal_limit_key`（`kp.seal` + `to_text`） |
+| admin PUT | `db::update_limit_role(pool, kp, r)` | 同上（**顺手证伪**：只封 insert 不封 update ⇒ P2 变红） |
+| 副本重建 | `db/restore.rs` 的 `INSERT INTO limit_role` | 同上（与 provider api-key 同一先例：**在写边界封**） |
+| 配置树（每角色实体 + 保真实体两处） | `cluster/arachne_entities.rs::sealed_limit_role` | `kp.seal_deterministic`（**必须**确定性：树按字节内容寻址，随机 nonce 会让**没变的配置**每次发布换个树名） |
+| 读（repo） | `db::open_limit_key` → `Sealed::open_text` | 信封开、明文过、打不开＝错误 |
+| 读（树） | `opened_limit_role` | **严格**：非信封＝**按名字报错**（理由见 2gl-G：树的兼容性由 `TOC_FORMAT` 负责，字段级 fallback 是 fail-open 方向） |
+| 读（HTTP） | `admin/handlers.rs` 四处调用点补 `state.key_provider.as_ref()` | 回显形态**不变**（仍明文回显 —— 见 2gl-E 的限度） |
+
+签名改动波及全部调用点：`store.rs`、`cluster/content.rs`、`cluster/arachne_materializer.rs`、以及 8 个测试文件（`repo`/`loader`/`metrics`/`anthropic_passthrough`/`streaming_usage_persistence`/`terminate_mode`/`fidelity_disabled_rows`/`arachne_derivation_fidelity`）。
+
+**与上一轮那份落点清单的一处**有意偏离**（记档）**：§2gk 末尾写的是"`restore` 落库时绑定的是树里的值 ⇒ 树若带封存形态，这里直接落库即可（不解封）"。本轮**没有**那样做：`FidelityRows.limit_roles` 在内存里保持**明文**（匹配引擎要用，而且副本的 `build_config_with_fidelity` 正是从它建 `cfg.limit_roles`），落库时由 `seal_limit_key` **重新封存** —— 这与同文件里 provider api-key 的先例一致（`restore.rs` 一直在用 `kp.seal` 重封，而不是搬运密文），于是"一行怎么被写进库"只有**一条规则**（都走 `seal_limit_key`），而树的封存形态只服务于"树这件载体"自身。代价是同一把 key 在树里与在库里是**两个不同的信封**（nonce 不同），语义相同、可读性相同；收益是不必让"树的值"和"库的值"必须同源，也就不会出现"只有经由树才封存"的第二条写路径。
+
+### 2gl-C. 自动迁移：为什么**不**放在 reader 里（这是"把读变成写"的坑，且有一个既有测试会抓）
+
+`seal_legacy_limit_keys(pool, kp)` 由**加载器**（`store::build_config`，启动与每次 reload 都跑）在**读之前**调用 ⇒ 无需人工步骤。它的形状是三步，每一步都有理由：
+
+1. `legacy_limit_key_rows`：**先纯读**（不加锁）⇒ 已封存的库上**连写事务都不开**（否则"加载器跑过"就等于"加载器每次都拿写锁"）；
+2. 有存量行才 `begin_write`；
+3. 每行用 `reseal_limit_key_row` 做 **CAS**（`WHERE id = ? AND matching_key = ?`，绑的是**读到的明文**）⇒ 读与写之间被 admin 写入（或另一节点先封存）改掉的行**不覆盖**，且**只统计真正改写的行数**（日志数字才不是谎话）。
+
+★**为什么不放进 reader**：`list_limit_roles_on` 是在 `ReplicationContent::load` 的**普通（deferred）读事务**里被调用的，在那种事务里写会去拿写锁、撞上并发写者就 `busy_timeout` 后失败 —— 而门禁里正有一条测试专门钉这件事（`load_does_not_block_on_a_concurrent_writer_holding_the_write_lock`）。所以"读"保持只读，迁移是**独立的一次写**。
+
+### 2gl-D. 主密钥轮换（`hydra --reseal`）必须覆盖这一列，否则轮换是单向门
+
+第三块 `limit_role`：与 provider/tenant 两块同一条规则 —— **"已是最新版本"要被 `open` 验证过**（版本号与密钥材料是两个独立旋钮）；不同之处是它**没有** `key_version` 列，版本在信封里，所以先在 `from_text` 里解析。另加一种情形：**明文行**（迁移与轮换谁先到都行）。`ResealReport` 增 `limit_keys_resealed`，`main.rs` 的 `reseal:` 行增 `limit_keys=N`。
+
+### 2gl-E. 文档订正（含一处**同一段里的自相矛盾**，是第 209 轮留下的）
+
+* `design.md` §10.1 与 schema 注释：`matching_key` 由"明文列"改为"**封存存放**（`sealed:v1:…`），NULL 仍表示匹配全部"，并写清**封存覆盖什么/不覆盖什么**。
+* `ops.md` §4 整段重写。★**发现**：第 209 轮改写了"计数桶已按摘要计（D-15②）"这条，却漏了同一列表里更早的那条"**计数桶仍用掩码**（未变）⇒ 掩码相同的两个 key 共用一个配额" —— **同一屏内两条互相否定**的话。已合并为一条（D-15② 生效 + 历史实测留档）。
+* 同一段还引用了**已被退役删除的 drill**（`integration/test_replica_fidelity.py`，仓库里已无此文件 —— `ls` 实测）作为"原始形式可用"的实测出处 ⇒ 改为**活着的**那条 `integration/test_limit_roles_enforcement.py`（同一形式、同一实测 `[200,200,429,429]`），并写明旧引用为何消失。
+* `ops.md` 的 `reseal` 报告行清单**多了 `limit_keys=`**（`main.rs` 打印 + `ResealReport` 新字段）⇒ 文档两处字段清单同步；`integration/test_key_rotation_live.py` 用的是**子串**断言（`"provider_keys=1" in report`），不受影响（未改 drill，故其覆盖仍止于"两类封存行"）。
+* `hydra-core/src/limit.rs`：`KEY_DIGEST_PREFIX` 的说明由"该列是明文列"改为"该列已封存；摘要买的是**封存买不到的那一半**——不存可还原物"。
+* `hydra-core/src/config.rs` 的 raw-key 告警**改写**（★这条不只是措辞）：原文说"该列 kept and replicated **in PLAINTEXT**"，D-16 之后**这句是假的**，而"把话说大了的告警＝训练运维跳过清单"；改为点名**仍然成立**的暴露（持主密钥者可还原 + `GET /api/v1/limit-roles` 明文回显），并保留"写摘要"的建议。`hydra-core/tests/validate.rs` 同步**两向**断言：必须出现新措辞、**不得**再出现 `PLAINTEXT`。
+* **限度（如实标注）**：admin API 仍**明文回显**该值（`GET /api/v1/limit-roles` + admin UI）。第 209 轮记的是"改回显是对外形状变更，需要你点头"，本轮**保持现状**，未改对外形状。
+
+### 2gl-F. 测试与证伪（13 条新增、14 枚探针全红；另有两处★自我发现）
+
+**新增**：`crypto` 2 条（信封往返且不含 key／非信封按明文过、信封打不开必须报错）、`db::tests` 2 条（CAS 拒绝被改过的行／CAS 正常改写且幂等）、`arachne_entities` 1 条（**每条** blob 都不含客户 key + 两条载体都往返 + 旧树明文可读）、`tests/limit_key_sealing.rs` 6 条（库内非明文且仍匹配／UPDATE 也封／存量行可读且被加载器重封存且幂等／副本重建后也封／信封打不开即拒绝（且用对密钥能读）／NULL 仍是 NULL）、`key_rotation` 1 条（轮换顺手封存发现的明文行）。夹具同步加强：配置树的两处 limit-role 夹具**真的带了一把客户 key**（否则"树里没有明文"是在空集上断言）。
+
+**证伪（14 枚探针，逐枚只改生产代码一处、跑完立即还原；收据 `.acceptance/round210-probe.out`，驱动脚本 `.acceptance/round210-probe.py`）**：P1 insert 不封 / P2 update 不封 / P3 reader 不解封 / P4 加载器不迁移 / P5 CAS 去掉 `AND matching_key = ?` / P6 restore 明文落库 / P7 非信封当错误 / P8 每角色实体不封 / P9 保真实体不封 / P10 树解码不解封 / P11 轮换跳过该列 / P12 信封直接放明文 / **P13 树解码按旧规则把明文当 key / P14 树格式静默退回 3**。**14/14 全部让指名的那条测试变红**（其中 P3/P10/P12 顺带打红同族兄弟，已如实记录在收据里）。
+
+★**自我发现①（"不会失败的检查"，我自己造的）**：CAS 那条测试**第一版把 UPDATE 语句抄在测试里**，于是**删掉生产代码里的 CAS 子句它照样绿** —— 它断言的是**代码的副本**。修法是让**两半都走生产代码**：把迁移拆成 `legacy_limit_key_rows`（读）与 `reseal_limit_key_row`（CAS 写），测试按**竞态发生的顺序**调用它们（读 → 并发写 → 写回陈旧信封），因此它现在**只能**因生产 CAS 存在而绿。这也是它必须放在 `db.rs` 的 `#[cfg(test)]` 里（集成测试够不到 `pub(crate)`）。
+★**自我发现②（承重点测错了）**：`open_text` 的"明文直通"这条分支，我原先的测试**只能**通过 `build_config` 走到它，而加载器**先封存再读** ⇒ 把该分支改成错误时那条测试**仍然绿**（探针 P7 报 NO-RED 才发现）。改成**先**断言 reader（尚未迁移时）能读出明文，再跑加载器看迁移；探针 P7 随即变红（`.acceptance/round210-probe.out`）。
+
+### 2gl-F2. ★★本轮最重的一条：封存**改变了树实体字节的语义** ⇒ 必须 bump `TOC_FORMAT`（3 → 4），否则混版本集群**静默 fail-open**
+
+这是我自己在收尾自查时问出来的问题，不在上一轮那份"落点清单"里：`limit_role/<id>` 实体里那个字段**字节形状没变**（还是 `Option<String>`），但**语义变了**（明文 key → `sealed:v1:…` 信封）。而 `arachne_keys.rs:58` 的 `TOC_FORMAT` 文档写得很清楚：「A toc carrying any other value is refused rather than guessed at: **a mixed-version cluster must fail loudly, because the alternative is one node writing a tree the others decode differently**」，历史两次 bump（1→2 cert 私钥载荷、2→3 实体键加内容哈希）都属这一类。
+
+**不 bump 的后果是"限流悄悄不再生效"**：一个还说着 3 的旧节点解同一份字节时，会把 `sealed:v1:…` **整个字符串当成要匹配的 key** ⇒ 所有按 `matching_key` 限流的角色**永不命中**（fail-open，无日志、无指标）。于是：
+
+* `TOC_FORMAT` **3 → 4**（`arachne_keys.rs`，文档里补第 4 条理由），混版本双方**按名字拒绝**对方的树（`the table of contents declares format 3; this build speaks 4`），拒不物化的节点继续服务**上一份已知良好配置** ⇒ 方向是**大声拒绝**而不是**静静失效**。
+* **树侧因此不再需要字段级 fallback**：`opened_limit_role` 由"非信封按明文过"改为**严格**（按名字报 `EntityCodecError::Crypto` 并点名角色）——树的兼容性由 `TOC_FORMAT` 负责，字段级 fallback 反而会让**被误解码的树**活下来（这正是"旧节点的明文"与"新节点的信封"共用同一字段的后果）。**数据库侧保留 fallback**（那一列有过真实存量行，且加载器迁移在读之前跑），两侧**故意不对称**，理由写在两处注释与 2gl-A。
+* **订正前一轮的措辞与本轮早先的措辞**：我先前在 `crypto.rs`/`db.rs`/测试文档里写的"旧树按明文读（滚动升级）"**是错的**（bump 之后它根本到不了解码器），已按实测改写；`cluster.md` 的键空间表把 `TOC_FORMAT = 3` 更正为 4 并写明原因。
+* **加一枚防遗忘的钉子**：`arachne_keys` 新增测试 `the_toc_format_is_pinned_with_its_reason`（断言 `TOC_FORMAT == 4`，失败信息要求"改了语义就 bump 并在上方文档补一条；没改语义的话，这条测试就是提醒你刚才发生了一次 bump、旧版本从此拒收这棵树"）——全仓**没有别的地方**会因为忘记 bump 而变红。
+* **运维面**：`ops.md` §4 与 `design.md` §10.1 各加一条 **UPGRADE NOTE**（升完所有节点再发布配置变更；拒绝是刻意的安全方向）。
+* **证伪**：P13（树解码按旧规则读明文）与 P14（格式静默退回 3）各自**恰好**打红自己那条测试（`.acceptance/round210-probe.out`）。
+
+**一处诚实的限度**：这一条**没有**做"两个真实不同版本的节点在同一个集群里互相拒绝"的端到端实验（那需要构建一个旧格式的二进制并起真集群）；支撑它的是 `Toc::decode` 的格式检查（既有测试 `malformed_tocs_are_refused` 覆盖 `UnsupportedFormat`）+ 新增的 pin 测试 + 静态读取。记在这里，而不是让它看起来像实测过。
+
+### 2gl-G. ★顺带发现的真洞：arachne 门控模块的 `--lib` 测试（278 条）**谁都不跑**
+
+新加的树测试落在 `cluster/arachne_entities.rs` 的 `#[cfg(test)] mod tests` 里，而它在 `--features server` 下**整个模块被编译掉** ⇒ 我查它到底有没有被执行时发现：门禁那条 `arachne rust tests (in-process)` 用的是 `--test` 目标列表，CI 同一步骤一样 ⇒ **`crates/hydra-server/src/cluster/` 自己的单元测试（278 条，`cargo test -p hydra-server --features server,cluster-redis,arachne --lib` = 278 passed / 0 failed，实测）在本地门禁与 CI 里都不执行**。这不是本轮引入的，但**本轮的证据落在了里面**，所以就地补上：门禁那一条 entry 与 CI 同名 step 各加 `--lib`（同一次 `cargo test` 调用里加目标选择器，不加 entry、不改计数）。（`check_ci_wiring` / `check_gate_entries` 两条守卫随后都 exit 0。）
+
+**门禁（实测）**：`.acceptance/round10-gate.sh` ⇒ **99 条目、全部 `exit=0`、`OVERALL=GREEN`、`GATE_EXIT=0`**（收据 `.acceptance/round210-gate.out`，日志 `.acceptance/round10-gate.log`；`entries=99`、`GATE COMPLETE`）。末条 `tree manifest (verify)` 报 **`OK (the source tree is unchanged: 380 file(s), docs-only changes: 1)`**（那 1 个 doc 是本记录 —— 它在跑动期间被补写过），⇒ **没有代码移动，99 条判定覆盖这份代码树**（与第 201/207/209 轮同一条判据）。★本轮**新加的 `--lib` 目标真的被执行了**：`GATE arachne rust tests (in-process) exit=0` 里现在既有 279 条 lib 测试、也有原来的 7 个 `--test` 目标。**开跑前**按 pre-flight 做了 `cargo fmt --check`（clean）与 `check_public_claims --measure --write`（788 = 262 core + 526 server，复核 exit 0）；两条守卫 `check_gate_entries` / `check_ci_wiring` 也各自 exit 0。
+
+**计数**：新增 Rust 测试 ⇒ 公开页按 pre-flight 规则先 `cargo fmt --check && node scripts/check_public_claims.cjs --measure --write` ⇒ 报 **788（262 core + 526 server）**，`--measure` 复核 exit 0（`--features server` 下 arachne 模块不参与计数，所以 12 条新增里只有 11 条进这个数字；第 12 条由 2gl-G 新补的 `--lib` 入口执行）。

@@ -288,21 +288,28 @@ struct LimitRoleRow {
     created_at: String,
 }
 
-impl From<LimitRoleRow> for LimitRole {
-    fn from(r: LimitRoleRow) -> Self {
-        LimitRole {
-            id: r.id,
-            name: r.name,
-            matching_key: r.matching_key,
-            matching_model: r.matching_model,
-            matching_tenant: r.matching_tenant,
-            matching_provider: r.matching_provider,
-            limit_count: r.limit_count,
-            limit_token: r.limit_token,
-            window: r.window,
-            enabled: r.enabled != 0,
-            created_at: r.created_at,
-        }
+impl LimitRoleRow {
+    /// The in-memory row, with `matching_key` opened.
+    ///
+    /// # Errors
+    /// [`crypto_to_sqlx`] wrapping a [`CryptoError`] when the stored value IS a sealed envelope the
+    /// master key cannot open (a wrong or rotated-away key is refused, never handed back as a key).
+    /// A value that is not an envelope at all is a pre-D-16 plaintext row and is returned as-is —
+    /// see `crypto::Sealed::open_text`.
+    fn to_model(&self, kp: &dyn KeyProvider) -> Result<LimitRole, sqlx::Error> {
+        Ok(LimitRole {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            matching_key: open_limit_key(kp, self.matching_key.clone())?,
+            matching_model: self.matching_model.clone(),
+            matching_tenant: self.matching_tenant.clone(),
+            matching_provider: self.matching_provider.clone(),
+            limit_count: self.limit_count,
+            limit_token: self.limit_token,
+            window: self.window.clone(),
+            enabled: self.enabled != 0,
+            created_at: self.created_at.clone(),
+        })
     }
 }
 
@@ -1282,15 +1289,62 @@ pub async fn delete_tenant_model(pool: &SqlitePool, id: &str) -> Result<(), sqlx
 // ---------------------------------------------------------------------------
 // CRUD — LimitRole
 // ---------------------------------------------------------------------------
+//
+// `matching_key` holds a CLIENT CREDENTIAL, and it is sealed at this boundary (decision D-16,
+// 2026-10-08 — the user's ruling: seal the column, and re-seal legacy rows without a manual step).
+// The three functions below split that one policy three ways:
+//
+//   * write (`insert_limit_role` / `update_limit_role`): `kp.seal(..).to_text()`. This column never
+//     receives a client key again.
+//   * read (`get_limit_role` / `list_limit_roles[_on]`): `crypto::Sealed::open_text`, which opens an
+//     envelope and passes a NON-envelope value through as plaintext. The migration below runs before
+//     the LOADER's own read, so what that branch actually serves is every OTHER reader — chiefly an
+//     admin `GET` before the migration has run. (Measured while falsifying this: see
+//     `crypto::Sealed::open_text`, which carries the probe's result.) The config TREE gets no such
+//     fallback on purpose; it is versioned by `TOC_FORMAT`, which D-16 bumped.
+//   * [`seal_legacy_limit_keys`]: the ONE place that rewrites a legacy row, called by the config
+//     loader. That is what makes the migration automatic; a reader never writes.
 
-pub async fn insert_limit_role(pool: &SqlitePool, r: &LimitRole) -> Result<(), sqlx::Error> {
+/// The at-rest form of a `limit_role.matching_key` value: sealed, or `None` for SQL NULL.
+fn seal_limit_key(kp: &dyn KeyProvider, key: Option<&str>) -> Result<Option<String>, sqlx::Error> {
+    match key {
+        None => Ok(None),
+        Some(k) => Ok(Some(
+            kp.seal(k.as_bytes()).map_err(crypto_to_sqlx)?.to_text(),
+        )),
+    }
+}
+
+/// The in-memory form of a stored `limit_role.matching_key` value.
+///
+/// The whole policy lives in [`crate::crypto::Sealed::open_text`] and is NOT re-derived here: the
+/// config tree carries the same values in the same text form, and two copies of "is this sealed?"
+/// is how the two would drift apart.
+fn open_limit_key(
+    kp: &dyn KeyProvider,
+    stored: Option<String>,
+) -> Result<Option<String>, sqlx::Error> {
+    match stored {
+        None => Ok(None),
+        Some(value) => Sealed::open_text(kp, &value)
+            .map(Some)
+            .map_err(crypto_to_sqlx),
+    }
+}
+
+pub async fn insert_limit_role(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    r: &LimitRole,
+) -> Result<(), sqlx::Error> {
+    let matching_key = seal_limit_key(kp, r.matching_key.as_deref())?;
     sqlx::query!(
         "INSERT INTO limit_role (id, name, matching_key, matching_model, matching_tenant, \
          matching_provider, limit_count, limit_token, window, enabled, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         r.id,
         r.name,
-        r.matching_key,
+        matching_key,
         r.matching_model,
         r.matching_tenant,
         r.matching_provider,
@@ -1305,7 +1359,11 @@ pub async fn insert_limit_role(pool: &SqlitePool, r: &LimitRole) -> Result<(), s
     Ok(())
 }
 
-pub async fn get_limit_role(pool: &SqlitePool, id: &str) -> Result<LimitRole, sqlx::Error> {
+pub async fn get_limit_role(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    id: &str,
+) -> Result<LimitRole, sqlx::Error> {
     let row = sqlx::query_as!(
         LimitRoleRow,
         r#"SELECT id as "id!", name, matching_key, matching_model, matching_tenant,
@@ -1315,16 +1373,28 @@ pub async fn get_limit_role(pool: &SqlitePool, id: &str) -> Result<LimitRole, sq
     )
     .fetch_one(pool)
     .await?;
-    Ok(row.into())
+    row.to_model(kp)
 }
 
-pub async fn list_limit_roles(pool: &SqlitePool) -> Result<Vec<LimitRole>, sqlx::Error> {
-    list_limit_roles_on(pool).await
+pub async fn list_limit_roles(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<Vec<LimitRole>, sqlx::Error> {
+    list_limit_roles_on(pool, kp).await
 }
 
 /// [`list_limit_roles`] on an arbitrary executor, so the replication content can
 /// read it inside ONE transaction (see `cluster::content::ReplicationContent::load`).
-pub(crate) async fn list_limit_roles_on<'e, E>(exec: E) -> Result<Vec<LimitRole>, sqlx::Error>
+///
+/// NOTE for that caller: this function only READS. The legacy re-seal is
+/// [`seal_legacy_limit_keys`], which opens its own write transaction, precisely because this one is
+/// called inside a plain (deferred) read transaction — a write here would have to take the write
+/// lock mid-read and would fail a node whose only sin was reading while an admin write was in
+/// flight.
+pub(crate) async fn list_limit_roles_on<'e, E>(
+    exec: E,
+    kp: &dyn KeyProvider,
+) -> Result<Vec<LimitRole>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -1336,17 +1406,103 @@ where
     )
     .fetch_all(exec)
     .await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    rows.iter().map(|r| r.to_model(kp)).collect()
+}
+
+/// The rows that still hold a PLAINTEXT `matching_key` — exactly what [`seal_legacy_limit_keys`] will
+/// rewrite.
+///
+/// Split out from the migration on purpose: the migration's READ is one plain statement on the pool
+/// and its WRITE is a compare-and-swap inside a write transaction, and the property that matters
+/// (a row that changed in between is not clobbered) only exists in the gap between them. A test that
+/// wants to model that gap has to be able to hold the two halves apart — otherwise it ends up
+/// asserting a COPY of the UPDATE text, which stays green after the production clause is deleted.
+async fn legacy_limit_key_rows(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, matching_key FROM limit_role WHERE matching_key IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, value)| Sealed::from_text(value).is_none())
+        .collect())
+}
+
+/// Seal ONE legacy row: `stale` is the plaintext the reader saw, `fresh` its envelope. Returns the
+/// number of rows actually rewritten (0 or 1) — 0 when the row changed, was deleted, or was sealed by
+/// another node in the meantime, none of which is an error.
+async fn reseal_limit_key_row<'e, E>(
+    exec: E,
+    id: &str,
+    stale: &str,
+    fresh: &str,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let done =
+        sqlx::query("UPDATE limit_role SET matching_key = ? WHERE id = ? AND matching_key = ?")
+            .bind(fresh)
+            .bind(id)
+            .bind(stale)
+            .execute(exec)
+            .await?;
+    Ok(done.rows_affected())
+}
+
+/// Seal every `limit_role.matching_key` still stored as PLAINTEXT. Returns how many rows were
+/// rewritten (0 on a database that is already sealed).
+///
+/// ## Why this exists, and why it is not inside the reader
+///
+/// Decision D-16 says an upgrade needs no manual step. The rows written before that decision hold a
+/// client key in the clear, so something has to rewrite them — and that something must be a WRITE,
+/// with its own transaction, not a side effect of a read (see [`list_limit_roles_on`]).
+///
+/// ## Shape
+///
+/// 1. [`legacy_limit_key_rows`] reads first, with no lock: on a sealed database this function opens
+///    no write transaction at all, which is what keeps "the loader ran" from meaning "the loader took
+///    the write lock" on every reload.
+/// 2. Each write is [`reseal_limit_key_row`]'s compare-and-swap, so an admin write (or another node)
+///    landing between the read and the write wins and this pass affects nothing.
+/// 3. Only rows that actually changed are counted, so the caller's log line means what it says.
+///
+/// # Errors
+/// A [`CryptoError`] from sealing, or a SQL error from the update.
+pub async fn seal_legacy_limit_keys(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<usize, sqlx::Error> {
+    let pending = legacy_limit_key_rows(pool).await?;
+    if pending.is_empty() {
+        return Ok(0); // already sealed: not even a write transaction is opened
+    }
+
+    let mut tx = begin_write(pool).await?;
+    let mut resealed = 0usize;
+    for (id, value) in pending {
+        let fresh = kp.seal(value.as_bytes()).map_err(crypto_to_sqlx)?.to_text();
+        resealed += reseal_limit_key_row(&mut *tx, &id, &value, &fresh).await? as usize;
+    }
+    tx.commit().await?;
+    Ok(resealed)
 }
 
 /// Update a limit role's mutable fields.
-pub async fn update_limit_role(pool: &SqlitePool, r: &LimitRole) -> Result<(), sqlx::Error> {
+pub async fn update_limit_role(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+    r: &LimitRole,
+) -> Result<(), sqlx::Error> {
+    let matching_key = seal_limit_key(kp, r.matching_key.as_deref())?;
     sqlx::query!(
         "UPDATE limit_role SET name = ?, matching_key = ?, matching_model = ?, \
          matching_tenant = ?, matching_provider = ?, limit_count = ?, limit_token = ?, \
          window = ?, enabled = ? WHERE id = ?",
         r.name,
-        r.matching_key,
+        matching_key,
         r.matching_model,
         r.matching_tenant,
         r.matching_provider,
@@ -1917,6 +2073,9 @@ pub struct ResealReport {
     pub provider_keys_resealed: usize,
     /// Tenant certificate private keys rewritten under the current key version.
     pub tenant_certs_resealed: usize,
+    /// `limit_role.matching_key` values rewritten under the current key version (decision D-16;
+    /// includes pre-D-16 PLAINTEXT rows, which this pass seals for the first time).
+    pub limit_keys_resealed: usize,
     /// Rows already at the current version (nothing to do).
     pub already_current: usize,
     /// Rows that could NOT be opened (unknown version / wrong key), left
@@ -2121,6 +2280,73 @@ pub async fn reseal_secrets(
         }
     }
 
+    // ---- limit_role.matching_key (decision D-16) --------------------------
+    //
+    // A third sealed column, added 2026-10-08. It has no `key_version` column of its own — the
+    // version lives inside the envelope — so the "already current" test below reads it from there.
+    // Two cases are handled, and they are different pieces of work:
+    //   * a pre-D-16 PLAINTEXT value: sealing it is a MIGRATION, not a rotation, and this pass is
+    //     the second of the two places that do it (the loader is the first, and the usual one);
+    //   * a sealed value with an older version: the rotation this command exists for.
+    let key_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, matching_key FROM limit_role WHERE matching_key IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, value) in key_rows {
+        let Some(sealed) = Sealed::from_text(&value) else {
+            match kp.seal(value.as_bytes()) {
+                Ok(fresh) => {
+                    sqlx::query("UPDATE limit_role SET matching_key = ? WHERE id = ?")
+                        .bind(fresh.to_text())
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.limit_keys_resealed += 1;
+                }
+                Err(e) => report
+                    .failed
+                    .push(format!("limit_role {id} matching_key: seal failed: {e}")),
+            }
+            continue;
+        };
+        if sealed.key_version == current {
+            // Same rule as the two blocks above: the version tag is an independent knob from the key
+            // material, so "already current" is VERIFIED by opening the value, not assumed from the
+            // number. Counting an unopenable row as fine is how the operator ends up deleting the
+            // only key that can read it.
+            match kp.open(&sealed) {
+                Ok(_) => report.already_current += 1,
+                Err(e) => report.failed.push(format!(
+                    "limit_role {id} matching_key: labelled key_version {current} (the CURRENT \
+                     version) but it does NOT open under the current key — the key was most likely \
+                     rotated without bumping HYDRA_ENCRYPTION_KEY_VERSION. Do NOT delete the \
+                     previous key until this is resolved: {e}"
+                )),
+            }
+            continue;
+        }
+        match kp.open(&sealed) {
+            Ok(plaintext) => match kp.seal(&plaintext) {
+                Ok(fresh) => {
+                    sqlx::query("UPDATE limit_role SET matching_key = ? WHERE id = ?")
+                        .bind(fresh.to_text())
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.limit_keys_resealed += 1;
+                }
+                Err(e) => report
+                    .failed
+                    .push(format!("limit_role {id} matching_key: seal failed: {e}")),
+            },
+            Err(e) => report.failed.push(format!(
+                "limit_role {id} matching_key: cannot open key_version {}: {e}",
+                sealed.key_version
+            )),
+        }
+    }
+
     // One commit for both tables: a re-seal that failed halfway would leave the
     // rotation in a state where neither "before" nor "after" is true of the whole
     // DB, which is exactly what an operator cannot reason about.
@@ -2159,4 +2385,128 @@ pub(crate) async fn test_pool() -> SqlitePool {
         .await
         .expect("run_migrate should create the schema");
     pool
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{StaticKeyProvider, KEY_LEN};
+
+    const LEGACY: &str = "sk-legacy-plaintext-key";
+
+    /// Write a row the way the code did BEFORE decision D-16: plaintext, straight into the column.
+    /// (`insert_limit_role` seals, so the legacy state cannot be produced through it any more.)
+    async fn insert_plaintext_role(pool: &SqlitePool, id: &str, key: &str) {
+        sqlx::query(
+            "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, \
+             created_at) VALUES (?, ?, ?, 600, 'm', 1, '')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(key)
+        .execute(pool)
+        .await
+        .expect("insert a pre-D-16 plaintext row");
+    }
+
+    async fn stored(pool: &SqlitePool, id: &str) -> Option<String> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT matching_key FROM limit_role WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .expect("select");
+        row.and_then(|r| r.0)
+    }
+
+    /// The legacy re-seal is a COMPARE-AND-SWAP, driven here through BOTH production halves in the
+    /// order the race happens: read the pending row, let the row change, then write the stale
+    /// envelope.
+    ///
+    /// Why a unit test and not an integration one: this is the ONLY way to hold the two halves apart,
+    /// and the first version of this test wrote the CAS statement out by hand — it stayed GREEN when
+    /// the production clause was deleted, i.e. it was asserting a copy of the code. The helper split
+    /// exists for this test (`legacy_limit_key_rows` + `reseal_limit_key_row`).
+    ///
+    /// Falsification: drop `AND matching_key = ?` from `reseal_limit_key_row` and the first two
+    /// assertions fail — the stale envelope wins and the newer key is silently destroyed.
+    #[tokio::test]
+    async fn the_legacy_reseal_refuses_a_row_that_changed_after_the_read() {
+        let pool = test_pool().await;
+        let kp = StaticKeyProvider::new([3u8; KEY_LEN], 1);
+        insert_plaintext_role(&pool, "r-cas", LEGACY).await;
+
+        // 1) the migration's READ.
+        let pending = legacy_limit_key_rows(&pool)
+            .await
+            .expect("read the pending rows");
+        assert_eq!(
+            pending,
+            vec![("r-cas".to_string(), LEGACY.to_string())],
+            "fixture: the row must be pending"
+        );
+
+        // 2) the row changes underneath it — an admin write, or another node sealing it first.
+        let newer = kp.seal(b"sk-written-in-between").expect("seal").to_text();
+        sqlx::query("UPDATE limit_role SET matching_key = ? WHERE id = ?")
+            .bind(&newer)
+            .bind("r-cas")
+            .execute(&pool)
+            .await
+            .expect("the concurrent write");
+
+        // 3) the migration's WRITE, carrying the value it read.
+        let stale = kp.seal(LEGACY.as_bytes()).expect("seal").to_text();
+        let mut tx = begin_write(&pool).await.expect("tx");
+        let rewritten = reseal_limit_key_row(&mut *tx, "r-cas", LEGACY, &stale)
+            .await
+            .expect("compare-and-swap");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            rewritten, 0,
+            "a row whose value changed after the read must NOT be rewritten (the CAS is what \
+             makes the migration safe to run on a live node)"
+        );
+        assert_eq!(
+            stored(&pool, "r-cas").await.as_deref(),
+            Some(newer.as_str()),
+            "the newer key must survive the migration's stale read"
+        );
+    }
+
+    /// ...and the same CAS still rewrites a row that did NOT change, so "refuse everything" would not
+    /// pass the test above. This one goes through the full production entry point.
+    ///
+    /// Falsification: return 0 from `reseal_limit_key_row` unconditionally (the lazy way to pass the
+    /// test above) and this fails.
+    #[tokio::test]
+    async fn the_legacy_reseal_rewrites_a_row_that_did_not_change() {
+        let pool = test_pool().await;
+        let kp = StaticKeyProvider::new([3u8; KEY_LEN], 1);
+        insert_plaintext_role(&pool, "r-still", LEGACY).await;
+
+        assert_eq!(
+            seal_legacy_limit_keys(&pool, &kp).await.expect("migrate"),
+            1,
+            "the one plaintext row must be rewritten"
+        );
+        let after = stored(&pool, "r-still").await.expect("still has a key");
+        assert!(
+            after.starts_with(crate::crypto::SEALED_TEXT_PREFIX) && !after.contains(LEGACY),
+            "the column must hold an envelope afterwards: {after}"
+        );
+        assert_eq!(
+            open_limit_key(&kp, Some(after)).expect("open").as_deref(),
+            Some(LEGACY),
+            "…and the key itself must come back"
+        );
+        assert_eq!(
+            seal_legacy_limit_keys(&pool, &kp)
+                .await
+                .expect("second pass"),
+            0,
+            "a sealed database needs no write at all"
+        );
+    }
 }

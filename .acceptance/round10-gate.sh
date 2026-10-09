@@ -61,7 +61,15 @@ gate "test optional + live redis/CH"   cargo test -p hydra-server --features ser
 # meant "it runs", and nothing enforced the difference until 2026-10-08. This entry mirrors the CI
 # step of the same name (`.github/workflows/ci.yml`, first step of `live-deps`, before the drills
 # because several of these tests bind real loopback ports near the drills').
-gate "arachne rust tests (in-process)"  cargo test -p hydra-server --features server,cluster-redis,arachne --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch --test arachne_store --test arachne_three_nodes --test arachne_cert_fidelity --test arachne_derivation_fidelity
+#
+# `--lib` added in round 210, for the same reason one level deeper: the `--test` list below covers the
+# INTEGRATION targets, while `crates/hydra-server/src/cluster/`'s own `#[cfg(test)] mod tests` (the
+# entity codec, the key space, the store) were executed by NO entry in this gate and NO step in CI —
+# `--features server` compiles that module out, so the entries that "run the server tests" never saw
+# them. Measured before adding it: `cargo test -p hydra-server --features server,cluster-redis,arachne
+# --lib` is 278 passed / 0 failed. The `--test` list stays (it pins the port-binding order); `--lib`
+# joins it in the same entry, because both need exactly this feature set.
+gate "arachne rust tests (in-process)"  cargo test -p hydra-server --features server,cluster-redis,arachne --lib --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch --test arachne_store --test arachne_three_nodes --test arachne_cert_fidelity --test arachne_derivation_fidelity
 # `#[ignore]`d tests: no CI job ran them before round 15, and the only carrier was
 # a script outside version control. This one needs no service.
 gate "ignored: listener limitation"     cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test boot_listeners -- --ignored

@@ -73,6 +73,31 @@ async fn seed_tenant_cert(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &st
     .expect("seal tenant cert");
 }
 
+/// Seed a `limit_role` whose `matching_key` is sealed under `kp` — the third sealed column, added by
+/// decision D-16 (2026-10-08), and the one with no `key_version` column of its own: the version
+/// lives INSIDE the envelope, which is why the rotation has to parse it rather than read it.
+async fn seed_limit_role_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str, key: &str) {
+    let sealed = kp.seal(key.as_bytes()).expect("seal").to_text();
+    sqlx::query(
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
+         VALUES (?, ?, ?, 600, 'm', 1, '')",
+    )
+    .bind(id)
+    .bind(id)
+    .bind(sealed)
+    .execute(pool)
+    .await
+    .expect("insert limit_role");
+}
+
+/// Read a stored `matching_key` back through the repo layer (the path the loader uses).
+async fn read_limit_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str) -> Option<String> {
+    db::get_limit_role(pool, kp, id)
+        .await
+        .ok()
+        .and_then(|r| r.matching_key)
+}
+
 /// Read a stored provider key back through a provider (the same path the loader
 /// uses at boot).
 async fn read_provider_key(
@@ -173,6 +198,7 @@ async fn a_rotation_reseals_every_secret_under_the_new_version() {
     seed_provider_key(&pool, &a, "k1", "sk-old-1").await;
     seed_provider_key(&pool, &a, "k2", "sk-old-2").await;
     seed_tenant_cert(&pool, &a, "t1", "-----BEGIN PRIVATE KEY-----old").await;
+    seed_limit_role_key(&pool, &a, "r1", "sk-limit-old").await;
 
     // Before: the new key alone cannot read anything (this is the state that
     // used to be fatal at boot).
@@ -182,6 +208,12 @@ async fn a_rotation_reseals_every_secret_under_the_new_version() {
     let report = db::reseal_secrets(&pool, &ring).await.expect("reseal");
     assert_eq!(report.provider_keys_resealed, 2, "both provider keys");
     assert_eq!(report.tenant_certs_resealed, 1, "the tenant cert key");
+    // Decision D-16: the `limit_role.matching_key` column is sealed too, so a rotation that skipped
+    // it would leave every limit role unreadable the moment the previous key is dropped.
+    assert_eq!(
+        report.limit_keys_resealed, 1,
+        "the sealed limit-role key: {report:?}"
+    );
     assert!(report.is_complete(), "no failures: {report:?}");
 
     // After: the NEW key alone opens everything (the ring is no longer needed),
@@ -199,9 +231,19 @@ async fn a_rotation_reseals_every_secret_under_the_new_version() {
         read_tenant_cert_key(&pool, &b, "t1").await.as_deref(),
         Some("-----BEGIN PRIVATE KEY-----old")
     );
+    assert_eq!(
+        read_limit_key(&pool, &b, "r1").await.as_deref(),
+        Some("sk-limit-old"),
+        "the limit-role key must be readable under the NEW key alone after the rotation"
+    );
     assert!(
         read_provider_key(&pool, &a, "k1").await.is_none(),
         "the old key must NOT be able to open a re-sealed row"
+    );
+    assert!(
+        read_limit_key(&pool, &a, "r1").await.is_none(),
+        "…nor the limit-role column (it was re-sealed under the new version, or the rotation \
+         silently skipped it and this asserts nothing)"
     );
     // The public cert PEM is untouched (it is public material).
     let cert_pem: (String,) = sqlx::query_as("SELECT cert_pem FROM tenant WHERE id = 't1'")
@@ -216,8 +258,56 @@ async fn a_rotation_reseals_every_secret_under_the_new_version() {
         .expect("reseal twice");
     assert_eq!(again.provider_keys_resealed, 0);
     assert_eq!(again.tenant_certs_resealed, 0);
-    assert_eq!(again.already_current, 3);
+    assert_eq!(again.limit_keys_resealed, 0);
+    assert_eq!(
+        again.already_current, 4,
+        "2 provider keys + 1 tenant cert + 1 limit-role key"
+    );
     assert!(again.is_complete());
+}
+
+/// A row that is still PLAINTEXT is sealed by the rotation pass too (decision D-16).
+///
+/// The loader is the usual migrator, but `hydra --reseal` runs BEFORE it (and can be run on its own),
+/// so it must not walk past a pre-D-16 row and leave the operator's rotation "complete" while a
+/// client key is still sitting in the clear. Either pass may be the one that gets there first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rotation_also_seals_a_plaintext_limit_key_it_finds() {
+    let pool = common::setup_pool().await;
+    // The way the pre-D-16 code wrote it: plaintext, straight into the column.
+    sqlx::query(
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
+         VALUES ('r-legacy', 'r-legacy', 'sk-legacy-plaintext', 600, 'm', 1, '')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert");
+
+    let report = db::reseal_secrets(&pool, &key_a()).await.expect("reseal");
+    assert_eq!(
+        report.limit_keys_resealed, 1,
+        "a plaintext row must be sealed by this pass: {report:?}"
+    );
+    assert!(report.is_complete(), "{report:?}");
+
+    let stored: (Option<String>,) =
+        sqlx::query_as("SELECT matching_key FROM limit_role WHERE id = 'r-legacy'")
+            .fetch_one(&pool)
+            .await
+            .expect("select");
+    assert!(
+        stored
+            .0
+            .as_deref()
+            .is_some_and(|v| v.starts_with("sealed:v1:")),
+        "the column must hold an envelope afterwards: {:?}",
+        stored.0
+    );
+    assert_eq!(
+        read_limit_key(&pool, &key_a(), "r-legacy").await.as_deref(),
+        Some("sk-legacy-plaintext"),
+        "…and the key itself must still come back"
+    );
 }
 
 /// A row nobody can open is REPORTED and left alone — never rewritten with

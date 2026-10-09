@@ -55,7 +55,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_ENCRYPTION_KEY` | *(unset)* | **Required.** Base64 of 32 bytes; AES-256-GCM master key encrypting provider api-keys at rest. Unset ⇒ the binary refuses to start (fail-closed). Generate with `openssl rand 32 \| base64`. Load from an `EnvironmentFile=` (see §1.2); never inline. A matching `HYDRA_ENCRYPTION_KEY_FILE` (**raw 32-byte file**) is also accepted, and **the file wins when both are set**. Measured 2026-09-30 (`integration/test_master_key_sources.py`): the two forms are the **same keystream** — rows sealed through one open through the other, in both directions; a trailing `\n` or `\r\n` in the file is trimmed (so `openssl rand 32 > key` and a Kubernetes secret volume both work), while a trailing **space** is not (only line endings are trimmed, and the error counts the bytes); a file holding **base64** text fails with `master key must be 32 bytes, got 44: HYDRA_ENCRYPTION_KEY holds the BASE64 … while HYDRA_ENCRYPTION_KEY_FILE holds the RAW bytes …`; and with neither variable set the binary refuses to start naming both. |
 | `HYDRA_ENCRYPTION_KEY_VERSION` | master-key version tag written to new ciphertext (default 1). A rotation sets the NEW version here (positive integer; `0`/garbage is refused at startup rather than silently defaulted). |
 | `HYDRA_ENCRYPTION_KEY_PREVIOUS` (+ `_PREVIOUS_VERSION`) | the OLD master key during a rotation window: with it set, the provider keeps a key ring so existing ciphertext still opens while `HYDRA_RESEAL_SECRETS=1` rewrites every row. Drop both after a clean re-seal report. |
-| `HYDRA_RESEAL_SECRETS` | *(unset)* | **One-shot maintenance switch**: set to `1`, `true`, `yes` or `on` (case-insensitive) to re-seal every stored secret under `HYDRA_ENCRYPTION_KEY`/`_VERSION` and EXIT — the process does not serve traffic in this mode. Run it once during a rotation, with the old key still present in `HYDRA_ENCRYPTION_KEY_PREVIOUS`; the report (`provider_keys=… tenant_certs=… already_current=… failed=…`) decides the exit code, and `failed` non-empty means **do not delete the previous key**. A row whose version already equals the current one is re-verified by actually opening it, so "already current" means "opens under the current key" — measured live 2026-09-30 with a row *labelled* current but sealed with other material: it is reported as `reseal FAILED: … labelled key_version 2 (the CURRENT version) but it does NOT open under the current key …`, exit 1. `0`/`false`/`no`/`off` (and unset) mean "serve normally" as you would expect. **Any other value is REFUSED at startup** (`exit 1`, with the offending value echoed): before 2026-09-30 every unrecognised value — `YES`, `on`, `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally", so a typo in this one-shot command left the operator with a healthy-looking node and **no indication that the rotation never ran** (measured in `integration/test_key_rotation_live.py`). See §3. |
+| `HYDRA_RESEAL_SECRETS` | *(unset)* | **One-shot maintenance switch**: set to `1`, `true`, `yes` or `on` (case-insensitive) to re-seal every stored secret under `HYDRA_ENCRYPTION_KEY`/`_VERSION` and EXIT — the process does not serve traffic in this mode. Run it once during a rotation, with the old key still present in `HYDRA_ENCRYPTION_KEY_PREVIOUS`; the report (`provider_keys=… tenant_certs=… limit_keys=… already_current=… failed=…`) decides the exit code, and `failed` non-empty means **do not delete the previous key**. A row whose version already equals the current one is re-verified by actually opening it, so "already current" means "opens under the current key" — measured live 2026-09-30 with a row *labelled* current but sealed with other material: it is reported as `reseal FAILED: … labelled key_version 2 (the CURRENT version) but it does NOT open under the current key …`, exit 1. `0`/`false`/`no`/`off` (and unset) mean "serve normally" as you would expect. **Any other value is REFUSED at startup** (`exit 1`, with the offending value echoed): before 2026-09-30 every unrecognised value — `YES`, `on`, `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally", so a typo in this one-shot command left the operator with a healthy-looking node and **no indication that the rotation never ran** (measured in `integration/test_key_rotation_live.py`). See §3. |
 | `HYDRA_DB_URL` | `sqlite:hydra.db?mode=rwc` | SQLite path. Use `sqlite://./data/hydra.db?mode=rwc` in production. |
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy **plaintext** listener. Always bound — the listener topology is derived from configuration only, never from whether tenants have certs (see `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`). |
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
@@ -183,7 +183,7 @@ docker run --rm \
   -e HYDRA_ENCRYPTION_KEY_PREVIOUS="$OLD_KEY" -e HYDRA_ENCRYPTION_KEY_PREVIOUS_VERSION="$OLD_VERSION" \
   -e HYDRA_RESEAL_SECRETS=1 \
   hydra:latest
-# → `reseal: provider_keys=N tenant_certs=M already_current=K failed=0`
+# → `reseal: provider_keys=N tenant_certs=M limit_keys=L already_current=K failed=0`
 #   exit code 0 = every secret now opens under the new version.
 #   Any `reseal FAILED: ...` line + exit code 1 = that row was left UNTOUCHED;
 #   do not drop the old key until the report is clean.
@@ -552,18 +552,35 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
   (streaming needs `stream_options.include_usage` for OpenAI; design §9.4).
 - **Soft-disable a role**: `enabled=false` (still listed but not matched).
 
-> **`matching_key` accepts the RAW client key OR its mask — fixed 2026-09-30, re-measured. USE THE
-> MASK.** (`integration/test_replica_fidelity.py`). This section used to say nothing about the form
+> **`matching_key` accepts the RAW client key, its mask, OR its `sha256:` digest — and since
+> 2026-10-08 the COLUMN IS SEALED AT REST (decision D-16). USE THE DIGEST.**
+> (`integration/test_limit_roles_enforcement.py` is the live drill for every form below; the
+> `test_replica_fidelity.py` this note used to cite was retired with the edge role.) This section used
+> to say nothing about the form
 > while `design.md` said "NULL **or equal to** the client api-key" (the raw key), and the code
 > silently compared only the mask. Now:
-> * **Write the MASK form** (see below how to get it) — it is the form to use, because
->   `matching_key` is stored and shipped **in plaintext**: `limit_role.matching_key` is a plain
->   column (`db.rs:1288` insert / `db.rs:1311` select — no `kp.seal`, unlike provider api-keys at
->   `db.rs:568`), it travels in the **config tree** as a plain `LimitRole`
->   (ADR-0001 D-7 carries the fidelity rows verbatim), and every node re-inserts it as-is (`db/restore.rs:242`). It is
->   also returned by `GET /api/v1/limit-roles` and rendered in the admin UI. **A raw key written
->   there is a live credential sitting in plaintext in every node's database, every backup, and
->   every admin API response.**
+> * **the column is SEALED** (D-16①, 2026-10-08 — the ruling was "seal everything, re-seal legacy
+>   rows without a manual step"): `limit_role.matching_key` goes in through `kp.seal`
+>   (`db.rs::seal_limit_key`, exactly like a provider api-key), the Arachne config tree carries that
+>   sealed value (`cluster/arachne_entities.rs::sealed_limit_role`), a materializing node seals it
+>   again as it writes its own database (`db/restore.rs`), and a row written BEFORE that decision is
+>   re-sealed the first time a loader reads it (`db::seal_legacy_limit_keys` — no operator step; the
+>   node logs `sealed N legacy plaintext 'limit_role.matching_key' value(s)` once). Master-key
+>   rotation covers the column too: `hydra --reseal` reports `limit_keys=N`.
+> * **what sealing does NOT cover** — the admin plane: `GET /api/v1/limit-roles` still returns the
+>   value in the clear (the admin UI renders it), and any process holding the master key can recover
+>   it. Sealing protects databases, backups and replicas from a filesystem-level reader; it does not
+>   make the credential unrecoverable.
+> * **UPGRADE NOTE (this change bumps the config-tree format to `TOC_FORMAT = 4`)**: the entity's
+>   bytes keep their shape but change MEANING, so a mixed-version cluster refuses each other's trees
+>   **by name** (`the table of contents declares format 3; this build speaks 4`) instead of decoding
+>   them. That is deliberate and it is the safe direction: a build speaking 3 would otherwise take the
+>   envelope text as the value to match and a key-scoped role would silently **stop being enforced**.
+>   The refusing node keeps serving its last-known-good config, so **upgrade every node before
+>   publishing a config change** — an old node will not pick up new config until it is upgraded.
+> * **Write the DIGEST form** — `sha256:<64 lowercase hex>` (decision D-16③) — when that matters: it
+>   matches the same key and stores **nothing recoverable at all**, not even under the master key
+>   (`printf %s "$KEY" | sha256sum`, then prefix the hex with `sha256:`).
 > * the **raw** form also fires (measured on the leader: `[200, 200, 429, 429]` for
 >   `sk-raw-only-probe-77`; before the fix the same leg measured `[200, 200, 200, 200]`, i.e. a
 >   quota that looked configured and enforced nothing) — use it only when you accept the exposure
@@ -571,21 +588,24 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 > * the **mask** form (`mask_key`: for a key of length ≥ 20 the first 10 and last 4 characters with
 >   the middle replaced by `*`; for length 6–19 the first 2 and last 2) is what you can read out of
 >   the `client_api_key` column of the usage rows — that is how to obtain it;
-> * the **counting bucket still uses the mask** (unchanged), so the raw key never becomes part of a
->   Redis key name or a metric label — but the consequence is unchanged: **two different client keys
->   whose masks coincide share ONE quota** — measured: `sk-fidelity-limited` and
->   `skzzzzzzzzzzzzzzzed` mask identically, and once the first key's window was spent the second key's
->   very first request was refused (`429`). Use one key per role if that matters.
-> * **the node warns about what the VALUE costs** (added 2026-09-30). A `matching_key` that is **not**
->   a mask is a raw client key: that column is kept and replicated in **plaintext** (unlike provider
->   api-keys, which are sealed) and is returned by `GET /api/v1/limit-roles`, so a live credential ends
->   up in every node's database, every backup and every admin response — the node says so by name at
->   config load. **The digest form (`sha256:<64 hex>`) is the one to use since 2026-10-08 (decision
->   D-16③)**: it matches the same key and stores nothing recoverable — `printf %s "$KEY" | sha256sum`
->   and prefix the hex with `sha256:`. The **mask** form also works and no longer carries a shared-window
->   cost: as of D-15② the window is keyed by a **digest** of the presented key, so two different keys
->   whose masks are identical have two separate windows (before that they shared one — measured: the
->   second key was refused on its first request once the first key's window was spent).
+> * the **counting bucket is keyed by a DIGEST of the presented key** (D-15②, 2026-10-08), so neither
+>   the raw key nor its mask ever becomes part of a Redis key name or a metric label — and **two
+>   different client keys whose masks coincide have two separate windows**. (Before D-15② the bucket
+>   used the mask and those two keys shared ONE quota: measured with `sk-fidelity-limited` and
+>   `skzzzzzzzzzzzzzzzed`, which mask identically — once the first key's window was spent, the second
+>   key's very first request was refused `429`. The window identity is now
+>   `(role_id, digest(presented key))`; the one-off cost of the change is that existing windows
+>   restarted once.)
+> * **the node warns about what the VALUE costs** (added 2026-09-30; **reworded 2026-10-08 by D-16**,
+>   because it used to say the column was plaintext and that stopped being true). A `matching_key`
+>   that is **not** a mask and not a digest is a raw client key: it is now sealed at rest and in the
+>   config tree, but it is still **recoverable by anything holding the master key** and
+>   `GET /api/v1/limit-roles` returns it in the clear, so a live credential still leaves the node in
+>   every admin response — the node says so by name at config load. **The digest form
+>   (`sha256:<64 hex>`) is the one to use (decision D-16③)**: it matches the same key and stores
+>   nothing recoverable at all — `printf %s "$KEY" | sha256sum` and prefix the hex with `sha256:`.
+>   The **mask** form also works and no longer carries a shared-window cost (D-15②, see the bullet
+>   above).
 > * **where those config warnings appear** (measured 2026-09-30, `integration/test_limit_roles_enforcement.py` L9):
 >   at **startup**, on **every config load**, and — because the admin write path reloads — **immediately
 >   when you write the role** (`POST`/`PUT /api/v1/limit-roles` answers `201`/`200` and the warning is in
@@ -609,10 +629,11 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >
 > `matching_model`, `matching_tenant` and `matching_provider` are **exact** matches (not prefixes
 > like the sub-tenant and operator key-prefix mechanisms), and `matching_provider` is inert because
-> the pre-routing gate runs before a provider is chosen (recorded as decision item D-11). Whether the
-> counting bucket should also key on the raw key (hash-first, since it becomes a Redis key name in
-> cluster mode) is recorded as **D-15**, and sealing the `matching_key` column (so the raw form stops
-> being a plaintext credential) as **D-16**; this note describes what the code does today.
+> the pre-routing gate runs before a provider is chosen (recorded as decision item D-11). The two
+> items this note used to leave open are both CLOSED and implemented (2026-10-08): the counting
+> bucket keys on a digest of the raw key (**D-15②**) and the `matching_key` column is sealed at rest
+> with legacy rows re-sealed by the loader (**D-16①**); the digest FORM (**D-16③**) is the one to
+> prefer. This note describes what the code does today.
 - **Multi-instance limitation (v1)**: counters are per-process. Multi-instance
   deployments need Redis-backed counters (v2 candidate, §16.6).
 

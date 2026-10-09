@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 
 use crate::crypto::KeyProvider;
 
-use super::crypto_to_sqlx;
+use super::{crypto_to_sqlx, seal_limit_key};
 
 /// The config tables wiped on restore, in dependency order (children first,
 /// parents last). The table name is a **static literal** per variant — never
@@ -237,7 +237,14 @@ pub async fn restore_config(
     // Limit roles — from `fidelity`, NOT from the runtime config: that view
     // holds only the ENABLED rows the hot path matches on, so rebuilding from it
     // would delete every disabled role on the replica (audit G1).
+    //
+    // `matching_key` is SEALED HERE, exactly like the provider api-keys above (decision D-16): the
+    // fidelity rows hold the key in memory (the matching engine needs it), and a replica that bound
+    // it straight into the column would be the one node in the fleet still storing a client key in
+    // the clear. Sealing at this boundary — rather than binding an envelope the tree supplied —
+    // keeps ONE rule for "how does a row get written": a value goes in through `seal_limit_key`.
     for r in &fidelity.limit_roles {
+        let matching_key = seal_limit_key(kp, r.matching_key.as_deref())?;
         sqlx::query(
             "INSERT INTO limit_role (id, name, matching_key, matching_model, matching_tenant, \
              matching_provider, limit_count, limit_token, window, enabled, created_at) \
@@ -245,7 +252,7 @@ pub async fn restore_config(
         )
         .bind(&r.id)
         .bind(&r.name)
-        .bind(&r.matching_key)
+        .bind(matching_key)
         .bind(&r.matching_model)
         .bind(&r.matching_tenant)
         .bind(&r.matching_provider)

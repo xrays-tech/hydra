@@ -383,9 +383,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         match db::reseal_secrets(&pool, key_provider.as_ref()).await {
             Ok(report) => {
                 println!(
-                    "reseal: provider_keys={} tenant_certs={} already_current={} failed={}",
+                    "reseal: provider_keys={} tenant_certs={} limit_keys={} already_current={} \
+                     failed={}",
                     report.provider_keys_resealed,
                     report.tenant_certs_resealed,
+                    report.limit_keys_resealed,
                     report.already_current,
                     report.failed.len()
                 );

@@ -62,6 +62,99 @@ pub struct Sealed {
     pub key_version: u32,
 }
 
+/// Marks a TEXT value that carries a [`Sealed`] rather than plaintext.
+///
+/// ## Why a prefix, when `provider_key` uses dedicated columns
+///
+/// `provider_key` splits a secret over `api_key_ciphertext` / `api_key_nonce` / `key_version`, so
+/// "is this row sealed?" is a property of the SCHEMA. `limit_role.matching_key` (decision D-16,
+/// 2026-10-08 — the user's ruling: seal the column, and re-seal legacy rows automatically) has ONE
+/// TEXT column that has held PLAINTEXT since the first release. Adding sibling columns would leave
+/// two carriers of the same secret and a row in which both are populated; instead the value says
+/// what it is, which is what makes the migration a READ-time question ("does this value parse as an
+/// envelope?") rather than a schema migration.
+///
+/// The `v1` tag is the format version: a future layout change is a new tag, never a silent
+/// reinterpretation of bytes already in someone's database or config tree.
+pub const SEALED_TEXT_PREFIX: &str = "sealed:v1:";
+
+impl Sealed {
+    /// This sealed value in the single TEXT form shared by `limit_role.matching_key` and the config
+    /// tree: `sealed:v1:<key_version>:<base64(nonce ‖ ciphertext)>`.
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        let mut raw = Vec::with_capacity(NONCE_LEN + self.ciphertext.len());
+        raw.extend_from_slice(&self.nonce);
+        raw.extend_from_slice(&self.ciphertext);
+        format!(
+            "{SEALED_TEXT_PREFIX}{}:{}",
+            self.key_version,
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        )
+    }
+
+    /// Parse [`Self::to_text`]'s form. `None` means "this value is NOT an envelope" — a plaintext
+    /// value written before the column was sealed, or something an operator typed.
+    ///
+    /// STRUCTURAL only: this answers "does this value look like a sealed block?", not "does it
+    /// open?". The two questions are deliberately different — see [`Self::open_text`].
+    #[must_use]
+    pub fn from_text(value: &str) -> Option<Self> {
+        let (version, payload) = value.strip_prefix(SEALED_TEXT_PREFIX)?.split_once(':')?;
+        let key_version: u32 = version.parse().ok()?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()?;
+        // A nonce AND at least a GCM tag: anything shorter cannot be a ciphertext this code wrote,
+        // so it is not an envelope (and must not be reported as a decryption failure).
+        if raw.len() <= NONCE_LEN {
+            return None;
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&raw[..NONCE_LEN]);
+        Some(Sealed {
+            ciphertext: raw[NONCE_LEN..].to_vec(),
+            nonce,
+            key_version,
+        })
+    }
+
+    /// Open a TEXT value that may be an envelope OR a plaintext value from before D-16.
+    ///
+    /// ## The fallback is narrow on purpose — and this is exactly what reaches it
+    ///
+    /// * A value that does NOT parse as an envelope is a pre-D-16 plaintext client key, and it is
+    ///   returned as-is. The loader re-seals what it finds (`db::seal_legacy_limit_keys` for the
+    ///   column, the encoder for the config tree).
+    ///
+    ///   MEASURED while falsifying this (round 210), because the first version of this comment
+    ///   overstated the case: the config LOADER migrates the column BEFORE it reads it, so the loader
+    ///   path alone does NOT depend on this branch (making the branch an error left the loader test
+    ///   green). What does depend on it is every other reader: `GET /api/v1/limit-roles` on a node
+    ///   whose migration has not run yet, and any other caller of `db::list_limit_roles`. "Not an
+    ///   envelope" means "written before D-16", not "corrupt", and inventing an error for it would
+    ///   break those paths over a value that is perfectly usable.
+    ///
+    ///   The config TREE is deliberately NOT one of those carriers: D-16 changed what a `limit_role`
+    ///   entity's bytes mean, so it is a `TOC_FORMAT` bump and an older tree is refused by the toc.
+    ///   The tree decoder refuses a plaintext value outright
+    ///   (`cluster::arachne_entities::opened_limit_role`) — a per-field fallback there would let a
+    ///   mis-decoded tree through, which is how a limit silently stops being enforced.
+    /// * A value that DOES parse but does not open is an ERROR. A wrong or rotated-away master key
+    ///   is never handed back as "the key", and there is no path here that returns ciphertext.
+    ///
+    /// # Errors
+    /// [`CryptoError::Decrypt`] / [`CryptoError::KeyVersionMismatch`] for an envelope the master key
+    /// ring cannot open; [`CryptoError::NotUtf8`] when the plaintext is not UTF-8.
+    pub fn open_text(kp: &dyn KeyProvider, value: &str) -> Result<String, CryptoError> {
+        let Some(sealed) = Self::from_text(value) else {
+            return Ok(value.to_string());
+        };
+        let plaintext = kp.open(&sealed)?;
+        String::from_utf8(plaintext).map_err(|_| CryptoError::NotUtf8)
+    }
+}
+
 /// Abstraction over master-key sources. `StaticKeyProvider` reads the key from
 /// the environment; a future `KmsKeyProvider` (AWS KMS / HashiCorp Vault) will
 /// implement this same trait without changing call sites.
@@ -579,5 +672,111 @@ mod tests {
                 "a deterministically sealed value must open like any other"
             );
         }
+    }
+
+    /// The TEXT envelope round-trips, and it holds no plaintext of the key.
+    ///
+    /// This is the form `limit_role.matching_key` is stored in (decision D-16) and the form the
+    /// config tree carries, so "the column is not the key" is a property of ONE function.
+    ///
+    /// Falsification: return the plaintext from `to_text` and the `contains` assertion fails; drop
+    /// the nonce from the layout and the round-trip fails.
+    #[test]
+    fn the_text_envelope_round_trips_and_hides_the_key() {
+        let kp = kp();
+        let secret = "sk-live-customer-key-0001";
+        let text = kp.seal(secret.as_bytes()).expect("seal").to_text();
+
+        assert!(
+            !text.contains(secret),
+            "the envelope must not contain the key: {text}"
+        );
+        assert!(
+            text.starts_with(SEALED_TEXT_PREFIX),
+            "the envelope must be recognisable: {text}"
+        );
+
+        let sealed = Sealed::from_text(&text).expect("parses as an envelope");
+        assert_eq!(
+            kp.open(&sealed).expect("open"),
+            secret.as_bytes(),
+            "the envelope must open back to the key"
+        );
+        assert_eq!(
+            Sealed::open_text(&kp, &text).expect("open_text"),
+            secret,
+            "the TEXT entry point must agree with the typed one"
+        );
+
+        // v1's layout is nonce ‖ ciphertext; a hand-built envelope must agree with the codec, or
+        // the format is only round-tripping against itself.
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(
+                text.strip_prefix(SEALED_TEXT_PREFIX)
+                    .unwrap()
+                    .split_once(':')
+                    .unwrap()
+                    .1,
+            )
+            .expect("base64");
+        assert_eq!(&raw[..NONCE_LEN], &sealed.nonce, "nonce comes first");
+        assert_eq!(&raw[NONCE_LEN..], sealed.ciphertext.as_slice());
+    }
+
+    /// A value that is NOT an envelope is a pre-D-16 plaintext row, and it is returned as-is.
+    ///
+    /// This is the migration (the user's ruling: legacy rows are re-sealed automatically, which
+    /// first requires being able to READ them). It is also the one place where the code deliberately
+    /// does not fail closed, so the boundary is pinned: only a STRUCTURAL non-envelope is passed
+    /// through. An envelope that will not open is an error, and never the ciphertext.
+    ///
+    /// Falsification: return `Err` for the plaintext case and the first assertion fails; fall back to
+    /// plaintext when `open` fails and the last one does (it would return the envelope text).
+    #[test]
+    fn open_text_passes_plaintext_through_and_refuses_an_unopenable_envelope() {
+        let kp = kp();
+        let legacy = "sk-legacy-plaintext-key";
+        assert_eq!(
+            Sealed::open_text(&kp, legacy).expect("plaintext passes through"),
+            legacy
+        );
+
+        // Nearly-an-envelope strings are plaintext, not "corrupt ciphertext": a wrong tag, a wrong
+        // version field, a truncated payload.
+        for almost in [
+            "sealed:v2:1:AAAA",
+            "sealed:v1:x:AAAA",
+            "sealed:v1:1:not base64!",
+            "sealed:v1:1:AAAA",
+            "sealed:v1:1:",
+            "unsealed:v1:1:AAAA",
+        ] {
+            assert!(
+                Sealed::from_text(almost).is_none(),
+                "{almost:?} must not parse as an envelope"
+            );
+            assert_eq!(
+                Sealed::open_text(&kp, almost).expect("read as plaintext"),
+                almost,
+                "{almost:?} must be read as a plaintext value"
+            );
+        }
+
+        // A REAL envelope under the wrong key: an error, and NOT the envelope text.
+        let wrong = StaticKeyProvider::new([9u8; KEY_LEN], 1);
+        let text = kp.seal(b"sk-under-another-key").expect("seal").to_text();
+        assert!(
+            matches!(Sealed::open_text(&wrong, &text), Err(CryptoError::Decrypt)),
+            "an envelope that does not open must be refused, not handed back"
+        );
+        // ...and a version outside the ring is refused as such.
+        let rotated = StaticKeyProvider::new([7u8; KEY_LEN], 5);
+        assert!(
+            matches!(
+                Sealed::open_text(&rotated, &text),
+                Err(CryptoError::KeyVersionMismatch { .. })
+            ),
+            "a version outside the ring must be refused by name"
+        );
     }
 }

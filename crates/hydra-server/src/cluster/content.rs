@@ -175,7 +175,7 @@ impl ReplicationContent {
             },
         );
 
-        let limit_roles = crate::db::list_limit_roles_on(&mut *tx).await?;
+        let limit_roles = crate::db::list_limit_roles_on(&mut *tx, kp).await?;
         let key_prefix_bindings = crate::db::list_provider_key_bindings_on(&mut *tx).await?;
         let tenant_token_hashes = crate::db::list_tenant_access_token_hashes_on(&mut *tx).await?;
         let provider_models = crate::db::list_provider_models_on(&mut *tx).await?;
@@ -260,6 +260,7 @@ mod tests {
         for id in ["r-b", "r-a"] {
             crate::db::insert_limit_role(
                 pool,
+                kp,
                 &hydra_core::model::LimitRole {
                     id: id.into(),
                     name: id.into(),

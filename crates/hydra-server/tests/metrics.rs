@@ -136,6 +136,7 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
     .unwrap();
     repo::insert_limit_role(
         pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
         &LimitRole {
             id: "default".into(),
             name: "default".into(),

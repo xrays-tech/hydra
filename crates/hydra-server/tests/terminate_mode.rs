@@ -172,6 +172,7 @@ async fn seed_key(
 async fn seed_default_role(pool: &sqlx::SqlitePool, tenant: &str) {
     repo::insert_limit_role(
         pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
         &LimitRole {
             id: "default".into(),
             name: "default".into(),
@@ -986,6 +987,7 @@ async fn send_one(client: &reqwest::Client, url: &str, body: &str) -> reqwest::R
 async fn tighten_limit_to_2(pool: &sqlx::SqlitePool) {
     repo::update_limit_role(
         pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
         &LimitRole {
             id: "default".into(),
             name: "default".into(),

@@ -918,7 +918,7 @@ mod tests {
         );
 
         // 2) The FIDELITY rows are in the replica's own database...
-        let roles = crate::db::list_limit_roles(&replica_pool)
+        let roles = crate::db::list_limit_roles(&replica_pool, key_provider.as_ref())
             .await
             .expect("list limit roles");
         assert_eq!(
