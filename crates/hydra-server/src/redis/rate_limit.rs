@@ -205,11 +205,14 @@ impl RedisRateLimiter {
     /// Pre-gate count check: for every matched role with a `limit_count`,
     /// atomically check-and-increment its Redis window; any denial → `Denied`.
     ///
-    /// **Two-phase** (P3-7 / 2026-10-09): phase 1 runs
+    /// **Two-phase** (P3-7 + review N3, 2026-10-09): phase 1 runs
     /// [`CHECK_COUNT_SCRIPT`] (read-only) on every matched window; phase 2 runs
-    /// [`INCR_COUNT_SCRIPT`] on each ONLY if all admitted. The old loop called a
-    /// per-role check-and-increment and returned at the first refusal, leaving
-    /// the roles before it charged for a request that was ultimately refused.
+    /// [`CHECK_AND_INC_SCRIPT`] (ATOMIC re-check + increment) on each ONLY if
+    /// all admitted. A pure write would let the phase-1→phase-2 gap push a
+    /// window past its limit; the atomic re-check keeps every window exactly
+    /// bounded. The old single-script per-role loop returned at the first
+    /// refusal, leaving the roles before it charged for a request that was
+    /// ultimately refused.
     pub async fn check_count(
         &self,
         roles: &[LimitRole],

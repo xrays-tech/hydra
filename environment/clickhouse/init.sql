@@ -50,7 +50,12 @@ ORDER BY (dedup_key, tenant_id, provider_id)
 --     record — so an equivalent re-send, even in a differently-composed batch,
 --     computes the SAME key;
 --   * convergence — `ReplacingMergeTree()` collapses rows sharing a key, so a
---     re-sent event is counted once;
+--     re-sent event is counted once. NOTE (review N2, 2026-10-09): the collapse
+--     happens on background merge, so DIRECT `clickhouse-client` queries see
+--     duplicates until a merge runs; Hydra's own `/usage` reads use
+--     `FROM usage_record FINAL` to make "counted once" immediate (crates/hydra-server/src/
+--     usage/backends/clickhouse/mod.rs); an operator querying the table directly must add
+--     `FINAL` too if deduplication matters;
 --   * NO version column is needed (and `created_at` CANNOT be one — it is a
 --     `String`, and ClickHouse rejects a String version column: it must be
 --     Int*/UInt*/Date/DateTime/DateTime64). The reason no version is needed is

@@ -826,7 +826,7 @@ pub fn resolve(
 | Hook | 触发时机 | 是否重试 | 处理 |
 | --- | --- | --- | --- |
 | `fail_to_connect` | TCP/TLS 连接失败 | ✅ 总是重试（未发送任何字节） | `ctx.cursor += 1`；`breaker::on_failure(pid)`；若仍有候选 → `e.set_retry(true)` → 回 `upstream_peer`；否则返回错误 |
-| `error_while_proxy` | 连接建立后出错（中断/超时/重置） | ⚠️ **条件**（见 §8.3） | 受 `retry_after_connect` 配置 + `upstream_bytes_seen==0` + body 可重放 三重约束 |
+| `error_while_proxy` | 连接建立后出错（中断/超时/重置） | ⚠️ **条件**（见 §8.3，字段已删） | 受 ~~`retry_after_connect` 配置~~ **（已删除，P3-1）** + `upstream_bytes_seen==0` + body 可重放 三重约束 |
 
 ### 8.2 关键安全约束（修订 P1-B6）
 
@@ -850,6 +850,8 @@ fn error_while_proxy(&self, _p: &HttpPeer, _s: &mut Session,
     let first_byte_not_seen = ctx.upstream_bytes_seen == 0;
     let more_candidates = ctx.cursor + 1 < ctx.candidates.len();
 
+    // ⚠️ `retry_after_connect` 已删除（P3-1，2026-10-09）：不存在该配置了。
+    // 这里仅保留历史伪代码。现行行为：只有连接失败（从未写字节）才重试。
     if cfg.retry_after_connect && first_byte_not_seen && body_replayable && more_candidates {
         ctx.cursor += 1;
         e.set_retry(true);                            // opt-in 的代理阶段重试
@@ -864,7 +866,7 @@ fn error_while_proxy(&self, _p: &HttpPeer, _s: &mut Session,
 > - `upstream_bytes_seen == 0` 是**第二道闸**，防止流式已开始后的灾难性重试；
 > - `body_replayable`：body 超过自实现缓冲上限（`[proxy] max_request_body`）时不再累积，重放会送出残缺 body → 禁止重试（§8.5）。
 
-> **ops 文档须显著标注**：`retry_after_connect=true` 在上游已处理但首字节未返回的窗口内重试，**会产生重复计费**。
+> **ops 文档须显著标注**：~~`retry_after_connect=true`~~ **（已删除，P3-1）** 曾在上游已处理但首字节未返回的窗口内重试，会产生重复计费 —— 该开关已随 terminate-mode 移除，无重复计费入口。
 
 ### 8.4 熔断器（CircuitBreaker，修订 P1-B5）
 
@@ -1403,8 +1405,9 @@ non_route_strategy     = "passthrough"  # passthrough | reject
 # ⚠️ 上面这行是历史遗留的「幽灵开关」：loader 从未读取它。实际开关是环境变量
 # HYDRA_NON_ROUTE_STRATEGY（已接线，取值非法则启动失败）；见审核二 C3。
 
+# ~~[failover]~~（已删除，P3-1 —— retry_after_connect 字段随 terminate-mode 移除，无此配置块）
 [failover]
-retry_after_connect = false        # 默认 false（安全）；true 接受重复计费风险
+retry_after_connect = false        # ~~默认 false（安全）；true 接受重复计费风险~~ —— 字段已删除
 
 [breaker]
 threshold       = 5               # 连续失败阈值
@@ -1558,7 +1561,7 @@ PRAGMA mmap_size = 134217728;
 - 基本转发联调（Mock 上游）。
 
 ### Phase 4 — 故障转移与熔断（2d）
-- `fail_to_connect` 总是重试；`error_while_proxy` 按 `retry_after_connect` + `upstream_bytes_seen` + `body_replayable` 条件重试（§8.3）；
+- `fail_to_connect` 总是重试；`error_while_proxy` 按 ~~`retry_after_connect`~~ **（已删除，P3-1）** + `upstream_bytes_seen` + `body_replayable` 条件重试（§8.3）；
 - `CircuitBreaker`（on_failure/on_success/is_dead + 后台探活）；
 - 大请求体策略 + 413（§8.5）；
 - 多上游 Mock 故障注入测试（连接失败/中断/超时/超大 body）。
@@ -1587,7 +1590,7 @@ PRAGMA mmap_size = 134217728;
 ### Phase 9 — 内建 UI + 加固（1.5d）
 - `admin-ui` 静态资源内嵌（含认证缓存失效、熔断复位操作）；
 - Admin 鉴权、key 掩码、错误模型统一；
-- 优雅升级验证、压测、文档（含 `retry_after_connect` 计费风险 ops 说明）。
+- 优雅升级验证、压测、文档（~~含 `retry_after_connect` 计费风险 ops 说明~~ **该开关已删除（P3-1），计费风险不再存在**）。
 
 **预估合计：约 14.5 人日**（与 `dev-plan.md` 波次计划一致；§18 Phase 划分已被波次计划取代，仅作阶段映射参考）。
 
@@ -1643,7 +1646,7 @@ PRAGMA mmap_size = 134217728;
 | B3 `TenantModel` 闸门 | P1 | ✅ §7.1 接入路由（用户确认=闸门） |
 | B4 `pingora-prometheus` | P1 | ✅ §1.1/§13.1/§19.1 自托管 `prometheus` crate |
 | B5 `status=-1` 机制 | P1 | ✅ §8.4 熔断器（用户确认=v1 内置） |
-| B6 故障转移计费竞态 | P1 | ✅ §8.1/§8.3 对齐 + `retry_after_connect` 配置默认 false |
+| B6 故障转移计费竞态 | P1 | ✅ §8.1/§8.3 对齐 + ~~`retry_after_connect` 配置默认 false~~ **（字段已删除，P3-1；现行恒不重放已发出请求）** |
 | C1 多 provider usage schema | P1 | ✅ §9.4 OpenAI+Anthropic+通用 |
 | C2 非 JSON 路径 | P2 | ✅ §6.3a passthrough/reject |
 | C3 大 body+重试 | P1 | ✅ §8.5 |

@@ -309,24 +309,31 @@ function main(argv) {
   ];
   // Allow the markdown bold we actually write (`**2** expect()`), and the zh
   // "处" quantifier; `\**` is "zero or more stars" (markdown **bold**).
-  const README_EXPECT_CLAIM = /\**(\d+)\**\s*(?:处\s*)?[`]*expect\(\)[`]*/;
+  const README_EXPECT_CLAIM = /\**(\d+)\**\s*(?:处\s*)?[`]*expect\(\)[`]*/g;
   for (const file of README) {
     if (!fs.existsSync(file)) {
       problems.push(`README missing at ${path.relative(ROOT, file)} — the expect-count claim must stay verifiable`);
       continue;
     }
     const text = fs.readFileSync(file, 'utf8');
-    const claim = text.match(README_EXPECT_CLAIM);
-    if (!claim) {
+    // Check EVERY occurrence (review N7, 2026-10-09): the zh README's prose
+    // ("2 处断言…的 `expect()`") and its table row both carry the count, and
+    // either could drift independently. The first-match form was fragile: a
+    // reworded first occurrence that still parses to the right number would
+    // hide a wrong second one.
+    const claims = [...text.matchAll(README_EXPECT_CLAIM)];
+    if (claims.length === 0) {
       problems.push(`${path.relative(ROOT, file)} carries no "N expect()" claim — P3-8: add the measured production count, or update this checker`);
       continue;
     }
-    const advertised = Number(claim[1]);
-    if (advertised !== allExpects.length) {
-      problems.push(
-        `${path.relative(ROOT, file)} advertises ${advertised} production expect() but the scan finds ${allExpects.length} — ` +
-          `the README claim must equal what check_source_purity measures`,
-      );
+    for (const claim of claims) {
+      const advertised = Number(claim[1]);
+      if (advertised !== allExpects.length) {
+        problems.push(
+          `${path.relative(ROOT, file)} advertises ${advertised} production expect() but the scan finds ${allExpects.length} — ` +
+            `the README claim must equal what check_source_purity measures`,
+        );
+      }
     }
   }
 

@@ -920,7 +920,10 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 > schema carries row-level idempotency too** (decision P2-1): the table is
 > `ReplacingMergeTree() ORDER BY (dedup_key, tenant_id, provider_id)` with a
 > stable per-row `dedup_key` (the per-request trace id), so a duplicated row written by
-> any retry collapses to one. **No version column is used** — every copy of one
+> any retry collapses to one. **The collapse happens on background merge — Hydra's
+> own `/usage` reads use `FROM usage_record FINAL` (review N2, 2026-10-09) so
+> "counted once" is immediate for the gateway; an operator querying the table
+> directly must add `FINAL` too.** **No version column is used** — every copy of one
 > `dedup_key` is byte-identical (a retry re-sends the very same in-memory
 > `UsageRecord`), and `created_at` cannot serve as a version anyway: it is a
 > `String`, and ClickHouse rejects a String version column (verified live on 24.3,
