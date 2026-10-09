@@ -110,7 +110,7 @@ def start_hydra():
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
         "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, 'adm.db')}?mode=rwc",
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-        "RUST_LOG": "warn",
+        "RUST_LOG": "info",   # INFO shows the hot-reload resize line (Q4 asserts it)
     })
     log = open(os.path.join(DIR, "hydra.log"), "w")
     return subprocess.Popen([BIN], env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -314,14 +314,14 @@ def main():
               bool(live), f"{live}")
         decisions = metric("hydra_admission_decisions_total")
         check("Q1: hydra_admission_decisions_total is exported", bool(decisions), f"{decisions[:2]}")
-        # ... and the OTHER direction: the stale-limits counter must stay SILENT for a
-        # provider whose configured limits match the gate. ops.md §9.1 turns this series
-        # into an alert ("accepted but not enforced"), and an alert that also fires when
-        # nothing is stale is worse than no alert. Q1 is the right place to assert it:
-        # these limits were written once, before any traffic, and never changed after.
-        no_false_alarm = metric("hydra_admission_limits_stale_total")
-        check("Q1: hydra_admission_limits_stale_total is ABSENT while the config matches "
-              "the gate (no false alarm)", no_false_alarm == [], f"{no_false_alarm}")
+        # ... and the OTHER direction: the resizes counter must stay SILENT for a
+        # provider whose configured limits match the gate. Since D-14 (2026-10-09) a
+        # resize happens only when a configuration change reaches the gate, so a gate
+        # that matches its config must never count one. Q1 is the right place to assert
+        # it: these limits were written once, before any traffic, and never changed.
+        no_false_alarm = metric("hydra_admission_resizes_total")
+        check("Q1: hydra_admission_resizes_total is ABSENT while the config matches "
+              "the gate (no resize to report)", no_false_alarm == [], f"{no_false_alarm}")
 
         # ---- Q2: waiters give up after queue_wait_timeout_ms ----
         reconfigure({"max_concurrency": 1, "max_queue_depth": 5, "queue_wait_timeout_ms": 300})
@@ -366,16 +366,19 @@ def main():
         check("Q3: max_concurrency=0 is the unlimited passthrough (all 3 succeed)",
               sorted(results3) == [200, 200, 200], f"codes={sorted(results3)}")
         # NB: /api/v1/concurrency cannot be used here to prove "0 = unlimited" — it
-        # reports the RUNTIME gate, and p1's gate was created earlier with cap 2 (see Q4,
-        # which pins that behaviour as a documented limitation).
-        # ---- Q4: KNOWN LIMITATION — admission limits are NOT resized on hot-reload ----
-        # `proxy/admission.rs` says so itself ("once created, a gate's semaphore is NOT
-        # resized if a later call passes a different max_concurrency — the first policy
-        # wins"); ops.md §4 and the /api/v1/concurrency description document it, and
-        # implementing the resize is decision item D-14. This case PINS the current
-        # behaviour so that a future resize is a deliberate, visible change: it asserts
-        # the gate keeps the OLD cap and that the endpoint agrees with the gate (not with
-        # the configuration), which is exactly the trap an operator falls into.
+        # reports the RUNTIME gate (the last generation the gate was resized to; see Q4,
+        # which pins the resize + the configuration-change window).
+        # ---- Q4: hot-reload RESIZE (decision item D-14, implemented 2026-10-09) ----
+        # A configuration change is applied on the next acquire: the gate swaps to a new
+        # generation (in-flight requests keep the old one until they drain). This pins
+        # THREE things: (a) the DB row takes the new cap; (b) between the reload and the
+        # next request the enforced cap is the last APPLIED one while the configuration
+        # asks for the new one, and that mismatch is VISIBLE (`limits_stale=true`) — never
+        # presented as the enforced cap; (c) once a request arrives the gate RESIZES, so
+        # the enforced cap becomes the configured one and the split disappears. Before
+        # D-14 a gate was created once and never moved ("the first policy wins"), so the
+        # enforced cap stayed at the creation-time value forever and the only thing to
+        # assert was the mismatch.
         probe_st, _, _ = call("GET", f"http://127.0.0.1:{ADMIN}/api/v1/health", token=TOKEN)
         print(f"   (Q4 precheck: /api/v1/health -> {probe_st}; node alive={proc.poll() is None})")
         reconfigure({"max_concurrency": 3, "max_queue_depth": 3, "queue_wait_timeout_ms": 2000})
@@ -394,6 +397,8 @@ def main():
         time.sleep(0.4)
         st_row, _, row = call("GET", f"http://127.0.0.1:{ADMIN}/api/v1/providers/p1", token=TOKEN)
         reported = None
+        configured_max = None
+        limits_stale_after_put = None
         raw_st, _, raw_body = call("GET", f"http://127.0.0.1:{ADMIN}/api/v1/concurrency", token=TOKEN)
         print(f"   (Q4 /api/v1/concurrency raw -> HTTP {raw_st} {raw_body[:160]})")
         try:
@@ -403,40 +408,53 @@ def main():
         entries = parsed.get("providers") if isinstance(parsed, dict) else parsed
         if isinstance(entries, list) and entries:
             reported = entries[0].get("max_concurrency") if isinstance(entries[0], dict) else None
+            configured_max = entries[0].get("configured_max_concurrency") if isinstance(entries[0], dict) else None
+            limits_stale_after_put = entries[0].get("limits_stale") if isinstance(entries[0], dict) else None
         elif isinstance(entries, dict):
             first = next(iter(entries.values()), None)
-            reported = first.get("max_concurrency") if isinstance(first, dict) else None
-        check("Q4 (known limitation): the DB row takes the new cap",
+            if isinstance(first, dict):
+                reported = first.get("max_concurrency")
+                configured_max = first.get("configured_max_concurrency")
+                limits_stale_after_put = first.get("limits_stale")
+        check("Q4: the DB row takes the new cap",
               '"max_concurrency":1' in row.replace(" ", ""), f"PUT -> {st}")
-        # The gate was created at p1's FIRST request, when the cap was 2 (the value it was
-        # seeded with at the top of this test). Neither the later PUT to 3 nor the PUT to 1
-        # moved it: "the first policy wins".
-        check("Q4 (known limitation): the RUNTIME gate keeps the cap captured at its FIRST "
-              "request — neither the increase to 3 nor the decrease to 1 was applied "
-              "(documented in ops.md §4 + api-docs; resize tracked as D-14)",
-              reported == 2, f"/api/v1/concurrency reports max_concurrency={reported} (gate, created with 2) "
-                              f"while the DB row says 1")
-        # …and the mismatch must be VISIBLE, never presented as the configured cap: the
-        # endpoint reports both sides plus `limits_stale`, the node logs a WARN, and the
-        # request is counted in hydra_admission_limits_stale_total. (Before round 78 an
-        # operator saw only the stale value and would conclude the change had applied.)
-        entries = parsed.get("providers") if isinstance(parsed, dict) else parsed
-        first = entries[0] if isinstance(entries, list) and entries else {}
-        configured = first.get("configured_max_concurrency")
+        # The config changed to 1, but NO request has arrived since the reload — the gate
+        # still enforces the cap it was last resized to (3, from the burst above, which had
+        # resized it away from the 2 it was seeded with at the top of the test). D-14 means
+        # the resize happens on the NEXT acquire, so this window is real and must be
+        # VISIBLE, never presented as the configured cap.
+        check("Q4: between reload and the next request the enforced cap is the last "
+              "APPLIED one (3, from the burst) — the resize has not reached the gate yet",
+              reported == 3, f"/api/v1/concurrency reports max_concurrency={reported}, "
+                              f"the DB row says 1")
         check("Q4: the endpoint reports the CONFIGURED cap next to the enforced one",
-              configured == 1, f"configured_max_concurrency={configured}, enforced={first.get('max_concurrency')}")
+              configured_max == 1, f"configured_max_concurrency={configured_max}, enforced={reported}")
         check("Q4: the endpoint flags the mismatch with limits_stale=true",
-              first.get("limits_stale") is True, f"limits_stale={first.get('limits_stale')}")
-        # a request after the change must be admitted under the stale limits AND counted
+              limits_stale_after_put is True, f"limits_stale={limits_stale_after_put}")
+        # A request now arrives: it must RESIZE the gate to the new cap (D-14). Wait for
+        # the probe, then re-read the endpoint — the split must be gone.
         proxied()
-        time.sleep(0.2)
-        stale = metric("hydra_admission_limits_stale_total")
-        check("Q4: hydra_admission_limits_stale_total counts requests admitted under stale limits",
-              any('provider="p1"' in l and not l.endswith(" 0") for l in stale), f"{stale[:2]}")
+        time.sleep(0.4)
+        raw_st2, _, raw_body2 = call("GET", f"http://127.0.0.1:{ADMIN}/api/v1/concurrency", token=TOKEN)
+        try:
+            parsed2 = json.loads(raw_body2)
+        except Exception:
+            parsed2 = {}
+        entries2 = parsed2.get("providers") if isinstance(parsed2, dict) else parsed2
+        first2 = entries2[0] if isinstance(entries2, list) and entries2 else {}
+        check("Q4: after a request the gate RESIZES — the enforced cap is now the "
+              "configured one (1, D-14)",
+              first2.get("max_concurrency") == 1,
+              f"enforced={first2.get('max_concurrency')}, configured={first2.get('configured_max_concurrency')}")
+        check("Q4: after the resize the endpoint reports limits_stale=false",
+              first2.get("limits_stale") is False, f"limits_stale={first2.get('limits_stale')}")
+        resizes = metric("hydra_admission_resizes_total")
+        check("Q4: hydra_admission_resizes_total counts the hot-reload resize(s)",
+              any('provider="p1"' in l and not l.endswith(" 0") for l in resizes), f"{resizes[:3]}")
         log = open(os.path.join(DIR, "hydra.log"), errors="replace").read()
-        check("Q4: the node warns once with both sides named",
-              "admission limits changed in configuration" in log and "configured_max_concurrency=1" in log,
-              "WARN present" if "admission limits changed" in log else "no WARN found")
+        check("Q4: the node logs the resize with both sides named",
+              "admission gate resized on hot-reload" in log and "configured_max_concurrency=1" in log,
+              "resize INFO present" if "admission gate resized" in log else "no resize log found")
 
     finally:
         upstream.shutdown()
@@ -452,7 +470,7 @@ def main():
         print(f"ADMISSION QUEUE: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print("ADMISSION QUEUE: PASSED (saturation bound, drop reasons, gauges, endpoint, "
-          "passthrough, and the documented no-resize-on-reload limitation)")
+          "passthrough, and the hot-reload resize with its configuration-change window)")
     return 0
 
 

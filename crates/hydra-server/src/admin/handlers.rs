@@ -222,11 +222,32 @@ fn warnings_for(state: &AdminState, subject: &str) -> Vec<String> {
         .collect()
 }
 
+/// P3-4 / D-16 second half (2026-10-09): the admin API must not echo a
+/// recoverable client key. `limit_role.matching_key` used to be the LAST
+/// plaintext-echo exception — provider keys never are (`?reveal=1` is a no-op
+/// since P1-5). The digest form (`sha256:` + hex, decision D-16③) is already
+/// unrecoverable and is echoed as-is (it is the form operators are told to
+/// use); every other value — a raw key, or a mask — is masked, so nothing
+/// carryable off an admin response or the UI can reconstruct the original.
+fn masked_matching_key(v: &str) -> String {
+    if hydra_core::limit::is_key_digest(v) {
+        v.to_string()
+    } else {
+        hydra_core::rewrite::mask_key(v)
+    }
+}
+
 /// A limit role plus its warnings, as the write endpoints answer. `warnings` is ALWAYS present
 /// (possibly empty) so a script can read it without sniffing for the key.
 fn limit_role_body(state: &AdminState, role: &LimitRole) -> serde_json::Value {
     let mut body = serde_json::to_value(role).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut body {
+        if let Some(k) = role.matching_key.as_deref() {
+            map.insert(
+                "matching_key".to_string(),
+                serde_json::json!(masked_matching_key(k)),
+            );
+        }
         map.insert(
             "warnings".to_string(),
             serde_json::json!(warnings_for(state, &role.id)),
@@ -1548,6 +1569,17 @@ fn matching_provider_write_error(provider: &str, trace_id: &str) -> Resp {
     )
 }
 
+/// A limit role with `matching_key` masked for READ responses (P3-4 / D-16
+/// second half). Clones the role and replaces `matching_key` with the masked /
+/// digest-preserved form — never the recoverable value.
+fn masked_limit_role(role: &LimitRole) -> LimitRole {
+    let mut out = role.clone();
+    if let Some(k) = role.matching_key.as_deref() {
+        out.matching_key = Some(masked_matching_key(k));
+    }
+    out
+}
+
 pub(super) async fn limit_role_collection(
     state: &AdminState,
     session: &mut ServerSession,
@@ -1556,7 +1588,10 @@ pub(super) async fn limit_role_collection(
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_limit_roles(state.db(), state.key_provider.as_ref()).await {
-            Ok(rows) => ok_json(200, &rows),
+            Ok(rows) => {
+                let masked: Vec<LimitRole> = rows.iter().map(masked_limit_role).collect();
+                ok_json(200, &masked)
+            }
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "POST" {
@@ -1601,7 +1636,7 @@ pub(super) async fn limit_role_item(
     match method {
         "GET" => match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await
         {
-            Ok(r) => ok_json(200, &r),
+            Ok(r) => ok_json(200, &masked_limit_role(&r)),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "role not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
         },
@@ -2607,9 +2642,12 @@ struct ConcurrencyList {
 pub(super) fn concurrency_collection(state: &AdminState) -> Resp {
     // The configured side comes from the LIVE snapshot (not from what the last request
     // happened to observe), so the response always contrasts "what the configuration asks
-    // for" with "what this gate is enforcing" — gates are not resized on hot-reload
-    // (ops.md §4 / decision item D-14), and reporting only the enforced value made a
-    // configuration change look applied.
+    // for" with "what this gate is enforcing". Since 2026-10-09 a gate RESIZES on
+    // hot-reload (decision item D-14 — the next acquire swaps in a new generation), so
+    // `limits_stale=true` means "a configuration change has been made but no request has
+    // applied it yet" (or the provider is no longer in the config); reporting only the
+    // enforced value would make a configuration change look applied before it reaches the
+    // gate.
     let cfg = state.store.snapshot();
     let providers = state.admission.snapshot_with_configured(|provider_id| {
         // `cfg.providers` is keyed by provider id.

@@ -1186,18 +1186,12 @@ impl ProxyHttp for HydraProxy {
                     // elsewhere bills the customer twice. ONLY a connect error
                     // proves the upstream never saw the request; anything else
                     // (a timeout, or a connection dropped after the request was
-                    // written) requires the documented opt-in
-                    // (`FailoverConfig::retry_after_connect`). It IS read — see the
-                    // `never_reached_upstream` branch below — and today nothing wires
-                    // it to an env var, so it holds its documented default of `false`.
-                    // If it is ever wired, `true` means "fail over even when the
-                    // request was already written", i.e. the double-billing case the
-                    // comment below describes.
-                    // A connect error is the ONLY proof the upstream never saw
-                    // the request. A FIRST-BYTE timeout is the opposite: the
-                    // request was written, so replaying it may double-bill — it
-                    // must therefore take the same path as any other post-send
-                    // failure (and NOT be silently upgraded to "never reached").
+                    // written) is a post-send failure and is never failed over.
+                    // This is fail-safe: we never replay a request that was
+                    // already sent, which prevents double upstream billing.
+                    // A FIRST-BYTE timeout is the opposite of a connect error —
+                    // the request was written — so it takes this same path (and
+                    // is NOT silently upgraded to "never reached").
                     let never_reached_upstream = match &e {
                         crate::proxy::provider_client::SendError::Transport(re) => re.is_connect(),
                         crate::proxy::provider_client::SendError::FirstByteTimeout { .. } => {
@@ -1211,7 +1205,7 @@ impl ProxyHttp for HydraProxy {
                             false
                         }
                     };
-                    if !never_reached_upstream && !self.state.proxy.failover.retry_after_connect {
+                    if !never_reached_upstream {
                         warn!(
                             trace_id = %ctx.trace_id,
                             provider_id = %cand.provider_id,

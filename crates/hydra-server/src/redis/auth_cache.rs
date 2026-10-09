@@ -8,6 +8,8 @@
 //! SCAN, plan §6.1). The plaintext api-key never appears; only its SHA-256
 //! hex.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use fred::clients::Pool;
@@ -33,6 +35,61 @@ fn idx_key(tenant_id: &str) -> String {
 /// L1 is not a clear at all: `AuthCache::check` re-hydrates an L1 miss from the
 /// L2. Bounded by the number of tenants, never by the number of keys.
 pub const GLOBAL_IDX_KEY: &str = "hydra:{auth:idx}";
+
+/// The verdict an L2 `get` resolves to: `(allowed, remaining_ttl)` when the key
+/// is present. Factored out of the [`L2::get`] return type (the boxed-future
+/// return would otherwise trip clippy's `type_complexity` lint) — same pattern
+/// as [`crate::proxy::limiter::CountVerdict`].
+type L2GetResult = Result<Option<(bool, Duration)>, RedisError>;
+
+/// The outcome of a fleet-wide clear: `(deleted, failed)`.
+type L2ClearResult = Result<(usize, usize), RedisError>;
+
+/// The behaviour an auth-verdict L2 (cluster P4) must provide to
+/// [`crate::http::AuthCache`].
+///
+/// `RedisAuthL2` (below) is the production Redis implementation. The trait is
+/// the seam (D-9) that lets the epoch-guard regression test drive a
+/// deterministic double — a fake L2 whose `get` can be made to stall so an
+/// invalidation lands WHILE the read is in flight — instead of relying on real
+/// Redis timing, which CI cannot reproduce reliably.
+///
+/// Object-safe (boxed futures, same pattern as [`crate::proxy::limiter::Limiter`])
+/// so `AuthCache` holds an `Arc<dyn L2>`.
+pub trait L2: Send + Sync {
+    /// Read a verdict: `(allowed, remaining_ttl)` when present.
+    fn get<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+    ) -> Pin<Box<dyn Future<Output = L2GetResult> + Send + 'a>>;
+
+    /// Store a verdict with its TTL (and record the key in the tenant index).
+    fn set<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+        allowed: bool,
+        ttl: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>>;
+
+    /// Remove one verdict (key + index entry).
+    fn del<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>>;
+
+    /// Remove every verdict of a tenant (index-driven; no SCAN).
+    fn del_tenant<'a>(
+        &'a self,
+        tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>>;
+
+    /// Remove every verdict of EVERY tenant (fleet-wide clear). Returns
+    /// `(deleted, failed)`.
+    fn del_all_tenants<'a>(&'a self) -> Pin<Box<dyn Future<Output = L2ClearResult> + Send + 'a>>;
+}
 
 /// Redis-backed auth-verdict L2 cache.
 #[derive(Clone)]
@@ -157,6 +214,50 @@ impl RedisAuthL2 {
             failed += 1;
         }
         Ok((deleted, failed))
+    }
+}
+
+// The L2 behaviour seam (D-9): `AuthCache` drives the L2 through this trait, so
+// the epoch-guard regression test can substitute a deterministic double. Each
+// method just forwards to the inherent `RedisAuthL2` method (inherent methods
+// take precedence over the same-named trait methods, so `self.get(..)` below is
+// the concrete Redis call).
+impl L2 for RedisAuthL2 {
+    fn get<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+    ) -> Pin<Box<dyn Future<Output = L2GetResult> + Send + 'a>> {
+        Box::pin(async move { self.get(tenant_id, key_hash_hex).await })
+    }
+
+    fn set<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+        allowed: bool,
+        ttl: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+        Box::pin(async move { self.set(tenant_id, key_hash_hex, allowed, ttl).await })
+    }
+
+    fn del<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key_hash_hex: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+        Box::pin(async move { self.del(tenant_id, key_hash_hex).await })
+    }
+
+    fn del_tenant<'a>(
+        &'a self,
+        tenant_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+        Box::pin(async move { self.del_tenant(tenant_id).await })
+    }
+
+    fn del_all_tenants<'a>(&'a self) -> Pin<Box<dyn Future<Output = L2ClearResult> + Send + 'a>> {
+        Box::pin(async move { self.del_all_tenants().await })
     }
 }
 
@@ -540,5 +641,181 @@ mod tests {
                 "{t}/{k} must be cleared even though t2 failed"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // D-9 — deterministic epoch-guard regression (NO real Redis).
+    //
+    // The L2 trait seam exists precisely so this race can be reproduced
+    // WITHOUT real Redis timing, which CI cannot make deterministic. The double
+    // below stalls inside `get` so the test can land an invalidation WHILE the
+    // read is in flight — the exact window the epoch guard (N1) must close.
+    //
+    // These are deterministic unit tests of the GUARD logic. They do NOT replace
+    // the real-Redis tests above (铁律 2): those still exercise the genuine
+    // Redis L2 end to end.
+    // -----------------------------------------------------------------------
+
+    /// A deterministic [`L2`] double: `get` blocks until the test releases it
+    /// and records every call. The other methods are no-ops (the test only
+    /// exercises `get` and the invalidation's `del`).
+    struct GatedL2 {
+        /// Signalled once `get` has reached its blocking point (the test uses
+        /// this to know the read is in flight before it invalidates).
+        started: tokio::sync::Notify,
+        /// Awaited by `get` until the test releases it.
+        release: tokio::sync::Notify,
+        /// The (stale) verdict `get` returns once released.
+        verdict: Option<(bool, Duration)>,
+        /// Number of `get` calls.
+        get_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl L2 for GatedL2 {
+        fn get<'a>(
+            &'a self,
+            _tenant_id: &'a str,
+            _key_hash_hex: &'a str,
+        ) -> Pin<Box<dyn Future<Output = L2GetResult> + Send + 'a>> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                // The read is now in flight: let the test land the invalidation.
+                self.started.notify_one();
+                // Block until the test releases the (stale) verdict.
+                self.release.notified().await;
+                Ok(self.verdict)
+            })
+        }
+
+        fn set<'a>(
+            &'a self,
+            _tenant_id: &'a str,
+            _key_hash_hex: &'a str,
+            _allowed: bool,
+            _ttl: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn del<'a>(
+            &'a self,
+            _tenant_id: &'a str,
+            _key_hash_hex: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn del_tenant<'a>(
+            &'a self,
+            _tenant_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RedisError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn del_all_tenants<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = L2ClearResult> + Send + 'a>> {
+            Box::pin(async move { Ok((0, 0)) })
+        }
+    }
+
+    /// D-9 / N1 — the L2 back-fill must pass through the invalidation epoch
+    /// guard.
+    ///
+    /// The upstream-resolution path is guarded by `set_if_unchanged`, but the
+    /// L2 back-fill in `check` used to BYPASS the guard: it read the L2 and
+    /// wrote the verdict straight into the L1 with no epoch check. So an
+    /// invalidation that lands while an L2 read is in flight (the read had
+    /// already captured the pre-invalidation verdict) would resurrect the
+    /// revoked verdict into the L1 for the whole TTL.
+    ///
+    /// This test reproduces that exact interleaving deterministically with
+    /// [`GatedL2`]: start a `check` that misses the L1 and stalls on the L2
+    /// read, invalidate the key WHILE the read is in flight, then release the
+    /// read with the (stale) verdict. The back-fill must refuse to write it.
+    ///
+    /// Without the epoch guard this test FAILS (the stale verdict is
+    /// back-filled); with it, the verdict is dropped and the next request
+    /// re-resolves.
+    #[tokio::test]
+    async fn l2_backfill_refuses_when_invalidated_while_the_read_is_in_flight() {
+        let l2 = std::sync::Arc::new(GatedL2 {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            // A stale ALLOW: the dangerous direction (a revoked key re-allowed).
+            verdict: Some((true, Duration::from_secs(300))),
+            get_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cache = std::sync::Arc::new(
+            crate::http::AuthCache::new(Duration::from_secs(300), Duration::from_secs(30))
+                .with_l2(l2.clone()),
+        );
+
+        // The check will miss the (empty) L1 and block on the L2 read.
+        let check_task = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.check("t1", "sk-a").await }
+        });
+
+        // Wait until the L2 read is in flight (the epoch is sampled and `get` is
+        // blocked). `notify_one` stores a permit, so this is correct whether the
+        // read started before or after we register the waiter.
+        l2.started.notified().await;
+
+        // Invalidate WHILE the read is in flight: bump the epoch and drop the
+        // entry (the double's `del` is a no-op — the load-bearing effect is the
+        // epoch bump, which `check` observes).
+        cache.invalidate("t1", &["sk-a".to_string()]).await;
+
+        // Release the read with the stale verdict.
+        l2.release.notify_one();
+
+        let verdict = check_task.await.expect("check task panicked");
+        assert_eq!(
+            verdict,
+            hydra_core::auth::Verdict::Miss,
+            "a verdict resolved before the invalidation must not be back-filled into the L1"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "the L1 must remain empty after a refused back-fill"
+        );
+        assert_eq!(
+            l2.get_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one L2 read was attempted"
+        );
+    }
+
+    /// D-9 / N1 control — when NO invalidation lands during the L2 read, the
+    /// back-fill must still succeed (the guard must not over-refuse). This is
+    /// the deterministic mirror of `auth_cache_l1_miss_hydrates_from_l2` (which
+    /// uses real Redis), so the guard's precision does not depend on a live
+    /// instance.
+    #[tokio::test]
+    async fn l2_backfill_succeeds_when_no_invalidation_lands_during_the_read() {
+        let l2 = std::sync::Arc::new(GatedL2 {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            verdict: Some((true, Duration::from_secs(300))),
+            get_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cache = std::sync::Arc::new(
+            crate::http::AuthCache::new(Duration::from_secs(300), Duration::from_secs(30))
+                .with_l2(l2.clone()),
+        );
+
+        // Release the read IMMEDIATELY (no invalidation in flight).
+        l2.release.notify_one();
+
+        let verdict = cache.check("t1", "sk-a").await;
+        assert_eq!(
+            verdict,
+            hydra_core::auth::Verdict::Hit(true),
+            "with no invalidation the L2 verdict must hydrate the L1"
+        );
+        assert_eq!(cache.len(), 1, "the L1 was back-filled from the L2");
     }
 }

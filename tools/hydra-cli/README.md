@@ -45,12 +45,18 @@ hydra-admin --help
 ## Configuration
 
 Every command needs the Hydra **base URL** and an **admin bearer token**. Provide
-them via flags or environment variables (flags win).
+them via flags or environment variables (flags win). **Prefer the environment
+variables** — a token passed on the command line shows up in `ps` output and the
+shell history of a shared host; the env var does not.
 
 | Flag          | Environment            | Default                  |
 | ------------- | ---------------------- | ------------------------ |
 | `--base-url`  | `HYDRA_BASE_URL` / `HYDRA_HOST` | `http://127.0.0.1:8081` |
 | `--token`     | `HYDRA_ADMIN_TOKEN`    | _required_               |
+
+> **`--token` is deprecated (2026-10-09).** It still works, but using it prints
+> one warning to stderr: the token is visible on argv. Set `HYDRA_ADMIN_TOKEN`
+> instead — same token, no `ps`/history leak.
 
 Extras:
 
@@ -67,7 +73,8 @@ hydra-admin health
 hydra-admin providers list --json
 ```
 
-Global options may appear **before or after** the subcommand:
+Global options may appear **before or after** the subcommand (the `--token` flag
+is kept for backward compatibility, but the env var is the recommended form):
 
 ```bash
 hydra-admin --token s3cret providers list

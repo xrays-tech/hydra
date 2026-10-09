@@ -77,10 +77,12 @@ pub struct AuthCache {
     /// per-tenant metric and for tests.
     capped: std::sync::atomic::AtomicU64,
     now: Clock,
-    /// Optional Redis L2 (cluster P4): consulted on L1 miss before the
-    /// upstream `auth_url`. `None` in single-node mode.
+    /// Optional L2 (cluster P4): consulted on L1 miss before the upstream
+    /// `auth_url`. `None` in single-node mode. Held as a trait object (D-9) so
+    /// the epoch-guard regression test can drive a deterministic double; the
+    /// production value is a `RedisAuthL2`.
     #[cfg(feature = "cluster-redis")]
-    l2: Option<Arc<crate::redis::auth_cache::RedisAuthL2>>,
+    l2: Option<Arc<dyn crate::redis::auth_cache::L2>>,
     /// Placeholder field (single-node builds never construct the L2).
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
@@ -133,11 +135,15 @@ impl AuthCache {
         self.capped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Attach the Redis L2 backend (cluster P4). L1 stays the hot path; the
-    /// L2 only sees L1 misses.
+    /// Attach the L2 backend (cluster P4). L1 stays the hot path; the L2 only
+    /// sees L1 misses.
+    ///
+    /// Takes the [`crate::redis::auth_cache::L2`] behaviour seam (D-9): the
+    /// production caller passes a `RedisAuthL2` (coerced to `Arc<dyn L2>`), and
+    /// the epoch-guard regression test passes a deterministic double.
     #[cfg(feature = "cluster-redis")]
     #[must_use]
-    pub fn with_l2(mut self, l2: Arc<crate::redis::auth_cache::RedisAuthL2>) -> Self {
+    pub fn with_l2(mut self, l2: Arc<dyn crate::redis::auth_cache::L2>) -> Self {
         self.l2 = Some(l2);
         self
     }
@@ -241,9 +247,27 @@ impl AuthCache {
         //     the `insert` takes the same shard's WRITE lock, so holding a read
         //     guard on this task is a self-deadlock (not a race: it can never
         //     resolve).
+        //
+        //     N1: the back-fill also honours the invalidation epoch. The upstream
+        //     path is guarded by `set_if_unchanged`, but this L2 read used to
+        //     bypass the guard entirely: an invalidation that lands WHILE the L2
+        //     read is in flight has already dropped the L1 (and L2) entry, so the
+        //     verdict the read returns was resolved BEFORE the revocation. Writing
+        //     it back into the L1 would undo the revocation for the whole TTL.
+        //     Sample the epoch before the read and refuse the back-fill if it
+        //     moved; the next request re-resolves (the L2 entry is gone, so it
+        //     re-auths upstream).
         #[cfg(feature = "cluster-redis")]
         if let Some(l2) = &self.l2 {
+            let epoch_before = self.epoch();
             if let Ok(Some((allowed, ttl))) = l2.get(tenant_id, &hex_digest(&hash)).await {
+                if self.epoch() != epoch_before {
+                    debug!(
+                        tenant = %tenant_id,
+                        "L2 back-fill refused: the cache was invalidated while the read was in flight"
+                    );
+                    return Verdict::Miss;
+                }
                 let expires_at = (self.now)() + ttl;
                 self.map.insert(
                     key,

@@ -2,7 +2,7 @@
 
 > **Tired of Python LLM gateways that leak gigabytes of RAM at idle and silently mangle your tool calls through lossy OpenAI↔Anthropic translation?**
 >
-> **Hydra is a Rust + Pingora LLM gateway that speaks both OpenAI and Anthropic *natively* — zero protocol conversion, per-tenant TLS, and billing-grade usage metering (cached tokens + TTFT) — in a 65 MiB binary with zero `unsafe` and zero production `unwrap`/`panic!`; the only panic sources are 6 `expect()` calls asserting unreachable invariants.**
+> **Hydra is a Rust + Pingora LLM gateway that speaks both OpenAI and Anthropic *natively* — zero protocol conversion, per-tenant TLS, and billing-grade usage metering (cached tokens + TTFT) — running at ~65 MiB RSS with zero `unsafe` and zero production `unwrap`/`panic!`; the only panic sources are 2 `expect()` calls asserting unreachable invariants (both registered, decision D-13).**
 
 **A high-performance LLM routing gateway.** Route **OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`)** client traffic to upstream model providers — format-homogeneous pass-through (the client's path is preserved end-to-end, including usage parsing), with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, granular usage metering (input/cached/output tokens + TTFT), and per-tenant TLS. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
 
@@ -17,9 +17,9 @@
 | ⚡ | **11,056 RPS** peak throughput | c=25, p99 = 4.39 ms |
 | 🪶 | **65 MiB** RSS under full load | 18.6 → 65.4 MiB; < 0.4% of a 16 GB box |
 | ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency; the model-extraction pass is O(body) (~0.09-1.3 ms/MB), so multi-MB bodies add milliseconds |
-| 🛡️ | **0** production `unwrap`/`panic!`, **6** `expect()` invariant assertions | both crates `#![forbid(unsafe_code)]`; the 6 panic sources are unreachable-invariant assertions — `main.rs` (cert store), `admin/mod.rs` (leader-mode SQLite pool), `cluster/control_client.rs` ×4 |
+| 🛡️ | **0** production `unwrap`/`panic!`, **2** `expect()` invariant assertions | both crates `#![forbid(unsafe_code)]`; the 2 panic sources are unreachable-invariant assertions — `main.rs` (cert store), `proxy/provider_client.rs`. **Count = what `check_source_purity.cjs` measures; the number is a testable claim, not prose.** |
 | 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
-| 🧪 | **core 114 + server 173** tests, `clippy -D warnings` clean | CI hard gate |
+| 🧪 | **core + server** tests (see [`docs/index.html`](docs/index.html) for the exact measured count), `clippy -D warnings` clean | CI hard gate |
 
 **Production-readiness: 9.2 / 10** — see the [full report](dev-docs/evaluation-report.html).
 

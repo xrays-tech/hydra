@@ -5,7 +5,10 @@ import type { EffectiveOpts, GlobalOpts } from '../config.js';
 export function addGlobalOptions(cmd: Command): Command {
   cmd
     .option('--base-url <url>', 'Hydra base URL (env: HYDRA_BASE_URL, HYDRA_HOST)')
-    .option('--token <tok>', 'Admin bearer token (env: HYDRA_ADMIN_TOKEN)')
+    .option(
+      '--token <tok>',
+      'Admin bearer token. DEPRECATED — prefer HYDRA_ADMIN_TOKEN (a token on argv shows up in `ps` / shell history). Emits one warning when used.',
+    )
     .option('--json', 'Raw JSON output, skip table formatting')
     .option('-v, --verbose', 'Print HTTP method + URL to stderr');
   return cmd;

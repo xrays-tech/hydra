@@ -516,8 +516,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <div class="num"><span data-count="0" data-fmt="int">0</span><span class="unit">unsafe</span></div>
       <div class="lab" data-l="zh">生产代码无 unwrap / panic / unsafe</div>
       <div class="lab" data-l="en">unsafe / unwrap / panic in production code</div>
-      <div class="note" data-l="zh">790 项 Rust 测试 · 浏览器 / SDK / JS 套件 · clippy -D warnings 硬门禁（2026-10-09）</div>
-      <div class="note" data-l="en">790 Rust tests · browser / SDK / JS suites · clippy -D warnings gate (2026-10-09)</div>
+      <div class="note" data-l="zh">792 项 Rust 测试 · 浏览器 / SDK / JS 套件 · clippy -D warnings 硬门禁（2026-10-09）</div>
+      <div class="note" data-l="en">792 Rust tests · browser / SDK / JS suites · clippy -D warnings gate (2026-10-09)</div>
     </div>
   </div>
   <div class="wrap">
@@ -745,8 +745,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
         <span data-l="en">Methodology: <code>10-core machine</code> + threaded mock upstream, no real paid provider hit. Full methodology + 8C16G VPS extrapolation in the <a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">evaluation report</a> (dated 2026-08-09 · v0.1.0 · macOS 10-core / 24 GB), threaded Python mock upstream, no real paid provider.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid">
-        <span data-l="zh">正确性门禁：<code>262 core + 528 server</code> 测试（2026-10-09 计数）、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
-        <span data-l="en">Correctness gates: <code>262 core + 528 server</code> tests (counted 2026-10-09), <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
+        <span data-l="zh">正确性门禁：<code>262 core + 530 server</code> 测试（2026-10-09 计数）、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
+        <span data-l="en">Correctness gates: <code>262 core + 530 server</code> tests (counted 2026-10-09), <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid;border-color:var(--accent);background:rgba(255,90,31,.05)">
         <span data-l="zh"><b style="color:var(--accent)">横向扩展 ∝ N：</b>数据面无状态，吞吐随节点数近似线性增长——K8s HPA 就绪，加副本就是加吞吐。集群 ≈ 单节点 × N（受上游与网络约束）。</span>

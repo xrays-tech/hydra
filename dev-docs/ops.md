@@ -490,36 +490,31 @@ error the old snapshot + old certs are retained and the endpoint returns 400
 ## 4. Rate-limit tuning (design §10, §15.1 `[limit]`)
 
 
-> **Per-provider admission limits are applied ONCE per provider, at its first request**
-> (measured 2026-09-29). `max_concurrency`, `max_queue_depth` and
-> `queue_wait_timeout_ms` are read when a provider's gate is created — i.e. the first time
-> it passes admission — and the gate is **not resized afterwards** (the code says so in
-> `proxy/admission.rs`: "once created, a gate's semaphore is NOT resized if a later call
-> passes a different max_concurrency — the first policy wins"). Concretely:
-> `PUT /api/v1/providers/{id}` with the new limits returns 200 and the row in the database
-> really does change (`GET /api/v1/providers/{id}` shows the new value), but a provider
-> that has ALREADY served traffic keeps enforcing the OLD limits until the process
-> restarts. Measured with a 1.2 s upstream: cap 2 → two concurrent requests reached
-> in-flight 2; after `PUT …max_concurrency: 1` + `POST /api/v1/reload`, two concurrent
-> requests STILL reached in-flight 2. Workaround today: restart the node after changing any
-> admission limit (a provider that has not served yet picks the new values up on its first
-> request). Implementing the resize is tracked as a decision item (D-14).
+> **Per-provider admission limits are RESIZED on hot-reload (decision item D-14,
+> implemented 2026-10-09).** `max_concurrency`, `max_queue_depth` and
+> `queue_wait_timeout_ms` are read when a provider's gate is created and again on
+> every subsequent `acquire`: a configuration change swaps in a NEW gate
+> generation (a fresh semaphore) the next time that provider admits a request,
+> while requests already in flight keep the OLD generation until they finish
+> (in-flight permits hold an `Arc` to the generation they were issued from, so
+> the old cap drains naturally). Concretely: `PUT /api/v1/providers/{id}` with
+> the new limits returns 200 and the row changes (`GET …/providers/{id}` shows
+> the new value), and the next request to that provider is admitted under the
+> NEW limits — no restart needed.
 >
-> **The mismatch is visible, not silent.** `GET /api/v1/concurrency` reports both sides:
-> `max_concurrency` / `max_queue_depth` / `queue_wait_timeout_ms` are what the RUNTIME gate
-> is enforcing, while `configured_max_concurrency` / `configured_max_queue_depth` /
-> `configured_queue_wait_timeout_ms` are what the LIVE configuration snapshot asks for right
-> now (resolved through `hydra_core::config::resolve_policy`, i.e. provider row → process
-> default — not a value some earlier request happened to observe). `limits_stale: true`
-> means the two disagree: the row changed and the gate did not. The same condition
-> increments `hydra_admission_limits_stale_total{provider}` once per request admitted while
-> the two sides differ, and the node logs one `WARN` per distinct policy (not per request).
-> Measured end-to-end: `PUT max_concurrency=1` (row 2 → 1) + reload, then three requests →
-> `configured_max_concurrency=1` next to `max_concurrency=2`, `limits_stale=true`,
-> `hydra_admission_limits_stale_total{provider="p1"} 3`. So "accepted but not applied" is an
-> alertable state instead of something to discover by hand (rule in §9.1). A node whose
-> configured and enforced values agree reports `limits_stale: false` and never increments
-> the counter.
+> **The window before the resize is visible, not silent.** `GET
+> /api/v1/concurrency` reports both sides: `max_concurrency` / `max_queue_depth` /
+> `queue_wait_timeout_ms` are what the RUNTIME gate is enforcing, while
+> `configured_max_concurrency` / `configured_max_queue_depth` /
+> `configured_queue_wait_timeout_ms` are what the LIVE configuration snapshot asks for
+> right now (resolved through `hydra_core::config::resolve_policy`, i.e. provider row →
+> process default — not a value some earlier request happened to observe). Between a
+> config write and the first request that applies it, the two disagree —
+> `limits_stale: true` — and each applied resize increments
+> `hydra_admission_resizes_total{provider}` and logs one `INFO` naming both sides.
+> The pre-D-14 behaviour (gates never resized, a per-request *stale-limits* counter
+> counting requests admitted under stale limits, restart required) is gone — when the
+> resize landed the counter was renamed to `hydra_admission_resizes_total`.
 Limits are configured as **roles** in the `limit_roles` table. Each role carries
 `matching_*` dimensions (any `NULL` = match-all on that dimension), a
 `limit_count` and/or `limit_token` ceiling, and a `window` (`m` / `h` / `d`).
@@ -572,10 +567,11 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   re-sealed the first time a loader reads it (`db::seal_legacy_limit_keys` — no operator step; the
 >   node logs `sealed N legacy plaintext 'limit_role.matching_key' value(s)` once). Master-key
 >   rotation covers the column too: `hydra --reseal` reports `limit_keys=N`.
-> * **what sealing does NOT cover** — the admin plane: `GET /api/v1/limit-roles` still returns the
->   value in the clear (the admin UI renders it), and any process holding the master key can recover
->   it. Sealing protects databases, backups and replicas from a filesystem-level reader; it does not
->   make the credential unrecoverable.
+> * **what sealing does NOT cover** — the admin plane: `GET /api/v1/limit-roles` returns `matching_key` MASKED
+>   (digest form as-is, everything else via `mask_key` — P3-4, 2026-10-09), so the node never echoes a
+>   recoverable client key; only something holding the master key can open the sealed envelope. Sealing
+>   protects databases, backups and replicas from a filesystem-level reader; it does not make the
+>   credential unrecoverable to the master-key holder.
 > * **UPGRADE NOTE (this change bumps the config-tree format to `TOC_FORMAT = 4`)**: the entity's
 >   bytes keep their shape but change MEANING, so a mixed-version cluster refuses each other's trees
 >   **by name** (`the table of contents declares format 3; this build speaks 4`) instead of decoding
@@ -604,13 +600,13 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 > * **the node warns about what the VALUE costs** (added 2026-09-30; **reworded 2026-10-08 by D-16**,
 >   because it used to say the column was plaintext and that stopped being true). A `matching_key`
 >   that is **not** a mask and not a digest is a raw client key: it is now sealed at rest and in the
->   config tree, but it is still **recoverable by anything holding the master key** and
->   `GET /api/v1/limit-roles` returns it in the clear, so a live credential still leaves the node in
->   every admin response — the node says so by name at config load. **The digest form
->   (`sha256:<64 hex>`) is the one to use (decision D-16③)**: it matches the same key and stores
->   nothing recoverable at all — `printf %s "$KEY" | sha256sum` and prefix the hex with `sha256:`.
->   The **mask** form also works and no longer carries a shared-window cost (D-15②, see the bullet
->   above).
+>   config tree, and still **recoverable by anything holding the master key** — but the admin API
+>   never echoes it (P3-4, 2026-10-09: `GET /api/v1/limit-roles` returns `matching_key` MASKED), so
+>   no admin response carries a live credential; the node says so by name at config load. **The
+>   digest form (`sha256:<64 hex>`) is the one to use (decision D-16③)**: it matches the same key
+>   and stores nothing recoverable at all — `printf %s "$KEY" | sha256sum` and prefix the hex with
+>   `sha256:`. The **mask** form also works and no longer carries a shared-window cost (D-15②, see
+>   the bullet above).
 > * **where those config warnings appear** (measured 2026-09-30, `integration/test_limit_roles_enforcement.py` L9):
 >   at **startup**, on **every config load**, and — because the admin write path reloads — **immediately
 >   when you write the role** (`POST`/`PUT /api/v1/limit-roles` answers `201`/`200` and the warning is in
@@ -1172,7 +1168,8 @@ promise in the paragraph above is real, and so are its two sharp edges:
 
 ## 7. ~~⚠️ `retry_after_connect`~~ — duplicate-billing risk (**已删除，见 terminate-mode**)
 
-> **此配置项已在 terminate-mode 重写中删除。** 以下内容保留作为历史参考。
+> **此配置项已在 terminate-mode 重写中删除，字段本身于 2026-10-09（P3-1）从代码彻底移除。**
+> 以下内容保留作为历史参考。
 >
 > Terminate-mode（当前实现）的故障转移是一个**简单 `for candidate in candidates { try send; on fail continue; }` 循环**：全 body 已缓存（`Bytes`），重放零成本（`Bytes::clone` O(1)）。失败时 `breaker.on_failure` + `record_retry("terminate_loop")`，成功则 `breaker.on_success`。
 >
@@ -1303,7 +1300,7 @@ name and label that really exists in this codebase (`/metrics`).
 | A config change was REFUSED (capacity) | `increase(hydra_arachne_publish_total{result="refused"}[10m]) > 0` | Encoding rejected the config **before a byte was sent**: a value over the library's 1 MiB cap, an id that cannot be keyed, or a failed seal. Retrying cannot help — this is a configuration change (shrink the entity, remove the offending id). It is the honest capacity alarm ADR-0001 risk R2 asks for; `hydra_arachne_config_bytes` shows the growth that leads to it, and no byte threshold is invented here because the limit is per VALUE, not on the tree |
 | Leadership is flapping | `increase(hydra_arachne_leader_flips_total[15m]) > 5` | The answer to "is this node the writer" changed more than five times in 15 minutes, on some node. A sampled gauge cannot show this (by the time a scrape lands the answer is true again), which is why the flips are counted separately. Flapping means an unstable quorum (a node restarting in a loop, a saturated link, a CPU-starved leader) and it moves the commit point under every writer |
 | Config snapshot stale | `hydra_config_snapshot_stale == 1` | A reload failed (post-write **or** the explicit `POST /api/v1/reload`); the in-memory snapshot is behind the DB. The state is nastier than it looks, and it was measured 2026-09-30 (`integration/test_snapshot_stale.py`) by putting a provider row the LOADER rejects directly into SQLite (the admin write boundary refuses such a row, so a hand-edited database or a restore is how this happens): the node **keeps serving** on the old snapshot, `POST /api/v1/reload` answers **400 `reload_failed`** ("old snapshot retained"), the gauge goes to 1, and — the trap the code documents in capitals — **every later admin write still answers 2xx while having no runtime effect**: a `PUT` that disables a tenant returned 200 and the tenant kept being served until a reload succeeded. Each tenant view carries `snapshot_stale: true` while this holds. **Recovery:** remove/fix the offending row and reload — the gauge returns to 0 and the pending write takes effect (measured: the disabled tenant then answered `403 tenant_disabled`). Until 2026-09-30 the explicit endpoint recorded **nothing**: a failing `/reload` left the gauge at 0 while a later successful `/reload` left an earlier 1 in place, so this alert could neither fire on the failure nor clear on the documented recovery |
-| Admission limits accepted but not enforced | `increase(hydra_admission_limits_stale_total[10m]) > 0` | A provider is being admitted under limits the live configuration no longer asks for: the `PUT /api/v1/providers/{id}` row change was accepted but the gate was never resized (see §4, decision item D-14). Firing means traffic is still flowing through the OLD cap; `GET /api/v1/concurrency` shows both sides for the affected provider (`max_concurrency` vs `configured_max_concurrency`) plus `limits_stale: true`. Restart the node to converge. The counter is per admitted request while the two sides differ, so `rate()` answers "how much traffic is affected" |
+| Admission gate resized on hot-reload | `increase(hydra_admission_resizes_total[10m]) > 0` | A provider's admission limits were changed and a new gate generation was applied (decision D-14, 2026-10-09): the `PUT /api/v1/providers/{id}` row change took effect on the next request. In-flight requests finished under the old cap, so a brief spike around a resize is expected. `GET /api/v1/concurrency` shows both sides for the affected provider (`max_concurrency` vs `configured_max_concurrency`) plus `limits_stale: true` only in the window between a config write and the first request that applies it |
 | Upstream first-byte timeouts | `increase(hydra_upstream_first_byte_timeout_total[10m]) > 0` | The upstream **accepted the connection** and then sent no response headers; each attempt fails within `HYDRA_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` (default 30s). Because the request WAS written, this is a post-send failure: the client gets `502 upstream_transport_error` **without failover** (replaying it could double-bill). A route that never completes the connect is a *different* case since 2026-09-30 — `HYDRA_UPSTREAM_CONNECT_TIMEOUT_SECS` (default 10s) fails it as a connect error, which **does** fail over and does **not** land in this counter. Before that bound existed it was misreported here *and* did not fail over: measured with a black-holed route, `codes=[502,200,502,200,502,200]` over six requests with `retries=0`. **Do not use `hydra_retries_total{stage="connect"}`** — nothing emits that label value (retries are recorded with `stage="terminate_loop"`), so such a rule could never fire |
 | Failed credential attempts | `increase(hydra_admin_auth_failures_total{result=~".+_throttled"}[10m]) > 0` | A peer exceeded `HYDRA_ADMIN_AUTH_FAIL_LIMIT_PER_MIN` failed attempts on the admin port. `result` is `<gate>_denied` (401) or `<gate>_throttled` (429). `gate` is **`admin`**: the internal
 `cluster` gate and its token were deleted on 2026-10-05 (they guarded the `/api/v1/internal/*`

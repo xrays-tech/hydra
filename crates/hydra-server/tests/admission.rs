@@ -393,19 +393,20 @@ async fn per_provider_isolation() {
     assert_eq!(ac.len(), 2, "two independent gates");
 }
 
-/// A configuration change that gates CANNOT apply must be visible, not silent.
+/// A configuration change must be APPLIED, and the split "enforced vs configured"
+/// view must reflect that (decision item D-14, implemented 2026-10-09).
 ///
-/// Gates are created on a provider's first request and never resized (`ops.md` §4,
-/// decision item D-14), so a `PUT /api/v1/providers/{id}` that lowers or raises the
-/// limits returns 200, changes the row, and yet leaves the runtime enforcing the OLD
-/// values — while `/api/v1/concurrency` used to report the (stale) enforced cap as if it
-/// were the configured one. `snapshot()` now carries both sides plus `limits_stale`, so
-/// an operator (or an alert on `hydra_admission_limits_stale_total`) can tell.
-///
-/// Falsification: delete the `observe_configured_limits` call in `acquire` and the
-/// configured fields keep the creation-time values, so `limits_stale` stays false.
+/// Gates were created on a provider's first request and never resized, so a
+/// `PUT /api/v1/providers/{id}` that lowered/raised the limits used to leave the
+/// runtime enforcing the OLD values while the endpoint reported the (stale) cap.
+/// Since D-14 the gate RESIZES on the next `acquire` (a new generation replaces
+/// the previous one; in-flight permits keep the old generation until they drain),
+/// and `snapshot_with_configured` — the live view the admin endpoint serves —
+/// reports the enforced side from the CURRENT generation. After a resize the two
+/// sides agree; a change that has not yet been applied (no request since the
+/// config write) is transiently `limits_stale`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_configured_limit_change_is_reported_as_stale() {
+async fn a_configured_limit_change_resizes_the_gate() {
     let admission = AdmissionControl::new();
 
     // First request creates the gate with these limits.
@@ -436,22 +437,41 @@ async fn a_configured_limit_change_is_reported_as_stale() {
         .expect("acquire still works under the new configuration");
     drop(permit);
 
-    let after = admission.snapshot();
+    // The live view: after the resize the enforced cap IS the new one.
+    let after = admission.snapshot_with_configured(|_| Some(policy(50, 8, 2_000)));
     let entry = after
         .iter()
         .find(|e| e.provider_id == "p1")
         .expect("p1 in snapshot");
     assert_eq!(
-        entry.max_concurrency, 4,
-        "the ENFORCED cap is still the creation-time one — gates are not resized"
+        entry.max_concurrency, 50,
+        "the ENFORCED cap is now the resized one — gates are resized on hot-reload (D-14)"
     );
     assert_eq!(
         entry.configured_max_concurrency, 50,
-        "the configured cap is reported separately"
+        "the configured cap matches the enforced cap after the resize"
     );
     assert_eq!(entry.configured_queue_wait_timeout_ms, 2_000);
     assert!(
+        !entry.limits_stale,
+        "after the resize the gate enforces exactly what the configuration asks for"
+    );
+
+    // A config change that has NOT yet been applied stays visible: ask the live view
+    // for a policy the gate has not been asked to enforce yet.
+    let pending = admission.snapshot_with_configured(|_| Some(policy(2, 1, 500)));
+    let entry = pending
+        .iter()
+        .find(|e| e.provider_id == "p1")
+        .expect("p1 in snapshot");
+    assert_eq!(
+        entry.max_concurrency, 50,
+        "still enforcing the last applied generation"
+    );
+    assert_eq!(entry.configured_max_concurrency, 2);
+    assert!(
         entry.limits_stale,
-        "the mismatch must be flagged, never presented as the configured cap"
+        "a config change that has not reached the gate must be flagged, never presented \
+         as the enforced cap"
     );
 }

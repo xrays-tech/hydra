@@ -3078,14 +3078,13 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
 
 // ---------------------------------------------------------------------------
 // REGRESSION - a transport error after the request was SENT must not be
-// replayed elsewhere unless retry_after_connect is on.
+// replayed elsewhere.
 // ---------------------------------------------------------------------------
 // A completion is non-idempotent: if the request reached the upstream the
 // provider may have generated (and billed) it before the response was lost, so
-// failing over bills the customer twice. FailoverConfig::retry_after_connect was
-// declared, documented as the guard for exactly this, and read by NOTHING —
-// every transport error was retried unconditionally. Only a CONNECT error (the
-// upstream never saw the request) is always safe to retry.
+// failing over bills the customer twice. Only a CONNECT error (the upstream
+// never saw the request) is always safe to retry; any post-send transport
+// error therefore returns 502 and is never failed over.
 //
 // NOTE: SWRR orders candidates by provider id, so the silent provider is named
 // to sort FIRST and be attempted first.
@@ -3111,7 +3110,7 @@ fn spawn_silent_drop_upstream() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn post_send_transport_error_is_not_failed_over_by_default() {
+async fn post_send_transport_error_is_not_failed_over() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(

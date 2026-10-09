@@ -503,6 +503,14 @@ pub struct ClickHouseUsageQuery {
 
 /// Totals row. `MAX(created_at)` is `""` (not NULL) for an empty set on
 /// ClickHouse, which `normalize_as_of` maps to `None`.
+///
+/// `FINAL` (added after review N2, 2026-10-09): the table is ReplacingMergeTree,
+/// whose row-collapse happens on background merge — WITHOUT `FINAL` a read issued
+/// before a merge still sees duplicate `dedup_key` rows and over-counts usage
+/// that the row-level idempotency (P2-1) is supposed to have prevented. `FINAL`
+/// makes the read collapse duplicates by the ORDER BY key (`dedup_key, tenant_id,
+/// provider_id`) at query time, so the "counted once" claim is immediately true,
+/// not merely eventually true.
 #[cfg(feature = "usage-clickhouse")]
 const CH_TOTALS_SELECT: &str = "\
 SELECT count()                                     AS requests, \
@@ -511,7 +519,7 @@ SELECT count()                                     AS requests, \
        COALESCE(sum(cache_hit_tokens), 0)          AS cache_hit_tokens, \
        COALESCE(sum(if(status_code >= 400, 1, 0)), 0) AS errors, \
        MAX(created_at)                             AS last_seen \
-FROM usage_record \
+FROM usage_record FINAL \
 WHERE tenant_id = {t:String} AND created_at >= {s:String} AND created_at < {e:String} \
 FORMAT JSONEachRow";
 
@@ -599,13 +607,17 @@ impl UsageQuery for ClickHouseUsageQuery {
 
             let mut rows = Vec::new();
             if let Some(expr) = ch_group_expr(group_by) {
+                // `FINAL` here for the same reason as the totals query (review N2,
+                // 2026-10-09): ReplacingMergeTree collapses on background merge, so
+                // without FINAL a read before a merge would count duplicate
+                // `dedup_key` rows in each group.
                 let sql = format!(
                     "SELECT {expr} AS key, count() AS requests, \
                             COALESCE(sum(tokens_in), 0) AS tokens_in, \
                             COALESCE(sum(tokens_out), 0) AS tokens_out, \
                             COALESCE(sum(cache_hit_tokens), 0) AS cache_hit_tokens, \
                             COALESCE(sum(if(status_code >= 400, 1, 0)), 0) AS errors \
-                     FROM usage_record \
+                     FROM usage_record FINAL \
                      WHERE tenant_id = {{t:String}} AND created_at >= {{s:String}} \
                        AND created_at < {{e:String}} \
                      GROUP BY key ORDER BY key FORMAT JSONEachRow"

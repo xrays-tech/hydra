@@ -332,6 +332,32 @@ impl SlidingWindow {
         }
     }
 
+    /// **Count dimension, read-only half of [`check_and_inc`]**: evict stale
+    /// samples and report whether `now` would be admitted, WITHOUT recording it.
+    ///
+    /// This is the "check" phase of the two-phase count gate (P3-7 /
+    /// 2026-10-09): every matched role is checked read-only first, so that a
+    /// request denied by ANY role consumes NO quota on the roles that came
+    /// before it — the old behaviour increment-and-then-maybe-deny left the
+    /// first roles' windows charged for a request that was ultimately refused.
+    ///
+    /// Notes for callers:
+    /// * the same effective-limit clamp as [`check_and_inc`](Self::check_and_inc)
+    ///   applies, so the read-only verdict never disagrees with the write path;
+    /// * `check` and the write phase are NOT one atomic step with respect to
+    ///   other requests. The write phase therefore uses the ATOMIC
+    ///   [`check_and_inc`](Self::check_and_inc) (never a bare append): that keeps
+    ///   every window EXACTLY bounded (a single-role gate stays precise — phase-2
+    ///   re-checks under the same lock as the increment), while the multi-role
+    ///   phase-1→phase-2 window is only as wide as the gap between the read-only
+    ///   pass and the atomic re-check (review N3, 2026-10-09).
+    #[must_use]
+    pub fn check(&mut self, now: Instant, limit: u64) -> bool {
+        self.evict_samples(now);
+        let effective = limit.min(MAX_SAMPLES_PER_WINDOW);
+        (self.samples.len() as u64) < effective
+    }
+
     /// Live request-count after the last [`check_and_inc`](Self::check_and_inc)
     /// (eviction only happens there, so this is a cheap O(1) read of current
     /// state).

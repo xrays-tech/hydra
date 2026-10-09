@@ -48,9 +48,10 @@
 //!   incremented on each outcome.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hydra_core::config::ConcurrencyPolicy;
 use serde::Serialize;
@@ -200,91 +201,104 @@ impl Drop for WaitGuard {
     }
 }
 
-/// Per-provider gate: one semaphore (concurrency cap) + a waiter counter.
-struct ProviderGate {
+/// One immutable "generation" of a per-provider gate: the concurrency semaphore
+/// plus the limits it was built with.
+///
+/// A gate RESIZES by replacing its current generation on hot-reload (decision
+/// item D-14, implemented 2026-10-09) rather than mutating a live semaphore —
+/// `tokio::sync::Semaphore` can only add permits, never remove them, so
+/// shrinking in place is impossible. In-flight requests hold an `Arc` to the
+/// generation their permit came from (via [`Permit`]), so an old generation
+/// stays alive until its last permit is released and then drains naturally;
+/// the new limits apply to every request admitted after the swap.
+#[derive(Debug)]
+struct GateGeneration {
     semaphore: Arc<Semaphore>,
-    /// Current **waiters** (queued, not yet holding a permit). In-flight =
-    /// `max_concurrency − semaphore.available_permits()`.
-    queue_depth: Arc<AtomicUsize>,
-    /// The concurrency cap this gate was created with. Stored separately
-    /// because `tokio::sync::Semaphore` does not expose its total permit count
-    /// — we need it to compute `inflight = max_concurrency - available`.
+    /// The concurrency cap this generation enforces. Stored separately because
+    /// `tokio::sync::Semaphore` does not expose its total permit count — we
+    /// need it to compute `inflight = max_concurrency - available`.
     max_concurrency: u32,
-    /// The queue bound / wait budget the gate was created with — carried so a later
-    /// configuration change can be REPORTED (see `observe_configured_limits`).
+    /// The queue bound this generation enforces.
     queue_capacity: u32,
+    /// The wait budget this generation enforces.
     wait_timeout_ms: u64,
-    /// The limits the CURRENT configuration asks for, as last seen at acquire time.
-    ///
-    /// A gate is never resized (decision item D-14), so these can differ from the
-    /// enforced values: that difference is a configuration change that has NOT taken
-    /// effect, and it used to be invisible — the admin API returned 200, the database
-    /// row changed, and `/api/v1/concurrency` reported the (stale) gate value as if it
-    /// were the configured one. Measured 2026-09-29; see `ops.md` §4.
-    configured: Mutex<ConcurrencyPolicy>,
-    /// Warn once per distinct configured policy instead of once per request.
-    warned_configured: Mutex<Option<ConcurrencyPolicy>>,
 }
 
-use crate::lock_gate;
+impl GateGeneration {
+    fn new(policy: ConcurrencyPolicy) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(policy.max_concurrency as usize)),
+            max_concurrency: policy.max_concurrency,
+            queue_capacity: policy.max_queue_depth,
+            wait_timeout_ms: policy.queue_wait_timeout_ms,
+        }
+    }
+
+    /// True when `policy` asks for exactly the limits this generation enforces.
+    fn matches(&self, policy: ConcurrencyPolicy) -> bool {
+        self.max_concurrency == policy.max_concurrency
+            && self.queue_capacity == policy.max_queue_depth
+            && self.wait_timeout_ms == policy.queue_wait_timeout_ms
+    }
+}
+
+/// Per-provider gate: the CURRENT generation behind an atomic swap + a waiter
+/// counter.
+///
+/// Hot-reload resize (D-14): when the configuration asks for different limits,
+/// [`AdmissionControl::acquire`] builds a new [`GateGeneration`] and
+/// `store()`s it. Requests that already hold a permit keep using the OLD
+/// generation's semaphore (the `Arc` in [`Permit`] keeps it alive), so the old
+/// cap drains to zero as those requests finish; every request admitted after
+/// the swap sees the new cap immediately. The waiter counter is deliberately
+/// shared across generations: queued waiters also hold their generation alive,
+/// and `max_queue_depth` stays a bound on the combined queue.
+struct ProviderGate {
+    /// The generation this gate is currently admitting under. Replaced (not
+    /// mutated) by a resize.
+    current: ArcSwap<GateGeneration>,
+    /// Current **waiters** (queued, not yet holding a permit). In-flight =
+    /// `max_concurrency − semaphore.available_permits()` of the current
+    /// generation.
+    queue_depth: Arc<AtomicUsize>,
+}
 
 impl ProviderGate {
     fn new(policy: ConcurrencyPolicy) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(policy.max_concurrency as usize)),
+            current: ArcSwap::from_pointee(GateGeneration::new(policy)),
             queue_depth: Arc::new(AtomicUsize::new(0)),
-            max_concurrency: policy.max_concurrency,
-            queue_capacity: policy.max_queue_depth,
-            wait_timeout_ms: policy.queue_wait_timeout_ms,
-            configured: Mutex::new(policy),
-            warned_configured: Mutex::new(None),
         }
     }
 
-    /// True when the limits enforced by this gate differ from the ones the current
-    /// configuration asks for, i.e. a change that requires a restart to take effect.
-    fn limits_stale(&self) -> bool {
-        let configured = *lock_gate(&self.configured);
-        configured.max_concurrency != self.max_concurrency
-            || configured.max_queue_depth != self.queue_capacity
-            || configured.queue_wait_timeout_ms != self.wait_timeout_ms
-    }
-
-    /// Record the limits the current configuration asks for, and when they differ from
-    /// the ones this gate enforces, say so ONCE (a WARN naming both sides) and count it.
+    /// Resize this gate to the requested `policy` (hot-reload, D-14).
     ///
-    /// This is the visibility half of D-14: the resize itself is still not implemented,
-    /// but "the change silently did nothing" is no longer possible to miss.
-    fn observe_configured_limits(&self, provider_id: &str, policy: ConcurrencyPolicy) {
-        {
-            let mut configured = lock_gate(&self.configured);
-            *configured = policy;
+    /// Returns the generation to admit this request under — the existing one
+    /// when it already matches `policy`, otherwise a freshly built one that has
+    /// REPLACED the current generation (in-flight permits keep the old one
+    /// alive until they drain). Logs an INFO once per distinct new policy and
+    /// counts the resize in `hydra_admission_resizes_total`.
+    fn resize_to(&self, provider_id: &str, policy: ConcurrencyPolicy) -> Arc<GateGeneration> {
+        let current = self.current.load_full();
+        if current.matches(policy) {
+            return current;
         }
-        if !self.limits_stale() {
-            return;
-        }
-        {
-            let mut warned = lock_gate(&self.warned_configured);
-            if *warned == Some(policy) {
-                return; // already reported this exact configuration
-            }
-            *warned = Some(policy);
-        }
-        tracing::warn!(
+        let next = Arc::new(GateGeneration::new(policy));
+        self.current.store(next.clone());
+        tracing::info!(
             target: "hydra::admission",
             provider = provider_id,
-            enforced_max_concurrency = self.max_concurrency,
+            enforced_max_concurrency = current.max_concurrency,
             configured_max_concurrency = policy.max_concurrency,
-            enforced_max_queue_depth = self.queue_capacity,
+            enforced_max_queue_depth = current.queue_capacity,
             configured_max_queue_depth = policy.max_queue_depth,
-            enforced_queue_wait_timeout_ms = self.wait_timeout_ms,
+            enforced_queue_wait_timeout_ms = current.wait_timeout_ms,
             configured_queue_wait_timeout_ms = policy.queue_wait_timeout_ms,
-            "admission limits changed in configuration but the gate is NOT resized \
-             (it keeps the limits captured at this provider's first request): the new \
-             limits take effect after a restart. This request is being admitted under \
-             the ENFORCED values above."
+            "admission gate resized on hot-reload: it now enforces the new limits (D-14); \
+             in-flight requests finish under the old cap"
         );
-        crate::admin::metrics::record_admission_limits_stale(provider_id);
+        crate::admin::metrics::record_admission_resize(provider_id);
+        next
     }
 }
 
@@ -366,39 +380,48 @@ impl AdmissionControl {
     /// The values are point-in-time and may change immediately after reading
     /// (the semaphore and atomic are live). This is fine for observability —
     /// the endpoint is for operators checking "is the queue backed up?".
+    ///
+    /// This view has no live configuration, so the configured side is the
+    /// generation currently enforced (a gate resizes on hot-reload — D-14), and
+    /// `limits_stale` is always `false` here. The LIVE-comparing view (the one
+    /// the admin endpoint actually serves) is [`Self::snapshot_with_configured`].
     #[must_use]
     pub fn snapshot(&self) -> Vec<ProviderConcurrencyStatus> {
         self.gates
             .iter()
             .map(|entry| {
                 let gate = entry.value();
-                let available = gate.semaphore.available_permits() as u32;
-                let inflight = gate.max_concurrency.saturating_sub(available);
-                let configured = *lock_gate(&gate.configured);
+                let gen = gate.current.load_full();
+                let available = gen.semaphore.available_permits() as u32;
+                let inflight = gen.max_concurrency.saturating_sub(available);
                 ProviderConcurrencyStatus {
                     provider_id: entry.key().to_string(),
-                    max_concurrency: gate.max_concurrency,
+                    max_concurrency: gen.max_concurrency,
                     inflight,
                     available,
                     queue_depth: gate.queue_depth.load(Ordering::Acquire),
-                    configured_max_concurrency: configured.max_concurrency,
-                    configured_max_queue_depth: configured.max_queue_depth,
-                    configured_queue_wait_timeout_ms: configured.queue_wait_timeout_ms,
-                    limits_stale: gate.limits_stale(),
+                    configured_max_concurrency: gen.max_concurrency,
+                    configured_max_queue_depth: gen.queue_capacity,
+                    configured_queue_wait_timeout_ms: gen.wait_timeout_ms,
+                    limits_stale: false,
                 }
             })
             .collect()
     }
 
     /// The same view as [`Self::snapshot`], but with the configured side taken from the
-    /// LIVE configuration instead of from what the last request happened to observe.
+    /// LIVE configuration instead of from what the gate currently enforces.
     ///
-    /// This is what `GET /api/v1/concurrency` serves: a gate is never resized (D-14), so
-    /// the interesting fact for an operator is "what does the configuration ask for RIGHT
-    /// NOW versus what is this gate enforcing". `configured` returns the resolved policy
-    /// for one provider (see `hydra_core::config::resolve_policy`); returning `None` for a
-    /// provider that no longer exists in the configuration marks the entry stale too (its
-    /// gate is still enforcing something nobody configured).
+    /// This is what `GET /api/v1/concurrency` serves. Since 2026-10-09 a gate
+    /// RESIZES on hot-reload (decision item D-14 — [`ProviderGate::resize_to`]
+    /// swaps in a new generation at the next `acquire`), so the interesting fact
+    /// for an operator is "what does the configuration ask for RIGHT NOW versus
+    /// what this gate is enforcing" — the answer is a transient window: a config
+    /// change becomes effective on the next request for that provider, and until
+    /// then `limits_stale` is true. `configured` returns the resolved policy for
+    /// one provider (see `hydra_core::config::resolve_policy`); returning `None`
+    /// for a provider that no longer exists in the configuration marks the entry
+    /// stale too (its gate is still enforcing something nobody configured).
     pub fn snapshot_with_configured(
         &self,
         configured: impl Fn(&str) -> Option<ConcurrencyPolicy>,
@@ -408,21 +431,18 @@ impl AdmissionControl {
             .iter()
             .map(|entry| {
                 let gate = entry.value();
-                let available = gate.semaphore.available_permits() as u32;
+                let gen = gate.current.load_full();
+                let available = gen.semaphore.available_permits() as u32;
                 let provider_id = entry.key().to_string();
                 let configured = configured(&provider_id);
                 let stale = match configured {
-                    Some(p) => {
-                        p.max_concurrency != gate.max_concurrency
-                            || p.max_queue_depth != gate.queue_capacity
-                            || p.queue_wait_timeout_ms != gate.wait_timeout_ms
-                    }
+                    Some(p) => !gen.matches(p),
                     None => true, // no longer configured at all
                 };
                 ProviderConcurrencyStatus {
                     provider_id,
-                    max_concurrency: gate.max_concurrency,
-                    inflight: gate.max_concurrency.saturating_sub(available),
+                    max_concurrency: gen.max_concurrency,
+                    inflight: gen.max_concurrency.saturating_sub(available),
                     available,
                     queue_depth: gate.queue_depth.load(Ordering::Acquire),
                     configured_max_concurrency: configured.map_or(0, |p| p.max_concurrency),
@@ -461,9 +481,15 @@ impl AdmissionControl {
         }
 
         let gate = self.get_or_create_gate(provider_id, policy);
-        // Report (once) when the configuration asks for different limits than this gate
-        // enforces — see `observe_configured_limits` and plan §2bi / D-14.
-        gate.observe_configured_limits(provider_id, policy);
+        // D-14 (2026-10-09): resize the gate to the current configuration on
+        // hot-reload. Returns the GENERATION this request should be admitted
+        // under — the current one when it already matches `policy`, else a fresh
+        // one that has replaced it (in-flight permits keep the old one alive).
+        // Everything below reads from that one generation, so the enforced
+        // concurrency cap, queue bound and wait budget can never be taken from
+        // two different policies again (a queue/wait mismatch with a stale cap
+        // was the pre-D-14 behaviour).
+        let gen = gate.resize_to(provider_id, policy);
 
         // 2+3. Reserve a waiter slot ATOMICALLY, and fail fast when the queue is
         //      full. `max_queue_depth == 0` means "no queue": at most one waiter
@@ -478,10 +504,10 @@ impl AdmissionControl {
         //      `Retry-After` computed from it described a bound the gate never
         //      enforced. One CAS covers both, and the WaitGuard still decrements on
         //      drop, so the depth keeps meaning "current waiters".
-        let max_depth = if policy.max_queue_depth == 0 {
+        let max_depth = if gen.queue_capacity == 0 {
             1
         } else {
-            policy.max_queue_depth as usize
+            gen.queue_capacity as usize
         };
         let Some(guard) =
             WaitGuard::try_reserve(gate.queue_depth.clone(), provider_id.to_string(), max_depth)
@@ -494,13 +520,13 @@ impl AdmissionControl {
         // Snapshot available permits to classify the outcome as "acquired"
         // (immediate, avail > 0) vs "queued" (had to wait, avail == 0). There
         // is a benign TOCTOU race here — for metrics labelling only.
-        let will_queue = gate.semaphore.available_permits() == 0;
+        let will_queue = gen.semaphore.available_permits() == 0;
 
         // 4. Bounded wait for a permit. `acquire_owned` needs an `Arc<Semaphore>`;
         //    clone the Arc (bump refcount) so the gate keeps its own handle.
         let wait_start = Instant::now();
-        let wait = Duration::from_millis(policy.queue_wait_timeout_ms);
-        match timeout(wait, gate.semaphore.clone().acquire_owned()).await {
+        let wait = Duration::from_millis(gen.wait_timeout_ms);
+        match timeout(wait, gen.semaphore.clone().acquire_owned()).await {
             // Got a permit — no longer waiting (guard drops, queue_depth--).
             // The Permit owns the semaphore slot (in-flight), released on its Drop.
             Ok(Ok(permit)) => {
@@ -511,16 +537,16 @@ impl AdmissionControl {
                     if will_queue { "queued" } else { "acquired" },
                 );
                 // Set inflight/available gauges from the live semaphore state.
-                let avail = gate.semaphore.available_permits();
-                let inflight = policy.max_concurrency.saturating_sub(avail as u32);
+                let avail = gen.semaphore.available_permits();
+                let inflight = gen.max_concurrency.saturating_sub(avail as u32);
                 metrics::record_permit_inflight(provider_id, inflight as i64);
                 metrics::record_permit_available(provider_id, avail as i64);
                 drop(guard);
                 Ok(Permit::Real {
                     inner: Some(permit),
                     provider_id: provider_id.to_string(),
-                    semaphore: Arc::clone(&gate.semaphore),
-                    max_concurrency: policy.max_concurrency,
+                    semaphore: Arc::clone(&gen.semaphore),
+                    max_concurrency: gen.max_concurrency,
                 })
             }
             // Semaphore closed (shutdown).
@@ -540,14 +566,15 @@ impl AdmissionControl {
         }
     }
 
-    /// Get-or-create the gate for `provider_id`, sizing the semaphore from
-    /// `policy.max_concurrency`. `entry().or_insert_with` is atomic per shard,
-    /// so two concurrent first-acquires for the same id resolve to one gate.
+    /// Get-or-create the gate for `provider_id`, sizing the initial generation's
+    /// semaphore from `policy.max_concurrency`. `entry().or_insert_with` is
+    /// atomic per shard, so two concurrent first-acquires for the same id
+    /// resolve to one gate.
     ///
-    /// NOTE: once created, a gate's semaphore is NOT resized if a later call
-    /// passes a different `max_concurrency` — the first policy wins. P0.4 will
-    /// handle resizing on hot-reload; for P0.2 the policy is stable per
-    /// provider within a test.
+    /// The initial policy only sizes the FIRST generation. A later `acquire`
+    /// with a different `policy` resizes the gate by replacing the generation
+    /// ([`ProviderGate::resize_to`] — D-14, hot-reload), so the first policy
+    /// does NOT win beyond the gate's first request.
     fn get_or_create_gate(
         &self,
         provider_id: &str,
@@ -586,37 +613,95 @@ mod tests {
         }
     }
 
-    /// A gate mutex poisoned by an unrelated panic must NOT turn the admission hot path
-    /// into a panic site: `lock_gate` recovers the inner value (the two mutexes only hold
-    /// reporting state — copies of a `ConcurrencyPolicy` — so there is no invariant a
-    /// half-finished writer could have left broken, while every task routing to this
-    /// provider shares the same gate).
-    ///
-    /// Without `lock_gate` (i.e. with `.lock().expect(...)`) this test panics with
-    /// "admission gate mutex" instead of asserting.
-    #[test]
-    fn a_poisoned_gate_mutex_does_not_panic_admission() {
-        let gate = Arc::new(ProviderGate::new(policy(2, 0, 0)));
+    /// Hot-reload resize (D-14): a later `acquire` with a DIFFERENT policy must
+    /// swap the gate to a new generation, and the next request must be admitted
+    /// under the NEW limits — not the first-policy-wins the old code enforced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_limit_change_resizes_the_gate() {
+        let admission = AdmissionControl::new();
 
-        // Poison `configured` on purpose: panic while holding the lock.
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = gate
-                .configured
-                .lock()
-                .expect("a fresh mutex is never poisoned");
-            panic!("poison the gate mutex on purpose");
-        }));
-        assert!(poisoned.is_err(), "the panic must have been raised");
+        // First request creates the gate with these limits.
+        let permit = admission
+            .acquire("p1", policy(4, 8, 1_000))
+            .await
+            .expect("the first acquire must succeed");
+        drop(permit);
+
+        let fresh = admission.snapshot();
+        let entry = fresh
+            .iter()
+            .find(|e| e.provider_id == "p1")
+            .expect("p1 in snapshot");
+        assert_eq!(entry.max_concurrency, 4);
         assert!(
-            gate.configured.lock().is_err(),
-            "the mutex must really be poisoned (otherwise this test proves nothing)"
+            !entry.limits_stale,
+            "nothing changed yet: the gate matches its initial policy"
         );
 
-        // The proving step: this call panicked before `lock_gate` existed.
-        gate.observe_configured_limits("p1", policy(1, 0, 0));
+        // The configuration now asks for 50 concurrent and a 2s wait budget.
+        let _permit = admission
+            .acquire("p1", policy(50, 8, 2_000))
+            .await
+            .expect("acquire still works under the new configuration");
+        drop(_permit);
+
+        let after = admission.snapshot();
+        let entry = after
+            .iter()
+            .find(|e| e.provider_id == "p1")
+            .expect("p1 in snapshot");
+        assert_eq!(
+            entry.max_concurrency, 50,
+            "the ENFORCED cap is now the resized one — gates are resized on hot-reload (D-14)"
+        );
+        assert_eq!(entry.inflight, 0);
         assert!(
-            gate.limits_stale(),
-            "the configured side was still recorded after recovering from the poison"
+            !entry.limits_stale,
+            "after the resize the gate enforces exactly what the configuration asks for"
+        );
+    }
+
+    /// The `.snapshot()` (no-live-config) view reports the current generation on both
+    /// sides; the LIVE view (`snapshot_with_configured`) is what flags a configuration
+    /// change that has not yet been applied (it becomes effective on the next acquire).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_view_flags_a_pending_resize_but_not_the_plain_view() {
+        let admission = AdmissionControl::new();
+        admission
+            .acquire("p1", policy(4, 8, 1_000))
+            .await
+            .expect("first acquire");
+        // A new policy is requested (would resize on next acquire) — simulate by asking
+        // the live view to compare against a config that has moved on.
+        let stale = admission.snapshot_with_configured(|_| Some(policy(50, 8, 2_000)));
+        let entry = stale
+            .iter()
+            .find(|e| e.provider_id == "p1")
+            .expect("p1 in snapshot");
+        assert!(
+            entry.limits_stale,
+            "the live view must flag: config asks 50, gate still enforces 4"
+        );
+        assert_eq!(
+            entry.max_concurrency, 4,
+            "enforced side is the generation's cap"
+        );
+        // The plain (no-live-config) view has nothing to compare against.
+        let plain = admission.snapshot();
+        let entry = plain
+            .iter()
+            .find(|e| e.provider_id == "p1")
+            .expect("p1 in snapshot");
+        assert!(!entry.limits_stale);
+        // And a provider dropped from the config is stale in the live view too.
+        let gone = admission.snapshot_with_configured(|_| None);
+        let entry = gone
+            .iter()
+            .find(|e| e.provider_id == "p1")
+            .expect("p1 still has a live gate");
+        assert!(
+            entry.limits_stale,
+            "a gate enforcing something nobody configured must be flagged"
         );
     }
 }

@@ -298,6 +298,38 @@ function main(argv) {
   const claimZh = /生产代码无 unwrap \/ panic \/ unsafe/.test(html);
   const claimEn = /unsafe \/ unwrap \/ panic in production code/.test(html);
 
+  // P3-8 (2026-10-09): the README (zh + en) advertises the production `expect`
+  // count — "**2** `expect()` invariant assertions". That number used to rot like
+  // the test counts (it said 6 until 2026-10-09, and named sites that no longer
+  // existed). The production count measured here (`allExpects.length`) is the
+  // truth; an advertised number is a claim only as long as a guard checks it.
+  const README = [
+    path.join(ROOT, 'README.md'),
+    path.join(ROOT, 'README.zh-CN.md'),
+  ];
+  // Allow the markdown bold we actually write (`**2** expect()`), and the zh
+  // "处" quantifier; `\**` is "zero or more stars" (markdown **bold**).
+  const README_EXPECT_CLAIM = /\**(\d+)\**\s*(?:处\s*)?[`]*expect\(\)[`]*/;
+  for (const file of README) {
+    if (!fs.existsSync(file)) {
+      problems.push(`README missing at ${path.relative(ROOT, file)} — the expect-count claim must stay verifiable`);
+      continue;
+    }
+    const text = fs.readFileSync(file, 'utf8');
+    const claim = text.match(README_EXPECT_CLAIM);
+    if (!claim) {
+      problems.push(`${path.relative(ROOT, file)} carries no "N expect()" claim — P3-8: add the measured production count, or update this checker`);
+      continue;
+    }
+    const advertised = Number(claim[1]);
+    if (advertised !== allExpects.length) {
+      problems.push(
+        `${path.relative(ROOT, file)} advertises ${advertised} production expect() but the scan finds ${allExpects.length} — ` +
+          `the README claim must equal what check_source_purity measures`,
+      );
+    }
+  }
+
   const info = `[purity] scanned ${files.length} file(s) under ${path.relative(ROOT, cratesRoot)}/*/src (outside #[cfg(test)] items); ${roots.length} crate root(s)`;
   // `problems.length === 0` is load-bearing and was MISSING when the D-13 registration landed
   // (2026-10-08): the branch asked only about `violations`, so the new "unregistered .expect site"

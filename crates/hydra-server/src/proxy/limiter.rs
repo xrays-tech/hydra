@@ -95,9 +95,20 @@ impl RateLimiter {
     }
 
     /// Pre-gate count check (design §10.3): match roles against `ctx`, then for
-    /// each matched role with a `limit_count`, admit iff every matching window
-    /// is under its limit. Returns `false` (and the matched role that denied)
-    /// the moment any window rejects.
+    /// each matched role with a `limit_count`, admit iff EVERY matching window is
+    /// under its limit. Returns `false` (and the matched role that denied)
+    ///     the moment any window rejects.
+    ///
+    /// **Two-phase** (P3-7 + final review N3, 2026-10-09): phase 1 checks every
+    /// matched window READ-ONLY ([`SlidingWindow::check`]) so a request denied by
+    /// ANY role charges NO quota (the old per-role `check_and_inc` loop consumed
+    /// the roles before the refusing one and this was the silent over-charge);
+    /// only if ALL of them admit does phase 2 charge each window. Phase 2 uses
+    /// the ATOMIC [`SlidingWindow::check_and_inc`] (never a bare append): adding
+    /// under the same DashMap entry lock as the re-check keeps every window
+    /// exactly bounded, so a single-role gate stays precise (phase-1 is a
+    /// fast path; the bound comes from phase-2) and a multi-role gate is only
+    /// as wide as the phase-1→phase-2 gap.
     ///
     /// `now` is injected so the shell can drive it from `Instant::now`; the
     /// pure core takes `now` explicitly.
@@ -108,36 +119,80 @@ impl RateLimiter {
         now: Instant,
     ) -> CountVerdict {
         let matched = match_roles(roles, ctx);
+
+        // Phase 1 — read-only: every matched role must admit; the first refusal
+        // denies WITHOUT charging any window.
         for role in &matched {
-            if let Some(limit) = role.limit_count {
-                let limit_u64 = u64::try_from(limit.max(0)).unwrap_or(0);
-                if limit_u64 == 0 {
-                    // limit_count == 0 ⇒ deny unconditionally (no window involved, so
-                    // there is no window remainder to promise).
-                    return CountVerdict::Denied {
-                        role_id: role.id.clone(),
-                        retry_after: None,
-                    };
-                }
-                let key = LimitKey {
+            let Some(limit) = role.limit_count else {
+                continue;
+            };
+            let limit_u64 = u64::try_from(limit.max(0)).unwrap_or(0);
+            if limit_u64 == 0 {
+                // limit_count == 0 ⇒ deny unconditionally (no window involved, so
+                // there is no window remainder to promise).
+                return CountVerdict::Denied {
                     role_id: role.id.clone(),
-                    bucket: bucket_for(role, ctx),
+                    retry_after: None,
                 };
-                // check_and_inc under the DashMap entry guard. The key is cloned for the
-                // retry-after lookup below (the entry API consumes it).
-                let admitted = self
+            }
+            let key = LimitKey {
+                role_id: role.id.clone(),
+                bucket: bucket_for(role, ctx),
+            };
+            // Read-only: a check must NOT create a window merely by being checked
+            // (that would grow the map per request for roles that never admit a
+            // sample). A missing window admits (0 live < limit).
+            let admitted = match self.windows.get_mut(&key) {
+                Some(mut window) => window.check(now, limit_u64),
+                None => true,
+            };
+            if !admitted {
+                debug!(role = %role.id, limit = limit_u64, "rate limit denied (count)");
+                let retry_after = self
                     .windows
-                    .entry(key.clone())
-                    .or_insert_with(|| SlidingWindow::new(window_len(role)))
-                    .check_and_inc(now, limit_u64);
-                if !admitted {
-                    debug!(role = %role.id, limit = limit, "rate limit denied (count)");
-                    let retry_after = self.windows.get(&key).and_then(|w| w.retry_after(now));
-                    return CountVerdict::Denied {
-                        role_id: role.id.clone(),
-                        retry_after,
-                    };
-                }
+                    .get(&key)
+                    .and_then(|w| w.value().retry_after(now));
+                return CountVerdict::Denied {
+                    role_id: role.id.clone(),
+                    retry_after,
+                };
+            }
+        }
+
+        // Phase 2 — write, ATOMICALLY: every role admitted in phase 1. Each window
+        // is charged under its own DashMap entry lock with the check-and-increment
+        // in ONE step, so no request ever pushes a window past its limit (the
+        // period between phase 1 and phase 2 is a fast path, not a bound). In the
+        // rare concurrent case where phase-2's re-check finds a window already
+        // full, deny (the earlier windows that did admit are charged, exactly as
+        // any single-role gate would be).
+        for role in &matched {
+            let Some(limit) = role.limit_count else {
+                continue;
+            };
+            let limit_u64 = u64::try_from(limit.max(0)).unwrap_or(0);
+            if limit_u64 == 0 {
+                continue; // unreachable (phase 1 denied) — defensive
+            }
+            let key = LimitKey {
+                role_id: role.id.clone(),
+                bucket: bucket_for(role, ctx),
+            };
+            let admitted = self
+                .windows
+                .entry(key.clone())
+                .or_insert_with(|| SlidingWindow::new(window_len(role)))
+                .check_and_inc(now, limit_u64);
+            if !admitted {
+                debug!(role = %role.id, limit = limit_u64, "rate limit denied at the atomic re-check (count)");
+                let retry_after = self
+                    .windows
+                    .get(&key)
+                    .and_then(|w| w.value().retry_after(now));
+                return CountVerdict::Denied {
+                    role_id: role.id.clone(),
+                    retry_after,
+                };
             }
         }
         CountVerdict::Admitted
@@ -528,6 +583,74 @@ mod tests {
         assert_eq!(
             rl.check_count(&roles, &ctx, Instant::now()),
             CountVerdict::Admitted
+        );
+    }
+
+    /// P3-7 (2026-10-09) — a request denied by a LATER role must not have consumed
+    /// quota on the roles that came BEFORE it.
+    ///
+    /// Two roles match the same context: `r-wide` (limit 3, matches first) and
+    /// `r-narrow` (limit 1, matches after). The old limit loop used `check_and_inc`
+    /// per role and returned at the first denial — so the SECOND request (refused by
+    /// `r-narrow`, now full) still incremented `r-wide`'s window: a denied request
+    /// consumed quota on the wider role. The two-phase gate checks every role
+    /// read-only first and only increments after all of them admit.
+    ///
+    /// Falsification: revert `check_count` to the single `check_and_inc` loop and
+    /// `r-wide`'s window counts 2 instead of 1 at the end (the refused request was
+    /// charged to it).
+    #[test]
+    fn a_request_denied_by_a_later_role_charges_no_earlier_role() {
+        let rl = RateLimiter::new();
+        let mut wide = role("r-wide", Some(3), "m");
+        wide.matching_model = Some("m1".into()); // distinct bucket from r-narrow
+        let mut narrow = role("r-narrow", Some(1), "m");
+        narrow.matching_model = Some("m1".into());
+        let roles = vec![wide, narrow];
+        let ctx = MatchCtx {
+            api_key: None,
+            api_key_raw: None,
+            model: Some("m1"),
+            tenant: Some("t1"),
+            provider: None,
+        };
+        let now = Instant::now();
+
+        // Request 1: both roles admit (wide 1/3, narrow 1/1).
+        assert_eq!(rl.check_count(&roles, &ctx, now), CountVerdict::Admitted);
+        // Request 2: wide still admits (2/3) but narrow is full (1/1) → denied.
+        let v2 = rl.check_count(&roles, &ctx, now);
+        assert!(
+            matches!(&v2, CountVerdict::Denied { role_id, .. } if role_id == "r-narrow"),
+            "the second request must be denied by the narrow role (it is full): {v2:?}"
+        );
+        // The denied request must NOT have charged r-wide: its window holds exactly
+        // ONE sample (only request 1, which admitted). Before the two-phase fix this
+        // was 2 — the refused request was counted on r-wide too.
+        let wide_key = LimitKey {
+            role_id: "r-wide".into(),
+            bucket: bucket_for(
+                &LimitRole {
+                    id: "r-wide".into(),
+                    name: String::new(),
+                    matching_key: None,
+                    matching_model: Some("m1".into()),
+                    matching_tenant: None,
+                    matching_provider: None,
+                    limit_count: Some(3),
+                    limit_token: None,
+                    window: "m".into(),
+                    enabled: true,
+                    created_at: String::new(),
+                },
+                &ctx,
+            ),
+        };
+        let wide_samples = rl.windows.get(&wide_key).map(|w| w.count()).unwrap_or(0);
+        assert_eq!(
+            wide_samples, 1,
+            "r-wide must hold exactly 1 sample: request 1 admitted it, request 2 was \
+             REFUSED by r-narrow and must not have charged r-wide"
         );
     }
 

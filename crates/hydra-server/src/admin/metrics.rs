@@ -43,7 +43,7 @@
 //! | `hydra_queue_wait_seconds` | histogram | provider | admission module (permit-acquired) |
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
-//! | `hydra_admission_limits_stale_total` | counter | provider | admission module (requests admitted under limits a configuration change has not applied — restart needed, plan §2bi / D-14) |
+//! | `hydra_admission_resizes_total` | counter | provider | admission module (hot-reload generations swapped, decision item D-14 — implemented 2026-10-09) |
 //! | `hydra_config_snapshot_stale` | gauge | — | `admin::reload_best_effort` (1 = last reload failed, snapshot stale) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
@@ -148,9 +148,10 @@ struct Metrics {
     queue_wait: HistogramVec,
     /// Queue drops (denied acquire) by reason.
     queue_drops: IntCounterVec,
-    /// Requests admitted under a gate whose limits are stale (config changed, restart
-    /// needed) — see `record_admission_limits_stale` and plan §2bi / D-14.
-    admission_limits_stale: IntCounterVec,
+    /// Hot-reload generation swaps (decision item D-14 — implemented 2026-10-09):
+    /// one per provider per configuration change applied via `ProviderGate::resize_to`.
+    /// See `record_admission_resize`.
+    admission_resizes: IntCounterVec,
     /// Admission decisions by outcome.
     admission_decisions: IntCounterVec,
     // ── Mid-stream observability (P2-9) ─────────────────────────────────
@@ -461,11 +462,10 @@ fn metrics() -> Option<&'static Metrics> {
                 LATENCY_BUCKETS.to_vec()
             )
             .ok()?,
-            admission_limits_stale: register_int_counter_vec!(
-                "hydra_admission_limits_stale_total",
-                "Requests admitted while a provider's admission limits were STALE (the gate \
-                 is not resized on hot-reload; the configured limits take effect after a \
-                 restart)",
+            admission_resizes: register_int_counter_vec!(
+                "hydra_admission_resizes_total",
+                "Per-provider admission gates resized on hot-reload (a new generation replaced \
+                 the previous one, decision item D-14 — implemented 2026-10-09)",
                 &["provider"]
             )
             .ok()?,
@@ -1200,18 +1200,20 @@ pub fn record_queue_wait(provider: &str, secs: f64) {
     }
 }
 
-/// Count requests admitted while a provider's gate enforces STALE limits (a configuration
-/// change that has not taken effect because gates are not resized — plan §2bi / D-14).
+/// Count a per-provider admission gate being RESIZED on hot-reload (a new generation
+/// replaces the previous one — decision item D-14, implemented 2026-10-09). A gate resizes
+/// when the configuration asks for different limits than the currently enforced generation
+/// ([`crate::proxy::admission::ProviderGate::resize_to`]); in-flight requests keep the old
+/// generation until they finish, so the counter's `rate()` answers "how often is the runtime
+/// converging on new limits".
 ///
-/// A counter rather than a gauge on purpose: what an operator wants to know is "is traffic
-/// still being admitted under the old limits?", and `rate()` on this answers that
-/// unambiguously. The gate also logs a WARN the first time it sees a given configuration.
+/// A counter rather than a gauge on purpose: what an operator wants to know is "how many
+/// times have limits changed and been applied", and `rate()` on this answers that
+/// unambiguously. The gate also logs an INFO on each resize.
 #[allow(dead_code)]
-pub fn record_admission_limits_stale(provider: &str) {
+pub fn record_admission_resize(provider: &str) {
     if let Some(m) = metrics() {
-        m.admission_limits_stale
-            .with_label_values(&[provider])
-            .inc();
+        m.admission_resizes.with_label_values(&[provider]).inc();
     }
 }
 

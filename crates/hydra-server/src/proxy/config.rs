@@ -1,11 +1,11 @@
-//! Proxy / failover runtime configuration (design §15.1 `[proxy]` / `[failover]`
-//! / `[breaker]`), parsed from the bootstrap config and held immutably by
+//! Proxy / breaker runtime configuration (design §15.1 `[proxy]` / `[breaker]`),
+//! parsed from the bootstrap config and held immutably by
 //! [`crate::proxy::HydraProxy`].
 //!
 //! Defaults match the design (§15.1, §8.5, §8.3): soft body cap 8 MiB, hard
-//! body cap 32 MiB, `retry_after_connect = false`, breaker threshold 5, probe
-//! interval 10 s. The `non_route_strategy` selects passthrough vs reject for
-//! requests without a `model` field (§6.3a).
+//! body cap 32 MiB, breaker threshold 5, probe interval 10 s. The
+//! `non_route_strategy` selects passthrough vs reject for requests without a
+//! `model` field (§6.3a).
 
 use std::time::Duration;
 
@@ -24,16 +24,6 @@ pub enum NonRouteStrategy {
     Passthrough,
     /// Reject with 400.
     Reject,
-}
-
-/// Failover policy (design §8.3 / §15.1 `[failover]`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FailoverConfig {
-    /// Whether to retry on errors *after* a connection was established to the
-    /// upstream. Default `false` (safety-first: avoid double billing for
-    /// non-idempotent LLM requests). When `true`, retry is still gated by
-    /// `upstream_bytes_seen == 0` and `body_replayable` (§8.3).
-    pub retry_after_connect: bool,
 }
 
 /// Breaker policy (design §8.4 / §15.1 `[breaker]`).
@@ -63,7 +53,7 @@ impl BreakerPolicy {
     }
 }
 
-/// Proxy runtime config (design §15.1 `[proxy]` + `[failover]` + `[breaker]`).
+/// Proxy runtime config (design §15.1 `[proxy]` + `[breaker]`).
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     /// Soft body cap: once exceeded, stop accumulating the replay buffer (the
@@ -82,8 +72,6 @@ pub struct ProxyConfig {
     /// Behaviour for non-routable requests (no `model` field). Default
     /// passthrough.
     pub non_route_strategy: NonRouteStrategy,
-    /// Failover policy.
-    pub failover: FailoverConfig,
     /// Breaker policy.
     pub breaker: BreakerPolicy,
     /// Default per-provider concurrency admission policy
@@ -157,7 +145,6 @@ impl Default for ProxyConfig {
             max_request_body: 8 * 1024 * 1024,
             max_request_body_hard: 32 * 1024 * 1024,
             non_route_strategy: NonRouteStrategy::Passthrough,
-            failover: FailoverConfig::default(),
             breaker: BreakerPolicy::default(),
             // CRITICAL SAFETY PROPERTY: all zeros ⇒ `max_concurrency == 0` ⇒
             // every unconfigured provider gets `Permit::Passthrough` (no gate,

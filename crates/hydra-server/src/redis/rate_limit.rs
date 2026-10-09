@@ -24,8 +24,32 @@ use hydra_core::model::LimitRole;
 
 use crate::proxy::limiter::{CountVerdict, LimitKey};
 
+/// Read-only count check: prune the window, admit iff under the limit.
+/// `ARGV`: [now_ms, window_ms, limit]. Returns 1 (admit) / 0 (deny) and does
+/// NOT write — this is the phase-1 half of the two-phase count gate (P3-7 /
+/// 2026-10-09, review N3): every matched window is checked read-only first so a
+/// request denied by ANY role consumes NO quota. The old
+/// `CHECK_AND_INC_SCRIPT`-per-role loop returned at the first refusal, leaving
+/// the roles before it charged for a request that was ultimately refused.
+pub const CHECK_COUNT_SCRIPT: &str = r#"
+local now = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local zk = KEYS[1]
+redis.call('ZREMRANGEBYSCORE', zk, '-inf', now - window_ms)
+local count = redis.call('ZCARD', zk)
+if count < limit then return 1 else return 0 end
+"#;
+
 /// Atomic check-and-increment (request count): prune the window, admit iff
 /// under the limit. `ARGV`: [now_ms, window_ms, limit, member].
+///
+/// This is the phase-2 half of the two-phase count gate (P3-7 + review N3,
+/// 2026-10-09): the caller runs [`CHECK_COUNT_SCRIPT`] on every matched window
+/// first (so a request denied by ANY role consumes nothing), then this script
+/// on each — ATOMICALLY re-checking under the same script as the increment, so
+/// no request can push a window past its limit (the phase-1→phase-2 gap cannot
+/// over-admit).
 pub const CHECK_AND_INC_SCRIPT: &str = r#"
 local now = tonumber(ARGV[1])
 local window_ms = tonumber(ARGV[2])
@@ -180,6 +204,12 @@ impl RedisRateLimiter {
 
     /// Pre-gate count check: for every matched role with a `limit_count`,
     /// atomically check-and-increment its Redis window; any denial → `Denied`.
+    ///
+    /// **Two-phase** (P3-7 / 2026-10-09): phase 1 runs
+    /// [`CHECK_COUNT_SCRIPT`] (read-only) on every matched window; phase 2 runs
+    /// [`INCR_COUNT_SCRIPT`] on each ONLY if all admitted. The old loop called a
+    /// per-role check-and-increment and returned at the first refusal, leaving
+    /// the roles before it charged for a request that was ultimately refused.
     pub async fn check_count(
         &self,
         roles: &[LimitRole],
@@ -187,6 +217,9 @@ impl RedisRateLimiter {
         _now: Instant,
     ) -> CountVerdict {
         let now = now_ms();
+
+        // Phase 1 — read-only: every matched window must admit; the first refusal
+        // denies WITHOUT charging anything.
         for (role, key, limit) in windows_to_check(roles, ctx) {
             if limit == 0 {
                 // Unconditional deny: no window is involved, so there is no window
@@ -196,17 +229,15 @@ impl RedisRateLimiter {
                     retry_after: None,
                 };
             }
-            let member = format!("{now}-{}-{}", self.instance, member_salt());
             let admitted: i64 = match self
                 .pool
                 .eval(
-                    CHECK_AND_INC_SCRIPT,
+                    CHECK_COUNT_SCRIPT,
                     vec![key],
                     vec![
                         now.to_string(),
                         window_ms(role).to_string(),
                         limit.to_string(),
-                        member,
                     ],
                 )
                 .await
@@ -216,7 +247,8 @@ impl RedisRateLimiter {
                     warn!(error = %e, "redis rate-limit check failed; failing open");
                     crate::admin::metrics::record_control_poll("rate_limit_error");
                     // fail-open per role — the error is deliberately swallowed
-                    // (documented in redis/mod.rs; there is NO env override)
+                    // (documented in redis/mod.rs; there is NO env override).
+                    // Phase-1 failure admits this role but does NOT write it.
                     continue;
                 }
             };
@@ -230,6 +262,53 @@ impl RedisRateLimiter {
                     role_id: role.id.clone(),
                     retry_after: Some(Duration::from_millis(window_ms(role).max(0) as u64)),
                 };
+            }
+        }
+
+        // Phase 2 — write, ATOMICALLY: every role admitted in phase 1. Each window
+        // is charged with a CHECK_AND_INC that re-checks under the same atomic
+        // script as the increment (a pure ZADD would let the phase-1→phase-2 gap
+        // push a window past its limit — review N3). If the atomic re-check denies,
+        // fall through: the denial reason has already been reported by phase 1.
+        for (role, key, limit) in windows_to_check(roles, ctx) {
+            if limit == 0 {
+                continue; // unreachable (phase 1 denied) — defensive
+            }
+            let member = format!("{now}-{}-{}", self.instance, member_salt());
+            let result: Result<i64, _> = self
+                .pool
+                .eval(
+                    CHECK_AND_INC_SCRIPT,
+                    vec![key],
+                    vec![
+                        now.to_string(),
+                        window_ms(role).to_string(),
+                        limit.to_string(),
+                        member,
+                    ],
+                )
+                .await;
+            match result {
+                // The Lua script only ever returns 0 or 1; 1 = admitted (one member
+                // added under the atomic re-check).
+                Ok(1) => {}
+                Ok(0) => {
+                    // Lost the atomic race with another request — the window is full.
+                    // Denied; the request was NOT counted here (nothing to roll back).
+                    return CountVerdict::Denied {
+                        role_id: role.id.clone(),
+                        retry_after: Some(Duration::from_millis(window_ms(role).max(0) as u64)),
+                    };
+                }
+                // A different value is a misparse (defensive — fail-open rather than
+                // crash the hot path).
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "redis rate-limit increment failed; request NOT counted");
+                    crate::admin::metrics::record_control_poll("rate_limit_error");
+                    // fail-open: the request is already admitted; a lost increment just
+                    // under-counts this window (same direction as the old check_and_inc).
+                }
             }
         }
         CountVerdict::Admitted
@@ -615,42 +694,104 @@ mod tests {
         );
     }
 
-    /// The sliding-window semantics of the REAL Lua script, evaluated by a REAL
+    /// The sliding-window semantics of the REAL Lua scripts, evaluated by a REAL
     /// Redis (dev-plan 铁律 2). The previous version ran the script through the
     /// in-process double's own interpreter — which could agree with a broken
     /// script, since both were written from the same reading of the semantics.
+    ///
+    /// P3-7 + review N3 (2026-10-09): the count gate is two scripts —
+    /// [`CHECK_COUNT_SCRIPT`] (read-only phase 1: admit iff under the limit,
+    /// writes nothing) and [`CHECK_AND_INC_SCRIPT`] (ATOMIC phase 2: re-checks
+    /// under the same script as the increment, so no request can push a window
+    /// past its limit). A member older than the window is evicted, and the
+    /// read-only phase-1 is what guarantees a refusal charges no quota.
     #[tokio::test]
     async fn script_semantics_on_real_redis() {
         use fred::prelude::*;
         let pool = crate::redis::test_redis::isolated_pool().await;
         let ck = "hydra:{rl:r1:b}:count".to_string();
-        for (i, expect) in [1i64, 1, 0].iter().enumerate() {
+        // Phase 1 (CHECK, read-only): 0, 1 live members against limit 2 ⇒
+        // admit, admit — WITHOUT writing.
+        let checks = [1i64, 1];
+        for (i, expect) in checks.iter().enumerate() {
             let got: i64 = pool
                 .eval(
-                    CHECK_AND_INC_SCRIPT,
+                    CHECK_COUNT_SCRIPT,
                     vec![ck.clone()],
-                    vec![
-                        "1000".to_string(),
-                        "60000".to_string(),
-                        "2".to_string(),
-                        format!("m{i}"),
-                    ],
+                    vec!["1000".to_string(), "60000".to_string(), "2".to_string()],
                 )
                 .await
                 .expect("EVAL");
-            assert_eq!(got, *expect, "call {i}: admit, admit, then deny");
+            assert_eq!(got, *expect, "check {i}: admit under the limit");
+            // Phase 1 must not mutate the window: CHECK admits by COUNT, not by write.
+            let card: i64 = pool.zcard(&ck).await.expect("ZCARD");
+            assert_eq!(
+                card, i as i64,
+                "CHECK is read-only: ZCARD before any INC is {i}"
+            );
+            // Phase 2 (atomic CHECK_AND_INC): only when CHECK admitted. Each write
+            // re-checks under the same script, so the window never exceeds the limit.
+            if *expect == 1 {
+                let admitted: i64 = pool
+                    .eval(
+                        CHECK_AND_INC_SCRIPT,
+                        vec![ck.clone()],
+                        vec![
+                            "1000".to_string(),
+                            "60000".to_string(),
+                            "2".to_string(),
+                            format!("m{i}"),
+                        ],
+                    )
+                    .await
+                    .expect("EVAL");
+                assert_eq!(
+                    admitted, 1,
+                    "phase-2 atomic INC admits when under the limit"
+                );
+            }
         }
+        // The gate is now at the limit: a phase-1 check + phase-2 INC must BOTH
+        // deny — the atomic phase 2 never exceeds the ceiling even if a caller
+        // only consulted phase 1.
+        let denied_check: i64 = pool
+            .eval(
+                CHECK_COUNT_SCRIPT,
+                vec![ck.clone()],
+                vec!["1000".to_string(), "60000".to_string(), "2".to_string()],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(denied_check, 0, "phase-1 check denies at the limit");
+        let denied_inc: i64 = pool
+            .eval(
+                CHECK_AND_INC_SCRIPT,
+                vec![ck.clone()],
+                vec![
+                    "1000".to_string(),
+                    "60000".to_string(),
+                    "2".to_string(),
+                    "m-3".to_string(),
+                ],
+            )
+            .await
+            .expect("EVAL");
+        assert_eq!(
+            denied_inc, 0,
+            "phase-2 atomic INC refuses at the limit (never over-admits)"
+        );
+        let card: i64 = pool.zcard(&ck).await.expect("ZCARD");
+        assert_eq!(card, 2, "the window stayed at 2 — no over-admission");
 
         // The window expires: an old member falls out and admission resumes.
         let later: i64 = pool
             .eval(
-                CHECK_AND_INC_SCRIPT,
+                CHECK_COUNT_SCRIPT,
                 vec![ck.clone()],
                 vec![
                     (1000 + 61_000).to_string(),
                     "60000".to_string(),
                     "2".to_string(),
-                    "m-later".to_string(),
                 ],
             )
             .await

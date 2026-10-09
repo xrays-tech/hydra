@@ -307,6 +307,25 @@ function main(argv) {
     }
   }
 
+  // P3-8 (2026-10-09): the README (zh + en) must NOT restate the Rust test
+  // counts — it used to advertise "core 114 + server 173" while the suites grew
+  // to 262/528 and nothing checked it (the guard only verifies docs/index.html).
+  // The README now points at docs/index.html for the exact number; a hand-written
+  // count in the README is a claim that can rot exactly like the page did, so
+  // re-adding one is a failure this checker has to catch. The expect-count claim
+  // is checked by check_source_purity.cjs (same P3-8).
+  for (const f of ['README.md', 'README.zh-CN.md']) {
+    const p = path.join(ROOT, f);
+    if (!fs.existsSync(p)) throw new ClaimError(2, `README missing at ${p}: ${f} must stay verifiable`);
+    const text = fs.readFileSync(p, 'utf8');
+    if (/\d+\s*(?:core|项\s*Rust)\s*\+\s*\d+\s*server|\d+\s*项\s*Rust\s*测试|\d+\s*Rust\s*tests/i.test(text)) {
+      problems.push(
+        `${f} re-states a Rust test count in prose — P3-8: the README must point at ` +
+          `docs/index.html for the exact number (a hand-written count rots exactly like the page did)`,
+      );
+    }
+  }
+
   if (problems.length === 0) {
     console.log(`[claims] OK: advertised ${advertised.zh} Rust tests == measured ${total} (hydra-core ${core} + hydra-server ${server}), dated ${zhDate[1]}`);
     console.log(`[claims] OK: correctness-gate claim matches per-suite counts (${gateClaims.length} occurrence(s): ${core} core + ${server} server) and carries the same measurement date`);

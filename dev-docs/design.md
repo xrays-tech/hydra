@@ -858,9 +858,11 @@ fn error_while_proxy(&self, _p: &HttpPeer, _s: &mut Session,
 }
 ```
 
-- `retry_after_connect` 默认 **`false`**（安全优先）；运维明确接受重复计费风险时置 `true`；
-- `upstream_bytes_seen == 0` 是**第二道闸**，防止流式已开始后的灾难性重试；
-- `body_replayable`：body 超过自实现缓冲上限（`[proxy] max_request_body`）时不再累积，重放会送出残缺 body → 禁止重试（§8.5）。
+> ⚠️ **§8.3 的 `retry_after_connect` 已删除（P3-1，2026-10-09）**：字段连同 `FailoverConfig` 从 `proxy/config.rs` 移除，首字节超时一律 502、不重放（防双计费的 fail-safe 方向），`tests/terminate_mode.rs` 回归测试同步。下方 §8.3 的伪代码与配置描述保留为**历史记录**，不再对应任何可接线配置（`ops.md` §7 同）。如需理解现行为：连接失败才重试；首字节超时 / 连接中断不重放。
+>
+> - ≈ `retry_after_connect`（**已删除**）默认 `false`（安全优先）；~~运维明确接受重复计费风险时置 `true`~~（无此开关了）；
+> - `upstream_bytes_seen == 0` 是**第二道闸**，防止流式已开始后的灾难性重试；
+> - `body_replayable`：body 超过自实现缓冲上限（`[proxy] max_request_body`）时不再累积，重放会送出残缺 body → 禁止重试（§8.5）。
 
 > **ops 文档须显著标注**：`retry_after_connect=true` 在上游已处理但首字节未返回的窗口内重试，**会产生重复计费**。
 
@@ -1017,8 +1019,7 @@ pub struct UsageRecord {
   配置树里也带同一封存形态（`cluster/arachne_entities.rs::sealed_limit_role`，用 `seal_deterministic`
   以免内容寻址的树名每次发布都变），副本经 `db/restore.rs` 重新封存落库，**升级前写入的明文行由加载器
   自动重新封存**（`db::seal_legacy_limit_keys`，无需人工步骤；主密钥轮换 `hydra --reseal` 也覆盖该列）。
-  **封存不覆盖的部分**：`GET /api/v1/limit-roles`（与管理 UI）仍**明文回显**，且持主密钥者能还原 ⇒
-  若要求"完全不可还原"，写**摘要形式**。**★配置树格式随之上到 `TOC_FORMAT = 4`**（`hydra_ctl` 键空间表
+  **封存不覆盖的部分（已收口，P3-4/2026-10-09）**：`GET /api/v1/limit-roles` 与管理 UI 曾**明文回显**且持主密钥者能还原——已改为**掩码回显**（digest 形式原样、其余 `mask_key`），管理面不再带回可还原的客户端凭据；持主密钥者本身仍能还原密钥信封，这是**密钥持有者**的既有能力，不是 API 回显。**★配置树格式随之上到 `TOC_FORMAT = 4`**（`hydra_ctl` 键空间表
   见 `cluster.md` §3）：实体字节**形状没变、语义变了** ⇒ 混版本集群互相**按名字拒绝**树，而不是让旧
   版本把信封文本当匹配值（那会让按 key 限流的角色**静默不再生效**）。详见 `ops.md` §4 与决策项
   **D-15②/D-16①③**（均已落地）。

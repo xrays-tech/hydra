@@ -1287,6 +1287,65 @@ async fn limit_role_crud_http() {
     )
     .await;
     assert_eq!(r.status(), 200);
+
+    // P3-4 / D-16 second half: the admin API must NOT echo a recoverable key.
+    // A role whose `matching_key` is a RAW key is returned MASKED (the last
+    // plaintext-echo exception — provider keys never are). A role whose
+    // `matching_key` is already a `sha256:` digest is unrecoverable and echoed
+    // as-is.
+    let raw = r#"{"id":"r-key-raw","name":"k","matching_key":"sk-raw-1234567890abcdef","matching_model":null,"matching_tenant":"t1","matching_provider":null,"limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(raw),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/limit-roles/r-key-raw",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let got = r.json::<serde_json::Value>().await.unwrap();
+    let echoed = got["matching_key"].as_str().unwrap_or("");
+    assert!(
+        !echoed.contains("sk-raw-1234567890abcdef")
+            && !echoed.contains("1234567890abcdef")
+            && echoed.contains('*'),
+        "a raw matching_key must be echoed MASKED, got {echoed:?}"
+    );
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let dgt = format!(
+        r#"{{"id":"r-key-dg","name":"k","matching_key":"{digest}","matching_model":null,"matching_tenant":"t1","matching_provider":null,"limit_count":10,"limit_token":null,"window":"m","enabled":true,"created_at":""}}"#
+    );
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/limit-roles",
+        Some(TOKEN),
+        Some(&dgt),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/limit-roles/r-key-dg",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap()["matching_key"],
+        digest,
+        "a digest matching_key is unrecoverable and must be echoed as-is"
+    );
+
     let upd = r#"{"id":"r1","name":"r2","matching_key":null,"matching_model":null,"matching_tenant":"t1","matching_provider":null,"limit_count":50,"limit_token":null,"window":"h","enabled":true,"created_at":"x"}"#;
     let r = req(
         port,

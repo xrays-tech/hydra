@@ -112,6 +112,31 @@ jobs:
       - name: Public claims match the measured suites
         run: node scripts/check_public_claims.cjs --core-log="$RUNNER_TEMP/core-tests.log" --server-log="$RUNNER_TEMP/server-tests.log"
 
+      # P3-5 (2026-10-09): the `.sqlx` offline cache must be FRESH. `SQLX_OFFLINE=true`
+      # (set above) makes the build read query metadata from `.sqlx/` but NEVER checks
+      # it against the migrations — so a schema change that forgets to regenerate the
+      # cache compiles green here and explodes at runtime. This step forces the check by
+      # replaying the migrations against a scratch SQLite and running
+      # `cargo sqlx prepare --check` (exit 1 when the cache is stale). `--workspace`
+      # with the features AFTER `--`, and ALL query-bearing features present — the root
+      # `.sqlx/` holds every crate's queries, and a partial feature set would make the
+      # check unable to notice a drift in the feature-gated ones (HANDOFF.md records the
+      # `--features db` trap: it no longer compiles on its own).
+      - name: .sqlx offline cache is fresh (cargo sqlx prepare --check)
+        run: |
+          set -euo pipefail
+          # The step below needs the sqlx-cli binary; no job installs it, so the
+          # `cargo sqlx ...` commands would fail with "no such command: sqlx" on
+          # first push (found by final review 2026-10-09, N1). Install the same
+          # 0.8.x the crate uses (Cargo.lock), sqlite-only — no live server DB.
+          cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,sqlite --locked
+          rm -f /tmp/hydra-sqlx-prepare.db*
+          export DATABASE_URL="sqlite:///tmp/hydra-sqlx-prepare.db"
+          cargo sqlx database create
+          cargo sqlx migrate run --source crates/hydra-server/migrations
+          cargo sqlx prepare --check --workspace -- \
+            --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
+
   # Neither `cluster-redis` (Redis-backed leader lease, cluster rate limits,
   # shared breaker votes, auth-cache L2, invalidation stream) nor
   # `usage-clickhouse` (the ClickHouse sink) is implied by `server`. Nothing
