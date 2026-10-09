@@ -162,6 +162,21 @@ fn validate_route_in_tx(
 /// BOTH the validator's overlap rejection AND a DB unique conflict.
 /// `key_prefix = Some(p)` ⇒ validate once, no retry. `id` is the row id used
 /// when a NEW row is inserted.
+///
+/// ## What "upsert by natural key" does and does not mean here (decision D-10)
+///
+/// A **retried** create (the same `(tenant_id, name)` sent twice, one after the
+/// other) does NOT converge: the validator sees the existing row and answers
+/// `NameDuplicate` → 409 before any upsert runs. What the `ON CONFLICT (tenant_id,
+/// name) DO UPDATE` in [`crate::db::upsert_sub_tenant_by_name`] is for is the
+/// CONCURRENT case — two creates that both validated against the same pre-insert
+/// snapshot, where the loser must not fail on a constraint it could not have seen.
+///
+/// That asymmetry is the open question in D-10 (management POST is strict, tenant
+/// PUT converges by resolving the natural key first), and it is written down here
+/// because the function was once documented as an idempotent upsert with no such
+/// caveat: a reader who trusted that sentence would expect a second POST to
+/// succeed with 200.
 pub async fn create_sub_tenant(
     pool: &SqlitePool,
     cfg: &ConfigData,
@@ -498,8 +513,20 @@ pub(crate) enum ApplyError {
     /// A pure string comparison, before any lookup — never a tenant-existence
     /// oracle.
     TenantMismatch,
-    /// The resource does not exist, or belongs to another tenant (404). Missing
-    /// and foreign are deliberately indistinguishable (no oracle).
+    /// The resource exists and belongs to ANOTHER tenant (404). A caller that
+    /// needs the "does not exist at all" case has to look at its own arm: for
+    /// DELETE, an absent row answers `WriteOutcome::Deleted` (an idempotent 204)
+    /// while a foreign row answers with this error (404). That difference is
+    /// deliberate — see the DELETE arm below.
+    ///
+    /// The sentence that used to stand here ("missing and foreign are
+    /// deliberately indistinguishable (no oracle)") was FALSE of this code from
+    /// the day it was written: the two cases were already 204 vs 404. It is
+    /// recorded as decision D-4, where the choice between "match the comment" and
+    /// "match the behaviour" was taken as the behaviour being intended: answering
+    /// 204 "deleted" to a request that deleted NOTHING is the worse lie, and the
+    /// oracle it closes is not exploitable (a row id is a nanosecond string, not
+    /// an enumerable one).
     NotFound,
     /// A transactional write-core failure (400/409/500).
     Core(CoreError),
@@ -508,9 +535,15 @@ pub(crate) enum ApplyError {
 /// Apply a tenant config write: run the A-2 **binding gate** (the write's
 /// declared target must be the authenticated tenant's own resources), then the
 /// shared **transactional write core** (`sub_tenant_write`). This is the SINGLE
-/// write point shared by the leader internal handler (V2/V3) and the data-plane
-/// local path (V5, D8) — so the two faces cannot diverge on validation, quota or
-/// natural-key upsert semantics.
+/// write point, reached from two FACES that differ only in their envelope: the
+/// admin API (`/api/v1/sub-tenants*`) and the tenant data plane (V5, D9) — so the
+/// two cannot diverge on validation, quota or natural-key upsert semantics.
+///
+/// It used to be three: the leader's internal handler (V2/V3) took the same
+/// writes over `/api/v1/internal/tenant-config/*`, and that whole family is
+/// retired (ADR-0001 D-6, plan T3.5) — the entry node applies its own write now.
+/// Mentioning it as a live caller would send a reader looking for code that no
+/// longer exists.
 ///
 /// It does **not** depend on `AdminState` or `ServerSession`: it takes the
 /// config [`SqlitePool`], the current [`ConfigData`] (provider / model / tenant

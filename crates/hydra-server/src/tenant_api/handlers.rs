@@ -658,22 +658,22 @@ pub async fn list_sub_tenant_routes(
 //
 // The four self-service WRITE endpoints (sub-tenant v2, D9). The gate (token,
 // URL cross-check, success budget) already ran in [`super::dispatch`], so the
-// authenticated tenant IS the write target. From here the request is EITHER
-// forwarded to the lease-holding leader (a cluster node, D1/D2) OR applied
-// locally (a single-node node, D8):
+// authenticated tenant IS the write target.
 //
-// - a **cluster** node forwards to the leader's internal endpoint
-//   ([`crate::tenant_config::TenantConfigForwarder::forward_config_write`])
-//   and relays the leader's status + body; and
-// - a **single-node** node (no forwarder) applies the write locally through
-//   the shared write core ([`apply_config_write`]) and reloads the snapshot so
-//   `config_version` advances.
+// From here there is ONE path, and it runs on the node that received the request: the write goes
+// through the shared write core ([`crate::admin::sub_tenant_write::apply_config_write`], reached via
+// [`local_write`]) and then reloads the snapshot so `config_version` advances.
 //
-// Both faces run the SAME A-2 binding (the write target must be the
-// authenticated tenant's own resources) — the binding is enforced inside
-// [`apply_config_write`] for the local path and by the leader for the forward
-// path — so they cannot diverge. The tenant Bearer and the request body are
-// NEVER logged here.
+// What this comment used to describe (deleted 2026-10-09, it had outlived its subject): a CLUSTER
+// node forwarded the request to the lease-holding leader's internal endpoint and relayed its status,
+// while only a single-node instance applied it locally — and the two branches were kept honest by
+// running the same A-2 binding on both. That split is retired with the forwarding layer (ADR-0001
+// D-6, plan T3.5, commit `37f0bc3`): the entry node applies its own write, so the binding has ONE
+// owner (inside the write core) instead of two implementations that had to agree, and any node can
+// accept a tenant write — see `dev-docs/tenant-api-integration.md` §"传输语义" for the tenant-facing
+// statement of that.
+//
+// The tenant Bearer and the request body are NEVER logged here.
 
 /// Default for the optional `enabled` field: `true`.
 fn default_true() -> bool {
@@ -712,8 +712,8 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> 
     serde_json::from_slice(bytes).map_err(|e| e.to_string())
 }
 
-/// The four D9 write endpoints: gate (already done) → binding → (forward |
-/// local write).
+/// The four D9 write endpoints: gate (already done) → build the write → the
+/// shared write core on THIS node.
 pub async fn write(
     state: &AppState,
     session: &mut Session,
@@ -725,9 +725,11 @@ pub async fn write(
     let trace_id = ctx.trace_id.clone();
 
     // (1) Read + parse the body (PUT only; DELETE carries none) and build the
-    //     shared [`TenantConfigWrite`] (the A-2 "authorised work"). The forward
-    //     face (a cluster node) derives its internal request FROM this value, so
-    //     the forward and local faces cannot disagree on what is written.
+    //     shared [`TenantConfigWrite`] (the A-2 "authorised work"). One value,
+    //     built in one place: the write core takes it as its input, so "what is
+    //     authorised" and "what is written" cannot drift apart (they used to be
+    //     two code paths — a forwarded request re-derived from this value and a
+    //     local one that took it directly).
     let config_write = match route {
         TenantWriteRoute::UpsertSubTenant { name, .. } => {
             let raw = match super::read_body(session, &trace_id).await {
@@ -791,12 +793,14 @@ pub async fn write(
         }
     };
 
-    // (2) V6 / D6 (A-2 6): the per-tenant config-write throttle is NOT applied
-    //     on this data-plane path. It is enforced by the leader's internal
-    //     endpoint (`admin::tenant_config_api::throttle_gate`), which every
-    //     forwarded write reaches; a single-node local write is bounded by the
-    //     general tenant-API per-tenant request budget instead. Do NOT add a
-    //     second throttle here: it would double-meter forwarded writes.
+    // (2) V6 / D6 (A-2 6): there is NO per-tenant config-write throttle on this path, and that is
+    //     the decision, not an omission. The throttle this comment used to point at
+    //     (`admin::tenant_config_api::throttle_gate`) lived on the leader's internal endpoint, and
+    //     both the endpoint and the module are gone with the forwarding layer — nothing reaches
+    //     them any more, so naming it as the owner of this responsibility would send the next reader
+    //     to a file that does not exist. What bounds this path today is the general tenant-API
+    //     per-tenant request budget (see `ops.md` for the accounting: cluster write ceiling = N x
+    //     single-window). Do NOT add a second throttle here without re-opening that accounting.
 
     // (3) Dispatch: THE ENTRY NODE APPLIES IT (D-6, 乙-full). There is no forwarding any more —
     //     `local_write` runs the shared write core against this node's own database and reloads the
