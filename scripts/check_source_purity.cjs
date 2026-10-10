@@ -42,6 +42,11 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
+// The one tree whose README claims (P3-8) this guard may compare its scan against:
+// ROOT's README.md / README.zh-CN.md describe the production `expect()` count of
+// ROOT's own `crates/` tree, so the claim is only meaningful when that is what we
+// just scanned. Named once so the default target and that condition cannot drift.
+const DEFAULT_SRC_ROOT = path.join(ROOT, 'crates');
 const FORBID = '#![forbid(unsafe_code)]';
 
 const FORBIDDEN = [
@@ -60,7 +65,7 @@ class ScanError extends Error {
 
 function parseArgs(argv) {
   const opts = {
-    srcRoot: process.env.PURITY_SRC_ROOT || path.join(ROOT, 'crates'),
+    srcRoot: process.env.PURITY_SRC_ROOT || DEFAULT_SRC_ROOT,
     docs: process.env.PURITY_DOCS || path.join(ROOT, 'docs', 'index.html'),
   };
   for (const arg of argv) {
@@ -303,10 +308,22 @@ function main(argv) {
   // the test counts (it said 6 until 2026-10-09, and named sites that no longer
   // existed). The production count measured here (`allExpects.length`) is the
   // truth; an advertised number is a claim only as long as a guard checks it.
-  const README = [
-    path.join(ROOT, 'README.md'),
-    path.join(ROOT, 'README.zh-CN.md'),
-  ];
+  //
+  // ...but only for the tree those READMEs describe. The claim is ROOT's, so it is
+  // compared only when the scan target IS ROOT's `crates/` tree; a `--src-root`
+  // pointing elsewhere (the tests build a fixture tree under /tmp) has no README
+  // claiming anything about its own `expect()` count, and pairing ROOT's claim with
+  // that unrelated scan is a meaningless comparison — measured: every fixture run
+  // went red with "README.md advertises 2 … but the scan finds 0". The default
+  // target (CI, the gate) is unaffected, so real-repo behaviour — including the
+  // "README missing" / "carries no claim" findings — is exactly as before.
+  const scansThisRepo = path.resolve(opts.srcRoot) === DEFAULT_SRC_ROOT;
+  const README = scansThisRepo
+    ? [
+        path.join(ROOT, 'README.md'),
+        path.join(ROOT, 'README.zh-CN.md'),
+      ]
+    : [];
   // Allow the markdown bold we actually write (`**2** expect()`), and the zh
   // "处" quantifier; `\**` is "zero or more stars" (markdown **bold**).
   const README_EXPECT_CLAIM = /\**(\d+)\**\s*(?:处\s*)?[`]*expect\(\)[`]*/g;
