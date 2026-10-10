@@ -69,7 +69,7 @@ gate "test optional + live redis/CH"   cargo test -p hydra-server --features ser
 # them. Measured before adding it: `cargo test -p hydra-server --features server,cluster-redis,arachne
 # --lib` is 278 passed / 0 failed. The `--test` list stays (it pins the port-binding order); `--lib`
 # joins it in the same entry, because both need exactly this feature set.
-gate "arachne rust tests (in-process)"  cargo test -p hydra-server --features server,cluster-redis,arachne --lib --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch --test arachne_store --test arachne_three_nodes --test arachne_cert_fidelity --test arachne_derivation_fidelity
+gate "arachne rust tests (in-process)"  cargo test -p hydra-server --features server,cluster-redis,arachne --lib --test arachne_adoption --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch --test arachne_store --test arachne_three_nodes --test arachne_cert_fidelity --test arachne_derivation_fidelity
 # `#[ignore]`d tests: no CI job ran them before round 15, and the only carrier was
 # a script outside version control. This one needs no service.
 gate "ignored: listener limitation"     cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test boot_listeners -- --ignored
@@ -108,6 +108,11 @@ gate "test tail checker tests"         node --test scripts/check_test_tails.test
 # The gate's OWN entries: a drill must not depend on what another entry happened to build.
 gate "gate entries build what they run" node scripts/check_gate_entries.cjs
 gate "gate entry checker tests"        node --test scripts/check_gate_entries.test.cjs
+# Every tests/arachne_*.rs must be NAMED in the explicit --test lists (workflow + this script):
+# an unnamed integration file is compiled but never executed, so a green gate would not be
+# evidence about it (2026-10-10 F1: arachne_adoption.rs missed both lists).
+gate "arachne test wiring"             node scripts/check_arachne_test_wiring.cjs
+gate "arachne wiring tests"            node --test scripts/check_arachne_test_wiring.test.cjs
 gate "ci wiring"                       node scripts/check_ci_wiring.cjs
 gate "ci wiring tests"                  node --test scripts/check_ci_wiring.test.cjs
 # The shared JS masker: a backtick inside a REGEX literal used to blank 74% of a real guard

@@ -374,6 +374,7 @@ jobs:
           set -o pipefail
           cargo test -p hydra-server --features server,cluster-redis,arachne \
             --lib \
+            --test arachne_adoption \
             --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch \
             --test arachne_store --test arachne_three_nodes \
             --test arachne_cert_fidelity --test arachne_derivation_fidelity
@@ -1020,6 +1021,15 @@ jobs:
 
       - name: gate-entry checker tests
         run: node --test scripts/check_gate_entries.test.cjs
+
+      # Every tests/arachne_*.rs must be NAMED in the arachne step's explicit --test list
+      # (this workflow AND the local gate script): an unnamed integration file is compiled
+      # but never executed, so a green run is not evidence about it (2026-10-10 F1).
+      - name: arachne test wiring (no unnamed tests/arachne_*.rs)
+        run: node scripts/check_arachne_test_wiring.cjs
+
+      - name: arachne wiring tests
+        run: node --test scripts/check_arachne_test_wiring.test.cjs
 
       # The public-claims checker is exercised in the `check` job (against real
       # suite transcripts); its own test suite runs here with the other JS suites.
