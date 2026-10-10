@@ -171,9 +171,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arachne-kv"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee40d8c26cd8ade6445a330a9d69e896ea4cad747cf3efb2159ecb93e018a347"
+checksum = "9537dd519de17ded2b662ef4449957a53369832d2e578d13e96d9eb9f5cb7b4b"
 dependencies = [
  "arachne-kv-seam",
  "arachne-kv-transport-tonic",
@@ -189,15 +189,15 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv-seam"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b051684f54676e01f8c934763592918a1b81401936d9fa80b5ab4fdb0f4182c"
+checksum = "b49fcec15d0f1e11a5164773fe2057c3010848bcff8933194752c9c47fa8e757"
 
 [[package]]
 name = "arachne-kv-testsupport"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70f69d2e361b0881797b7d7d655f8ee73fcbf7179d41f70af98b1b16302e3a07"
+checksum = "182cfd3849f3649076fee6c163a4d6173aa03f9fc42100648e055f95292c501c"
 dependencies = [
  "arachne-kv-seam",
  "tokio",
@@ -205,9 +205,9 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv-transport-tonic"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b02bfb3cfcf0c6052e48b00204b85e02cfceff6f8a304268f13bafb6e2c4c541"
+checksum = "8338b7d3c978dcb22286bc7718674e0db4ae06932526272c63700fb75f1b20fd"
 dependencies = [
  "arachne-kv-seam",
  "http",

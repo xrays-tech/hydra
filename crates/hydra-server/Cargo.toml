@@ -213,7 +213,7 @@ fred = { version = "10", features = ["i-scripts"], optional = true }
 # write issued at a follower reaches the leader (ADR-0001 D-3). The lean core
 # (`default-features = false`) has no remote transport and cannot serve a
 # multi-process cluster.
-arachne-kv = { version = "0.3", optional = true }
+arachne-kv = { version = "0.4", optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,
@@ -222,7 +222,7 @@ arachne-kv = { version = "0.3", optional = true }
 [dev-dependencies]
 # Test-support only, and dev-only by upstream design: it must never enter a runtime dependency tree.
 # The isolation recipe in ADR-0001’s plan (alive-but-partitioned node) needs its in-memory transport.
-arachne-kv-testsupport = "0.3"
+arachne-kv-testsupport = "0.4"
 # `Runtime::new` takes a `&slog::Logger`. Production gets one from Arachne's own `assemble_cluster`
 # facade, so this is needed only by a test that builds the runtime ITSELF — i.e. by the
 # alive-partition test, which must own the transport to be able to firewall it. Same major version the
