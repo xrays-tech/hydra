@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use arachne_kv::client::Handle;
 use arachne_kv::server::Arachne;
-use arachne_kv::{NodeId, Profile};
+use arachne_kv::{CasOp, CasPred, CasResult, NodeId, Profile};
 
 /// The environment variable carrying the static member list.
 pub const PEERS_ENV: &str = "HYDRA_CLUSTER_PEERS";
@@ -828,7 +828,12 @@ pub fn cluster_id_env() -> String {
 /// The state a node reports about its own cluster membership, used to verify on
 /// every start that this process and its data directory agree about which
 /// cluster they belong to.
-const HANDSHAKE_CLUSTER_KEY: &[u8] = b"hydra/ctl/cluster_id";
+///
+/// Public because it is the physical key the adoption protocol writes (plan
+/// 2026-10-10 §3.2.1): tests assert against it that a refused adoption left no
+/// trace, and nothing else may ever write it — a second writer would recreate
+/// the exact race `cas(NotExists)` closes.
+pub const HANDSHAKE_CLUSTER_KEY: &[u8] = b"hydra/ctl/cluster_id";
 
 /// Refuse to start when the data directory belongs to another cluster.
 ///
@@ -839,8 +844,11 @@ const HANDSHAKE_CLUSTER_KEY: &[u8] = b"hydra/ctl/cluster_id";
 /// * a directory that **already records** an identity: every member must agree
 ///   with it, whatever its own role is — a plain local read answers this;
 /// * a directory with **no** identity yet: it is adopted by writing the key,
-///   which only the leader can do. A node that cannot write it is not an error —
-///   some other member will, and until then there is nothing to disagree with.
+///   which only the leader can do, and the write is CONDITIONAL (`cas(NotExists)`,
+///   §3.2) so a stale read or a lost race refuses instead of overwriting a
+///   cluster id another member just claimed. A node that cannot write it is not
+///   an error — some other member will, and until then there is nothing to
+///   disagree with.
 ///
 /// So a non-leader only ever fails this check when the directory's recorded
 /// identity differs from its own configuration, which is exactly the case worth
@@ -865,13 +873,10 @@ pub async fn preflight_cluster_id(
     match handle.get_stale(HANDSHAKE_CLUSTER_KEY).await {
         Ok(Some(found)) if found.as_slice() == expected => return Ok(()),
         Ok(Some(found)) => {
-            return Err(format!(
-                "this node's Arachne data directory belongs to a different cluster: it recorded \
-                 {:?} but this process is configured for {:?} (HYDRA_CLUSTER_ID / \
-                 HYDRA_ARACHNE_DATA_DIR). Refusing to join.",
-                String::from_utf8_lossy(&found),
-                cluster_id
-            ))
+            return Err(cluster_mismatch_error(
+                &String::from_utf8_lossy(&found),
+                cluster_id,
+            ));
         }
         // Nothing recorded yet (or the read could not answer): try to adopt it.
         Ok(None) => {}
@@ -880,14 +885,64 @@ pub async fn preflight_cluster_id(
         }
     }
 
-    // 2. Adopt the directory. Only the leader can, and until it does the answer
-    //    is "ask again" rather than a verdict either way.
+    // 2. Adopt the directory — with a CONDITIONAL write. This was a blind `put`;
+    //    it is now `cas(NotExists)` (plan 2026-10-10 §3.2). The read above can go
+    //    stale between step 1 and this write — another member can adopt in that
+    //    window, or the read itself can fail while the key already holds an id —
+    //    and a blind put would silently OVERWRITE it: the leader would commit a
+    //    second cluster id over the first, and the two halves of the cluster would
+    //    then disagree with no error anywhere. The compare-and-swap closes that
+    //    TOCTOU window: a lost race is a mismatch REFUSAL, never a clobber (B1).
+    //
+    //    `without_redirect()` is kept deliberately: the DEFAULT `cas` forwards to
+    //    the leader (measured, spike B4), which would let a FOLLOWER's preflight
+    //    adopt and change the "only a leader can claim a directory" semantics this
+    //    check is built on. So only the leader gets a verdict here; everyone else
+    //    gets `PENDING_ADOPTION` and the caller's retry loop keeps asking.
     match handle
         .without_redirect()
-        .put(HANDSHAKE_CLUSTER_KEY, expected)
+        .cas(
+            HANDSHAKE_CLUSTER_KEY,
+            CasPred::NotExists,
+            CasOp::Put(expected.to_vec()),
+        )
         .await
     {
-        Ok(()) => Ok(()),
+        // The key was absent and THIS write claimed it: first adoption.
+        Ok(CasResult::Applied) => Ok(()),
+        // The key was claimed since our read. An EQUAL value is SUCCESS — the other
+        // writer adopted the same id, so this directory agrees with itself — and
+        // that equality is a HYDRA-side wrapper convention: the library reports only
+        // the predicate miss plus the value it observed (B2 is this branch).
+        Ok(CasResult::NotApplied {
+            current_value: Some(v),
+            ..
+        }) => {
+            if v.as_slice() == expected {
+                Ok(())
+            } else {
+                // A different id won the race: refuse, naming what collided. Falling
+                // through to "write anyway" is the silent clobber this branch exists
+                // to prevent.
+                Err(cluster_mismatch_error(
+                    &String::from_utf8_lossy(&v),
+                    cluster_id,
+                ))
+            }
+        }
+        // `NotExists` never misses an absent key, so `None` cannot occur here — a
+        // defensive refusal rather than an adoption of something unreadable.
+        Ok(CasResult::NotApplied {
+            current_value: None,
+            ..
+        }) => Err(cluster_mismatch_error("<none>", cluster_id)),
+        // NOT a verdict, so NOT terminal: the cluster could not answer — no leader
+        // yet (cold start), no quorum, back-pressure — or, for `Timeout`, it has not
+        // told us whether the write landed (result UNKNOWN, not "definitely not
+        // adopted"). The retry loop decides: the next iteration's step-1 read sees a
+        // landed write and answers Ok. A minority node answers `Timeout` after ~1–2 s
+        // (measured, spike B4), so this arm must keep covering it — mapping it to a
+        // hard failure would kill every preflight behind a briefly partitioned leader.
         Err(arachne_kv::client::ArachneError::NotLeader { .. })
         | Err(arachne_kv::client::ArachneError::QuorumUnavailable)
         | Err(arachne_kv::client::ArachneError::Timeout)
@@ -899,6 +954,22 @@ pub async fn preflight_cluster_id(
             "cannot record this node's cluster identity in its Arachne data directory: {e:?}"
         )),
     }
+}
+
+/// The refusal a cluster-id disagreement produces — shared by the local read
+/// (step 1) and the lost `cas` race (step 2), so wherever the collision is
+/// caught the operator sees ONE message: which id the directory recorded, which
+/// id this process is configured with, and which variables decide.
+///
+/// Not inlined twice: the two call sites ARE the same fact, and a future edit
+/// that reworded only one of them would make the same failure look like two
+/// different problems.
+fn cluster_mismatch_error(recorded: &str, cluster_id: &str) -> String {
+    format!(
+        "this node's Arachne data directory belongs to a different cluster: it recorded \
+         {recorded:?} but this process is configured for {cluster_id:?} (HYDRA_CLUSTER_ID / \
+         HYDRA_ARACHNE_DATA_DIR). Refusing to join."
+    )
 }
 
 /// The marker a caller retries on: the data directory has no recorded cluster
