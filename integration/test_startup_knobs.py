@@ -26,11 +26,12 @@ promises. What the port had to change, and why, leg by leg (see the per-leg comm
 Two operator-facing promises are still the subject, and both survived the port:
 
   * `ops.md` §13.3 / `cluster.md` §2: an unsupported `HYDRA_REDIS_MODE` **fails fast at startup**
-    ("a typo must not silently mean `single`") — **on a cluster node**. That qualifier is not
-    decoration and it is measured by K12: the mode is read only inside `if role.is_cluster()`
-    (`main.rs`), so on the documented single-node default a misspelt value is not validated at all
-    (round 194: the unqualified wording here, in the CI step and in four doc lines claimed a
-    fail-fast that does not exist on the default deployment);
+    ("a typo must not silently mean `single`"). Since DD-1 (2026-10-09) that promise holds on
+    ANY role: the mode used to be read only inside `if role.is_cluster()` (`main.rs`), so the
+    single-node default silently ignored a misspelt value (round 194 measured that the unqualified
+    wording in four doc lines claimed a fail-fast that did not exist on the default deployment).
+    K12 now pins the TIGHTENED boundary: `HYDRA_REDIS_MODE` is validated whenever it is SET,
+    so the single-node default also rejects the typo;
   * a deployment that configures cluster settings it is not going to use must SAY SO, naming every
     variable — the diagnostic that used to be silent (round 192).
 
@@ -68,9 +69,11 @@ Every leg observes the REAL binary (process exit code + log text), never a helpe
       three and dropped the rest silently.
   K11 a retired variable is reported on a HEALTHY cluster node too — quorum, a leader and a served
       config, and the ERROR must still be there.
-  K12 the BOUNDARY of K1/K2: on the single-node default the misspelt mode is never validated, so an
-      operator gets no signal at all. Read the qualifier above before quoting K1/K2 as an
-      unconditional promise.
+  K12 the BOUNDARY of K1/K2, tightened by DD-1 (2026-10-09): the mode used to be
+      read only inside `if role.is_cluster()`, so the single-node default never
+      validated a misspelt value. Now `HYDRA_REDIS_MODE` is validated whenever it
+      is SET — any role — so the misspelt value is rejected on the single-node
+      default too; this leg pins the opposite of the old boundary.
   K13 a data directory that has never been claimed, with NO majority up, refuses to start AFTER the
       10 s deadline — and the ERROR says what to DO about it (start a majority together /
       `podManagementPolicy: Parallel`). Measured 2026-10-05: the message named only the symptom, and
@@ -699,20 +702,18 @@ def single_node_legs():
               f"state={state} exit={rc} parsed={len(names)}/{declared} missing={missing or 'none'} "
               f"src={line[:400] or '<no line>'}")
 
-    # ---- K12: the BOUNDARY of K1/K2 — measured, not assumed ------------------------------------
+    # ---- K12: the BOUNDARY of K1/K2 — tightened by DD-1 (2026-10-09) --------
+    # The mode used to be read only inside `if role.is_cluster()`, so on the
+    # single-node default a misspelt value was silently ignored (this leg pinned
+    # that gap). DD-1 (2026-10-09) validates `HYDRA_REDIS_MODE` whenever it is
+    # SET — any role — so the single-node default now REJECTS the typo too,
+    # naming the knob AND the value, and the node does not serve.
     state, rc, log = observe("k12_redis_mode_typo_single_node", {"HYDRA_REDIS_MODE": "clustr"})
     rejected = "unsupported HYDRA_REDIS_MODE" in log
-    # Measured, and more precise than "never mentioned": the knob IS in `CLUSTER_ONLY_ENV`, so setting
-    # it alone also fires the "cluster wiring is configured but …" ERROR — which names the VARIABLE
-    # and never the misspelt VALUE. That is the whole boundary: on the single-node default the value
-    # is not validated, and the operator learns nothing about it being wrong.
-    wiring_line = line_about(log, "wiring_without_members=HYDRA_REDIS_MODE")
-    check("K12: on the single-node default the misspelt HYDRA_REDIS_MODE is NOT validated — the node "
-          "serves, no line rejects the value, and at most the wiring ERROR names the variable without "
-          "the value",
-          state in ("up", "alive") and not rejected and "fatal startup error" not in log
-          and "clustr" not in wiring_line,
-          f"state={state} exit={rc} rejected={rejected} wiring-names-value={'clustr' in wiring_line}")
+    check("K12 (DD-1): on the single-node default the misspelt HYDRA_REDIS_MODE IS validated — the "
+          "node refuses to start and names the knob AND the value",
+          state not in ("up", "alive") and rejected and "fatal startup error" in log,
+          f"state={state} exit={rc} rejected={rejected} log-names-value={'clustr' in line_about(log, 'HYDRA_REDIS_MODE')}")
 
 
 if __name__ == "__main__":

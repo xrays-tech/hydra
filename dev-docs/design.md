@@ -892,7 +892,7 @@ impl CircuitBreaker {
 }
 ```
 
-- **触发**：连续 `threshold`（默认 5）次 `on_failure` → 进 dead-set，候选选择跳过（§7.1 步骤 4）；
+- **触发**：连续 `threshold`（默认 5）次 `on_failure` → 进 dead-set，候选选择跳过（§7.1 步骤 4）。**NB（DD-2，2026-10-09）：`threshold`/`probe_interval` 是固定默认，不可配**——无 env、无 config-file loader（`ops.md` §13.3 记实测：全仓 grep `BREAKER_THRESHOLD`/`PROBE_INTERVAL` 均为空），`[breaker]` 配置示例只是设计草图不是接线面；可用运维杠杆是 `DELETE /api/v1/breaker/{id}`。
 - **恢复**：后台探活任务每 `probe_interval`（默认 10s）对 dead provider 做轻量探测（如 `GET {endpoint}/v1/models` 或 TCP 探活）；成功 → 移出 dead-set 并清零计数；
 - **联动 DB `status=-1`**（可选，慢周期）：另设一个低频（如每 60s）任务，对长期 dead 的 provider 将其 `provider_model.status` 写 -1，供 Admin 可见；恢复时回 1。热路径不依赖此写。
 - **reload_all 不清 dead-set**：保留对真实故障的判断；provider 被 Admin 删除时同步移除其 dead/fails 条目。
@@ -1410,8 +1410,8 @@ non_route_strategy     = "passthrough"  # passthrough | reject
 retry_after_connect = false        # ~~默认 false（安全）；true 接受重复计费风险~~ —— 字段已删除
 
 [breaker]
-threshold       = 5               # 连续失败阈值
-probe_interval  = "10s"           # dead provider 探活间隔
+threshold       = 5               # 连续失败阈值（固定默认，DD-2：不可配）
+probe_interval  = "10s"           # dead provider 探活间隔（固定默认，DD-2：不可配）
 # ⚠️ 这两个键**同样没有接线**：全仓没有配置文件 loader，也没有读它们的 env 变量，实际值就是
 # hydra-server/src/proxy/config.rs::BreakerPolicy::default() 里的常量（5 / 10s）。实测见
 # ops.md §6.3；唯一可用的杠杆是 DELETE /api/v1/breaker/{id}。

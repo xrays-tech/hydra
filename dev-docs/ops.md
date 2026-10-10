@@ -1584,7 +1584,7 @@ StatefulSet needs — and bare-metal systemd live in `dev-docs/cluster.md` §5.
 | `HYDRA_NODE_ID` | **required in cluster mode**: this node's identity, and it must appear in the member list. No `HOSTNAME`/random fallback on purpose — a duplicate id means two nodes share one raft identity |
 | `HYDRA_ARACHNE_LISTEN` | **required in cluster mode**: where this node's raft transport binds. It must equal **this node's own entry** in the member list, or the node refuses to start (`ListenMismatch`). Its port is unrelated to the admin port — the old "must equal the admin port" rule existed only so the leader hint was directly usable as an admin endpoint, and nothing uses it that way any more (the hint is display-only) |
 | `HYDRA_CLUSTER_ID` | optional: names the cluster so a node refuses to adopt an Arachne data directory that belongs to a different one. Defaults to a hash of the MEMBER LIST (ADR-0001: the list is the cluster identity; the order matters) |
-| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **On a cluster-role node only**: the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the value is not validated at all, and the only line that can mention the variable is the "cluster wiring is configured but …" ERROR (which never quotes the value). Pinned by `integration/test_startup_knobs.py` K1/K2 **and K12** |
+| `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` | backbone; `single` wired — `sentinel`/`cluster` **and any unrecognised value** fail fast at startup (a typo must not silently mean `single`). **Since DD-1 (2026-10-09) this holds on ANY role**: `HYDRA_REDIS_MODE` is validated whenever it is SET (`main.rs` bootstraps the parse unconditionally), so a single-node deployment that inherited a stray/misspelt value refuses to start too. The "cluster wiring is configured but …" ERROR still names the variable when the member list is unset. Pinned by `integration/test_startup_knobs.py` K1/K2 **and the DD-1-tightened K12** |
 | `HYDRA_ADMIN_TOKEN` | required in cluster mode: every node serves its own admin API, so it gates EACH node (not a relaying standby — that layer is retired) |
 | `HYDRA_ENCRYPTION_KEY` | master key, identical fleet-wide |
 | `HYDRA_USAGE_SINK=clickhouse` | mandatory in cluster mode (+ `HYDRA_CLICKHOUSE_URL`) |
@@ -1811,9 +1811,11 @@ item 3.
   value** of `HYDRA_REDIS_MODE` — including a typo: `clustr` used to fall through to `single` (measured
   2026-10-01 on the wire: the node started and registered), which is the opposite of this section's
   promise. `HYDRA_REDIS_MODE=single`/`SINGLE`/unset are accepted; anything else stops the process with
-  `unsupported HYDRA_REDIS_MODE '<what you wrote>' (supported: single)` — **on a cluster-role node**:
-  the mode is read inside `if role.is_cluster()` (`main.rs`), so with the member list unset the
-  value is not validated at all (measured 2026-10-01: the node serves, and the only line that can
+  `unsupported HYDRA_REDIS_MODE '<what you wrote>' (supported: single)` — **on any role** since
+  DD-1 (2026-10-09): the mode is validated whenever it is SET (`main.rs` bootstraps the parse
+  unconditionally; the parse used to live only inside `if role.is_cluster()`), so a single-node
+  deployment that inherited a misspelt value also refuses to start, instead of serving with the
+  typo silently ignored (measured 2026-10-01: the node served, and the only line that could
   mention the variable is the "cluster wiring is configured but …" ERROR, which never quotes the
   value). Pinned by `integration/test_startup_knobs.py` K1/K2 and K12 — and the "on a cluster node"
   half of that pair now runs against a REAL three-member cluster, because a lone member of a

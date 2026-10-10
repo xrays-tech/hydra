@@ -44,7 +44,10 @@ default = []
 # - `runtime`    : shared async-runtime helpers (tokio, dashmap, arc-swap,
 #                  tracing, prometheus, thiserror, chrono, include_dir).
 #                  Required by every I/O module.
-# - `db`         : sqlx pool / migrations / repo (W2).
+# - `db`         : sqlx pool / migrations / repo (W2). NOT standalone: `store.rs` /
+#                  `db/restore.rs` depend on `crate::cluster::*`, which `db` does not
+#                  gate (decision D-7, 2026-10-09 — the bare-slice recipe is retired;
+#                  builds that need the store use `--features server`).
 # - `http-client`: reqwest auth upstream (W3).
 # - `proxy`        : pingora proxy shell over plain TCP (W4a). No TLS backend —
 #                   the plain `add_tcp` listener. Enables `tls` only via a

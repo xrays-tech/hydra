@@ -175,6 +175,20 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     //     the decision — and a node with the list set is a raft member.
     let role = hydra_server::cluster::NodeRole::from_env();
 
+    // DD-1 (2026-10-09): `HYDRA_REDIS_MODE` is validated whenever it is SET —
+    // not only on cluster nodes. Round 191 measured a cluster node booting as
+    // `single` under `clustr`; the fix caught that inside `role.is_cluster()`,
+    // but the boundary meant a single node with a stray/misspelt mode inherited
+    // from some manifest was silently ignored (K12 pinned that gap explicitly).
+    // The parse is cheap and pure; run it unconditionally so a bad value fails
+    // fast on ANY role. The cluster branch below re-parses for the value itself.
+    #[cfg(feature = "cluster-redis")]
+    if let Ok(mode) = std::env::var("HYDRA_REDIS_MODE") {
+        if !mode.trim().is_empty() {
+            hydra_server::redis::RedisMode::parse(Some(&mode))?;
+        }
+    }
+
     // (0b) Arachne control plane (ADR-0001). Started HERE, inside the async bootstrap, and
     //      that placement is a requirement rather than a preference: `Arachne::start` builds a
     //      `tokio::time::Interval` while assembling its actor and panics with
