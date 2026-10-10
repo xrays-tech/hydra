@@ -727,9 +727,11 @@ impl ServeHttp for AdminService {
 
         // NO leader write gate any more (ADR-0001 T3.3). This node executes an admin mutation
         // LOCALLY and, once the write commits, publishes the resulting config to the control
-        // plane; the raft library forwards the head write to the leader. The layer that relayed
-        // the whole HTTP request to the lease holder is retired along with the Redis lease it was
-        // built for (the write no longer needs a leader to LAND, only to be COMMITTED).
+        // plane; the raft library forwards that publish — the whole batch (missing entities +
+        // toc + head) as ONE atomic `multi_put`, a single log entry — to the leader. The layer
+        // that relayed the whole HTTP request to the lease holder is retired along with the Redis
+        // lease it was built for (the write no longer needs a leader to LAND, only to be
+        // COMMITTED).
         self.route(&method, &path, query.as_deref(), session, &trace_id)
             .await
     }

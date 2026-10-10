@@ -5,9 +5,12 @@
 //!
 //! Under the homogeneous model (ADR-0001 D-2, and the user's ruling on where a management write
 //! lands) every node runs the same write path: the SQLite transaction commits LOCALLY, then this
-//! node encodes its own config into a tree and commits the head. The head write is the commit
-//! point, and it is the one operation the library forwards to the raft leader, so "any node can
-//! accept a management write" does not mean "any node is a writer" at the storage level.
+//! node encodes its own config into a tree and commits it: the entities it does not have yet, the
+//! toc and the head go into ONE `multi_put` — a single log entry, all or nothing, the head moving
+//! in the same entry as the tree it names (2026-10-10, plan `2026-10-10-multi-put-atomic-publish`).
+//! That batch is the one operation the library forwards to the raft leader (when this node is a
+//! follower), so "any node can accept a management write" does not mean "any node is a writer" at
+//! the storage level.
 //!
 //! ## Why the local write is not rolled back when publishing fails
 //!
@@ -21,7 +24,8 @@
 //! A retry queue. A failed publish is retried by the NEXT write (which publishes whatever the
 //! config is then) and by `POST /api/v1/reload`; a background retry loop would add a second owner
 //! of "the tree the cluster should have" without changing the outcome for a config that cannot be
-//! encoded at all (an over-sized value, a provider id that cannot be keyed).
+//! encoded or committed at all (an over-sized value, a provider id that cannot be keyed, a batch
+//! over the library's entry-count/total-byte bound).
 
 use std::sync::Arc;
 
@@ -60,8 +64,10 @@ impl ConfigPublisher {
     ///
     /// # Errors
     /// A human-readable reason: the codec refused the config (an unkeyable id, a value over the
-    /// library's 1 MiB cap, a seal that failed), or the commit did not go through (no leader, no
-    /// quorum). Both mean "the cluster does not have this config".
+    /// library's 1 MiB cap, a seal that failed); the `multi_put` batch overran a library bound
+    /// (>4096 entries / >4 MiB total — refused before propose, nothing enters the log); or the
+    /// commit did not go through (no leader, no quorum). All mean "the cluster does not have this
+    /// config"; the first two are also counted as `publish_total{result="refused"}`.
     pub async fn publish(
         &self,
         cfg: &ConfigData,

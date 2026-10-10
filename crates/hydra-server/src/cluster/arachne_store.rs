@@ -6,15 +6,16 @@
 //!
 //! ```text
 //! publish(tree) =
-//!   1. write every entity whose bytes differ from the previous tree
-//!   2. write the new toc
-//!   3. write head = <new toc hash>          <- the commit
+//!   1. collect the entities this node does not have (content-addressed keys)
+//!   2. multi_put([…those entities, new toc, head])   <- ONE log entry = the commit
 //! ```
 //!
-//! A failure before step 3 leaves the previous tree current and every reader
-//! untouched; the half-written entities belong to a tree nobody names, so they
-//! are unreachable rather than dangerous. This is why the ordering is asserted
-//! by a test rather than left to review.
+//! The whole publish is one `multi_put`: one log entry, one session, one apply,
+//! all or nothing. A failed publish therefore leaves the previous tree current
+//! with nothing half-written — and a batch that overruns the library's bounds
+//! (entry count / total bytes) is refused BEFORE propose, so it never enters
+//! the log at all. Head remains the only commit point; it now moves in the same
+//! entry as the entities and toc it names rather than after them.
 //!
 //! ## Reading
 //!
@@ -24,9 +25,10 @@
 //! * a follower can materialize without a linearizable read (a follower's `get`
 //!   returns `QuorumUnavailable` immediately — measured, ADR-0001 §10 F-2);
 //! * a reader that catches the cluster mid-publish sees EITHER the old tree or
-//!   the new one, never a mix, because head names exactly one toc and every
-//!   entity is checked against the hash that toc records. A mismatch is a
-//!   retry, not a repair.
+//!   the new one, never a mix: the publish applies in a single log entry (head
+//!   moves together with its entities), and past that head names exactly one
+//!   toc while every entity is checked against the hash that toc records. A
+//!   mismatch is a retry, not a repair.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -69,6 +71,22 @@ pub enum StoreError {
     /// what separates "the alert fires when the cluster is down" from "the alert
     /// fires whenever anything goes wrong".
     QuorumUnavailable,
+    /// The key space refused the write **before** it entered the log: a bound was
+    /// overrun (a value over `max_value_bytes`, or a `multi_put` batch over the
+    /// entry-count / total-byte caps). Nothing was committed; nothing partial exists.
+    ///
+    /// Produced at exactly one place — the `multi_put` call in [`Self::publish_inner`],
+    /// which discriminates `ArachneError::InvalidArgument` for the batch it assembled
+    /// (2026-10-10: the shared `map_err` that serves the read path deliberately does
+    /// NOT map `InvalidArgument` here — a bound refusal is a fact about a batch).
+    ///
+    /// Its own variant rather than a string inside [`StoreError::Arachne`] because it
+    /// is a fact about the CONFIG, not about the cluster — the fix is a smaller config,
+    /// not a repair — and it is the same refusal `ConfigPublisher` counts at encode
+    /// time. It is what `hydra_arachne_publish_total{result="refused"}` counts
+    /// (ADR-0001 risk R2's capacity alarm), and the difference from `Arachne` is what
+    /// separates "this config will never fit" from "the cluster had a bad day".
+    Refused(String),
     /// The key space refused something (a bad entity id, an undecodable toc).
     Keys(KeysError),
     /// Arachne refused or could not serve the operation.
@@ -84,6 +102,10 @@ impl std::fmt::Display for StoreError {
             Self::QuorumUnavailable => f.write_str(
                 "no raft majority was reachable, so the control plane could not commit or confirm \
                  anything; the node keeps serving the config it already materialized",
+            ),
+            Self::Refused(e) => write!(
+                f,
+                "the cluster refused the write before proposing it (nothing entered the log): {e}"
             ),
             Self::Keys(e) => write!(f, "config key space: {e}"),
             Self::Arachne(e) => write!(f, "arachne: {e}"),
@@ -103,6 +125,12 @@ fn map_err(e: ArachneError) -> StoreError {
     match e {
         ArachneError::NotLeader { .. } => StoreError::NotLeader,
         ArachneError::QuorumUnavailable => StoreError::QuorumUnavailable,
+        // NOTE: `InvalidArgument` is deliberately NOT mapped to `StoreError::Refused` here
+        // (2026-10-10, oracle F2). `map_err` serves every call in this module — reads
+        // (`read_inner`, `current_hash`, `current_head_with_index`) as well as the publish —
+        // and a pre-propose bound refusal is a fact about a `multi_put` BATCH, not about a
+        // read. The `Refused` discrimination therefore lives at the `multi_put` call site in
+        // `publish_inner`, where the batch it judges was actually assembled.
         other => StoreError::Arachne(format!("{other:?}")),
     }
 }
@@ -291,12 +319,13 @@ impl ArachneConfigStore {
         }
     }
 
-    /// Publish `tree` and commit it by moving the head last.
+    /// Publish `tree` as one atomic batch: entities + toc + head in a single `multi_put`.
     ///
     /// # Errors
     /// [`StoreError::NotLeader`] when this node does not own the commit point,
-    /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Arachne`] for a
-    /// transport or quorum failure.
+    /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Refused`] when the
+    /// batch overruns a library bound (nothing enters the log), [`StoreError::Arachne`]
+    /// for a transport or quorum failure.
     pub async fn publish(&self, tree: &ConfigTree) -> Result<String, StoreError> {
         let outcome = self.publish_inner(tree).await;
         // One record per publish, with the outcome the operator's rule is written
@@ -307,6 +336,10 @@ impl ArachneConfigStore {
             Ok(_) => "ok",
             Err(StoreError::NotLeader) => "not_leader",
             Err(StoreError::QuorumUnavailable) => "quorum_unavailable",
+            // The capacity alarm: a pre-propose bound refusal is a fact about the
+            // config, not a transport or codec failure — `refused`, like the encoder's
+            // own refusal in `ConfigPublisher::publish`.
+            Err(StoreError::Refused(_)) => "refused",
             Err(_) => "error",
         });
         if let Err(e) = &outcome {
@@ -335,8 +368,9 @@ impl ArachneConfigStore {
         // `without_redirect()` here made the whole cluster's publish leader-only, which three
         // real nodes demonstrated immediately: 2 of 3 writes failed with `NotLeader`.
         //
-        // Each `put` is forwarded INDIVIDUALLY, so the publisher does not need to be the leader —
-        // but see `KNOWN RISK` below: the sequence is not atomic.
+        // `multi_put` is forwarded the same way (`propose_with_redirect`): the publisher need
+        // not be the leader, and the WHOLE batch crosses as one command — entities, toc and
+        // head apply in a single log entry, so there is no sequence left to be half-done.
         let writer = &self.handle;
 
         // Why no baseline read: with content-addressed entity keys, "is this entity already
@@ -348,31 +382,51 @@ impl ArachneConfigStore {
         //
         // The check costs one LOCAL read per entity and saves a raft log entry per unchanged
         // entity — the property the key-path design was chosen for.
-        // 1. entities — a failure here leaves the old tree committed and the new
-        //    one unreachable, because nothing names it yet.
         //
         // `get_stale` on our own replica: a "missing" answer from a lagging node only costs a
-        // redundant, idempotent put, while a "present" answer cannot be wrong about the CONTENT
-        // (the key it answered for is derived from that content's hash).
+        // redundant, idempotent entry in the batch, while a "present" answer cannot be wrong about
+        // the CONTENT (the key it answered for is derived from that content's hash). And hydra
+        // never deletes an entity, so "present" cannot become "gone" between this read and the
+        // batch commit either — nothing can invalidate the skip.
+        let mut missing: Vec<(String, &[u8])> = Vec::new();
         for (path, bytes) in tree.iter() {
             let key = cfg_entity(path, &hex_hash(&content_hash(bytes)));
             if matches!(self.handle.get_stale(key.as_bytes()).await, Ok(Some(_))) {
                 continue;
             }
-            writer.put(key.as_bytes(), bytes).await.map_err(map_err)?;
+            missing.push((key, bytes.as_slice()));
         }
 
-        // 2. the toc
-        writer
-            .put(cfg_toc(&toc_hash).as_bytes(), &toc.encode())
-            .await
-            .map_err(map_err)?;
+        // ONE atomic batch = one log entry: the entities this node was missing, then the toc,
+        // then the head. Head keeps its place (written last) inside the batch, but it no longer
+        // commits AFTER the payload — it commits WITH it, so no reader ever observes a window
+        // in which the head names a tree that is not fully written. The batch always carries
+        // toc + head (never empty — the library refuses empty batches), the head value is still
+        // the toc's content hash (the toc's bytes ARE the tree's name), and toc/head are
+        // rewritten every publish: only the entities get the local-existence skip.
+        let toc_bytes = toc.encode();
+        let toc_key = cfg_toc(&toc_hash);
+        let head_key = ctl_head();
+        let mut batch: Vec<(&[u8], &[u8])> = missing
+            .iter()
+            .map(|(key, bytes)| (key.as_bytes(), *bytes))
+            .collect();
+        batch.push((toc_key.as_bytes(), toc_bytes.as_slice()));
+        batch.push((head_key.as_bytes(), toc_hash.as_bytes()));
 
-        // 3. the commit
-        writer
-            .put(ctl_head().as_bytes(), toc_hash.as_bytes())
-            .await
-            .map_err(map_err)?;
+        // Capacity bound: the library validates the batch BEFORE propose (>4096 entries, >4MiB
+        // total key+value bytes, any value over `max_value_bytes`) and answers `InvalidArgument`
+        // with NOTHING in the log — fail-stop. This call site — and only this call site — turns
+        // that into `StoreError::Refused`, which `publish` counts as `result="refused"` (the
+        // capacity alarm) instead of `error`: a pre-propose refusal is a fact about THIS BATCH,
+        // not a cluster failure, and the shared `map_err` (which also serves the read path) must
+        // not claim that meaning. The batch is NEVER split to fit: splitting would trade away the
+        // atomicity this call exists for — an over-sized config fails whole, by design, until the
+        // config shrinks.
+        writer.multi_put(&batch).await.map_err(|e| match e {
+            ArachneError::InvalidArgument(msg) => StoreError::Refused(msg),
+            other => map_err(other),
+        })?;
 
         Ok(toc_hash)
     }

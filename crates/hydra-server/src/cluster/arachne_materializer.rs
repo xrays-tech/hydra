@@ -478,6 +478,10 @@ mod tests {
     /// Disjoint from all seven: these tests run CONCURRENTLY and a raft member must bind the
     /// address its peers were told about (reusing a port fails with "Address already in use").
     const PORT_STALE_SEAM: u16 = 18432;
+    /// Disjoint from everything above (and from `PORT_STALE_SEAM`): the over-cap publish test
+    /// needs its own node because its assertions read the head's origin index, which a shared
+    /// node could move under it.
+    const PORT_OVER_CAP: u16 = 18409;
 
     fn data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hydra-mat-{tag}-{}", std::process::id()));
@@ -1134,6 +1138,148 @@ mod tests {
             ctl.current_hash().await.expect("read head"),
             None,
             "nothing may be published when the tree cannot be encoded"
+        );
+    }
+
+    /// Unwrap a committed tree read, failing loudly on `Empty`.
+    fn expect_tree(outcome: ReadOutcome) -> ConfigTree {
+        match outcome {
+            ReadOutcome::Tree(t) => (*t).clone(),
+            ReadOutcome::Empty => panic!("expected a committed tree, found an empty config"),
+        }
+    }
+
+    /// `hydra_arachne_publish_total{result="refused"}` — the capacity alarm ADR-0001 risk R2
+    /// asks for. Read from the process-wide registry, which this module's tests SHARE, so
+    /// callers compare deltas and allow for a concurrent sibling's own refusal.
+    fn refused_publish_count() -> u64 {
+        crate::admin::metrics::render()
+            .lines()
+            .find_map(|l| l.strip_prefix("hydra_arachne_publish_total{result=\"refused\"} "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// AN OVER-CAP PUBLISH IS REFUSED WHOLE: nothing enters the log, the head does not move,
+    /// the refusal is counted, and THIS node's local SQLite commit still stands.
+    ///
+    /// The shape is the one a big-but-legal config produces (plan 2026-10-10 A2): five
+    /// providers whose names are 900 KiB each — every single value is UNDER the 1 MiB per-value
+    /// cap (so nothing here is the encoder's fault; compare `a_failed_publish_names_itself_…`
+    /// above, which trips that cap instead), but the missing batch totals ~4.4 MiB, over the
+    /// library's `MAX_MULTI_PUT_TOTAL_BYTES` (4 MiB). The library validates the batch BEFORE
+    /// proposing, so the whole batch stays out of the log: the head keeps its value and its
+    /// origin index, the cluster keeps serving the previous tree (no half-write), this node
+    /// keeps serving — and holding the row of — the providers its own transaction just
+    /// committed, and `publish` counts `result="refused"` instead of an opaque error. That is
+    /// exactly why the admin layer can answer "committed locally, NOT published" honestly.
+    ///
+    /// Falsification: split the batch to fit the cap and the head-index assertion fails as soon
+    /// as any part of it commits; drop the `InvalidArgument → Refused` discrimination at the
+    /// `multi_put` call site and the reason no longer carries the Refused wording nor the
+    /// `refused` counter increment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_cap_publish_is_refused_whole_and_the_local_commit_still_stands() {
+        let raft = node("publish-over-cap", PORT_OVER_CAP).await;
+        wait_writable(&raft).await;
+        let ctl = ArachneConfigStore::new(raft.handle.clone());
+        let key_provider: Arc<dyn crate::crypto::KeyProvider> = Arc::new(kp());
+        let pool = pool().await;
+        let store = ConfigStore::load(pool.clone(), key_provider.clone())
+            .await
+            .expect("load")
+            .with_publisher(Arc::new(
+                crate::cluster::arachne_publish::ConfigPublisher::new(
+                    ctl.clone(),
+                    key_provider.clone(),
+                ),
+            ));
+
+        // Baseline: one small provider, published — so "nothing moved" is measurable.
+        crate::db::insert_provider(&pool, &provider("p0"))
+            .await
+            .expect("insert p0");
+        assert!(
+            store.reload_all().await.expect("baseline publish"),
+            "fixture: the baseline insert must change the config"
+        );
+        let (head_before, idx_before) = ctl
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("the baseline must have published a head");
+        let tree_before = expect_tree(ctl.read().await.expect("baseline read"));
+        let refused_before = refused_publish_count();
+
+        // Five providers × 900 KiB: each value fits, the batch does not.
+        for i in 1..=5 {
+            let mut p = provider(&format!("p{i}"));
+            p.name = "x".repeat(900 * 1024);
+            crate::db::insert_provider(&pool, &p)
+                .await
+                .expect("insert oversized provider");
+        }
+
+        match store.reload_all().await {
+            // NB: `crate::store::StoreError` (the ConfigStore's) is a DIFFERENT type from
+            // this module's `arachne_store::StoreError` — the publish step belongs to the former.
+            Err(crate::store::StoreError::NotPublished { reason }) => {
+                assert!(
+                    reason.contains("MAX_MULTI_PUT_TOTAL_BYTES"),
+                    "the refusal must name the batch cap that tripped — that is the pre-propose \
+                     InvalidArgument, nothing entered the log — got: {reason}"
+                );
+                assert!(
+                    reason.contains("nothing entered the log"),
+                    "the reason must carry the Refused wording, got: {reason}"
+                );
+            }
+            other => panic!(
+                "an over-cap publish must surface as NotPublished (local commit stands, cluster \
+                 does not have it), got {other:?}"
+            ),
+        }
+
+        // The whole batch stayed OUT of the log: the head is byte-identical AND at the same
+        // origin index — a partially applied batch would have moved at least one of them.
+        let (head_after, idx_after) = ctl
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("the head must still be there");
+        assert_eq!(
+            (head_after.as_str(), idx_after),
+            (head_before.as_str(), idx_before),
+            "the refused batch must not have entered the log: head value and origin index unmoved"
+        );
+        assert_eq!(
+            expect_tree(ctl.read().await.expect("cluster read")),
+            tree_before,
+            "the cluster must still serve exactly the pre-refusal tree (no half-write)"
+        );
+
+        // The LOCAL side stands — the whole reason the error says "committed, not published".
+        for i in 1..=5 {
+            let id = format!("p{i}");
+            assert!(
+                crate::db::get_provider(&pool, &id).await.is_ok(),
+                "the local row for {id} must stand: the SQLite commit is not rolled back"
+            );
+        }
+        assert_eq!(
+            store.snapshot().providers.len(),
+            6,
+            "this node must still SERVE all six providers (p0 + the five that failed to publish)"
+        );
+
+        // The capacity alarm fired: `refused`, not an opaque error. `>` (an increase) rather
+        // than `==` because the process-wide counter is shared with the per-value-cap test
+        // that can be running concurrently in this same binary.
+        let refused_after = refused_publish_count();
+        assert!(
+            refused_after > refused_before,
+            "publish must count a pre-propose refusal as result=\"refused\" (before \
+             {refused_before}, after {refused_after})"
         );
     }
 

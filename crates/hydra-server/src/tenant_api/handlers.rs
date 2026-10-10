@@ -805,8 +805,9 @@ pub async fn write(
     // (3) Dispatch: THE ENTRY NODE APPLIES IT (D-6, 乙-full). There is no forwarding any more —
     //     `local_write` runs the shared write core against this node's own database and reloads the
     //     snapshot, which PUBLISHES the resulting config to the control plane (plan T3.2). The
-    //     library forwards the head write to the raft leader, so the write needs this node to be
-    //     able to COMMIT, not to be the leader.
+    //     library forwards that publish — the whole batch (missing entities + toc + head) as ONE
+    //     atomic `multi_put`, a single log entry — to the raft leader, so the write needs this
+    //     node to be able to COMMIT, not to be the leader.
     //
     //     What this replaced: a cluster node relayed the request to the lease holder's internal
     //     endpoint (`/api/v1/internal/tenant-config/*`) with the tenant Bearer in a dedicated
