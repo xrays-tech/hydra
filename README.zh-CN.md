@@ -45,7 +45,7 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 - **外部认证**：每个租户配置自己的 `auth_url`；Hydra 缓存判定 5 分钟，并提供失效接口（欠费/封禁由租户自决）。
 - **故障转移 + 熔断**：failover 循环依次尝试每个候选供应商；连续失败触发 dead-set，后台探活恢复。全 body 重放 O(1)。
 - **限流**：内存滑动窗口（请求数 + token），按角色，m/h/d 窗口。
-- **用量记录**：可插拔 Sink（默认 SQLite，可选 ClickHouse）；**细粒度 token 分解**：`prompt_tokens`/`completion_tokens`/`total_tokens`/`cached_tokens`（OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`）；**延迟指标**：`forward_latency_ms`（Hydra 自身开销）+ `ttft_ms`（首 token 延迟）。所有数字字段默认 0（无 NULL）。
+- **用量记录**：可插拔 Sink（**`HYDRA_USAGE_SINK` 必填、无默认**：`clickhouse` 共享存储 或 `none` 显式不计量；旧 SQLite sink 已于 2026-10-07 退役并按名字拒启）；**细粒度 token 分解**：`prompt_tokens`/`completion_tokens`/`total_tokens`/`cached_tokens`（OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`）；**延迟指标**：`forward_latency_ms`（Hydra 自身开销）+ `ttft_ms`（首 token 延迟）。所有数字字段默认 0（无 NULL）。
 - **按租户 TLS**：基于 SNI 的证书选择，热更新（BoringSSL/OpenSSL）。
 - **管理 REST + UI**：全部配置实体增删改查、Prometheus `/metrics`、内嵌控制台。
 
@@ -54,6 +54,10 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 ### Docker（推荐）
 
 ```bash
+# 两把 key 均必填——不 export 则 compose 直接失败
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"
+
 # 1. 交叉编译 linux/amd64 二进制 + 构建镜像
 ./environment/build.sh
 
@@ -68,7 +72,11 @@ python3 ../environment/init.py
 
 ```bash
 cargo build --release --features server
-HYDRA_ADMIN_TOKEN=<token> ./target/release/hydra
+# HYDRA_ENCRYPTION_KEY 与 HYDRA_USAGE_SINK 均必填、无默认
+HYDRA_ADMIN_TOKEN=<token> \
+HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" \
+HYDRA_USAGE_SINK=none \
+./target/release/hydra
 ```
 
 ## 配置
@@ -85,9 +93,20 @@ Hydra 通过**环境变量**启动（运行时），所有路由配置存于 **S
 | `HYDRA_ENCRYPTION_KEY` | —                                | 32 字节的 base64；落库加密 provider api-key（**必填**，缺失即拒启动）。生成：`openssl rand 32 \| base64` |
 | `HYDRA_USAGE_SINK`     | —（**必填**）                     | `clickhouse`（共享用量存储）或 `none`（显式不计量）。`sqlite`（旧的单节点默认）已于 2026-10-07 退役并**按名字拒绝启动** |
 | `HYDRA_CLICKHOUSE_URL` | —                                | ClickHouse HTTP 端点（`HYDRA_USAGE_SINK=clickhouse` 时必填） |
-| `RUST_LOG`             | `info`                           | 日志级别                                            |
+| `RUST_LOG` | *未设* | 日志级别；未设时进程内默认按 tracing 默认 `error`——`info` 为部署推荐值 |
 
-**端口**：`8080`/`443` 代理 · `8081` 管理（REST + UI + metrics）。
+> **单节点 vs 集群的唯一开关是 `HYDRA_CLUSTER_PEERS`**：不设置 = 单节点（上表即可）；设置（≥3 项、三节点逐字相同）= 进入 raft 集群，此时还需：
+
+| 环境变量 | 默认 | 用途 |
+|---|---|---|
+| `HYDRA_CLUSTER_PEERS` | —（**集群必填**） | 静态成员表，`name=host:port` 逗号分隔；**顺序即 raft id**；≥3 项；所有节点逐字相同 |
+| `HYDRA_NODE_ID` | —（**必填**） | 本节点在成员表里的名字，各节点唯一 |
+| `HYDRA_ARACHNE_LISTEN` | —（**必填**） | 本节点 raft 传输地址，须等于成员表里自己那一项 |
+| `HYDRA_CLUSTER_ID` | 成员表哈希（**建议显式设置**） | 集群身份；显式设置后日后可安全改成员表 |
+| `HYDRA_REDIS_URL` | —（**必填**） | 数据面共享状态骨干（Redis 是集群的依赖之一，另一为用量 sink） |
+| `HYDRA_REDIS_MODE` | `single` | 仅集群读取，只接受 `single` |
+
+**端口**：`8080` 代理（明文，恒定绑定）· `8443` 代理（TLS，仅当设置 `HYDRA_TLS_LISTEN`）· `8081` 管理（REST + UI + metrics）。
 
 ## 使用
 
@@ -109,7 +128,7 @@ curl -X POST http://localhost:8081/api/v1/tenants \
   -d '{"id":"acme","name":"ACME","domain":"acme.example.com","auth_url":"https://auth.acme.example.com/v","enabled":true}'
 
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/v1/providers
-curl http://localhost:8081/metrics
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/metrics
 ```
 
 ### 把客户端指向 Hydra
@@ -137,19 +156,32 @@ dev-docs/                 design.md、ops.md、dev-plan.md、架构分析
 
 ## 集群模式（Cluster Mode）
 
-单节点零依赖；集群 = `HYDRA_ROLE=leader|edge` + Redis（唯一外置依赖），
-K8s/k3s 无关、自维持（自动选举/故障切换/加入退出/自愈）。
+单节点零外置依赖；**集群唯一开关是 `HYDRA_CLUSTER_PEERS`**（静态成员表，`name=host:port` 逗号分隔）——
+设了它（≥3 项）本进程就是 raft 集群成员，不设即单节点、行为零变化。成员表**顺序即 raft id**，
+所有节点的值必须逐字相同。**最少 3 个成员**（`MINIMUM_MEMBERS=3`，少于 3 项在解析成员表时就拒绝启动）。
+
+集群是 3 个**完全同构**的 raft 成员（都跑数据面/管理面/本地 SQLite/raft），**没有 edge、没有可
+`--scale` 的角色**；任意时刻**恰好一个 writer**，由 raft 写探测决定。控制面是 Arachne（raft 线性化
+KV），Redis 只承载数据面近似状态。
+
+集群构建/运行：
 
 ```bash
-cargo build --release --features server,cluster-redis,usage-clickhouse
-cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+# 需含 arachne feature，否则设了 HYDRA_CLUSTER_PEERS 会拒启
+cargo build --release --features server,cluster-redis,arachne,usage-clickhouse
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # 每个节点都用
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # 全集群一致
+cd environment && docker compose -f docker-compose.cluster.yml up -d   # 3 个同构成员，勿 --scale
 ```
 
-已通过真实环境验收（双 leader 候选 + 无状态 edge，docker Redis）：故障切换
-~11–18s、跨节点限流、共享熔断、认证失效总线、无共享卷证书轮换。
-详见 **[`dev-docs/cluster.md`](dev-docs/cluster.md)**（环境变量表、Redis 故障矩阵、
-故障切换演练与实测记录）与
-[`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml)。
+每节点必填：`HYDRA_CLUSTER_PEERS`（三处相同）、各自不同的 `HYDRA_NODE_ID` 与
+`HYDRA_ARACHNE_LISTEN`（且后者须等于成员表里自己那一项）、`HYDRA_REDIS_URL`、`HYDRA_ADMIN_TOKEN`、
+`HYDRA_ENCRYPTION_KEY`（全集群一致）、`HYDRA_USAGE_SINK`；**强烈建议显式设 `HYDRA_CLUSTER_ID`**
+（否则默认=成员表哈希，改成员表会全集群拒启）。
+
+实测（3 个真进程，docker Redis）：选举/故障切换 **~1.1–1.6 s**、双 writer 从未出现、失去多数派时
+管理写立即 503 而数据面继续服务。详见 [`dev-docs/cluster.md`](dev-docs/cluster.md)（成员表、故障矩阵、
+成员变更 SOP）与 [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml)。
 
 ## 更多
 

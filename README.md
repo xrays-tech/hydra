@@ -55,6 +55,10 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 ### Docker (recommended)
 
 ```bash
+# both keys are REQUIRED — compose fails fast if not exported
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"
+
 # 1. cross-compile the linux/amd64 binary + build the image
 ./environment/build.sh
 
@@ -69,7 +73,11 @@ python3 ../environment/init.py
 
 ```bash
 cargo build --release --features server
-HYDRA_ADMIN_TOKEN=<token> ./target/release/hydra
+# HYDRA_ENCRYPTION_KEY and HYDRA_USAGE_SINK are required (no defaults)
+HYDRA_ADMIN_TOKEN=<token> \
+HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" \
+HYDRA_USAGE_SINK=none \
+./target/release/hydra
 ```
 
 ## Configure
@@ -86,9 +94,20 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | `HYDRA_ENCRYPTION_KEY` | —                              | Base64 of 32 bytes; encrypts provider api-keys at rest (**required**, fail-closed). Generate: `openssl rand 32 \| base64`. |
 | `HYDRA_USAGE_SINK`   | — (**required**)                 | `clickhouse` (shared store) or `none` (no metering)   |
 | `HYDRA_CLICKHOUSE_URL` | —                              | ClickHouse HTTP endpoint (when sink=clickhouse)      |
-| `RUST_LOG`           | `info`                           | Log level                                            |
+| `RUST_LOG` | *unset* | Log level; in-process default when unset is tracing's `error` — `info` is the recommended/deployed value |
 
-**Ports**: `8080`/`443` proxy · `8081` admin (REST + UI + metrics).
+> The only switch between single-node and cluster is **`HYDRA_CLUSTER_PEERS`**: unset = single node (the table above is all you need); set (≥3 entries, byte-identical on all three nodes) = enter a raft cluster — you then also need:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `HYDRA_CLUSTER_PEERS` | — (**required for cluster**) | Static member list, `name=host:port` comma-separated; **order is the raft id**; ≥3 entries; identical on every node |
+| `HYDRA_NODE_ID` | — (**required**) | This node's name from the member list; unique per node |
+| `HYDRA_ARACHNE_LISTEN` | — (**required**) | This node's raft transport address; must equal its own entry in the member list |
+| `HYDRA_CLUSTER_ID` | hash of the member list (**set explicitly**) | Cluster identity; setting it explicitly lets you change the member list later |
+| `HYDRA_REDIS_URL` | — (**required**) | Shared data-plane state backbone (Redis is one cluster dependency, alongside the usage sink) |
+| `HYDRA_REDIS_MODE` | `single` | Read by the cluster only; only `single` is accepted |
+
+**Ports**: `8080` proxy (plaintext, always bound) · `8443` proxy (TLS, only if `HYDRA_TLS_LISTEN` is set) · `8081` admin (REST + UI + metrics).
 
 ## Use
 
@@ -114,7 +133,7 @@ curl -X POST http://localhost:8081/api/v1/tenants \
 # list / reload / metrics
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/v1/providers
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/v1/reload
-curl http://localhost:8081/metrics
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/metrics
 ```
 
 ### Point a client at Hydra
@@ -130,6 +149,8 @@ curl https://acme.example.com/v1/chat/completions \
 
 Hydra resolves tenant `acme` by domain → calls `auth_url` to authorize the key → routes `gpt-4o` to an allowed provider → swaps in a provider key → streams the response back → records usage (tokens + cached + TTFT).
 
+**Model catalog**: `GET /v1/models` is publicly readable (with or without an api-key — the presented key does not trigger auth, it only narrows the catalog by key-prefix binding) and returns the catalog of models this tenant can currently call (Hydra aggregates locally: union across allowed providers, filtered by the tenant model whitelist, excluding broken/disabled/keyless providers); chat calls still require an api-key. Admin has a read-only aggregate at `GET /api/v1/tenants/{tenant_id}/models`. See `dev-docs/design-tenant-model-catalog.md` and `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`.
+
 ## Project layout
 
 ```
@@ -142,21 +163,37 @@ dev-docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 
 ## Cluster Mode
 
-Single node stays zero-dependency. A cluster is opt-in: set `HYDRA_ROLE=leader|edge`
-with a Redis (the one required external dependency) — self-sustaining (automatic
-election, failover, join/leave, self-healing) and orchestration-agnostic
-(compose / k3s / k8s / bare metal).
+Single node needs no external dependency; **the only cluster switch is `HYDRA_CLUSTER_PEERS`**
+(a static member list, `name=host:port` comma-separated). Set it (≥3 entries) and this process is a
+raft cluster member; leave it unset and you stay single-node with unchanged behavior. The member
+list **order is the raft id** and must be byte-identical on every node. **Minimum 3 members**
+(`MINIMUM_MEMBERS = 3`); fewer is rejected while parsing the member list.
+
+The cluster is three **identical** raft members (each runs data plane + admin API + local SQLite +
+raft); there is **no edge role and no `--scale`**. Exactly **one writer** exists at any time, decided
+by a raft write probe. The control plane is Arachne (raft-linearizable KV); Redis only carries
+approximate data-plane state.
+
+Cluster build / run:
 
 ```bash
-cargo build --release --features server,cluster-redis,usage-clickhouse
-cd environment && docker compose -f docker-compose.cluster.yml up -d --scale hydra-edge=2
+# requires the arachne feature, or a node with HYDRA_CLUSTER_PEERS set refuses to boot
+cargo build --release --features server,cluster-redis,arachne,usage-clickhouse
+export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # every node uses it
+export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # identical across the cluster
+cd environment && docker compose -f docker-compose.cluster.yml up -d   # 3 identical members, do NOT --scale
 ```
 
-Live-acceptance verified (dual leader + stateless edges, docker Redis):
-failover ~11–18 s, cross-node rate limiting, shared circuit breaker,
-auth-cache invalidation bus, cert rotation without shared volumes.
-See **[`dev-docs/cluster.md`](dev-docs/cluster.md)** (env table, failure matrix,
-failover drill + acceptance record).
+Per node: `HYDRA_CLUSTER_PEERS` (identical on all), a distinct `HYDRA_NODE_ID` and
+`HYDRA_ARACHNE_LISTEN` (the latter must equal this node's own entry in the list), `HYDRA_REDIS_URL`,
+`HYDRA_ADMIN_TOKEN`, `HYDRA_ENCRYPTION_KEY` (identical), `HYDRA_USAGE_SINK`; **strongly set
+`HYDRA_CLUSTER_ID` explicitly** (default = hash of the member list, so changing the list changes
+cluster identity and makes every node refuse to start).
+
+Measured (3 real processes, docker Redis): election/failover **~1.1–1.6 s**, no dual writer ever
+observed, and on quorum loss admin writes return 503 immediately while the data plane keeps serving.
+See **[`dev-docs/cluster.md`](dev-docs/cluster.md)** (member list, failure matrix, membership-change SOP)
+and [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml).
 
 ## More
 
