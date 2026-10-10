@@ -86,7 +86,7 @@
 
 | 键 | 内容 |
 |---|---|
-| `hydra/ctl/head` | **当前配置树的内容哈希** —— **提交点**，最后写 |
+| `hydra/ctl/head` | **当前配置树的内容哈希** —— **提交点**（与实体、toc 同批原子提交，head 在**批内最后**） |
 | `hydra/cfg/toc/<toc-hash>` | 该树的目录（每个实体的路径 + 内容哈希 + 长度） |
 | `hydra/cfg/e/<path>/<content-hash>` | **每实体一键，键自带内容哈希** |
 | `hydra/ctl/cluster_id` | 本节点数据目录记录下来的集群身份（"认领"机制，见 §5.6） |
@@ -102,12 +102,15 @@
 管理写打在**任意节点**都成立，序列是：
 
 1. 入口节点在**本地 SQLite 事务**里提交（`BEGIN IMMEDIATE`，事务内重读活行 + 当前配置，校验归属/配额/前缀）；
-2. 本地重建 `ConfigData` → 编码成分片 → 写实体（键已存在则跳过）→ 写 toc；
-3. **最后写 `hydra/ctl/head`** —— 这一步才是提交点，也是**唯一**被库转发给 raft leader 的操作。
+2. 本地重建 `ConfigData` → 编码成分片 → 组批：内容寻址下**未命中的实体**（键已存在则跳过）+ toc + head，head 放在**批内最后**；
+3. 批次作为**一条 `multi_put`** 提交 —— **一条 raft 日志项、一个原子批次、全成或全不成**（2026-10-10，见计划 `2026-10-10-multi-put-atomic-publish.md`）；这也是（入口在 follower 上时）**唯一被库转发给 raft leader 的操作**，整批**一次**转发。
 
-因此：**head 不前进 ⇒ 集群里没有任何节点会看到半份配置**。第 3 步失败时，本地事务**已经提交**，
-所以错误是 `StoreError::NotPublished`（"已提交到本节点库、**未发布**到集群"），管理 API 答
+因此：**head 不前进 ⇒ 集群里没有任何节点会看到半份配置**——批整体失败时**一个字节都不进日志**，
+半写窗口不是"被时序避免"，而是结构上不存在。发布失败时本地事务**已经提交**，
+所以错误是 `StoreError::NotPublished`（"已提交到本节点库、**未发布**到集群"，拒绝原因原样带在 reason 里），管理 API 答
 **503 `config_not_published`**，而节点继续用自己那份新配置服务——文案不是"写失败"，因为回滚没有发生。
+超出库的批上限（**>4096 条 / 合计 >4 MiB**；编码期另有单值 >1 MiB、无法成键、密封失败）也在 propose **之前**
+整批拒绝 ⇒ 计量进 `hydra_arachne_publish_total{result="refused"}`（容量告警，见 §7）。
 
 ### 3.3 每个节点自己物化
 
@@ -268,7 +271,11 @@ spec:
 
 **一个从未被认领过的数据目录**必须由**多数派**先认领才能服务。节点启动时：先**本地读**目录里记录的
 集群身份（`hydra/ctl/cluster_id`）——已经记着且与配置一致 ⇒ 立刻通过；**没记着** ⇒ 只能由 **leader**
-写进去（这一步刻意**不走转发**），而 leader 需要多数派在场。重试窗口 `PREFLIGHT_DEADLINE` = **10 秒**。
+以**条件写**认领（`without_redirect().cas(NotExists)`，刻意**不走转发**；2026-10-10 起由盲 `put` 硬化为
+条件写）：若读与写之间目录已被别的成员抢先认领，**值相同视为通过、不同则按 `belongs to a different
+cluster` 拒绝**——不静默覆写。认领本身需要多数派在场；未就绪期间每轮重试在日志里是
+`cluster identity not adopted yet`（`PENDING_ADOPTION`），走满重试窗口 `PREFLIGHT_DEADLINE` = **10 秒**
+才以硬错误退出（见下表）。
 
 四种情形，都已实测（2026-10-05）：
 
@@ -375,7 +382,7 @@ docker compose -f docker-compose.cluster.yml start hydra-a
 |---|---|
 | `hydra_arachne_this_node_leader{node}` | 1 = 本节点是 writer。**`sum() == 0` 就是"集群没有写者"**（该序列只在集群节点上存在，单节点部署不会误报） |
 | `hydra_arachne_leader_flips_total` | 本节点"我是不是 leader"的答案变了几次（采样 gauge 看不到抖动） |
-| `hydra_arachne_publish_total{result}` | `ok` / `not_leader` / `quorum_unavailable` / `error` / `refused`（编码期拒绝：超 1 MiB、无法成键、密封失败 ⇒ **容量告警**） |
+| `hydra_arachne_publish_total{result}` | `ok` / `not_leader` / `quorum_unavailable` / `error` / `refused`（**propose 前**拒绝、整批不进日志：编码期——单值超 1 MiB、无法成键、密封失败；或批上限——`multi_put` **>4096 条 / 合计 >4 MiB** ⇒ **容量告警**） |
 | `hydra_arachne_config_bytes` | 最近一次成功发布的树字节数（增长曲线） |
 | `hydra_arachne_quorum_unavailable_total{op}` | 因无多数派而被拒的操作（`publish` / `read`） |
 | `hydra_replica_materialize_retries_total{outcome}` | 物化循环：`attempt` / `succeeded` / `failed` / `throttled`（稳态不计） |
