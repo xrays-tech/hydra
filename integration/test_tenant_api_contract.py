@@ -230,7 +230,9 @@ def main():
 
         # ---- §4.1 401 with an IDENTICAL message for the three causes ------------
         texts = {}
-        st_none, _, texts["missing"] = tenant("GET", "/whoami", token=None)
+        st_none, _, texts["missing"] = call(
+            "GET", f"http://127.0.0.1:{DATA}/tenant/t1/api/v1/whoami",
+            token=None, host="contract.local")
         st_bad, _, texts["wrong"] = tenant("GET", "/whoami", token="not-a-token-at-all-1234")
         st_unset, _, texts["unconfigured"] = call(
             "GET", f"http://127.0.0.1:{DATA}/tenant/t3/api/v1/whoami",
@@ -249,7 +251,7 @@ def main():
 
         # ---- §4.4 the nine routes, and the method convention --------------------
         read_routes = [("GET", "/whoami"), ("GET", f"/usage?since={SINCE}"),
-                       ("GET", "/sub-tenants"), ("GET", "/sub-tenant-routes")]
+                       ("GET", "/user-groups"), ("GET", "/users")]
         for method, path in read_routes:
             st, _, text = tenant(method, path)
             check(f"§5: the documented read route {method} {path.split('?')[0]} answers",

@@ -331,10 +331,21 @@ pub async fn dispatch(
     //    list endpoints and a method-agnostic read parse would mis-attribute them.
     //    A near-miss is a LOCAL 404 — never a fall-through to the proxy pipeline,
     //    where a tenant token would be read as a client api-key (design §3.2).
-    if method == "PUT" || method == "DELETE" {
-        let Some(write) = parse_write_route(method, path) else {
-            return respond_error(session, ctx, 404, "not_found", "unknown path").await;
-        };
+    let write = if method == "PUT" || method == "DELETE" {
+        // PUT/DELETE are ALWAYS write-shaped: a near miss is a local 404.
+        match parse_write_route(method, path) {
+            Some(w) => Some(w),
+            None => return respond_error(session, ctx, 404, "not_found", "unknown path").await,
+        }
+    } else if method == "POST" {
+        // POST has exactly one write route (api-key mint), but the same path
+        // shapes are also GETs. A miss falls through to the read router so a
+        // POST on a read route answers 405, not a misleading 404.
+        parse_write_route(method, path)
+    } else {
+        None
+    };
+    if let Some(write) = write {
         // Every write route variant names its tenant (it came from the URL), so
         // the accessor — not a hand-written pattern list — is what keeps a new
         // variant from silently dropping out of the URL cross-check below.

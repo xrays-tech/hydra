@@ -75,7 +75,9 @@ def admin(method, path, body=None):
     return call(method, f"http://127.0.0.1:{ADMIN}/api/v1{path}", token=TOKEN, body=body)
 
 
-def tenant(method, path, token=T1_TOKEN, body=None):
+def tenant(method, path, token=None, body=None):
+    if token is None:
+        token = T1_TOKEN
     return call(method, f"http://127.0.0.1:{DATA}/tenant/t1/api/v1{path}", token=token, body=body,
                 host="boundaries.local")
 
@@ -116,7 +118,9 @@ class Upstream(BaseHTTPRequestHandler):
         pass
 
 
-def proxied(key=CLIENT_KEY):
+def proxied(key=None):
+    if key is None:
+        key = CLIENT_KEY
     return call("POST", f"http://127.0.0.1:{DATA}/v1/chat/completions",
                 token=key, host="boundaries.local",
                 body={"model": "echo", "messages": [{"role": "user", "content": "hi"}]})
@@ -161,6 +165,7 @@ def stop(proc):
 
 
 def seed():
+    global T1_TOKEN, T2_TOKEN, CLIENT_KEY
     admin("POST", "/providers", {"id": "p1", "key": "p1", "name": "P",
                                  "endpoint": f"http://127.0.0.1:{UPSTREAM}", "weight": 1,
                                  "created_at": "", "updated_at": ""})
@@ -172,7 +177,7 @@ def seed():
     for tid, token, domain in (("t1", T1_TOKEN, "boundaries.local"),
                                ("t2", T2_TOKEN, "other-boundaries.local")):
         st, out = admin("POST", "/tenants", {
-            "id": tid, "name": tid.upper(), "domain": domain,
+            "id": tid, "name": tid.upper(), "domain": domain, "enabled": True,
             "created_at": "", "updated_at": ""})
         if st not in (200, 201):
             raise SystemExit(f"[boundaries] CANNOT VERIFY: seeding {tid} -> {st} {out[:160]}")
@@ -180,13 +185,38 @@ def seed():
                                            "provider_id": "p1", "created_at": "", "updated_at": ""})
         admin("POST", "/tenant-models", {"id": f"tm-{tid}", "tenant_id": tid,
                                          "model_key": "echo", "created_at": "", "updated_at": ""})
+        st, out = admin("POST", f"/tenants/{tid}/access-tokens", {"name": "test"})
+        if st not in (200, 201):
+            raise SystemExit(f"[boundaries] CANNOT VERIFY: minting token {tid} -> {st} {out[:160]}")
+        minted = json.loads(out)["token"]
+        if tid == "t1":
+            T1_TOKEN = minted
+        else:
+            T2_TOKEN = minted
+    # A client credential now comes from the hierarchy: group -> user -> key.
+    st, out = call("PUT", f"http://127.0.0.1:{DATA}/tenant/t1/api/v1/user-groups",
+                   token=T1_TOKEN, host="boundaries.local", body={"name": "g1"})
+    if st not in (200, 201):
+        raise SystemExit(f"[boundaries] CANNOT VERIFY: group -> {st} {out[:160]}")
+    gid = json.loads(out)["user_group"]["id"]
+    st, out = call("PUT", f"http://127.0.0.1:{DATA}/tenant/t1/api/v1/users",
+                   token=T1_TOKEN, host="boundaries.local",
+                   body={"user_group_id": gid, "name": "u1"})
+    if st not in (200, 201):
+        raise SystemExit(f"[boundaries] CANNOT VERIFY: user -> {st} {out[:160]}")
+    uid = json.loads(out)["user"]["id"]
+    st, out = call("POST", f"http://127.0.0.1:{DATA}/tenant/t1/api/v1/users/{uid}/api-keys",
+                   token=T1_TOKEN, host="boundaries.local", body={"name": "k1"})
+    if st not in (200, 201):
+        raise SystemExit(f"[boundaries] CANNOT VERIFY: key -> {st} {out[:160]}")
+    CLIENT_KEY = json.loads(out)["key"]
     admin("POST", "/reload", {})
     time.sleep(0.3)
 
 
 def set_enabled(enabled):
     st, out = admin("PUT", "/tenants/t1", {
-        "id": "t1", "name": "T1", "domain": "boundaries.local",
+        "id": "t1", "name": "T1", "domain": "boundaries.local", "enabled": enabled,
         "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""})
     admin("POST", "/reload", {})
     time.sleep(0.3)
