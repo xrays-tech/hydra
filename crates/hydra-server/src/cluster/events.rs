@@ -1,16 +1,18 @@
 //! # Invalidation bus (cluster P4)
 //!
-//! Auth-cache invalidations travel as **Redis Streams** entries
-//! (`hydra:{ctl:events}`), so every node (edge AND leader) drops the affected
-//! local cache entries — and, unlike a leader-held buffer, the stream
-//! **survives leader failover** (it lives in Redis, not in a leader's
-//! memory). Consumers track their last-read id. A background trim keeps the
-//! stream bounded to `maxlen`; when a trim removes entries the `generation`
-//! counter (`hydra:{ctl:gen}`) is bumped and every node clears its local auth
-//! cache — the removed events may not have reached a lagging consumer, and a
-//! full clear is the safe, idempotent response. Entries carry `{tenant_id,
-//! keyhashes}` (v=2; SHA-256 digests, never plaintext) — re-applying is a
-//! no-op.
+//! Invalidation events travel as **Redis Streams** entries
+//! (`hydra:{ctl:events}`), so every node (edge AND leader) can track whether it
+//! has acknowledged them — and, unlike a leader-held buffer, the stream
+//! **survives leader failover** (it lives in Redis, not in a leader's memory).
+//! Consumers track their last-read id and publish that position as a per-node
+//! applied watermark. A background trim keeps the stream bounded to `maxlen`;
+//! when a trim removes entries the `generation` counter (`hydra:{ctl:gen}`) is
+//! bumped so consumers know the stream moved past a position some node may not
+//! have read. Entries carry `{tenant_id, keyhashes}` (v=2; SHA-256 digests,
+//! never plaintext) — re-reading is a no-op.
+//!
+//! This module deliberately does not touch auth caches. The bus's semantics are
+//! publication, acknowledgement, bounded trimming, and generation compensation.
 //!
 //! **Key**: `hydra:{ctl:events}` (single-key ops, topology-safe).
 
@@ -104,17 +106,18 @@ pub enum AppliedOutcome {
 pub struct Invalidation {
     pub tenant_id: Option<String>,
     /// v=2 payload: SHA-256 hex digests. The plaintext api-key is never on the
-    /// wire — only its digest. Empty ⇒ a whole-tenant / whole-cache clear.
+    /// wire — only its digest. Empty ⇒ a whole-tenant / whole-stream scope event.
     pub keyhashes: Vec<String>,
     /// v=1 legacy payload: plaintext api-keys, kept ONLY so events published
-    /// before the v=2 switch replay correctly from the stream. Hashed on the
-    /// spot at apply time; never re-broadcast or logged.
+    /// before the v=2 switch remain readable from the stream. The plaintext is
+    /// never re-broadcast or logged; digest equivalence is checked with the same
+    /// helper used at publish.
     pub legacy_keys: Vec<String>,
 }
 
 /// The fleet-wide result of one invalidation, in the tri-state the HTTP layer
 /// reports — **shared by both entry points** (the tenant API's E2 and the
-/// operator's `DELETE /api/v1/auth/cache`).
+/// operator's invalidation endpoint).
 ///
 /// It exists because the boolean it replaces lied: `published: true` was the
 /// initial value and only ever became `false` when a stream existed AND the
@@ -150,7 +153,7 @@ impl FleetReport {
         self
     }
 
-    /// No stream at all: this node's own clear IS the whole answer. Only
+    /// No stream at all: this node's own event is the whole answer. Only
     /// reachable for the single-node `all` role — `main` refuses to start a
     /// `leader`/`edge` without a Redis backbone, so "cluster member with no
     /// channel" cannot occur, and a stream that exists but fails is
@@ -272,8 +275,8 @@ pub struct InvalidationStream {
 }
 
 /// SHA-256 hex digest of a plaintext api-key (the v=2 stream payload). Module-
-/// level so both `publish` (hash at the boundary) and `apply_invalidation`
-/// (hash legacy `keys` on the spot for replay) share one implementation.
+/// level so publish (hash at the boundary) and tests (digest equivalence for
+/// legacy v=1 events) share one implementation.
 fn sha256_hex_str(s: &str) -> String {
     hydra_core::auth::sha256_hex_string(s.as_bytes())
 }
@@ -311,10 +314,11 @@ impl InvalidationStream {
 
     /// Record that `node_id` has FULLY applied everything up to `event_id`.
     ///
-    /// **Call order is load-bearing: apply first, acknowledge second.** An
-    /// acknowledgement written before the clear would let the publisher tell the
-    /// tenant "applied everywhere" while this node was still serving the stale
-    /// verdict — the barrier would certify exactly the thing it exists to detect.
+    /// **Call order is load-bearing: read/apply first, acknowledge second.** An
+    /// acknowledgement written before the node has consumed the event would let
+    /// the publisher tell the tenant "applied everywhere" while this node was
+    /// still behind — the barrier would certify exactly the thing it exists to
+    /// detect.
     pub async fn mark_applied(&self, node_id: &str, event_id: &str) -> Result<(), RedisError> {
         let _: Option<String> = self
             .pool
@@ -491,10 +495,10 @@ impl InvalidationStream {
                         "tenant" => tenant_id = Some(v),
                         // v=2: SHA-256 hex digests.
                         // v=2: SHA-256 hex digests. An EMPTY field means "no
-                        // keys" (a whole-tenant clear), never one empty digest:
-                        // `"".split(',')` yields `[""]`, which made
-                        // `apply_invalidation` take the per-key branch and
-                        // invalidate nothing at all — silently (audit L-3).
+                        // keys" (a whole-tenant / whole-stream scope event), never
+                        // one empty digest: `"".split(',')` yields `[""]`, and a
+                        // consumer must not treat that as one malformed key
+                        // silently (audit L-3).
                         "keyhashes" => {
                             keyhashes = v
                                 .split(',')
@@ -502,7 +506,7 @@ impl InvalidationStream {
                                 .map(str::to_string)
                                 .collect();
                         }
-                        // v=1 legacy: plaintext keys (replayed, hashed at apply).
+                        // v=1 legacy: plaintext keys parsed for replay/compatibility.
                         "keys" => {
                             legacy_keys = v
                                 .split(',')
@@ -528,7 +532,8 @@ impl InvalidationStream {
 
     /// Trim the stream to `maxlen` entries. Returns the number removed. The
     /// periodic trim task ([`trim_and_maybe_bump`] / [`spawn_trim_task`]) bumps
-    /// the generation whenever a trim actually removes entries.
+    /// the generation when a trim drops entries that a consumer may not have
+    /// applied.
     pub async fn trim(&self, maxlen: u64) -> Result<i64, RedisError> {
         let removed: i64 = self
             .pool
@@ -544,8 +549,8 @@ impl InvalidationStream {
         Ok(removed)
     }
 
-    /// Bump the generation counter (trim overflow): nodes observing a bump
-    /// clear their local auth caches.
+    /// Bump the generation counter (trim overflow): consumers observing a bump
+    /// know the stream moved past a position they may not have read.
     pub async fn bump_generation(&self) -> Result<i64, RedisError> {
         let n: i64 = self.pool.incr(GENERATION_KEY).await?;
         Ok(n)
@@ -585,7 +590,7 @@ impl InvalidationStream {
     /// used to be two commands: `XTRIM` first, then `INCR`, so anything that
     /// failed in between (a dropped connection, a command timeout) left the
     /// entries deleted with NO compensation — and the only backstop against
-    /// dropping an invalidation nobody had read is that generation bump.
+    /// dropping an event nobody had read is that generation bump.
     /// Redis runs a script as a single command, so the two effects cannot be
     /// separated by a network failure any more.
     ///
@@ -598,9 +603,9 @@ impl InvalidationStream {
     /// [`InvalidationStream::slowest_live_watermark`]). When it covers every
     /// dropped id, the trim removed only events every live node had already
     /// applied, so there is nothing to compensate for. Without this, a fleet
-    /// that is keeping up perfectly still got every node's auth cache wiped on
-    /// each trim once the event rate passed `maxlen / interval` (≈333 events/s
-    /// at the shipped constants) — a cross-tenant availability hole one tenant
+    /// that is keeping up perfectly still got a generation bump on each trim
+    /// once the event rate passed `maxlen / interval` (≈333 events/s at the
+    /// shipped constants) — a cross-tenant availability hole one tenant
     /// could hold open with a couple of invalidations per minute.
     pub async fn trim_and_maybe_bump(
         &self,
@@ -672,7 +677,7 @@ fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
 /// `KEYS[1]` = stream, `KEYS[2]` = generation counter, `ARGV[1]` = maxlen.
 /// Exact `MAXLEN` (matching the previous `XCapTrim::Exact`), and the counter is
 /// only touched when something was actually removed — a spurious bump would
-/// clear every node's auth cache for nothing.
+/// force every consumer to compensate for nothing.
 pub const TRIM_AND_MAYBE_BUMP_SCRIPT: &str = r#"
 local function gt(a, b)
   local am, as = string.match(a, '^(%d+)-(%d+)$')
@@ -715,41 +720,6 @@ end
 return {removed, bump}
 "#;
 
-/// Apply one invalidation to a local auth cache (idempotent).
-pub async fn apply_invalidation(
-    cache: &crate::http::AuthCache,
-    inv: &Invalidation,
-    known_tenants: &[String],
-) -> usize {
-    // Resolve the target digests: v=2 `keyhashes`, or the v=1 legacy `keys`
-    // hashed on the spot (stream replay — pre-switch events must invalidate
-    // the same entries; this is replay, not a compatibility fallback).
-    let keyhashes: Vec<String> = if !inv.keyhashes.is_empty() {
-        inv.keyhashes.clone()
-    } else {
-        inv.legacy_keys.iter().map(|k| sha256_hex_str(k)).collect()
-    };
-    match (&inv.tenant_id, keyhashes.is_empty()) {
-        (Some(tid), true) => cache.invalidate_tenant(tid).await,
-        (Some(tid), false) => cache.invalidate_hashes(tid, &keyhashes).await,
-        (None, true) => {
-            // Whole-cache clear (a `tenant: None` event with no keys): clear
-            // L1 AND the L2 fleet-wide. Iterating `known_tenants` instead would
-            // skip both the L1 entries of a tenant this node's snapshot does not
-            // know and (until B2) the L2 entirely.
-            cache.clear_all().await
-        }
-        (None, false) => {
-            // Keys across all tenants.
-            let mut n = 0;
-            for t in known_tenants {
-                n += cache.invalidate_hashes(t, &keyhashes).await;
-            }
-            n
-        }
-    }
-}
-
 /// How many stream entries one `XREAD` asks for (`XREAD COUNT`).
 const INVALIDATION_READ_BATCH: u64 = 100;
 
@@ -758,24 +728,21 @@ const INVALIDATION_READ_BATCH: u64 = 100;
 const INVALIDATION_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Spawn the per-node invalidation consumer (cluster P4): an `XREAD` loop
-/// over the stream; each event is applied to the local auth cache (idempotent
-/// replay — on reconnect it re-reads from the last id); a `generation` bump
-/// (the stream was trimmed past our watermark) clears the local cache.
+/// over the stream. Each event advances the node's last-read id, then the
+/// whole batch is acknowledged through the per-node applied watermark; a
+/// `generation` bump (the stream was trimmed past some consumer's position)
+/// refreshes the consumer state without pretending unread trimmed ids were
+/// applied.
 ///
 /// **Drains before idling** (review B3c). The loop used to read
 /// [`INVALIDATION_READ_BATCH`] entries and then sleep unconditionally, i.e. a
 /// hard ceiling of batch/idle = 200 events/s per node with no back-pressure:
 /// above that sustained rate the stream grows to `maxlen`, every trim then drops
-/// unread entries, every drop bumps the generation, and every node then clears
-/// its whole auth cache — on a schedule set by the trim interval. The sleep is
-/// now only paid when a read returned fewer than a full batch, i.e. when there
-/// is genuinely nothing left to read.
-pub fn spawn_invalidation_consumer(
-    stream: InvalidationStream,
-    auth: std::sync::Arc<crate::http::HttpAuthChecker>,
-    store: crate::store::ConfigStore,
-    node_id: String,
-) {
+/// unread entries, every drop bumps the generation, and every consumer has to
+/// compensate on a schedule set by the trim interval. The sleep is now only paid
+/// when a read returned fewer than a full batch, i.e. when there is genuinely
+/// nothing left to read.
+pub fn spawn_invalidation_consumer(stream: InvalidationStream, node_id: String) {
     tokio::spawn(async move {
         let mut last_id = "0".to_string();
         let mut gen: i64 = stream.generation().await.unwrap_or(0);
@@ -783,7 +750,7 @@ pub fn spawn_invalidation_consumer(
         // a consumer that panicked and restarted, a node partitioned from Redis,
         // a node that was never registered — is invisible without this: the
         // consumer's only reaction to a failure is a `warn!` and a retry, and a
-        // stalled node keeps serving stale ALLOWs from its L1 for the full TTL.
+        // stalled node is reported as lagging forever.
         let mut last_advance = tokio::time::Instant::now();
         loop {
             // Publish the consumer's health BEFORE doing work, so a stall is
@@ -811,39 +778,26 @@ pub fn spawn_invalidation_consumer(
                     // immediately instead of sleeping.
                     more_to_read = events.len() as u64 == INVALIDATION_READ_BATCH;
                     if !events.is_empty() {
-                        for (id, inv) in events {
-                            let known: Vec<String> = store
-                                .snapshot()
-                                .tenants_by_domain
-                                .values()
-                                .map(|t| t.id.clone())
-                                .collect();
-                            apply_invalidation(auth.cache(), &inv, &known).await;
+                        for (id, _) in events {
                             last_id = id;
                         }
                         // The watermark moved: reset the stall clock.
                         last_advance = tokio::time::Instant::now();
-                        // Keep the local `hydra_auth_cache_size` gauge
-                        // truthful: entries cleared HERE never pass through
-                        // the admin invalidation handlers (which run only on
-                        // the node that received the request — never on an
-                        // edge data-plane node consuming the stream).
-                        crate::admin::metrics::record_auth_cache_size(auth.cache().len());
-                        // ACKNOWLEDGE THE WHOLE BATCH, AFTER APPLYING IT.
+                        // ACKNOWLEDGE THE WHOLE BATCH, AFTER READING IT.
                         // This is the order the barrier depends on: a publisher
                         // waits for this watermark, and an acknowledgement
-                        // written before the clear would let it tell a tenant
-                        // "applied everywhere" while this node was still serving
-                        // the stale verdict. One write per batch, not per event:
+                        // written before the node had consumed the batch would
+                        // tell a tenant "applied everywhere" while this node was
+                        // still behind. One write per batch, not per event:
                         // the watermark is a position, not a log.
                         if let Err(e) = stream.mark_applied(&node_id, &last_id).await {
-                            // The clear DID happen here; only the evidence did
+                            // The read DID happen here; only the evidence did
                             // not land. Reported so a publisher sees this node as
                             // lagging rather than silently believing it.
                             tracing::warn!(
                                 error = %e,
                                 node = %node_id,
-                                "invalidation applied but the watermark write failed;                                  publishers will see this node as lagging"
+                                "invalidation consumed but the watermark write failed; publishers will see this node as lagging"
                             );
                         }
                     }
@@ -852,27 +806,25 @@ pub fn spawn_invalidation_consumer(
                             gen = g;
                             tracing::info!(
                                 generation = g,
-                                "invalidation generation bumped; clearing local auth cache (L1 + L2)"
+                                "invalidation generation bumped; consumer state refreshed"
                             );
-                            // DELIBERATELY NO WATERMARK ADVANCE HERE. A bump means
-                            // the stream was trimmed, so the events between our last
-                            // read and the trim are GONE — their ids are unknowable,
-                            // and a node may not account for an event it never read.
-                            // The whole-cache clear below supersedes their EFFECT
-                            // (everything is gone), but the barrier must keep
-                            // reporting those events as unapplied rather than claim
-                            // a position it cannot name. Conservative on purpose:
-                            // report "not converged" rather than lie about it.
-                            // L1 **and** L2 (B2): clearing only the L1 let the
-                            // next `check` re-hydrate the very verdict this
-                            // clear exists to drop, for the rest of its TTL.
-                            auth.cache().clear_all().await;
-                            // NO `record_auth_cache_size(0)` here: that gauge counts the
-                            // L1, and writing 0 while a PARTIAL L2 clear left verdicts
-                            // in Redis made the dashboard claim an empty cache. The L1
-                            // length is recorded by the next `check()`, and the L2's own
-                            // outcome is reported by
-                            // `hydra_auth_cache_clear_total{layer="l2",result=...}`.
+                            // A bump means the stream was trimmed, so events between
+                            // this consumer's last read and the trim may be GONE. We
+                            // refresh the known watermark (`last_id`) but deliberately
+                            // do not invent an id for unread trimmed entries: if `last_id`
+                            // has not reached the published event, the barrier must keep
+                            // reporting it as unapplied rather than lie about a position
+                            // this node cannot name.
+                            if last_id != "0" {
+                                if let Err(e) = stream.mark_applied(&node_id, &last_id).await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        node = %node_id,
+                                        "generation bump observed but the watermark refresh write failed"
+                                    );
+                                }
+                            }
+                            last_advance = tokio::time::Instant::now();
                         }
                         _ => {}
                     }
@@ -893,15 +845,14 @@ pub fn spawn_invalidation_consumer(
 ///
 /// When a trim removes entries that some live consumer had NOT yet applied, the
 /// generation is bumped (via [`InvalidationStream::trim_and_maybe_bump`]) so
-/// every node re-hydrates its auth cache — a removed event may not have reached
-/// a lagging consumer, and a full local clear is the safe, idempotent response.
+/// consumers know the stream moved past a position they may not have read.
 ///
 /// When the `live_nodes` view proves that every dropped id was already applied
 /// by every live node, no bump happens: there is nothing to compensate for, and
-/// bumping would wipe the whole fleet's auth cache for nothing. That distinction
-/// is what stops a fleet that is keeping up from clearing every cache on each
-/// trim once the event rate passes `maxlen / interval`. Pass `None` when no live
-/// view exists (single-node build): the task then behaves as before.
+/// bumping would force every consumer to treat the bus as moved for nothing. That
+/// distinction is what stops a fleet that is keeping up from getting generation
+/// bumps on each trim once the event rate passes `maxlen / interval`. Pass `None`
+/// when no live view exists (single-node build): the task then behaves as before.
 pub fn spawn_trim_task(
     stream: InvalidationStream,
     maxlen: u64,
@@ -943,7 +894,7 @@ pub fn spawn_trim_task(
                         tracing::debug!(
                             removed = removed,
                             "invalidation stream trimmed; every dropped entry was already \
-                             applied by all live nodes, so no bump (no cache clear)"
+                              applied by all live nodes, so no bump"
                         );
                     }
                 }
@@ -963,7 +914,6 @@ pub fn spawn_trim_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::AuthCache;
     use std::time::Duration;
 
     /// A REAL Redis, on its own database (dev-plan 铁律 2: the invalidation bus
@@ -1010,56 +960,6 @@ mod tests {
         assert_eq!(s.generation().await.expect("gen2"), 1);
     }
 
-    #[test]
-    fn apply_invalidation_to_local_cache() {
-        // A real in-memory AuthCache + a wiremock-free check: seed a verdict,
-        // invalidate via the bus event, assert the next check goes upstream
-        // (cache cleared).
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-            cache
-                .set("t1", "sk-a", true, Duration::from_secs(300))
-                .await;
-            assert_eq!(
-                cache.check("t1", "sk-a").await,
-                hydra_core::auth::Verdict::Hit(true),
-                "seeded verdict is cached"
-            );
-            let n = apply_invalidation(
-                &cache,
-                &Invalidation {
-                    tenant_id: Some("t1".into()),
-                    keyhashes: vec![sha256_hex_str("sk-a")],
-                    legacy_keys: vec![],
-                },
-                &["t1".into()],
-            )
-            .await;
-            assert_eq!(n, 1);
-            assert_eq!(
-                cache.check("t1", "sk-a").await,
-                hydra_core::auth::Verdict::Miss,
-                "invalidation cleared the local entry"
-            );
-            // Idempotent: applying again is a no-op.
-            apply_invalidation(
-                &cache,
-                &Invalidation {
-                    tenant_id: Some("t1".into()),
-                    keyhashes: vec![sha256_hex_str("sk-a")],
-                    legacy_keys: vec![],
-                },
-                &["t1".into()],
-            )
-            .await;
-            assert_eq!(
-                cache.check("t1", "sk-a").await,
-                hydra_core::auth::Verdict::Miss
-            );
-        });
-    }
-
     // ---- F-1: the stream carries SHA-256 digests, never plaintext --------
 
     #[tokio::test]
@@ -1094,11 +994,11 @@ mod tests {
     }
 
     /// REVIEW L-3 — an empty `keyhashes` field must mean "no keys" (a
-    /// whole-tenant clear), not "one empty digest". `"".split(',')` yields
-    /// `[""]`, which used to take the per-key branch and invalidate NOTHING,
+    /// whole-tenant event), not "one empty digest". `"".split(',')` yields
+    /// `[""]`, which used to take the per-key branch and carry an empty digest
     /// silently.
     #[tokio::test]
-    async fn an_empty_keyhashes_field_is_a_whole_tenant_clear() {
+    async fn an_empty_keyhashes_field_is_a_whole_tenant_event() {
         let pool = pool().await;
         let s = InvalidationStream::new(pool.clone());
         // Hand-written XADD with an EMPTY keyhashes field (a foreign publisher,
@@ -1117,25 +1017,24 @@ mod tests {
         let events = s.read_since("0", 10).await.expect("read");
         assert_eq!(events.len(), 1);
         let inv = &events[0].1;
+        assert_eq!(
+            inv.tenant_id.as_deref(),
+            Some("t1"),
+            "a tenant-scoped event with no digests names the whole tenant"
+        );
         assert!(
             inv.keyhashes.is_empty(),
             "an empty field must parse to NO digests, got {:?}",
             inv.keyhashes
         );
-
-        // And it clears the tenant's cached verdicts.
-        let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-        cache
-            .set("t1", "sk-a", true, Duration::from_secs(300))
-            .await;
-        assert_eq!(cache.len(), 1);
-        let cleared = apply_invalidation(&cache, inv, &["t1".to_string()]).await;
-        assert_eq!(cleared, 1, "a whole-tenant clear must drop the entry");
-        assert_eq!(cache.len(), 0);
+        assert!(
+            inv.legacy_keys.is_empty(),
+            "v=2 must not invent legacy keys from an empty field"
+        );
     }
 
     #[tokio::test]
-    async fn comma_key_invalidated_by_hash() {
+    async fn comma_key_is_one_digest_not_two() {
         // A key containing a comma is hashed WHOLE before the comma-join, so
         // the stream carries ONE digest (never an ambiguous split).
         let s = InvalidationStream::new(pool().await);
@@ -1147,21 +1046,6 @@ mod tests {
         let inv = &events[0].1;
         assert_eq!(inv.keyhashes.len(), 1, "a comma key is ONE digest, not two");
         assert_eq!(inv.keyhashes[0], sha256_hex_str("a,b"));
-
-        // A cache seeded with the SAME key is invalidated by that digest.
-        let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-        cache.set("t1", "a,b", true, Duration::from_secs(300)).await;
-        assert_eq!(
-            cache.check("t1", "a,b").await,
-            hydra_core::auth::Verdict::Hit(true),
-            "seeded verdict is cached"
-        );
-        let n = apply_invalidation(&cache, inv, &["t1".into()]).await;
-        assert_eq!(n, 1, "the comma key was invalidated by its hash");
-        assert_eq!(
-            cache.check("t1", "a,b").await,
-            hydra_core::auth::Verdict::Miss
-        );
     }
 
     #[tokio::test]
@@ -1197,73 +1081,22 @@ mod tests {
             "legacy event parses the plaintext `keys` field"
         );
 
-        // Equivalence: applying EITHER event clears the SAME cache entry.
-        let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-        cache
-            .set("t1", "sk-a", true, Duration::from_secs(300))
-            .await;
+        // Equivalence: the legacy plaintext key has the SAME digest the v=2
+        // event carries, so a consumer replaying either event can account for
+        // the same logical invalidation.
         assert_eq!(
-            apply_invalidation(&cache, inv_v2, &["t1".into()]).await,
-            1,
-            "v2 event invalidated the entry"
+            inv_v2.keyhashes,
+            vec![sha256_hex_str("sk-a")],
+            "the v=2 event carries the SHA-256 digest of the plaintext key"
         );
         assert_eq!(
-            cache.check("t1", "sk-a").await,
-            hydra_core::auth::Verdict::Miss
-        );
-        // Re-seed, apply the legacy event → the SAME entry is cleared (replay).
-        cache
-            .set("t1", "sk-a", true, Duration::from_secs(300))
-            .await;
-        assert_eq!(
-            apply_invalidation(&cache, inv_legacy, &["t1".into()]).await,
-            1,
-            "legacy event invalidated the SAME entry (stream replay)"
-        );
-        assert_eq!(
-            cache.check("t1", "sk-a").await,
-            hydra_core::auth::Verdict::Miss
+            inv_v2.keyhashes,
+            vec![sha256_hex_str(&inv_legacy.legacy_keys[0])],
+            "the legacy and v=2 events describe the same key digest"
         );
     }
 
-    #[test]
-    fn invalidate_hashes_equivalent_to_invalidate() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            // Same key, same count, same end state — via either method.
-            let c1 = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-            c1.set("t1", "sk-a", true, Duration::from_secs(300)).await;
-            let c2 = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-            c2.set("t1", "sk-a", true, Duration::from_secs(300)).await;
-            let via_hashes = c1.invalidate_hashes("t1", &[sha256_hex_str("sk-a")]).await;
-            let via_plain = c2.invalidate("t1", &["sk-a".to_string()]).await;
-            assert_eq!(via_hashes, via_plain, "both remove exactly one entry");
-            assert_eq!(via_plain, 1);
-            assert_eq!(c1.len(), 0);
-            assert_eq!(c2.len(), 0);
-            assert_eq!(
-                c1.check("t1", "sk-a").await,
-                hydra_core::auth::Verdict::Miss
-            );
-            assert_eq!(
-                c2.check("t1", "sk-a").await,
-                hydra_core::auth::Verdict::Miss
-            );
-
-            // A foreign / unparseable digest is ignored (no panic, no false
-            // removal).
-            let c3 = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-            c3.set("t1", "sk-a", true, Duration::from_secs(300)).await;
-            assert_eq!(
-                c3.invalidate_hashes("t1", &["zz".into()]).await,
-                0,
-                "malformed digest is ignored"
-            );
-            assert_eq!(c3.len(), 1, "the real entry survives");
-        });
-    }
-
-    // ---- F-6: periodic trim → generation bump → consumer clear -----------
+    // ---- F-6: periodic trim → generation bump → consumer state -----------
 
     #[tokio::test]
     async fn trim_and_maybe_bump() {
@@ -1285,10 +1118,10 @@ mod tests {
     }
 
     /// A trim that drops ONLY entries every live consumer had already applied
-    /// must NOT bump: a bump makes the whole fleet clear its auth cache, and
-    /// doing that on every trim is the cross-tenant availability hole this
-    /// watermark check closes (a fleet that keeps up above `maxlen / interval`
-    /// events/s used to wipe every cache every interval).
+    /// must NOT bump: a bump tells every consumer the stream has moved past
+    /// positions they may not have read, and doing that on every trim creates
+    /// compensation churn for nothing (a fleet that keeps up above `maxlen /
+    /// interval` events/s used to bump on every interval).
     #[tokio::test]
     async fn a_trim_of_applied_entries_does_not_bump() {
         let s = InvalidationStream::new(pool().await);
@@ -1322,7 +1155,7 @@ mod tests {
         assert!(
             !bumped,
             "every dropped entry was already applied by every live node ⇒ nothing to \
-             compensate for, so no fleet-wide cache clear"
+              compensate for, so no generation bump"
         );
         assert_eq!(
             s.generation().await.expect("gen"),
@@ -1358,7 +1191,7 @@ mod tests {
         assert!(
             bumped,
             "ids[1] and ids[2] were dropped while n2 had not applied them ⇒ the bump \
-             (and the fleet-wide clear) is required"
+              (and consumer-state compensation) is required"
         );
         assert_eq!(s.generation().await.expect("gen"), 1);
     }
@@ -1433,8 +1266,8 @@ mod tests {
             "the bump is applied on top of the unparseable value (treated as 0)"
         );
 
-        // A trim that removes nothing must NOT bump: a spurious bump clears
-        // every node's auth cache for nothing.
+        // A trim that removes nothing must NOT bump: a spurious bump forces
+        // consumers to compensate for an event loss that did not happen.
         let (removed, bumped) = s.trim_and_maybe_bump(2, None).await.expect("second pass");
         assert_eq!(removed, 0);
         assert!(!bumped, "nothing dropped ⇒ no bump");
@@ -1447,48 +1280,34 @@ mod tests {
     /// It read 100 entries and then slept 500 ms unconditionally: a hard
     /// ceiling of ~200 events/s. Above that the stream grows to `maxlen`, every
     /// trim drops unread entries, every drop bumps the generation, and every
-    /// node clears its whole auth cache on the trim schedule. Measured before
-    /// the fix: 250 events took 1.006 s (three batches); with the drain loop it
-    /// is a few milliseconds.
+    /// consumer has to compensate on the trim schedule. Measured before the fix:
+    /// 250 events took 1.006 s (three batches); with the drain loop the node
+    /// acknowledges the last id in a few milliseconds.
     #[tokio::test]
     async fn consumer_drains_a_backlog_without_idling() {
         let pool = pool().await;
         let stream = InvalidationStream::new(pool.clone());
-        let auth = std::sync::Arc::new(
-            crate::http::HttpAuthChecker::new(
-                AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-                crate::http::AuthConfig::default(),
-            )
-            .expect("checker"),
-        );
-        let store = crate::store::ConfigStore::from_data(
-            crate::db::test_pool().await,
-            hydra_core::config::ConfigData::default(),
-            std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
-        )
-        .await
-        .expect("from_data");
+        let node_id = "test-node".to_string();
+        let node_ids = vec![node_id.clone()];
 
-        // 250 keys cached, then 250 single-key invalidations to apply.
         const N: usize = 250;
+        let mut last_id = String::new();
         for i in 0..N {
-            auth.cache()
-                .set("t1", &format!("sk-{i}"), true, Duration::from_secs(300))
-                .await;
-        }
-        assert_eq!(auth.cache().len(), N, "seeded");
-        for i in 0..N {
-            stream
+            last_id = stream
                 .publish(Some("t1".to_string()), vec![format!("sk-{i}")])
                 .await
                 .expect("publish");
         }
 
-        spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
+        spawn_invalidation_consumer(stream.clone(), node_id.clone());
         let started = std::time::Instant::now();
         let mut drained = false;
         for _ in 0..400 {
-            if auth.cache().is_empty() {
+            let marks = stream
+                .applied_watermarks(&node_ids)
+                .await
+                .expect("read watermarks");
+            if marks.get(&node_id).map(String::as_str) == Some(last_id.as_str()) {
                 drained = true;
                 break;
             }
@@ -1497,7 +1316,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(
             drained,
-            "the consumer did not apply all {N} events within 2s"
+            "the consumer did not acknowledge all {N} events within 2s"
         );
         assert!(
             elapsed < Duration::from_millis(400),
@@ -1507,65 +1326,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trim_bump_clears_consumer_cache() {
-        // End-to-end: publish past maxlen → the trim task removes entries →
-        // bumps the generation → the consumer observes the bump and clears its
-        // local cache.
+    async fn consumer_continues_after_generation_bump() {
+        // End-to-end: a generation bump is observed by a live consumer, and the
+        // consumer continues draining the stream instead of stopping after the
+        // bump. The consumer must not account for trimmed entries, but it must
+        // still acknowledge events that are published after the bump.
         let pool = pool().await;
         let stream = InvalidationStream::new(pool.clone());
+        let node_id = "test-node".to_string();
+        let node_ids = vec![node_id.clone()];
 
-        let auth = std::sync::Arc::new(
-            crate::http::HttpAuthChecker::new(
-                AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-                crate::http::AuthConfig::default(),
-            )
-            .expect("checker"),
-        );
-        auth.cache()
-            .set("t1", "sk-a", true, Duration::from_secs(300))
-            .await;
-        assert_eq!(auth.cache().len(), 1, "seeded verdict before trim");
+        let initial_id = stream
+            .publish(Some("t1".to_string()), vec!["sk-before".to_string()])
+            .await
+            .expect("publish");
+        spawn_invalidation_consumer(stream.clone(), node_id.clone());
 
-        // An empty store (its database holds no config and no fidelity rows) is
-        // fine: the published events target ANOTHER tenant, so they cannot clear
-        // the seeded `t1` verdict — only the generation bump
-        // can. (A `(None, [])` event is itself a whole-cache clear and would
-        // clear it directly; that path is covered by
-        // `apply_invalidation_to_local_cache`.)
-        let store = crate::store::ConfigStore::from_data(
-            crate::db::test_pool().await,
-            hydra_core::config::ConfigData::default(),
-            std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1)),
-        )
-        .await
-        .expect("from_data");
-
-        spawn_invalidation_consumer(stream.clone(), auth.clone(), store, "test-node".to_string());
-        spawn_trim_task(stream.clone(), 2, Duration::from_millis(20), None);
-
-        // Publish past maxlen (2) → the trim task removes 3 → bumps.
-        for i in 0..5 {
-            stream
-                .publish(Some("t9".to_string()), vec![format!("sk-{i}")])
+        // Wait until the consumer has observed and acknowledged the first event
+        // so the bump happens after the consumer is already live.
+        for _ in 0..150 {
+            let marks = stream
+                .applied_watermarks(&node_ids)
                 .await
-                .expect("publish");
-        }
-
-        // Wait for the consumer to observe the bump and clear the cache.
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if auth.cache().is_empty() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                .expect("read watermarks");
+            if marks.get(&node_id).map(String::as_str) == Some(initial_id.as_str()) {
+                break;
             }
-        })
-        .await
-        .expect("consumer did not clear the cache within 3s (bump not observed)");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let marks = stream
+            .applied_watermarks(&node_ids)
+            .await
+            .expect("read watermarks");
         assert_eq!(
-            auth.cache().len(),
-            0,
-            "consumer cleared the local cache on bump"
+            marks.get(&node_id).map(String::as_str),
+            Some(initial_id.as_str()),
+            "consumer did not acknowledge the initial event before the generation bump"
+        );
+
+        // Force the generation bump, then publish another event that the consumer
+        // must still be able to read and acknowledge.
+        stream.bump_generation().await.expect("bump");
+        let after_id = stream
+            .publish(Some("t1".to_string()), vec!["sk-after".to_string()])
+            .await
+            .expect("publish");
+
+        for _ in 0..150 {
+            let marks = stream
+                .applied_watermarks(&node_ids)
+                .await
+                .expect("read watermarks");
+            if marks.get(&node_id).map(String::as_str) == Some(after_id.as_str()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let marks = stream
+            .applied_watermarks(&node_ids)
+            .await
+            .expect("read watermarks");
+        assert_eq!(
+            marks.get(&node_id).map(String::as_str),
+            Some(after_id.as_str()),
+            "consumer stopped after generation bump (no watermark advance after the bump)"
         );
         assert_eq!(
             stream.generation().await.expect("gen"),

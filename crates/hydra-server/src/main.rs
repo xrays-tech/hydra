@@ -823,8 +823,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         let stream = hydra_server::cluster::events::InvalidationStream::new(b.pool().clone());
         hydra_server::cluster::events::spawn_invalidation_consumer(
             stream.clone(),
-            auth.clone(),
-            store.clone(),
             cluster.node_id.clone(),
         );
         // F-6: the trim task is spawned LATER, once the live-node view exists
