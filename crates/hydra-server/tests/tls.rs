@@ -182,7 +182,6 @@ async fn seed_tenant_with_cert(
             id: id.into(),
             name: format!("{id}-tenant"),
             domain: domain.into(),
-            auth_url: format!("https://auth.{domain}/verify"),
             cert_key: Some(cert_key.into()),
             cert_file: Some(cert_file.into()),
             enabled: true,

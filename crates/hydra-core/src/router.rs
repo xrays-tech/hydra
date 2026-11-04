@@ -529,7 +529,6 @@ mod tests {
             id: "t_acme".into(),
             name: "Acme".into(),
             domain: "acme.com".into(),
-            auth_url: "https://auth.acme.com".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,

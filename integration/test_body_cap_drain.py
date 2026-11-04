@@ -147,6 +147,7 @@ def stop(proc):
 
 
 def seed():
+    global TENANT_TOKEN
     rows = [
         ("providers", {"id": "p1", "key": "p1", "name": "P",
                        "endpoint": f"http://127.0.0.1:{UPSTREAM}", "weight": 1,
@@ -155,8 +156,6 @@ def seed():
                              "status": 1, "created_at": "", "updated_at": ""}),
         ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up", "created_at": ""}),
         ("tenants", {"id": "t1", "name": "T", "domain": DOMAIN,
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
-                     "access_token": TENANT_TOKEN, "cert_key": None, "cert_file": None,
                      "created_at": "", "updated_at": ""}),
         ("tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",
                               "created_at": "", "updated_at": ""}),
@@ -167,6 +166,10 @@ def seed():
         st, out = admin("POST", f"/{path}", body)
         if st not in (200, 201):
             raise SystemExit(f"[capdrain] CANNOT VERIFY: seeding {path} -> {st} {out[:140]}")
+    st, out = admin("POST", "/tenants/t1/access-tokens", {"name": "cap"})
+    if st not in (200, 201):
+        raise SystemExit(f"[capdrain] CANNOT VERIFY: minting tenant token -> {st} {str(out)[:140]}")
+    TENANT_TOKEN = json.loads(out)["token"]
     admin("POST", "/reload", {})
     time.sleep(0.3)
 
@@ -302,7 +305,7 @@ def main():
 
         # ---- T3: the data plane's contrast (it DRAINS before answering) -------------
         body3 = b'{"model":"echo","messages":[{"role":"user","content":"' + b"y" * (DATA_CAP * 2) + b'"}]}'
-        seen3 = dribble(DATA, "/v1/chat/completions", DOMAIN, "sk-tenant-1", len(body3),
+        seen3 = dribble(DATA, "/v1/chat/completions", DOMAIN, TENANT_TOKEN, len(body3),
                         chunk=8 * 1024, pause=0.02)
         announce("T3 the DATA plane with a drippled oversized body",
                  f"wrote {seen3['written']}/{seen3['total']} bytes, write_error="
@@ -318,7 +321,7 @@ def main():
         # ---- T4: a fresh connection works on both planes ---------------------------
         st4a, out4a = call("GET", f"http://127.0.0.1:{DATA}{tenant_path.rsplit('/', 1)[0]}",
                            token=TENANT_TOKEN, host=DOMAIN)
-        st4b, out4b = call("POST", f"http://127.0.0.1:{DATA}/v1/chat/completions", token="sk-tenant-1",
+        st4b, out4b = call("POST", f"http://127.0.0.1:{DATA}/v1/chat/completions", token=TENANT_TOKEN,
                            host=DOMAIN,
                            body={"model": "echo", "messages": [{"role": "user", "content": "hi"}]})
         announce("T4 fresh requests afterwards", f"tenant API HTTP {st4a}; data plane HTTP {st4b}")

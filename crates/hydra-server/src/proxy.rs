@@ -512,7 +512,7 @@ impl ProxyHttp for HydraProxy {
         // (0) Tenant self-service API. Intercepted BEFORE Host→tenant (an IP or
         //     own-hostname call must not 404), before the client api-key
         //     extraction (`Authorization: Bearer` is ALSO a client api-key
-        //     transport — a tenant token must never be forwarded to `auth_url`
+        //     transport — a tenant token must never be forwarded to the retired external-auth surface
         //     or masked into a usage record), and before the `/v1/models`
         //     catalog intercept.
         //
@@ -1989,7 +1989,6 @@ mod tests {
             id: domain.to_string(),
             name: domain.to_string(),
             domain: domain.to_string(),
-            auth_url: "https://auth.example/v".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,

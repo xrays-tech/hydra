@@ -47,7 +47,6 @@ fn tenant(id: &str, domain: &str, enabled: bool) -> Tenant {
         id: id.into(),
         name: format!("{id}-tenant"),
         domain: domain.into(),
-        auth_url: format!("https://auth.{domain}/verify"),
         cert_key: None,
         cert_file: None,
         enabled,
@@ -215,7 +214,7 @@ async fn provider_key_crud() {
     );
 }
 
-/// T4.4 — tenant CRUD incl. `auth_url NOT NULL`, `domain UNIQUE`, `enabled` CHECK.
+/// T4.4 — tenant CRUD incl. `domain UNIQUE`, `enabled` CHECK.
 #[tokio::test]
 async fn tenant_crud() {
     let pool = common::setup_pool().await;
@@ -225,7 +224,7 @@ async fn tenant_crud() {
 
     let got = repo::get_tenant(&pool, "t1").await.expect("get");
     assert_eq!(got, t);
-    assert_eq!(got.auth_url, "https://auth.acme.com/verify");
+    assert_eq!(got.name, "t1-tenant");
 
     // domain UNIQUE conflict.
     let err = repo::insert_tenant(&pool, &tenant("t2", "acme.com", true))
@@ -238,8 +237,8 @@ async fn tenant_crud() {
 
     // enabled CHECK: SQL bypass via raw insert with enabled=2.
     let err = sqlx::query(
-        "INSERT INTO tenant (id, name, domain, auth_url, enabled) \
-         VALUES ('tbad','bad','bad.com', 'u', 2)",
+        "INSERT INTO tenant (id, name, domain, enabled) \
+         VALUES ('tbad','bad','bad.com', 2)",
     )
     .execute(&pool)
     .await
@@ -591,7 +590,7 @@ async fn repo_insert_then_query_roundtrip() {
     let tenants = repo::list_tenants(&pool).await.expect("tenants");
     assert_eq!(tenants.len(), 1);
     assert_eq!(tenants[0].domain, "acme.com");
-    assert_eq!(tenants[0].auth_url, "https://auth.acme.com/verify");
+    assert_eq!(tenants[0].name, "t1-tenant");
 }
 
 /// T4.9 — provider keys are encrypted at rest (AES-256-GCM).

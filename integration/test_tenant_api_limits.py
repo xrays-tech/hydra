@@ -13,7 +13,8 @@ FAILURE lockout (the B1 contract: only the authentication-failure path consults 
 
 The caps are shortened here so the assertions are quick (the drill prints the values it
 used); the default values are what the docs quote. Reaching the authorised paths needs a
-tenant access token, which the admin API sets as `access_token` (stored hashed, ≥16 chars).
+tenant access token, which the admin API mints at
+`POST /api/v1/tenants/{tenant_id}/access-tokens` (plaintext shown once).
 
 Run: python3 integration/test_tenant_api_limits.py     # needs target/debug/hydra
 Exit 0 pass · 1 an assertion failed · 2 could not verify.
@@ -92,15 +93,20 @@ MOCK = MockClickHouse()
 
 
 def bring_up(label, admin, data, rate):
+    global TENANT_TOKEN
     proc = start(label, admin, data, rate)
     if not wait_healthy(admin):
         raise SystemExit(f"[tenant-limits] CANNOT VERIFY: node {label} never became healthy")
     st, _, out = call("POST", f"http://127.0.0.1:{admin}/api/v1/tenants", token=ADMIN_TOKEN, body={
-        "id": "t1", "name": "T", "domain": "load.local", "auth_url": "http://127.0.0.1:18997",
-        "enabled": True, "access_token": TENANT_TOKEN, "cert_key": None, "cert_file": None,
+        "id": "t1", "name": "T", "domain": "load.local",         "enabled": True, "cert_key": None, "cert_file": None,
         "created_at": "", "updated_at": ""})
     if st not in (200, 201):
         raise SystemExit(f"[tenant-limits] CANNOT VERIFY: seeding the tenant -> {st} {out[:120]}")
+    st, _, out = call("POST", f"http://127.0.0.1:{admin}/api/v1/tenants/t1/access-tokens",
+                      token=ADMIN_TOKEN, body={"name": "test"})
+    if st not in (200, 201):
+        raise SystemExit(f"[tenant-limits] CANNOT VERIFY: minting the tenant token -> {st} {out[:120]}")
+    TENANT_TOKEN = json.loads(out)["token"]
     time.sleep(0.3)
     return proc
 

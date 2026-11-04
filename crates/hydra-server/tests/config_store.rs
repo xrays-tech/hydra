@@ -40,7 +40,6 @@ fn tenant(id: &str, domain: &str) -> Tenant {
         id: id.into(),
         name: format!("{id}-tenant"),
         domain: domain.into(),
-        auth_url: format!("https://auth.{domain}/verify"),
         cert_key: None,
         cert_file: None,
         enabled: true,

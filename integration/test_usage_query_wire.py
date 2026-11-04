@@ -204,7 +204,7 @@ def make_ch_mock(received):
 
 
 class Upstream(BaseHTTPRequestHandler):
-    """The tenant `auth_url` the data plane never needs here — but `reload` validates it."""
+    """The tenant `the retired auth column` the data plane never needs here — but `reload` validates it."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -309,6 +309,7 @@ def stop(proc):
 
 
 def seed(admin_port=ADMIN):
+    global TENANT_TOKEN
     """One provider/model/tenant. The usage reader needs none of it to work, but the tenant
     API requires an authenticated tenant, and its config must load."""
     st, out = admin("POST", "/providers", {"id": "p1", "key": "p1", "name": "P",
@@ -322,9 +323,7 @@ def seed(admin_port=ADMIN):
     admin("POST", "/provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up",
                                      "created_at": ""}, port=admin_port)
     st, out = admin("POST", "/tenants", {"id": "t1", "name": "T1", "domain": DOMAIN,
-                                         "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth",
-                                         "enabled": True, "access_token": TENANT_TOKEN,
-                                         "cert_key": None, "cert_file": None,
+                                         "enabled": True,                                          "cert_key": None, "cert_file": None,
                                          "created_at": "", "updated_at": ""}, port=admin_port)
     if st not in (200, 201):
         raise SystemExit(f"[usage-wire] CANNOT VERIFY: seeding tenant -> {st} {out[:160]}")
@@ -332,6 +331,10 @@ def seed(admin_port=ADMIN):
                                         "created_at": "", "updated_at": ""}, port=admin_port)
     admin("POST", "/tenant-models", {"id": "tm1", "tenant_id": "t1", "model_key": "echo",
                                      "created_at": "", "updated_at": ""}, port=admin_port)
+    st, out = admin("POST", "/tenants/t1/access-tokens", {"name": "usage"}, port=admin_port)
+    if st not in (200, 201):
+        raise SystemExit(f"[usage-wire] CANNOT VERIFY: minting tenant token -> {st} {out[:160]}")
+    TENANT_TOKEN = json.loads(out)["token"]
     admin("POST", "/reload", {}, port=admin_port)
     time.sleep(0.3)
 

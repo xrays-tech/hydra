@@ -7,7 +7,7 @@
 //!
 //! ## Why these live apart from [`crate::auth`]
 //!
-//! `auth.rs` is the EXTERNAL-auth vocabulary (`auth_url` verdicts, the cache
+//! `auth.rs` is the EXTERNAL-auth vocabulary (the retired auth-verdict cache
 //! decision core) that plan §3.7 deletes wholesale in T10. These types are its
 //! REPLACEMENT, and welding them into the module that is scheduled for deletion
 //! would force the deletion batch to cherry-pick them back out. One new module,

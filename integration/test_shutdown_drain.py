@@ -163,7 +163,6 @@ def seed(admin_port=ADMIN, models=("slow2", "slow3")):
             ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up",
                                "created_at": ""}),
             ("tenants", {"id": "t1", "name": "T", "domain": DOMAIN,
-                         "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                          "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
             ("tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",
                                   "created_at": "", "updated_at": ""})]

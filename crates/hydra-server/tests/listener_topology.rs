@@ -113,7 +113,6 @@ impl TempDb {
                     id: "t1".into(),
                     name: "t1-tenant".into(),
                     domain: TENANT_DOMAIN.into(),
-                    auth_url: format!("https://auth.{TENANT_DOMAIN}/verify"),
                     cert_key: Some(fixture("acme.key")),
                     cert_file: Some(fixture("acme.crt")),
                     enabled: true,

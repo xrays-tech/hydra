@@ -30,6 +30,7 @@ mod common;
 use std::sync::Arc;
 
 use hydra_core::model::Tenant;
+use hydra_core::model::TenantAccessToken;
 use hydra_server::cluster::arachne_entities::build_config_with_fidelity;
 use hydra_server::cluster::arachne_materializer::encode_config;
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
@@ -48,7 +49,6 @@ fn tenant(id: &str, domain: &str) -> Tenant {
         id: id.into(),
         name: id.into(),
         domain: domain.into(),
-        auth_url: format!("https://auth.{domain}/v1"),
         cert_key: None,
         cert_file: None,
         enabled: true,
@@ -73,9 +73,23 @@ async fn seed_leader(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider) {
     )
     .await
     .expect("store cert content");
-    repo::set_tenant_access_token_hash(pool, "t1", Some(&"a".repeat(64)))
-        .await
-        .expect("token hash");
+    repo::insert_tenant_access_token(
+        pool,
+        &TenantAccessToken {
+            id: "tok-1".into(),
+            tenant_id: "t1".into(),
+            name: "test".into(),
+            token_hash: "a".repeat(64),
+            token_prefix: "ht_test".into(),
+            token_last4: "test".into(),
+            enabled: true,
+            expires_at: None,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        },
+    )
+    .await
+    .expect("insert token");
 }
 
 #[tokio::test]

@@ -320,7 +320,7 @@ class RedisRelay:
 # ---------------------------------------------------------------------------
 
 class Upstream(BaseHTTPRequestHandler):
-    """The tenant `auth_url` AND the provider endpoint: any key is allowed, the chat answer
+    """The tenant `the retired auth column` AND the provider endpoint: any key is allowed, the chat answer
     reports 5 prompt + 8 completion tokens (so one response is 13 tokens)."""
 
     def do_GET(self):
@@ -489,13 +489,10 @@ def seed():
                              "status": 1, "created_at": "", "updated_at": ""}),
         ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up", "created_at": ""}),
         ("tenants", {"id": "t1", "name": "T1", "domain": "count.local",
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
         ("tenants", {"id": "t2", "name": "T2", "domain": "token.local",
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
         ("tenants", {"id": "t3", "name": "T3", "domain": "probe.local",
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
     ]
     for tid in ("t1", "t2", "t3"):

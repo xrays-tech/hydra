@@ -190,7 +190,6 @@ def kill_our_instances():
 
 def seed(admin, with_cert):
     tenant = {"id": "t1", "name": "T", "domain": DOMAIN,
-              "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
               "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}
     if with_cert:
         tenant["cert_pem"] = CERT["pem"]

@@ -18,7 +18,7 @@
 //!    plane down while every probe stayed green.
 //! 4. **The target is told what it needs to rebuild.** `FidelityRows` travel with the config,
 //!    because a replica that receives only `ConfigData` cannot rebuild its SQLite tables
-//!    byte-faithfully (disabled rows, provider-key identity, offline models, token hashes).
+//!    byte-faithfully (disabled rows, provider-key identity, offline models, tenant access tokens).
 //!
 //! ## What this layer deliberately does NOT do yet
 //!
@@ -413,7 +413,10 @@ mod tests {
     use arachne_kv::server::{assemble_cluster, ClusterConfig};
     use arachne_kv::{NodeId, Profile};
     use hydra_core::config::{CertMeta, ModelProvider};
-    use hydra_core::model::{Provider, ProviderKey, ProviderModel, Tenant, TenantProvider};
+    use hydra_core::identity::TenantTokenIdentity;
+    use hydra_core::model::{
+        Provider, ProviderKey, ProviderModel, Tenant, TenantAccessToken, TenantProvider,
+    };
 
     /// A migrated in-memory pool — the replica side of the real-target test.
     async fn pool() -> sqlx::SqlitePool {
@@ -559,7 +562,6 @@ mod tests {
             id: id.to_string(),
             name: format!("name-{id}"),
             domain: domain.to_string(),
-            auth_url: format!("https://auth.{domain}"),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -817,6 +819,15 @@ mod tests {
                 cert_key_pem: Some(RICH_KEY_PEM.into()),
             },
         );
+        // The leader loader derives this from the SAME token rows the tree carries.
+        cfg.tenant_tokens.insert(
+            "a".repeat(64),
+            TenantTokenIdentity {
+                tenant_id: "t1".into(),
+                token_name: "test".into(),
+                expires_at: None,
+            },
+        );
         cfg.reindex_tenants();
         cfg
     }
@@ -827,7 +838,7 @@ mod tests {
         "-----BEGIN PRIVATE KEY-----\nMIIEvQacme\n-----END PRIVATE KEY-----\n";
 
     /// The rows `ConfigData` is derived from and cannot express: a DISABLED role, a provider-key
-    /// row with its identity, an OFFLINE model, a grant, and the token hash.
+    /// row with its identity, an OFFLINE model, and a grant.
     fn rich_fidelity() -> FidelityRows {
         FidelityRows {
             limit_roles: fidelity().limit_roles,
@@ -837,7 +848,6 @@ mod tests {
                 api_key: "sk-one".into(),
                 created_at: "2026-01-04 00:00:00".into(),
             }],
-            tenant_token_hashes: vec![("t1".into(), "a".repeat(64))],
             provider_models: vec![
                 ProviderModel {
                     id: "pm-online".into(),
@@ -858,6 +868,18 @@ mod tests {
                 id: "tp-1".into(),
                 tenant_id: "t1".into(),
                 provider_id: "p1".into(),
+            }],
+            tenant_access_tokens: vec![TenantAccessToken {
+                id: "tok-1".into(),
+                tenant_id: "t1".into(),
+                name: "test".into(),
+                token_hash: "a".repeat(64),
+                token_prefix: "ht_test".into(),
+                token_last4: "test".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-01-01 00:00:00".into(),
+                updated_at: "2026-01-01 00:00:00".into(),
             }],
             ..FidelityRows::default()
         }
@@ -948,14 +970,17 @@ mod tests {
             2,
             "the OFFLINE model is dropped by `models_by_key` and must still reach the replica"
         );
-        let hashes = crate::db::list_tenant_access_token_hashes(&replica_pool)
+        let tokens = crate::db::list_tenant_access_tokens(&replica_pool)
             .await
-            .expect("list token hashes");
+            .expect("list tenant access tokens");
         assert_eq!(
-            hashes,
-            vec![("t1".to_string(), "a".repeat(64))],
-            "the tenant token hash rides the fidelity entity and is written verbatim"
+            tokens.len(),
+            1,
+            "the tenant access token rides the entity and is written verbatim"
         );
+        assert_eq!(tokens[0].id, "tok-1");
+        assert_eq!(tokens[0].tenant_id, "t1");
+        assert_eq!(tokens[0].name, "test");
 
         // 3) ...and so is the cert private key (the defect that made the entity gain a sealed key).
         let cert = crate::db::get_tenant_cert(&replica_pool, key_provider.as_ref(), "t1")

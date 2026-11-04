@@ -100,7 +100,6 @@ fn clean_config_with(p: Provider) -> ConfigData {
             id: "t1".into(),
             name: "t1".into(),
             domain: "acme.com".into(),
-            auth_url: "https://auth.acme.com/verify".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,

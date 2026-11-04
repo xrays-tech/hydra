@@ -52,8 +52,8 @@ async fn seed_provider_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &s
 
 async fn seed_tenant_cert(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str, pem: &str) {
     sqlx::query(
-        "INSERT INTO tenant (id, name, domain, auth_url, enabled, created_at, updated_at) \
-         VALUES (?, 't', 'localhost', 'http://a/auth', 1, '', '')",
+        "INSERT INTO tenant (id, name, domain, enabled, created_at, updated_at) \
+         VALUES (?, 't', 'localhost', 1, '', '')",
     )
     .bind(id)
     .execute(pool)

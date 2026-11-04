@@ -47,9 +47,8 @@ const TENANT_TOKEN: &str = "sk-tenant-token-0123456789abcdef";
 const OTHER_TOKEN: &str = "sk-other-tenant-token-0123456789";
 
 /// The token lives in the `tenant_access_token` TABLE — the snapshot the gate
-/// reads is built from it (`ConfigData.tenant_tokens`, enabled rows only). A
-/// hash in the legacy `tenant.access_token_hash` column is no longer what
-/// authenticates.
+/// reads is built from it (`ConfigData.tenant_tokens`, enabled rows only). The
+/// retired single-column token field is gone (T10 Stage D).
 async fn seed_tenant(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -62,7 +61,6 @@ async fn seed_tenant(
             id: id.into(),
             name: format!("{id}-name"),
             domain: domain.into(),
-            auth_url: format!("https://auth.{domain}/verify"),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -342,7 +340,7 @@ async fn a_token_for_another_tenant_is_403_not_404() {
 
 /// THE reason the interception must precede the api-key extraction: a tenant
 /// token presented here must never be read as a client key. Nothing may reach
-/// the tenant's `auth_url`, and nothing may be written to the metering sink.
+/// the old auth path, and nothing may be written to the metering sink.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_tenant_token_is_never_treated_as_a_client_key() {
     let pool = common::setup_pool().await;
@@ -382,7 +380,7 @@ async fn the_gate_reads_the_snapshot_not_the_database() {
 
     // Rotate in the DB only: retire the old row, insert the new one. No reload_all.
     // (The multi-token model rotates by REPLACING rows in `tenant_access_token`;
-    // the legacy `tenant.access_token_hash` column is not what the gate reads.)
+    // the retired single-column token field is gone (T10 Stage D).)
     let rotated = "sk-rotated-token-9999999999";
     hydra_server::db::delete_tenant_access_token(&pool, &old_token_id)
         .await
@@ -485,8 +483,8 @@ async fn before_the_first_snapshot_the_gate_fails_closed_with_503() {
 
 /// Reason C of the design, in its general form: gating on the three literal
 /// paths would let `/tenant/…/typo` fall through to the api-key extraction and
-/// external auth, i.e. POST the tenant's own token to its `auth_url`. Anything
-/// under the reserved prefix is answered HERE.
+/// the old external-auth path. Anything under the reserved prefix is answered
+/// HERE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_path_under_the_reserved_prefix_is_answered_locally() {
     let pool = common::setup_pool().await;
@@ -665,7 +663,6 @@ async fn whoami_returns_the_snapshot_view() {
     assert_eq!(v["tenant_id"], "t1");
     assert_eq!(v["name"], "t1-name");
     assert_eq!(v["domain"], "acme.example");
-    assert_eq!(v["auth_url"], "https://auth.acme.example/verify");
     assert_eq!(v["enabled"], true);
     assert_eq!(
         v["config_version"].as_u64(),
@@ -701,10 +698,8 @@ async fn whoami_never_leaks_a_secret() {
             "the response must not mention {forbidden:?}: {body}"
         );
     }
-    // ...while the two fields it DOES expose are the tenant's own and are not
-    // credentials: the domain it is bound to and the auth endpoint Hydra calls.
+    // ...while the non-secret field it DOES expose is the domain it is bound to.
     assert!(v["domain"].is_string());
-    assert!(v["auth_url"].is_string());
 }
 
 /// T7 (E1 form): a suspended tenant must still be able to read its own state.
@@ -778,7 +773,6 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
         id: "t1".into(),
         name: "edge-tenant".into(),
         domain: "edge.example".into(),
-        auth_url: "https://auth.edge.example/verify".into(),
         cert_key: None,
         cert_file: None,
         enabled: true,
@@ -805,10 +799,6 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
         fidelity: FidelityRows {
             limit_roles: vec![],
             provider_keys: vec![],
-            tenant_token_hashes: vec![(
-                "t1".to_string(),
-                sha256_hex_string(TENANT_TOKEN.as_bytes()),
-            )],
             provider_models: vec![],
             tenant_providers: vec![],
             tenant_models: vec![],
@@ -1236,8 +1226,8 @@ async fn a_wrong_tenant_in_the_url_does_not_spend_the_success_budget() {
 
 /// A SUSPENDED tenant (欠费停机) must still be able to run its own recovery: read
 /// its state and check what it has used. The gate never consults `enabled` —
-/// suspension is the tenant's own policy, expressed through its `auth_url`, and a
-/// tenant that cannot reach the recovery path cannot recover.
+/// suspension is the tenant's own policy, and a tenant that cannot reach the
+/// recovery path cannot recover.
 ///
 /// E1 alone was covered; this pins both surviving self-service endpoints (E2,
 /// the auth-cache invalidate route, was retired with the external-auth surface

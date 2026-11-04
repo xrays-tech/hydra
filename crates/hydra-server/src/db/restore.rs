@@ -166,34 +166,20 @@ pub async fn restore_config(
         .await?;
     }
 
-    // Tenants (+ cert content columns + the access-token HASH).
-    //
-    // The hash is part of the row, not a follow-up step: `ConfigData` has no
-    // field for it, so it rides the wire as a sealed fidelity row and is written
-    // HERE (a separate UPDATE could silently affect zero rows if the tenant set
-    // ever diverged, and a promoted replica would then answer 401 to every
-    // request until an operator re-entered the token — §7-7). It arrives as a
-    // hash and is reproduced VERBATIM: nothing is re-hashed at this boundary.
-    let token_hashes: std::collections::HashMap<&str, &str> = fidelity
-        .tenant_token_hashes
-        .iter()
-        .map(|(tenant_id, hash)| (tenant_id.as_str(), hash.as_str()))
-        .collect();
+    // Tenants (+ cert content columns).
     for t in cfg.tenants_by_domain.values() {
         sqlx::query(
-            "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
-             created_at, updated_at, access_token_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tenant (id, name, domain, cert_key, cert_file, enabled, \
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&t.id)
         .bind(&t.name)
         .bind(&t.domain)
-        .bind(&t.auth_url)
         .bind(&t.cert_key)
         .bind(&t.cert_file)
         .bind(t.enabled)
         .bind(&t.created_at)
         .bind(&t.updated_at)
-        .bind(token_hashes.get(t.id.as_str()).copied())
         .execute(&mut *tx)
         .await?;
         // Cert content (migration 0007): sealed key, plaintext cert PEM.

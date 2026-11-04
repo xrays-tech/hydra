@@ -15,7 +15,6 @@ fn sample_tenant() -> Tenant {
         id: "t_acme".into(),
         name: "Acme".into(),
         domain: "acme.com".into(),
-        auth_url: "https://auth.acme.com/verify".into(),
         cert_key: None,
         cert_file: None,
         enabled: true,
@@ -54,8 +53,8 @@ fn configdata_construct_and_index() {
     assert_eq!(
         cfg.tenants_by_domain
             .get("acme.com")
-            .map(|t| t.auth_url.as_str()),
-        Some("https://auth.acme.com/verify")
+            .map(|t| t.domain.as_str()),
+        Some("acme.com")
     );
     // Case-sensitivity contract: lookup is by lowercased domain.
     assert!(!cfg.tenants_by_domain.contains_key("ACME.COM"));

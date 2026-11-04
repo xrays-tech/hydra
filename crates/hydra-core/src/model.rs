@@ -97,16 +97,13 @@ pub struct ProviderKeyDto {
 // Tenant family
 // ---------------------------------------------------------------------------
 
-/// A tenant, bound to a domain. `auth_url` is mandatory (NOT NULL): a tenant
-/// without it is always rejected (design §11.1).
+/// A tenant, bound to a domain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tenant {
     pub id: String,
     pub name: String,
     /// Domain (lowercased) that maps to this tenant. `localhost` is allowed.
     pub domain: String,
-    /// External auth endpoint — required. Empty/missing ⇒ all requests 401.
-    pub auth_url: String,
     pub cert_key: Option<String>,
     pub cert_file: Option<String>,
     pub enabled: bool,
@@ -134,9 +131,8 @@ pub struct TenantModel {
 // User hierarchy（四级：tenant -> user_group -> user -> api_key，plan §3.1）
 //
 // ADDITIVE ONLY (T1, decision D-17): these mirror the NEW tables created by
-// migration `0014_user_hierarchy.sql`. The remaining old structures (`auth_url`,
-// the single `access_token_hash`) stay until the terminal deletion batch T10
-// lands `0015` together with the code removal.
+// migration `0014_user_hierarchy.sql`. The terminal deletion batch T10 lands
+// `0015` together with the code removal.
 // ---------------------------------------------------------------------------
 
 /// A user's billing state (plan §3.2 / acceptance B4). The wire form is

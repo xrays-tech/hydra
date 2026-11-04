@@ -18,7 +18,7 @@ edge cases and non-CRUD endpoints covered by the Rust suite:
       `first2…last2` for >= 6 — `?reveal=1` is accepted and is a NO-OP since
       P1-5: the admin API never returns plaintext. The old wording here said
       "first4…last4; ?reveal=1 → plaintext", which the body below contradicts.)
-    - tenant auth_url mandatory (POST without → 400)
+    - tenant domain UNIQUE
     - UNIQUE conflict → 409 (provider key, provider-model (key,provider_id),
       tenant domain, tenant-provider (tenant_id,provider_id),
       tenant-model (tenant_id,model_key))
@@ -320,21 +320,10 @@ def test_provider_keys(parent_provider_body: dict) -> None:
 
 
 def test_tenants() -> None:
-    print("\n[tenants] CRUD + auth_url mandatory + domain UNIQUE")
-    # auth_url empty -> 400 (missing_required_field)
-    bad = {"id": "it-tenant", "name": "T", "domain": "it.example.com",
-           "auth_url": "", "cert_key": None, "cert_file": None,
-           "enabled": True, "created_at": "", "updated_at": ""}
-    s, j = req("POST", "/api/v1/tenants", bad, expect=400)
-    d = as_dict(j)
-    if d:
-        err = d.get("error") or {}
-        assert_eq("  tenants empty auth_url error code",
-                  err.get("code"), "missing_required_field")
+    print("\n[tenants] CRUD + domain UNIQUE")
 
     # Valid
     body = {"id": "it-tenant", "name": "IT Tenant", "domain": "it.example.com",
-            "auth_url": "https://auth.it.example.com/v",
             "cert_key": None, "cert_file": None, "enabled": True,
             "created_at": "", "updated_at": ""}
     req("POST", "/api/v1/tenants", body, expect=201)
@@ -346,14 +335,9 @@ def test_tenants() -> None:
     d = as_dict(j)
     if d:
         assert_eq("  tenants GET item domain", d.get("domain"), "it.example.com")
-    # PUT update (auth_url v2, disabled)
-    upd = dict(body, name="IT Tenant v2",
-               auth_url="https://auth.it.example.com/v2", enabled=False)
+    # PUT update (disabled)
+    upd = dict(body, name="IT Tenant v2", enabled=False)
     s, j = req("PUT", "/api/v1/tenants/it-tenant", upd, expect=200)
-    d = as_dict(j)
-    if d:
-        assert_eq("  tenants PUT auth_url", d.get("auth_url"),
-                  "https://auth.it.example.com/v2")
     # domain UNIQUE conflict
     req("POST", "/api/v1/tenants", body, expect=409)
     # DELETE -> 204, then 404
@@ -536,7 +520,6 @@ def tenant_body() -> dict:
     n = _uid()
     return {
         "id": f"it-tenant-{n}", "name": "IT Tenant", "domain": f"it-{n}.example.com",
-        "auth_url": "https://auth.it.example.com/v",
         "cert_key": None, "cert_file": None, "enabled": True,
         "created_at": "", "updated_at": "",
     }

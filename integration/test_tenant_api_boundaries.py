@@ -173,8 +173,6 @@ def seed():
                                ("t2", T2_TOKEN, "other-boundaries.local")):
         st, out = admin("POST", "/tenants", {
             "id": tid, "name": tid.upper(), "domain": domain,
-            "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
-            "access_token": token, "cert_key": None, "cert_file": None,
             "created_at": "", "updated_at": ""})
         if st not in (200, 201):
             raise SystemExit(f"[boundaries] CANNOT VERIFY: seeding {tid} -> {st} {out[:160]}")
@@ -189,7 +187,6 @@ def seed():
 def set_enabled(enabled):
     st, out = admin("PUT", "/tenants/t1", {
         "id": "t1", "name": "T1", "domain": "boundaries.local",
-        "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": enabled,
         "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""})
     admin("POST", "/reload", {})
     time.sleep(0.3)

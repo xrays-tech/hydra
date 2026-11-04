@@ -216,7 +216,6 @@ struct TenantRow {
     id: String,
     name: String,
     domain: String,
-    auth_url: String,
     cert_key: Option<String>,
     cert_file: Option<String>,
     enabled: i64,
@@ -230,7 +229,6 @@ impl From<TenantRow> for Tenant {
             id: r.id,
             name: r.name,
             domain: r.domain,
-            auth_url: r.auth_url,
             cert_key: r.cert_key,
             cert_file: r.cert_file,
             enabled: r.enabled != 0,
@@ -635,8 +633,7 @@ pub async fn delete_provider_key(pool: &SqlitePool, id: &str) -> Result<(), sqlx
 // CRUD — Tenant
 // ---------------------------------------------------------------------------
 
-/// Insert a tenant. `auth_url` is NOT NULL → inserting with an empty/non-null
-/// value is fine; a NULL would error at the SQLite layer.
+/// Insert a tenant.
 ///
 /// Empty/blank `cert_file`/`cert_key` strings are normalized to `NULL`:
 /// optional legacy cert paths arrive as `""` from the admin UI (and other
@@ -647,12 +644,11 @@ pub async fn insert_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Er
     let cert_key = non_empty_path(t.cert_key.as_deref());
     let cert_file = non_empty_path(t.cert_file.as_deref());
     sqlx::query!(
-        "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
-         created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO tenant (id, name, domain, cert_key, cert_file, enabled, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         t.id,
         t.name,
         t.domain,
-        t.auth_url,
         cert_key,
         cert_file,
         t.enabled,
@@ -674,7 +670,7 @@ fn non_empty_path(p: Option<&str>) -> Option<String> {
 pub async fn get_tenant(pool: &SqlitePool, id: &str) -> Result<Tenant, sqlx::Error> {
     let row = sqlx::query_as!(
         TenantRow,
-        r#"SELECT id as "id!", name, domain, auth_url, cert_key, cert_file, enabled,
+        r#"SELECT id as "id!", name, domain, cert_key, cert_file, enabled,
                   created_at, updated_at
            FROM tenant WHERE id = ?"#,
         id
@@ -687,7 +683,7 @@ pub async fn get_tenant(pool: &SqlitePool, id: &str) -> Result<Tenant, sqlx::Err
 pub async fn list_tenants(pool: &SqlitePool) -> Result<Vec<Tenant>, sqlx::Error> {
     let rows = sqlx::query_as!(
         TenantRow,
-        r#"SELECT id as "id!", name, domain, auth_url, cert_key, cert_file, enabled,
+        r#"SELECT id as "id!", name, domain, cert_key, cert_file, enabled,
                   created_at, updated_at
            FROM tenant ORDER BY created_at"#
     )
@@ -696,18 +692,17 @@ pub async fn list_tenants(pool: &SqlitePool) -> Result<Vec<Tenant>, sqlx::Error>
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-/// Update a tenant's mutable fields (`name`, `domain`, `auth_url`, cert paths,
+/// Update a tenant's mutable fields (`name`, `domain`, cert paths,
 /// `enabled`, `updated_at`). Blank cert paths are normalized to `NULL`
 /// (same rule as `insert_tenant`).
 pub async fn update_tenant(pool: &SqlitePool, t: &Tenant) -> Result<(), sqlx::Error> {
     let cert_key = non_empty_path(t.cert_key.as_deref());
     let cert_file = non_empty_path(t.cert_file.as_deref());
     sqlx::query!(
-        "UPDATE tenant SET name = ?, domain = ?, auth_url = ?, cert_key = ?, cert_file = ?, \
+        "UPDATE tenant SET name = ?, domain = ?, cert_key = ?, cert_file = ?, \
          enabled = ?, updated_at = ? WHERE id = ?",
         t.name,
         t.domain,
-        t.auth_url,
         cert_key,
         cert_file,
         t.enabled,
@@ -724,9 +719,6 @@ pub struct TenantWrite<'a> {
     pub tenant: &'a Tenant,
     /// `true` = INSERT (create), `false` = UPDATE (edit).
     pub is_create: bool,
-    /// `Some(None)` = clear the token; `Some(Some(hash))` = set/rotate it;
-    /// `None` = leave it alone.
-    pub token_hash: Option<Option<String>>,
     /// `Some((None, None))` = clear the certificate; `Some((Some(pem), Some(key)))`
     /// = replace it; `None` = leave it alone.
     pub cert: Option<(Option<String>, Option<String>)>,
@@ -759,12 +751,11 @@ pub async fn write_tenant(
 
     if w.is_create {
         sqlx::query!(
-            "INSERT INTO tenant (id, name, domain, auth_url, cert_key, cert_file, enabled, \
-             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tenant (id, name, domain, cert_key, cert_file, enabled, \
+             created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             t.id,
             t.name,
             t.domain,
-            t.auth_url,
             cert_key,
             cert_file,
             t.enabled,
@@ -775,29 +766,15 @@ pub async fn write_tenant(
         .await?;
     } else {
         sqlx::query!(
-            "UPDATE tenant SET name = ?, domain = ?, auth_url = ?, cert_key = ?, cert_file = ?, \
+            "UPDATE tenant SET name = ?, domain = ?, cert_key = ?, cert_file = ?, \
              enabled = ?, updated_at = ? WHERE id = ?",
             t.name,
             t.domain,
-            t.auth_url,
             cert_key,
             cert_file,
             t.enabled,
             t.updated_at,
             t.id,
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    if let Some(hash) = &w.token_hash {
-        // Bind first: `hash.as_deref()` would create a temporary that the query
-        // borrows past the end of the statement.
-        let hash: Option<&str> = hash.as_deref();
-        sqlx::query!(
-            "UPDATE tenant SET access_token_hash = ? WHERE id = ?",
-            hash,
-            t.id
         )
         .execute(&mut *tx)
         .await?;
@@ -970,76 +947,6 @@ pub async fn update_tenant_cert(
     .execute(pool)
     .await?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tenant access token (migration 0009, the tenant self-service credential)
-// ---------------------------------------------------------------------------
-//
-// The tenant self-service credential is stored as a SHA-256 hex HASH only —
-// one-way, never echoed, never recoverable (lost token => rotate via the
-// admin API / UI). It is compared, never used for outbound calls, so a hash
-// is the correct primitive (same reasoning as the api-key digests the
-// limiter keys on).
-
-/// Set (or clear, `None`) a tenant's access-token hash.
-pub async fn set_tenant_access_token_hash(
-    pool: &SqlitePool,
-    tenant_id: &str,
-    hash: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        "UPDATE tenant SET access_token_hash = ? WHERE id = ?",
-        hash,
-        tenant_id
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// All `(tenant_id, access_token_hash)` pairs — the tenant-token gate scans
-/// these and compares the presented token's digest (constant-time).
-pub async fn list_tenant_access_token_hashes(
-    pool: &SqlitePool,
-) -> Result<Vec<(String, String)>, sqlx::Error> {
-    list_tenant_access_token_hashes_on(pool).await
-}
-
-/// [`list_tenant_access_token_hashes`] on an arbitrary executor
-/// (one-transaction read).
-pub(crate) async fn list_tenant_access_token_hashes_on<'e, E>(
-    exec: E,
-) -> Result<Vec<(String, String)>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    let rows = sqlx::query!(
-        "SELECT id, access_token_hash FROM tenant WHERE access_token_hash IS NOT NULL \
-           ORDER BY id"
-    )
-    .fetch_all(exec)
-    .await?;
-    Ok(rows
-        .into_iter()
-        // `id` is `TEXT PRIMARY KEY` without NOT NULL, so sqlx types it
-        // Option<String> — a PK can never be NULL, unwrap_or_default is safe.
-        .filter_map(|r| r.access_token_hash.map(|h| (r.id.unwrap_or_default(), h)))
-        .collect())
-}
-
-/// Whether a tenant has an access token configured (for the admin view).
-pub async fn tenant_has_access_token(
-    pool: &SqlitePool,
-    tenant_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT access_token_hash FROM tenant WHERE id = ?",
-        tenant_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|r| r.access_token_hash).is_some())
 }
 
 /// One-time backfill for migration 0007: tenants with legacy `cert_file` /
@@ -1456,8 +1363,8 @@ pub async fn delete_limit_role(pool: &SqlitePool, id: &str) -> Result<(), sqlx::
 // CRUD — 用户层级 / 租户访问令牌 / Global Role（migration 0014, plan §3.1）
 //
 // T1 is ADDITIVE (decision D-17): the loader gains these reads alongside the
-// surviving legacy tables (`tenant.auth_url`, `tenant.access_token_hash`), which
-// stay until the terminal deletion batch T10 lands `0015` with the code removal.
+// surviving legacy tables at that time; `0015` now drops the remaining legacy
+// `tenant` columns as part of the terminal deletion batch.
 //
 // These use **runtime** `sqlx::query` / `query_as` (no `.sqlx/` offline-cache
 // refresh — T1 adds no query macros). `enabled`

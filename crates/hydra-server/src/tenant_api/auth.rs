@@ -3,23 +3,22 @@
 //! ## Why it reads the config snapshot and not the database
 //!
 //! The previous tenant endpoint lived on the admin service and resolved a token
-//! by running `SELECT id, access_token_hash FROM tenant WHERE access_token_hash
-//! IS NOT NULL` on **every attempt** — an unbounded, unordered full-table read,
-//! with no rate limit and no lockout, driven by an unauthenticated caller. Moving
+//! by running a full-table tenant-token read on **every attempt** — an unbounded,
+//! unordered read with no rate limit and no lockout, driven by an unauthenticated caller. Moving
 //! the endpoint to the internet-facing data-plane listener without changing that
 //! would have turned it into a cheap remote amplifier against the leader's
 //! SQLite.
 //!
 //! The snapshot already carries what is needed: the cluster replication content
-//! holds `FidelityRows::tenant_token_hashes` (`tenant_id -> SHA-256 hex`), which
-//! the wire seals and `hydrate` opens. So the gate is **zero I/O**, works on
-//! every role (leader, standby and edge all hold a replication content), and
-//! agrees with the rest of the cluster by construction rather than by expiry.
+//! holds `FidelityRows::tenant_access_tokens`, and `ConfigData.tenant_tokens` is
+//! derived from those rows during snapshot hydration. So the gate is **zero I/O**, works
+//! on every role (leader, standby and edge all hold a replication content), and agrees
+//! with the rest of the cluster by construction rather than by expiry.
 //!
 //! ## One guard, both halves
 //!
-//! The token hashes and the tenant rows are read from the **same**
-//! `replication()` guard. `ReplicationContent` holds both (`fidelity()` and the
+//! The token identities and the tenant rows are read from the **same**
+//! `replication()` guard. `ReplicationContent` holds the data and config behind both (`fidelity()` and the
 //! `cfg` it was built with), so a request can never be authenticated against one
 //! generation of the snapshot and answered from another.
 
@@ -196,7 +195,6 @@ mod tests {
                     id: id.clone(),
                     name: id.clone(),
                     domain: domain.clone(),
-                    auth_url: "https://auth.example/v".into(),
                     cert_key: None,
                     cert_file: None,
                     enabled: true,

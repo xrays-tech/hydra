@@ -253,7 +253,6 @@ def seed():
     admin("POST", "/provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up",
                                      "created_at": ""})
     admin("POST", "/tenants", {"id": "t1", "name": "T", "domain": "stream.local",
-                               "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                                "cert_key": None, "cert_file": None,
                                "created_at": "", "updated_at": ""})
     admin("POST", "/tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",

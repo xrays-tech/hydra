@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id as \"id!\", key_prefix, provider_id, enabled, created_at, updated_at\n           FROM provider_key_binding ORDER BY key_prefix",
+  "query": "SELECT id as \"id!\", name, domain, cert_key, cert_file, enabled,\n                  created_at, updated_at\n           FROM tenant ORDER BY created_at",
   "describe": {
     "columns": [
       {
@@ -9,28 +9,38 @@
         "type_info": "Text"
       },
       {
-        "name": "key_prefix",
+        "name": "name",
         "ordinal": 1,
         "type_info": "Text"
       },
       {
-        "name": "provider_id",
+        "name": "domain",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "enabled",
+        "name": "cert_key",
         "ordinal": 3,
-        "type_info": "Integer"
+        "type_info": "Text"
       },
       {
-        "name": "created_at",
+        "name": "cert_file",
         "ordinal": 4,
         "type_info": "Text"
       },
       {
-        "name": "updated_at",
+        "name": "enabled",
         "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 7,
         "type_info": "Text"
       }
     ],
@@ -41,10 +51,12 @@
       true,
       false,
       false,
+      true,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "f0b564032d87a58224279bfd93a250156575f6c820e119502cc75ab200d83878"
+  "hash": "11d160dc893f761adc6617c0cb4f20e8cd136a20f842cd8b7bb5dbf2acceb4f5"
 }

@@ -24,7 +24,7 @@ DELETE → GET-404) for all 7 config entities:
 Plus edge cases and non-CRUD endpoints:
 
 - provider-key masking (always masked `first10…last4`; `?reveal=1` accepted but no-op — P1-5)
-- `tenant.auth_url` mandatory (POST without → 400)
+- tenant domain UNIQUE
 - UNIQUE constraint conflicts → 409 (5 cases)
 - FK / CHECK constraint violations → 400 (3 cases)
 - 401 without token / with wrong token

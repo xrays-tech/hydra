@@ -37,7 +37,7 @@ use crate::tenant_api::{respond_json, Authenticated};
 /// caller cannot otherwise see. In particular there is **no** token digest, no
 /// certificate material and no provider key — a tenant reading its own state must
 /// not be handed anything it could use against another tenant, and the fields it
-/// does get (`domain`, `auth_url`) are the ones it would otherwise have to open a
+/// does get (`domain`) is the one it would otherwise have to open a
 /// support ticket to learn.
 #[derive(Serialize)]
 struct Whoami<'a> {
@@ -47,9 +47,6 @@ struct Whoami<'a> {
     /// The domain this tenant is currently bound to — i.e. which `Host` traffic
     /// reaches it. Read-only here: changing it is an operator action.
     domain: &'a str,
-    /// Where Hydra sends this tenant's clients' api-keys for verification.
-    /// Read-only here for the same reason. Removed in T10.
-    auth_url: &'a str,
     /// The non-secret name of the tenant access token that authorised this call.
     token_name: &'a str,
     /// The configuration snapshot version the authorisation was decided against.
@@ -77,7 +74,6 @@ pub async fn whoami(
         name: &t.name,
         enabled: t.enabled,
         domain: &t.domain,
-        auth_url: &t.auth_url,
         token_name: &auth.token_name,
         // The version the GATE read, not a fresh one: a response must never be
         // attributed to a configuration newer than the one that authorised it.

@@ -22,14 +22,6 @@ use sqlx::SqlitePool;
 
 use crate::crypto::KeyProvider;
 
-/// Tenant access-token HASH (`tenant_id` → hash) — never the token itself.
-///
-/// Carried so a replica can answer `has_access_token` and serve the tenant
-/// self-service endpoints on the DATA plane
-/// (`GET /tenant/{id}/api/v1/whoami`) without a 401 — the
-/// snapshot, not the database, is what the tenant gate reads (design §3.4).
-pub type TenantTokenHashes = Vec<(String, String)>;
-
 /// The rows a replica needs BEYOND `ConfigData` to rebuild itself faithfully.
 ///
 /// Every vector is loaded in a TOTAL order (see [`ReplicationContent::load`]) so
@@ -42,8 +34,6 @@ pub struct FidelityRows {
     /// `provider_key` rows WITH their identity (`id`, `created_at`) so the
     /// replica keeps the leader's primary keys instead of minting new ones.
     pub provider_keys: Vec<ProviderKey>,
-    /// `tenant_id` → access-token hash.
-    pub tenant_token_hashes: TenantTokenHashes,
     /// Offline `provider_model` rows (the derived map drops `status != 1`).
     pub provider_models: Vec<ProviderModel>,
     /// Join rows with their ids preserved.
@@ -197,7 +187,6 @@ impl ReplicationContent {
         );
 
         let limit_roles = crate::db::list_limit_roles_on(&mut *tx, kp).await?;
-        let tenant_token_hashes = crate::db::list_tenant_access_token_hashes_on(&mut *tx).await?;
         let provider_models = crate::db::list_provider_models_on(&mut *tx).await?;
         let tenant_providers = crate::db::list_tenant_providers_on(&mut *tx).await?;
         let tenant_models = crate::db::list_tenant_models_on(&mut *tx).await?;
@@ -218,7 +207,6 @@ impl ReplicationContent {
             fidelity: FidelityRows {
                 limit_roles,
                 provider_keys,
-                tenant_token_hashes,
                 provider_models,
                 tenant_providers,
                 tenant_models,
@@ -312,7 +300,6 @@ mod tests {
                 id: "t1".into(),
                 name: "T".into(),
                 domain: "acme.com".into(),
-                auth_url: "https://auth.acme.com/v".into(),
                 cert_key: None,
                 cert_file: None,
                 enabled: true,
@@ -322,9 +309,23 @@ mod tests {
         )
         .await
         .expect("insert tenant");
-        crate::db::set_tenant_access_token_hash(pool, "t1", Some("deadbeef"))
-            .await
-            .expect("set token hash");
+        crate::db::insert_tenant_access_token(
+            pool,
+            &hydra_core::model::TenantAccessToken {
+                id: "tok1".into(),
+                tenant_id: "t1".into(),
+                name: "test".into(),
+                token_hash: "deadbeef".into(),
+                token_prefix: "ht_deadbeef".into(),
+                token_last4: "beef".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-01-01 00:00:00".into(),
+                updated_at: "2026-01-01 00:00:00".into(),
+            },
+        )
+        .await
+        .expect("insert tenant access token");
         crate::db::insert_provider_model(
             pool,
             &hydra_core::model::ProviderModel {
@@ -394,7 +395,7 @@ mod tests {
         // Non-vacuous: the vectors this compares are actually populated.
         assert_eq!(first.fidelity().provider_keys.len(), 2);
         assert_eq!(first.fidelity().limit_roles.len(), 2);
-        assert_eq!(first.fidelity().tenant_token_hashes.len(), 1);
+        assert_eq!(first.fidelity().tenant_access_tokens.len(), 1);
         assert_eq!(first.fidelity().provider_models.len(), 1);
         assert_eq!(first.fidelity().tenant_providers.len(), 1);
         assert_eq!(first.fidelity().tenant_models.len(), 1);

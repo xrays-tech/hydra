@@ -50,7 +50,6 @@ fn tenant_full(id: &str, domain: &str) -> Tenant {
         id: id.into(),
         name: format!("{id}-tenant"),
         domain: domain.into(),
-        auth_url: format!("https://auth.{domain}/verify"),
         cert_key: None,
         cert_file: None,
         enabled: true,
@@ -188,10 +187,7 @@ async fn loader_build_indexes_correct() {
 
     // tenants_by_domain (lowercased)
     assert!(cfg.tenants_by_domain.contains_key("acme.com"));
-    assert_eq!(
-        cfg.tenants_by_domain["acme.com"].auth_url,
-        "https://auth.acme.com/verify"
-    );
+    assert_eq!(cfg.tenants_by_domain["acme.com"].name, "t1-tenant");
 }
 
 /// `tenants_by_id` 是**派生索引**，必须与 `tenants_by_domain` 同源同批。
@@ -224,7 +220,7 @@ async fn loader_derives_tenants_by_id_from_the_same_rows() {
             by_id.domain, t.domain,
             "id index must point at the same row"
         );
-        assert_eq!(by_id.auth_url, t.auth_url);
+        assert_eq!(by_id.id, t.id);
     }
     // 反向：id 索引里不能有 domain 索引中没有的行（防止"多填"）。
     for (id, t) in &cfg.tenants_by_id {

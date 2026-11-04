@@ -90,7 +90,6 @@ fn tenant_t() -> Tenant {
         id: "t".into(),
         name: "T".into(),
         domain: "example.com".into(),
-        auth_url: "https://auth.example.com/v".into(),
         cert_key: None,
         cert_file: None,
         enabled: true,

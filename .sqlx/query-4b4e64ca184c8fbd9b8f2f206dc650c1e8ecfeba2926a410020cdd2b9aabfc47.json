@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO tenant (id, name, domain, cert_key, cert_file, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "4b4e64ca184c8fbd9b8f2f206dc650c1e8ecfeba2926a410020cdd2b9aabfc47"
+}

@@ -6,7 +6,7 @@
 //! cache is per node, so "clear this key" is a fan-out, and a stream trim that
 //! overtakes a lagging consumer bumps a generation which makes EVERY node drop
 //! its WHOLE cache (`cluster::events`). Each clear also sends every affected
-//! client back to the tenant's `auth_url`. A single tenant's credential must not
+//! client back to the retired external-auth surface. A single tenant's credential must not
 //! be able to spend other tenants' availability, so the endpoint is capped.
 //!
 //! ## Bound, stated honestly

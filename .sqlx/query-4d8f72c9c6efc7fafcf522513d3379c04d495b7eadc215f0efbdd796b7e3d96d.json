@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE tenant SET name = ?, domain = ?, cert_key = ?, cert_file = ?, enabled = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "4d8f72c9c6efc7fafcf522513d3379c04d495b7eadc215f0efbdd796b7e3d96d"
+}

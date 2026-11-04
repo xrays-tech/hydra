@@ -42,12 +42,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model (`model_key`) + one key. The
 /// provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_routed(
-    pool: &sqlx::SqlitePool,
-    auth_url: &str,
-    upstream_endpoint: &str,
-    model_key: &str,
-) {
+async fn seed_routed(pool: &sqlx::SqlitePool, upstream_endpoint: &str, model_key: &str) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -83,7 +78,6 @@ async fn seed_routed(
             id: "t1".into(),
             name: "t1".into(),
             domain: "localhost".into(),
-            auth_url: auth_url.into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -145,7 +139,7 @@ async fn seed_routed(
     .await
     .expect("insert limit_role");
     // T3 internal auth: the data-plane gate decides from the identity index
-    // derived from user_group/user/user_api_key rows. `auth_url` above stays
+    // derived from user_group/user/user_api_key rows. The old auth field is gone
     // on the Tenant row (it is data, not a live hop) but is never consulted.
     common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
@@ -290,13 +284,7 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_routed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-        "claude-3-5-sonnet-test",
-    )
-    .await;
+    seed_routed(&pool, &upstream.uri(), "claude-3-5-sonnet-test").await;
 
     let recording = Arc::new(RecordingSink::default());
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
@@ -372,13 +360,7 @@ async fn v1_chat_completions_regression_generic_scanner() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_routed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-        "gpt-4",
-    )
-    .await;
+    seed_routed(&pool, &upstream.uri(), "gpt-4").await;
 
     let recording = Arc::new(RecordingSink::default());
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
@@ -478,13 +460,7 @@ async fn v1_messages_upstream_gets_x_api_key_and_anthropic_version() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_routed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-        "claude-3-5-sonnet-test",
-    )
-    .await;
+    seed_routed(&pool, &upstream.uri(), "claude-3-5-sonnet-test").await;
 
     let recording = Arc::new(RecordingSink::default());
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));

@@ -18,7 +18,7 @@
 //! normal proxy pipeline: Host→tenant resolution, then the client api-key
 //! extraction. The tenant's own access token travels in `Authorization: Bearer`,
 //! which is ALSO a legitimate client api-key transport, so a fall-through would
-//! POST that token to the tenant's `auth_url` and mask it into a usage record.
+//! POST that token to the retired external-auth surface and mask it into a usage record.
 //! Anything under the reserved prefix is therefore answered here, and a path
 //! that is not one of the five routes gets a local `404`.
 //!
@@ -119,7 +119,7 @@ pub struct TenantApiConfig {
     /// Cap on AUTHORISED requests per tenant per minute (design §5.1),
     /// `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`. This is the amplification budget:
     /// it is what stops one tenant's credential from spending other tenants'
-    /// availability through cache fan-out and `auth_url` re-verification.
+    /// availability through cache fan-out and auth re-verification.
     pub rate_limit_per_min: u32,
     /// Cap on FAILED authentications per source IP and per token digest
     /// (`HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN`). The gate is zero-I/O now,

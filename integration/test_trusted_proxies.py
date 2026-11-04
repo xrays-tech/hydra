@@ -135,8 +135,7 @@ def bring_up(label, admin, data, trusted):
     if not wait_healthy(admin):
         raise SystemExit(f"[trusted-proxy] CANNOT VERIFY: node {label} never became healthy")
     st = post(f"http://127.0.0.1:{admin}/api/v1/tenants",
-              {"id": "t1", "name": "T", "domain": "load.local", "auth_url": "http://127.0.0.1:18997",
-               "enabled": True, "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""},
+              {"id": "t1", "name": "T", "domain": "load.local",                "enabled": True, "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""},
               token=TOKEN)
     if st not in (200, 201):
         raise SystemExit(f"[trusted-proxy] CANNOT VERIFY: seeding the tenant -> {st}")

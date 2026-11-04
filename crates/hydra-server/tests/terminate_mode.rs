@@ -60,7 +60,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model + one key (the minimal routed
 /// graph). The provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_one(pool: &sqlx::SqlitePool, auth_url: &str, upstream_endpoint: &str) {
+async fn seed_one(pool: &sqlx::SqlitePool, upstream_endpoint: &str) {
     seed_provider(pool, "p1", "openai", "OpenAI", upstream_endpoint).await;
     repo::insert_provider_model(
         pool,
@@ -74,7 +74,7 @@ async fn seed_one(pool: &sqlx::SqlitePool, auth_url: &str, upstream_endpoint: &s
     )
     .await
     .expect("insert provider_model");
-    seed_tenant(pool, "t1", "localhost", auth_url).await;
+    seed_tenant(pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         pool,
         &TenantProvider {
@@ -126,14 +126,13 @@ async fn seed_provider(pool: &sqlx::SqlitePool, id: &str, key: &str, name: &str,
     .expect("insert provider");
 }
 
-async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, auth_url: &str) {
+async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str) {
     repo::insert_tenant(
         pool,
         &Tenant {
             id: id.into(),
             name: id.into(),
             domain: domain.into(),
-            auth_url: auth_url.into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -145,9 +144,7 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, auth_url: 
     .expect("insert tenant");
     // T3 internal auth: the data plane resolves the CLIENT credential from
     // `ConfigData.users_by_api_key_hash` (user_group / user / user_api_key rows),
-    // NOT from `tenant.auth_url`. Every request this file sends carries
     // `Bearer test-client-key`, so the tenant's own seeding step seeds that
-    // identity — an `auth_url` mock can no longer authenticate a request.
     // A test that deliberately wants an UNAUTHENTICATED leg must send a key
     // that was never seeded (see `usage_record_never_invents_attribution_without_a_principal`).
     common::seed_api_identity(pool, id, "test-client-key").await;
@@ -311,12 +308,7 @@ async fn full_body_forwarded_intact_and_key_swapped() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -377,13 +369,7 @@ async fn tenant_without_tenant_model_mapping_is_default_open() {
     )
     .await
     .expect("insert provider_model");
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         &pool,
         &TenantProvider {
@@ -452,12 +438,7 @@ async fn sse_stream_is_forwarded_chunk_by_chunk() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -529,13 +510,7 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
     )
     .await
     .unwrap();
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         &pool,
         &TenantProvider {
@@ -639,12 +614,7 @@ async fn breaker_success_clears_failures() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     // Pre-charge the breaker with a failure; a 2xx response should reset it.
     state.breaker.on_failure("p1");
@@ -701,12 +671,7 @@ async fn usage_tokens_extracted_from_response() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
 
     // Use a recording sink to verify usage extraction end-to-end.
     let recording = Arc::new(RecordingSink::default());
@@ -756,12 +721,7 @@ async fn error_404_when_model_not_found() {
     // Mount nothing on the upstream — routing should fail before we hit it.
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     // Allow the tenant to use a model that NO provider serves → router returns
     // ModelNotFound (404), distinct from ModelNotAllowed (403) which fires when
     // the model is not in the tenant_models gate at all.
@@ -798,12 +758,7 @@ async fn error_400_when_model_field_is_ambiguous() {
     // BEFORE any provider is contacted.
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -843,7 +798,6 @@ async fn error_400_when_model_field_is_ambiguous() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_401_when_auth_denied() {
     // T3 internal auth: a DENIAL is a credential the identity index does not
-    // know (revoked/expired/unknown), decided locally — the `auth_url` mock
     // below stays mounted precisely to prove it is never consulted.
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -860,12 +814,7 @@ async fn error_401_when_auth_denied() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -919,12 +868,7 @@ async fn error_402_when_auth_denied_insufficient_balance() {
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     // Same ids `common::seed_api_identity` used (deterministic by design).
     repo::upsert_user(
         &pool,
@@ -994,12 +938,7 @@ async fn error_502_when_all_providers_fail() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -1075,12 +1014,7 @@ async fn rate_limit_429_on_third_request() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     tighten_limit_to_2(&pool).await;
 
     let state = build_state(&pool).await;
@@ -1127,12 +1061,7 @@ async fn rate_limit_429_even_when_routing_would_503() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     tighten_limit_to_2(&pool).await;
 
     // Build state with breaker threshold=2: after two 500s the provider enters
@@ -1246,12 +1175,7 @@ async fn default_no_concurrency_config_is_passthrough_200() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
 
     // Verify the default policy is all-zeros (⇒ Passthrough).
@@ -1324,13 +1248,7 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
     )
     .await
     .expect("insert provider_model");
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         &pool,
         &TenantProvider {
@@ -1489,13 +1407,7 @@ async fn admission_capped_provider_does_not_block_second_request() {
         .await
         .unwrap();
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (tpid, pid) in [("tpA", "pA"), ("tpB", "pB")] {
         repo::insert_tenant_provider(
             &pool,
@@ -1625,13 +1537,7 @@ async fn usage_record_never_invents_attribution_without_a_principal() {
     )
     .await
     .unwrap();
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         &pool,
         &TenantProvider {
@@ -1822,7 +1728,7 @@ async fn allowing_auth_server() -> MockServer {
 /// counted — see terminate_mode.rs:321 precedent).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_get_v1_models_union_whitelist_answered_locally() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream_a = MockServer::start().await;
     let upstream_b = MockServer::start().await;
 
@@ -1849,13 +1755,7 @@ async fn catalog_get_v1_models_union_whitelist_answered_locally() {
         .await
         .expect("insert provider_model");
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
         repo::insert_tenant_provider(
             &pool,
@@ -1941,7 +1841,7 @@ async fn catalog_get_v1_models_union_whitelist_answered_locally() {
 /// its body is echoed back downstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_get_v1_models_id_still_passes_through_upstream() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models/gpt-4"))
@@ -1955,12 +1855,7 @@ async fn catalog_get_v1_models_id_still_passes_through_upstream() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -1992,7 +1887,6 @@ async fn catalog_get_v1_models_id_still_passes_through_upstream() {
 
 /// (Task 2c — round-2 revision) The directory is public WITH a key too: the
 /// external-auth boundary never runs on the exact `GET /v1/models` path, so
-/// even a key the tenant auth_url would DENY reads the local catalog — 200,
 /// zero auth calls, zero upstream. A presented key only narrows via prefix
 /// binding (no binding in this seed ⇒ same union as anonymous).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2005,12 +1899,7 @@ async fn catalog_get_v1_models_denied_key_still_reads_200_no_auth() {
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -2045,7 +1934,7 @@ async fn catalog_get_v1_models_denied_key_still_reads_200_no_auth() {
 /// request chat path would 403 TenantForbidden for the same tenant).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_get_v1_models_tenant_without_providers_returns_empty() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
@@ -2064,13 +1953,7 @@ async fn catalog_get_v1_models_tenant_without_providers_returns_empty() {
     )
     .await
     .expect("insert provider_model");
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     // NOTE: deliberately NO insert_tenant_provider here.
     seed_key(
         &pool,
@@ -2175,13 +2058,7 @@ async fn catalog_public_anonymous_get_v1_models_200_union_zero_upstream() {
         .await
         .expect("insert provider_model");
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
         repo::insert_tenant_provider(
             &pool,
@@ -2274,16 +2151,11 @@ async fn catalog_public_anonymous_get_v1_models_200_union_zero_upstream() {
 /// catalog (200), not a passthrough.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_public_anonymous_get_v1_models_query_ignored() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -2308,16 +2180,11 @@ async fn catalog_public_anonymous_get_v1_models_query_ignored() {
 /// 401 missing_api_key, no catalog, no upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_public_anonymous_head_v1_models_still_requires_key() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -2341,16 +2208,11 @@ async fn catalog_public_anonymous_head_v1_models_still_requires_key() {
 /// before any passthrough.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_public_anonymous_get_v1_models_id_still_requires_key() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -2374,7 +2236,7 @@ async fn catalog_public_anonymous_get_v1_models_id_still_requires_key() {
 /// tenant_disabled (the enabled gate runs before the catalog branch).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_public_anonymous_get_v1_models_disabled_tenant_403() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
@@ -2385,7 +2247,6 @@ async fn catalog_public_anonymous_get_v1_models_disabled_tenant_403() {
             id: "t1".into(),
             name: "t1".into(),
             domain: "localhost".into(),
-            auth_url: format!("{}/auth", auth_server.uri()),
             cert_key: None,
             cert_file: None,
             enabled: false,
@@ -2414,16 +2275,11 @@ async fn catalog_public_anonymous_get_v1_models_disabled_tenant_403() {
 async fn catalog_public_anonymous_get_v1_models_unknown_domain_404() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let hostport = root.trim_start_matches("http://").to_string();
@@ -2522,12 +2378,7 @@ async fn every_header_credential_transport_authenticates() {
             .await;
 
         let pool = common::setup_pool().await;
-        seed_one(
-            &pool,
-            &format!("{}/auth", auth_server.uri()),
-            &upstream.uri(),
-        )
-        .await;
+        seed_one(&pool, &upstream.uri()).await;
         let root = start_proxy(build_state(&pool).await);
         let client = test_client();
 
@@ -2591,12 +2442,7 @@ async fn query_credential_transport_authenticates_and_is_not_forwarded() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2637,7 +2483,7 @@ async fn query_credential_transport_authenticates_and_is_not_forwarded() {
 /// and the shadowing value never leaves the gateway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn differing_transports_use_the_highest_precedence_value() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -2648,12 +2494,7 @@ async fn differing_transports_use_the_highest_precedence_value() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2707,12 +2548,7 @@ async fn no_credential_in_any_transport_is_401_missing_api_key() {
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2748,16 +2584,11 @@ async fn no_credential_in_any_transport_is_401_missing_api_key() {
 /// Negative pin (C1/C4): a non-Bearer scheme is not a credential transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn non_bearer_authorization_scheme_is_rejected() {
-    let auth_server = allowing_auth_server().await;
+    let _auth_server = allowing_auth_server().await;
     let upstream = MockServer::start().await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let root = start_proxy(build_state(&pool).await);
     let client = test_client();
 
@@ -2810,13 +2641,7 @@ async fn catalog_key_in_the_query_transport_does_not_narrow_the_directory() {
         .await
         .expect("insert provider_model");
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
         repo::insert_tenant_provider(
             &pool,
@@ -2910,12 +2735,7 @@ async fn model_decoys_cannot_bypass_the_tenant_model_whitelist() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -2988,12 +2808,7 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
 
     // Threshold 2: a couple of wrongly-counted failures would already trip it.
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
@@ -3100,13 +2915,7 @@ async fn post_send_transport_error_is_not_failed_over() {
         .await
         .unwrap();
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (id, pid) in [("tp_as", "p_asilent"), ("tp_zl", "p_zlive")] {
         repo::insert_tenant_provider(
             &pool,
@@ -3251,7 +3060,6 @@ async fn state_for_one_upstream(
         )
         .mount(&auth_server)
         .await;
-    let auth_url = format!("{}/auth", auth_server.uri());
 
     seed_provider(pool, "p1", "p1", "P1", endpoint).await;
     repo::insert_provider_model(
@@ -3266,7 +3074,7 @@ async fn state_for_one_upstream(
     )
     .await
     .unwrap();
-    seed_tenant(pool, "t1", "localhost", &auth_url).await;
+    seed_tenant(pool, "t1", "localhost").await;
     repo::insert_tenant_provider(
         pool,
         &TenantProvider {
@@ -3485,13 +3293,7 @@ async fn state_for_body_read(
         )
         .mount(&auth_server)
         .await;
-    seed_tenant(
-        pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(pool, "t1", "localhost").await;
     let state = build_state_with_proxy_config(
         pool,
         ProxyConfig {
@@ -3620,12 +3422,7 @@ async fn unparsable_body_cannot_bypass_the_tenant_model_whitelist() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -3737,12 +3534,7 @@ async fn bodied_request_outside_v1_is_rejected() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let client = test_client();
@@ -3823,12 +3615,7 @@ async fn non_route_strategy_reject_refuses_a_model_less_body() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_one(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-    )
-    .await;
+    seed_one(&pool, &upstream.uri()).await;
 
     // (1) Reject: a well-formed body with NO model member is refused, and the
     //     upstream is never called.
@@ -3937,13 +3724,7 @@ async fn a_provider_that_lost_its_keys_is_named_in_metrics_while_requests_succee
         .await
         .unwrap();
     }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
+    seed_tenant(&pool, "t1", "localhost").await;
     for (tpid, pid) in [("tp_gone", "p_gone"), ("tp_live", "p_live")] {
         repo::insert_tenant_provider(
             &pool,

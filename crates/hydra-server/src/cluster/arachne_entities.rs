@@ -94,12 +94,12 @@ pub struct CertTreeEntity {
 ///
 /// ## Why the secrets stay sealed
 ///
-/// `provider_keys` hold provider API keys, `tenant_token_hashes` hold the fleet's authentication
-/// material and `limit_roles` carry a `matching_key` that may be a live CLIENT key. The existing wire
-/// SEALS all of them, and a tree that carried them in the clear would quietly undo that — so this
-/// type keeps the same split: the rows that are not secret travel as plain JSON, and every secret
-/// column travels sealed. `limit_roles` is the one set where a SINGLE COLUMN is sealed rather than
-/// the whole row ([`sealed_limit_role`]), because D-16 seals the column, not the table.
+/// `provider_keys` hold provider API keys and `limit_roles` carry a `matching_key` that may be a
+/// live CLIENT key. The existing wire SEALS both, and a tree that carried them in the clear would
+/// quietly undo that — so this type keeps the same split: the rows that are not secret travel as
+/// plain JSON, and every secret column travels sealed. `limit_roles` is the one set where a SINGLE
+/// COLUMN is sealed rather than the whole row ([`sealed_limit_role`]), because D-16 seals the column,
+/// not the table.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FidelityTreeEntity {
     /// Full `limit_role` rows, DISABLED included, each with its `matching_key` sealed.
@@ -113,8 +113,6 @@ pub struct FidelityTreeEntity {
     pub tenant_models: Vec<TenantModel>,
     /// Provider api-keys WITH their row identity, sealed.
     pub sealed_provider_keys: Vec<SealedProviderKey>,
-    /// `tenant_id` → sealed access-token hash.
-    pub sealed_tenant_token_hashes: Vec<(String, Sealed)>,
 }
 
 /// One provider key's identity plus its sealed api-key.
@@ -299,23 +297,9 @@ impl FidelityTreeEntity {
             });
         }
 
-        let mut tenant_token_hashes = Vec::with_capacity(self.sealed_tenant_token_hashes.len());
-        for (tenant_id, sealed) in &self.sealed_tenant_token_hashes {
-            let hash = kp.open(sealed).map_err(|e| EntityCodecError::Crypto {
-                path: EntityPath::Fidelity.to_key_segment(),
-                reason: format!("cannot open the token hash of tenant {tenant_id}: {e}"),
-            })?;
-            let hash = String::from_utf8(hash).map_err(|_| EntityCodecError::Crypto {
-                path: EntityPath::Fidelity.to_key_segment(),
-                reason: format!("the token hash of tenant {tenant_id} is not valid UTF-8"),
-            })?;
-            tenant_token_hashes.push((tenant_id.clone(), hash));
-        }
-
         Ok(FidelityRows {
             limit_roles,
             provider_keys,
-            tenant_token_hashes,
             provider_models: self.provider_models.clone(),
             tenant_providers: self.tenant_providers.clone(),
             tenant_models: self.tenant_models.clone(),
@@ -365,22 +349,12 @@ impl FidelityTreeEntity {
                 sealed,
             });
         }
-        let mut sealed_tenant_token_hashes = Vec::with_capacity(rows.tenant_token_hashes.len());
-        for (tenant_id, hash) in &rows.tenant_token_hashes {
-            let sealed = kp.seal_deterministic(hash.as_bytes()).map_err(|e| {
-                EntityCodecError::Unsupported {
-                    reason: format!("cannot seal the token hash of tenant {tenant_id}: {e}"),
-                }
-            })?;
-            sealed_tenant_token_hashes.push((tenant_id.clone(), sealed));
-        }
         Ok(Self {
             limit_roles,
             provider_models: rows.provider_models.clone(),
             tenant_providers: rows.tenant_providers.clone(),
             tenant_models: rows.tenant_models.clone(),
             sealed_provider_keys,
-            sealed_tenant_token_hashes,
         })
     }
 }
@@ -881,7 +855,6 @@ pub fn build_config_with_fidelity(
                 // decoded from `user_group/<id>`, `user/<id>`, etc. depending on path order.
                 fidelity.limit_roles = legacy.limit_roles;
                 fidelity.provider_keys = legacy.provider_keys;
-                fidelity.tenant_token_hashes = legacy.tenant_token_hashes;
                 fidelity.provider_models = legacy.provider_models;
                 fidelity.tenant_providers = legacy.tenant_providers;
                 fidelity.tenant_models = legacy.tenant_models;
@@ -1043,7 +1016,6 @@ mod tests {
             id: id.to_string(),
             name: format!("name-{id}"),
             domain: domain.to_string(),
-            auth_url: format!("https://auth.{domain}"),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -1163,7 +1135,6 @@ mod tests {
                     created_at: "2026-01-05T00:00:00Z".into(),
                 },
             ],
-            tenant_token_hashes: vec![("t1".into(), "a".repeat(64))],
             provider_models: vec![
                 ProviderModel {
                     id: "pm-online".into(),
@@ -1266,9 +1237,8 @@ mod tests {
 
     /// The fidelity entity must not become a plaintext channel for secrets.
     ///
-    /// The sealed-rows pattern is not decoration: `provider_keys` hold API keys and
-    /// `tenant_token_hashes` are the fleet's auth material, and the existing wire seals BOTH.
-    /// A tree that carried them in the clear would quietly undo that.
+    /// The sealed-rows pattern is not decoration: `provider_keys` hold API keys and the existing
+    /// wire seals them. A tree that carried them in the clear would quietly undo that.
     ///
     /// Falsification: serialize the rows as-is and the "no plaintext secret" assertions fail.
     #[tokio::test]
@@ -1285,11 +1255,6 @@ mod tests {
                 blob.path.to_key_segment()
             );
             assert!(
-                !text.contains(&"a".repeat(64)),
-                "entity {} carries a tenant token hash in the clear",
-                blob.path.to_key_segment()
-            );
-            assert!(
                 !text.contains("PRIVATE KEY"),
                 "entity {} carries private key material",
                 blob.path.to_key_segment()
@@ -1300,7 +1265,6 @@ mod tests {
         let tree = tree_of(&blobs).expect("tree");
         let (_, rebuilt) = build_config_with_fidelity(&tree, &kp()).expect("rebuild");
         assert_eq!(rebuilt.provider_keys[0].api_key, "sk-one");
-        assert_eq!(rebuilt.tenant_token_hashes[0].1, "a".repeat(64));
 
         // A different master key must refuse rather than hand back garbage.
         let wrong = crate::crypto::StaticKeyProvider::new([9u8; 32], 1);
@@ -1757,7 +1721,6 @@ mod tests {
                 id: format!("cap_t{n}"),
                 name: format!("name-cap_t{n}"),
                 domain: format!("cap{n}.example"),
-                auth_url: format!("https://auth.cap{n}.example"),
                 cert_key: None,
                 cert_file: None,
                 enabled: true,

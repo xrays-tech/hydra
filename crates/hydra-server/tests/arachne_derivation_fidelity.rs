@@ -52,7 +52,6 @@ fn tenant(id: &str, domain: &str) -> Tenant {
         id: id.into(),
         name: id.into(),
         domain: domain.into(),
-        auth_url: format!("https://auth.{LOWERCASE_DOMAIN}/v1"),
         cert_key: None,
         cert_file: None,
         enabled: true,

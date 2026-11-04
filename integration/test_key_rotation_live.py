@@ -250,7 +250,6 @@ def seed():
         # measured: `POST /api/v1/tenants/t1/cert` is 404 `unknown path`). Without a cert the
         # report's `tenant_certs` column would be untested.
         ("tenants", {"id": "t1", "name": "T", "domain": DOMAIN,
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": "",
                      "cert_pem": cert_pem(), "cert_key_pem": cert_key_pem()}),
         ("tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",

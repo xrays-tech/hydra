@@ -80,7 +80,6 @@ fn entities_derive_roundtrip() {
         id: "t_01".into(),
         name: "Acme".into(),
         domain: "acme.com".into(),
-        auth_url: "https://auth.acme.com/verify".into(),
         cert_key: Some("/certs/acme.key".into()),
         cert_file: Some("/certs/acme.crt".into()),
         enabled: true,
@@ -89,12 +88,11 @@ fn entities_derive_roundtrip() {
     };
     roundtrip(&tenant);
 
-    // Also verify the mandatory-auth_url invariant survives a missing cert pair.
+    // A tenant with no certificate pair still round-trips.
     let tenant_bare = Tenant {
         cert_key: None,
         cert_file: None,
         enabled: false,
-        auth_url: String::new(),
         ..tenant.clone()
     };
     roundtrip(&tenant_bare);

@@ -607,7 +607,7 @@ function assert(name, cond, detail) {
     // A trailing backslash + newline inside the Rust literal is a string
     // continuation: flatten those so each statement is one line.
     // them, then read the column lists of the statements that touch `updated_at`
-    // (the targeted single-column UPDATEs — access_token_hash, cert ciphertext —
+    // (the targeted single-column UPDATEs — cert ciphertext —
     // are written by their own paths and must NOT be form fields).
     const dbSrc = fs
       .readFileSync(path.join(__dirname, "..", "crates", "hydra-server", "src", "db.rs"), "utf8")
@@ -693,7 +693,6 @@ function assert(name, cond, detail) {
       id: "acme",
       name: "ACME",
       domain: "acme.example.com",
-      auth_url: "https://auth.acme.example.com/v1/verify",
       cert_file: "/certs/acme.crt",
       cert_key: "/certs/acme.key",
       enabled: true,

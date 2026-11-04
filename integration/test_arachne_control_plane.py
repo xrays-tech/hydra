@@ -65,7 +65,7 @@ failures = []
 
 
 class MockUpstream(BaseHTTPRequestHandler):
-    """One process answering BOTH the tenant's `auth_url` and the upstream chat completion.
+    """One process answering BOTH the tenant's `the retired auth column` and the upstream chat completion.
 
     Gate 5 asserts the data plane still serves while the control plane has lost its quorum, and
     that cannot be shown by an open port: it needs a request that actually goes through the gate,
@@ -235,7 +235,6 @@ def seed_proxy_fixture(node):
         ("/provider-keys", {"id": "pk-up", "provider_id": "p-up", "api_key": "sk-up",
                             "created_at": ""}),
         ("/tenants", {"id": "t-drill", "name": "Drill", "domain": "drill.local",
-                      "auth_url": f"{upstream}/auth", "enabled": True,
                       "cert_key": None, "cert_file": None,
                       "created_at": "", "updated_at": ""}),
         ("/tenant-providers", {"id": "tp-drill", "tenant_id": "t-drill", "provider_id": "p-up",

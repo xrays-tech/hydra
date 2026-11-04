@@ -679,7 +679,6 @@ mod tests {
             fidelity: crate::cluster::content::FidelityRows {
                 limit_roles: Vec::new(),
                 provider_keys: Vec::new(),
-                tenant_token_hashes: Vec::new(),
                 provider_models: Vec::new(),
                 tenant_providers: Vec::new(),
                 tenant_models: Vec::new(),
@@ -719,7 +718,6 @@ mod tests {
                 id: "t1".into(),
                 name: "T".into(),
                 domain: "acme.com".into(),
-                auth_url: "https://auth.acme.com/v".into(),
                 cert_key: None,
                 cert_file: None,
                 enabled: true,

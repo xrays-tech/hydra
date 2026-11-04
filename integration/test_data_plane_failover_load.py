@@ -75,7 +75,7 @@ failures = []
 
 
 class MockUpstream(BaseHTTPRequestHandler):
-    """Answers the tenant's `auth_url` and the upstream chat completion, so a proxied request is real."""
+    """Answers the tenant's `the retired auth column` and the upstream chat completion, so a proxied request is real."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -235,7 +235,6 @@ def seed_proxy_fixture(node):
         ("/provider-keys", {"id": "pk-load", "provider_id": "p-load", "api_key": "sk-up",
                             "created_at": ""}),
         ("/tenants", {"id": "t-load", "name": "Load", "domain": "load.local",
-                      "auth_url": f"{upstream}/auth", "enabled": True,
                       "cert_key": None, "cert_file": None,
                       "created_at": "", "updated_at": ""}),
         ("/tenant-providers", {"id": "tp-load", "tenant_id": "t-load", "provider_id": "p-load",

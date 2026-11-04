@@ -1,18 +1,13 @@
-//! The tenant access-token lifecycle on the **management** API (migration 0009):
-//! set / rotate / clear, the `has_access_token` view, and that the token is
-//! never echoed back.
+//! The tenant access-token lifecycle on the **management** API.
 //!
-//! The self-service surface lives on the **data plane**, where a tenant can
-//! reach it without the operator exposing the whole management API: the read
-//! endpoints under `/tenant/{tenant_id}/api/v1/`. (The cache-invalidation
-//! endpoint that used to headline that surface was retired with the external-auth
-//! surface, T10 Stage B.) Their tests live in `tests/tenant_api.rs` (single node)
-//! and `tests/tenant_api_cluster.rs` (real Redis), and the contract is
-//! `dev-docs/design-tenant-api.md`. The five tests that used to live here drove
-//! the old management-plane invalidation route; each of
-//! their assertions is carried by a data-plane test (see the T9 record in
-//! `dev-docs/aegis/plans/2026-09-17-tenant-api.md`), so this file no longer
-//! asserts anything about cache invalidation.
+//! Tokens live in the `tenant_access_token` table. The management API creates,
+//! lists, and deletes them; the self-service surface lives on the **data plane**
+//! under `/tenant/{tenant_id}/api/v1/` (see `tests/tenant_api.rs` and
+//! `tests/tenant_api_cluster.rs`, contract `dev-docs/design-tenant-api.md`).
+//!
+//! The old single-column tenant token field and its old view are
+//! gone (T10 Stage D). The plaintext token is minted by the management API and
+//! returned ONCE; list and read routes never carry the token or its hash.
 
 #![cfg(all(feature = "db", feature = "http-client", feature = "proxy"))]
 
@@ -31,7 +26,6 @@ use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 
 const TOKEN: &str = "test-admin-token";
-const TENANT_TOKEN: &str = "sk-tenant-self-service-0123456789abcdef";
 
 /// See `common::ephemeral_port`: no bind-then-release race (the previous
 /// local copy could hand two concurrent tests the same port).
@@ -90,15 +84,17 @@ where
     panic!("admin server never ready");
 }
 
-async fn create_tenant(port: u16, id: &str, token: Option<&str>) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "id": id, "name": "Acme", "domain": format!("{id}.test"),
-        "auth_url": "https://auth.example.com/v1/verify",
-        "enabled": true, "created_at": "", "updated_at": ""
+async fn create_tenant(port: u16, id: &str) -> serde_json::Value {
+    let body = serde_json::json!({
+        "id": id,
+        "name": "Acme",
+        "domain": format!("{id}.test"),
+        "cert_key": null,
+        "cert_file": null,
+        "enabled": true,
+        "created_at": "",
+        "updated_at": "",
     });
-    if let Some(t) = token {
-        body["access_token"] = serde_json::Value::String(t.to_string());
-    }
     wait_ready(|| {
         let c = client();
         let b = body.clone();
@@ -118,108 +114,173 @@ async fn create_tenant(port: u16, id: &str, token: Option<&str>) -> serde_json::
     .await
 }
 
-#[tokio::test]
-async fn tenant_token_set_never_echoed_and_has_flag() {
-    let port = start_admin(admin_state().await);
-    let created = create_tenant(port, "t-acme", Some(TENANT_TOKEN)).await;
-    assert_eq!(created["has_access_token"], true, "got {created}");
-    let body = created.to_string();
-    assert!(!body.contains("access_token_hash"), "hash leaked: {body}");
-    assert!(!body.contains(TENANT_TOKEN), "token leaked: {body}");
-    // list view also carries the flag
-    let list: serde_json::Value = client()
-        .get(format!("http://127.0.0.1:{port}/api/v1/tenants"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .send()
-        .await
-        .expect("list")
-        .json()
-        .await
-        .expect("json");
-    let row = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["id"] == "t-acme")
-        .expect("row");
-    assert_eq!(row["has_access_token"], true, "got {list}");
-    assert!(
-        !row.to_string().contains("access_token_hash"),
-        "hash leaked in list"
-    );
-}
-
-#[tokio::test]
-async fn tenant_token_blank_keeps_and_empty_clears() {
-    let port = start_admin(admin_state().await);
-    create_tenant(port, "t-rot", Some(TENANT_TOKEN)).await;
-    let c = client();
-    // blank (null) keeps the token
-    let body = serde_json::json!({
-        "id": "t-rot", "name": "Rot", "domain": "t-rot.test",
-        "auth_url": "https://auth.example.com/v1/verify", "enabled": true,
-        "created_at": "", "updated_at": "", "access_token": null
-    });
-    let r = c
-        .put(format!("http://127.0.0.1:{port}/api/v1/tenants/t-rot"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .json(&body)
-        .send()
-        .await
-        .expect("put");
-    let updated: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(
-        updated["has_access_token"], true,
-        "blank must keep: got {updated}"
-    );
-    // explicit "" clears
-    let body2 = serde_json::json!({
-        "id": "t-rot", "name": "Rot", "domain": "t-rot.test",
-        "auth_url": "https://auth.example.com/v1/verify", "enabled": true,
-        "created_at": "", "updated_at": "", "access_token": ""
-    });
-    let r2 = c
-        .put(format!("http://127.0.0.1:{port}/api/v1/tenants/t-rot"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .json(&body2)
-        .send()
-        .await
-        .expect("put2");
-    let cleared: serde_json::Value = r2.json().await.expect("json");
-    assert_eq!(
-        cleared["has_access_token"], false,
-        "empty must clear: got {cleared}"
-    );
-}
-
-#[tokio::test]
-async fn tenant_token_too_short_rejected_400() {
-    let port = start_admin(admin_state().await);
-    let body = serde_json::json!({
-        "id": "t-short", "name": "S", "domain": "t-short.test",
-        "auth_url": "https://auth.example.com/v1/verify", "enabled": true,
-        "created_at": "", "updated_at": "", "access_token": "short"
-    });
-    let r = wait_ready(|| {
+async fn create_access_token(port: u16, tenant_id: &str, name: &str) -> serde_json::Value {
+    let body = serde_json::json!({ "name": name });
+    wait_ready(|| {
         let c = client();
         let b = body.clone();
+        let u = format!("http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/access-tokens");
         Box::pin(async move {
-            c.post(format!("http://127.0.0.1:{port}/api/v1/tenants"))
+            match c
+                .post(u)
                 .header("authorization", format!("Bearer {TOKEN}"))
                 .json(&b)
+                .send()
+                .await
+            {
+                Ok(r) => Some(r.json().await.expect("json")),
+                Err(_) => None,
+            }
+        })
+    })
+    .await
+}
+
+async fn list_access_tokens(port: u16, tenant_id: &str) -> serde_json::Value {
+    wait_ready(|| {
+        let c = client();
+        let u = format!("http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/access-tokens");
+        Box::pin(async move {
+            match c
+                .get(u)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .send()
+                .await
+            {
+                Ok(r) => Some(r.json().await.expect("json")),
+                Err(_) => None,
+            }
+        })
+    })
+    .await
+}
+
+async fn delete_access_token(port: u16, tenant_id: &str, token_id: &str) -> reqwest::Response {
+    wait_ready(|| {
+        let c = client();
+        let u =
+            format!("http://127.0.0.1:{port}/api/v1/tenants/{tenant_id}/access-tokens/{token_id}");
+        Box::pin(async move {
+            c.delete(u)
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .send()
                 .await
                 .ok()
         })
     })
-    .await;
-    assert_eq!(r.status(), 400);
-    let body: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "invalid_access_token", "got {body}");
+    .await
+}
+
+#[tokio::test]
+async fn mints_a_tenant_access_token_and_never_echoes_the_plaintext_or_hash() {
+    let port = start_admin(admin_state().await);
+    create_tenant(port, "t-acme").await;
+    let created = create_access_token(port, "t-acme", "ci").await;
+    assert_eq!(created["name"], "ci", "got {created}");
+    assert!(
+        created["token"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("ht_"),
+        "the mint response must carry the plaintext once: {created}"
+    );
+
+    let plaintext = created["token"].as_str().unwrap_or_default();
+    let list_value = list_access_tokens(port, "t-acme").await;
+    let rows = list_value.as_array().expect("list");
+    let row = rows
+        .iter()
+        .find(|r| r["id"] == created["id"])
+        .expect("token row");
+    assert_eq!(row["name"], "ci", "got {row}");
+    assert!(
+        row["token"].is_null(),
+        "the list must not echo the plaintext: {row}"
+    );
+    let list_text = list_value.to_string();
+    let forbidden_hash_key = "access_token".to_owned() + "_hash";
+    assert!(
+        !list_text.contains(&forbidden_hash_key),
+        "hash leaked in list: {list_text}"
+    );
+    assert!(
+        !list_text.contains(plaintext),
+        "plaintext leaked in list: {list_text}"
+    );
+}
+
+#[tokio::test]
+async fn deletes_an_access_token_without_touching_the_tenant() {
+    let port = start_admin(admin_state().await);
+    create_tenant(port, "t-del").await;
+    let created = create_access_token(port, "t-del", "ci").await;
+    let token_id = created["id"].as_str().expect("token id");
+
+    let deleted = delete_access_token(port, "t-del", token_id).await;
+    assert_eq!(deleted.status().as_u16(), 204, "delete must report success");
+    let list_value = list_access_tokens(port, "t-del").await;
+    assert!(
+        list_value.as_array().expect("list").is_empty(),
+        "deleted token is still visible: {list_value:?}"
+    );
+
+    let tenants: serde_json::Value = client()
+        .get(format!("http://127.0.0.1:{port}/api/v1/tenants"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("list tenants")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        tenants
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "t-del"),
+        "deleting the token must not delete the tenant: {tenants}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_a_blank_access_token_name() {
+    let port = start_admin(admin_state().await);
+    create_tenant(port, "t-name").await;
+    let body = serde_json::json!({ "name": "   " });
+    let r = client()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/v1/tenants/t-name/access-tokens"
+        ))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(r.status().as_u16(), 400, "got {r:?}");
+    let e: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(e["error"]["code"], "invalid_name", "got {e}");
+}
+
+#[tokio::test]
+async fn rejects_an_unknown_tenant_access_token_create() {
+    let port = start_admin(admin_state().await);
+    let r = client()
+        .post(format!(
+            "http://127.0.0.1:{port}/api/v1/tenants/missing/access-tokens"
+        ))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({ "name": "ci" }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(r.status().as_u16(), 404, "got {r:?}");
+    let e: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(e["error"]["code"], "not_found", "got {e}");
 }
 
 // ---------------------------------------------------------------------------
-// C16 — the old management-plane tenant route is GONE
+// C16 — the old management-plane tenant token route is GONE
 // ---------------------------------------------------------------------------
 
 /// Both invalidation shapes used to be reachable from here: the tenant self-service
@@ -241,13 +302,15 @@ async fn tenant_token_too_short_rejected_400() {
 #[tokio::test]
 async fn the_retired_auth_cache_management_shapes_are_gone() {
     let port = start_admin(admin_state().await);
-    create_tenant(port, "t-gone", Some(TENANT_TOKEN)).await;
+    create_tenant(port, "t-gone").await;
+    let created = create_access_token(port, "t-gone", "ci").await;
+    let token = created["token"].as_str().expect("token");
     let url = format!("http://127.0.0.1:{port}/api/v1/auth/cache");
 
     // (a) The tenant token: 200 while the old route existed, 401 now.
     let r = client()
         .post(&url)
-        .header("authorization", format!("Bearer {TENANT_TOKEN}"))
+        .header("authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("request");

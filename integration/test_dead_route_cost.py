@@ -203,7 +203,6 @@ def seed(dead_endpoint, dead_only=False, admin_port=ADMIN):
                  ("provider-keys", {"id": "pk-live", "provider_id": "p-live", "api_key": "sk-live",
                                     "created_at": ""})]
     rows += [("tenants", {"id": "t1", "name": "T", "domain": "deadroute.local",
-                          "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                           "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
              ("tenant-providers", {"id": "tp-dead", "tenant_id": "t1", "provider_id": "p-dead",
                                    "created_at": "", "updated_at": ""}),

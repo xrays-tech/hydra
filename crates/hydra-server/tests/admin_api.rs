@@ -719,7 +719,7 @@ async fn provider_key_crud_http() {
 }
 
 // ===========================================================================
-// §2.4 — tenant CRUD (auth_url required + domain UNIQUE)
+// §2.4 — tenant CRUD (domain UNIQUE + enabled update)
 // ===========================================================================
 
 #[tokio::test]
@@ -727,20 +727,8 @@ async fn tenant_crud_http() {
     let state = admin_state().await;
     let port = start_admin(state);
 
-    // auth_url empty → 400.
-    let bad = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
-    let r = req(
-        port,
-        reqwest::Method::POST,
-        "/api/v1/tenants",
-        Some(TOKEN),
-        Some(bad),
-    )
-    .await;
-    assert_eq!(r.status(), 400);
-
     // Valid.
-    let t = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let t = r#"{"id":"t1","name":"T","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
     let r = req(
         port,
         reqwest::Method::POST,
@@ -763,7 +751,7 @@ async fn tenant_crud_http() {
     assert_eq!(r.status(), 409);
 
     // PUT + DELETE.
-    let upd = r#"{"id":"t1","name":"T2","domain":"acme.com","auth_url":"https://auth.acme.com/v2","cert_key":null,"cert_file":null,"enabled":false,"created_at":"x","updated_at":""}"#;
+    let upd = r#"{"id":"t1","name":"T2","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":false,"created_at":"x","updated_at":""}"#;
     let r = req(
         port,
         reqwest::Method::PUT,
@@ -773,10 +761,7 @@ async fn tenant_crud_http() {
     )
     .await;
     assert_eq!(r.status(), 200);
-    assert_eq!(
-        r.json::<serde_json::Value>().await.unwrap()["auth_url"],
-        "https://auth.acme.com/v2"
-    );
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()["name"], "T2");
     let r = req(
         port,
         reqwest::Method::DELETE,
@@ -801,7 +786,7 @@ async fn tenant_cert_content_http() {
 
     // POST with content.
     let body = format!(
-        r#"{{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":{cert_pem:?},"cert_key_pem":{key_pem:?}}}"#,
+        r#"{{"id":"t1","name":"T","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":{cert_pem:?},"cert_key_pem":{key_pem:?}}}"#,
         cert_pem = cert_pem,
         key_pem = key_pem
     );
@@ -852,7 +837,7 @@ async fn tenant_cert_content_http() {
 
     // cert_key_pem without cert_pem → 400.
     let bad = format!(
-        r#"{{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_key_pem":{key_pem:?}}}"#,
+        r#"{{"id":"t1","name":"T","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_key_pem":{key_pem:?}}}"#,
         key_pem = key_pem
     );
     let r = req(
@@ -866,7 +851,7 @@ async fn tenant_cert_content_http() {
     assert_eq!(r.status(), 400);
 
     // Explicit clear: cert_pem "" → cert removed.
-    let clear = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"","cert_key_pem":null}"#;
+    let clear = r#"{"id":"t1","name":"T","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"","cert_key_pem":null}"#;
     let r = req(
         port,
         reqwest::Method::PUT,
@@ -897,7 +882,7 @@ async fn tenant_create_ui_payload_no_zombie_on_400() {
     let port = start_admin(state.clone());
 
     // 1. Exact admin-UI payload: blank legacy paths arrive as "" (not null).
-    let ui = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let ui = r#"{"id":"t1","name":"T","domain":"acme.com","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
     let r = req(
         port,
         reqwest::Method::POST,
@@ -919,7 +904,7 @@ async fn tenant_create_ui_payload_no_zombie_on_400() {
     assert_eq!(list[0].cert_key, None, "\"\" stored as NULL");
 
     // 2. cert_pem without cert_key_pem → 400 BEFORE the row is written.
-    let bad = r#"{"id":"t2","name":"T2","domain":"acme2.com","auth_url":"https://auth.acme.com/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----"}"#;
+    let bad = r#"{"id":"t2","name":"T2","domain":"acme2.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":"","cert_pem":"-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----"}"#;
     let r = req(
         port,
         reqwest::Method::POST,
@@ -937,7 +922,7 @@ async fn tenant_create_ui_payload_no_zombie_on_400() {
     );
 
     // 3. Non-empty but unreadable legacy path → 400 BEFORE the row is written.
-    let bad_path = r#"{"id":"t3","name":"T3","domain":"acme3.com","auth_url":"https://auth.acme.com/v","cert_file":"/nonexistent/cert.pem","cert_key":"/nonexistent/key.pem","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let bad_path = r#"{"id":"t3","name":"T3","domain":"acme3.com","cert_file":"/nonexistent/cert.pem","cert_key":"/nonexistent/key.pem","cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}"#;
     let r = req(
         port,
         reqwest::Method::POST,
@@ -969,7 +954,7 @@ async fn tenant_create_ui_payload_no_zombie_on_400() {
     )
     .unwrap();
     let legacy = format!(
-        r#"{{"id":"t4","name":"T4","domain":"acme4.com","auth_url":"https://auth.acme.com/v","cert_file":{:?},"cert_key":{:?},"cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}}"#,
+        r#"{{"id":"t4","name":"T4","domain":"acme4.com","cert_file":{:?},"cert_key":{:?},"cert_pem":null,"cert_key_pem":null,"enabled":true,"created_at":"","updated_at":""}}"#,
         cert_path.to_string_lossy(),
         key_path.to_string_lossy()
     );
@@ -1010,7 +995,7 @@ async fn tenant_provider_and_model_crud_http() {
         Some(p),
     )
     .await;
-    let t = r#"{"id":"t1","name":"T","domain":"acme.com","auth_url":"https://a.example/v","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
+    let t = r#"{"id":"t1","name":"T","domain":"acme.com","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
     let _ = req(
         port,
         reqwest::Method::POST,
@@ -1602,13 +1587,11 @@ async fn a_failed_secret_write_rolls_back_the_whole_tenant() {
         "id": "t-atomic",
         "name": "atomic",
         "domain": "atomic.example",
-        "auth_url": "https://auth.example/v",
         "cert_file": "",
         "cert_key": "",
         "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
         "cert_key_pem": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----",
         "enabled": true,
-        "access_token": "0123456789abcdef",
         "created_at": "",
         "updated_at": ""
     });
@@ -1642,10 +1625,12 @@ async fn a_failed_secret_write_rolls_back_the_whole_tenant() {
         "no tenant row may survive the rolled-back transaction"
     );
     assert!(
-        !repo::tenant_has_access_token(state.db(), "t-atomic")
+        repo::list_tenant_access_tokens(state.db())
             .await
-            .expect("has token"),
-        "no token hash may survive a rolled-back tenant write"
+            .expect("tokens")
+            .iter()
+            .all(|tok| tok.tenant_id != "t-atomic"),
+        "no tenant access token may survive a rolled-back tenant write"
     );
 }
 
@@ -1681,13 +1666,11 @@ async fn a_stale_snapshot_is_reported_in_the_response() {
         "id": "t-stale",
         "name": "stale",
         "domain": "stale.example",
-        "auth_url": "https://auth.example/v",
         "cert_file": "",
         "cert_key": "",
         "cert_pem": null,
         "cert_key_pem": null,
         "enabled": true,
-        "access_token": null,
         "created_at": "",
         "updated_at": ""
     });
@@ -1701,10 +1684,6 @@ async fn a_stale_snapshot_is_reported_in_the_response() {
     .await;
     assert_eq!(r.status(), 201, "the write itself succeeded");
     let created: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(
-        created["has_access_token"], false,
-        "the pre-existing field is still there: {created}"
-    );
     assert_eq!(
         created["snapshot_stale"], true,
         "the response must say the runtime snapshot is behind the committed DB: {created}"
@@ -1745,13 +1724,11 @@ async fn a_normal_write_reports_a_fresh_snapshot() {
         "id": "t-fresh",
         "name": "fresh",
         "domain": "fresh.example",
-        "auth_url": "https://auth.example/v",
         "cert_file": "",
         "cert_key": "",
         "cert_pem": null,
         "cert_key_pem": null,
         "enabled": true,
-        "access_token": "0123456789abcdef",
         "created_at": "",
         "updated_at": ""
     });
@@ -1766,13 +1743,7 @@ async fn a_normal_write_reports_a_fresh_snapshot() {
     assert_eq!(r.status(), 201);
     let created: serde_json::Value = r.json().await.expect("json");
     assert_eq!(created["snapshot_stale"], false, "got {created}");
-    assert_eq!(created["has_access_token"], true, "got {created}");
-    assert!(
-        repo::tenant_has_access_token(state.db(), "t-fresh")
-            .await
-            .expect("has token"),
-        "the token hash committed with the row"
-    );
+    assert_eq!(created["id"], "t-fresh", "got {created}");
 }
 
 // ===========================================================================
@@ -2031,7 +2002,6 @@ async fn cat_seed_tenant(state: &AdminState, id: &str, domain: &str) {
             id: id.into(),
             name: id.into(),
             domain: domain.into(),
-            auth_url: "https://auth.example.com/v".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -2286,7 +2256,6 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
             id: "t1".into(),
             name: "T1".into(),
             domain: "acme.test".into(),
-            auth_url: "https://auth.example.com/v".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -2558,56 +2527,6 @@ async fn provider_key_put_is_atomic_and_keeps_the_previous_key_on_failure() {
     let item: serde_json::Value = r.json().await.expect("json");
     assert_eq!(item["id"], "k1");
     assert_eq!(item["provider_id"], "p1");
-}
-
-// ===========================================================================
-// Audit §4 "zombie tenant" — a rejected access_token must not leave a
-// committed, enabled tenant behind. The certificate path already pre-validated
-// before the INSERT; the access-token path did not.
-// ===========================================================================
-
-#[tokio::test]
-async fn tenant_create_with_a_too_short_access_token_leaves_no_zombie() {
-    let state = admin_state().await;
-    let port = start_admin(state.clone());
-
-    let bad = r#"{"id":"zombie","name":"Z","domain":"zombie.example","auth_url":"https://auth.example/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"access_token":"short","created_at":"","updated_at":""}"#;
-    let r = req(
-        port,
-        reqwest::Method::POST,
-        "/api/v1/tenants",
-        Some(TOKEN),
-        Some(bad),
-    )
-    .await;
-    assert_eq!(r.status(), 400, "a 5-char access_token must be rejected");
-    let e: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(e["error"]["code"], "invalid_access_token");
-
-    // THE POINT: no row. Before the pre-check the tenant was inserted first,
-    // so the operator saw "create failed" while an enabled tenant was live -
-    // and the retry hit the UNIQUE constraint, which is how the zombie stays.
-    let tenants = repo::list_tenants(state.db()).await.expect("list");
-    assert!(
-        tenants.iter().all(|t| t.id != "zombie"),
-        "the 400 left a committed tenant behind: {:?}",
-        tenants.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
-    );
-    assert!(state.store.snapshot().tenants_by_domain.is_empty());
-
-    // Control: a 16-character token is accepted and stored (hashed).
-    let ok = r#"{"id":"real","name":"R","domain":"real.example","auth_url":"https://auth.example/v","cert_file":"","cert_key":"","cert_pem":null,"cert_key_pem":null,"enabled":true,"access_token":"0123456789abcdef","created_at":"","updated_at":""}"#;
-    let r = req(
-        port,
-        reqwest::Method::POST,
-        "/api/v1/tenants",
-        Some(TOKEN),
-        Some(ok),
-    )
-    .await;
-    assert_eq!(r.status(), 201);
-    let created: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(created["has_access_token"], true);
 }
 
 // ===========================================================================
@@ -2893,7 +2812,6 @@ async fn user_hierarchy_reads_http() {
             id: "t1".into(),
             name: "hier-one".into(),
             domain: "hier1.example".into(),
-            auth_url: "https://auth.hier1.example/verify".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -2911,7 +2829,6 @@ async fn user_hierarchy_reads_http() {
             id: "t2".into(),
             name: "hier-two".into(),
             domain: "hier2.example".into(),
-            auth_url: "https://auth.hier2.example/verify".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,

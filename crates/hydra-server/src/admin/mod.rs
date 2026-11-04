@@ -530,8 +530,7 @@ impl AdminService {
             return cluster_api::cluster_status(&self.state, trace_id).await;
         }
         // The tenant auth-url probe used to be served here. It was retired with
-        // the external auth surface (T10 Stage B); `tenant.auth_url` remains a stored
-        // tenant field, but there is no admin probe route for it now.
+        // the external auth surface (T10 Stage B), and the stored tenant field went with it in Stage D.
         // Tenant model catalog (design-tenant-model-catalog §2.3, P1): GET
         // /api/v1/tenants/{tenant_id}/models — read-only aggregate over the
         // config snapshot (static full-set view with per-provider online

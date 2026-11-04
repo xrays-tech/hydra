@@ -17,8 +17,9 @@
 -- operator-visible outcome is independent of the order of the two `sub_*`
 -- statements.
 --
--- This migration does NOT touch `tenant`. The `auth_url` and `access_token_hash`
--- columns on `tenant` are deferred to Stage D and stay present here.
+-- The `tenant` columns below are removed after the legacy tables. The columns
+-- are dropped after the table drops so a partial migration leaves the legacy
+-- tables gone before a `tenant` row/column change can fail on an older DB.
 --
 -- Historical migrations that created or extended these tables are untouched;
 -- `sqlx::migrate!` checksums them, so a later deletion is the only safe way to
@@ -26,3 +27,6 @@
 DROP TABLE IF EXISTS provider_key_binding;
 DROP TABLE IF EXISTS sub_tenant_route;
 DROP TABLE IF EXISTS sub_tenant;
+
+ALTER TABLE tenant DROP COLUMN access_token_hash;
+ALTER TABLE tenant DROP COLUMN auth_url;

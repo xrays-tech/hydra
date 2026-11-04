@@ -12,9 +12,9 @@ use sqlx::SqlitePool;
 // Identity seeding helpers (multi-token / internal-auth model)
 //
 // The tenant gate resolves a bearer from `ConfigData.tenant_tokens`, which the
-// loader builds from the `tenant_access_token` TABLE (enabled rows only) — a
-// hash written to the legacy `tenant.access_token_hash` column is no longer
-// what the gate reads. The client-api-key path (`enforce_auth`) resolves
+// loader builds from the `tenant_access_token` TABLE (enabled rows only). The
+// retired single-column token field is gone (T10 Stage D); the gate reads the
+// table-backed rows only. The client-api-key path (`enforce_auth`) resolves
 // `ConfigData.users_by_api_key_hash`, derived from the `user_group` / `user`
 // / `user_api_key` tables. These helpers write the rows the snapshot is
 // actually built from.
@@ -282,7 +282,6 @@ pub fn hydrated(
         fidelity: hydra_server::cluster::content::FidelityRows {
             limit_roles: Vec::new(),
             provider_keys: Vec::new(),
-            tenant_token_hashes: Vec::new(),
             provider_models: Vec::new(),
             tenant_providers: Vec::new(),
             tenant_models: Vec::new(),

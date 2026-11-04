@@ -264,7 +264,7 @@ pub fn spawn_gc_task(limiter: std::sync::Arc<TenantApiLimiter>, interval: Durati
 
 /// SHA-256 hex of a presented token, for use as a limiter key. Owned here so the
 /// limiter never sees a plaintext token (the same digest the tenant gate compares
-/// against `tenant.access_token_hash`).
+/// against `tenant_access_token.token_hash`).
 #[must_use]
 pub fn token_digest(token: &str) -> String {
     hydra_core::auth::sha256_hex_string(token.as_bytes())

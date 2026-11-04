@@ -77,7 +77,6 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
             id: id.into(),
             name: format!("{id}-name"),
             domain: domain.into(),
-            auth_url: format!("https://auth.{domain}/verify"),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -89,9 +88,8 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
     .expect("insert tenant");
     if let Some(tok) = token {
         // T3 tenant-API gate: the loader builds `ConfigData.tenant_tokens` from
-        // the ENABLED `tenant_access_token` ROWS. The legacy single-hash column
-        // (`tenant.access_token_hash`, written by `set_tenant_access_token_hash`)
-        // is no longer consulted, so the token must live in the table.
+        // the ENABLED `tenant_access_token` ROWS. The old single-column token field
+        // is gone (T10 Stage D), so the token must live in the table.
         common::seed_tenant_access_token(pool, id, "usage", tok, true, None).await;
     }
 }

@@ -55,7 +55,7 @@ fn ephemeral_port() -> u16 {
 }
 
 /// Seed the test DB with one tenant/provider/model/key + limit role.
-async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
+async fn seed(pool: &sqlx::SqlitePool, upstream: &str) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -91,7 +91,6 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
             id: "t1".into(),
             name: "T".into(),
             domain: "localhost".into(),
-            auth_url: auth_url.into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -153,7 +152,6 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
     .await
     .unwrap();
     // T3 internal auth: the data-plane gate decides from the identity index
-    // derived from user_group/user/user_api_key rows; `auth_url` is data only.
     common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
 
@@ -174,7 +172,7 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
 #[tokio::test]
 async fn tenant_cert_gauge_tracks_snapshot_changes() {
     let pool = common::setup_pool().await;
-    seed(&pool, "http://127.0.0.1:1/auth", "http://127.0.0.1:2").await;
+    seed(&pool, "http://127.0.0.1:2").await;
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
@@ -201,7 +199,6 @@ async fn tenant_cert_gauge_tracks_snapshot_changes() {
             id: "t-cert".into(),
             name: "cert".into(),
             domain: domain.into(),
-            auth_url: "https://auth.example/v".into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -267,12 +264,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
 
     // --- seed + build shared state ------------------------------------------
     let pool = common::setup_pool().await;
-    seed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream_server.uri(),
-    )
-    .await;
+    seed(&pool, &upstream_server.uri()).await;
 
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
@@ -506,12 +498,7 @@ async fn all_candidates_failed_produces_empty_provider_sample() {
 
     // --- seed + build shared state (same shape as the success test) ---------
     let pool = common::setup_pool().await;
-    seed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream_server.uri(),
-    )
-    .await;
+    seed(&pool, &upstream_server.uri()).await;
 
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())

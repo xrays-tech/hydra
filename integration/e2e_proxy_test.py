@@ -156,7 +156,6 @@ def main():
               "created_at": ""}),
             ("tenant", "/tenants",
              {"id": "local", "name": "Local", "domain": "localhost",
-              "auth_url": f"http://localhost:{MOCK_AUTH_PORT}", "enabled": True,
               "cert_key": None, "cert_file": None,
               "created_at": "", "updated_at": ""}),
             ("tenant-provider", "/tenant-providers",

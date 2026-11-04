@@ -213,8 +213,7 @@ def main():
 
     def seed_tenant(tid, domain, crt, key):
         return admin("POST", "/api/v1/tenants", {
-            "id": tid, "name": tid, "domain": domain, "auth_url": "http://127.0.0.1:18999",
-            "enabled": True, "cert_file": crt, "cert_key": key,
+            "id": tid, "name": tid, "domain": domain,             "enabled": True, "cert_file": crt, "cert_key": key,
             "created_at": "", "updated_at": ""})
 
     # (1) a tenant cert becomes live with NO explicit /reload
@@ -242,8 +241,7 @@ def main():
     # (1)+(2) the hot rotation: PUT only, no /reload, no restart
     print("== §3.1 hot rotation: PUT the tenant with the NEW paths (no /reload, no restart)")
     st, out = admin("PUT", "/api/v1/tenants/t1", {
-        "id": "t1", "name": "t1", "domain": "load.local", "auth_url": "http://127.0.0.1:18999",
-        "enabled": True, "cert_file": crt_b, "cert_key": key_b,
+        "id": "t1", "name": "t1", "domain": "load.local",         "enabled": True, "cert_file": crt_b, "cert_key": key_b,
         "created_at": "", "updated_at": ""})
     check("PUT accepted", st in (200, 201), f"{st} {out[:80]}")
     time.sleep(0.7)

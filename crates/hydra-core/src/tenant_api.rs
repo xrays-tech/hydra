@@ -182,7 +182,7 @@ pub struct TenantApiRoute<'a> {
 /// near miss (`.../models`, `.../typo`, a trailing slash, an extra segment) is
 /// `None`. The caller then answers `404` **locally** — it must not let such a
 /// path fall through to the proxy pipeline, where a tenant token would be read
-/// as a client api-key and POSTed to the tenant's `auth_url` (design §3.2).
+/// as a client api-key and sent through the retired external-auth path (design §3.2).
 #[must_use]
 pub fn parse_route<'a>(path: &'a str) -> Option<TenantApiRoute<'a>> {
     let rest = path.strip_prefix("/tenant/")?;
@@ -364,7 +364,7 @@ impl TenantWriteRoute<'_> {
 /// wrong method, a missing or extra path segment, a wrong version, an empty
 /// tenant id — is `None`, which the caller answers as a **local `404`** (it must
 /// never fall through to the proxy pipeline, where a tenant token would be read
-/// as a client api-key and POSTed to the tenant's `auth_url`).
+/// as a client api-key and sent through the retired external-auth path).
 ///
 /// The `{id}` segment is the **raw** path segment: an identity-plane row id is
 /// printable ASCII with no `/` (D9), so the raw segment and the stored value are

@@ -780,20 +780,13 @@ struct TenantUpsert {
     /// Private key PEM (content mode, primary). Required when `cert_pem` set.
     #[serde(default)]
     cert_key_pem: Option<String>,
-    /// Tenant self-service access token (migration 0009): stored as a
-    /// SHA-256 hex hash only, never echoed. `Some("")` clears the token;
-    /// `None` (or a missing field) keeps the current token on edit.
-    #[serde(default)]
-    access_token: Option<String>,
 }
 
-/// Tenant response view: the entity plus a derived `has_access_token` flag.
-/// The token hash itself is one-way and write-only — never serialized.
+/// Tenant response view: the entity plus the snapshot staleness flag.
 #[derive(Serialize)]
 struct TenantView {
     #[serde(flatten)]
     tenant: Tenant,
-    has_access_token: bool,
     /// The write IS committed; this only says the post-write reload failed, so
     /// the running config still shows the previous value. Process-level flag —
     /// see `AdminState::snapshot_stale`.
@@ -801,19 +794,17 @@ struct TenantView {
 }
 
 impl TenantView {
-    fn new(tenant: Tenant, has_access_token: bool, snapshot_stale: bool) -> Self {
+    fn new(tenant: Tenant, snapshot_stale: bool) -> Self {
         Self {
             tenant,
-            has_access_token,
             snapshot_stale,
         }
     }
 
     /// Build from live admin state (the common case).
-    fn from_state(state: &AdminState, tenant: Tenant, has_access_token: bool) -> Self {
+    fn from_state(state: &AdminState, tenant: Tenant) -> Self {
         Self::new(
             tenant,
-            has_access_token,
             state
                 .snapshot_stale
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -947,95 +938,18 @@ fn resolve_tenant_cert_write(
 }
 
 /// The two optional secret writes a tenant write may carry:
-/// `(token_hash, cert)` — see [`crate::db::TenantWrite`].
-///
-/// Naming the tuple keeps the helper's signature readable and the DB layer's
-/// contract explicit.
-type SecretWrites = (
-    Option<Option<String>>,
-    Option<(Option<String>, Option<String>)>,
-);
-
-/// Turn the handler-level certificate action and the body's `access_token` into
-/// the two optional writes that [`crate::db::write_tenant`] applies inside its
+/// Certificate write that [`crate::db::write_tenant`] applies inside its
 /// transaction.
-///
-/// PURE on purpose: every validation and every hash happens BEFORE the
-/// transaction opens, so a rejected token can never leave a committed tenant
-/// behind (audit §4 "zombie tenant"), and the DB layer receives plain values.
-///
-/// Semantics preserved from the previous step-by-step helpers:
-/// - certificate: `None` = leave alone, `Clear` = clear, `Content` = replace;
-/// - access token: body `None` = leave alone, `Some("")` = clear,
-///   `Some(non-empty)` = set/rotate (stored as a SHA-256 hex digest only).
 #[allow(clippy::result_large_err)]
-fn resolved_secret_writes(
-    action: CertWrite,
-    access_token: &Option<String>,
-    trace_id: &str,
-) -> Result<SecretWrites, Resp> {
-    let cert = match action {
+fn resolved_cert_write(action: CertWrite) -> Option<(Option<String>, Option<String>)> {
+    match action {
         CertWrite::None => None,
         CertWrite::Clear => Some((None, None)),
         CertWrite::Content {
             cert_pem,
             cert_key_pem,
         } => Some((Some(cert_pem), Some(cert_key_pem))),
-    };
-    let token_hash = match access_token {
-        None => None,
-        Some(raw) => {
-            let token = raw.trim();
-            if token.is_empty() {
-                Some(None) // empty means "clear the token"
-            } else {
-                // Defence in depth: `validate_access_token_shape` already ran
-                // before the write, but the rule lives here too so the helper
-                // cannot silently accept a short token if a caller forgets.
-                if token.len() < crate::tenant_api::MIN_TENANT_TOKEN_LEN {
-                    return Err(err_json(
-                        400,
-                        "invalid_access_token",
-                        &format!(
-                            "access_token must be at least {} characters",
-                            crate::tenant_api::MIN_TENANT_TOKEN_LEN
-                        ),
-                        trace_id,
-                    ));
-                }
-                Some(Some(sha256_hex_str(token)))
-            }
-        }
-    };
-    Ok((token_hash, cert))
-}
-
-/// Shape-check a tenant access token BEFORE the tenant row is written.
-///
-/// The certificate path already pre-validates for exactly this reason
-/// (`resolve_tenant_cert_write` before `insert_tenant`): a 4xx that arrives
-/// after the INSERT leaves a tenant the UI reported as "create failed" but
-/// which exists and is enabled - and a retry then hits the UNIQUE constraint,
-/// so the operator gives up and keeps the zombie (audit section 4).
-#[allow(clippy::result_large_err)]
-fn validate_access_token_shape(access_token: &Option<String>, trace_id: &str) -> Result<(), Resp> {
-    let Some(raw) = access_token else {
-        return Ok(());
-    };
-    let token = raw.trim();
-    // Empty means "clear the token" (see `apply_tenant_access_token_write`).
-    if !token.is_empty() && token.len() < crate::tenant_api::MIN_TENANT_TOKEN_LEN {
-        return Err(err_json(
-            400,
-            "invalid_access_token",
-            &format!(
-                "access_token must be at least {} characters",
-                crate::tenant_api::MIN_TENANT_TOKEN_LEN
-            ),
-            trace_id,
-        ));
     }
-    Ok(())
 }
 
 pub(super) async fn tenant_collection(
@@ -1047,17 +961,9 @@ pub(super) async fn tenant_collection(
     if method == "GET" {
         match crate::db::list_tenants(state.db()).await {
             Ok(rows) => {
-                let with_token: HashSet<String> =
-                    crate::db::list_tenant_access_token_hashes(state.db())
-                        .await
-                        .map(|pairs| pairs.into_iter().map(|(id, _)| id).collect())
-                        .unwrap_or_default();
                 let views: Vec<TenantView> = rows
                     .into_iter()
-                    .map(|t| {
-                        let has = with_token.contains(&t.id);
-                        TenantView::from_state(state, t, has)
-                    })
+                    .map(|t| TenantView::from_state(state, t))
                     .collect();
                 ok_json(200, &views)
             }
@@ -1073,16 +979,6 @@ pub(super) async fn tenant_collection(
             Err(r) => return r,
         };
         let mut t = up.tenant;
-        // auth_url is mandatory (design §11.1): empty ⇒ 400 (NOT NULL only
-        // catches SQL NULL, not the empty string).
-        if t.auth_url.trim().is_empty() {
-            return err_json(
-                400,
-                "missing_required_field",
-                "auth_url is required",
-                trace_id,
-            );
-        }
         if t.id.is_empty() {
             t.id = gen_id();
         }
@@ -1107,27 +1003,16 @@ pub(super) async fn tenant_collection(
             Ok(a) => a,
             Err(r) => return r,
         };
-        // Same no-zombie rule for the access token: a too-short token must be
-        // rejected BEFORE the INSERT, otherwise the 400 leaves a committed,
-        // enabled tenant behind (audit §4).
-        if let Err(r) = validate_access_token_shape(&up.access_token, trace_id) {
-            return r;
-        }
-        // ONE transaction: the row, its certificate and its token hash commit
-        // together or not at all (audit §2.2 G-P1). Writing them in separate
-        // statements is the "500 but the change is live" defect.
-        let (token_hash, cert) =
-            match resolved_secret_writes(cert_action, &up.access_token, trace_id) {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+        // ONE transaction: the tenant row and its certificate commit together or
+        // not at all (audit §2.2 G-P1). Access tokens live in their own table
+        // and have their own write path.
+        let cert = resolved_cert_write(cert_action);
         if let Err(e) = crate::db::write_tenant(
             state.db(),
             state.key_provider.as_ref(),
             crate::db::TenantWrite {
                 tenant: &t,
                 is_create: true,
-                token_hash,
                 cert,
             },
         )
@@ -1135,13 +1020,10 @@ pub(super) async fn tenant_collection(
         {
             return db_err_resp(e, trace_id);
         }
-        let has = crate::db::tenant_has_access_token(state.db(), &t.id)
-            .await
-            .unwrap_or(false);
         if let Some(r) = reload_best_effort(state, trace_id).await {
             return r;
         }
-        ok_json(201, &TenantView::from_state(state, t, has))
+        ok_json(201, &TenantView::from_state(state, t))
     } else {
         method_not_allowed(trace_id)
     }
@@ -1156,12 +1038,7 @@ pub(super) async fn tenant_item(
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_tenant(state.db(), id).await {
-            Ok(t) => {
-                let has = crate::db::tenant_has_access_token(state.db(), id)
-                    .await
-                    .unwrap_or(false);
-                ok_json(200, &TenantView::from_state(state, t, has))
-            }
+            Ok(t) => ok_json(200, &TenantView::from_state(state, t)),
             Err(e) if is_not_found(&e) => err_json(404, "not_found", "tenant not found", trace_id),
             Err(e) => db_err_resp(e, trace_id),
         },
@@ -1189,27 +1066,13 @@ pub(super) async fn tenant_item(
                 Ok(a) => a,
                 Err(r) => return r,
             };
-            // Pre-validate for the same reason as POST: a rejected token must
-            // not leave the tenant half-updated.
-            if let Err(r) = validate_access_token_shape(&up.access_token, trace_id) {
-                return r;
-            }
-            // One transaction, exactly like create (see above).
-            let (token_hash, cert) =
-                match resolved_secret_writes(cert_action, &up.access_token, trace_id) {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                };
-            // Which token state did THIS request write? (`None` = untouched.)
-            // Computed before the struct literal moves `token_hash`.
-            let written_token_state = token_hash.as_ref().map(|h| h.is_some());
+            let cert = resolved_cert_write(cert_action);
             if let Err(e) = crate::db::write_tenant(
                 state.db(),
                 state.key_provider.as_ref(),
                 crate::db::TenantWrite {
                     tenant: &t,
                     is_create: false,
-                    token_hash,
                     cert,
                 },
             )
@@ -1217,24 +1080,12 @@ pub(super) async fn tenant_item(
             {
                 return db_err_resp(e, trace_id);
             }
-            // The write IS committed at this point, so the answer must not
-            // depend on a second read succeeding: a failed re-read used to be
-            // reported as `404 not found` (and as `has_access_token: false`) for a
-            // tenant that had just been written — "reported as failed but
-            // actually live", one step later than §7-3 fixed it.
-            let has = match written_token_state {
-                // We know what we just wrote, so answer from that.
-                Some(written) => written,
-                None => crate::db::tenant_has_access_token(state.db(), id)
-                    .await
-                    .unwrap_or(true), // read failed ⇒ do not claim "no token"
-            };
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
                     if let Some(r) = reload_best_effort(state, trace_id).await {
                         return r;
                     }
-                    ok_json(200, &TenantView::from_state(state, t, has))
+                    ok_json(200, &TenantView::from_state(state, t))
                 }
                 Err(e) if is_not_found(&e) => {
                     err_json(404, "not_found", "tenant not found", trace_id)

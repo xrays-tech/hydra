@@ -150,9 +150,9 @@ def chat_body(model="echo", pad=0):
     return json.dumps(envelope).encode()
 
 
-def proxied(body_bytes, timeout=30):
-    return call("POST", f"http://127.0.0.1:{DATA}/v1/chat/completions", token="sk-tenant-1",
-                host=DOMAIN, raw_body=body_bytes, timeout=timeout)
+def proxied(body_bytes, timeout=30, token=None):
+    return call("POST", f"http://127.0.0.1:{DATA}/v1/chat/completions",
+                token=token or TENANT_TOKEN, host=DOMAIN, raw_body=body_bytes, timeout=timeout)
 
 
 def raw_exchange(headers: str, body: bytes, tail_behavior: str, timeout=20):
@@ -222,6 +222,7 @@ def wait_healthy(budget=25.0):
 
 
 def seed():
+    global TENANT_TOKEN
     rows = [
         ("providers", {"id": "p1", "key": "p1", "name": "P",
                        "endpoint": f"http://127.0.0.1:{UPSTREAM}", "weight": 1,
@@ -231,10 +232,8 @@ def seed():
         ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up",
                            "created_at": ""}),
         ("tenants", {"id": "t1", "name": "T", "domain": DOMAIN,
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
-                     # The TENANT API authenticates with this, not with a client key — the
-                     # first version of B7 sent `sk-tenant-1` and got 401 before the body cap.
-                     "access_token": TENANT_TOKEN,
+                     # The TENANT API authenticates with a minted tenant access token, not
+                     # with a client key; the old fixed token fixture is no longer supported.
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
         ("tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",
                               "created_at": "", "updated_at": ""}),
@@ -245,6 +244,10 @@ def seed():
         st, out = admin("POST", f"/{path}", body)
         if st not in (200, 201):
             raise SystemExit(f"[body] CANNOT VERIFY: seeding {path} -> {st} {out[:140]}")
+    st, out = admin("POST", "/tenants/t1/access-tokens", {"name": "body"})
+    if st not in (200, 201):
+        raise SystemExit(f"[body] CANNOT VERIFY: minting tenant token -> {st} {out[:140]}")
+    TENANT_TOKEN = json.loads(out)["token"]
     admin("POST", "/reload", {})
     time.sleep(0.3)
 
@@ -290,7 +293,7 @@ def main():
 
         # ---- B3: the TOTAL deadline on a client that sends half and stops -------
         headers = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {DOMAIN}\r\n"
-                   f"Authorization: Bearer sk-tenant-1\r\nContent-Type: application/json\r\n"
+                   f"Authorization: Bearer {TENANT_TOKEN}\r\nContent-Type: application/json\r\n"
                    f"Content-Length: 100000\r\n\r\n")
         raw, elapsed = raw_exchange(headers, b'{"model":"echo","messages":' + b"x" * 900,
                                     "stall", timeout=BODY_TIMEOUT + 6)
@@ -305,7 +308,7 @@ def main():
         # ---- B4: a TRUNCATED body must not reach the provider -------------------
         mark = len(RECEIVED.snapshot())
         headers4 = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {DOMAIN}\r\n"
-                    f"Authorization: Bearer sk-tenant-1\r\nContent-Type: application/json\r\n"
+                    f"Authorization: Bearer {TENANT_TOKEN}\r\nContent-Type: application/json\r\n"
                     f"Content-Length: 5000\r\n\r\n")
         raw4, elapsed4 = raw_exchange(headers4, b'{"model":"echo","messages":' + b"y" * 200,
                                       "truncate", timeout=15)
@@ -331,7 +334,7 @@ def main():
         mark_b = len(RECEIVED.snapshot())
         valid_prefix = chat_body()          # a complete, valid body …
         headers4b = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {DOMAIN}\r\n"
-                     f"Authorization: Bearer sk-tenant-1\r\nContent-Type: application/json\r\n"
+                     f"Authorization: Bearer {TENANT_TOKEN}\r\nContent-Type: application/json\r\n"
                      f"Content-Length: {len(valid_prefix) + 4096}\r\n\r\n")
         raw4b, elapsed4b = raw_exchange(headers4b, valid_prefix, "truncate", timeout=15)
         line4b = raw4b.split(b"\r\n", 1)[0].decode(errors="replace")
@@ -346,7 +349,7 @@ def main():
 
         # ---- B5: the same deadline on a CHUNKED body ---------------------------
         headers5 = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {DOMAIN}\r\n"
-                    f"Authorization: Bearer sk-tenant-1\r\nContent-Type: application/json\r\n"
+                    f"Authorization: Bearer {TENANT_TOKEN}\r\nContent-Type: application/json\r\n"
                     f"Transfer-Encoding: chunked\r\n\r\n")
         raw5, elapsed5 = raw_exchange(headers5, b"64\r\n" + b"z" * 100, "stall",
                                       timeout=BODY_TIMEOUT + 6)

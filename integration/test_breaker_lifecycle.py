@@ -185,7 +185,6 @@ def seed():
         ("/provider-keys", {"id": "pk-good", "provider_id": "p-good", "api_key": "sk-g",
                             "created_at": ""}),
         ("/tenants", {"id": "t1", "name": "T", "domain": "breaker.local",
-                      "auth_url": f"http://127.0.0.1:{GOOD_UPSTREAM}/auth", "enabled": True,
                       "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
         ("/tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p-flaky",
                                "created_at": "", "updated_at": ""}),

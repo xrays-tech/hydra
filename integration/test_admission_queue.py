@@ -76,7 +76,7 @@ class SlowUpstream(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         if length:
             self.rfile.read(length)
-        # The tenant's `auth_url` points here too, so the auth hop must get a real
+        # The tenant's `the retired auth column` points here too, so the auth hop must get a real
         # verdict — and it must NOT sleep, or every request dies at the auth gate with
         # `auth_upstream_unavailable` (which is what the first version measured).
         if self.path.startswith("/auth"):
@@ -138,7 +138,6 @@ def seed(provider_limits):
         ("tenants", {"id": "t1", "name": "T", "domain": "load.local",
                      # the /auth path is what makes the mock answer a verdict instead of
                      # a (slow) chat completion
-                     "auth_url": f"http://127.0.0.1:{UPSTREAM}/auth", "enabled": True,
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
         ("tenant-providers", {"id": "tp1", "tenant_id": "t1", "provider_id": "p1",
                               "created_at": "", "updated_at": ""}),

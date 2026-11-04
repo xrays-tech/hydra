@@ -48,12 +48,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model (`model_key`) + one key. The
 /// provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_routed(
-    pool: &sqlx::SqlitePool,
-    auth_url: &str,
-    upstream_endpoint: &str,
-    model_key: &str,
-) {
+async fn seed_routed(pool: &sqlx::SqlitePool, upstream_endpoint: &str, model_key: &str) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -89,7 +84,6 @@ async fn seed_routed(
             id: "t1".into(),
             name: "t1".into(),
             domain: "localhost".into(),
-            auth_url: auth_url.into(),
             cert_key: None,
             cert_file: None,
             enabled: true,
@@ -151,7 +145,7 @@ async fn seed_routed(
     .await
     .expect("insert limit_role");
     // T3 internal auth: the data-plane gate decides from the identity index
-    // derived from user_group/user/user_api_key rows; `auth_url` is data only.
+    // derived from user_group/user/user_api_key rows. The old auth field is gone.
     common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
 
@@ -324,13 +318,7 @@ async fn openai_streaming_usage_persists_to_sqlite() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_routed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-        "gpt-4",
-    )
-    .await;
+    seed_routed(&pool, &upstream.uri(), "gpt-4").await;
     let (state, sink) = build_state_with_recording_sink(pool.clone()).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -395,13 +383,7 @@ async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
         .await;
 
     let pool = common::setup_pool().await;
-    seed_routed(
-        &pool,
-        &format!("{}/auth", auth_server.uri()),
-        &upstream.uri(),
-        "claude-3-5-sonnet-test",
-    )
-    .await;
+    seed_routed(&pool, &upstream.uri(), "claude-3-5-sonnet-test").await;
     let (state, sink) = build_state_with_recording_sink(pool.clone()).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/messages");

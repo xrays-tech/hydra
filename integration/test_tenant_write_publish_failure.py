@@ -62,7 +62,7 @@ failures = []
 
 
 class MockUpstream(BaseHTTPRequestHandler):
-    """The tenant's `auth_url` (the tenant API gate calls it) and the upstream chat endpoint."""
+    """The tenant's `the retired auth column` (the tenant API gate calls it) and the upstream chat endpoint."""
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -188,6 +188,7 @@ class Node:
 
 
 def seed(node, upstream):
+    global TENANT_TOKEN
     for path, payload in (
         ("/providers", {"id": "p-pf", "key": "p-pf", "name": "PF", "endpoint": upstream,
                         "weight": 1, "created_at": "", "updated_at": ""}),
@@ -196,9 +197,7 @@ def seed(node, upstream):
         ("/provider-keys", {"id": "pk-pf", "provider_id": "p-pf", "api_key": "sk-up",
                             "created_at": ""}),
         ("/tenants", {"id": "t1", "name": "T", "domain": "pubfail.local",
-                      "auth_url": f"{upstream}/auth", "enabled": True, "cert_key": None,
-                      "cert_file": None, "access_token": TENANT_TOKEN,
-                      "created_at": "", "updated_at": ""}),
+                      "cert_file": None,                       "created_at": "", "updated_at": ""}),
         ("/tenant-providers", {"id": "tp-pf", "tenant_id": "t1", "provider_id": "p-pf",
                                "created_at": "", "updated_at": ""}),
         ("/tenant-models", {"id": "tm-pf", "tenant_id": "t1", "model_key": "echo",
@@ -207,6 +206,14 @@ def seed(node, upstream):
         status, body = http(node.admin_port, "POST", f"/api/v1{path}", token=ADMIN_TOKEN, body=payload)
         if status not in (200, 201):
             raise RuntimeError(f"seeding {path} -> HTTP {status} {body}")
+    status, body = http(node.admin_port, "POST", "/api/v1/tenants/t1/access-tokens",
+                        token=ADMIN_TOKEN, body={"name": "pubfail"})
+    if status not in (200, 201):
+        raise RuntimeError(f"minting tenant token -> HTTP {status} {body}")
+    payload = body if isinstance(body, dict) else json.loads(body)
+    TENANT_TOKEN = payload.get("token")
+    if not TENANT_TOKEN:
+        raise RuntimeError("minting tenant token did not return a token")
 
 
 def tenant_write(node, name):

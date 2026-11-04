@@ -41,8 +41,8 @@ DIR = os.path.join(ROOT, ".acceptance", "tenant-contract-test")
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
 ADMIN, DATA = 18780, 18781
 TOKEN = "hydra-tenant-contract-admin-2026"
-T1_TOKEN = "tenant-contract-token-t1-2026"
-T2_TOKEN = "tenant-contract-token-t2-2026"
+T1_TOKEN = None
+T2_TOKEN = None
 # t3 is deliberately left WITHOUT an access token (§4.1: 401 with the same message).
 
 failures = []
@@ -84,7 +84,9 @@ def admin(method, path, body=None):
     return call(method, f"http://127.0.0.1:{ADMIN}/api/v1{path}", token=TOKEN, body=body)
 
 
-def tenant(method, path, token=T1_TOKEN, body=None, host="contract.local", raw_body=None):
+def tenant(method, path, token=None, body=None, host="contract.local", raw_body=None):
+    if token is None:
+        token = T1_TOKEN
     return call(method, f"http://127.0.0.1:{DATA}/tenant/t1/api/v1{path}", token=token, body=body,
                 host=host, raw_body=raw_body)
 
@@ -128,6 +130,7 @@ def stop(proc):
 
 
 def seed():
+    global T1_TOKEN, T2_TOKEN
     admin("POST", "/providers", {"id": "p1", "key": "p1", "name": "P",
                                  "endpoint": "http://127.0.0.1:18999", "weight": 1,
                                  "created_at": "", "updated_at": ""})
@@ -136,18 +139,24 @@ def seed():
                                        "created_at": "", "updated_at": ""})
     admin("POST", "/provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up",
                                      "created_at": ""})
-    for tid, token, domain in (("t1", T1_TOKEN, "contract.local"),
-                               ("t2", T2_TOKEN, "other-contract.local"),
-                               ("t3", None, "no-token.local")):
+    for tid, domain in (("t1", "contract.local"),
+                        ("t2", "other-contract.local"),
+                        ("t3", "no-token.local")):
         body = {"id": tid, "name": tid.upper(), "domain": domain,
-                "auth_url": "http://127.0.0.1:18999/auth", "enabled": True,
-                "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}
-        if token:
-            body["access_token"] = token
+                "cert_key": None, "cert_file": None, "enabled": True,
+                "created_at": "", "updated_at": ""}
         st, _, out = admin("POST", "/tenants", body)
         if st not in (200, 201):
             raise SystemExit(f"[tenant-contract] CANNOT VERIFY: seeding {tid} -> {st} {out[:160]}")
         if tid != "t3":
+            st, _, out = admin("POST", f"/tenants/{tid}/access-tokens", {"name": "test"})
+            if st not in (200, 201):
+                raise SystemExit(f"[tenant-contract] CANNOT VERIFY: minting token for {tid} -> {st} {out[:160]}")
+            minted = json.loads(out)["token"]
+            if tid == "t1":
+                T1_TOKEN = minted
+            elif tid == "t2":
+                T2_TOKEN = minted
             admin("POST", "/tenant-providers", {"id": f"tp-{tid}", "tenant_id": tid,
                                                 "provider_id": "p1", "created_at": "",
                                                 "updated_at": ""})
