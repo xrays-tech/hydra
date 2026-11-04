@@ -6,10 +6,10 @@
 //!
 //! See `dev-docs/waves/wave-1-pure-core.md` §3.9.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use hydra_core::config::{validate, ConfigData, ModelProvider, Severity, ValidationIssue};
-use hydra_core::model::{LimitRole, Provider, SubTenant, SubTenantRoute, Tenant};
+use hydra_core::model::{GlobalRole, LimitRole, Provider, SubTenant, SubTenantRoute, Tenant};
 use pretty_assertions::assert_eq;
 
 // --- fixtures ---------------------------------------------------------------
@@ -410,20 +410,9 @@ fn validate_output_is_deterministic() {
 /// anything, so there is nothing dangling.
 #[test]
 fn validate_empty_config_is_clean() {
-    let cfg = ConfigData {
-        tenants_by_domain: HashMap::new(),
-        tenants_by_id: HashMap::new(),
-        models_by_key: HashMap::new(),
-        tenant_providers: HashMap::new(),
-        tenant_models: HashMap::new(),
-        providers: HashMap::new(),
-        provider_keys: HashMap::new(),
-        limit_roles: Vec::new(),
-        key_prefix_bindings: Vec::new(),
-        sub_tenants: Vec::new(),
-        sub_tenant_routes: Vec::new(),
-        certs: HashMap::new(),
-    };
+    // (Was an exhaustive struct literal; `Default` keeps it compiling as fields
+    // are added — same semantics: every field empty ⇒ nothing to dangle.)
+    let cfg = ConfigData::default();
     assert!(validate(&cfg).is_empty());
 }
 
@@ -621,5 +610,56 @@ fn validate_sub_tenant_prefix_overlap_within_tenant_warns() {
     assert!(
         issues.iter().all(|i| i.severity != Severity::Fatal),
         "prefix overlap must be Warn, not Fatal; got {issues:?}"
+    );
+}
+
+/// T9.10 — a `global_role` with the WILDCARD `tenant_id` granting a provider that
+/// at least one tenant does NOT allow in `tenant_providers` ⇒ Warn.
+///
+/// NOT Fatal on purpose: the rule is legitimate for the tenants that DO grant that
+/// provider, and `router` intersects a wildcard rule with each tenant's own gate
+/// (fail-closed), so the symptom is "silently inert for that tenant", not breakage.
+#[test]
+fn validate_warns_when_a_wildcard_role_grants_a_provider_no_tenant_allows() {
+    let mut cfg = clean_config();
+
+    // `p2` is a real, keyed, online provider — it just is NOT in `t1`'s
+    // `tenant_providers` (which grants only `p1`).
+    cfg.providers
+        .insert("p2".into(), provider("p2", "https://b.io", 3));
+    cfg.provider_keys.insert("p2".into(), vec!["sk-2".into()]);
+
+    cfg.global_roles.push(GlobalRole {
+        id: "gr1".into(),
+        name: "grant these providers to everyone".into(),
+        tenant_id: "*".into(),
+        user_group_id: "*".into(),
+        user_id: "*".into(),
+        api_key_id: "*".into(),
+        model_key: "*".into(),
+        provider_ids: vec!["p1".into(), "p2".into()],
+        enabled: true,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    });
+    // `validate` reads the DERIVED indexes, so they must be rebuilt by hand HERE.
+    cfg.reindex_tenants();
+    cfg.reindex_global_roles();
+
+    let issues = validate(&cfg);
+    assert!(
+        issues.iter().all(|i| i.severity != Severity::Fatal),
+        "a wildcard rule must never be Fatal; got {issues:?}"
+    );
+
+    let warns = warn_messages(&issues);
+    assert!(
+        warns.iter().any(|m| m.contains("gr1") && m.contains("p2")),
+        "expected the wildcard-provider warning, got {warns:?}"
+    );
+    // `p1` IS granted by every tenant in this fixture, so it must NOT be named.
+    assert!(
+        warns.iter().all(|m| !m.contains("p1")),
+        "p1 is allowed by every tenant and must not be flagged; got {warns:?}"
     );
 }

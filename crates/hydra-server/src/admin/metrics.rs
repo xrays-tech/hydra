@@ -35,6 +35,7 @@
 //! | `hydra_limit_rejected_total` | counter | tenant, role, dim | proxy `request_filter` (429). **`dim` is `count` or `tokens`** (measured 2026-09-30: the plural is the real value, so a rule written on `dim="token"` would never fire) |
 //! | `hydra_sni_host_mismatch_total` | counter | — | `tls::note_sni_host_mismatch` (W4b) |
 //! | `hydra_route_errors_total` | counter | tenant, reason | proxy `request_filter` (route err) |
+//! | `hydra_sticky_hit_total` | counter | — | proxy candidate ordering (session affinity pinned the provider; T7b) |
 //! | `hydra_ttft_seconds` | histogram | tenant, provider, model | proxy `logging` (time to first token) |
 //! | `hydra_cached_tokens_total` | counter | tenant, provider, model | proxy `logging` (prompt-cache hits) |
 //! | `hydra_permit_inflight` | gauge | provider | admission module (set on acquire/release) |
@@ -197,6 +198,12 @@ struct Metrics {
     /// here means real convergence loss — or an event rate above
     /// `maxlen / trim_interval` with a consumer that cannot keep up.
     invalidation_generation_bumps: IntCounter,
+    /// Session-affinity (T7b, plan §3.4 step 4) provider selections: a routed
+    /// request whose provider choice was pinned by its session header instead
+    /// of being ordered by SWRR. A rate of 0 with `HYDRA_SESSION_AFFINITY` on
+    /// simply means no client presents a session header (or no principal
+    /// resolved) — the feature is inert, not broken.
+    sticky_hits: IntCounter,
     // ── Downstream listener topology (审核四 P4) ─────────────────────────
     /// 1 = the configured listener was verified to accept connections at
     /// startup (protocol=plain|tls); 0 = configured but NOT accepting — the
@@ -540,6 +547,11 @@ fn metrics() -> Option<&'static Metrics> {
             invalidation_generation_bumps: register_int_counter!(
                 "hydra_invalidation_generation_bumps_total",
                 "Trims that dropped an entry a live consumer had not applied (whole-fleet cache clear)"
+            )
+            .ok()?,
+            sticky_hits: register_int_counter!(
+                "hydra_sticky_hit_total",
+                "Routed requests whose provider was pinned by session affinity (instead of SWRR)"
             )
             .ok()?,
             // ── Downstream listener topology ──────────────────────────────
@@ -1074,6 +1086,17 @@ pub fn record_invalidation_trimmed(entries: i64) {
 pub fn record_invalidation_generation_bump() {
     if let Some(m) = metrics() {
         m.invalidation_generation_bumps.inc();
+    }
+}
+
+/// Count a session-affinity provider selection (T7b, plan §3.4 step 4): the
+/// request had a session header + a resolved principal and affinity is configured
+/// on, and `affinity::order_with_affinity` actually pinned a provider. The
+/// fallback to plain SWRR (sticky key selected no candidate) is deliberately
+/// NOT counted here — it is an ordinary SWRR request.
+pub fn record_sticky_hit() {
+    if let Some(m) = metrics() {
+        m.sticky_hits.inc();
     }
 }
 

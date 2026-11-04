@@ -30,7 +30,7 @@ use crate::proxy::SelectedRoute;
 /// In terminate mode the only hooks that run are `request_filter` (which does
 /// the whole gateway job) and `logging` (which reads back the fields below).
 /// Fields are grouped by the phase that writes them:
-/// - *request_filter*: `tenant`, `client_api_key`, `auth_verdict`, `model_key`,
+/// - *request_filter*: `tenant`, `client_api_key`, `session_id`, `auth_verdict`, `model_key`,
 ///   `candidates`, `route_error`, `trace_id`, `started_at`, `selected`,
 ///   `upstream_host`, `upstream_started_at`, `status_code`.
 /// - *request_filter (stream-back)*: `scanner` (mutated per response chunk).
@@ -57,6 +57,15 @@ pub struct RequestContext {
     /// is given `window_ms` from each generation in turn, so samples could be evicted early or kept
     /// too long).
     pub cfg: Option<Arc<ConfigData>>,
+    /// The principal resolved by the internal api-key auth path (T3).
+    pub principal: Option<hydra_core::identity::ApiPrincipal>,
+    /// Session affinity key (T7b, plan §3.4 step 4): the session id extracted
+    /// from the request headers (`X-Opencode-Session` → `Session-Id` →
+    /// `x-conversation-id`, first valid wins), already trimmed and length-capped
+    /// (≤256 bytes) at extraction time. `None` ⇒ no affinity hint ⇒ candidate
+    /// ordering stays pure SWRR. It is a ROUTING hint only: never logged, never
+    /// an authorization input.
+    pub session_id: Option<String>,
     /// The external-auth verdict (carries the HTTP status to write back).
     pub auth_verdict: Option<AuthVerdict>,
     /// `model_key` extracted from the full request body via `memchr` (None ⇒
@@ -114,6 +123,8 @@ impl RequestContext {
             tenant: None,
             client_api_key: None,
             cfg: None,
+            principal: None,
+            session_id: None,
             auth_verdict: None,
             model_key: None,
             candidates: Vec::new(),

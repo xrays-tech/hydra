@@ -25,14 +25,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affinity;
 pub mod apikey;
 pub mod auth;
 pub mod breaker;
 pub mod config;
 pub mod extract;
+pub mod identity;
 pub mod limit;
 pub mod model;
 pub mod rewrite;
+pub mod role;
 pub mod router;
 pub mod sse;
 pub mod sub_tenant;

@@ -75,7 +75,14 @@ use std::hash::{Hash, Hasher};
 /// against, so a key-scoped role on that node would silently match nothing and **stop enforcing its
 /// limit**. That is exactly the case this constant exists for — the two builds refuse each other by
 /// name, and the older node keeps serving its last-known-good config until the upgrade completes.
-pub const TOC_FORMAT: u32 = 4;
+///
+/// **5** — the user-hierarchy control plane gained per-row entities for
+/// `user_group`, `user`, `user_api_key`, `tenant_access_token`, and `global_role`, and the sealed
+/// hash columns (`key_hash`, `token_hash`) moved onto those entity payloads rather than the `_fidelity`
+/// singleton. A build speaking 4 has no decoder arms for the new paths and must refuse this tree by
+/// name rather than ignore it: ignoring new rows would silently rebuild a replica with no users, keys
+/// or roles while still naming a tree that says it has them.
+pub const TOC_FORMAT: u32 = 5;
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";
@@ -171,6 +178,16 @@ pub enum EntityPath {
     /// ever replaced whole (they come from one read transaction), and splitting them would
     /// multiply the toc for no benefit a replica can use.
     Fidelity,
+    /// `user_group/<id>` — full user-group rows, disabled included.
+    UserGroup(String),
+    /// `user/<id>` — full user rows, disabled AND delinquent included.
+    User(String),
+    /// `user_api_key/<id>` — full user API-key rows; `key_hash` travels sealed.
+    UserApiKey(String),
+    /// `tenant_access_token/<id>` — full tenant token rows; `token_hash` travels sealed.
+    TenantAccessToken(String),
+    /// `global_role/<id>` — full Global Role rows (incl. disabled) with their provider set.
+    GlobalRole(String),
 }
 
 impl EntityPath {
@@ -192,6 +209,11 @@ impl EntityPath {
             Self::Cert(id) => format!("cert/{id}"),
             Self::Meta => "meta".to_string(),
             Self::Fidelity => "_fidelity".to_string(),
+            Self::UserGroup(id) => format!("user_group/{id}"),
+            Self::User(id) => format!("user/{id}"),
+            Self::UserApiKey(id) => format!("user_api_key/{id}"),
+            Self::TenantAccessToken(id) => format!("tenant_access_token/{id}"),
+            Self::GlobalRole(id) => format!("global_role/{id}"),
         }
     }
 
@@ -213,6 +235,11 @@ impl EntityPath {
             Self::TenantProvider(_) => 12,
             Self::TenantModel(_) => 13,
             Self::Fidelity => 14,
+            Self::UserGroup(_) => 15,
+            Self::User(_) => 16,
+            Self::UserApiKey(_) => 17,
+            Self::TenantAccessToken(_) => 18,
+            Self::GlobalRole(_) => 19,
         }
     }
 
@@ -231,7 +258,12 @@ impl EntityPath {
             | Self::TenantProvider(id)
             | Self::TenantModel(id)
             | Self::Token(id)
-            | Self::Cert(id) => Some(id),
+            | Self::Cert(id)
+            | Self::UserGroup(id)
+            | Self::User(id)
+            | Self::UserApiKey(id)
+            | Self::TenantAccessToken(id)
+            | Self::GlobalRole(id) => Some(id),
             Self::Meta | Self::Fidelity => None,
         }
     }
@@ -374,6 +406,11 @@ fn kind_name(path: &EntityPath) -> &'static str {
         EntityPath::Cert(_) => "cert",
         EntityPath::Meta => "meta",
         EntityPath::Fidelity => "_fidelity",
+        EntityPath::UserGroup(_) => "user_group",
+        EntityPath::User(_) => "user",
+        EntityPath::UserApiKey(_) => "user_api_key",
+        EntityPath::TenantAccessToken(_) => "tenant_access_token",
+        EntityPath::GlobalRole(_) => "global_role",
     }
 }
 
@@ -567,6 +604,26 @@ impl Toc {
                 12 => EntityPath::TenantProvider(id),
                 13 => EntityPath::TenantModel(id),
                 14 => EntityPath::Fidelity,
+                15 => {
+                    validate_id("entity", &id)?;
+                    EntityPath::UserGroup(id)
+                }
+                16 => {
+                    validate_id("entity", &id)?;
+                    EntityPath::User(id)
+                }
+                17 => {
+                    validate_id("entity", &id)?;
+                    EntityPath::UserApiKey(id)
+                }
+                18 => {
+                    validate_id("entity", &id)?;
+                    EntityPath::TenantAccessToken(id)
+                }
+                19 => {
+                    validate_id("entity", &id)?;
+                    EntityPath::GlobalRole(id)
+                }
                 other => {
                     return Err(KeysError::UnknownEntityKind {
                         discriminant: other,
@@ -665,6 +722,11 @@ mod tests {
             EntityPath::Cert("x".into()),
             EntityPath::Meta,
             EntityPath::Fidelity,
+            EntityPath::UserGroup("x".into()),
+            EntityPath::User("x".into()),
+            EntityPath::UserApiKey("x".into()),
+            EntityPath::TenantAccessToken("x".into()),
+            EntityPath::GlobalRole("x".into()),
         ]
     }
 
@@ -786,7 +848,7 @@ mod tests {
     #[test]
     fn the_toc_format_is_pinned_with_its_reason() {
         assert_eq!(
-            TOC_FORMAT, 4,
+            TOC_FORMAT, 5,
             "if you changed what an entity's bytes MEAN, bump this number AND add its entry to the \
              doc above (the history is the reason the constant exists); if you did not, this test \
              is the reminder that a bump happened and older builds now refuse this tree by name"

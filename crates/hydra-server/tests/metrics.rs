@@ -153,6 +153,9 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
     )
     .await
     .unwrap();
+    // T3 internal auth: the data-plane gate decides from the identity index
+    // derived from user_group/user/user_api_key rows; `auth_url` is data only.
+    common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
 
 /// T7 — the certificate gauge must track HOT-RELOADED certs.

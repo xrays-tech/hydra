@@ -323,5 +323,78 @@ function blankingFixture({ docDefault, code }) {
   );
 }
 
+/* A helper called with a CONST DEFAULT — the shape every capacity ceiling in this tree
+ * reads through (`env_positive_u32(\n "HYDRA_X",\n DEFAULT_X,\n);`, `cargo fmt` splits it that way).
+ * Measured 2026-11-04: `HYDRA_MAX_USERS_PER_TENANT` / `HYDRA_MAX_HIERARCHY_ROWS` were wired AND
+ * documented at `1000` / `3000`, yet this guard printed `???? code=no fallback found`, i.e. the
+ * doc promise went unverified because the extraction only recognised a LITERAL default.
+ * The three cases below keep the new shape honest: it must COMPARE, it must still report DRIFT
+ * when the const disagrees, and an identifier that resolves to NOTHING must not count as evidence. */
+{
+  const fx = blankingFixture({
+    docDefault: 3000,
+    code:
+      "pub const DEFAULT_TEST_KNOB_0: u32 = 3_000;\n" +
+      "fn knob_0() -> u32 {\n" +
+      "    env_positive_u32(\n" +
+      '        "HYDRA_TEST_KNOB_0",\n' +
+      "        DEFAULT_TEST_KNOB_0,\n" +
+      "    );\n" +
+      "}\n",
+  });
+  const r = run(fx);
+  assert(
+    "a helper called with a CONST default is compared (not `????`)",
+    r.status === 0,
+    `status=${r.status} out=${r.out.trim().slice(0, 200)}`,
+  );
+  assert(
+    "...and the witness names the const it resolved",
+    /const DEFAULT_TEST_KNOB_0/.test(r.out),
+    r.out.trim().slice(0, 200),
+  );
+}
+{
+  // The same shape, the const disagrees with the table: DRIFT, so the new shape cannot
+  // bless a row it merely recognises.
+  const fx = blankingFixture({
+    docDefault: 3000,
+    code:
+      "pub const DEFAULT_TEST_KNOB_0: u32 = 9_999;\n" +
+      "fn knob_0() -> u32 {\n" +
+      "    env_positive_u32(\n" +
+      '        "HYDRA_TEST_KNOB_0",\n' +
+      "        DEFAULT_TEST_KNOB_0,\n" +
+      "    );\n" +
+      "}\n",
+  });
+  const r = run(fx);
+  assert(
+    "a CONST default that differs from the documented one is drift",
+    r.status === 1 && /ops\.md says 3000/.test(r.out),
+    `status=${r.status} out=${r.out.trim().slice(0, 200)}`,
+  );
+}
+{
+  // An identifier with no such const anywhere in the scanned sources: recognising the SHAPE is
+  // not evidence, so this row must stay unverified rather than pass.
+  const fx = blankingFixture({
+    docDefault: 3000,
+    code:
+      "fn knob_0() -> u32 {\n" +
+      "    env_positive_u32(\n" +
+      '        "HYDRA_TEST_KNOB_0",\n' +
+      "        DEFAULT_NOT_DEFINED_HERE,\n" +
+      "    );\n" +
+      "}\n",
+  });
+  const r = run(fx);
+  assert(
+    "a CONST default that resolves to nothing is NOT a pass",
+    r.status === 1 && /cannot be compared with the code/.test(r.out),
+    `status=${r.status} out=${r.out.trim().slice(0, 200)}`,
+  );
+}
+
 console.log(failures === 0 ? "\nALL DOCUMENTED-DEFAULT TESTS PASSED" : `\n${failures} TEST(S) FAILED`);
 process.exit(failures ? 1 : 0);

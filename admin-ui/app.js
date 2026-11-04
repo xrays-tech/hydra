@@ -68,6 +68,8 @@ const ICONS = {
   key2:       '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9"/>',
   book:       '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/>',
   chart:      '<path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="8" rx="1"/><rect x="12" y="6" width="3" height="12" rx="1"/><rect x="17" y="13" width="3" height="5" rx="1"/>',
+  roles:      '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M18 8v6M15 11h6"/>',
+  token:      '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10h10M7 14h6"/><path d="M17 14h1"/>',
 };
 function icon(name, size = 17) {
   const wrap = document.createElement("span");
@@ -107,6 +109,18 @@ let CURRENT = "providers";
 const FK = {};          // { providers: {list, map}, tenants: {...} } — lazy
 const COUNTS = {};      // section-key -> row count (for nav badges)
 const FK_PATHS = { providers: "/providers", tenants: "/tenants" };
+
+/* --- new hierarchy pages -------------------------------------------------
+ * ROLE_ROWS is the last global-role list; it doubles as a suggestion source
+ * because the admin API does not expose the user hierarchy yet (see the
+ * hierarchy note on the page). HIERARCHY is filled opportunistically from the
+ * endpoints that DO exist on a newer node; a 404 simply leaves it empty. */
+let ROLE_ROWS = [];
+let ACCESS_TENANT = null;          // selected tenant on the Access Tokens page
+let PENDING_TOKEN = null;          // plaintext shown once, for the current visit
+const HIERARCHY = { promise: null, groups: [], users: [], keys: [], available: false };
+const MODEL_HINTS = { promise: null, keys: [] };
+
 
 async function ensureFK(kind) {
   if (FK[kind]) return FK[kind];
@@ -551,6 +565,17 @@ function numOrDash(v) {
 
 /* ---- custom sections (auth-cache / breaker / health) ---- */
 const CUSTOM = {
+  "global-roles": {
+    title: "custom.globalroles.title", nav: "custom.globalroles.nav", icon: "roles",
+    desc: "custom.globalroles.pageDesc",
+    render: renderGlobalRoles,
+  },
+  "access-tokens": {
+    title: "custom.accesstokens.title", nav: "custom.accesstokens.nav", icon: "token",
+    desc: "custom.accesstokens.pageDesc",
+    render: renderAccessTokens,
+    teardown: teardownAccessTokens,
+  },
   "auth-cache": {
     title: "custom.authcache.title", nav: "custom.authcache.title", icon: "authcache",
     desc: "custom.authcache.pageDesc",
@@ -582,7 +607,7 @@ const CUSTOM = {
 
 /* ordered nav with section dividers */
 const NAV = [
-  { labelKey: "common.nav.configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "tenant-providers", "tenant-models", "limit-roles", "provider-key-bindings"] },
+  { labelKey: "common.nav.configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "global-roles", "access-tokens", "tenant-providers", "tenant-models", "limit-roles"] },
   { labelKey: "common.nav.operations", items: ["auth-cache", "breaker", "health", "stats"] },
   { labelKey: "common.nav.reference", items: ["api-docs"] },
 ];
@@ -626,7 +651,9 @@ function go(key) {
   // re-rendering itself over the page the user had navigated to (review
   // D3/M-9). Pages that own no timer simply omit `teardown`.
   const leaving = CUSTOM[CURRENT];
-  if (leaving && typeof leaving.teardown === "function") leaving.teardown();
+  if (leaving && typeof leaving.teardown === "function") {
+    leaving.teardown({ sameSection: key === CURRENT });
+  }
   CURRENT = key;
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.key === key));
   closeSidebar();
@@ -1036,6 +1063,892 @@ async function doDelete(cfg, record) {
     await loadEntity(CURRENT);
   } catch (e) {
     toast(e.message, "err", { title: t("common.toast.failedDelete", { singular: t(cfg.singular) }) });
+  }
+}
+
+/* ===========================================================================
+ * Custom: Global Roles (five dimensions -> provider set)
+ * ======================================================================== */
+
+/** Best-effort hierarchy lookup for the dimension suggestions.
+ *
+ * The Global Role write API validates group/user/api-key ids against the live
+ * tables, but the CURRENT admin surface has no read endpoint for them. A newer
+ * node may expose /user-groups, /users and /user-api-keys; when it does the
+ * form becomes a real cascade. When it does not, the inputs still accept ids and
+ * the suggestions come from rules that already use them. A 404 is expected, not
+ * an error the operator has to dismiss. */
+async function ensureHierarchy() {
+  if (!HIERARCHY.promise) {
+    HIERARCHY.promise = (async () => {
+      const [g, u, k] = await Promise.all([
+        api("GET", "/user-groups").catch(() => null),
+        api("GET", "/users").catch(() => null),
+        api("GET", "/user-api-keys").catch(() => null),
+      ]);
+      if (Array.isArray(g)) HIERARCHY.groups = g;
+      if (Array.isArray(u)) HIERARCHY.users = u;
+      if (Array.isArray(k)) HIERARCHY.keys = k;
+      HIERARCHY.available = !!(g || u || k);
+      return HIERARCHY;
+    })();
+  }
+  return HIERARCHY.promise;
+}
+
+/** Model keys for the datalist: /models when it exists, else provider-models. */
+async function ensureModelHints() {
+  if (!MODEL_HINTS.promise) {
+    MODEL_HINTS.promise = (async () => {
+      const keys = new Set();
+      const collect = (payload) => {
+        const list = Array.isArray(payload)
+          ? payload
+          : (payload && Array.isArray(payload.models) ? payload.models : []);
+        for (const m of list) {
+          const key = typeof m === "string" ? m : (m.key || m.model_key || m.id || m.name);
+          if (key) keys.add(String(key));
+        }
+      };
+      try { collect(await api("GET", "/models")); } catch { /* route may not exist */ }
+      if (!keys.size) {
+        try { collect(await api("GET", "/provider-models")); } catch { /* optional */ }
+      }
+      MODEL_HINTS.keys = [...keys].sort((a, b) => a.localeCompare(b));
+      return MODEL_HINTS.keys;
+    })();
+  }
+  return MODEL_HINTS.promise;
+}
+
+function dedupeRowsById(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    if (!row || row.id === undefined || row.id === null) continue;
+    const id = String(row.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(row);
+  }
+  return out;
+}
+
+/** Group suggestions, narrowed by tenant when one is selected. */
+function roleGroupRows(tenant) {
+  const rows = HIERARCHY.groups.slice();
+  for (const r of ROLE_ROWS) {
+    if (r.user_group_id && r.user_group_id !== "*") {
+      rows.push({
+        id: r.user_group_id,
+        tenant_id: r.tenant_id && r.tenant_id !== "*" ? r.tenant_id : "",
+        name: "",
+      });
+    }
+  }
+  return dedupeRowsById(rows).filter((g) => !tenant || !g.tenant_id || g.tenant_id === tenant);
+}
+
+function roleUserRows(tenant, group) {
+  const rows = HIERARCHY.users.slice();
+  for (const r of ROLE_ROWS) {
+    if (r.user_id && r.user_id !== "*") {
+      rows.push({
+        id: r.user_id,
+        tenant_id: r.tenant_id && r.tenant_id !== "*" ? r.tenant_id : "",
+        user_group_id: r.user_group_id && r.user_group_id !== "*" ? r.user_group_id : "",
+        name: "",
+      });
+    }
+  }
+  return dedupeRowsById(rows).filter((u) => {
+    if (tenant && u.tenant_id && u.tenant_id !== tenant) return false;
+    if (group && u.user_group_id && u.user_group_id !== group) return false;
+    return true;
+  });
+}
+
+function roleKeyRows(tenant, group, user) {
+  const users = new Map(HIERARCHY.users.map((u) => [String(u.id), u]));
+  const rows = HIERARCHY.keys.slice();
+  for (const r of ROLE_ROWS) {
+    if (r.api_key_id && r.api_key_id !== "*") {
+      rows.push({
+        id: r.api_key_id,
+        user_id: r.user_id && r.user_id !== "*" ? r.user_id : "",
+        tenant_id: r.tenant_id && r.tenant_id !== "*" ? r.tenant_id : "",
+        user_group_id: r.user_group_id && r.user_group_id !== "*" ? r.user_group_id : "",
+        name: "",
+      });
+    }
+  }
+  return dedupeRowsById(rows).filter((k) => {
+    if (user && k.user_id && k.user_id !== user) return false;
+    const owner = users.get(String(k.user_id || ""));
+    const tenantId = k.tenant_id || (owner && owner.tenant_id) || "";
+    const groupId = k.user_group_id || (owner && owner.user_group_id) || "";
+    if (tenant && tenantId && tenantId !== tenant) return false;
+    if (group && groupId && groupId !== group) return false;
+    return true;
+  });
+}
+
+function fillRoleDatalist(list, rows) {
+  clear(list);
+  for (const row of rows) {
+    const id = String(row.id);
+    const name = row.name && String(row.name) !== id ? String(row.name) : "";
+    list.appendChild(el("option", { value: id, label: name ? `${name} · ${id}` : id }));
+  }
+}
+
+function roleDimCell(value) {
+  return value && value !== "*"
+    ? el("span", { class: "mono", text: String(value) })
+    : el("span", { class: "muted", text: t("custom.globalroles.any") });
+}
+
+function roleProvidersCell(ids) {
+  const list = Array.isArray(ids) ? ids : [];
+  if (!list.length) return el("span", { class: "muted", text: "—" });
+  const map = (FK.providers && FK.providers.map) || new Map();
+  const shown = list.slice(0, 3);
+  const wrap = el("div", { class: "chips" });
+  for (const id of shown) {
+    const p = map.get(String(id));
+    const label = (p && (p.name || p.key)) || id;
+    wrap.appendChild(el("span", { class: "chip", title: String(id) }, el("span", { class: "chip-dot" }), String(label)));
+  }
+  if (list.length > shown.length) {
+    wrap.appendChild(el("span", { class: "chip more", text: t("custom.globalroles.more", { n: list.length - shown.length }) }));
+  }
+  return wrap;
+}
+
+function roleEnabledSwitch(role) {
+  const on = !!role.enabled;
+  return el("button", {
+    class: `switch ${on ? "on" : ""}`,
+    type: "button",
+    role: "switch",
+    "aria-checked": on ? "true" : "false",
+    "aria-label": t(on ? "custom.globalroles.toggleDisable" : "custom.globalroles.toggleEnable"),
+    onClick: () => toggleGlobalRole(role),
+  },
+    el("span", { class: "switch-knob" }),
+    el("span", { class: "switch-label", text: t(on ? "common.status.true" : "common.status.false") }),
+  );
+}
+
+async function renderGlobalRoles() {
+  clear($("#page-actions"));
+  $("#page-actions").appendChild(el("button", { class: "btn sm", onClick: renderGlobalRoles },
+    icon("refresh", 14), el("span", { class: "btn-label", text: t("common.action.refresh") })));
+
+  showSkeleton($("#content"));
+  try {
+    const [rows] = await Promise.all([
+      api("GET", "/global-roles"),
+      ensureFK("providers"),
+    ]);
+    ROLE_ROWS = Array.isArray(rows) ? rows : [];
+    renderGlobalRolesPanel();
+  } catch (e) {
+    renderErrorPanel(e);
+    toast(e.message, "err", { title: t("custom.globalroles.loadFailed") });
+  }
+}
+
+function renderGlobalRolesPanel() {
+  const content = $("#content");
+  clear(content);
+  const panel = el("div", { class: "panel" });
+  panel.appendChild(el("div", { class: "panel-head" },
+    el("h2", {}, el("span", { text: t("custom.globalroles.title") }), " ",
+      el("span", { class: "count", text: String(ROLE_ROWS.length) })),
+    el("div", { class: "spacer" }),
+    el("button", { class: "btn primary sm", onClick: () => openGlobalRoleForm(null) },
+      icon("plus", 14),
+      el("span", { class: "btn-label", text: t("common.action.new", { singular: t("custom.globalroles.singular") }) })),
+  ));
+  panel.appendChild(el("p", { class: "note" }, t("custom.globalroles.desc")));
+
+  if (!ROLE_ROWS.length) {
+    panel.appendChild(emptyState("inbox", t("custom.globalroles.emptyTitle"), t("custom.globalroles.emptyMsg"),
+      {
+        primary: t("common.empty.new", { singular: t("custom.globalroles.singular") }),
+        onClick: () => openGlobalRoleForm(null),
+      }));
+  } else {
+    panel.appendChild(renderGlobalRoleTable());
+  }
+  content.appendChild(panel);
+}
+
+function renderGlobalRoleTable() {
+  const cols = [
+    "custom.globalroles.colName",
+    "custom.globalroles.colTenant",
+    "custom.globalroles.colGroup",
+    "custom.globalroles.colUser",
+    "custom.globalroles.colKey",
+    "custom.globalroles.colModel",
+    "custom.globalroles.colProviders",
+    "custom.globalroles.colEnabled",
+  ];
+  const thead = el("thead", {}, el("tr", {},
+    ...cols.map((k) => el("th", { text: t(k) })),
+    el("th", { text: "" }),
+  ));
+  const tbody = el("tbody", {});
+  for (const role of ROLE_ROWS) {
+    tbody.appendChild(el("tr", {},
+      el("td", {}, el("span", { class: "role-name", text: role.name || role.id })),
+      el("td", {}, roleDimCell(role.tenant_id)),
+      el("td", {}, roleDimCell(role.user_group_id)),
+      el("td", {}, roleDimCell(role.user_id)),
+      el("td", {}, roleDimCell(role.api_key_id)),
+      el("td", {}, roleDimCell(role.model_key)),
+      el("td", {}, roleProvidersCell(role.provider_ids)),
+      el("td", {}, roleEnabledSwitch(role)),
+      el("td", { class: "actions" },
+        el("div", { class: "row-actions" },
+          iconBtn("edit", t("common.action.edit"), () => openGlobalRoleForm(role)),
+          iconBtn("trash", t("common.action.delete"), () => deleteGlobalRole(role), "danger"),
+        ),
+      ),
+    ));
+  }
+  return el("div", { class: "table-wrap" }, el("table", {}, thead, tbody));
+}
+
+function roleFieldGroup(labelKey, control, { required = false, tipKey = null, full = false } = {}) {
+  const group = el("div", { class: `input-group ${full ? "full" : ""}` },
+    el("label", { text: t(labelKey) }, required ? el("span", { class: "req", text: " *" }) : null),
+    control,
+  );
+  if (tipKey) group.appendChild(el("div", { class: "field-tip", text: t(tipKey) }));
+  return group;
+}
+
+async function openGlobalRoleForm(record) {
+  const isEdit = !!record;
+  await Promise.all([ensureFK("tenants"), ensureFK("providers"), ensureHierarchy(), ensureModelHints()]);
+
+  const form = el("form", { class: "form-grid", onSubmit: (e) => e.preventDefault() });
+  const alertBox = el("div", { class: "alert err form-alert hidden", role: "alert" });
+  form.appendChild(alertBox);
+
+  const nameInput = el("input", {
+    type: "text",
+    placeholder: "acme-default",
+    value: record ? record.name || "" : "",
+  });
+  const nameError = el("div", { class: "field-error hidden" });
+  const nameGroup = el("div", { class: "input-group full" },
+    el("label", { text: t("custom.globalroles.colName") }, el("span", { class: "req", text: " *" })),
+    nameInput,
+    nameError,
+  );
+  form.appendChild(nameGroup);
+
+  const enabledInput = el("input", { type: "checkbox" });
+  enabledInput.checked = record ? !!record.enabled : true;
+  form.appendChild(el("div", { class: "input-group full" },
+    el("label", { class: "check" }, enabledInput,
+      el("span", { text: t("custom.globalroles.colEnabled") })),
+  ));
+
+  const tenantSel = el("select", {});
+  const tenantIds = new Set();
+  tenantSel.appendChild(el("option", { value: "", text: t("custom.globalroles.anyTenant") }));
+  for (const tenant of ((FK.tenants && FK.tenants.list) || [])) {
+    const id = String(tenant.id);
+    tenantIds.add(id);
+    tenantSel.appendChild(el("option", { value: id, text: `${tenant.name || tenant.id} · ${id}` }));
+  }
+  if (record && record.tenant_id && record.tenant_id !== "*") {
+    const id = String(record.tenant_id);
+    if (!tenantIds.has(id)) {
+      tenantSel.appendChild(el("option", { value: id, text: id }));
+    }
+    tenantSel.value = id;
+  }
+
+  const groupInput = el("input", {
+    type: "text",
+    list: "global-role-groups",
+    placeholder: t("custom.globalroles.anyGroup"),
+    value: record && record.user_group_id !== "*" ? String(record.user_group_id) : "",
+  });
+  const userInput = el("input", {
+    type: "text",
+    list: "global-role-users",
+    placeholder: t("custom.globalroles.anyUser"),
+    value: record && record.user_id !== "*" ? String(record.user_id) : "",
+  });
+  const keyInput = el("input", {
+    type: "text",
+    list: "global-role-keys",
+    placeholder: t("custom.globalroles.anyKey"),
+    value: record && record.api_key_id !== "*" ? String(record.api_key_id) : "",
+  });
+  const modelInput = el("input", {
+    type: "text",
+    list: "global-role-models",
+    placeholder: t("custom.globalroles.anyModel"),
+    value: record && record.model_key !== "*" ? String(record.model_key) : "",
+  });
+
+  const groupsList = el("datalist", { id: "global-role-groups" });
+  const usersList = el("datalist", { id: "global-role-users" });
+  const keysList = el("datalist", { id: "global-role-keys" });
+  const modelsList = el("datalist", { id: "global-role-models" });
+
+  const dims = el("div", { class: "full" },
+    el("div", { class: "section-label", text: t("custom.globalroles.fieldDims") }),
+    el("div", { class: "role-dims" },
+      roleFieldGroup("custom.globalroles.colTenant", tenantSel, { tipKey: "custom.globalroles.tipAny" }),
+      roleFieldGroup("custom.globalroles.colGroup", groupInput, { tipKey: "custom.globalroles.tipAny" }),
+      roleFieldGroup("custom.globalroles.colUser", userInput, { tipKey: "custom.globalroles.tipAny" }),
+      roleFieldGroup("custom.globalroles.colKey", keyInput, { tipKey: "custom.globalroles.tipAny" }),
+      roleFieldGroup("custom.globalroles.colModel", modelInput, { tipKey: "custom.globalroles.tipModel" }),
+    ),
+    groupsList, usersList, keysList, modelsList,
+  );
+  if (!HIERARCHY.available) {
+    dims.appendChild(el("div", { class: "field-tip hierarchy-tip", text: t("custom.globalroles.hierarchyUnavailable") }));
+  }
+  form.appendChild(dims);
+
+  const selectedProviders = new Set(
+    (record && (record.provider_ids || record.providers) || []).map(String),
+  );
+  const providerField = buildProviderPicker(selectedProviders);
+  form.appendChild(providerField.root);
+
+  function refreshSuggestions() {
+    const tenant = tenantSel.value.trim();
+    const group = groupInput.value.trim();
+    const user = userInput.value.trim();
+    fillRoleDatalist(groupsList, roleGroupRows(tenant));
+    fillRoleDatalist(usersList, roleUserRows(tenant, group));
+    fillRoleDatalist(keysList, roleKeyRows(tenant, group, user));
+    const modelKeys = new Set(MODEL_HINTS.keys);
+    for (const r of ROLE_ROWS) if (r.model_key && r.model_key !== "*") modelKeys.add(String(r.model_key));
+    fillRoleDatalist(modelsList, [...modelKeys].sort((a, b) => a.localeCompare(b)).map((id) => ({ id })));
+  }
+
+  tenantSel.addEventListener("change", refreshSuggestions);
+  groupInput.addEventListener("input", refreshSuggestions);
+  userInput.addEventListener("input", refreshSuggestions);
+  keyInput.addEventListener("input", refreshSuggestions);
+  groupInput.addEventListener("change", () => {
+    const row = roleGroupRows("").find((g) => String(g.id) === groupInput.value.trim());
+    if (row && row.tenant_id && !tenantSel.value) tenantSel.value = row.tenant_id;
+    refreshSuggestions();
+  });
+  userInput.addEventListener("change", () => {
+    const row = roleUserRows("", "").find((u) => String(u.id) === userInput.value.trim());
+    if (row) {
+      if (!tenantSel.value && row.tenant_id) tenantSel.value = row.tenant_id;
+      if (!groupInput.value && row.user_group_id) groupInput.value = row.user_group_id;
+    }
+    refreshSuggestions();
+  });
+  keyInput.addEventListener("change", () => {
+    const row = roleKeyRows("", "", "").find((k) => String(k.id) === keyInput.value.trim());
+    if (row && row.user_id) {
+      const owner = roleUserRows("", "").find((u) => String(u.id) === row.user_id);
+      if (!userInput.value) userInput.value = row.user_id;
+      if (owner) {
+        if (!groupInput.value && owner.user_group_id) groupInput.value = owner.user_group_id;
+        if (!tenantSel.value && owner.tenant_id) tenantSel.value = owner.tenant_id;
+      }
+    }
+    refreshSuggestions();
+  });
+  refreshSuggestions();
+
+  const submitBtn = el("button", { class: "btn primary", type: "submit" },
+    el("span", { class: "btn-label", text: isEdit ? t("common.action.saveChanges") : t("common.form.new", { singular: t("custom.globalroles.singular") }) }));
+
+  const modal = openModal({
+    icon: isEdit ? "edit" : "plus",
+    title: isEdit ? t("custom.globalroles.editTitle") : t("custom.globalroles.createTitle"),
+    sub: t("custom.globalroles.formNote"),
+    body: form,
+    size: "lg",
+    actions: [
+      el("button", { class: "btn", text: t("common.action.cancel"), onClick: () => closeModal() }),
+      submitBtn,
+    ],
+  });
+
+  setTimeout(() => nameInput.focus(), 60);
+  submitBtn.addEventListener("click", (e) => { e.preventDefault(); submit(); });
+  form.addEventListener("submit", (e) => { e.preventDefault(); submit(); });
+
+  function showError(message) {
+    alertBox.textContent = message;
+    alertBox.classList.remove("hidden");
+    if (typeof alertBox.scrollIntoView === "function") alertBox.scrollIntoView({ block: "nearest" });
+  }
+
+  async function submit() {
+    const name = nameInput.value.trim();
+    nameInput.classList.remove("invalid");
+    nameError.classList.add("hidden");
+    if (!name) {
+      nameInput.classList.add("invalid");
+      nameError.textContent = t("common.form.required", { label: t("custom.globalroles.colName") });
+      nameError.classList.remove("hidden");
+      nameInput.focus();
+      return;
+    }
+
+    const body = {
+      name,
+      tenant_id: tenantSel.value.trim() || "*",
+      user_group_id: groupInput.value.trim() || "*",
+      user_id: userInput.value.trim() || "*",
+      api_key_id: keyInput.value.trim() || "*",
+      model_key: modelInput.value.trim() || "*",
+      providers: [...selectedProviders],
+      enabled: !!enabledInput.checked,
+    };
+    if (isEdit) body.id = record.id;
+
+    setLoading(submitBtn, true, isEdit ? t("common.action.saving") : t("common.action.creating"));
+    try {
+      const saved = await api("PUT", "/global-roles", { body });
+      closeModal();
+      toast(t("custom.globalroles.saved"), "ok");
+      if (saved && Array.isArray(saved.warnings) && saved.warnings.length) {
+        toast(saved.warnings.join(" "), "info", { title: t("custom.globalroles.warnTitle") });
+      }
+      await renderGlobalRoles();
+    } catch (e) {
+      setLoading(submitBtn, false);
+      if (e.status === 503) {
+        showError(`${t("custom.globalroles.errorNotPublished")} ${e.message}`);
+        toast(t("custom.globalroles.errorNotPublished"), "err");
+        // The write committed locally before the publish failed: refresh the
+        // list under the modal so a later Get reflects the stored row.
+        renderGlobalRoles();
+      } else if (e.status === 400 || e.code === "invalid_role") {
+        showError(`${t("custom.globalroles.errorInvalid")} ${e.message}`);
+      } else {
+        showError(e.message);
+      }
+    }
+  }
+
+  return modal;
+}
+
+function buildProviderPicker(selected) {
+  const root = el("fieldset", { class: "provider-picker full" },
+    el("legend", { text: t("custom.globalroles.fieldProviders") }),
+  );
+
+  const search = el("input", {
+    type: "search",
+    class: "provider-search",
+    placeholder: t("custom.globalroles.searchProviders"),
+    "aria-label": t("custom.globalroles.searchProviders"),
+  });
+  const meta = el("div", { class: "picker-meta" });
+  const list = el("div", { class: "provider-list" });
+  const empty = el("p", { class: "field-tip hidden", text: t("custom.globalroles.noProviders") });
+  const providers = ((FK.providers && FK.providers.list) || []).slice()
+    .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+
+  function updateMeta() {
+    meta.textContent = t("custom.globalroles.selected", { n: selected.size });
+  }
+
+  if (!providers.length) {
+    list.appendChild(el("p", { class: "field-tip", text: t("custom.globalroles.noProviderData") }));
+  }
+
+  for (const provider of providers) {
+    const id = String(provider.id);
+    const checkbox = el("input", { type: "checkbox" });
+    checkbox.checked = selected.has(id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) selected.add(id);
+      else selected.delete(id);
+      updateMeta();
+    });
+    const option = el("label", { class: "provider-option" },
+      checkbox,
+      el("span", { class: "provider-name", text: provider.name || id }),
+      el("span", { class: "provider-id mono", text: id }),
+    );
+    option.dataset.search = `${provider.name || ""} ${provider.key || ""} ${id}`.toLowerCase();
+    list.appendChild(option);
+  }
+
+  search.addEventListener("input", () => {
+    const needle = search.value.trim().toLowerCase();
+    for (const option of list.querySelectorAll(".provider-option")) {
+      option.classList.toggle("hidden", !!needle && !option.dataset.search.includes(needle));
+    }
+    const visible = [...list.querySelectorAll(".provider-option")].some((o) => !o.classList.contains("hidden"));
+    empty.classList.toggle("hidden", visible || !providers.length);
+  });
+
+  root.appendChild(search);
+  root.appendChild(meta);
+  root.appendChild(list);
+  root.appendChild(empty);
+  root.appendChild(el("div", { class: "field-tip", text: t("custom.globalroles.tipProviders") }));
+  return { root, selected };
+}
+
+function roleToggleBody(role, enabled) {
+  return {
+    id: role.id,
+    name: role.name,
+    tenant_id: role.tenant_id,
+    user_group_id: role.user_group_id,
+    user_id: role.user_id,
+    api_key_id: role.api_key_id,
+    model_key: role.model_key,
+    providers: Array.isArray(role.provider_ids) ? role.provider_ids : [],
+    enabled,
+  };
+}
+
+async function toggleGlobalRole(role) {
+  const next = !role.enabled;
+  try {
+    await api("PUT", "/global-roles", { body: roleToggleBody(role, next) });
+    toast(t(next ? "custom.globalroles.enabledToast" : "custom.globalroles.disabledToast"), "ok");
+    await renderGlobalRoles();
+  } catch (e) {
+    if (e.status === 503) {
+      toast(`${t("custom.globalroles.errorNotPublished")} ${e.message}`, "err");
+      await renderGlobalRoles();
+    } else {
+      toast(e.message, "err", { title: t("custom.globalroles.toggleFailed") });
+    }
+  }
+}
+
+async function deleteGlobalRole(role) {
+  const ok = await confirmDialog({
+    title: t("custom.globalroles.deleteTitle"),
+    message: t("custom.globalroles.deleteMsg"),
+    target: `${role.name || role.id} (${role.id})`,
+  });
+  if (!ok) return;
+  try {
+    await api("DELETE", `/global-roles/${encodeURIComponent(role.id)}`);
+    toast(t("custom.globalroles.deleted"), "ok");
+    await renderGlobalRoles();
+  } catch (e) {
+    toast(e.message, "err", { title: t("custom.globalroles.deleteFailed") });
+  }
+}
+
+/* ===========================================================================
+ * Custom: Tenant Access Tokens
+ * ======================================================================== */
+
+function teardownAccessTokens({ sameSection = false } = {}) {
+  // The plaintext must not survive NAVIGATION, but a language switch re-renders
+  // the SAME page and must not erase a token the operator has not copied yet.
+  if (!sameSection) PENDING_TOKEN = null;
+}
+
+async function renderAccessTokens() {
+  clear($("#page-actions"));
+  $("#page-actions").appendChild(el("button", { class: "btn sm", onClick: renderAccessTokens },
+    icon("refresh", 14), el("span", { class: "btn-label", text: t("common.action.refresh") })));
+
+  showSkeleton($("#content"));
+  let tenants = [];
+  try {
+    tenants = await api("GET", "/tenants") || [];
+  } catch (e) {
+    renderErrorPanel(e);
+    toast(e.message, "err", { title: t("custom.accesstokens.loadFailed") });
+    return;
+  }
+
+  if (!ACCESS_TENANT || !tenants.some((x) => String(x.id) === String(ACCESS_TENANT))) {
+    ACCESS_TENANT = tenants.length ? String(tenants[0].id) : null;
+  }
+
+  const content = $("#content");
+  clear(content);
+  const panel = el("div", { class: "panel" });
+
+  if (!tenants.length) {
+    panel.appendChild(el("div", { class: "panel-head" },
+      el("h2", {}, el("span", { text: t("custom.accesstokens.title") })), el("div", { class: "spacer" })));
+    panel.appendChild(emptyState("inbox", t("custom.accesstokens.noTenantsTitle"), t("custom.accesstokens.noTenantsMsg")));
+    panel.appendChild(el("div", { class: "empty-action" },
+      el("button", { class: "btn sm", onClick: () => go("tenants") },
+        icon("tenants", 14),
+        el("span", { text: t("custom.accesstokens.goTenants") }))));
+    content.appendChild(panel);
+    return;
+  }
+
+  const tenantSelect = el("select", { id: "access-tenant", "aria-label": t("custom.accesstokens.selectTenant") });
+  for (const tenant of tenants) {
+    tenantSelect.appendChild(el("option", {
+      value: String(tenant.id),
+      text: `${tenant.name || tenant.id} · ${tenant.id}`,
+    }));
+  }
+  tenantSelect.value = String(ACCESS_TENANT);
+  tenantSelect.addEventListener("change", () => {
+    ACCESS_TENANT = tenantSelect.value;
+    renderAccessTokens();
+  });
+
+  panel.appendChild(el("div", { class: "panel-head access-head" },
+    el("h2", {}, el("span", { text: t("custom.accesstokens.title") }), " ",
+      el("span", { class: "count", id: "access-token-count", text: "" })),
+    el("div", { class: "spacer" }),
+    el("div", { class: "tenant-picker" },
+      el("label", { for: "access-tenant", text: t("custom.accesstokens.selectTenant") }),
+      tenantSelect,
+    ),
+    el("button", { class: "btn primary sm", onClick: () => openAccessTokenForm(String(ACCESS_TENANT)) },
+      icon("plus", 14),
+      el("span", { class: "btn-label", text: t("custom.accesstokens.new") })),
+  ));
+  panel.appendChild(el("p", { class: "note" }, t("custom.accesstokens.desc")));
+
+  if (PENDING_TOKEN && String(PENDING_TOKEN.tenant_id) === String(ACCESS_TENANT)) {
+    panel.appendChild(pendingTokenCallout());
+  }
+  const wrap = el("div", { id: "access-token-wrap" });
+  panel.appendChild(wrap);
+  content.appendChild(panel);
+  await loadAccessTokenTable(String(ACCESS_TENANT), wrap);
+}
+
+function tokenSkeleton() {
+  return el("div", { class: "table-wrap" },
+    el("table", {},
+      el("tbody", {}, ...Array.from({ length: 3 }).map(() =>
+        el("tr", { class: "skeleton-row" },
+          el("td", {}, el("span", { class: "skeleton" })),
+          el("td", {}, el("span", { class: "skeleton", style: "width:40%" })),
+          el("td", {}, el("span", { class: "skeleton", style: "width:30%" })),
+          el("td", {}, el("span", { class: "skeleton", style: "width:20%" })),
+        ),
+      )),
+    ),
+  );
+}
+
+async function loadAccessTokenTable(tenantId, wrap) {
+  clear(wrap);
+  wrap.appendChild(tokenSkeleton());
+  let rows = [];
+  try {
+    rows = await api("GET", `/tenants/${encodeURIComponent(tenantId)}/access-tokens`) || [];
+  } catch (e) {
+    clear(wrap);
+    wrap.appendChild(emptyState("alert", t("custom.accesstokens.loadFailed"), e.message));
+    toast(e.message, "err", { title: t("custom.accesstokens.loadFailed") });
+    return;
+  }
+  clear(wrap);
+  const count = $("#access-token-count");
+  if (count) count.textContent = String(rows.length);
+  if (!rows.length) {
+    wrap.appendChild(emptyState("inbox", t("custom.accesstokens.emptyTitle"), t("custom.accesstokens.emptyMsg"),
+      { primary: t("common.empty.new", { singular: t("custom.accesstokens.singular") }),
+        onClick: () => openAccessTokenForm(tenantId) }));
+    return;
+  }
+  wrap.appendChild(accessTokenTable(rows, tenantId));
+}
+
+function accessTokenTable(rows, tenantId) {
+  const headers = [
+    "custom.accesstokens.colId",
+    "custom.accesstokens.colName",
+    "custom.accesstokens.colPrefix",
+    "custom.accesstokens.colLast4",
+    "custom.accesstokens.colEnabled",
+    "custom.accesstokens.colExpires",
+  ];
+  const thead = el("thead", {}, el("tr", {},
+    ...headers.map((k) => el("th", { text: t(k) })),
+    el("th", { text: "" }),
+  ));
+  const tbody = el("tbody", {});
+  for (const row of rows) {
+    tbody.appendChild(el("tr", {},
+      el("td", {}, el("span", { class: "mono", text: row.id })),
+      el("td", {}, el("span", { class: "role-name", text: row.name || "—" })),
+      el("td", {}, el("span", { class: "mono", text: row.token_prefix || "—" })),
+      el("td", {}, el("span", { class: "mono", text: row.token_last4 || "—" })),
+      el("td", {}, boolPill(!!row.enabled)),
+      el("td", {}, expiryCell(row.expires_at)),
+      el("td", { class: "actions" },
+        el("div", { class: "row-actions" },
+          iconBtn("trash", t("custom.accesstokens.revoke"), () => revokeAccessToken(tenantId, row), "danger"),
+        ),
+      ),
+    ));
+  }
+  return el("div", { class: "table-wrap" }, el("table", {}, thead, tbody));
+}
+
+function expiryCell(value) {
+  if (!value) return el("span", { class: "muted", text: t("custom.accesstokens.never") });
+  const at = Date.parse(value);
+  const expired = !Number.isNaN(at) && at <= Date.now();
+  return el("span", { class: expired ? "pill err" : "mono", text: shortTime(value), title: String(value) });
+}
+
+function pendingTokenCallout() {
+  const copyBtn = el("button", { class: "btn primary sm", type: "button", text: t("common.action.copy") });
+  copyBtn.addEventListener("click", () => copyText(PENDING_TOKEN.token, copyBtn));
+  return el("div", { class: "token-callout", role: "status" },
+    el("div", { class: "token-callout-head" },
+      el("div", {},
+        el("strong", { text: t("custom.accesstokens.createdTitle") }),
+        el("div", { class: "field-tip", text: t("custom.accesstokens.createdWarning") }),
+      ),
+      copyBtn,
+    ),
+    el("code", { class: "token-value", text: PENDING_TOKEN.token }),
+    el("div", { class: "token-meta", text: `${PENDING_TOKEN.name} · ${PENDING_TOKEN.token_prefix}…${PENDING_TOKEN.token_last4}` }),
+    el("div", { class: "token-actions" },
+      el("span", { class: "field-tip", text: t("custom.accesstokens.prefixHelp") }),
+      el("button", { class: "btn sm", type: "button", text: t("custom.accesstokens.done"),
+        onClick: () => { PENDING_TOKEN = null; renderAccessTokens(); } }),
+    ),
+  );
+}
+
+function openAccessTokenForm(tenantId) {
+  const form = el("form", { class: "form-grid", onSubmit: (e) => e.preventDefault() });
+  const alertBox = el("div", { class: "alert err form-alert hidden", role: "alert" });
+  form.appendChild(alertBox);
+
+  const nameInput = el("input", { type: "text", placeholder: "ci-deploy" });
+  const nameError = el("div", { class: "field-error hidden" });
+  form.appendChild(el("div", { class: "input-group full" },
+    el("label", { text: t("custom.accesstokens.fieldName") }, el("span", { class: "req", text: " *" })),
+    nameInput,
+    nameError,
+  ));
+
+  const expiresInput = el("input", { type: "datetime-local" });
+  const expiresError = el("div", { class: "field-error hidden" });
+  form.appendChild(el("div", { class: "input-group full" },
+    el("label", { text: t("custom.accesstokens.fieldExpires") }),
+    expiresInput,
+    expiresError,
+    el("div", { class: "field-tip", text: t("custom.accesstokens.tipExpires") }),
+  ));
+
+  const submitBtn = el("button", { class: "btn primary", type: "submit" },
+    el("span", { class: "btn-label", text: t("common.form.new", { singular: t("custom.accesstokens.singular") }) }));
+
+  openModal({
+    icon: "token",
+    title: t("custom.accesstokens.createTitle"),
+    sub: t("custom.accesstokens.desc"),
+    body: form,
+    actions: [
+      el("button", { class: "btn", text: t("common.action.cancel"), onClick: () => closeModal() }),
+      submitBtn,
+    ],
+  });
+
+  setTimeout(() => nameInput.focus(), 60);
+  submitBtn.addEventListener("click", (e) => { e.preventDefault(); submit(); });
+  form.addEventListener("submit", (e) => { e.preventDefault(); submit(); });
+
+  function showError(message) {
+    alertBox.textContent = message;
+    alertBox.classList.remove("hidden");
+  }
+
+  async function submit() {
+    const name = nameInput.value.trim();
+    nameInput.classList.remove("invalid");
+    nameError.classList.add("hidden");
+    expiresInput.classList.remove("invalid");
+    expiresError.classList.add("hidden");
+    if (!name) {
+      nameInput.classList.add("invalid");
+      nameError.textContent = t("custom.accesstokens.nameRequired");
+      nameError.classList.remove("hidden");
+      nameInput.focus();
+      return;
+    }
+    let expiresAt = null;
+    if (expiresInput.value) {
+      const parsed = new Date(expiresInput.value);
+      if (Number.isNaN(parsed.getTime())) {
+        expiresInput.classList.add("invalid");
+        expiresError.textContent = t("custom.accesstokens.badExpiry");
+        expiresError.classList.remove("hidden");
+        expiresInput.focus();
+        return;
+      }
+      expiresAt = parsed.toISOString();
+    }
+    const body = { name };
+    if (expiresAt) body.expires_at = expiresAt;
+
+    setLoading(submitBtn, true, t("common.action.creating"));
+    try {
+      const created = await api("POST", `/tenants/${encodeURIComponent(tenantId)}/access-tokens`, { body });
+      closeModal();
+      PENDING_TOKEN = {
+        tenant_id: tenantId,
+        token: created.token,
+        name: created.name || name,
+        token_prefix: created.token_prefix || "",
+        token_last4: created.token_last4 || "",
+      };
+      toast(t("custom.accesstokens.created"), "ok");
+      await renderAccessTokens();
+    } catch (e) {
+      setLoading(submitBtn, false);
+      if (e.status === 503) {
+        // The handler stores the token, then returns 503 without the plaintext
+        // body. The secret is unrecoverable; say so instead of pretending the
+        // create failed as a whole.
+        showError(t("custom.accesstokens.notPublished"));
+        toast(t("custom.accesstokens.notPublished"), "err");
+        renderAccessTokens();
+      } else {
+        showError(e.message);
+      }
+    }
+  }
+}
+
+async function revokeAccessToken(tenantId, token) {
+  const ok = await confirmDialog({
+    title: t("custom.accesstokens.revokeTitle"),
+    message: t("custom.accesstokens.revokeMsg"),
+    target: `${token.name || token.id} (${token.id})`,
+    confirmText: t("custom.accesstokens.revoke"),
+  });
+  if (!ok) return;
+  try {
+    await api("DELETE", `/tenants/${encodeURIComponent(tenantId)}/access-tokens/${encodeURIComponent(token.id)}`);
+    toast(t("custom.accesstokens.revoked"), "ok");
+    await renderAccessTokens();
+  } catch (e) {
+    toast(e.message, "err", { title: t("custom.accesstokens.revokeFailed") });
   }
 }
 

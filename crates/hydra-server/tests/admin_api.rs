@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
+use hydra_core::model::{BillingStatus, Tenant, User, UserApiKey, UserGroup};
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
@@ -3394,4 +3395,225 @@ async fn repeated_bad_admin_tokens_are_throttled_then_a_valid_token_still_works(
         200,
         "throttling failed attempts must not block a successful one"
     );
+}
+
+// ===========================================================================
+// The user hierarchy, READ (plan §3.5 — the cascading global-role UI)
+//
+// Three GET paths so an operator can render `role → users → keys`. The point this
+// suite pins is the one a copy-paste of the row serializer gets wrong: a
+// `user_api_key` row carries `key_hash`, and the admin API must not put a
+// credential digest on the wire. Everything else here is a smoke check that the
+// rows are the ones the tenant write path stores, filtered by `?tenant_id=`.
+// ===========================================================================
+
+#[tokio::test]
+async fn user_hierarchy_reads_http() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // Seeded through the SAME repo calls the tenant self-service write path makes,
+    // so what these reads answer is exactly what a tenant minted.
+    let pool = state.db();
+    repo::insert_tenant(
+        pool,
+        &Tenant {
+            id: "t1".into(),
+            name: "hier-one".into(),
+            domain: "hier1.example".into(),
+            auth_url: "https://auth.hier1.example/verify".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("insert tenant t1");
+    // A tenant with NO hierarchy rows: the `?tenant_id=` filter has to be able
+    // to answer an honest empty list.
+    repo::insert_tenant(
+        pool,
+        &Tenant {
+            id: "t2".into(),
+            name: "hier-two".into(),
+            domain: "hier2.example".into(),
+            auth_url: "https://auth.hier2.example/verify".into(),
+            cert_key: None,
+            cert_file: None,
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("insert tenant t2");
+    repo::upsert_user_group(
+        pool,
+        &UserGroup {
+            id: "g1".into(),
+            tenant_id: "t1".into(),
+            name: "Ops".into(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("upsert user group");
+    repo::upsert_user(
+        pool,
+        &User {
+            id: "u1".into(),
+            tenant_id: "t1".into(),
+            user_group_id: "g1".into(),
+            external_id: Some("ext-1".into()),
+            name: "Ann".into(),
+            enabled: true,
+            billing_status: BillingStatus::Active,
+            billing_reason: None,
+            billing_updated_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("upsert user");
+
+    let plaintext = "hk_plaintext_never_returns";
+    let key_hash = hydra_core::auth::sha256_hex_string(plaintext.as_bytes());
+    repo::insert_user_api_key(
+        pool,
+        &UserApiKey {
+            id: "k1".into(),
+            user_id: "u1".into(),
+            name: "ci".into(),
+            key_hash: key_hash.clone(),
+            key_prefix: "hk_pla".into(),
+            key_last4: "turns".into(),
+            enabled: true,
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("insert user api key");
+
+    // --- user-groups --------------------------------------------------------
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/user-groups",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let groups_doc: serde_json::Value = r.json().await.expect("user-groups json");
+    let groups = groups_doc.as_array().expect("array");
+    assert_eq!(groups.len(), 1, "the node's one group must be listed");
+    assert_eq!(groups[0]["id"].as_str().unwrap_or(""), "g1");
+    assert_eq!(groups[0]["tenant_id"].as_str().unwrap_or(""), "t1");
+    assert_eq!(groups[0]["name"].as_str().unwrap_or(""), "Ops");
+    assert_eq!(groups[0]["enabled"].as_bool(), Some(true));
+
+    // --- users -------------------------------------------------------------
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/users",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let users_doc: serde_json::Value = r.json().await.expect("users json");
+    let users = users_doc.as_array().expect("array");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["id"].as_str().unwrap_or(""), "u1");
+    assert_eq!(users[0]["user_group_id"].as_str().unwrap_or(""), "g1");
+    assert_eq!(users[0]["external_id"].as_str().unwrap_or(""), "ext-1");
+    // `billing_status` is here because it is the state a cascade explains: a UI
+    // that cannot see it cannot tell a cascade from a manual suspension.
+    assert_eq!(users[0]["billing_status"].as_str().unwrap_or(""), "active");
+
+    // --- user-api-keys: ALWAYS masked --------------------------------------
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/user-api-keys",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.expect("api-keys body");
+    let keys_doc: serde_json::Value =
+        serde_json::from_str::<serde_json::Value>(body.as_str()).expect("api-keys json");
+    let keys = keys_doc.as_array().expect("array");
+    assert_eq!(keys.len(), 1, "the node's one key must be listed");
+    // Rendered once, for the failure messages below.
+    let key_row = serde_json::to_string(&keys[0]).expect("row json");
+    assert_eq!(keys[0]["id"].as_str().unwrap_or(""), "k1");
+    assert_eq!(keys[0]["user_id"].as_str().unwrap_or(""), "u1");
+    assert_eq!(keys[0]["key_prefix"].as_str().unwrap_or(""), "hk_pla");
+    assert_eq!(keys[0]["key_last4"].as_str().unwrap_or(""), "turns");
+    // The digest is STRUCTURALLY ABSENT — an empty string would still be a
+    // serializer that knows about it, and the next field added would come back.
+    assert!(
+        keys[0].get("key_hash").is_none(),
+        "the admin view must not carry a key_hash field at all: {key_row}"
+    );
+    for (forbidden, why) in [
+        ("key_hash", "the field name itself must not travel"),
+        (
+            key_hash.as_str(),
+            "the stored digest of the key must never leave the node",
+        ),
+        (plaintext, "the plaintext is shown ONCE, at creation"),
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "GET /api/v1/user-api-keys must not carry {forbidden}: {why}",
+        );
+    }
+    // A never-expiring key answers JSON null, not a missing field: a caller
+    // reconciling the list must be able to tell "no expiry" from "no data".
+    assert!(
+        keys[0]["expires_at"].is_null(),
+        "`expires_at` must serialize as null: {key_row}"
+    );
+
+    // --- `?tenant_id=` ----------------------------------------------------
+    // For keys this resolves through the key's OWNER (a `user_api_key` row names
+    // only `user_id`), so t2 — which owns no users — must answer empty.
+    for (path, expect_len) in [
+        ("/api/v1/user-groups?tenant_id=t1", 1),
+        ("/api/v1/user-groups?tenant_id=t2", 0),
+        ("/api/v1/users?tenant_id=t1", 1),
+        ("/api/v1/users?tenant_id=t2", 0),
+        ("/api/v1/user-api-keys?tenant_id=t1", 1),
+        ("/api/v1/user-api-keys?tenant_id=t2", 0),
+    ] {
+        let r = req(port, reqwest::Method::GET, path, Some(TOKEN), None).await;
+        assert_eq!(r.status(), 200, "{path}");
+        let rows_doc: serde_json::Value = r.json().await.expect("json");
+        let rows = rows_doc.as_array().expect("array");
+        assert_eq!(rows.len(), expect_len, "{path}");
+    }
+
+    // --- READ-ONLY ---------------------------------------------------------
+    // The write half of this surface is the TENANT's own API, which carries that
+    // tenant's scoping rules; a second write path here would be a second rule set
+    // over one table.
+    for (method, verb, path) in [
+        (reqwest::Method::POST, "POST", "/api/v1/users"),
+        (reqwest::Method::PUT, "PUT", "/api/v1/user-groups"),
+        (reqwest::Method::POST, "POST", "/api/v1/user-api-keys"),
+    ] {
+        let r = req(port, method, path, Some(TOKEN), Some("{}")).await;
+        assert_eq!(r.status(), 405, "{verb} {path} must be refused, not served");
+    }
 }

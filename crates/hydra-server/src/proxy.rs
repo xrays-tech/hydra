@@ -59,6 +59,7 @@ use hydra_core::apikey::{extract_client_key, ClientKeyInput, KeyExtraction};
 use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::{extract_model_field, ModelField};
+use hydra_core::identity::{decide_api_key, AuthDecision};
 use hydra_core::limit::MatchCtx;
 use hydra_core::model::{
     Candidate, ExcludedCandidate, ExclusionReason, RouteError, SubTenantRoute,
@@ -74,6 +75,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use rand::seq::SliceRandom;
 use tracing::{debug, info, warn};
 
+#[allow(unused_imports)]
 use crate::http::{AuthChecker, HttpAuthChecker};
 use crate::proxy::admission::{AdmissionControl, AdmissionError};
 use crate::proxy::breaker_wrap::CircuitBreaker;
@@ -367,15 +369,43 @@ impl HydraProxy {
         })
     }
 
-    /// Cache-first external auth boundary (§6.3 §4 / §11). Runs the
-    /// `AuthChecker`, records auth metrics (§17) and — when the verdict is
-    /// Denied — writes the structured 401/402/503 response body (402 carries the
-    /// reason label, e.g. insufficient_balance).
+    /// The session id used as the AFFINITY key (T7b, plan §3.4 step 4), read
+    /// from the first VALID header in the plan's precedence order:
+    /// `X-Opencode-Session` → `Session-Id` → `x-conversation-id`.
     ///
-    /// Returns `Ok(true)` when the request has been answered (denied ⇒ the
-    /// caller must short-circuit), `Ok(false)` when it may proceed. Used by
-    /// the mandatory-auth step (4); the tenant model catalog (2.5) deliberately
-    /// does NOT call it — the directory is public with or without a key.
+    /// `HeaderMap` lookup is case-insensitive, so the spellings below record
+    /// intent rather than matching rules. The value is used ONLY as a routing
+    /// hint (a hash input for sticky selection) — never logged, never an
+    /// authorization input — so a present-but-invalid value (empty after trim,
+    /// or larger than 256 bytes) is IGNORED and the next transport is tried,
+    /// rather than rejecting the request. The 256-byte cap exists because an
+    /// unbounded client header must not become an unbounded hash input.
+    fn extract_session_id(session: &Session) -> Option<String> {
+        const MAX_SESSION_BYTES: usize = 256;
+        let headers = &session.req_header().headers;
+        for name in [
+            "x-opencode-session".to_string(),
+            "session-id".to_string(),
+            "x-conversation-id".to_string(),
+        ] {
+            match headers.get(name.as_str()).and_then(|v| v.to_str().ok()) {
+                None => {}
+                Some(raw) => {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() && trimmed.len() <= MAX_SESSION_BYTES {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// T3 internal api-key auth path against the pinned config snapshot.
+    ///
+    /// Returns `Ok(true)` when the request has been answered (denied), `Ok(false)`
+    /// when it may proceed.
+    #[allow(unused)]
     async fn enforce_auth(
         &self,
         session: &mut Session,
@@ -383,48 +413,67 @@ impl HydraProxy {
         tenant: &hydra_core::model::Tenant,
         api_key: &str,
     ) -> PingoraResult<bool> {
-        let verdict = self.state.auth.check(tenant, api_key).await;
-        ctx.auth_verdict = Some(verdict.clone());
-        // Metrics (§17): auth decision + cache size (+ upstream-error counter).
-        {
-            let src = match &verdict {
-                AuthVerdict::Allowed { source } | AuthVerdict::Denied { source, .. } => {
-                    match source {
-                        CacheSource::Hit => "hit",
-                        CacheSource::Miss => "miss",
-                        CacheSource::Local => "local",
-                    }
-                }
-            };
-            let vlabel = match &verdict {
-                AuthVerdict::Allowed { .. } => "allowed",
-                AuthVerdict::Denied { .. } => "denied",
-            };
-            crate::admin::metrics::record_auth_decision(&tenant.id, vlabel, src);
-            crate::admin::metrics::record_auth_cache_size(self.state.auth.cache().len());
-            if let AuthVerdict::Denied { reason, .. } = &verdict {
-                if *reason == "auth_upstream_unavailable" {
-                    crate::admin::metrics::record_auth_upstream_error(&tenant.id);
-                }
+        let cfg_arc = match &ctx.cfg {
+            Some(cfg) => Arc::clone(cfg),
+            None => {
+                let guard = self.state.store.snapshot();
+                Arc::clone(&guard)
+            }
+        };
+        let cfg: &ConfigData = cfg_arc.as_ref();
+
+        let hash = hydra_core::auth::sha256_hex_string(api_key.as_bytes());
+        let identity = cfg.users_by_api_key_hash.get(&hash);
+        let now = now_iso8601();
+        let decision = decide_api_key(&tenant.id, tenant.enabled, identity, &now);
+
+        match decision {
+            AuthDecision::Allow => {
+                crate::admin::metrics::record_auth_decision(&tenant.id, "allowed", "internal");
+                ctx.auth_verdict = Some(AuthVerdict::Allowed {
+                    source: CacheSource::Local,
+                });
+                ctx.principal = identity.map(|id| id.principal.clone());
+                Ok(false)
+            }
+            AuthDecision::InvalidKey => {
+                crate::admin::metrics::record_auth_decision(&tenant.id, "invalid_key", "internal");
+                return respond_auth_denial(session, 401, "invalid_api_key").await;
+            }
+            AuthDecision::UserDisabled => {
+                crate::admin::metrics::record_auth_decision(
+                    &tenant.id,
+                    "user_disabled",
+                    "internal",
+                );
+                return respond_auth_denial(session, 403, "user_disabled").await;
+            }
+            AuthDecision::GroupDisabled => {
+                crate::admin::metrics::record_auth_decision(
+                    &tenant.id,
+                    "group_disabled",
+                    "internal",
+                );
+                return respond_auth_denial(session, 403, "group_disabled").await;
+            }
+            AuthDecision::TenantDisabled => {
+                crate::admin::metrics::record_auth_decision(
+                    &tenant.id,
+                    "tenant_disabled",
+                    "internal",
+                );
+                return respond_auth_denial(session, 403, "tenant_disabled").await;
+            }
+            AuthDecision::Delinquent => {
+                crate::admin::metrics::record_auth_decision(&tenant.id, "delinquent", "internal");
+                let body = Bytes::from(
+                    "{\"error\":{\"message\":\"user_delinquent\",\"type\":\"insufficient_quota\",\"code\":\"user_delinquent\"}}"
+                );
+                session.set_keepalive(None);
+                session.respond_error_with_body(402, body).await?;
+                Ok(true)
             }
         }
-        if let AuthVerdict::Denied { status, reason, .. } = &verdict {
-            // An insufficient-balance denial (status 402) is surfaced with the
-            // mainstream OpenAI-compatible gateway type "insufficient_quota";
-            // every other auth denial keeps type "auth_error".
-            let err_type = if *status == 402 {
-                "insufficient_quota"
-            } else {
-                "auth_error"
-            };
-            let body = Bytes::from(format!(
-                "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"{err_type}\"}}}}"
-            ));
-            session.set_keepalive(None);
-            session.respond_error_with_body(*status, body).await?;
-            return Ok(true);
-        }
-        Ok(false)
     }
 }
 
@@ -569,22 +618,34 @@ impl ProxyHttp for HydraProxy {
         }
         let api_key_opt = extraction.key;
 
+        // (3.5) Session-affinity hint (T7b, plan §3.4 step 4). Read from the
+        //       first VALID session header in the documented precedence
+        //       (`X-Opencode-Session` → `Session-Id` → `x-conversation-id`),
+        //       trimmed and capped at 256 bytes; anything present-but-invalid
+        //       falls through to the next transport. Extracted BEFORE the
+        //       catalog intercept and BEFORE routing so every later step sees
+        //       the same value.
+        ctx.session_id = Self::extract_session_id(session);
+
         // (2.5) Tenant model catalog (design-tenant-model-catalog §2.2, P0;
         //       public-read revision round 2 — dev-docs/aegis/plans/2026-09-08).
         //
         // Intercept `GET /v1/models` — the tenant model directory — BEFORE the
         // mandatory api-key gate and answer from the LOCAL union of this
-        // tenant's currently routable models (`router::accessible_models`,
-        // design §2.1), serialised OpenAI-style:
+        //     tenant's currently routable models (`router::accessible_models_*`,
+        //       T7a principal-aware variant on the request path — design §2.1),
+        //       serialised OpenAI-style:
         //   {"object":"list","data":[{"id":<model>,"object":"model"}, ...]}
         // Auth semantics for the directory:
         //   - the directory is unconditionally public for the tenant (resolved
         //     from Host, steps 1-2 above) — the external-auth boundary NEVER
         //     runs on this exact path, whether a key was presented or not;
-        //   - a presented key is therefore not validated; it only narrows the
-        //     listing to the bound provider via key-prefix binding inside
-        //     `accessible_models` (key = Some; the bound view is a subset of
-        //     the anonymous union, so presenting a key adds no information).
+        //   - a presented key is therefore not validated; since T7a it narrows
+        //     the listing via the caller's PRINCIPAL and its Global Role rules
+        //     (inside `accessible_models_with_principal`) — the role-narrowed
+        //     view is a subset of the anonymous union, so presenting a key adds
+        //     no information (pre-T7a the narrowing came from key-prefix binding
+        //     inside `accessible_models`).
         //     Unknown domain (1) and disabled-tenant (2) short-circuits still
         //     apply unchanged.
         // Only method GET on the exact path `/v1/models` is intercepted (the
@@ -602,16 +663,33 @@ impl ProxyHttp for HydraProxy {
         };
         if is_catalog_get {
             // Round-2 semantics: no external auth on the directory. A presented
-            // key (api_key_opt) is passed through ONLY for key-prefix binding
-            // narrowing — a bound view ⊆ the anonymous union, so the read is
-            // public with or without a key. record_catalog fires once per
-            // served directory request.
+            // key is NEVER validated here — it is looked up in the identity
+            // index ONLY to learn the PRINCIPAL behind it, so the listing can
+            // come from the same Global Role rules the router will apply (T7a).
+            // Looking the key up is not an auth decision: a revoked/expired key
+            // still resolves to a principal, but this path never checks key
+            // state, user/group enablement, billing or expiry, and never 401/402/403
+            // from this lookup. An unknown key yields `principal = None` ⇒ the
+            // anonymous union, exactly as an absent key.
+            //
+            // NOTE the narrowing rule CHANGED with T7a: key-prefix binding no
+            // longer narrows the catalog (`accessible_models_with_principal`
+            // has no raw-key argument); the caller's Global Role rules do —
+            // still a subset of the anonymous union, so presenting a key still
+            // adds no information an attacker could use.
+            //
+            // record_catalog fires once per served directory request.
             crate::admin::metrics::record_catalog(&tenant.id);
-            let entries = router::accessible_models(
+            let principal = api_key_opt.as_ref().and_then(|k| {
+                cfg.users_by_api_key_hash
+                    .get(&hydra_core::auth::sha256_hex_string(k.as_bytes()))
+                    .map(|id| &id.principal)
+            });
+            let entries = router::accessible_models_with_principal(
                 cfg,
                 self.state.breaker.as_ref(),
                 &tenant.id,
-                api_key_opt.as_deref(),
+                principal,
             );
             return respond_catalog(session, ctx, &entries).await;
         }
@@ -863,12 +941,23 @@ impl ProxyHttp for HydraProxy {
         let (candidates, model_for_route) = match model_opt {
             Some(m) => {
                 let model_key = m;
-                let outcome = match router::resolve_detailed(
+                // T7a: the route is decided from the request's PRINCIPAL, not the
+                // raw api-key — `resolve_with_principal` applies the Global Role
+                // candidate union (plan §3.4 step 2) and intersects it with the
+                // model's serving providers and the live breaker. `ctx.principal`
+                // is Some ONLY on the internal-auth Allow path (T3); an external-
+                // auth verdict carries no principal, so those requests fall back
+                // to the legacy `models_by_key ∩ tenant_providers` base INSIDE the
+                // router — the behaviour before T7a, unchanged. The api-key string
+                // argument is gone: the key's narrowing (key-prefix binding) lived
+                // in the candidate SET, which the principal's role union now
+                // supersedes.
+                let outcome = match router::resolve_with_principal(
                     cfg,
                     self.state.breaker.as_ref(),
                     &tenant,
                     &model_key,
-                    Some(api_key.as_str()),
+                    ctx.principal.as_ref(),
                 ) {
                     Ok(o) => o,
                     Err(e) => {
@@ -883,7 +972,8 @@ impl ProxyHttp for HydraProxy {
                 // Name the providers that WOULD have served this request but were
                 // dropped while the candidate set was built (`breaker_dead` /
                 // `no_key` / `invalid_weight`; a deliberate `soft_disabled` is
-                // reported by `resolve_detailed` but not counted — see
+                // reported by `resolve_*` (both entry points share `resolve_impl`)
+                // but not counted — see
                 // `record_excluded_candidates`). Recorded on SUCCESSFUL requests too,
                 // deliberately: that is the case that used to leave no trace — a
                 // provider whose last api-key was deleted stops being chosen while
@@ -935,14 +1025,50 @@ impl ProxyHttp for HydraProxy {
         };
         ctx.model_key = model_for_route.clone();
 
-        // SWRR order over the resolved candidates (skip for passthrough — a
-        // single candidate needs no ordering). Thread the per-(tenant,model)
-        // state from the ConfigStore's DashMap.
+        // Candidate ORDER (T7b, plan §3.4 step 4). A passthrough request stays
+        // unordered (a single candidate needs no ordering). A ROUTED request
+        // gets one of two orders:
+        //   STICKY  — affinity configured ON (`HYDRA_SESSION_AFFINITY`, default)
+        //             AND a session header AND a resolved principal: the same
+        //             (tenant, model, api-key, session) always selects the same
+        //             provider (weighted rendezvous, ∝ weights), so the prompt
+        //             cache a session warmed under one provider keeps being hit
+        //             instead of being reshuffled per request.
+        //   SWRR    — the default smooth-weighted order, threaded through the
+        //             ConfigStore's per-(tenant,model) DashMap.
+        //
+        //             The STICKY path NEVER touches that SWRR state: the two
+        //             orders must not contaminate each other's counters.
+        //             `order_with_affinity` returns false when the sticky key
+        //             selects nothing (the provider it pinned is no longer a
+        //             candidate in this generation — breaker dead, key deleted,
+        //             role changed); that request then falls back to plain SWRR,
+        //             which is the correct answer once affinity has given up.
         let mut candidates = candidates;
         if let Some(model_key) = model_for_route.as_deref() {
-            let key = (tenant_id.clone(), model_key.to_string());
-            let mut guard = self.state.store.swrr().entry(key).or_default();
-            swrr::order(&mut candidates, &mut guard);
+            let mut sticky_ordered = false;
+            if let (true, Some(session), Some(principal)) = (
+                self.state.proxy.session_affinity,
+                ctx.session_id.as_ref(),
+                ctx.principal.as_ref(),
+            ) {
+                let key = hydra_core::affinity::sticky_key(
+                    &tenant_id,
+                    model_key,
+                    &principal.api_key_id,
+                    session,
+                );
+                sticky_ordered =
+                    hydra_core::affinity::order_with_affinity(&mut candidates, Some(&key));
+                if sticky_ordered {
+                    crate::admin::metrics::record_sticky_hit();
+                }
+            }
+            if !sticky_ordered {
+                let key = (tenant_id.clone(), model_key.to_string());
+                let mut guard = self.state.store.swrr().entry(key).or_default();
+                swrr::order(&mut candidates, &mut guard);
+            }
         }
         ctx.candidates = candidates.clone();
 
@@ -1445,15 +1571,21 @@ impl ProxyHttp for HydraProxy {
         if let (Some(tenant), Some(sel)) = (ctx.tenant.as_ref(), ctx.selected.as_ref()) {
             let model = ctx.model_key.clone().unwrap_or_default();
             let masked = ctx.client_api_key.as_ref().map(|k| mask_key(k));
-            // v3 attribution: the sub-tenant this request belongs to, from the RAW
-            // key prefix (never the masked form). A cheap snapshot clone; the match
-            // is pure and independent of gate (3.6) / operator key-prefix bindings.
-            let sub_tenant_id = {
-                let cfg = self.state.store.snapshot();
-                ctx.client_api_key
-                    .as_deref()
-                    .and_then(|k| router::sub_tenant_id_for_key(&cfg, &tenant.id, k))
-                    .map(str::to_string)
+            // Attribution for the usage row: the USER hierarchy behind the
+            // request, taken from the principal the INTERNAL api-key path already
+            // resolved (`ctx.principal`) — never re-derived from the masked key,
+            // and never invented: a request this path did not resolve (an
+            // unknown/revoked key answered earlier, or a path that carries no
+            // principal) lands with all three dimensions NULL. The three levels
+            // are stored side by side so `/usage?group_by=user|user_group|api_key`
+            // can bucket on any of them without a join.
+            let (user_id, user_group_id, api_key_id) = match ctx.principal.as_ref() {
+                Some(p) => (
+                    Some(p.user_id.clone()),
+                    Some(p.user_group_id.clone()),
+                    Some(p.api_key_id.clone()),
+                ),
+                None => (None, None, None),
             };
             let now_iso = now_iso8601();
             let record = hydra_core::model::UsageRecord {
@@ -1461,7 +1593,9 @@ impl ProxyHttp for HydraProxy {
                 provider_id: sel.provider_id.clone(),
                 model_key: model,
                 client_api_key_masked: masked,
-                sub_tenant_id,
+                user_id,
+                user_group_id,
+                api_key_id,
                 status_code: status,
                 // Preserve None (→ NULL): a provider that does not report a
                 // dimension must not masquerade as a zero count.
@@ -1713,6 +1847,19 @@ async fn respond_catalog(
 async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> PingoraResult<bool> {
     let body = Bytes::from(format!(
         "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"proxy_error\"}}}}"
+    ));
+    session.set_keepalive(None);
+    session.respond_error_with_body(status, body).await?;
+    Ok(true)
+}
+
+async fn respond_auth_denial(
+    session: &mut Session,
+    status: u16,
+    reason: &str,
+) -> PingoraResult<bool> {
+    let body = Bytes::from(format!(
+        "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"auth_error\"}}}}"
     ));
     session.set_keepalive(None);
     session.respond_error_with_body(status, body).await?;

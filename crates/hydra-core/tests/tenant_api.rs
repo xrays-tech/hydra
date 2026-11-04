@@ -151,21 +151,24 @@ fn the_three_endpoints_parse() {
         parse_route("/tenant/t1/api/v1/whoami"),
         Some(TenantApiRoute {
             endpoint: Endpoint::Whoami,
-            tenant_id: "t1"
+            tenant_id: "t1",
+            user_id: None
         })
     );
     assert_eq!(
         parse_route("/tenant/t1/api/v1/auth/cache/invalidate"),
         Some(TenantApiRoute {
             endpoint: Endpoint::InvalidateAuthCache,
-            tenant_id: "t1"
+            tenant_id: "t1",
+            user_id: None
         })
     );
     assert_eq!(
         parse_route("/tenant/t1/api/v1/usage"),
         Some(TenantApiRoute {
             endpoint: Endpoint::Usage,
-            tenant_id: "t1"
+            tenant_id: "t1",
+            user_id: None
         })
     );
 }
@@ -180,14 +183,16 @@ fn the_sub_tenant_endpoints_parse() {
         parse_route("/tenant/t1/api/v1/sub-tenants"),
         Some(TenantApiRoute {
             endpoint: Endpoint::ListSubTenants,
-            tenant_id: "t1"
+            tenant_id: "t1",
+            user_id: None
         })
     );
     assert_eq!(
         parse_route("/tenant/t1/api/v1/sub-tenant-routes"),
         Some(TenantApiRoute {
             endpoint: Endpoint::ListSubTenantRoutes,
-            tenant_id: "t1"
+            tenant_id: "t1",
+            user_id: None
         })
     );
 }
@@ -325,6 +330,316 @@ fn the_write_route_segment_is_read_raw() {
             name: "a%2Fb"
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// user-hierarchy READ routes (T5 flat lists + T6 per-user api-key list)
+// ---------------------------------------------------------------------------
+
+/// The two flat user-hierarchy lists parse like the sub-tenant lists: the item id
+/// is NEVER part of a READ route, so `.../user-groups/{id}` and `.../users/{id}`
+/// belong to the DELETE family below, not here.
+#[test]
+fn the_user_hierarchy_reads_parse() {
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/user-groups"),
+        Some(TenantApiRoute {
+            endpoint: Endpoint::ListUserGroups,
+            tenant_id: "t1",
+            user_id: None
+        })
+    );
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/users"),
+        Some(TenantApiRoute {
+            endpoint: Endpoint::ListUsers,
+            tenant_id: "t1",
+            user_id: None
+        })
+    );
+}
+
+/// The ONE read route that carries an item id (T6): the per-user api-key list
+/// puts `{uid}` on [`TenantApiRoute.user_id`] rather than inventing a second
+/// endpoint per user, so one label (`user-api-keys`) covers an unbounded number
+/// of users in the metric.
+#[test]
+fn the_per_user_api_key_read_carries_the_user_id() {
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/users/u_9/api-keys"),
+        Some(TenantApiRoute {
+            endpoint: Endpoint::ListUserApiKeys,
+            tenant_id: "t1",
+            user_id: Some("u_9")
+        })
+    );
+    // Every OTHER read keeps the field None, so a reader cannot mistake a flat
+    // route for a per-user one.
+    assert_eq!(
+        parse_route("/tenant/t1/api/v1/users")
+            .expect("flat list")
+            .user_id,
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// api-key + billing WRITE routes (T6)
+// ---------------------------------------------------------------------------
+
+/// The three self-service identity writes: `POST .../users/{uid}/api-keys` mints,
+/// `DELETE .../users/{uid}/api-keys/{kid}` revokes, `PUT .../users/{uid}/billing`
+/// sets the欠费 dimension. The target user is a PATH segment on all three —
+/// unlike the flat `PUT api/v1/users` upsert, whose row id is in the BODY.
+#[test]
+fn the_api_key_and_billing_writes_parse() {
+    assert_eq!(
+        parse_write_route("POST", "/tenant/t1/api/v1/users/u_9/api-keys"),
+        Some(TenantWriteRoute::CreateUserApiKey {
+            tenant_id: "t1",
+            user_id: "u_9"
+        })
+    );
+    assert_eq!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/u_9/api-keys/k_7"),
+        Some(TenantWriteRoute::DeleteUserApiKey {
+            tenant_id: "t1",
+            user_id: "u_9",
+            key_id: "k_7"
+        })
+    );
+    assert_eq!(
+        parse_write_route("PUT", "/tenant/t1/api/v1/users/u_9/billing"),
+        Some(TenantWriteRoute::SetUserBilling {
+            tenant_id: "t1",
+            user_id: "u_9"
+        })
+    );
+}
+
+/// The pairing on the DELETE is what decides the shape: `.../api-keys` with no
+/// `{kid}` is NOT a "delete every key of this user" shortcut, and it is NOT a
+/// `DeleteUser` of a user named `u_9/api-keys` either — both readings are
+/// refused, and the caller gets a local 404.
+#[test]
+fn the_key_delete_needs_both_ids() {
+    assert!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/u_9/api-keys").is_none(),
+        "no kid"
+    );
+    assert!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/u_9/api-keys/").is_none(),
+        "empty kid"
+    );
+    assert!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/u_9/api-keys/k/1").is_none(),
+        "nested kid"
+    );
+    assert!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users//api-keys/k_7").is_none(),
+        "empty uid"
+    );
+    // The key DELETE is tried BEFORE the user DELETE, and the user DELETE still
+    // works for its own shape.
+    assert_eq!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/u_9"),
+        Some(TenantWriteRoute::DeleteUser {
+            tenant_id: "t1",
+            id: "u_9"
+        })
+    );
+    assert_eq!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/user-groups/g_3"),
+        Some(TenantWriteRoute::DeleteUserGroup {
+            tenant_id: "t1",
+            id: "g_3"
+        })
+    );
+    assert_eq!(
+        parse_write_route("PUT", "/tenant/t1/api/v1/user-groups"),
+        Some(TenantWriteRoute::UpsertUserGroup { tenant_id: "t1" })
+    );
+    assert_eq!(
+        parse_write_route("PUT", "/tenant/t1/api/v1/users"),
+        Some(TenantWriteRoute::UpsertUser { tenant_id: "t1" })
+    );
+}
+
+/// Near misses on the identity paths are `None` (a local 404, never a
+/// fall-through to the proxy pipeline, where a tenant token would be read as a
+/// client api-key).
+#[test]
+fn identity_path_near_misses_do_not_parse() {
+    for (method, bad) in [
+        // A READ under a write method (the create is POST, not GET).
+        ("GET", "/tenant/t1/api/v1/users/u_9/api-keys"),
+        // `POST api/v1/users` mints nothing: the key list is per-user.
+        ("POST", "/tenant/t1/api/v1/users"),
+        ("POST", "/tenant/t1/api/v1/users/u_9/api-keys/"),
+        ("POST", "/tenant/t1/api/v1/users/u_9/api-keys/k_7"),
+        ("POST", "/tenant/t1/api/v1/users/u_9/billing"),
+        // The billing write is a PUT, and a trailing/extra segment is not billing.
+        ("PUT", "/tenant/t1/api/v1/users/u_9/api-keys"),
+        ("PUT", "/tenant/t1/api/v1/users/u_9/billing/"),
+        ("PUT", "/tenant/t1/api/v1/users/u_9/billing/extra"),
+        ("PUT", "/tenant/t1/api/v1/users/u_9/billingx"),
+        ("PUT", "/tenant/t1/api/v1/users/u_9/x/billing"),
+        // A user id with a `/` in it is two segments, not one.
+        ("PUT", "/tenant/t1/api/v1/users/a/b/billing"),
+        // Wrong version / wrong resource name.
+        ("POST", "/tenant/t1/api/v2/users/u_9/api-keys"),
+        ("POST", "/tenant/t1/api/v1/user/u_9/api-keys"),
+        ("DELETE", "/tenant/t1/api/v1/users/u_9/api-key/k_7"),
+        // Empty tenant id.
+        ("POST", "/tenant//api/v1/users/u_9/api-keys"),
+    ] {
+        assert!(
+            parse_write_route(method, bad).is_none(),
+            "{method} {bad:?} must not parse"
+        );
+    }
+    for bad in [
+        "/tenant/t1/api/v1/users/u_9/api-keys/",
+        "/tenant/t1/api/v1/users/u_9/api-keys/k_7",
+        "/tenant/t1/api/v1/users/u_9/billing",
+        "/tenant/t1/api/v1/users//api-keys",
+        "/tenant/t1/api/v1/users/u_9/api-keys/extra/more",
+        "/tenant/t1/api/v1/user-groups/g_3",
+    ] {
+        assert!(
+            parse_route(bad).is_none(),
+            "{bad:?} must not parse as a read"
+        );
+    }
+}
+
+/// The metric label of EVERY write variant, pinned. These strings ARE the
+/// `hydra_tenant_api_requests_total` label set, so a rename is a dashboard break
+/// and belongs in a change that says so.
+#[test]
+fn write_route_labels_are_pinned() {
+    let cases: &[(&'static str, TenantWriteRoute<'static>)] = &[
+        (
+            "sub-tenant-upsert",
+            TenantWriteRoute::UpsertSubTenant {
+                tenant_id: "t",
+                name: "n",
+            },
+        ),
+        (
+            "sub-tenant-delete",
+            TenantWriteRoute::DeleteSubTenant {
+                tenant_id: "t",
+                id: "i",
+            },
+        ),
+        (
+            "sub-tenant-route-upsert",
+            TenantWriteRoute::UpsertRoute { tenant_id: "t" },
+        ),
+        (
+            "sub-tenant-route-delete",
+            TenantWriteRoute::DeleteRoute {
+                tenant_id: "t",
+                id: "i",
+            },
+        ),
+        (
+            "user-group-upsert",
+            TenantWriteRoute::UpsertUserGroup { tenant_id: "t" },
+        ),
+        (
+            "user-group-delete",
+            TenantWriteRoute::DeleteUserGroup {
+                tenant_id: "t",
+                id: "i",
+            },
+        ),
+        (
+            "user-upsert",
+            TenantWriteRoute::UpsertUser { tenant_id: "t" },
+        ),
+        (
+            "user-delete",
+            TenantWriteRoute::DeleteUser {
+                tenant_id: "t",
+                id: "i",
+            },
+        ),
+        (
+            "user-api-key-create",
+            TenantWriteRoute::CreateUserApiKey {
+                tenant_id: "t",
+                user_id: "u",
+            },
+        ),
+        (
+            "user-api-key-delete",
+            TenantWriteRoute::DeleteUserApiKey {
+                tenant_id: "t",
+                user_id: "u",
+                key_id: "k",
+            },
+        ),
+        (
+            "user-billing-set",
+            TenantWriteRoute::SetUserBilling {
+                tenant_id: "t",
+                user_id: "u",
+            },
+        ),
+    ];
+    for (expected, route) in cases.iter().copied() {
+        assert_eq!(route.label(), expected, "label of {route:?}");
+    }
+}
+
+/// `tenant_id()` is what the dispatcher cross-checks the URL against the
+/// credential with, BEFORE the gate. A variant that failed to yield its tenant
+/// would silently drop that check, so EVERY variant is covered here.
+#[test]
+fn every_write_route_names_its_tenant() {
+    let routes: [TenantWriteRoute<'static>; 11] = [
+        TenantWriteRoute::UpsertSubTenant {
+            tenant_id: "t_1",
+            name: "n",
+        },
+        TenantWriteRoute::DeleteSubTenant {
+            tenant_id: "t_1",
+            id: "i",
+        },
+        TenantWriteRoute::UpsertRoute { tenant_id: "t_1" },
+        TenantWriteRoute::DeleteRoute {
+            tenant_id: "t_1",
+            id: "i",
+        },
+        TenantWriteRoute::UpsertUserGroup { tenant_id: "t_1" },
+        TenantWriteRoute::DeleteUserGroup {
+            tenant_id: "t_1",
+            id: "i",
+        },
+        TenantWriteRoute::UpsertUser { tenant_id: "t_1" },
+        TenantWriteRoute::DeleteUser {
+            tenant_id: "t_1",
+            id: "i",
+        },
+        TenantWriteRoute::CreateUserApiKey {
+            tenant_id: "t_1",
+            user_id: "u",
+        },
+        TenantWriteRoute::DeleteUserApiKey {
+            tenant_id: "t_1",
+            user_id: "u",
+            key_id: "k",
+        },
+        TenantWriteRoute::SetUserBilling {
+            tenant_id: "t_1",
+            user_id: "u",
+        },
+    ];
+    for route in routes.iter() {
+        assert_eq!(route.tenant_id(), "t_1", "tenant_id() of {route:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

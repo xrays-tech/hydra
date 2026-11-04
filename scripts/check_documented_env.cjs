@@ -95,6 +95,7 @@ const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_ENCRYPTION_KEY_FILE', 'a real knob, mentioned inside the `HYDRA_ENCRYPTION_KEY` row; read at `crypto.rs:142` (verified this round)'],
   ['HYDRA_ENCRYPTION_KEY_PREVIOUS_VERSION', 'read at `crypto.rs:186`; named in the rotation procedure example'],
   ['HYDRA_BREAKER_QUORUM', 'read at `main.rs:73`; named in the breaker prose and in the not-wired list'],
+  ['HYDRA_MAX_USER_API_KEYS_PER_TENANT', "WIRED, but read through a multi-line `env_positive_u32(\"HYDRA_MAX_USER_API_KEYS_PER_TENANT\", DEFAULT_MAX_USER_API_KEYS_PER_TENANT)` at `tenant_api/mod.rs:233-235`; the helper literal is on its own line so this checker's single-line \"literal-argument\" shape does not see it. Documented in prose (ops.md) rather than as a config-table first-column row, since a table row would be a promise the guard cannot mechanically verify and wiring it into the table must not require editing product code."],
 ]);
 
 class ScanError extends Error {

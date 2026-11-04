@@ -27,10 +27,10 @@
 
 ## 这是什么
 
-Hydra 部署在你的 Agent/客户端与 LLM 供应商之间。一次请求：按域名解析租户 → 调用租户自有认证端点鉴权 → **读取完整请求体**（model 可从任意位置/schema 提取）→ 路由（模型 × 租户授权供应商，加权轮询）→ 换上供应商 key → 用自有 HTTP client (reqwest) 调真实供应商 → 流式回写响应 → 解析用量 token（含缓存 token）→ 记录。
+Hydra 部署在你的 Agent/客户端与 LLM 供应商之间。一次请求：按域名解析租户 → 内部 API-key 鉴权（对照租户里存 per-user api-key,no external auth_url） → **读取完整请求体**（model 可从任意位置/schema 提取）→ 路由（模型 × 租户授权供应商 ∩ 命中 Global Role,加权轮询）→ 换上供应商 key → 用自有 HTTP client (reqwest) 调真实供应商 → 流式回写响应 → 解析用量 token（含缓存 token）→ 记录。
 
 ```
-Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body → 提取model
+Agent ──► Pingora ──► [解析租户 → 内部 API-key 鉴权 → 读全body → 提取model
                         → 路由 → 换key → reqwest调供应商 → 流式回写SSE
                         → 解析用量(输入/缓存/输出+TTFT) → 记录]
 ```
@@ -42,7 +42,8 @@ Agent ──► Pingora ──► [解析租户 → 外部认证 → 读全body 
 - **终止模式代理（Terminate-in-Pingora）**：在 `request_filter` 内读取完整请求体（model 提取适用于任意位置/schema，不再受首 chunk 限制）；通过专用 reqwest client 调用供应商；SSE 响应经 Pingora session 流式回写。返回 `Ok(true)`，Pingora 不拨号 upstream。
 - **路由**：模型名 → 供应商 ∩ 租户授权供应商；平滑加权轮询（Nginx SWRR）。
 - **api-key 前缀绑定闸门**：按原始前缀把客户端 api-key 固定到指定供应商（`sk_aaa_*` → Provider A）；最长前缀优先，fail-closed（绑定供应商不可用 ⇒ 503，绝不回落）。
-- **外部认证**：每个租户配置自己的 `auth_url`；Hydra 缓存判定 5 分钟，并提供失效接口（欠费/封禁由租户自决）。
+- **内部 API-key 鉴权 + 四级用户体系**：客户端出示自己的 api-key（`hk_` + CSPRNG，落库里存 only SHA-256，plaintext shown only at creation）resolved to a user under the four-level hierarchy `tenant → user_group → user → api_key`.unknown/disabled/expired key → **401**,user/group disabled → **403**,delinquent user（set via the tenant API `PUT /users/{id}/billing`)→ **402 `user_delinquent`**.no external `auth_url`,no auth cache.租户 access token（`ht_`,multi-token per tenant）only gate 租户 self-service API.旧 external-auth path（`auth_url` / `HttpAuthChecker` / `AuthCache`)is dead code pending the deferred T10 cleanup.
+- **Global Role 调度**：a `global_role` table keyed on `(tenant, user_group, user, api_key, model)`（each dim `*` = any）→ provider set.matched rules' providers are **unioned**（dedup,ordered by `provider_id` ascending）and always intersected with the providers that actually serve that model;wildcard-tenant roles still intersect `tenant_providers`(fail-closed).no session header → weighted SWRR（平滑加权轮询）;with one → session-sticky weighted rendezvous（`HYDRA_SESSION_AFFINITY`,default on).no match → today's `tenant_providers ∩ models_by_key` behavior.
 - **故障转移 + 熔断**：failover 循环依次尝试每个候选供应商；连续失败触发 dead-set，后台探活恢复。全 body 重放 O(1)。
 - **限流**：内存滑动窗口（请求数 + token），按角色，m/h/d 窗口。
 - **用量记录**：可插拔 Sink（**`HYDRA_USAGE_SINK` 必填、无默认**：`clickhouse` 共享存储 或 `none` 显式不计量；旧 SQLite sink 已于 2026-10-07 退役并按名字拒启）；**细粒度 token 分解**：`prompt_tokens`/`completion_tokens`/`total_tokens`/`cached_tokens`（OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`）；**延迟指标**：`forward_latency_ms`（Hydra 自身开销）+ `ttft_ms`（首 token 延迟）。所有数字字段默认 0（无 NULL）。
@@ -112,7 +113,7 @@ Hydra 通过**环境变量**启动（运行时），所有路由配置存于 **S
 
 ### 管理界面
 
-打开 `http://<host>:8081/admin/`，输入管理 token。管理供应商、模型、key、租户、授权、限流角色，查看/失效认证缓存与熔断器。
+打开 `http://<host>:8081/admin/`，输入管理 token。管理供应商、模型、key、租户、授权、限流角色，Global Role 调度,查看熔断器状态。
 
 ### 管理 REST
 
@@ -140,7 +141,7 @@ curl https://acme.example.com/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-Hydra 按域名解析租户 → 调 `auth_url` 鉴权 → 路由 `gpt-4o` 到授权供应商 → 换 key → 流式回写 → 记录用量。
+Hydra 按域名解析租户 → 对照租户里存 per-user api-key 鉴权（内部:unknown/disabled key → 401,user/group disabled → 403,delinquent → 402 `user_delinquent`)→ 路由 `gpt-4o` 到授权供应商（命中 Global Role 收窄）→ 换 key → 流式回写 → 记录用量。
 
 **模型目录**：`GET /v1/models` **无条件公开可读**（带不带 api-key 均可访问——出示的 key 不会触发鉴权，仅按 key 前缀绑定收窄目录），返回**该租户当前可调用模型的目录**——Hydra 本地聚合（跨授权 provider 并集、按租户模型白名单过滤、剔除熔断/软禁用/无 key 的 provider），不再直通单一上游；聊天等调用仍须 api-key。管理端另有只读聚合端点 `GET /api/v1/tenants/{tenant_id}/models`（admin token；含每个 provider 的在线状态，供运维诊断）。详见 `dev-docs/design-tenant-model-catalog.md` 与 `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`。
 

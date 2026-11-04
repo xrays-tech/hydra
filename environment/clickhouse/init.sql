@@ -17,7 +17,16 @@ CREATE TABLE IF NOT EXISTS usage_record (
     provider_id        String,
     model_key          String,
     client_api_key     Nullable(String),
-    sub_tenant_id      Nullable(String),
+    -- Usage ATTRIBUTION (the user hierarchy: tenant → group → user → key).
+    -- Written from the principal the internal api-key auth path resolved; NULL
+    -- when the request carried no resolvable principal. The three levels are
+    -- stored side by side so `/usage?group_by=user|user_group|api_key` buckets
+    -- on any one of them without a join. NULL is NOT the same as '': an
+    -- unattributed row must stay NULL here, and the read side coalesces it to
+    -- the documented empty-string group.
+    user_id            Nullable(String),
+    user_group_id      Nullable(String),
+    api_key_id         Nullable(String),
     status_code        UInt16,
     tokens_in          Nullable(UInt64),
     tokens_out         Nullable(UInt64),

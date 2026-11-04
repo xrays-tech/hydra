@@ -201,6 +201,145 @@ pub struct ProviderKeyBinding {
 }
 
 // ---------------------------------------------------------------------------
+// User hierarchy（四级：tenant -> user_group -> user -> api_key，plan §3.1）
+//
+// ADDITIVE ONLY (T1, decision D-17): these mirror the NEW tables created by
+// migration `0014_user_hierarchy.sql`. The old structures (`auth_url`, the
+// single `access_token_hash`, `sub_tenant`, `provider_key_binding`) remain
+// untouched until the terminal deletion batch T10 lands `0015` together with the
+// code removal.
+// ---------------------------------------------------------------------------
+
+/// A user's billing state (plan §3.2 / acceptance B4). The wire form is
+/// snake_case, matching the SQLite `CHECK (billing_status IN
+/// ('active','delinquent'))` domain. `Delinquent` ⇒ API-key auth answers 402
+/// `user_delinquent` (never 401: the key exists and is valid, the account cannot
+/// pay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingStatus {
+    /// Normal: the user pays.
+    Active,
+    /// 欠费: the user is over quota / suspended.
+    Delinquent,
+}
+
+/// A user group: a tenant-scoped grouping of users (plan §3.1, acceptance A1).
+/// `UNIQUE (tenant_id, name)` is enforced by SQLite; the loader keeps ALL rows
+/// (incl. `enabled == false`) in `ConfigData::user_groups` so a disabled group
+/// answers 403 `group_disabled` (known but disabled) rather than 401.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A user within one tenant, belonging to exactly one group.
+///
+/// `billing_status` is the欠费 dimension (plan §3.2 / D-5): the identity index
+/// deliberately carries it for disabled AND delinquent rows so replicas decide
+/// 402/403 consistently. `external_id` is an optional operator-supplied id,
+/// `UNIQUE (tenant_id, external_id)` in SQLite (NULL allowed, not deduplicated
+/// there — SQLite treats NULLs as distinct, which matches "no external id").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub tenant_id: String,
+    pub user_group_id: String,
+    /// Optional operator-facing id.
+    pub external_id: Option<String>,
+    pub name: String,
+    pub enabled: bool,
+    pub billing_status: BillingStatus,
+    /// Free-text reason set with the billing status (plan §3.3 PUT /billing
+    /// `reason?`).
+    pub billing_reason: Option<String>,
+    /// When the billing status last changed (`None` = never explicitly set).
+    pub billing_updated_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A client API-Key owned by a user — the fourth level of the hierarchy.
+///
+/// ONLY the SHA-256 hex hash is stored (decision D-7): the plaintext is shown
+/// once at creation and never recoverable. `key_prefix` / `key_last4` are display
+/// atoms (audit-safe identity, e.g. `hk_6f2a…` + `9c1f`) — logs and error bodies
+/// may name these, never the key (acceptance B2). The loader returns ALL rows
+/// (incl. disabled/expired keys): a revoked key must read as "known → 401",
+/// not "unknown", so anti-enumeration survives onto replicas (D-5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserApiKey {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    /// SHA-256 hex of the plaintext key (globally UNIQUE).
+    pub key_hash: String,
+    pub key_prefix: String,
+    pub key_last4: String,
+    pub enabled: bool,
+    /// Expiry (RFC3339 UTC, normalized at write time, plan §3.1); `None` =
+    /// never expires.
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A tenant access token (plan §3.2/§3.3, acceptance A2): one of MANY
+/// per-tenant credentials that gate the tenant self-service API. hydra generates
+/// the plaintext (`ht_` + CSPRNG, decision D-18) and shows it exactly once;
+/// only the hash + display atoms are stored. `token_hash` is globally UNIQUE,
+/// so a cross-tenant hash collision is structurally impossible (the fail-closed
+/// duplicate-hash branch of the old tenant-token gate can go away in T10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAccessToken {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    /// SHA-256 hex of the plaintext token (globally UNIQUE).
+    pub token_hash: String,
+    pub token_prefix: String,
+    pub token_last4: String,
+    pub enabled: bool,
+    /// Expiry (RFC3339 UTC); `None` = never expires.
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A Global Role rule (plan §3.4, acceptance C1–C5): the five-dimensional key
+/// `(tenant, user_group, user, api_key, model)` mapped to a SET of providers.
+/// The literal `*` on a dimension means "any value on that dimension" (decision
+/// D-2); a rule counts as a hit only when ALL five dimensions match. The
+/// provider set lives in the `global_role_provider` table and is carried here as
+/// `provider_ids` (the loader joins the two tables in Rust, §3.4).
+///
+/// `#[serde(default)]` on `provider_ids`: a serialized rule without the field
+/// decodes to the EMPTY set rather than failing — an empty rule can match and
+/// contribute nothing, which `config::validate` and the router both handle
+/// (the union stays empty → legacy fallback).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalRole {
+    pub id: String,
+    pub name: String,
+    pub tenant_id: String,
+    pub user_group_id: String,
+    pub user_id: String,
+    pub api_key_id: String,
+    pub model_key: String,
+    /// The rule's provider set (empty = matches and contributes nothing).
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ---------------------------------------------------------------------------
 // Limiting
 // ---------------------------------------------------------------------------
 
@@ -424,11 +563,20 @@ pub struct UsageRecord {
     pub provider_id: String,
     pub model_key: String,
     pub client_api_key_masked: Option<String>,
-    /// The sub-tenant this request was attributed to (v3), derived at record
-    /// time from the RAW api-key prefix — never reconstructed from the stored
-    /// masked key (design-sub-tenant.md §7.1). `None` when no enabled sub-tenant
-    /// prefix matched.
-    pub sub_tenant_id: Option<String>,
+    /// WHO the request was attributed to, taken from the resolved
+    /// [`hydra_core::identity::ApiPrincipal`] at record time (the internal
+    /// api-key auth path) — NOT reconstructed from the stored masked key.
+    /// The three levels of the user hierarchy (tenant → group → user → key)
+    /// land side by side so a `/usage?group_by=` read can bucket on any of
+    /// them without a join.
+    ///
+    /// `None` when the request was not resolved by that path (no principal
+    /// ⇒ no attribution is invented; a missing dimension must stay NULL,
+    /// never `""`, which is what the read side's grouping buckets reserve for
+    /// "the key was known and had no value here").
+    pub user_id: Option<String>,
+    pub user_group_id: Option<String>,
+    pub api_key_id: Option<String>,
     pub status_code: u16,
     /// Tokens sent in the request (all input, cache hits included).
     pub tokens_in: Option<u64>,

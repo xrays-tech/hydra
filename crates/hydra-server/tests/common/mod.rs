@@ -8,6 +8,140 @@
 use hydra_server::db;
 use sqlx::SqlitePool;
 
+// ---------------------------------------------------------------------------
+// Identity seeding helpers (multi-token / internal-auth model)
+//
+// The tenant gate resolves a bearer from `ConfigData.tenant_tokens`, which the
+// loader builds from the `tenant_access_token` TABLE (enabled rows only) — a
+// hash written to the legacy `tenant.access_token_hash` column is no longer
+// what the gate reads. The client-api-key path (`enforce_auth`) resolves
+// `ConfigData.users_by_api_key_hash`, derived from the `user_group` / `user`
+// / `user_api_key` tables. These helpers write the rows the snapshot is
+// actually built from.
+//
+// Ids are DETERMINISTIC (`tok-<tenant>-<name>`, `grp-<tenant>`, …) so a test
+// can predict and rotate/delete a seeded row; the admin `gen_id()` is
+// `pub(crate)` and nanosecond-based, which would make such assertions flaky.
+// ---------------------------------------------------------------------------
+
+/// Display atoms for a seeded credential, same SHAPE the admin UI reads: the
+/// first 8 characters as the prefix, the last 4 as the tail. Never the hash,
+/// never used for matching — only so the seeded row looks like a real one.
+#[allow(dead_code)]
+fn display_atoms(plaintext: &str) -> (String, String) {
+    let prefix = plaintext.chars().take(8).collect::<String>();
+    let mut tail = String::new();
+    for ch in plaintext.chars().rev().take(4) {
+        tail.insert(0, ch);
+    }
+    (prefix, tail)
+}
+
+/// Seed one tenant access token (hash + display atoms of `plaintext`) into
+/// `tenant_access_token`. Returns the deterministic row id — a test that
+/// rotates the token deletes the old row by this id.
+#[allow(dead_code)]
+pub async fn seed_tenant_access_token(
+    pool: &SqlitePool,
+    tenant_id: &str,
+    name: &str,
+    plaintext: &str,
+    enabled: bool,
+    expires_at: Option<String>,
+) -> String {
+    let id = format!("tok-{tenant_id}-{name}");
+    let hash = hydra_core::auth::sha256_hex_string(plaintext.as_bytes());
+    let (prefix, last4) = display_atoms(plaintext);
+    db::insert_tenant_access_token(
+        pool,
+        &hydra_core::model::TenantAccessToken {
+            id: id.clone(),
+            tenant_id: tenant_id.into(),
+            name: name.into(),
+            token_hash: hash,
+            token_prefix: prefix,
+            token_last4: last4,
+            enabled,
+            expires_at,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("insert tenant access token");
+    id
+}
+
+/// Seed the full client identity a data-plane request needs under the internal
+/// auth model: a `user_group`, an ACTIVE `user` (enabled, Active billing) and
+/// a `user_api_key` whose hash `enforce_auth` resolves.
+/// Returns `(group_id, user_id, key_id)`.
+#[allow(dead_code)]
+pub async fn seed_api_identity(
+    pool: &SqlitePool,
+    tenant_id: &str,
+    api_key_plaintext: &str,
+) -> (String, String, String) {
+    let group_id = format!("grp-{tenant_id}");
+    let user_id = format!("usr-{tenant_id}");
+    let key_id = format!("key-{tenant_id}");
+
+    db::upsert_user_group(
+        pool,
+        &hydra_core::model::UserGroup {
+            id: group_id.clone(),
+            tenant_id: tenant_id.into(),
+            name: format!("{tenant_id}-group"),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("upsert user_group");
+
+    db::upsert_user(
+        pool,
+        &hydra_core::model::User {
+            id: user_id.clone(),
+            tenant_id: tenant_id.into(),
+            user_group_id: group_id.clone(),
+            external_id: None,
+            name: format!("{tenant_id}-user"),
+            enabled: true,
+            billing_status: hydra_core::model::BillingStatus::Active,
+            billing_reason: None,
+            billing_updated_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("upsert user");
+
+    let hash = hydra_core::auth::sha256_hex_string(api_key_plaintext.as_bytes());
+    let (prefix, last4) = display_atoms(api_key_plaintext);
+    db::insert_user_api_key(
+        pool,
+        &hydra_core::model::UserApiKey {
+            id: key_id.clone(),
+            user_id: user_id.clone(),
+            name: format!("{tenant_id}-key"),
+            key_hash: hash,
+            key_prefix: prefix,
+            key_last4: last4,
+            enabled: true,
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .await
+    .expect("insert user_api_key");
+
+    (group_id, user_id, key_id)
+}
+
 /// A migrated, PRAGMA-configured in-memory pool. One per test.
 // Each test target compiles this module on its own, so a helper used by one
 // target is "dead code" in all the others (same as [`ephemeral_port`]).
@@ -155,6 +289,11 @@ pub fn hydrated(
             tenant_models: Vec::new(),
             sub_tenants: Vec::new(),
             sub_tenant_routes: Vec::new(),
+            user_groups: Vec::new(),
+            users: Vec::new(),
+            user_api_keys: Vec::new(),
+            tenant_access_tokens: Vec::new(),
+            global_roles: Vec::new(),
         },
     }
 }

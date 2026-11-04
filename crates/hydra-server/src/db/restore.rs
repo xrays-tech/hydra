@@ -9,6 +9,7 @@
 use sqlx::SqlitePool;
 
 use crate::crypto::KeyProvider;
+use hydra_core::model::BillingStatus;
 
 use super::{crypto_to_sqlx, seal_limit_key};
 
@@ -24,6 +25,12 @@ enum WipedTable {
     LimitRole,
     TenantModel,
     TenantProvider,
+    GlobalRoleProvider,
+    GlobalRole,
+    TenantAccessToken,
+    UserApiKey,
+    User,
+    UserGroup,
     Tenant,
     ProviderKey,
     ProviderModel,
@@ -44,6 +51,12 @@ impl WipedTable {
             WipedTable::LimitRole => "DELETE FROM limit_role",
             WipedTable::TenantModel => "DELETE FROM tenant_model",
             WipedTable::TenantProvider => "DELETE FROM tenant_provider",
+            WipedTable::GlobalRoleProvider => "DELETE FROM global_role_provider",
+            WipedTable::GlobalRole => "DELETE FROM global_role",
+            WipedTable::TenantAccessToken => "DELETE FROM tenant_access_token",
+            WipedTable::UserApiKey => "DELETE FROM user_api_key",
+            WipedTable::User => "DELETE FROM \"user\"",
+            WipedTable::UserGroup => "DELETE FROM user_group",
             WipedTable::Tenant => "DELETE FROM tenant",
             WipedTable::ProviderKey => "DELETE FROM provider_key",
             WipedTable::ProviderModel => "DELETE FROM provider_model",
@@ -82,6 +95,11 @@ pub async fn restore_config(
     // `provider`, so it must precede the deletion of either (FK is ON,
     // `db.rs`). `sub_tenant` references `tenant`, so it must precede the
     // `tenant` wipe below.
+    //
+    // The new hierarchy wipes children before parents too: `global_role_provider`
+    // before both `global_role` and `provider`; `user_api_key` before `user`; and `user`
+    // before `user_group` (the FK direction is user -> group). `tenant_access_token`
+    // references tenant, so it clears before the tenant wipe.
     for table in [
         WipedTable::SubTenantRoute,
         WipedTable::SubTenant,
@@ -89,6 +107,12 @@ pub async fn restore_config(
         WipedTable::LimitRole,
         WipedTable::TenantModel,
         WipedTable::TenantProvider,
+        WipedTable::GlobalRoleProvider,
+        WipedTable::GlobalRole,
+        WipedTable::TenantAccessToken,
+        WipedTable::UserApiKey,
+        WipedTable::User,
+        WipedTable::UserGroup,
         WipedTable::Tenant,
         WipedTable::ProviderKey,
         WipedTable::ProviderModel,
@@ -319,6 +343,129 @@ pub async fn restore_config(
         .bind(&r.updated_at)
         .execute(&mut *tx)
         .await?;
+    }
+
+    // User hierarchy / tenant tokens / Global Roles (plan §3.5, T2). These come from `fidelity`
+    // because the runtime config intentionally omits disabled rows (except the identity tables, which
+    // still carry full users/groups) and omits disabled tenant tokens / Global Rules entirely.
+    //
+    // Insert after the FK parents already written above:
+    //   user_group -> tenant
+    //   user       -> user_group
+    //   key        -> user
+    //   tenant token -> tenant
+    //   global_role provider -> provider + global_role
+    for g in &fidelity.user_groups {
+        sqlx::query(
+            "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&g.id)
+        .bind(&g.tenant_id)
+        .bind(&g.name)
+        .bind(g.enabled)
+        .bind(&g.created_at)
+        .bind(&g.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for u in &fidelity.users {
+        let billing_status: &'static str = match u.billing_status {
+            BillingStatus::Active => "active",
+            BillingStatus::Delinquent => "delinquent",
+        };
+        sqlx::query(
+            "INSERT INTO \"user\" (id, tenant_id, user_group_id, external_id, name, \
+             enabled, billing_status, billing_reason, billing_updated_at, created_at, \
+             updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&u.id)
+        .bind(&u.tenant_id)
+        .bind(&u.user_group_id)
+        .bind(&u.external_id)
+        .bind(&u.name)
+        .bind(u.enabled)
+        .bind(billing_status)
+        .bind(&u.billing_reason)
+        .bind(&u.billing_updated_at)
+        .bind(&u.created_at)
+        .bind(&u.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for k in &fidelity.user_api_keys {
+        sqlx::query(
+            "INSERT INTO user_api_key (id, user_id, name, key_hash, key_prefix, key_last4, \
+             enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&k.id)
+        .bind(&k.user_id)
+        .bind(&k.name)
+        .bind(&k.key_hash)
+        .bind(&k.key_prefix)
+        .bind(&k.key_last4)
+        .bind(k.enabled)
+        .bind(&k.expires_at)
+        .bind(&k.created_at)
+        .bind(&k.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for tok in &fidelity.tenant_access_tokens {
+        sqlx::query(
+            "INSERT INTO tenant_access_token (id, tenant_id, name, token_hash, token_prefix, \
+             token_last4, enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+            .bind(&tok.id)
+            .bind(&tok.tenant_id)
+            .bind(&tok.name)
+            .bind(&tok.token_hash)
+            .bind(&tok.token_prefix)
+            .bind(&tok.token_last4)
+            .bind(tok.enabled)
+            .bind(&tok.expires_at)
+            .bind(&tok.created_at)
+            .bind(&tok.updated_at)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for role in &fidelity.global_roles {
+        sqlx::query(
+            "INSERT INTO global_role (id, name, tenant_id, user_group_id, user_id, api_key_id, \
+             model_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&role.id)
+        .bind(&role.name)
+        .bind(&role.tenant_id)
+        .bind(&role.user_group_id)
+        .bind(&role.user_id)
+        .bind(&role.api_key_id)
+        .bind(&role.model_key)
+        .bind(role.enabled)
+        .bind(&role.created_at)
+        .bind(&role.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // The provider set is normalized in its own table. `GlobalRole.provider_ids` does not carry
+    // the child row's PRIMARY KEY, so the row id is re-derived deterministically from the (role,
+    // provider) pair. The UNIQUE(role_id, provider_id) constraint is the real identity; the id
+    // only has to be stable and collision-resistant enough for restore.
+    for role in &fidelity.global_roles {
+        for provider_id in &role.provider_ids {
+            sqlx::query(
+                "INSERT INTO global_role_provider (id, role_id, provider_id) VALUES (?, ?, ?)",
+            )
+            .bind(format!(
+                "grprov:{role_id}:{provider_id}",
+                role_id = role.id,
+                provider_id = provider_id
+            ))
+            .bind(&role.id)
+            .bind(provider_id)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     // The version marker commits with the content it describes, or neither does.

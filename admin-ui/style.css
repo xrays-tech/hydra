@@ -157,7 +157,7 @@ code { font-family: var(--mono); font-size: .92em; }
 .input-wrap { position: relative; display: flex; align-items: center; }
 
 input[type=text], input[type=password], input[type=number], input[type=url],
-input[type=search], select, textarea {
+input[type=search], input[type=datetime-local], select, textarea {
   width: 100%; padding: 9px 11px;
   background: var(--bg-1); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--r-sm);
@@ -570,3 +570,139 @@ pre.json .b { color: #56d4dd; }
   color: var(--warn);
   font-size: .875rem;
 }
+
+/* ===================== Global Roles / Access Tokens ===================== */
+.section-label {
+  font-size: 10.5px; color: var(--faint); text-transform: uppercase;
+  letter-spacing: .14em; margin-bottom: 8px;
+}
+.role-name { font-weight: 600; color: var(--text); }
+.role-dims {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 14px 16px;
+}
+.hierarchy-tip { margin-top: 9px; color: var(--warn); }
+.form-alert { grid-column: 1 / -1; }
+
+/* provider chips in the table */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; max-width: 320px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  max-width: 150px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--panel-2);
+  color: var(--text-2); font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.chip-dot {
+  width: 5px; height: 5px; border-radius: 50%; flex: none;
+  background: var(--accent); box-shadow: 0 0 6px rgba(76,141,255,.65);
+}
+.chip.more {
+  color: var(--muted); border-style: dashed; background: transparent;
+}
+
+/* compact enable/disable switch */
+.switch {
+  appearance: none; font: inherit; font-size: 11.5px;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 3px 9px 3px 4px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--panel-2);
+  color: var(--muted); cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.switch:hover { border-color: var(--border-2); color: var(--text); }
+.switch-knob {
+  width: 24px; height: 14px; border-radius: 999px; flex: none;
+  background: var(--border-2); position: relative;
+  transition: background .15s;
+}
+.switch-knob::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--muted); transition: left .15s, background .15s;
+}
+.switch.on {
+  color: var(--ok); border-color: rgba(63,185,80,.4);
+  background: rgba(63,185,80,.1);
+}
+.switch.on .switch-knob { background: rgba(63,185,80,.35); }
+.switch.on .switch-knob::after { left: 12px; background: var(--ok); }
+
+/* provider multi-select */
+.provider-picker { border: 0; padding: 0; margin: 0; min-width: 0; }
+.provider-picker legend {
+  padding: 0; margin-bottom: 5px; font-size: 12px;
+  color: var(--text-2); font-weight: 500;
+}
+.provider-search { margin-bottom: 5px; }
+.picker-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.provider-list {
+  max-height: 220px; overflow-y: auto; margin-top: 8px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--bg-1);
+}
+.provider-option {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 10px; cursor: pointer;
+  border-bottom: 1px solid rgba(48,54,61,.65);
+}
+.provider-option:last-child { border-bottom: none; }
+.provider-option:hover { background: var(--hover); }
+.provider-option input { width: 15px; height: 15px; accent-color: var(--accent); flex: none; }
+.provider-name { font-size: 12.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-id { margin-left: auto; color: var(--faint); font-size: 11px; }
+
+/* access-token controls */
+.access-head { align-items: flex-end; }
+.tenant-picker { display: flex; flex-direction: column; gap: 4px; min-width: 220px; }
+.tenant-picker label {
+  font-size: 10.5px; color: var(--faint);
+  text-transform: uppercase; letter-spacing: .12em;
+}
+.tenant-picker select { padding-top: 6px; padding-bottom: 6px; }
+
+/* the one-and-only plaintext token callout */
+.token-callout {
+  margin: 0 0 16px; padding: 14px;
+  border: 1px solid rgba(210,153,34,.5);
+  border-radius: var(--r-md);
+  background:
+    linear-gradient(180deg, rgba(210,153,34,.12), transparent 70%),
+    var(--panel-2);
+  box-shadow: var(--shadow-sm);
+}
+.token-callout-head {
+  display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px;
+}
+.token-callout-head > div:first-child { flex: 1; min-width: 0; }
+.token-callout-head strong { display: block; color: var(--warn); font-size: 13px; }
+.token-callout-head .field-tip { color: var(--text-2); margin-top: 2px; }
+.token-value {
+  display: block; width: 100%; padding: 10px 12px;
+  background: var(--bg-1); border: 1px solid var(--border-2);
+  border-radius: var(--r-sm); color: var(--text);
+  font-family: var(--mono); font-size: 13px;
+  overflow-x: auto; white-space: nowrap;
+}
+.token-meta { margin-top: 7px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.token-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 10px;
+}
+
+/* keyboard focus is visible on custom controls too */
+.btn:focus-visible, .icon-btn:focus-visible, .nav-item:focus-visible,
+.switch:focus-visible, .provider-option:focus-within {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+  .role-dims { grid-template-columns: 1fr; }
+  .access-head { align-items: stretch; }
+  .tenant-picker { width: 100%; }
+  .token-actions { align-items: flex-start; flex-direction: column; }
+}
+
+/* action under an empty state that is a navigation, not a create */
+.empty-action { text-align: center; margin-top: -28px; padding-bottom: 24px; }

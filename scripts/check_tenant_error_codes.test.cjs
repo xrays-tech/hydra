@@ -523,5 +523,26 @@ const MULTILINE = (helperStatus) =>
   }
 }
 
+{
+  // Round (2026-11-03 internal auth): the data-plane envelope helpers `respond_auth_denial` /
+  // `short_circuit` build `{"error":{"message":"<arg>",…}}` — the string argument is the MESSAGE and
+  // the body carries NO `code`, so their reason strings must NOT be compared against §6 (the tenant-API
+  // envelope). Without shape 0, `respond_auth_denial(session, 401, "invalid_wait")` next to the tenant
+  // row `invalid_wait` (400) produced a FALSE DRIFT "emitted with DIFFERENT statuses (400/401)".
+  const r = run({
+    rows: [ROW("invalid_wait", 400)],
+    src:
+      'async fn h() { respond_error(session, ctx, 400, "invalid_wait", "x").await; }\n' +
+      'async fn g() { respond_auth_denial(session, 401, "invalid_wait").await; }\n' +
+      'async fn k() { short_circuit(session, 403, "invalid_wait").await; }\n',
+    min: 1,
+  });
+  assert(
+    "a MESSAGE-only data-plane envelope helper is NOT a code emission (tenant row stays 400)",
+    r.status === 0 && /OK    invalid_wait = 400 \(table says 400\)/.test(r.out),
+    `status=${r.status} ${r.out.trim().split("\n").filter((l) => /invalid_wait|DRIFT/.test(l)).join(" | ").slice(0, 200)}`,
+  );
+}
+
 console.log(failures === 0 ? "\nALL TENANT-ERROR-CODE TESTS PASSED" : `\n${failures} TEST(S) FAILED`);
 process.exit(failures ? 1 : 0);

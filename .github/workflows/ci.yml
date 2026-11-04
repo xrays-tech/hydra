@@ -563,8 +563,9 @@ jobs:
           # `live-deps` job creates the schema from init.sql and inserts NOTHING". Its guard asserts
           # `count() > 0` for tenant `local` in `2026-09-15`, so without this INSERT the step can
           # never be green — it was wired but had never been reached (the ClickHouse 403 stopped the
-          # job at its first step). One unattributed row on purpose: it is what drives the
-          # `sub_tenant_id IS NULL` legs that pin the COALESCE.
+          # job at its first step). One UNATTRIBUTED row on purpose (the attribution columns are
+          # left out, so `user_id`/`user_group_id`/`api_key_id` default to NULL): it is what drives
+          # the `user_id IS NULL` legs that pin the COALESCE.
           curl -sS -u "$CH_USER:$CH_PASSWORD" --fail --data-binary @- http://127.0.0.1:8123/ <<'SQL'
           INSERT INTO usage_record (tenant_id, provider_id, model_key, status_code, tokens_in, tokens_out, latency_ms, created_at)
           VALUES ('local', 'ci-provider', 'ci-model', 200, 7, 3, 12, '2026-09-15T12:00:00Z')

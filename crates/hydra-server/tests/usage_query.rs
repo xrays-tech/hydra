@@ -19,7 +19,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::Tenant;
 use hydra_server::crypto::StaticKeyProvider;
@@ -90,13 +89,11 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
     .await
     .expect("insert tenant");
     if let Some(tok) = token {
-        hydra_server::db::set_tenant_access_token_hash(
-            pool,
-            id,
-            Some(&sha256_hex_string(tok.as_bytes())),
-        )
-        .await
-        .expect("set token hash");
+        // T3 tenant-API gate: the loader builds `ConfigData.tenant_tokens` from
+        // the ENABLED `tenant_access_token` ROWS. The legacy single-hash column
+        // (`tenant.access_token_hash`, written by `set_tenant_access_token_hash`)
+        // is no longer consulted, so the token must live in the table.
+        common::seed_tenant_access_token(pool, id, "usage", tok, true, None).await;
     }
 }
 
@@ -559,11 +556,18 @@ async fn the_response_carries_its_window_source_and_echoed_bounds() {
 
 /// `until` is optional and defaults to now, so the documented "usage after a
 /// timestamp" call works without a second parameter.
+/// The window is computed from NOW: a hard-coded `since` ages out of the 31-day
+/// ceiling (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`) and turns this leg red on a
+/// date rather than on a change — the same failure mode the `tenant_api` drill
+/// measured on 2026-10-07.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn until_defaults_to_now_when_it_is_omitted() {
     let pool = common::setup_pool().await;
     let (root, c) = usage_url(&pool).await;
-    let url = format!("{root}/tenant/{T}/api/v1/usage?since=2026-09-16T00:00:00Z");
+    let since = (chrono::Utc::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let url = format!("{root}/tenant/{T}/api/v1/usage?since={since}");
     let (status, v) = get_json(&c, &url, TOKEN).await;
     assert_eq!(status, 200, "{v}");
     let until = v["until"].as_str().unwrap_or_default();
@@ -571,7 +575,7 @@ async fn until_defaults_to_now_when_it_is_omitted() {
         until.len() == 20 && until.ends_with('Z') && until.contains('T'),
         "until must be the canonical form: {until}"
     );
-    assert!(until > "2026-09-16T00:00:00Z", "{until}");
+    assert!(until > since.as_str(), "{until} must be after {since}");
 }
 
 /// A node with no readable usage store answers 503, never a zero.
@@ -1002,31 +1006,32 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
 }
 
 // ---------------------------------------------------------------------------
-// v3 (T3.4) — `group_by=sub_tenant` on ClickHouse
+// The user-hierarchy groupings on ClickHouse
 // ---------------------------------------------------------------------------
 
-/// `sub_tenant_id` is the one nullable **grouping** column, and that is what
-/// makes it dangerous on ClickHouse: SQL NULL travels as JSON `null` (measured
-/// on the bundled instance — `SELECT CAST(NULL,'Nullable(String)') AS key …
-/// FORMAT JSONEachRow` answers `{"key":null,…}`), while the rows decoder
-/// requires a **string** `key`. Before the fix, a single unattributed row in
-/// the window failed the entire read as 503 `decode_error` — "the store is
-/// broken" for a window that is merely partly attributed.
+/// `user_id` / `user_group_id` / `api_key_id` are the NULLABLE **grouping**
+/// columns, and that is what makes them dangerous on ClickHouse: SQL NULL
+/// travels as JSON `null` (measured on the bundled instance — `SELECT
+/// CAST(NULL,'Nullable(String)') AS key … FORMAT
+/// JSONEachRow` answers `{"key":null,…}`), while the rows decoder requires a
+/// **string** `key`. Before the fix, a single unattributed row in the window
+/// failed the entire read as 503 `decode_error` — "the store is broken" for a
+/// window that is merely partly attributed.
 ///
 /// Both halves of the fix are pinned here, because either one alone proves
 /// nothing: the shipped expression coalesces to `""`, **and** a null key really
 /// is a decode failure rather than a row that quietly disappears.
 #[cfg(feature = "usage-clickhouse")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
+async fn clickhouse_group_by_user_never_keys_a_row_null() {
     let since = "2026-09-15T00:00:00Z";
     let until = "2026-09-16T00:00:00Z";
-    // The unattributed row arrives under the empty key — the same bucket SQLite
-    // produces — and is counted, not dropped.
+    // The unattributed row arrives under the empty key — the same bucket
+    // every backend produces — and is counted, not dropped.
     let grouped = concat!(
         r#"{"key":"","requests":"1","tokens_in":"7","tokens_out":"3","cache_hit_tokens":"0","errors":"0"}"#,
         "\n",
-        r#"{"key":"st1","requests":"2","tokens_in":"205","tokens_out":"11","cache_hit_tokens":"0","errors":"0"}"#,
+        r#"{"key":"u1","requests":"2","tokens_in":"205","tokens_out":"11","cache_hit_tokens":"0","errors":"0"}"#,
         "\n",
     );
     let (url, server) =
@@ -1037,7 +1042,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
             "local",
             since,
             until,
-            hydra_server::usage::query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::User,
         )
         .await
         .expect("both answers decode");
@@ -1045,7 +1050,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
     assert_eq!(agg.rows.len(), 2, "{:?}", agg.rows);
     assert_eq!(agg.rows[0].key, "", "unattributed rows bucket under \"\"");
     assert_eq!(agg.rows[0].totals.tokens_in, 7);
-    assert_eq!(agg.rows[1].key, "st1");
+    assert_eq!(agg.rows[1].key, "u1");
     assert_eq!(agg.rows[1].totals.requests, 2);
 
     // The SQL must rule the null key out **by construction**, not by luck of the
@@ -1059,7 +1064,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
         .map(|(_, v)| v.into_owned())
         .expect("the SQL travels in `query=`");
     assert!(
-        sql.contains("coalesce(sub_tenant_id, '')"),
+        sql.contains("coalesce(user_id, '')"),
         "a NULL key fails the whole read: {sql}"
     );
     assert!(sql.contains("GROUP BY key"), "{sql}");
@@ -1078,7 +1083,7 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
             "local",
             since,
             until,
-            hydra_server::usage::query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::User,
         )
         .await
         .expect_err("a null group key must fail the read, not vanish from it");
@@ -1086,6 +1091,56 @@ async fn clickhouse_group_by_sub_tenant_never_keys_a_row_null() {
         matches!(err, hydra_server::usage::query::UsageQueryError::Decode(_)),
         "{err:?}"
     );
+}
+
+/// The other two attribution dimensions must be coalesced the same way: one
+/// `""` bucket for a row whose principal had no value there, and a bare
+/// column would make that window unreadable. The assertion here is on the
+/// SQL each grouping emits (the wire shape above already proved why the
+/// coalesce is load-bearing).
+#[cfg(feature = "usage-clickhouse")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_attribution_dimension_is_coalesced_in_its_sql() {
+    let since = "2026-09-15T00:00:00Z";
+    let until = "2026-09-16T00:00:00Z";
+    let rows = concat!(
+        r#"{"key":"","requests":"1","tokens_in":"7","tokens_out":"3","cache_hit_tokens":"0","errors":"0"}"#,
+        "\n",
+    );
+    for (group, column) in [
+        (
+            hydra_server::usage::query::GroupBy::UserGroup,
+            "user_group_id",
+        ),
+        (hydra_server::usage::query::GroupBy::ApiKey, "api_key_id"),
+    ] {
+        let (url, server) =
+            fake_clickhouse_sequence(vec![CH_QUOTED.to_string(), rows.to_string()]).await;
+        let ch_reader = reader("clickhouse", &common::setup_pool().await, Some(&url));
+        let agg = ch_reader
+            .aggregate("local", since, until, group)
+            .await
+            .expect("the empty-key group decodes");
+        assert_eq!(
+            agg.rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            vec![String::new()],
+            "{column}: unattributed usage buckets under \"\"",
+        );
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let sql = reqs
+            .last()
+            .expect("the grouped query was sent")
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "query")
+            .map(|(_, v)| v.into_owned())
+            .expect("the SQL travels in `query=`");
+        assert!(
+            sql.contains(&format!("coalesce({column}, '')")),
+            "{column} must be coalesced, never grouped bare: {sql}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,13 +1250,15 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
     );
     println!("rows={:?}", agg.rows);
 
-    // v3: the same window grouped by the one **nullable** key, over the rows the
-    // instance really has. `sub_tenant_id` arrives via the documented one-off
-    // ALTER and every pre-existing row is NULL, so this window is exactly the
-    // shape that used to fail the whole read (503 decode_error) instead of
-    // answering. Two things are pinned: the reader's own grouped read, and the
-    // hand-run proof that the bare column really does put `null` on the wire —
-    // i.e. that the COALESCE is what makes the read survive real data.
+    // The same window grouped by a **nullable** attribution key, over the rows
+    // the instance really has. `user_id` arrives from `init.sql` (fresh
+    // instances) or from the idempotent ALTER in `docker-compose.local.yml`
+    // (existing volumes), so every pre-existing row is NULL and this window is
+    // exactly the shape that used to fail the whole read (503 decode_error)
+    // instead of answering. Two things are pinned: the reader's own grouped
+    // read, and the hand-run proof that the bare column really does put `null`
+    // on the wire — i.e. that the COALESCE is what makes the read survive real
+    // data.
     async fn hand_query(ch: &str, sql: String) -> String {
         ch_hand_run(ch, sql).await
     }
@@ -1210,11 +1267,11 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
             &tenant,
             "2026-09-15T00:00:00Z",
             "2026-09-16T00:00:00Z",
-            hydra_server::usage::query::GroupBy::SubTenant,
+            hydra_server::usage::query::GroupBy::User,
         )
         .await
         .expect("a window of unattributed rows must be answered, not failed");
-    println!("sub_tenant groups={:?}", grouped.rows);
+    println!("user groups={:?}", grouped.rows);
     assert_eq!(
         grouped.rows.iter().map(|r| r.totals.requests).sum::<u64>(),
         grouped.totals.requests,
@@ -1226,7 +1283,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
         let body = hand_query(
             &ch,
             format!(
-                "SELECT countIf(sub_tenant_id IS NULL) AS c FROM usage_record \
+                "SELECT countIf(user_id IS NULL) AS c FROM usage_record \
                  WHERE tenant_id = '{tenant}' AND created_at >= '2026-09-15T00:00:00Z' \
                  AND created_at < '2026-09-16T00:00:00Z' FORMAT JSONEachRow"
             ),
@@ -1258,7 +1315,7 @@ async fn live_clickhouse_aggregate_matches_a_hand_run_query() {
         let bare = hand_query(
             &ch,
             format!(
-                "SELECT sub_tenant_id AS key, count() AS requests FROM usage_record \
+                "SELECT user_id AS key, count() AS requests FROM usage_record \
                  WHERE tenant_id = '{tenant}' AND created_at >= '2026-09-15T00:00:00Z' \
                  AND created_at < '2026-09-16T00:00:00Z' GROUP BY key ORDER BY key FORMAT JSONEachRow"
             ),

@@ -29,6 +29,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::{ApiKeyIdentity, ApiPrincipal, TenantTokenIdentity};
+use crate::model::{GlobalRole, User, UserApiKey, UserGroup};
 use crate::model::{LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
 
 /// In-memory configuration snapshot. All indexes are built once at load time
@@ -86,6 +88,59 @@ pub struct ConfigData {
     /// Only `enabled == true` rows (mirrors `key_prefix_bindings`).
     pub sub_tenant_routes: Vec<SubTenantRoute>,
 
+    // --- User hierarchy + internal auth (plan §3.1/§3.2; T1 additive) -----
+    //
+    // These back the FOUR-level identity (tenant -> user_group -> user -> api_key)
+    // and the multi-token tenant API gate. Unlike the legacy auth path, NOTHING
+    // here is decided by an outbound call: the identity index is built ONCE per
+    // snapshot by [`ConfigData::reindex_identity`] and read lock-free.
+    /// ALL user groups — incl. `enabled == false` (plan §3.2: a disabled group
+    /// answers 403 `group_disabled`, which requires the row to be PRESENT, not
+    /// absent; absence would read as "unknown group" and collapse into the 401
+    /// family).
+    pub user_groups: Vec<UserGroup>,
+
+    /// `user_id` → ALL users — incl. disabled AND delinquent (decision D-5: the
+    /// billing state is a business fact the 402 branch needs, and the row itself
+    /// is what anti-enumeration rests on).
+    pub users: HashMap<String, User>,
+
+    /// `sha256(client api-key)` → identity record. **派生索引** — see
+    /// [`ConfigData::reindex_identity`], its single write entry point.
+    ///
+    /// **不上集群线缆**（`serde(skip)`）: built from the FULL `users` + the FULL
+    /// `user_api_key` rows (incl. disabled/expired keys, disabled users/groups),
+    /// so a revoked key on a replica is "known → 401", never "unknown" — the same
+    /// source-of-truth rule as `tenants_by_id`: leader (`build_config`) and replica
+    /// (tree decode, plan §3.5) derive it with ONE implementation, and a missing
+    /// field on the wire must never degrade a valid key to 401.
+    #[serde(skip, default)]
+    pub users_by_api_key_hash: HashMap<String, ApiKeyIdentity>,
+
+    /// `sha256(tenant access token)` → `{tenant_id, token_name}`. ENABLED rows
+    /// ONLY (plan §3.2: unlike the api-key index, a revoked tenant token is simply
+    /// GONE — the token index is not an enumeration surface, `whoami` returns the
+    /// `token_name`, never any plaintext).
+    pub tenant_tokens: HashMap<String, TenantTokenIdentity>,
+
+    /// ENABLED Global Role rules, `provider_ids` joined in from
+    /// `global_role_provider` (plan §3.4). Disabled rules are NOT inert-but-known
+    /// (they must match NOTHING, not even as failover candidates), so — unlike
+    /// the identity rows — only enabled ones load.
+    pub global_roles: Vec<GlobalRole>,
+
+    /// `tenant_id` → indexes into `global_roles`. **派生索引** — see
+    /// [`ConfigData::reindex_global_roles`], its single write entry point; `serde(skip)`
+    /// for the same reason as every other derived index.
+    #[serde(skip, default)]
+    pub global_roles_by_tenant: HashMap<String, Vec<usize>>,
+
+    /// Indexes into `global_roles` whose `tenant_id` is the `*` wildcard (decision
+    /// D-3: a wildcard-tenant rule must still intersect `tenant_providers` —
+    /// fail-closed against one broad rule re-routing every tenant).
+    #[serde(skip, default)]
+    pub global_roles_any_tenant: Vec<usize>,
+
     /// `domain` → certificate metadata. Plain value here (see module docs);
     /// W1–W2 carries `CertMeta`, W4 resolves to a parsed `ResolvedCert` on the
     /// server side while this map remains the single source of truth.
@@ -112,6 +167,89 @@ impl ConfigData {
                 .values()
                 .map(|t| (t.id.clone(), t.clone())),
         );
+    }
+
+    /// Rebuild `users_by_api_key_hash` from `self.users` + the FULL
+    /// `user_api_key` rows — the ONE write entry point for the identity index
+    /// (plan §3.2 "身份索引推导（承重规则）").
+    ///
+    /// Same-shape rule as [`reindex_tenants`]: both the leader loader
+    /// (`store.rs::build_config`) and the replica materializer (plan §3.5, after
+    /// tree decode) call THIS implementation, so the derived index cannot fork
+    /// between the two, and the wire never carries it.
+    ///
+    /// `keys` MUST be the FULL table (incl. `enabled = false` / expired rows),
+    /// and `self.users` / the group dimension likewise: a disabled key stays KNOWN
+    /// (401 `invalid_api_key`, per the truth table), a disabled user/group is
+    /// distinguishable at auth time (403), and a delinquent user is recorded on
+    /// the principal (402). This is decision D-5: revocation must not become
+    /// indistinguishable from never-having-existed, or every replica can enumerate
+    /// live keys.
+    ///
+    /// A key whose `user_id` is absent from `self.users` is an ORPHAN the schema
+    /// FK should prevent (`user_api_key.user_id REFERENCES user(id)`); such a key
+    /// cannot yield a principal — it is SKIPPED here (unknown key → 401 either
+    /// way) rather than fabricating an identity. Core has no logger, so the skip
+    /// is silent; the server-side loader is the place that would report it.
+    pub fn reindex_identity(&mut self, keys: &[UserApiKey]) {
+        self.users_by_api_key_hash.clear();
+        let group_enabled: HashMap<String, bool> = self
+            .user_groups
+            .iter()
+            .map(|g| (g.id.clone(), g.enabled))
+            .collect();
+        for k in keys {
+            let Some(u) = self.users.get(&k.user_id) else {
+                continue;
+            };
+            self.users_by_api_key_hash.insert(
+                k.key_hash.clone(),
+                ApiKeyIdentity {
+                    principal: ApiPrincipal {
+                        tenant_id: u.tenant_id.clone(),
+                        user_group_id: u.user_group_id.clone(),
+                        user_id: u.id.clone(),
+                        api_key_id: k.id.clone(),
+                        billing_status: u.billing_status,
+                    },
+                    key_enabled: k.enabled,
+                    user_enabled: u.enabled,
+                    group_enabled: group_enabled
+                        .get(&u.user_group_id)
+                        .copied()
+                        .unwrap_or(false),
+                    expires_at: k.expires_at.clone(),
+                },
+            );
+        }
+    }
+
+    /// Rebuild the Global Role indexes (`global_roles_by_tenant` /
+    /// `global_roles_any_tenant`) from `self.global_roles` — the ONE write entry
+    /// point for both (same derived-index rule as [`reindex_tenants`]: `serde(skip)`,
+    /// loader + replica share this implementation).
+    ///
+    /// ENABLED rules only, and the index stores INDICES into `global_roles` (plan
+    /// §3.2), so the matcher (`router` lane, T6/T7) reads the role bodies from the
+    /// single vector. A rule whose `tenant_id` is the `*` wildcard goes to
+    /// `global_roles_any_tenant`; matching a request takes `by_tenant[tenant]`
+    /// PLUS `any_tenant` (plan §3.4 "先取 … + …, 逐条比较五维").
+    pub fn reindex_global_roles(&mut self) {
+        self.global_roles_by_tenant.clear();
+        self.global_roles_any_tenant.clear();
+        for (idx, role) in self.global_roles.iter().enumerate() {
+            if !role.enabled {
+                continue;
+            }
+            if role.tenant_id == "*" {
+                self.global_roles_any_tenant.push(idx);
+            } else {
+                self.global_roles_by_tenant
+                    .entry(role.tenant_id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
     }
 }
 
@@ -549,6 +687,152 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
                     "provider '{}' sets queue_wait_timeout_ms=0; must be > 0",
                     provider.id
                 )));
+            }
+        }
+    }
+
+    // --- User hierarchy / Global Role referential integrity (plan §3.1
+    //  write-time invariants, load-time WARN backstop) ---------------------
+    //
+    // The SQLite FKs prevent most of this at write time, but the config graph is
+    // the authority a replica rebuilds from, and a hand-edited DB or a restored
+    // snapshot can still dangle; WARN (not Fatal) so the snapshot still publishes
+    // and the affected rows are inert at auth/match time.
+    let group_ids: HashSet<&str> = cfg.user_groups.iter().map(|g| g.id.as_str()).collect();
+    let api_key_ids: HashSet<&str> = cfg
+        .users_by_api_key_hash
+        .values()
+        .map(|idn| idn.principal.api_key_id.as_str())
+        .collect();
+    let tenant_ids: HashSet<&str> = cfg
+        .tenants_by_domain
+        .values()
+        .map(|t| t.id.as_str())
+        .collect();
+
+    for user in cfg.users.values() {
+        if !tenant_ids.contains(user.tenant_id.as_str()) {
+            issues.push(ValidationIssue::warn_about(
+                user.id.clone(),
+                format!(
+                    "user '{}' references unknown tenant_id '{}'",
+                    user.id, user.tenant_id
+                ),
+            ));
+        }
+        if !group_ids.contains(user.user_group_id.as_str()) {
+            issues.push(ValidationIssue::warn_about(
+                user.id.clone(),
+                format!(
+                    "user '{}' references unknown user_group_id '{}'",
+                    user.id, user.user_group_id
+                ),
+            ));
+        }
+    }
+
+    // global_roles: every CONCRETE dimension must resolve to a row. `*` is the
+    // wildcard (decision D-2) and is never a subject of these checks. A missing
+    // dimension is inert at match time (no principal can carry an id that was
+    // never issued), so WARN — plan §3.1 "悬挂维度 -> Warn".
+    for role in &cfg.global_roles {
+        if role.tenant_id != "*" && !tenant_ids.contains(role.tenant_id.as_str()) {
+            issues.push(ValidationIssue::warn_about(
+                role.id.clone(),
+                format!(
+                    "global_role '{}' references unknown tenant_id '{}'",
+                    role.id, role.tenant_id
+                ),
+            ));
+        }
+        if role.user_group_id != "*" && !group_ids.contains(role.user_group_id.as_str()) {
+            issues.push(ValidationIssue::warn_about(
+                role.id.clone(),
+                format!(
+                    "global_role '{}' references unknown user_group_id '{}'",
+                    role.id, role.user_group_id
+                ),
+            ));
+        }
+        if role.user_id != "*" && !cfg.users.contains_key(&role.user_id) {
+            issues.push(ValidationIssue::warn_about(
+                role.id.clone(),
+                format!(
+                    "global_role '{}' references unknown user_id '{}'",
+                    role.id, role.user_id
+                ),
+            ));
+        }
+        if role.api_key_id != "*" && !api_key_ids.contains(role.api_key_id.as_str()) {
+            issues.push(ValidationIssue::warn_about(
+                role.id.clone(),
+                format!(
+                    "global_role '{}' references unknown api_key_id '{}'",
+                    role.id, role.api_key_id
+                ),
+            ));
+        }
+        // `model_key` concrete but not offered by any ONLINE provider: allowed
+        // (pre-provisioning a rule before the model comes online is legitimate —
+        // plan §3.1 "允许预配置"), hence WARN.
+        if role.model_key != "*" {
+            let missing = match cfg.models_by_key.get(&role.model_key) {
+                Some(v) => v.is_empty(),
+                None => true,
+            };
+            if missing {
+                issues.push(ValidationIssue::warn_about(
+                    role.id.clone(),
+                    format!(
+                        "global_role '{}' scopes model_key '{}' which has no online provider yet \
+                         (pre-provisioned, or the model went offline)",
+                        role.id, role.model_key
+                    ),
+                ));
+            }
+        }
+        // D-3 backstop (best-effort, WARN): a WILDCARD-tenant rule is a CANDIDATE
+        // for EVERY tenant, but `router` intersects it with each tenant's own
+        // `tenant_providers` gate (fail-closed: a provider a tenant does not grant
+        // is never routable for that tenant, whatever any rule says). So a provider
+        // OUTSIDE SOME tenant's set means the rule silently does nothing for that
+        // tenant — usually not what the operator meant by "global". Fatal would
+        // be wrong: the rule is legitimate for the tenants that DO grant it, and a
+        // tenant may intentionally be restricted to a subset.
+        //
+        // A tenant with NO `tenant_providers` entry counts as granting NOTHING (the
+        // router's `get()` fail-closes the same way), so such a tenant makes every
+        // concrete provider of a wildcard rule an offender.
+        if role.tenant_id == "*" && !role.provider_ids.is_empty() {
+            let offenders: Vec<&str> = role
+                .provider_ids
+                .iter()
+                .filter(|p| {
+                    cfg.tenants_by_id.values().any(|t| {
+                        !cfg.tenant_providers
+                            .get(&t.id)
+                            .is_some_and(|allowed| allowed.contains(p.as_str()))
+                    })
+                })
+                .map(|p| p.as_str())
+                .collect();
+            if !offenders.is_empty() {
+                // Sorted: this runs inside a HashMap-derived loop, and the warning
+                // text is operator-visible.
+                let mut sorted = offenders.clone();
+                sorted.sort();
+                issues.push(ValidationIssue::warn_about(
+                    role.id.clone(),
+                    format!(
+                        "global_role '{}' has a WILDCARD tenant (candidate for all {} tenant(s)) \
+                         but grants provider(s) {} that at least one tenant does NOT allow in \
+                         `tenant_providers` — for those tenants this rule can never route; the \
+                         router intersects a wildcard rule with each tenant's own provider gate",
+                        role.id,
+                        cfg.tenants_by_id.len(),
+                        sorted.join(", ")
+                    ),
+                ));
             }
         }
     }

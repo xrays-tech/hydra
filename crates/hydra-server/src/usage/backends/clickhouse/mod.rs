@@ -227,8 +227,8 @@ impl Drop for ClickHouseSink {
 /// plus the row-level idempotency key `dedup_key`.
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT_PREFIX: &str =
-    "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, sub_tenant_id, \
-     status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
+    "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, user_id, \
+     user_group_id, api_key_id, status_code, tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
      forward_latency_ms, ttft_ms, upstream_host, error, created_at, dedup_key)";
 
 /// The insert statement for one batch, carrying ClickHouse's
@@ -395,8 +395,18 @@ fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
         Some(v) => json_string_into(out, v),
         None => out.push_str("null"),
     }
-    out.push_str(",\"sub_tenant_id\":");
-    match &r.sub_tenant_id {
+    out.push_str(",\"user_id\":");
+    match &r.user_id {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"user_group_id\":");
+    match &r.user_group_id {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"api_key_id\":");
+    match &r.api_key_id {
         Some(v) => json_string_into(out, v),
         None => out.push_str("null"),
     }
@@ -531,11 +541,16 @@ fn ch_group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
-        // ClickHouse emits SQL NULL as JSON `null` — measured on the bundled
-        // instance over real rows, where the bare column answers
-        // `{"key":null,…}` — and the decoder requires a string `key`, so one
-        // unattributed row would fail the whole window as a decode error.
-        GroupBy::SubTenant => Some("coalesce(sub_tenant_id, '')"),
+        // The three attribution dimensions are NULLABLE columns, and every one
+        // of them is a legal grouping key. ClickHouse emits SQL NULL as JSON
+        // `null` — measured on the bundled instance over real rows, where the
+        // bare column answers `{"key":null,…}` — and the decoder requires a
+        // string `key`, so one unattributed row would fail the whole window as
+        // a decode error. Hence `coalesce(…, '')` on all three, not the bare
+        // column name.
+        GroupBy::User => Some("coalesce(user_id, '')"),
+        GroupBy::UserGroup => Some("coalesce(user_group_id, '')"),
+        GroupBy::ApiKey => Some("coalesce(api_key_id, '')"),
         // `created_at` is a fixed-width `YYYY-MM-DDTHH:MM:SSZ` string on both
         // backends, so the date is a safe 10-byte slice. No date function: it
         // would both change semantics and drop the primary-key pruning.

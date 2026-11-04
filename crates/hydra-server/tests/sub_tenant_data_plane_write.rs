@@ -24,7 +24,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
@@ -105,9 +104,10 @@ async fn seed_leader(pool: &sqlx::SqlitePool) {
     )
     .await
     .expect("insert t1");
-    repo::set_tenant_access_token_hash(pool, "t1", Some(&sha256_hex_string(T1_TOKEN.as_bytes())))
-        .await
-        .expect("set t1 token hash");
+    // T3 tenant-API gate: `ConfigData.tenant_tokens` is derived from the ENABLED
+    // `tenant_access_token` rows; the legacy `tenant.access_token_hash` column
+    // (written by `set_tenant_access_token_hash`) is no longer consulted.
+    common::seed_tenant_access_token(pool, "t1", "ops", T1_TOKEN, true, None).await;
     repo::insert_tenant_provider(
         pool,
         &TenantProvider {
@@ -142,13 +142,12 @@ async fn seed_leader(pool: &sqlx::SqlitePool) {
 async fn local_node_state(token: &str) -> Arc<AppState> {
     let pool = common::setup_pool().await;
     seed_leader(&pool).await;
-    hydra_server::db::set_tenant_access_token_hash(
-        &pool,
-        "t1",
-        Some(&sha256_hex_string(token.as_bytes())),
-    )
-    .await
-    .expect("store the tenant's token hash");
+    // `seed_leader` already carries the tenant's own token row (T1_TOKEN). A
+    // node presenting a DIFFERENT token needs its own ENABLED row — the legacy
+    // hash column is dead under T3, so writing it here would be a no-op.
+    if token != T1_TOKEN {
+        common::seed_tenant_access_token(&pool, "t1", "node", token, true, None).await;
+    }
     let kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([7u8; 32], 1));
     let store = ConfigStore::load(pool, kp.clone())
         .await

@@ -46,7 +46,8 @@ pub mod throttle;
 pub mod time_bound;
 pub mod trusted_proxy;
 
-use hydra_core::tenant_api::{parse_route, parse_write_route, Endpoint, TenantWriteRoute};
+use hydra_core::tenant_api::{parse_route, parse_write_route, Endpoint};
+
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 use std::time::Duration;
@@ -75,6 +76,28 @@ fn env_positive_u32(key: &str, default: u32) -> u32 {
 /// internet-facing port is guessable, and the minimum is the cheapest thing that
 /// makes guessing impractical.
 pub const MIN_TENANT_TOKEN_LEN: usize = 16;
+
+/// Default ceiling on the api-key rows ONE tenant may hold
+/// (`HYDRA_MAX_USER_API_KEYS_PER_TENANT`, T6). The create handler reads the
+/// CONFIGURED value; this constant is only what "unset" means. Zero is rejected
+/// like every other limit here: a ceiling of zero makes the endpoint a permanent
+/// `400`, i.e. a typo in an env var removing a capability.
+pub const DEFAULT_MAX_USER_API_KEYS_PER_TENANT: u32 = 1_000;
+
+/// Default ceiling on the USER rows ONE tenant may hold
+/// (`HYDRA_MAX_USERS_PER_TENANT`, plan §3.5). Same reason as the api-key ceiling
+/// above: the credential that mints a user is the tenant's own, so the bound has
+/// to cap what one tenant's credential can make this node store.
+pub const DEFAULT_MAX_USERS_PER_TENANT: u32 = 1_000;
+
+/// Default ceiling on the TOTAL hierarchy rows this node holds
+/// (`HYDRA_MAX_HIERARCHY_ROWS`, plan §3.5). Counts the FIVE hierarchy tables
+/// together (user groups + users + user api-keys + tenant access tokens + global
+/// roles) because the thing that grows without an operator noticing is the row
+/// COUNT of the whole identity surface, not one table's. The plan's own headroom
+/// argument: the config publish budget is 4096 entries (`multi_put`), so a
+/// ceiling of 3000 leaves room for the rest of the snapshot to travel with it.
+pub const DEFAULT_MAX_HIERARCHY_ROWS: u32 = 3_000;
 
 /// Runtime configuration for the tenant API.
 ///
@@ -116,6 +139,38 @@ pub struct TenantApiConfig {
     /// Not an optimisation: it is what stops one tenant's query from scanning
     /// every other tenant's rows in the store (design §5.1).
     pub usage_max_window_days: u32,
+    /// Ceiling on api-key rows a TENANT may hold in total
+    /// (`HYDRA_MAX_USER_API_KEYS_PER_TENANT`, default 1000, T6).
+    ///
+    /// Tenant-scoped rather than per-user on purpose: the credential that mints a
+    /// key is the tenant's own, so the ceiling has to bound what one tenant's
+    /// credential can make this node store (row count, and the size of the derived
+    /// identity index), not just one user's hygiene. Enforced on the CREATE path
+    /// (`handlers::user_api_key_create`), never on read.
+    pub max_user_api_keys_per_tenant: u32,
+    /// Ceiling on `user` rows a TENANT may hold in total
+    /// (`HYDRA_MAX_USERS_PER_TENANT`, default 1000, plan §3.5).
+    ///
+    /// Checked on the CREATE path of `PUT .../users` ONLY — an update of an
+    /// existing row adds no row, so it must not be refused (a tenant at its
+    /// ceiling can still edit what it has). Enforced on the CREATE path, never on
+    /// read, exactly like the api-key ceiling above.
+    pub max_users_per_tenant: u32,
+    /// Ceiling on the FIVE hierarchy tables' TOTAL row count
+    /// (`HYDRA_MAX_HIERARCHY_ROWS`, default 3000, plan §3.5).
+    ///
+    /// Applies to every hierarchy CREATE (user group / user / user api-key). The
+    /// count is taken from the PINNED config snapshot, so the check costs no extra
+    /// DB round trip and a read failure cannot become a new failure mode.
+    ///
+    /// It is a GROWTH bound, not an accounting statement, and said so because the
+    /// snapshot is not a row census: it carries ALL `user_group` and `user` rows
+    /// and every api-key row (in the derived identity index), but only ENABLED
+    /// `tenant_access_token` and `global_role` rows. Disabled rows in those two
+    /// tables therefore make the bound slightly LOOSE — the direction that admits
+    /// a create rather than refusing one, which is the safe side of a capacity
+    /// guard.
+    pub max_hierarchy_rows: u32,
     /// The ids of the LIVE data-plane nodes, or `None` off-cluster.
     ///
     /// Injected as a closure rather than by handing `AppState` the node registry:
@@ -145,6 +200,12 @@ impl std::fmt::Debug for TenantApiConfig {
             .field("auth_fail_limit_per_min", &self.auth_fail_limit_per_min)
             .field("lockout_secs", &self.lockout_secs)
             .field("usage_max_window_days", &self.usage_max_window_days)
+            .field(
+                "max_user_api_keys_per_tenant",
+                &self.max_user_api_keys_per_tenant,
+            )
+            .field("max_users_per_tenant", &self.max_users_per_tenant)
+            .field("max_hierarchy_rows", &self.max_hierarchy_rows)
             .field("live_nodes", &self.live_nodes.is_some())
             .field("trusted_proxies", &self.trusted_proxies.len())
             .finish()
@@ -161,6 +222,9 @@ impl Default for TenantApiConfig {
             lockout_secs: 900,
             invalidate_per_min: 10,
             usage_max_window_days: time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS,
+            max_user_api_keys_per_tenant: DEFAULT_MAX_USER_API_KEYS_PER_TENANT,
+            max_users_per_tenant: DEFAULT_MAX_USERS_PER_TENANT,
+            max_hierarchy_rows: DEFAULT_MAX_HIERARCHY_ROWS,
             live_nodes: None,
             // Trust nobody by default: `HYDRA_TRUSTED_PROXIES` is read and
             // validated in `main` (fail-closed), not here, so a typo cannot
@@ -205,6 +269,21 @@ impl TenantApiConfig {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS);
+        // The api-key ceiling (T6): same rule as the other limits — unset,
+        // unparseable or zero falls back to the default, because a ceiling of 0
+        // would answer `400` to every key mint.
+        let max_user_api_keys_per_tenant = env_positive_u32(
+            "HYDRA_MAX_USER_API_KEYS_PER_TENANT",
+            DEFAULT_MAX_USER_API_KEYS_PER_TENANT,
+        );
+        // The user ceiling (plan §3.5): same fall-back rule — a ceiling of 0 would
+        // answer `400` to every user mint, so a typo must not remove the capability.
+        let max_users_per_tenant =
+            env_positive_u32("HYDRA_MAX_USERS_PER_TENANT", DEFAULT_MAX_USERS_PER_TENANT);
+        // The global hierarchy-row ceiling (plan §3.5): read here, enforced on
+        // EVERY hierarchy create. Same fall-back rule as its siblings.
+        let max_hierarchy_rows =
+            env_positive_u32("HYDRA_MAX_HIERARCHY_ROWS", DEFAULT_MAX_HIERARCHY_ROWS);
         Self {
             enabled,
             converge_timeout,
@@ -213,6 +292,9 @@ impl TenantApiConfig {
             lockout_secs,
             invalidate_per_min,
             usage_max_window_days,
+            max_user_api_keys_per_tenant,
+            max_users_per_tenant,
+            max_hierarchy_rows,
             // Wired by `main` for cluster nodes; a single-node build leaves it
             // `None`, and the endpoint then reports `single_node`.
             live_nodes: None,
@@ -261,12 +343,10 @@ pub async fn dispatch(
         let Some(write) = parse_write_route(method, path) else {
             return respond_error(session, ctx, 404, "not_found", "unknown path").await;
         };
-        let url_tenant = match write {
-            TenantWriteRoute::UpsertSubTenant { tenant_id, .. }
-            | TenantWriteRoute::DeleteSubTenant { tenant_id, .. }
-            | TenantWriteRoute::UpsertRoute { tenant_id }
-            | TenantWriteRoute::DeleteRoute { tenant_id, .. } => tenant_id,
-        };
+        // Every write route variant names its tenant (it came from the URL), so
+        // the accessor — not a hand-written pattern list — is what keeps a new
+        // variant from silently dropping out of the URL cross-check below.
+        let url_tenant = write.tenant_id();
         // The ROUTE is known here — from the path alone, before any credential is
         // looked at — so it must be set BEFORE the gate, exactly as on the read
         // path below. `run_gate` is what writes the 401/403/429/503 refusal, and
@@ -306,6 +386,14 @@ pub async fn dispatch(
         Endpoint::Usage => "usage",
         Endpoint::ListSubTenants => "sub-tenants",
         Endpoint::ListSubTenantRoutes => "sub-tenant-routes",
+        // T5 reads: the label is the ROUTE, not the row set — no user or group
+        // id enters a metric label (unbounded cardinality).
+        Endpoint::ListUserGroups => "user-groups",
+        Endpoint::ListUsers => "users",
+        // T6: the per-user api-key list. Its label carries no user id — that would
+        // put an unbounded value into a metric label (the same rule that keeps the
+        // tenant id out of the label for an unrouted request).
+        Endpoint::ListUserApiKeys => "user-api-keys",
     });
 
     // 2b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
@@ -317,7 +405,10 @@ pub async fn dispatch(
         Endpoint::Whoami
         | Endpoint::Usage
         | Endpoint::ListSubTenants
-        | Endpoint::ListSubTenantRoutes => "GET",
+        | Endpoint::ListSubTenantRoutes
+        | Endpoint::ListUserGroups
+        | Endpoint::ListUsers
+        | Endpoint::ListUserApiKeys => "GET",
         Endpoint::InvalidateAuthCache => "POST",
     };
     if method != expected {
@@ -366,6 +457,31 @@ pub async fn dispatch(
         Endpoint::ListSubTenantRoutes => {
             handlers::list_sub_tenant_routes(state, session, ctx, &authenticated).await
         }
+        // T6 (D-7/D-5 read face): the caller's OWN keys under one of its OWN users.
+        // Fed from the DB rows, not the snapshot — the snapshot's api-key index is
+        // `#[serde(skip)]` and carries only routing atoms, so the display fields
+        // (name, expiry, enabled) exist only in `hydra_user_api_keys`.
+        // `parse_route` attaches the user id to the route for this endpoint ONLY,
+        // so the `None` arm is unreachable by construction; answering it as the
+        // same local 404 every other near-miss gets keeps it unreachable in
+        // behaviour too, without an assert that could take a worker down.
+        Endpoint::ListUserApiKeys => match route.user_id {
+            Some(uid) => {
+                handlers::list_user_api_keys(state, session, ctx, &authenticated, uid).await
+            }
+            None => respond_error(session, ctx, 404, "not_found", "unknown path").await,
+        },
+        // T5 reads — the tenant's OWN user groups and users, snapshot-fed exactly
+        // like the sub-tenant lists above: the rows and the `config_version` they
+        // are attributed to come from ONE guard, so a replica that has not
+        // materialized a row itself answers like the node that wrote it.
+        // `?group_id=` on `/users` never reaches `parse_route` (`proxy.rs` hands
+        // this module `uri.path()`, query-free), so that filter is read from the
+        // URI inside `handlers::list_users`.
+        Endpoint::ListUserGroups => {
+            handlers::list_user_groups(state, session, ctx, &authenticated).await
+        }
+        Endpoint::ListUsers => handlers::list_users(state, session, ctx, &authenticated).await,
     }
 }
 

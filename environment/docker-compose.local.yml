@@ -244,12 +244,12 @@ services:
   # are), so the DDL is applied by a one-shot client container instead.
   #
   # This DDL MUST stay byte-identical in shape to environment/clickhouse/init.sql
-  # (and therefore to `crates/hydra-server/migrations/0011_usage_sub_tenant_id.sql`).
-  # It previously stopped at the pre-v3 table (no `sub_tenant_id`) while the sink
-  # (sink.rs CLICKHOUSE_INSERT) writes that column — so a fresh `up` on this file
-  # failed every usage flush with `NO_SUCH_COLUMN_IN_TABLE` and silently dropped
-  # the batch after the retention cap. `CREATE TABLE IF NOT EXISTS` never adds a
-  # column to an EXISTING volume, hence the idempotent ALTER below as well.
+  # (and to the sink's `INSERT INTO usage_record (…)` column list).
+  # It previously stopped at an older table (no attribution columns) while the sink
+  # wrote those columns — so a fresh `up` on this file failed every usage flush
+  # with `NO_SUCH_COLUMN_IN_TABLE` and silently dropped the batch after the retention
+  # cap. `CREATE TABLE IF NOT EXISTS` never adds a column to an EXISTING volume,
+  # hence the idempotent ALTER below as well.
   clickhouse-init:
     image: clickhouse/clickhouse-server:24.3
     container_name: hydra-local-clickhouse-init
@@ -262,7 +262,9 @@ services:
             provider_id        String,
             model_key          String,
             client_api_key     Nullable(String),
-            sub_tenant_id      Nullable(String),
+            user_id            Nullable(String),
+            user_group_id      Nullable(String),
+            api_key_id         Nullable(String),
             status_code        UInt16,
             tokens_in          Nullable(UInt64),
             tokens_out         Nullable(UInt64),
@@ -278,8 +280,10 @@ services:
         clickhouse-client --host clickhouse --query "
           ALTER TABLE usage_record MODIFY SETTING non_replicated_deduplication_window = 1000"
         clickhouse-client --host clickhouse --query "
-          ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)"
-        echo "[clickhouse-init] usage_record ready (v4: row-level idempotency via dedup_key + ReplacingMergeTree)"
+          ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS user_id Nullable(String),
+            ADD COLUMN IF NOT EXISTS user_group_id Nullable(String),
+            ADD COLUMN IF NOT EXISTS api_key_id Nullable(String)"
+        echo "[clickhouse-init] usage_record ready (v5: user-hierarchy attribution columns)"
     depends_on:
       clickhouse: { condition: service_healthy }
     restart: "no"

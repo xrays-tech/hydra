@@ -52,9 +52,10 @@
 use std::collections::HashSet;
 
 use hydra_core::config::{CertMeta, ConfigData};
+use hydra_core::identity::TenantTokenIdentity;
 use hydra_core::model::{
-    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
-    TenantModel, TenantProvider,
+    GlobalRole, LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant,
+    SubTenantRoute, TenantAccessToken, TenantModel, TenantProvider, User, UserApiKey, UserGroup,
 };
 
 use super::arachne_keys::{
@@ -133,6 +134,56 @@ pub struct SealedProviderKey {
     pub created_at: String,
     /// The api-key, sealed under the master key.
     pub sealed: Sealed,
+}
+
+/// One user API-key row with its `key_hash` sealed.
+///
+/// This is the tree carrier for `user_api_key/<id>`: every non-secret column is plain JSON, and the
+/// only authentication material (`key_hash`) is sealed deterministically. `enabled=false` and expired
+/// keys still travel here — they decode into `FidelityRows.user_api_keys`, and `reindex_identity` later
+/// turns them into known-but-invalid identity records on the replica (D-5).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SealedUserApiKey {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub key_prefix: String,
+    pub key_last4: String,
+    pub enabled: bool,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Sealed SHA-256 hash (`key_hash`), never serialized in the clear by this entity.
+    pub sealed_key_hash: Sealed,
+}
+
+/// One tenant access-token row with its `token_hash` sealed.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SealedTenantAccessToken {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub token_prefix: String,
+    pub token_last4: String,
+    pub enabled: bool,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Sealed SHA-256 hash (`token_hash`), never serialized in the clear by this entity.
+    pub sealed_token_hash: Sealed,
+}
+
+/// Global Role entity: the rule row without its provider vector plus the provider vector itself.
+///
+/// `role.provider_ids` is emptied before serialisation so the provider set appears exactly once, as
+/// the entity's dedicated `provider_ids` field. Disabled rules still travel under this path and are
+/// restored from `FidelityRows.global_roles`; only enabled ones enter `ConfigData.global_roles`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GlobalRoleTreeEntity {
+    /// The Global Role row itself. `role.provider_ids` is always empty on the wire.
+    pub role: GlobalRole,
+    /// The role's provider ids, in loader order (provider_id ascending).
+    pub provider_ids: Vec<String>,
 }
 
 /// Seal a `limit_role`'s `matching_key` for the tree: the row comes back with that ONE column
@@ -277,6 +328,9 @@ impl FidelityTreeEntity {
             tenant_models: self.tenant_models.clone(),
             sub_tenants: self.sub_tenants.clone(),
             sub_tenant_routes: self.sub_tenant_routes.clone(),
+            // The user-hierarchy fields are deliberately not carried by `_fidelity`; they arrive
+            // through their own `user_group/<id>`, `user/<id>`, ... entity paths.
+            ..FidelityRows::default()
         })
     }
 
@@ -437,8 +491,128 @@ pub fn split_config(
         &EntityPath::Fidelity,
         &FidelityTreeEntity::from_plaintext(fidelity, kp)?,
     )?);
+    add_fidelity_row_blobs(&mut out, fidelity, kp)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Deterministically seal a tree-carried secret. The tree is content-addressed, so a fresh nonce
+/// per publish would rename an unchanged config.
+fn sealed_deterministic(
+    value: &str,
+    what: String,
+    kp: &dyn KeyProvider,
+) -> Result<Sealed, EntityCodecError> {
+    kp.seal_deterministic(value.as_bytes())
+        .map_err(|e| EntityCodecError::Unsupported {
+            reason: format!("cannot seal {what}: {e}"),
+        })
+}
+
+/// Open a tree-carried sealed string. A wrong master key is refused, never downgraded to plaintext.
+fn open_sealed_string(
+    sealed: &Sealed,
+    what: &str,
+    path: &EntityPath,
+    kp: &dyn KeyProvider,
+) -> Result<String, EntityCodecError> {
+    let bytes = kp.open(sealed).map_err(|e| EntityCodecError::Crypto {
+        path: path.to_key_segment(),
+        reason: format!("cannot open {what}: {e}"),
+    })?;
+    String::from_utf8(bytes).map_err(|_| EntityCodecError::Crypto {
+        path: path.to_key_segment(),
+        reason: format!("{what} is not valid UTF-8 after unsealing"),
+    })
+}
+
+/// Add the FULL user-hierarchy rows from `FidelityRows` as per-row entities.
+///
+/// These paths are the authority for the new tables (plan §3.5 / D-13): disabled and expired rows
+/// travel here too, but the same rows are NOT duplicated into the `_fidelity` singleton.
+fn add_fidelity_row_blobs(
+    out: &mut Vec<EntityBlob>,
+    fidelity: &FidelityRows,
+    kp: &dyn KeyProvider,
+) -> Result<(), EntityCodecError> {
+    let check = |path: &EntityPath| -> Result<(), EntityCodecError> {
+        validate_entities(&[TocEntry {
+            path: path.clone(),
+            content_hash: [0u8; 32],
+            len: 0,
+        }])?;
+        Ok(())
+    };
+
+    for group in &fidelity.user_groups {
+        let path = EntityPath::UserGroup(group.id.clone());
+        check(&path)?;
+        out.push(encode(&path, group)?);
+    }
+    for user in &fidelity.users {
+        let path = EntityPath::User(user.id.clone());
+        check(&path)?;
+        out.push(encode(&path, user)?);
+    }
+    for key in &fidelity.user_api_keys {
+        let path = EntityPath::UserApiKey(key.id.clone());
+        check(&path)?;
+        let sealed_key_hash =
+            sealed_deterministic(&key.key_hash, format!("user api key {}", key.id), kp)?;
+        out.push(encode(
+            &path,
+            &SealedUserApiKey {
+                id: key.id.clone(),
+                user_id: key.user_id.clone(),
+                name: key.name.clone(),
+                key_prefix: key.key_prefix.clone(),
+                key_last4: key.key_last4.clone(),
+                enabled: key.enabled,
+                expires_at: key.expires_at.clone(),
+                created_at: key.created_at.clone(),
+                updated_at: key.updated_at.clone(),
+                sealed_key_hash,
+            },
+        )?);
+    }
+    for token in &fidelity.tenant_access_tokens {
+        let path = EntityPath::TenantAccessToken(token.id.clone());
+        check(&path)?;
+        let sealed_token_hash = sealed_deterministic(
+            &token.token_hash,
+            format!("tenant access token {}", token.id),
+            kp,
+        )?;
+        out.push(encode(
+            &path,
+            &SealedTenantAccessToken {
+                id: token.id.clone(),
+                tenant_id: token.tenant_id.clone(),
+                name: token.name.clone(),
+                token_prefix: token.token_prefix.clone(),
+                token_last4: token.token_last4.clone(),
+                enabled: token.enabled,
+                expires_at: token.expires_at.clone(),
+                created_at: token.created_at.clone(),
+                updated_at: token.updated_at.clone(),
+                sealed_token_hash,
+            },
+        )?);
+    }
+    for role in &fidelity.global_roles {
+        let path = EntityPath::GlobalRole(role.id.clone());
+        check(&path)?;
+        let mut without_providers = role.clone();
+        without_providers.provider_ids.clear();
+        out.push(encode(
+            &path,
+            &GlobalRoleTreeEntity {
+                role: without_providers,
+                provider_ids: role.provider_ids.clone(),
+            },
+        )?);
+    }
+    Ok(())
 }
 
 /// Build the CONFIG entities (no fidelity). Private: sealing is not optional, so there is no
@@ -740,7 +914,98 @@ pub fn build_config_with_fidelity(
             }
             EntityPath::Fidelity => {
                 let entity = decode::<FidelityTreeEntity>(path, bytes)?;
-                fidelity = entity.rows(kp)?;
+                let legacy = entity.rows(kp)?;
+                // Assign ONLY the old fidelity fields. The user-hierarchy rows are per-row
+                // entities, so assigning the whole `FidelityRows` here could erase rows already
+                // decoded from `user_group/<id>`, `user/<id>`, etc. depending on path order.
+                fidelity.limit_roles = legacy.limit_roles;
+                fidelity.key_prefix_bindings = legacy.key_prefix_bindings;
+                fidelity.provider_keys = legacy.provider_keys;
+                fidelity.tenant_token_hashes = legacy.tenant_token_hashes;
+                fidelity.provider_models = legacy.provider_models;
+                fidelity.tenant_providers = legacy.tenant_providers;
+                fidelity.tenant_models = legacy.tenant_models;
+                fidelity.sub_tenants = legacy.sub_tenants;
+                fidelity.sub_tenant_routes = legacy.sub_tenant_routes;
+            }
+            EntityPath::UserGroup(_) => {
+                let group = decode::<UserGroup>(path, bytes)?;
+                fidelity.user_groups.push(group.clone());
+                // ConfigData.user_groups is the AUTH gate's known-state view, not an enabled-only
+                // projection: a disabled group must still answer 403 `group_disabled`, so the full
+                // row belongs here too (decision D-5 / loader rule above).
+                cfg.user_groups.push(group);
+            }
+            EntityPath::User(_) => {
+                let user = decode::<User>(path, bytes)?;
+                fidelity.users.push(user.clone());
+                // Same identity-known rule: disabled AND delinquent users remain present so
+                // auth can distinguish 403/402 from unknown. `reindex_identity` below consumes
+                // these plus the decoded key rows.
+                cfg.users.insert(user.id.clone(), user);
+            }
+            EntityPath::UserApiKey(_) => {
+                let entity = decode::<SealedUserApiKey>(path, bytes)?;
+                let key_hash =
+                    open_sealed_string(&entity.sealed_key_hash, "user api key hash", path, kp)?;
+                fidelity.user_api_keys.push(UserApiKey {
+                    id: entity.id.clone(),
+                    user_id: entity.user_id.clone(),
+                    name: entity.name.clone(),
+                    key_prefix: entity.key_prefix.clone(),
+                    key_hash,
+                    key_last4: entity.key_last4.clone(),
+                    enabled: entity.enabled,
+                    expires_at: entity.expires_at.clone(),
+                    created_at: entity.created_at.clone(),
+                    updated_at: entity.updated_at.clone(),
+                });
+            }
+            EntityPath::TenantAccessToken(_) => {
+                let entity = decode::<SealedTenantAccessToken>(path, bytes)?;
+                let token_hash = open_sealed_string(
+                    &entity.sealed_token_hash,
+                    "tenant access token hash",
+                    path,
+                    kp,
+                )?;
+                let token = TenantAccessToken {
+                    id: entity.id.clone(),
+                    tenant_id: entity.tenant_id.clone(),
+                    name: entity.name.clone(),
+                    token_prefix: entity.token_prefix.clone(),
+                    token_hash: token_hash.clone(),
+                    token_last4: entity.token_last4.clone(),
+                    enabled: entity.enabled,
+                    expires_at: entity.expires_at.clone(),
+                    created_at: entity.created_at.clone(),
+                    updated_at: entity.updated_at.clone(),
+                };
+                fidelity.tenant_access_tokens.push(token.clone());
+                // Unlike identity rows, tenant-token config is enabled-only: a revoked token is
+                // simply GONE (plan §3.3), so only enabled rows enter `ConfigData.tenant_tokens`.
+                if token.enabled {
+                    cfg.tenant_tokens.insert(
+                        token_hash.clone(),
+                        TenantTokenIdentity {
+                            tenant_id: token.tenant_id.clone(),
+                            token_name: token.name.clone(),
+                            expires_at: token.expires_at.clone(),
+                        },
+                    );
+                }
+            }
+            EntityPath::GlobalRole(_) => {
+                let entity = decode::<GlobalRoleTreeEntity>(path, bytes)?;
+                let mut role = entity.role;
+                role.provider_ids = entity.provider_ids.clone();
+                fidelity.global_roles.push(role.clone());
+                // Disabled Global Roles must match NOTHING, not even as failover candidates,
+                // so only enabled rows enter the config vector while the full rows stay in
+                // fidelity for faithful restore.
+                if role.enabled {
+                    cfg.global_roles.push(role);
+                }
             }
             // Not part of the config tree (yet). Refused rather than skipped: a skipped path
             // means this node is reading a tree written by another version and would serve a
@@ -791,7 +1056,34 @@ pub fn build_config_with_fidelity(
         (&a.sub_tenant_id, &a.model_key, &a.id).cmp(&(&b.sub_tenant_id, &b.model_key, &b.id))
     });
 
+    // User-hierarchy vectors restore the loader's SQL orders (plan §3.2/§3.5):
+    //   user_group           ORDER BY tenant_id, name
+    //   user                 ORDER BY id
+    //   user_api_key         ORDER BY id
+    //   tenant_access_token  ORDER BY id
+    //   global_role          ORDER BY id
+    // The trailing `id` on the user-group sort only makes the order total; the table's
+    // UNIQUE(tenant_id, name) makes it a no-op for ties.
+    cfg.user_groups
+        .sort_by(|a, b| (&a.tenant_id, &a.name, &a.id).cmp(&(&b.tenant_id, &b.name, &b.id)));
+    fidelity
+        .user_groups
+        .sort_by(|a, b| (&a.tenant_id, &a.name, &a.id).cmp(&(&b.tenant_id, &b.name, &b.id)));
+    fidelity.users.sort_by(|a, b| a.id.cmp(&b.id));
+    fidelity.user_api_keys.sort_by(|a, b| a.id.cmp(&b.id));
+    fidelity
+        .tenant_access_tokens
+        .sort_by(|a, b| a.id.cmp(&b.id));
+    cfg.global_roles.sort_by(|a, b| a.id.cmp(&b.id));
+    fidelity.global_roles.sort_by(|a, b| a.id.cmp(&b.id));
+
     cfg.reindex_tenants();
+    // Identity and Global Role derived indexes now have their full inputs on the tree:
+    // full user rows + full user-api-key rows, and full/enabled-appropriate global roles.
+    // `reindex_identity` consumes `fidelity.user_api_keys` (full table), NOT the enabled-only
+    // config vector, exactly like `store::build_config` does.
+    cfg.reindex_identity(&fidelity.user_api_keys);
+    cfg.reindex_global_roles();
     Ok((cfg, fidelity))
 }
 
@@ -800,7 +1092,7 @@ mod tests {
     use super::*;
     use hydra_core::config::{CertMeta, ModelProvider};
     use hydra_core::model::{
-        Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
+        BillingStatus, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
     };
 
     fn tenant(id: &str, domain: &str) -> Tenant {
@@ -981,6 +1273,10 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
             }],
+            // This fixture predates the T2 user-hierarchy paths; keep those fields empty here
+            // so the test below remains about the legacy fidelity carrier it was written for.
+            // Dedicated `new_user_hierarchy...` tests cover the per-row paths.
+            ..FidelityRows::default()
         }
     }
 
@@ -1258,6 +1554,419 @@ mod tests {
     ///
     /// Falsification: swap `seal_deterministic` back to `seal`, or `sorted_members` back to the raw
     /// set, and this fails.
+    #[test]
+    fn new_user_hierarchy_rows_round_trip_without_double_encoding() {
+        let mut cfg = config();
+        let groups = vec![
+            UserGroup {
+                id: "g-disabled".into(),
+                tenant_id: "t1".into(),
+                name: "a-disabled".into(),
+                enabled: false,
+                created_at: "2026-02-01T00:00:00Z".into(),
+                updated_at: "2026-02-01T00:00:00Z".into(),
+            },
+            UserGroup {
+                id: "g-enabled".into(),
+                tenant_id: "t1".into(),
+                name: "b-enabled".into(),
+                enabled: true,
+                created_at: "2026-02-01T00:00:00Z".into(),
+                updated_at: "2026-02-01T00:00:00Z".into(),
+            },
+        ];
+        let users = vec![
+            User {
+                id: "u-disabled".into(),
+                tenant_id: "t1".into(),
+                user_group_id: "g-disabled".into(),
+                external_id: Some("e-disabled".into()),
+                name: "Disabled user".into(),
+                enabled: false,
+                billing_status: BillingStatus::Delinquent,
+                billing_reason: Some("over quota".into()),
+                billing_updated_at: Some("2026-02-02T00:00:00Z".into()),
+                created_at: "2026-02-02T00:00:00Z".into(),
+                updated_at: "2026-02-02T00:00:00Z".into(),
+            },
+            User {
+                id: "u-enabled".into(),
+                tenant_id: "t1".into(),
+                user_group_id: "g-enabled".into(),
+                external_id: None,
+                name: "Enabled user".into(),
+                enabled: true,
+                billing_status: BillingStatus::Active,
+                billing_reason: None,
+                billing_updated_at: None,
+                created_at: "2026-02-03T00:00:00Z".into(),
+                updated_at: "2026-02-03T00:00:00Z".into(),
+            },
+        ];
+        let keys = vec![
+            UserApiKey {
+                id: "k-disabled".into(),
+                user_id: "u-disabled".into(),
+                name: "revoked key".into(),
+                key_hash: "d".repeat(64),
+                key_prefix: "hk_dis".into(),
+                key_last4: "1111".into(),
+                enabled: false,
+                expires_at: Some("2026-03-01T00:00:00Z".into()),
+                created_at: "2026-02-04T00:00:00Z".into(),
+                updated_at: "2026-02-04T00:00:00Z".into(),
+            },
+            UserApiKey {
+                id: "k-enabled".into(),
+                user_id: "u-enabled".into(),
+                name: "live key".into(),
+                key_hash: "e".repeat(64),
+                key_prefix: "hk_ena".into(),
+                key_last4: "2222".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-02-05T00:00:00Z".into(),
+                updated_at: "2026-02-05T00:00:00Z".into(),
+            },
+        ];
+        let tokens = vec![
+            TenantAccessToken {
+                id: "tok-disabled".into(),
+                tenant_id: "t1".into(),
+                name: "disabled token".into(),
+                token_hash: "f".repeat(64),
+                token_prefix: "ht_dis".into(),
+                token_last4: "3333".into(),
+                enabled: false,
+                expires_at: None,
+                created_at: "2026-02-06T00:00:00Z".into(),
+                updated_at: "2026-02-06T00:00:00Z".into(),
+            },
+            TenantAccessToken {
+                id: "tok-enabled".into(),
+                tenant_id: "t1".into(),
+                name: "enabled token".into(),
+                token_hash: "a".repeat(64),
+                token_prefix: "ht_ena".into(),
+                token_last4: "4444".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-02-07T00:00:00Z".into(),
+                updated_at: "2026-02-07T00:00:00Z".into(),
+            },
+        ];
+        let roles = vec![
+            GlobalRole {
+                id: "gr-disabled".into(),
+                name: "disabled role".into(),
+                tenant_id: "t1".into(),
+                user_group_id: "g-disabled".into(),
+                user_id: "u-disabled".into(),
+                api_key_id: "k-disabled".into(),
+                model_key: "gpt-x".into(),
+                provider_ids: vec!["p-disabled".into()],
+                enabled: false,
+                created_at: "2026-02-08T00:00:00Z".into(),
+                updated_at: "2026-02-08T00:00:00Z".into(),
+            },
+            GlobalRole {
+                id: "gr-enabled".into(),
+                name: "enabled role".into(),
+                tenant_id: "t1".into(),
+                user_group_id: "g-enabled".into(),
+                user_id: "u-enabled".into(),
+                api_key_id: "k-enabled".into(),
+                model_key: "gpt-x".into(),
+                provider_ids: vec!["p1".into()],
+                enabled: true,
+                created_at: "2026-02-09T00:00:00Z".into(),
+                updated_at: "2026-02-09T00:00:00Z".into(),
+            },
+        ];
+
+        cfg.user_groups = groups.clone();
+        cfg.users.clear();
+        for user in &users {
+            cfg.users.insert(user.id.clone(), user.clone());
+        }
+        cfg.tenant_tokens.clear();
+        for token in &tokens {
+            if token.enabled {
+                cfg.tenant_tokens.insert(
+                    token.token_hash.clone(),
+                    TenantTokenIdentity {
+                        tenant_id: token.tenant_id.clone(),
+                        token_name: token.name.clone(),
+                        expires_at: token.expires_at.clone(),
+                    },
+                );
+            }
+        }
+        cfg.global_roles = roles.iter().filter(|r| r.enabled).cloned().collect();
+        cfg.reindex_tenants();
+        cfg.reindex_identity(&keys);
+        cfg.reindex_global_roles();
+
+        let rows = FidelityRows {
+            user_groups: groups.clone(),
+            users: users.clone(),
+            user_api_keys: keys.clone(),
+            tenant_access_tokens: tokens.clone(),
+            global_roles: roles.clone(),
+            ..FidelityRows::default()
+        };
+
+        let blobs = split_config(&cfg, &rows, &kp()).expect("split new hierarchy config");
+        for segment in &[
+            "user_group/g-disabled",
+            "user_group/g-enabled",
+            "user/u-disabled",
+            "user/u-enabled",
+            "user_api_key/k-disabled",
+            "user_api_key/k-enabled",
+            "tenant_access_token/tok-disabled",
+            "tenant_access_token/tok-enabled",
+            "global_role/gr-disabled",
+            "global_role/gr-enabled",
+        ] {
+            assert!(
+                blobs
+                    .iter()
+                    .any(|blob| blob.path.to_key_segment().as_str() == *segment),
+                "missing per-row entity for {segment}",
+            );
+        }
+
+        for blob in &blobs {
+            let text = String::from_utf8_lossy(&blob.bytes).to_string();
+            assert!(
+                !text.contains("d".repeat(64).as_str()) && !text.contains("f".repeat(64).as_str()),
+                "entity {} carries a user-key/tenant-token hash in the clear",
+                blob.path.to_key_segment(),
+            );
+        }
+
+        let fid_blob = blobs
+            .iter()
+            .find(|blob| blob.path.to_key_segment() == "_fidelity")
+            .expect("fidelity entity");
+        let fid_text = String::from_utf8_lossy(&fid_blob.bytes).to_string();
+        for forbidden in &[
+            "user_groups",
+            "users",
+            "user_api_keys",
+            "tenant_access_tokens",
+            "global_roles",
+            "g-disabled",
+            "u-disabled",
+            "k-disabled",
+            "tok-disabled",
+            "gr-disabled",
+        ] {
+            assert!(
+                !fid_text.contains(forbidden),
+                "the _fidelity entity carries {forbidden} again; new hierarchy rows must be single-encoded",
+            );
+        }
+
+        let tree = tree_of(&blobs).expect("tree of new hierarchy blobs");
+        let (rebuilt_cfg, rebuilt_rows) =
+            build_config_with_fidelity(&tree, &kp()).expect("decode new hierarchy tree");
+
+        assert_eq!(
+            rebuilt_rows.user_groups, groups,
+            "full user-group rows must round-trip"
+        );
+        assert_eq!(rebuilt_rows.users, users, "full user rows must round-trip");
+        assert_eq!(
+            rebuilt_rows.user_api_keys, keys,
+            "full user API-key rows must round-trip"
+        );
+        assert_eq!(
+            rebuilt_rows.tenant_access_tokens, tokens,
+            "full tenant access-token rows must round-trip",
+        );
+        assert_eq!(
+            rebuilt_rows.global_roles, roles,
+            "full global-role rows must round-trip"
+        );
+
+        assert_eq!(
+            rebuilt_cfg.user_groups, groups,
+            "config keeps disabled groups as known state"
+        );
+        assert_eq!(
+            rebuilt_cfg.users, cfg.users,
+            "config keeps disabled/delinquent users"
+        );
+        assert_eq!(
+            rebuilt_cfg.tenant_tokens, cfg.tenant_tokens,
+            "tenant token config remains enabled-only"
+        );
+        assert_eq!(
+            rebuilt_cfg.global_roles, cfg.global_roles,
+            "global-role config remains enabled-only"
+        );
+        assert!(
+            rebuilt_cfg
+                .users_by_api_key_hash
+                .values()
+                .any(|id| id.principal.api_key_id == "k-disabled"),
+            "a revoked key must remain known, not vanish into an unknown 401",
+        );
+        assert!(
+            rebuilt_cfg
+                .global_roles
+                .iter()
+                .any(|role| role.id == "gr-enabled"),
+            "enabled global role must be present on the replica",
+        );
+        assert!(
+            rebuilt_cfg
+                .global_roles
+                .iter()
+                .any(|role| role.id == "gr-enabled" && role.provider_ids == vec!["p1".to_string()]),
+            "global-role provider vector must survive per-row entity decode",
+        );
+    }
+
+    #[test]
+    #[ignore = "capacity guard: run manually when changing per-row entity overhead"]
+    fn new_user_hierarchy_toc_and_values_stay_within_target_budgets() {
+        for n in [1usize, 10usize, 100usize, 500usize] {
+            let mut cfg = config();
+            let provider_id = format!("cap_p{n}");
+            let tenant = Tenant {
+                id: format!("cap_t{n}"),
+                name: format!("name-cap_t{n}"),
+                domain: format!("cap{n}.example"),
+                auth_url: format!("https://auth.cap{n}.example"),
+                cert_key: None,
+                cert_file: None,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            cfg.tenants_by_domain
+                .insert(tenant.domain.clone(), tenant.clone());
+            cfg.providers
+                .insert(provider_id.clone(), provider(provider_id.as_str()));
+
+            let group_id = format!("g{n}");
+            let user_id = format!("u{n}");
+            let key_id = format!("k{n}");
+            let token_id = format!("tok{n}");
+            let key_hash = format!("{:064x}", 0x1000 + n);
+            let token_hash = format!("{:064x}", 0x2000 + n);
+            let user_group = UserGroup {
+                id: group_id.clone(),
+                tenant_id: tenant.id.clone(),
+                name: group_id.clone(),
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            let user = User {
+                id: user_id.clone(),
+                tenant_id: tenant.id.clone(),
+                user_group_id: group_id.clone(),
+                external_id: None,
+                name: user_id.clone(),
+                enabled: true,
+                billing_status: BillingStatus::Active,
+                billing_reason: None,
+                billing_updated_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            let key = UserApiKey {
+                id: key_id.clone(),
+                user_id: user_id.clone(),
+                name: key_id.clone(),
+                key_hash: key_hash.clone(),
+                key_prefix: key_id.clone(),
+                key_last4: key_id.clone(),
+                enabled: true,
+                expires_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            let token = TenantAccessToken {
+                id: token_id.clone(),
+                tenant_id: tenant.id.clone(),
+                name: token_id.clone(),
+                token_hash: token_hash.clone(),
+                token_prefix: token_id.clone(),
+                token_last4: token_id.clone(),
+                enabled: true,
+                expires_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            let role_count = n.saturating_sub(4);
+            let global_roles: Vec<GlobalRole> = (0usize..role_count)
+                .map(|i| GlobalRole {
+                    id: format!("gr{n}-{i:06}"),
+                    name: format!("role {n} {i}"),
+                    tenant_id: tenant.id.clone(),
+                    user_group_id: group_id.clone(),
+                    user_id: user_id.clone(),
+                    api_key_id: key_id.clone(),
+                    model_key: "gpt-x".into(),
+                    provider_ids: vec![provider_id.clone()],
+                    enabled: true,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .collect();
+
+            cfg.user_groups = vec![user_group.clone()];
+            cfg.users.clear();
+            cfg.users.insert(user_id.clone(), user.clone());
+            cfg.tenant_tokens.clear();
+            cfg.tenant_tokens.insert(
+                token_hash.clone(),
+                TenantTokenIdentity {
+                    tenant_id: tenant.id.clone(),
+                    token_name: token_id.clone(),
+                    expires_at: None,
+                },
+            );
+            cfg.global_roles = global_roles.clone();
+            cfg.reindex_tenants();
+            cfg.reindex_identity(std::slice::from_ref(&key));
+            cfg.reindex_global_roles();
+
+            let rows = FidelityRows {
+                user_groups: vec![user_group.clone()],
+                users: vec![user.clone()],
+                user_api_keys: vec![key.clone()],
+                tenant_access_tokens: vec![token.clone()],
+                global_roles: global_roles.clone(),
+                ..FidelityRows::default()
+            };
+
+            let blobs = split_config(&cfg, &rows, &kp()).expect("capacity split");
+            let tree = tree_of(&blobs).expect("capacity tree");
+            let toc = toc_of(&tree).expect("capacity toc");
+            let entity_count = blobs.len();
+            let value_bytes: usize = blobs.iter().map(|blob| blob.bytes.len()).sum();
+            let toc_bytes = toc.encode().len();
+
+            assert!(
+                entity_count < 4096,
+                "{n}-row hierarchy: expected fewer than 4096 entities, got {entity_count}",
+            );
+            assert!(
+                value_bytes < 1024 * 1024,
+                "{n}-row hierarchy: expected under 1 MiB of entity values, got {value_bytes} bytes",
+            );
+            assert!(
+                toc_bytes < 1024 * 1024,
+                "{n}-row hierarchy: expected under 1 MiB of TOC, got {toc_bytes} bytes",
+            );
+        }
+    }
     #[tokio::test]
     async fn two_independent_builds_of_the_same_config_name_the_same_tree() {
         // Two INDEPENDENT constructions, the way two loader runs would produce them: fresh

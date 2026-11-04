@@ -17,6 +17,7 @@
 //! structs (sqlx decodes `INTEGER` → `i64`) and cast to the idiomatic `i32` /
 //! `bool` used by [`hydra_core::model`] at the boundary.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -25,8 +26,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::SqlitePool;
 
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
-    Tenant, TenantModel, TenantProvider,
+    BillingStatus, GlobalRole, LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel,
+    SubTenant, SubTenantRoute, Tenant, TenantAccessToken, TenantModel, TenantProvider, User,
+    UserApiKey, UserGroup,
 };
 
 use crate::crypto::{self, CryptoError, KeyProvider, Sealed};
@@ -1990,6 +1992,643 @@ pub async fn upsert_sub_tenant_route_by_key(
         }
     };
     Ok(row.into())
+}
+
+// ---------------------------------------------------------------------------
+// CRUD — 用户层级 / 租户访问令牌 / Global Role（migration 0014, plan §3.1）
+//
+// T1 is ADDITIVE (decision D-17): the loader gains these reads; the old tables
+// (`sub_tenant`, `provider_key_binding`, `tenant.auth_url`, `tenant.access_token_hash`)
+// and every function above stay untouched until the terminal deletion batch T10
+// lands `0015` with the code removal.
+//
+// Like the sub-tenant section, these use **runtime** `sqlx::query` / `query_as`
+// (no `.sqlx/` offline-cache refresh — T1 adds no query macros). `enabled`
+// maps `INTEGER`↔`bool` at the boundary; `billing_status` maps the TEXT CHECK
+// domain onto [`hydra_core::model::BillingStatus`]; the loader (not the repo)
+// filters where §3.2 says enabled-only.
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct UserGroupRow {
+    id: String,
+    tenant_id: String,
+    name: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<UserGroupRow> for UserGroup {
+    fn from(r: UserGroupRow) -> Self {
+        UserGroup {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            name: r.name,
+            enabled: r.enabled != 0,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct UserRow {
+    id: String,
+    tenant_id: String,
+    user_group_id: String,
+    external_id: Option<String>,
+    name: String,
+    enabled: i64,
+    billing_status: String,
+    billing_reason: Option<String>,
+    billing_updated_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<UserRow> for User {
+    fn from(r: UserRow) -> Self {
+        User {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            user_group_id: r.user_group_id,
+            external_id: r.external_id,
+            name: r.name,
+            enabled: r.enabled != 0,
+            // The CHECK domain is ('active','delinquent'); an out-of-domain value
+            // cannot exist through the schema, and a manual edit must not crash the
+            // loader — anything not exactly 'delinquent' loads as Active (the
+            // safe default: never fabricate a 402 from a corrupt row).
+            billing_status: if r.billing_status == "delinquent" {
+                BillingStatus::Delinquent
+            } else {
+                BillingStatus::Active
+            },
+            billing_reason: r.billing_reason,
+            billing_updated_at: r.billing_updated_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct UserApiKeyRow {
+    id: String,
+    user_id: String,
+    name: String,
+    key_hash: String,
+    key_prefix: String,
+    key_last4: String,
+    enabled: i64,
+    expires_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<UserApiKeyRow> for UserApiKey {
+    fn from(r: UserApiKeyRow) -> Self {
+        UserApiKey {
+            id: r.id,
+            user_id: r.user_id,
+            name: r.name,
+            key_hash: r.key_hash,
+            key_prefix: r.key_prefix,
+            key_last4: r.key_last4,
+            enabled: r.enabled != 0,
+            expires_at: r.expires_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct TenantAccessTokenRow {
+    id: String,
+    tenant_id: String,
+    name: String,
+    token_hash: String,
+    token_prefix: String,
+    token_last4: String,
+    enabled: i64,
+    expires_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<TenantAccessTokenRow> for TenantAccessToken {
+    fn from(r: TenantAccessTokenRow) -> Self {
+        TenantAccessToken {
+            id: r.id,
+            tenant_id: r.tenant_id,
+            name: r.name,
+            token_hash: r.token_hash,
+            token_prefix: r.token_prefix,
+            token_last4: r.token_last4,
+            enabled: r.enabled != 0,
+            expires_at: r.expires_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct GlobalRoleRow {
+    id: String,
+    name: String,
+    tenant_id: String,
+    user_group_id: String,
+    user_id: String,
+    api_key_id: String,
+    model_key: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+struct GlobalRoleProviderRow {
+    role_id: String,
+    provider_id: String,
+}
+
+/// All user groups, ordered deterministically (`tenant_id, name` — the
+/// UNIQUE key). Returns ALL rows incl. `enabled = false`; the loader keeps them
+/// (plan §3.2: a disabled group answers 403, so the row must be present).
+pub async fn list_user_groups(pool: &SqlitePool) -> Result<Vec<UserGroup>, sqlx::Error> {
+    list_user_groups_on(pool).await
+}
+
+/// [`list_user_groups`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_user_groups_on<'e, E>(exec: E) -> Result<Vec<UserGroup>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<UserGroupRow> = sqlx::query_as(
+        "SELECT id, tenant_id, name, enabled, created_at, updated_at \
+         FROM user_group ORDER BY tenant_id, name",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// All users, ordered by id (deterministic restore/derivation order). Returns
+/// ALL rows incl. disabled / delinquent (decision D-5 — see `ConfigData::users`).
+pub async fn list_users(pool: &SqlitePool) -> Result<Vec<User>, sqlx::Error> {
+    list_users_on(pool).await
+}
+
+/// [`list_users`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_users_on<'e, E>(exec: E) -> Result<Vec<User>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<UserRow> = sqlx::query_as(
+        "SELECT id, tenant_id, user_group_id, external_id, name, enabled, \
+         billing_status, billing_reason, billing_updated_at, created_at, updated_at \
+         FROM user ORDER BY id",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// All user api-keys, ordered by id. Returns ALL rows incl. disabled/expired
+/// (plan §3.2: revoked keys must read as 401 "known", not "unknown" — the
+/// FULL set is what [`ConfigData::reindex_identity`] consumes).
+pub async fn list_user_api_keys(pool: &SqlitePool) -> Result<Vec<UserApiKey>, sqlx::Error> {
+    list_user_api_keys_on(pool).await
+}
+
+/// [`list_user_api_keys`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_user_api_keys_on<'e, E>(exec: E) -> Result<Vec<UserApiKey>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<UserApiKeyRow> = sqlx::query_as(
+        "SELECT id, user_id, name, key_hash, key_prefix, key_last4, enabled, \
+         expires_at, created_at, updated_at \
+         FROM user_api_key ORDER BY id",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// All tenant access tokens, ordered by id. The LOADER filters to enabled-only
+/// when building `ConfigData::tenant_tokens` (plan §3.2) — the repo returns
+/// rows, not policy.
+pub async fn list_tenant_access_tokens(
+    pool: &SqlitePool,
+) -> Result<Vec<TenantAccessToken>, sqlx::Error> {
+    list_tenant_access_tokens_on(pool).await
+}
+
+/// [`list_tenant_access_tokens`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_tenant_access_tokens_on<'e, E>(
+    exec: E,
+) -> Result<Vec<TenantAccessToken>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<TenantAccessTokenRow> = sqlx::query_as(
+        "SELECT id, tenant_id, name, token_hash, token_prefix, token_last4, \
+         enabled, expires_at, created_at, updated_at \
+         FROM tenant_access_token ORDER BY id",
+    )
+    .fetch_all(exec)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Global Roles with their provider sets, joined IN Rust (two queries, one
+/// deterministic order each — the plan §3.2 shape: `GlobalRole.provider_ids:
+/// Vec<String>`). Returns ALL rows; the loader filters to enabled-only (a
+/// disabled rule must match NOTHING, so unlike the identity rows it is dropped,
+/// not kept-inert).
+///
+/// `provider_ids` within a role are ordered ascending (plan §3.4: "顺序确定
+/// (provider_id 升序)") — the union in the router dedups via `BTreeSet` anyway,
+/// but the stored vector must be deterministic so the `PartialEq` generation
+/// predicate does not flicker on identical sets in different orders.
+pub async fn list_global_roles(pool: &SqlitePool) -> Result<Vec<GlobalRole>, sqlx::Error> {
+    list_global_roles_on(pool).await
+}
+
+/// [`list_global_roles`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_global_roles_on<'e, E>(exec: E) -> Result<Vec<GlobalRole>, sqlx::Error>
+where
+    // Two fetch_all calls (role rows + provider rows) need the executor twice;
+    // every executor this is ever called with is a borrow (`&pool` / `&tx`), hence
+    // `Copy` — same reason `pool` is Copy at the public wrappers' call sites.
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite> + Copy,
+{
+    let role_rows: Vec<GlobalRoleRow> = sqlx::query_as(
+        "SELECT id, name, tenant_id, user_group_id, user_id, api_key_id, model_key, \
+         enabled, created_at, updated_at \
+         FROM global_role ORDER BY id",
+    )
+    .fetch_all(exec)
+    .await?;
+    // `ORDER BY role_id, provider_id`: deterministic per role, provider_id
+    // ascending. Grouping is a linear merge over the already-ordered rows.
+    let provider_rows: Vec<GlobalRoleProviderRow> = sqlx::query_as(
+        "SELECT role_id, provider_id FROM global_role_provider ORDER BY role_id, provider_id",
+    )
+    .fetch_all(exec)
+    .await?;
+
+    let mut by_role: HashMap<String, Vec<String>> = HashMap::new();
+    for p in provider_rows {
+        by_role.entry(p.role_id).or_default().push(p.provider_id);
+    }
+    let mut out: Vec<GlobalRole> = Vec::with_capacity(role_rows.len());
+    for role in role_rows {
+        // Taken BEFORE the field moves below: `role.id` is consumed by the struct.
+        let provider_ids = by_role.remove(&role.id).unwrap_or_default();
+        out.push(GlobalRole {
+            id: role.id,
+            name: role.name,
+            tenant_id: role.tenant_id,
+            user_group_id: role.user_group_id,
+            user_id: role.user_id,
+            api_key_id: role.api_key_id,
+            model_key: role.model_key,
+            // A role with no provider rows gets the EMPTY set: it matches and
+            // contributes nothing (the union stays empty -> legacy fallback, plan
+            // §3.4). Never a missing field.
+            provider_ids,
+            enabled: role.enabled != 0,
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        });
+    }
+    Ok(out)
+}
+
+/// [`list_global_roles_on`] against a borrowed SQLite connection/transaction.
+///
+/// The generic `Copy` bound above is awkward for a transaction: sqlx exposes a
+/// transaction's connection as `&mut *tx`, which is an executor but not `Copy`.
+/// A snapshot reader that needs BOTH role and provider rows in the SAME
+/// transaction uses this variant instead of opening a separate pool read.
+pub(crate) async fn list_global_roles_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<Vec<GlobalRole>, sqlx::Error> {
+    let role_rows: Vec<GlobalRoleRow> = sqlx::query_as(
+        "SELECT id, name, tenant_id, user_group_id, user_id, api_key_id, model_key, \
+         enabled, created_at, updated_at \
+         FROM global_role ORDER BY id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let provider_rows: Vec<GlobalRoleProviderRow> = sqlx::query_as(
+        "SELECT role_id, provider_id FROM global_role_provider ORDER BY role_id, provider_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut by_role: HashMap<String, Vec<String>> = HashMap::new();
+    for p in provider_rows {
+        by_role.entry(p.role_id).or_default().push(p.provider_id);
+    }
+
+    let mut out: Vec<GlobalRole> = Vec::with_capacity(role_rows.len());
+    for role in role_rows {
+        let provider_ids = by_role.remove(&role.id).unwrap_or_default();
+        out.push(GlobalRole {
+            id: role.id,
+            name: role.name,
+            tenant_id: role.tenant_id,
+            user_group_id: role.user_group_id,
+            user_id: role.user_id,
+            api_key_id: role.api_key_id,
+            model_key: role.model_key,
+            provider_ids,
+            enabled: role.enabled != 0,
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Runtime-checked user-hierarchy CRUD (no `.sqlx` compile-time cache dependency).
+///
+/// `updated_at` is written by SQLite (`datetime('now')`), matching the column
+/// defaults in `0014_user_hierarchy.sql` and keeping repo writes honest even when
+/// callers hand in a stale `updated_at` field.
+fn billing_status_to_str(status: BillingStatus) -> &'static str {
+    match status {
+        BillingStatus::Active => "active",
+        BillingStatus::Delinquent => "delinquent",
+    }
+}
+
+pub async fn upsert_user_group(pool: &SqlitePool, group: &UserGroup) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           name = excluded.name, \
+           enabled = excluded.enabled, \
+           updated_at = datetime('now')",
+    )
+    .bind(&group.id)
+    .bind(&group.tenant_id)
+    .bind(&group.name)
+    .bind(group.enabled)
+    .bind(&group.created_at)
+    .execute(pool)
+    .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn delete_user_group(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query("DELETE FROM user_group WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn upsert_user(pool: &SqlitePool, user: &User) -> Result<u64, sqlx::Error> {
+    let billing_status = billing_status_to_str(user.billing_status);
+    let affected = sqlx::query(
+        "INSERT INTO \"user\" (id, tenant_id, user_group_id, external_id, name, \
+         enabled, billing_status, billing_reason, billing_updated_at, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           tenant_id = excluded.tenant_id, \
+           user_group_id = excluded.user_group_id, \
+           external_id = excluded.external_id, \
+           name = excluded.name, \
+           enabled = excluded.enabled, \
+           billing_status = excluded.billing_status, \
+           billing_reason = excluded.billing_reason, \
+           billing_updated_at = excluded.billing_updated_at, \
+           updated_at = datetime('now')",
+    )
+    .bind(&user.id)
+    .bind(&user.tenant_id)
+    .bind(&user.user_group_id)
+    .bind(&user.external_id)
+    .bind(&user.name)
+    .bind(user.enabled)
+    .bind(billing_status)
+    .bind(&user.billing_reason)
+    .bind(&user.billing_updated_at)
+    .bind(&user.created_at)
+    .execute(pool)
+    .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn delete_user(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query("DELETE FROM \"user\" WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn insert_user_api_key(
+    pool: &SqlitePool,
+    api_key: &UserApiKey,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO user_api_key (id, user_id, name, key_hash, key_prefix, key_last4, \
+         enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+    )
+        .bind(&api_key.id)
+        .bind(&api_key.user_id)
+        .bind(&api_key.name)
+        .bind(&api_key.key_hash)
+        .bind(&api_key.key_prefix)
+        .bind(&api_key.key_last4)
+        .bind(api_key.enabled)
+        .bind(&api_key.expires_at)
+        .bind(&api_key.created_at)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn delete_user_api_key(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query("DELETE FROM user_api_key WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn insert_tenant_access_token(
+    pool: &SqlitePool,
+    token: &TenantAccessToken,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO tenant_access_token (id, tenant_id, name, token_hash, token_prefix, token_last4, \
+         enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+    )
+        .bind(&token.id)
+        .bind(&token.tenant_id)
+        .bind(&token.name)
+        .bind(&token.token_hash)
+        .bind(&token.token_prefix)
+        .bind(&token.token_last4)
+        .bind(token.enabled)
+        .bind(&token.expires_at)
+        .bind(&token.created_at)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+pub async fn delete_tenant_access_token(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query("DELETE FROM tenant_access_token WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+/// The Global Role row write (create or replace) on a borrowed connection.
+///
+/// `created_at` is bound ONLY in the INSERT arm: the `ON CONFLICT` arm never touches
+/// it, so an UPDATE PRESERVES the original creation time — an admin rewrite of an
+/// existing rule must not look like a re-creation to the operator.
+async fn upsert_global_role_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    role: &GlobalRole,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO global_role (id, name, tenant_id, user_group_id, user_id, api_key_id, \
+         model_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           name = excluded.name, \
+           tenant_id = excluded.tenant_id, \
+           user_group_id = excluded.user_group_id, \
+           user_id = excluded.user_id, \
+           api_key_id = excluded.api_key_id, \
+           model_key = excluded.model_key, \
+           enabled = excluded.enabled, \
+           updated_at = datetime('now')",
+    )
+        .bind(&role.id)
+        .bind(&role.name)
+        .bind(&role.tenant_id)
+        .bind(&role.user_group_id)
+        .bind(&role.user_id)
+        .bind(&role.api_key_id)
+        .bind(&role.model_key)
+        .bind(role.enabled)
+        .bind(&role.created_at)
+        .execute(&mut *conn)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+/// The pool-level wrapper of [`upsert_global_role_on_conn`] (its own implicit
+/// write transaction). When the provider set changes with the row — which is every
+/// admin write — use [`upsert_global_role_with_providers`]: the two writes must land
+/// as ONE transaction, see the note there.
+pub async fn upsert_global_role(pool: &SqlitePool, role: &GlobalRole) -> Result<u64, sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    let affected = upsert_global_role_on_conn(&mut tx, role).await?;
+    tx.commit().await?;
+    Ok(affected)
+}
+
+/// The provider-set rewrite on a borrowed connection — shared by
+/// [`replace_global_role_providers`] and the one-transaction role writer below.
+async fn replace_global_role_providers_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    role_id: &str,
+    providers: &[String],
+) -> Result<u64, sqlx::Error> {
+    sqlx::query("DELETE FROM global_role_provider WHERE role_id = ?")
+        .bind(role_id)
+        .execute(&mut *conn)
+        .await?;
+
+    let mut normalized = providers.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+
+    let mut inserted = 0;
+    for provider_id in normalized {
+        let affected = sqlx::query(
+            "INSERT INTO global_role_provider (id, role_id, provider_id) VALUES (?, ?, ?)",
+        )
+        .bind(format!(
+            "grprov:{role_id}:{provider_id}",
+            role_id = role_id,
+            provider_id = provider_id
+        ))
+        .bind(role_id)
+        .bind(provider_id)
+        .execute(&mut *conn)
+        .await?;
+        inserted += affected.rows_affected();
+    }
+    Ok(inserted)
+}
+
+/// Replace a Global Role's provider set in one SQLite transaction.
+///
+/// The provider set is the normalized `global_role_provider` table, not a JSON
+/// blob: delete old child rows, then insert the requested provider ids. The provider
+/// ids are de-duplicated because `UNIQUE(role_id, provider_id)` is the table's identity
+/// and `GlobalRole.provider_ids` may contain the same provider more than once.
+pub async fn replace_global_role_providers(
+    pool: &SqlitePool,
+    role_id: &str,
+    providers: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    let inserted = replace_global_role_providers_on_conn(&mut tx, role_id, providers).await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Create-or-replace a Global Role AND replace its provider set in ONE transaction.
+///
+/// This is the admin PUT path's single write primitive. Doing the two writes as
+/// two separate transactions leaves a window in which the rule row is committed
+/// while the provider set is still the OLD one (or empty, on a fresh create): the
+/// provider set IS the rule's entire effect, so a half-written rule is a live rule
+/// granting the wrong providers to every matching request. A failure anywhere rolls
+/// the whole thing back — no role without its intended provider set, never a
+/// role row plus orphan child rows either (`ON DELETE CASCADE` + the FK).
+///
+/// The role row goes FIRST: `global_role_provider.role_id REFERENCES global_role(id)`,
+/// so the child rows cannot be inserted before their parent exists.
+///
+/// Returns the ROLE row count (always 1 — `ON CONFLICT DO UPDATE` reports a row
+/// even when the values are identical); the provider row count is deliberately not
+/// part of the answer, the caller already knows the set it wrote.
+pub async fn upsert_global_role_with_providers(
+    pool: &SqlitePool,
+    role: &GlobalRole,
+    providers: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    let affected = upsert_global_role_on_conn(&mut tx, role).await?;
+    let _inserted = replace_global_role_providers_on_conn(&mut tx, &role.id, providers).await?;
+    tx.commit().await?;
+    Ok(affected)
+}
+
+pub async fn delete_global_role(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query("DELETE FROM global_role WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
 }
 
 // ---------------------------------------------------------------------------

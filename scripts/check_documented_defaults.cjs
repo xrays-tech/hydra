@@ -86,6 +86,7 @@ const UNVERIFIED_OK = records(process.env.CDD_UNVERIFIED_OK, [
   ['HYDRA_NODE_ID', 'documented default is derived at startup (host:port), not a literal'],
   ['HYDRA_TRUSTED_PROXIES', 'documented default is empty; the code splits a list, no scalar fallback'],
   ['HYDRA_TENANT_API', 'documented default `on`; the code parses it as a boolean master switch'],
+  ['HYDRA_SESSION_AFFINITY', 'documented default `on`; the code parses a vocabulary (`off`/`false`/`0` select the no-session-header path, anything else keeps `on`) — there is no scalar fallback to compare'],
 ]);
 
 
@@ -229,6 +230,31 @@ function codeDefault(sources, varName, rawLines) {
     const afterVar = wide.slice(atVar + varName.length);
     const nextKnob = afterVar.search(/HYDRA_[A-Z0-9_]+/);
     const window = nextKnob === -1 ? wide : wide.slice(0, atVar + varName.length + nextKnob);
+    // A helper call can carry a CONST default instead of a literal — the shape every
+    // capacity ceiling in this tree uses, spread over lines by `cargo fmt`:
+    //
+    //     env_positive_u32(
+    //         "HYDRA_MAX_HIERARCHY_ROWS",
+    //         DEFAULT_MAX_HIERARCHY_ROWS,
+    //     );
+    //
+    // With the literal-only pattern below, such a row printed `???? code=no fallback
+    // found`: the guard could not see a default the code DOES have, so the doc promise
+    // went unverified (measured 2026-11-04: `HYDRA_MAX_USERS_PER_TENANT` / `HYDRA_MAX_HIERARCHY_ROWS`
+    // were wired and documented at `1000` / `3000` and this guard still refused to compare them).
+    // The const is resolved the same way `unwrap_or`'s const argument is. An identifier
+    // that resolves to NOTHING is NOT treated as a hit — it falls through to the other
+    // shapes rather than claiming OK.
+    const helper = wide.match(new RegExp(`\\w+\\s*\\(\\s*"${varName}"\\s*,\\s*([\\d_]+|[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z0-9_]+)*)`));
+    if (helper) {
+      if (/^[0-9_]/.test(helper[1])) {
+        const n = numericLiteral(helper[1]);
+        if (n !== null) return { value: n, how: "helper called with an inline default", line: i + 1 };
+      } else {
+        const c = constValue(sources, helper[1]) || anyConstIn(sources, helper[1]);
+        if (c) return { value: c.value, how: `helper called with a const default -> ${c.where}`, line: i + 1 };
+      }
+    }
     const inline = wide.match(new RegExp(`\\w+\\s*\\(\\s*"${varName}"\\s*,\\s*([\\d_]+)`));
     if (inline) return { value: numericLiteral(inline[1]), how: "helper called with an inline default", line: i + 1 };
     const unwrapped = window.match(new RegExp(`"${varName}"[\\s\\S]{0,900}?unwrap_or(?:_else)?\\(\\s*(?:\\|[^|]*\\|\\s*)?([^\\n]{1,120})`));

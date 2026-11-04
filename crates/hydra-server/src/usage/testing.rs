@@ -37,7 +37,12 @@ pub(crate) fn record(trace: &str) -> UsageRecord {
         provider_id: "p".into(),
         model_key: "m".into(),
         client_api_key_masked: None,
-        sub_tenant_id: None,
+        // Attribution is NULL by default: the harness record stands for an
+        // UNAUTHENTICATED-to-the-internal-path request, and a test that wants a
+        // principal sets the three dimensions explicitly.
+        user_id: None,
+        user_group_id: None,
+        api_key_id: None,
         status_code: 200,
         tokens_in: Some(1),
         tokens_out: Some(1),

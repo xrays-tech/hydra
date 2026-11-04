@@ -27,10 +27,10 @@
 
 ## What it is
 
-Hydra sits between your agents/clients and your LLM providers. A client request is resolved to a tenant by domain, authenticated against the tenant's own auth endpoint, the **full request body is read** so `model` can be extracted from any position/schema, then Hydra routes (model × tenant-allowed providers, weighted round-robin), swaps the client key for a provider key, calls the real provider via its own HTTP client (reqwest), streams the response back, parses usage tokens (including cached tokens), and records it all.
+Hydra sits between your agents/clients and your LLM providers. A client request is resolved to a tenant by domain, authenticated **internally** against the tenant's own stored per-user API keys (no external auth call), the **full request body is read** so `model` can be extracted from any position/schema, then Hydra routes (model × tenant-allowed providers ∩ any matching Global Role, weighted round-robin), swaps the client key for a provider key, calls the real provider via its own HTTP client (reqwest), streams the response back, parses usage tokens (including cached tokens), and records it all.
 
 ```
-Agent ──► Pingora ──► [tenant resolve → external auth → read full body → extract model
+Agent ──► Pingora ──► [tenant resolve → internal API-key auth → read full body → extract model
                         → route → swap key → reqwest call to provider → stream SSE back
                         → parse usage (input/cached/output + TTFT) → record]
 ```
@@ -43,7 +43,8 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 - **Two client protocols, format-homogeneous**: accept OpenAI (`POST /v1/chat/completions`) **and** Anthropic (`POST /v1/messages`). The path you call selects the format end-to-end — the upstream URL, request body, and usage parser all match (no OpenAI↔Anthropic conversion). `UsageScanner` picks `ProviderKind::Anthropic` for `/v1/messages` (parses `input_tokens`/`output_tokens`/`cache_read_input_tokens`), `Generic` otherwise.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
 - **Key-prefix binding gate**: pin client api-keys by raw prefix to one provider (`sk_aaa_*` → Provider A); longest prefix wins, fail-closed (bound provider unavailable ⇒ 503, never falls back).
-- **External auth**: each tenant points to its own `auth_url`; Hydra caches verdicts 5 min and exposes an invalidation endpoint (the tenant decides欠费/封禁).
+- **Internal API-key auth + four-level user hierarchy**: a client presents its own api-key (`hk_` + CSPRNG, stored only as SHA-256; plaintext shown once at creation), resolved to a user under `tenant → user_group → user → api_key`. Unknown/disabled/expired key → **401**, disabled user/group → **403**, a user flagged delinquent via the tenant API → **402 `user_delinquent`**. No external `auth_url`, no auth cache. Tenant access tokens (`ht_`, multi-token per tenant) gate the tenant self-service API only. The old external-auth path (`auth_url` / `HttpAuthChecker` / `AuthCache`) is dead code pending the deferred T10 cleanup.
+- **Global Role routing**: a `global_role` table keyed on `(tenant, user_group, user, api_key, model)` — each dimension `*` = any — maps to a provider set. Matched rules' providers are **unioned** (dedup, `provider_id` ascending) and always intersected with providers actually serving that model; wildcard-tenant roles still intersect `tenant_providers` (fail-closed). Weighted SWRR by default, or session-sticky weighted rendezvous (`HYDRA_SESSION_AFFINITY`, default on). No match → today's `tenant_providers ∩ models_by_key` behavior.
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.
 - **Usage recording**: pluggable sink (**ClickHouse** — the shared store — or `none` to switch metering off; the retired per-node SQLite sink was removed 2026-10-07); **granular token breakdown**: `prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_tokens` (OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`); **latency metrics**: `forward_latency_ms` (Hydra overhead before provider call) + `ttft_ms` (time to first token). All numeric fields default to 0 (no NULLs).
@@ -113,7 +114,7 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 
 ### Admin UI
 
-Open `http://<host>:8081/admin/` and enter the admin token. Manage providers, models, keys, tenants, access, rate-limit roles, and view/invalidate the auth cache and circuit breaker.
+Open `http://<host>:8081/admin/` and enter the admin token. Manage providers, models, keys, tenants, access, rate-limit roles, Global Roles, and view circuit-breaker status.
 
 ### Admin REST
 
@@ -147,7 +148,7 @@ curl https://acme.example.com/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Hydra resolves tenant `acme` by domain → calls `auth_url` to authorize the key → routes `gpt-4o` to an allowed provider → swaps in a provider key → streams the response back → records usage (tokens + cached + TTFT).
+Hydra resolves tenant `acme` by domain → authorizes the key against the tenant's stored per-user API keys (internal: 401 on unknown/disabled key, 403 on disabled user/group, 402 on a delinquent user) → routes `gpt-4o` to an allowed provider (optionally narrowed by a matching Global Role) → swaps in a provider key → streams the response back → records usage (tokens + cached + TTFT).
 
 **Model catalog**: `GET /v1/models` is publicly readable (with or without an api-key — the presented key does not trigger auth, it only narrows the catalog by key-prefix binding) and returns the catalog of models this tenant can currently call (Hydra aggregates locally: union across allowed providers, filtered by the tenant model whitelist, excluding broken/disabled/keyless providers); chat calls still require an api-key. Admin has a read-only aggregate at `GET /api/v1/tenants/{tenant_id}/models`. See `dev-docs/design-tenant-model-catalog.md` and `dev-docs/aegis/plans/2026-09-08-public-models-catalog.md`.
 

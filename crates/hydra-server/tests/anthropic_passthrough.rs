@@ -145,6 +145,10 @@ async fn seed_routed(
     )
     .await
     .expect("insert limit_role");
+    // T3 internal auth: the data-plane gate decides from the identity index
+    // derived from user_group/user/user_api_key rows. `auth_url` above stays
+    // on the Tenant row (it is data, not a live hop) but is never consulted.
+    common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
 
 /// Bind an ephemeral port, return it, then release the socket so Pingora can
@@ -191,7 +195,16 @@ async fn send_until_ready(
     for _ in 0..60 {
         match client
             .post(url)
-            .header(api_key_header, "Bearer test-client-key")
+            // `x-api-key` carries the BARE key (`Bearer` is an `Authorization`
+            // scheme only — hydra_core::apikey does not strip it elsewhere).
+            .header(
+                api_key_header,
+                if api_key_header == "x-api-key" {
+                    "test-client-key"
+                } else {
+                    "Bearer test-client-key"
+                },
+            )
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()

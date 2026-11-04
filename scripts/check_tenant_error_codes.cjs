@@ -91,6 +91,13 @@ function documentedCodes(docText) {
   return out;
 }
 
+/** The call that OWNS position idx: walks back over an argument list with no statement terminator
+ *  (`; { } (`) between the call name and idx. Null when the literal is not an argument of a call. */
+function callOwner(text, idx) {
+  const m = text.slice(0, idx).match(/([a-z_][a-z0-9_]{4,})\((?:[^;{}()]|\n)*$/);
+  return m ? m[1] : null;
+}
+
 /** The status(es) the code sends together with `code`, or [] when not extractable. */
 function codeStatuses(sources, code) {
   const found = new Set();
@@ -99,6 +106,16 @@ function codeStatuses(sources, code) {
     let idx = -1;
     while ((idx = f.text.indexOf(literal, idx + 1)) !== -1) {
       const before = f.text.slice(Math.max(0, idx - 260), idx);
+      // shape 0: MESSAGE-ONLY data-plane envelope helpers. `short_circuit` (proxy.rs:1847) and
+      // `respond_auth_denial` (proxy.rs:1856) build `{"error":{"message":"<arg>","type":…}}` — the
+      // string argument is the MESSAGE, and these bodies carry NO `code` field, so their reason
+      // strings are NOT emissions of a documented §6 code (which is the TENANT-API envelope, §4.3).
+      // Measured 2026-11-03: the new internal-auth site `respond_auth_denial(session, 401,
+      // "invalid_api_key")` (proxy.rs:441) was read as a 401 emission of the tenant-API row
+      // `invalid_api_key` (400 = a key >4096 bytes sent to the tenant API) → FALSE DRIFT
+      // "emitted with DIFFERENT statuses (400/401)". §7.1 documents the data-plane messages apart
+      // from §6; they must not be cross-compared.
+      if (["respond_auth_denial", "short_circuit"].includes(callOwner(f.text, idx))) continue;
       // shape 1: respond_error(…, <status>, "<code>"
       const viaRespond = before.match(/respond_error\([^;]{0,240}?,\s*(\d{3})\s*,\s*$/);
       if (viaRespond) {

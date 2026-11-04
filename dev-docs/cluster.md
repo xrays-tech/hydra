@@ -90,12 +90,15 @@
 | `hydra/cfg/toc/<toc-hash>` | 该树的目录（每个实体的路径 + 内容哈希 + 长度） |
 | `hydra/cfg/e/<path>/<content-hash>` | **每实体一键，键自带内容哈希** |
 | `hydra/ctl/cluster_id` | 本节点数据目录记录下来的集群身份（"认领"机制，见 §5.6） |
-| `hydra/ctl/format` | 键空间格式版本（`TOC_FORMAT = 4`，2026-10-09 因 D-16 封存 `limit_role.matching_key` 而 bump：**同一份字节的语义变了** ⇒ 混版本集群互相**按名字拒绝**对方的树，而不是让旧节点拿信封文本去匹配、悄悄不再限流） |
+| `hydra/ctl/format` | 键空间格式版本（`TOC_FORMAT = 5`。bump 单调递增、**禁 reset 为 1**（变体删除重排判别值，旧树里会被新枚举静默错读）：3→4 因 D-16 封存 `limit_role.matching_key`（**同一份字节的语义变了**）；4→5 因 2026-11-03 四级用户体系新增 `EntityPath` 判别值（见 §3.1 下）。变体**增**改 key 布局与解码分支 ⇒ 混版本集群互相**按名字拒绝**对方的树，旧节点里新路径上 `UnknownEntityKind` 拒绝而非静默漏读，而不是让旧节点拿信封文本去匹配、悄悄不再限流） |
 
 实体键**内容寻址**是刻意的：同一个实体的两个版本各有各的键，于是"并发发布互相撕裂"在键层面就
 不可能发生，而"这个实体是否已经存过"由**键自身**回答（对自己副本查一次，不需要基线、不需要跨节点
 协商）。**读取一律 `get_stale`**：线性读 `get` 在 follower 上会立刻返回 `QuorumUnavailable`，
 所以"顺序严格"不是靠线性读保证的，而是靠**单写者 + 内容哈希 + 逐实体校验**。
+
+> **2026-11-03 新增实体（四级用户体系，`TOC_FORMAT` 5）**：`EntityPath` 里另出
+> `user_group/<id>`、`user/<id>`、`user_api_key/<id>`、`tenant_access_token/<id>`、`global_role/<id>`（payload 里 `GlobalRoleTreeEntity { role, provider_ids }`）。这五类的行**只**由 per-row 实体承载（含 `enabled=false`/欠费/禁用/过期 key 全量），**不**复制进 `_fidelity` 单值（避容量悬崖，决策 D-13）；`key_hash`/`token_hash` 用 `seal_deterministic` 密封进树。身份三字段（`user_groups`/`users`/`users_by_api_key_hash`）由 `reindex_identity` 从**全量行**构建（leader `build_config` 与副本解码后同源），so 副本里 disabled key 仍是"已知但撤销"（401），not "未知"。**restore 顺序**（`WipedTable`）：`global_role_provider` → `global_role` → `user_api_key` → `user` → `user_group` → `tenant_access_token` → 现表。旧 `SubTenant`/`SubTenantRoute`/`KeyBinding`/单 `Token` 实体与 `_fidelity` 对应字段随终批 T10 里删除——本计划里 T10 **已‑deferred**，故现里旧实体**仍在**树里并存（新二进制读两者，`UnknownEntityKind` 只在读里删除后）。
 
 ### 3.2 写入与提交点
 

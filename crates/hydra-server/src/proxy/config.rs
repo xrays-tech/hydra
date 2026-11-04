@@ -137,6 +137,16 @@ pub struct ProxyConfig {
     /// it deliberately instead of discovering the interaction as a 408.
     /// `0` is rejected at parse time: it would reject every bodied request.
     pub request_body_timeout_secs: u64,
+    /// Session affinity (T7b, plan §3.4 step 4): when a request carries a
+    /// session header, the SAME provider should answer the same session's
+    /// repeats (prompt-cache locality: a cache warmed under one provider is
+    /// useless to the next). `HYDRA_SESSION_AFFINITY`.
+    ///
+    /// Default ON, and a malformed value falls back to the default rather than
+    /// refusing to start: this is a routing hint, not a safety control, so a
+    /// typo must not take the gateway down. When OFF (or when the request has
+    /// no session header / no principal), candidate ordering stays pure SWRR.
+    pub session_affinity: bool,
 }
 
 impl Default for ProxyConfig {
@@ -172,6 +182,7 @@ impl Default for ProxyConfig {
             // prompt. See the field docs for why this is a total, not idle,
             // deadline.
             request_body_timeout_secs: 60,
+            session_affinity: true,
         }
     }
 }
@@ -253,6 +264,32 @@ pub fn parse_max_request_body_hard(raw: Option<&str>) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(ProxyConfig::default().max_request_body_hard)
+}
+
+/// Whether session affinity is on: `HYDRA_SESSION_AFFINITY`, defaulting to
+/// [`ProxyConfig::default`]'s value (`true`). Pure, like its siblings.
+///
+/// The parse is TOTAL by design: `on`/`true`/`1` ⇒ ON, `off`/`false`/`0` ⇒ OFF
+/// (case- and whitespace-insensitive), and anything else falls back to the
+/// default rather than refusing to start. Session affinity is a routing
+/// hint, not a safety control — an unparseable boolean in the environment
+/// must not take the gateway down, and the fallback keeps the shipped default
+/// visible in the startup log.
+#[must_use]
+pub fn parse_session_affinity(raw: Option<&str>) -> bool {
+    let default = ProxyConfig::default().session_affinity;
+    match raw.map(|v| v.trim().to_lowercase()) {
+        None => default,
+        Some(v) => {
+            if v == "off" || v == "false" || v == "0" {
+                false
+            } else if v == "on" || v == "true" || v == "1" {
+                true
+            } else {
+                default
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -417,5 +454,24 @@ mod tests {
         assert_eq!(parse_request_body_timeout_secs(Some("nope")), 60);
         assert_eq!(parse_request_body_timeout_secs(Some("-1")), 60);
         assert_eq!(ProxyConfig::default().request_body_timeout_secs, 60);
+    }
+
+    /// Session affinity is total: both directions parse, case/whitespace
+    /// variations are accepted, and anything unparseable keeps the shipped
+    /// default (ON) rather than turning into a startup failure.
+    #[test]
+    fn session_affinity_parse_is_total_and_defaults_on() {
+        assert!(parse_session_affinity(None), "default");
+        assert!(parse_session_affinity(Some("on")));
+        assert!(parse_session_affinity(Some("TRUE")));
+        assert!(parse_session_affinity(Some(" 1 ")));
+        assert!(!parse_session_affinity(Some("off")));
+        assert!(!parse_session_affinity(Some("False")));
+        assert!(!parse_session_affinity(Some("0")));
+        assert!(
+            parse_session_affinity(Some("maybe")),
+            "garbage falls back to ON"
+        );
+        assert!(ProxyConfig::default().session_affinity);
     }
 }

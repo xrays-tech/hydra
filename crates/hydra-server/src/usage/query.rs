@@ -45,9 +45,15 @@ pub enum GroupBy {
     None,
     Model,
     Provider,
-    /// The sub-tenant the request was attributed to (v3). Rows whose key matched
-    /// no enabled sub-tenant prefix group under the empty key.
-    SubTenant,
+    /// The USER the request was attributed to (`UsageRecord::user_id`), taken
+    /// from the resolved principal. Rows with no principal group under the empty
+    /// key.
+    User,
+    /// The user GROUP (`UsageRecord::user_group_id`).
+    UserGroup,
+    /// The client api KEY (`UsageRecord::api_key_id`) — the finest level: one
+    /// key's own usage, without exposing the key itself.
+    ApiKey,
     /// Calendar day, derived from the fixed-width prefix of `created_at`.
     Day,
 }
@@ -61,7 +67,9 @@ impl GroupBy {
             "none" | "" => Some(Self::None),
             "model" => Some(Self::Model),
             "provider" => Some(Self::Provider),
-            "sub_tenant" => Some(Self::SubTenant),
+            "user" => Some(Self::User),
+            "user_group" => Some(Self::UserGroup),
+            "api_key" => Some(Self::ApiKey),
             "day" => Some(Self::Day),
             _ => None,
         }
@@ -74,7 +82,9 @@ impl GroupBy {
             Self::None => "none",
             Self::Model => "model",
             Self::Provider => "provider",
-            Self::SubTenant => "sub_tenant",
+            Self::User => "user",
+            Self::UserGroup => "user_group",
+            Self::ApiKey => "api_key",
             Self::Day => "day",
         }
     }

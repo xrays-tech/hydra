@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 use hydra_core::model::{
-    LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
-    TenantModel, TenantProvider,
+    GlobalRole, LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant,
+    SubTenantRoute, TenantAccessToken, TenantModel, TenantProvider, User, UserApiKey, UserGroup,
 };
 use sqlx::SqlitePool;
 
@@ -56,6 +56,35 @@ pub struct FidelityRows {
     pub sub_tenants: Vec<SubTenant>,
     /// FULL `sub_tenant_route` rows — including `enabled == false`.
     pub sub_tenant_routes: Vec<SubTenantRoute>,
+
+    // --- User hierarchy / tenant tokens / Global Roles (plan §3.5 / D-13) ----
+    //
+    // These are FULL row sets for the per-row Arachne entities, including disabled rows.
+    // They are deliberately NOT serialized into the `_fidelity` singleton: each row travels
+    // under its own entity path so a disabled user/key/token/rule remains known on a replica
+    // without turning the old fidelity value into another whole-config blob. They DO take part
+    // in `PartialEq`, because the generation predicate must notice a change in any of these
+    // rows even when the old `_fidelity` bytes would otherwise be unchanged.
+    #[serde(skip)]
+    /// FULL `user_group` rows — including `enabled == false`.
+    pub user_groups: Vec<UserGroup>,
+
+    #[serde(skip)]
+    /// FULL `user` rows — including disabled AND delinquent users (decision D-5).
+    pub users: Vec<User>,
+
+    #[serde(skip)]
+    /// FULL `user_api_key` rows — including disabled/expired keys. The hash is sealed in the
+    // per-row entity, never carried in `_fidelity`.
+    pub user_api_keys: Vec<UserApiKey>,
+
+    #[serde(skip)]
+    /// FULL `tenant_access_token` rows — including disabled/expired tokens.
+    pub tenant_access_tokens: Vec<TenantAccessToken>,
+
+    #[serde(skip)]
+    /// FULL `global_role` rows — including disabled rules and their provider sets.
+    pub global_roles: Vec<GlobalRole>,
 }
 
 /// Everything a replica must reproduce, plus the version it was produced at.
@@ -183,6 +212,14 @@ impl ReplicationContent {
         let tenant_models = crate::db::list_tenant_models_on(&mut *tx).await?;
         let sub_tenants = crate::db::list_sub_tenants_on(&mut *tx).await?;
         let sub_tenant_routes = crate::db::list_sub_tenant_routes_on(&mut *tx).await?;
+        // User-hierarchy rows (plan §3.5 / D-13): the FULL table views the per-row tree entities
+        // need. Keep them in the SAME read snapshot as the legacy row sets; otherwise a user could
+        // be restored whose key, group or role came from different revisions.
+        let user_groups = crate::db::list_user_groups_on(&mut *tx).await?;
+        let users = crate::db::list_users_on(&mut *tx).await?;
+        let user_api_keys = crate::db::list_user_api_keys_on(&mut *tx).await?;
+        let tenant_access_tokens = crate::db::list_tenant_access_tokens_on(&mut *tx).await?;
+        let global_roles = crate::db::list_global_roles_on_conn(&mut tx).await?;
         // Release the read snapshot before doing anything else with the pool.
         tx.commit().await?;
 
@@ -199,6 +236,11 @@ impl ReplicationContent {
                 tenant_models,
                 sub_tenants,
                 sub_tenant_routes,
+                user_groups,
+                users,
+                user_api_keys,
+                tenant_access_tokens,
+                global_roles,
             },
         })
     }

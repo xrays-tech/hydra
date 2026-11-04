@@ -17,7 +17,7 @@ Cases (a mock ClickHouse stands in for the database, so no real instance is touc
   U3    the SQL and its bindings: `WHERE tenant_id = {t:String}` with `param_t`/`param_s`/
         `param_e` — the tenant id is bound, never interpolated into the query text
   U4    `group_by=model` is a SECOND query (`GROUP BY key ORDER BY key`), not a UNION ALL
-  U5    `group_by=sub_tenant` coalesces the NULL sub-tenant key (one unattributed row would
+  U5    `group_by=user|user_group|api_key` coalesce the NULL attribution key (one unattributed row would
         otherwise fail the whole window) and `group_by=day` slices `created_at`
   U6    the JSON-NUMBER shape is accepted too, so a format change cannot zero usage
   U7    an EMPTY window: ClickHouse answers `{"last_seen":""}` (not null) -> `as_of: null`
@@ -115,16 +115,18 @@ def group_body(sql):
         return '{"key":"%s","requests":"%s","tokens_in":"%s","tokens_out":"%s",' \
                '"cache_hit_tokens":"%s","errors":"%s"}' % (key, req, ti, to, ch, err)
 
-    if "coalesce(sub_tenant_id" in sql:
-        # The documented empty-string group: usage that matched no sub-tenant prefix.
-        return row("", "1", "10", "4", "0", "0") + "\n" + row("sub-1", "2", "90", "36", "8", "1") + "\n"
-    if "sub_tenant_id AS key" in sql:
-        # What a BARE `sub_tenant_id` really answers (measured on ClickHouse 24.3): SQL NULL
-        # becomes JSON `null`, and the decoder requires a string `key` — so the whole window
-        # fails as a decode error. This mock branch exists so that dropping the `coalesce`
-        # fails the leg for the PRODUCT's reason, not for the harness's.
-        return '{"key":null,"requests":"1","tokens_in":"10","tokens_out":"4",' \
-               '"cache_hit_tokens":"0","errors":"0"}\n'
+    for col, val in (("user_id", "u-1"), ("user_group_id", "g-1"), ("api_key_id", "k-1")):
+        if f"coalesce({col}" in sql:
+            # The documented empty-string group: usage whose principal had no value on
+            # this dimension (or no principal at all).
+            return row("", "1", "10", "4", "0", "0") + "\n" + row(val, "2", "90", "36", "8", "1") + "\n"
+        if f"{col} AS key" in sql:
+            # What a BARE attribution column really answers (measured on ClickHouse 24.3): SQL NULL
+            # becomes JSON `null`, and the decoder requires a string `key` — so the whole window
+            # fails as a decode error. This mock branch exists so that dropping the `coalesce`
+            # fails the leg for the PRODUCT's reason, not for the harness's.
+            return '{"key":null,"requests":"1","tokens_in":"10","tokens_out":"4",' \
+                   '"cache_hit_tokens":"0","errors":"0"}\n'
     if "substr(created_at" in sql:
         return row("2026-09-29", "3", "100", "40", "10", "1") + "\n"
     return row("echo", "2", "90", "36", "8", "0") + "\n" + row("other", "1", "10", "4", "2", "1") + "\n"
@@ -426,19 +428,26 @@ def main():
               isinstance(body, dict) and body.get("totals", {}).get("requests") == 3,
               f"totals={body.get('totals') if isinstance(body, dict) else body}")
 
-        # ---- U5: the two special groupings ------------------------------------
-        mark = len(received.snapshot())
-        st, _, body = usage("&group_by=sub_tenant")
-        sub_sql = urllib.parse.parse_qs(
-            urllib.parse.urlparse(received.snapshot()[mark:][-1][1]).query).get("query", [""])[0]
-        sub_keys = [r["key"] for r in body.get("rows", [])] if isinstance(body, dict) else []
-        check("U5: `group_by=sub_tenant` coalesces the NULL sub-tenant key (one unattributed "
-              "row must not fail the whole window)",
-              "coalesce(sub_tenant_id, '')" in sub_sql,
-              f"{sub_sql[:130]}")
-        check("U5: ...and unmatched usage arrives as the documented empty-string group",
-              st == 200 and "" in sub_keys and "sub-1" in sub_keys,
-              f"HTTP {st} keys={sub_keys}")
+        # ---- U5: the attribution groupings + the day slice -------------------
+        for group, column, value in (
+            ("user", "user_id", "u-1"),
+            ("user_group", "user_group_id", "g-1"),
+            ("api_key", "api_key_id", "k-1"),
+        ):
+            mark = len(received.snapshot())
+            st, _, body = usage(f"&group_by={group}")
+            reqs = received.snapshot()[mark:]
+            g_sql = urllib.parse.parse_qs(
+                urllib.parse.urlparse(reqs[-1][1]).query).get("query", [""])[0]
+            keys = [r["key"] for r in body.get("rows", [])] if isinstance(body, dict) else []
+            check(f"U5: `group_by={group}` coalesces the NULL {column} key (one unattributed "
+                  "row must not fail the whole window)",
+                  f"coalesce({column}, '')" in g_sql,
+                  f"{g_sql[:130]}")
+            check(f"U5: ...and unattributed {group} usage arrives as the documented empty-string "
+                  "group, alongside the real key",
+                  st == 200 and "" in keys and value in keys,
+                  f"HTTP {st} keys={keys}")
         mark = len(received.snapshot())
         st, _, body = usage("&group_by=day")
         day_sql = urllib.parse.parse_qs(

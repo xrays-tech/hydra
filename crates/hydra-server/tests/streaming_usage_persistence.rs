@@ -151,6 +151,9 @@ async fn seed_routed(
     )
     .await
     .expect("insert limit_role");
+    // T3 internal auth: the data-plane gate decides from the identity index
+    // derived from user_group/user/user_api_key rows; `auth_url` is data only.
+    common::seed_api_identity(pool, "t1", "test-client-key").await;
 }
 
 /// See `common::ephemeral_port`: no bind-then-release race (the previous

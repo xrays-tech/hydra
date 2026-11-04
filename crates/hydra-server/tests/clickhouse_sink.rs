@@ -23,7 +23,9 @@ fn sample() -> UsageRecord {
         provider_id: "provider-1".to_string(),
         model_key: "gpt-test".to_string(),
         client_api_key_masked: None,
-        sub_tenant_id: None,
+        user_id: Some("user-1".into()),
+        user_group_id: Some("group-1".into()),
+        api_key_id: Some("key-1".into()),
         status_code: 200,
         tokens_in: Some(12),
         tokens_out: Some(34),
@@ -39,14 +41,17 @@ fn sample() -> UsageRecord {
 }
 
 // The `usage_record` columns, in declaration order
-// (environment/clickhouse/init.sql — provider-neutral token columns plus the
-// row-level idempotency key `dedup_key`).
+// (environment/clickhouse/init.sql — provider-neutral token columns, the
+// user-hierarchy attribution dimensions, plus the row-level idempotency
+// key `dedup_key`).
 const USAGE_COLUMNS: &[&str] = &[
     "tenant_id",
     "provider_id",
     "model_key",
     "client_api_key",
-    "sub_tenant_id",
+    "user_id",
+    "user_group_id",
+    "api_key_id",
     "status_code",
     "tokens_in",
     "tokens_out",
@@ -130,6 +135,12 @@ fn clickhouse_json_row_new_metrics_null_when_absent() {
     r.cache_hit_tokens = None;
     r.forward_latency_ms = None;
     r.ttft_ms = None;
+    // Attribution must stay NULL (not `""`) when there is no principal: `""` is
+    // the read side's bucket for "attributed, empty key", and conflating the two
+    // would fold unauthenticated usage into a fake user.
+    r.user_id = None;
+    r.user_group_id = None;
+    r.api_key_id = None;
     let json = build_clickhouse_json_row(&r);
     assert!(
         json.contains("\"cache_hit_tokens\":null"),
@@ -142,6 +153,18 @@ fn clickhouse_json_row_new_metrics_null_when_absent() {
     assert!(
         json.contains("\"ttft_ms\":null"),
         "ttft_ms None must be null: {json}"
+    );
+    assert!(
+        json.contains("\"user_id\":null"),
+        "user_id None must be null: {json}"
+    );
+    assert!(
+        json.contains("\"user_group_id\":null"),
+        "user_group_id None must be null: {json}"
+    );
+    assert!(
+        json.contains("\"api_key_id\":null"),
+        "api_key_id None must be null: {json}"
     );
 }
 

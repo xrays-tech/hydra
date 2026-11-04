@@ -1316,6 +1316,7 @@ impl TlsAccept for HydraCertStore {
 | | DELETE | `/api/v1/tenant-models/:id` |
 | LimitRole | GET/POST | `/api/v1/limit-roles` |
 | | GET/PUT/DELETE | `/api/v1/limit-roles/:id` |
+| 用户层级（**读 only**） | GET | `/api/v1/user-groups` · `/api/v1/users` · `/api/v1/user-api-keys`（`?tenant_id=` 过滤；keys 里 **always** 掩 —— 没有 `key_hash`，见 `admin::handlers::UserApiKeyView`） |
 | 认证缓存 | **DELETE** | **`/api/v1/auth/cache`**（强制失效，详见下方） |
 | 熔断器 | GET / DELETE | `/api/v1/breaker`（查看 dead-set）/ `/api/v1/breaker/:provider_id`（手动复位） |
 | 系统 | GET | `/api/v1/health` |

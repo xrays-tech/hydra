@@ -551,6 +551,42 @@ impl AdminService {
         if method == "GET" && parts.len() == 3 && parts[0] == "tenants" && parts[2] == "models" {
             return handlers::tenant_model_catalog(&self.state, parts[1], trace_id).await;
         }
+        // Tenant access tokens (plan §3.2 / T1 + T4a): MULTIPLE named tokens per
+        // tenant, managed UNDER the tenant's OWN path —
+        //   GET    /api/v1/tenants/{tenant_id}/access-tokens   (list; display atoms
+        //         only, NEVER the hash or the plaintext)
+        //   POST   /api/v1/tenants/{tenant_id}/access-tokens   (mint; plaintext ONCE)
+        //   DELETE /api/v1/tenants/{tenant_id}/access-tokens/{token_id}
+        // Registered BEFORE the `parts.len() > 2` rejection below, exactly like the
+        // model-catalog path above (these paths are 3 and 4 segments). The handlers
+        // decide the METHOD (list/create on the collection, delete on the item), so
+        // an unsupported method answers 405 rather than 404; a 5th segment matches
+        // NOTHING here and falls through to the unknown-path 404.
+        if parts.len() >= 3
+            && parts.len() <= 4
+            && parts[0] == "tenants"
+            && parts[2] == "access-tokens"
+        {
+            let tenant_id = parts[1].to_string();
+            if parts.len() == 3 {
+                return handlers::tenant_access_token_collection(
+                    &self.state,
+                    session,
+                    method,
+                    &tenant_id,
+                    trace_id,
+                )
+                .await;
+            }
+            return handlers::tenant_access_token_item(
+                &self.state,
+                method,
+                &tenant_id,
+                parts[3],
+                trace_id,
+            )
+            .await;
+        }
 
         // REST CRUD resources.
         let resource = parts.first().copied().unwrap_or("");
@@ -620,6 +656,30 @@ impl AdminService {
             }
             ("sub-tenant-routes", Some(id)) => {
                 handlers::sub_tenant_route_item(state, session, method, id, trace_id).await
+            }
+            // Global Roles (plan §3.4): GET answers every rule incl. the DISABLED
+            // ones, PUT create-or-replaces the rule AND its provider set in ONE
+            // transaction, DELETE removes it (`ON DELETE CASCADE` drops the provider
+            // child rows). See `handlers::global_role_collection` for the write order.
+            ("global-roles", None) => {
+                handlers::global_role_collection(state, session, method, trace_id).await
+            }
+            ("global-roles", Some(id)) => {
+                handlers::global_role_item(state, session, method, id, trace_id).await
+            }
+            // The user hierarchy, READ (plan §3.5). The cascading global-role UI
+            // needs to render `role → users → keys`, and without these three paths
+            // it cannot tell a cascade that fired from one it merely expected.
+            // READ-ONLY: the WRITE half of this surface is the tenant self-service
+            // API, which carries the tenant's own scoping rules. `?tenant_id=`
+            // filters node-wide rows down to one tenant; `user-api-keys` is ALWAYS
+            // masked (no `key_hash`) — see `handlers::UserApiKeyView`.
+            ("user-groups", None) => {
+                handlers::user_group_collection(state, method, query, trace_id).await
+            }
+            ("users", None) => handlers::user_collection(state, method, query, trace_id).await,
+            ("user-api-keys", None) => {
+                handlers::user_api_key_collection(state, method, query, trace_id).await
             }
             _ => handlers::err_json(404, "not_found", "unknown path", trace_id),
         }

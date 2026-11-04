@@ -661,6 +661,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         max_request_body_hard: hydra_server::proxy::config::parse_max_request_body_hard(
             std::env::var("HYDRA_MAX_REQUEST_BODY_HARD").ok().as_deref(),
         ),
+        // Session affinity (T7b): read here or it is a ghost env. Total parse
+        // with an ON default — a malformed value must not stop the gateway.
+        session_affinity: hydra_server::proxy::config::parse_session_affinity(
+            std::env::var("HYDRA_SESSION_AFFINITY").ok().as_deref(),
+        ),
         ..ProxyConfig::default()
     };
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]

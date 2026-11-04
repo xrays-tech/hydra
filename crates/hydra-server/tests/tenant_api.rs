@@ -45,9 +45,16 @@ impl UsageSink for NoopSink {
 const TENANT_TOKEN: &str = "sk-tenant-token-0123456789abcdef";
 const OTHER_TOKEN: &str = "sk-other-tenant-token-0123456789";
 
-/// The tenant row must carry the token's HASH — the snapshot is what the gate
-/// reads, and a plaintext token in the row would be a different bug.
-async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Option<&str>) {
+/// The token lives in the `tenant_access_token` TABLE — the snapshot the gate
+/// reads is built from it (`ConfigData.tenant_tokens`, enabled rows only). A
+/// hash in the legacy `tenant.access_token_hash` column is no longer what
+/// authenticates.
+async fn seed_tenant(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    domain: &str,
+    token: Option<&str>,
+) -> Option<String> {
     hydra_server::db::insert_tenant(
         pool,
         &Tenant {
@@ -65,13 +72,9 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
     .await
     .expect("insert tenant");
     if let Some(tok) = token {
-        hydra_server::db::set_tenant_access_token_hash(
-            pool,
-            id,
-            Some(&sha256_hex_string(tok.as_bytes())),
-        )
-        .await
-        .expect("set token hash");
+        Some(common::seed_tenant_access_token(pool, id, "test", tok, true, None).await)
+    } else {
+        None
     }
 }
 
@@ -391,21 +394,22 @@ async fn the_tenant_token_is_never_treated_as_a_client_key() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gate_reads_the_snapshot_not_the_database() {
     let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let old_token_id = seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN))
+        .await
+        .expect("seeded token row id");
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state.clone());
     let c = client();
     let url = format!("{root}/tenant/t1/api/v1/whoami");
 
-    // Rotate in the DB only. No reload_all.
+    // Rotate in the DB only: retire the old row, insert the new one. No reload_all.
+    // (The multi-token model rotates by REPLACING rows in `tenant_access_token`;
+    // the legacy `tenant.access_token_hash` column is not what the gate reads.)
     let rotated = "sk-rotated-token-9999999999";
-    hydra_server::db::set_tenant_access_token_hash(
-        &pool,
-        "t1",
-        Some(&sha256_hex_string(rotated.as_bytes())),
-    )
-    .await
-    .expect("rotate");
+    hydra_server::db::delete_tenant_access_token(&pool, &old_token_id)
+        .await
+        .expect("retire the old token row");
+    common::seed_tenant_access_token(&pool, "t1", "rotated", rotated, true, None).await;
 
     let (old_status, _) =
         body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
@@ -812,6 +816,17 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
         updated_at: "2026-01-01T00:00:00Z".into(),
     };
     cfg.tenants_by_domain.insert(t.domain.clone(), t);
+    // The gate authenticates from `ConfigData.tenant_tokens` (hash → identity).
+    // `hydrate` fills it from the `tenant_access_tokens` fidelity rows; here we
+    // are the producer of the wire, so we state the same identity directly.
+    cfg.tenant_tokens.insert(
+        sha256_hex_string(TENANT_TOKEN.as_bytes()),
+        hydra_core::identity::TenantTokenIdentity {
+            tenant_id: "t1".into(),
+            token_name: "edge-token".into(),
+            expires_at: None,
+        },
+    );
     // `hydrate` does this in production; here we are the producer of the wire.
     cfg.reindex_tenants();
     store.apply_snapshot(HydratedWire {
@@ -830,6 +845,22 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
             tenant_models: vec![],
             sub_tenants: vec![],
             sub_tenant_routes: vec![],
+            user_groups: vec![],
+            users: vec![],
+            user_api_keys: vec![],
+            tenant_access_tokens: vec![hydra_core::model::TenantAccessToken {
+                id: "tok-edge".into(),
+                tenant_id: "t1".into(),
+                name: "edge-token".into(),
+                token_hash: sha256_hex_string(TENANT_TOKEN.as_bytes()),
+                token_prefix: "sk-tenant".into(),
+                token_last4: "cdef".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            }],
+            global_roles: vec![],
         },
     });
 
@@ -939,68 +970,36 @@ async fn invalidate_rejects_an_oversized_request() {
     assert_eq!(status2, 400, "got {v2}");
 }
 
-/// T11: a precise key clears that key HERE and forces the next request for it to
-/// re-query the tenant's auth service.
+/// T11: a precise key clears that key HERE and ONLY that key.
 ///
-/// The cache is keyed `(tenant_id, sha256(key))`, so this is the only way to
-/// verify the clear took effect: observe that the upstream is asked again.
+/// The cache is keyed `(tenant_id, sha256(key))`. Under the internal-auth model a
+/// data-plane client request no longer WRITES this cache (its verdict comes from
+/// `ConfigData.users_by_api_key_hash`), so the cached verdicts are seeded through
+/// the same seam `a_throttled_invalidate_does_not_clear_the_cache` uses. What is
+/// pinned is the CLEAR itself — E2 still performs it, and the second entry proves
+/// a named-key request does not sweep the tenant's whole L1.
+///
+/// The old leg that pointed the tenant at a mock `auth_url` and observed the
+/// upstream being asked again was EXTERNAL auth (T3 retires the check); it is
+/// removed rather than resurrected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalidate_clears_exactly_the_named_key() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let auth_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/verify"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(r#"{"allowed":true}"#, "application/json"),
-        )
-        .expect(2) // once for the first request, once after the clear
-        .mount(&auth_server)
-        .await;
-
     let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.local", Some(TENANT_TOKEN)).await;
-    // Point the tenant at the mock auth service.
-    let mut t = hydra_server::db::get_tenant(&pool, "t1")
-        .await
-        .expect("get");
-    t.auth_url = format!("{}/verify", auth_server.uri());
-    hydra_server::db::update_tenant(&pool, &t)
-        .await
-        .expect("update");
+    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state.clone());
 
-    // A client request with key K populates the cache.
-    let c = client();
-    let chat = format!("{root}/v1/chat/completions");
-    let probe = |key: &str| {
-        let c = c.clone();
-        let url = chat.clone();
-        let key = key.to_string();
-        async move {
-            for _ in 0..60 {
-                let r = c
-                    .post(&url)
-                    .bearer_auth(&key)
-                    .header("host", "acme.local")
-                    .json(&serde_json::json!({"model": "nope", "messages": []}))
-                    .send()
-                    .await;
-                if let Ok(r) = r {
-                    return r.status().as_u16();
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
-            panic!("never ready");
-        }
-    };
-    let _ = probe("sk-key-to-clear").await;
-    assert!(
-        !state.auth.cache().is_empty(),
-        "the first request must have cached a verdict"
-    );
+    // Two cached verdicts: the named one must go, the other must stay.
+    state
+        .auth
+        .cache()
+        .set("t1", "sk-key-to-clear", true, Duration::from_secs(300))
+        .await;
+    state
+        .auth
+        .cache()
+        .set("t1", "sk-key-to-keep", true, Duration::from_secs(300))
+        .await;
 
     let before = state.auth.cache().len();
     let (status, v) = post_invalidate(
@@ -1015,13 +1014,23 @@ async fn invalidate_clears_exactly_the_named_key() {
     assert_eq!(v["scope"], "keys", "got {v}");
     assert_eq!(
         v["invalidated"], 1,
-        "the named key was cached, so exactly one entry must go: {v}"
+        "the named key was cached, so exactly one entry must go: {v}",
     );
-    assert!(state.auth.cache().len() < before, "the cache must shrink");
-
-    // And the next request for that key goes upstream again (the mock's
-    // `.expect(2)` is asserted when it is dropped).
-    let _ = probe("sk-key-to-clear").await;
+    assert_eq!(
+        state.auth.cache().len(),
+        before - 1,
+        "the named key was removed and nothing else",
+    );
+    assert_eq!(
+        state.auth.cache().check("t1", "sk-key-to-clear").await,
+        hydra_core::auth::Verdict::Miss,
+        "the cleared key must re-judge, not replay",
+    );
+    assert_eq!(
+        state.auth.cache().check("t1", "sk-key-to-keep").await,
+        hydra_core::auth::Verdict::Hit(true),
+        "a named-key request must not sweep the tenant's whole L1",
+    );
 }
 
 /// The per-tenant invalidate throttle is checked BEFORE the local cache clear,
@@ -2054,6 +2063,17 @@ async fn the_read_only_endpoints_work_from_a_materialized_snapshot_alone() {
         updated_at: "2026-01-01T00:00:00Z".into(),
     };
     cfg.sub_tenant_routes.push(route.clone());
+    // The gate authenticates from `ConfigData.tenant_tokens` (hash → identity);
+    // `hydrate` fills it from the `tenant_access_tokens` fidelity rows, and here
+    // we are the producer of the wire, so we state the same identity directly.
+    cfg.tenant_tokens.insert(
+        sha256_hex_string(TENANT_TOKEN.as_bytes()),
+        hydra_core::identity::TenantTokenIdentity {
+            tenant_id: "t1".into(),
+            token_name: "edge-token".into(),
+            expires_at: None,
+        },
+    );
     // `hydrate` does this in production; here we are the producer of the wire.
     cfg.reindex_tenants();
     store.apply_snapshot(HydratedWire {
@@ -2072,6 +2092,22 @@ async fn the_read_only_endpoints_work_from_a_materialized_snapshot_alone() {
             tenant_models: vec![],
             sub_tenants: vec![st],
             sub_tenant_routes: vec![route],
+            user_groups: vec![],
+            users: vec![],
+            user_api_keys: vec![],
+            tenant_access_tokens: vec![hydra_core::model::TenantAccessToken {
+                id: "tok-edge".into(),
+                tenant_id: "t1".into(),
+                name: "edge-token".into(),
+                token_hash: sha256_hex_string(TENANT_TOKEN.as_bytes()),
+                token_prefix: "sk-tenant".into(),
+                token_last4: "cdef".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            }],
+            global_roles: vec![],
         },
     });
 

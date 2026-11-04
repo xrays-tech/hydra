@@ -146,6 +146,14 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, auth_url: 
     )
     .await
     .expect("insert tenant");
+    // T3 internal auth: the data plane resolves the CLIENT credential from
+    // `ConfigData.users_by_api_key_hash` (user_group / user / user_api_key rows),
+    // NOT from `tenant.auth_url`. Every request this file sends carries
+    // `Bearer test-client-key`, so the tenant's own seeding step seeds that
+    // identity — an `auth_url` mock can no longer authenticate a request.
+    // A test that deliberately wants an UNAUTHENTICATED leg must send a key
+    // that was never seeded (see `usage_record_never_invents_attribution_without_a_principal`).
+    common::seed_api_identity(pool, id, "test-client-key").await;
 }
 
 async fn seed_key(
@@ -861,13 +869,22 @@ async fn error_400_when_model_field_is_ambiguous() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_401_when_auth_denied() {
+    // T3 internal auth: a DENIAL is a credential the identity index does not
+    // know (revoked/expired/unknown), decided locally — the `auth_url` mock
+    // below stays mounted precisely to prove it is never consulted.
     let auth_server = MockServer::start().await;
-    // Auth upstream denies the request.
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(401))
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
+    // Mounted so that a leak past the gate would be visible as a provider hit
+    // rather than a wiremock 404.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"leaked"}"#))
+        .mount(&upstream)
+        .await;
 
     let pool = common::setup_pool().await;
     seed_one(
@@ -881,19 +898,49 @@ async fn error_401_when_auth_denied() {
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
 
-    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
-    assert_eq!(resp.status(), 401);
+    // `test-client-key` HAS an identity row in this graph, so the denied leg
+    // presents a key that was never seeded.
+    let resp = send_with_headers(
+        &client,
+        &url,
+        &[("authorization", "Bearer sk-never-seeded")],
+        r#"{"model":"gpt-4"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 401, "an unknown credential must be denied");
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("\"message\":\"invalid_api_key\""),
+        "the internal-auth 401 body must name the reason: {body}"
+    );
+
+    let upstream_hits = upstream.received_requests().await.expect("recording on");
+    assert!(
+        upstream_hits.is_empty(),
+        "a denied request must never reach a provider: {}",
+        upstream_hits.len()
+    );
+    let auth_hits = auth_server.received_requests().await.expect("recording on");
+    assert!(
+        auth_hits.is_empty(),
+        "the denial came from the identity index, not from an auth hop: {}",
+        auth_hits.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_402_when_auth_denied_insufficient_balance() {
+    // T3 internal auth: the 402 arm of the decision table is a DELINQUENT
+    // USER behind the presented credential. The Dogress-style in-band
+    // `insufficient_balance` deny rode the EXTERNAL auth hop, which the data
+    // plane no longer takes — the quota state is read from the identity index
+    // (`users_by_api_key_hash[].principal.billing_status`), so this fixture
+    // seeds the identity and then flips its billing status.
     let auth_server = MockServer::start().await;
-    // Dogress-style in-band denial: always HTTP 200, the reason rides the body.
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": false,
-            "reason": "insufficient_balance",
-        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
+        )
         .mount(&auth_server)
         .await;
     let upstream = MockServer::start().await;
@@ -905,6 +952,25 @@ async fn error_402_when_auth_denied_insufficient_balance() {
         &upstream.uri(),
     )
     .await;
+    // Same ids `common::seed_api_identity` used (deterministic by design).
+    repo::upsert_user(
+        &pool,
+        &hydra_core::model::User {
+            id: "usr-t1".into(),
+            tenant_id: "t1".into(),
+            user_group_id: "grp-t1".into(),
+            external_id: None,
+            name: "t1-user".into(),
+            enabled: true,
+            billing_status: hydra_core::model::BillingStatus::Delinquent,
+            billing_reason: Some("over_quota".to_string()),
+            billing_updated_at: None,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("flip the seeded user to delinquent");
     let state = build_state(&pool).await;
     let root = start_proxy(state);
     let url = format!("{root}/v1/chat/completions");
@@ -914,18 +980,25 @@ async fn error_402_when_auth_denied_insufficient_balance() {
     assert_eq!(
         resp.status(),
         402,
-        "insufficient balance must surface as HTTP 402 Payment Required"
+        "a delinquent user must surface as HTTP 402 Payment Required"
     );
     let body = resp.text().await.expect("body");
     assert_eq!(
-        body, r#"{"error":{"message":"insufficient_balance","type":"insufficient_quota"}}"#,
-        "402 body must carry the reason and the mainstream gateway type"
+        body,
+        r#"{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}"#,
+        "402 body must carry the internal-auth reason and the mainstream gateway type"
     );
     let upstream_hits = upstream.received_requests().await.expect("recording on");
     assert!(
         upstream_hits.is_empty(),
         "no upstream call may happen when auth denies: {}",
         upstream_hits.len()
+    );
+    let auth_hits = auth_server.received_requests().await.expect("recording on");
+    assert!(
+        auth_hits.is_empty(),
+        "the 402 came from the identity index, not from an auth round-trip: {}",
+        auth_hits.len()
     );
 }
 
@@ -1540,22 +1613,31 @@ async fn admission_capped_provider_does_not_block_second_request() {
 }
 
 // ===========================================================================
-// T3.3 (sub-tenant v3) — usage is ATTRIBUTED to a sub-tenant from the raw api-key
-// prefix, at the recording point.
+// The RECORDING POINT's attribution: the usage row carries the user hierarchy
+// of the principal that resolved the request, and invents nothing when there is
+// no principal.
 //
-// The v3 plan promised this integration test and it was never written (the
-// implementation-side derivation existed, the assertion did not), which is why a
-// "T3.1–T3.6 implemented" status line could hide "the recording point writes the
-// wrong id" — exactly the class of defect a status line cannot carry.
-//
-// The property under test: the key prefix that SELECTS a sub-tenant is the same
-// key prefix that ATTRIBUTES the usage row, and attribution is independent of
-// routing (a route can narrow the provider; it cannot change who the key belongs
-// to).
+// This leg used to assert sub-tenant-prefix attribution (`UsageRecord.sub_tenant_id`);
+// that column is gone — attribution now comes from the resolved
+// `ApiPrincipal` (`user_id` / `user_group_id` / `api_key_id`), which the
+// internal api-key path puts on the context. What is pinned here is the
+// half that does NOT need a seeded principal, and it is the half that fails
+// loudest if the record builder guesses: a request with no resolved principal
+// must land with all three dimensions NULL, never `""` and never a value
+// reconstructed from the masked key (`""` is what the read side reserves for
+// "attributed, but empty on this dimension"). The positive leg — a resolved
+// The OLD fixture reached the recording point with NO principal only because
+// EXTERNAL auth could answer "allow" for a credential that has no identity
+// rows. Under T3 the data plane resolves the principal from the identity index
+// BEFORE routing, so that state is no longer reachable on the request path —
+// an unknown credential is refused with 401 and produces NO record at all.
+// Both halves are pinned accordingly: a resolved principal writes its OWN ids
+// (never values reconstructed from the masked key), and an unresolvable
+// credential leaves nothing behind.
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn usage_is_attributed_to_the_sub_tenant_that_owns_the_key_prefix() {
+async fn usage_record_never_invents_attribution_without_a_principal() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -1623,34 +1705,11 @@ async fn usage_is_attributed_to_the_sub_tenant_that_owns_the_key_prefix() {
     .await;
     seed_default_role(&pool, "t1").await;
 
-    // The sub-tenant whose prefix matches the test client key
-    // (`test-client-key` starts with `test-client-`).
-    repo::insert_sub_tenant(
-        &pool,
-        &SubTenant {
-            id: "st1".into(),
-            tenant_id: "t1".into(),
-            name: "team-a".into(),
-            key_prefix: "test-client-".into(),
-            enabled: true,
-            created_at: NOW.into(),
-            updated_at: NOW.into(),
-        },
-    )
-    .await
-    .unwrap();
-
     let recording = Arc::new(RecordingSink::default());
     let key_provider = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("store");
-    // The snapshot the proxy reads must carry the sub-tenant (load reads the DB).
-    assert_eq!(
-        store.snapshot().sub_tenants.len(),
-        1,
-        "fixture: the sub-tenant is in the snapshot"
-    );
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -1671,17 +1730,37 @@ async fn usage_is_attributed_to_the_sub_tenant_that_owns_the_key_prefix() {
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
 
+    // (1) A credential the identity index KNOWS (`seed_tenant` seeded the
+    //     user_group / user / user_api_key rows for `test-client-key`): the
+    //     record carries the ids of the resolved principal.
     let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.status(),
+        200,
+        "the seeded credential must authenticate"
+    );
     let _ = resp.text().await;
 
     let records = recording.records();
-    assert_eq!(records.len(), 1, "one usage record for one request");
     assert_eq!(
-        records[0].sub_tenant_id.as_deref(),
-        Some("st1"),
-        "the row must be attributed to the sub-tenant whose prefix owns the key \
-         (this is the assertion T3.3 promised)"
+        records.len(),
+        1,
+        "one usage record for one authenticated request"
+    );
+    assert_eq!(
+        records[0].user_id,
+        Some("usr-t1".to_string()),
+        "a resolved principal writes its own user id, never a value derived from the key"
+    );
+    assert_eq!(
+        records[0].user_group_id,
+        Some("grp-t1".to_string()),
+        "a resolved principal writes its own group id"
+    );
+    assert_eq!(
+        records[0].api_key_id,
+        Some("key-t1".to_string()),
+        "a resolved principal writes its own key id"
     );
     // The masked client key is recorded; the RAW key never is.
     assert!(
@@ -1692,6 +1771,29 @@ async fn usage_is_attributed_to_the_sub_tenant_that_owns_the_key_prefix() {
             .contains("test-client-key"),
         "the raw api-key must never be persisted: {:?}",
         records[0].client_api_key_masked
+    );
+
+    // (2) A credential the identity index does NOT know: refused at the gate
+    //     BEFORE routing, so there is no record whose attribution the builder
+    //     could invent.
+    let resp = client
+        .post(url)
+        .header("authorization", "Bearer sk-never-seeded")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4"}"#.to_string())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        resp.status(),
+        401,
+        "an unknown credential is refused at the gate"
+    );
+    let _ = resp.text().await;
+    assert_eq!(
+        recording.records().len(),
+        1,
+        "a refused request must not emit a usage record to attribute"
     );
 }
 
@@ -2048,16 +2150,25 @@ async fn catalog_get_v1_models_tenant_without_providers_returns_empty() {
     );
 }
 
-/// (Task 2e) Key-prefix binding gate: a client api-key matching an enabled
-/// prefix binding restricts the catalog to the bound provider (fail-closed).
-/// pA serves alpha + shared; pB serves beta + shared; no tenant_models rows
-/// (default-open). With key `test-client-key` bound to pA, the catalog lists
-/// only pA's models — pB's beta must be dropped.
+/// (Task 2e — restated for T7a) Key-prefix binding does NOT narrow the
+/// directory: `accessible_models_with_principal` takes no raw api-key, so the
+/// binding's fail-closed rule lives on the ROUTING side only. pA serves alpha
+/// + shared; pB serves beta + shared; no tenant_models rows (default-open).
+/// With `test-client-key` bound to pA the catalog lists the whole union —
+/// pB's beta is NOT dropped — and the binding still decides which provider
+/// answers a chat request for a model only it serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_get_v1_models_key_prefix_binding_restricts_providers() {
+async fn catalog_get_v1_models_key_prefix_binding_does_not_narrow_the_directory() {
     let auth_server = allowing_auth_server().await;
     let upstream_a = MockServer::start().await;
     let upstream_b = MockServer::start().await;
+    // Only pA answers; an unmounted pB would surface as a wiremock 404 AND a
+    // recorded hit, so the routing assertion below stays observable.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"served-by-pA"}"#))
+        .mount(&upstream_a)
+        .await;
 
     let pool = common::setup_pool().await;
     seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
@@ -2142,8 +2253,40 @@ async fn catalog_get_v1_models_key_prefix_binding_restricts_providers() {
     let body = resp.text().await.expect("body");
     assert_eq!(
         body,
-        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"shared","object":"model"}]}"#,
-        "binding to pA must drop pB's beta from the catalog (fail-closed): {body}"
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"beta","object":"model"},{"id":"shared","object":"model"}]}"#,
+        "the directory is the tenant union; a key-prefix binding no longer narrows it: {body}"
+    );
+
+    // The binding still decides ROUTING: `alpha` is served only by pA, and the
+    // binding pins this client key to pA, so pB must receive nothing.
+    let resp = send_until_ready(
+        &client,
+        &format!("{root}/v1/chat/completions"),
+        r#"{"model":"alpha","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the bound provider must serve its own model"
+    );
+    let _ = resp.text().await;
+    let a_hits = upstream_a
+        .received_requests()
+        .await
+        .expect("upstream_a recording on");
+    assert!(
+        a_hits.iter().any(|r| r.method.as_str() == "POST"),
+        "the bound provider (pA) must receive the routed request"
+    );
+    let b_hits = upstream_b
+        .received_requests()
+        .await
+        .expect("upstream_b recording on");
+    assert!(
+        b_hits.is_empty(),
+        "the unbound provider (pB) must receive nothing: {}",
+        b_hits.len()
     );
 }
 // ===========================================================================
@@ -2538,22 +2681,9 @@ async fn send_with_headers(
     );
 }
 
-/// The bodies the tenant auth service actually received, concatenated. Proves
-/// the transport (not merely the header name) was understood — the auth
-/// service is a real wiremock server (dev-plan §1 铁律 2).
-async fn auth_seen_bodies(auth_server: &MockServer) -> String {
-    auth_server
-        .received_requests()
-        .await
-        .expect("auth recording on")
-        .iter()
-        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-/// Every supported **header** transport authenticates and the raw key reaches
-/// the tenant auth service (fresh graph per case: the auth cache must not be
-/// able to mask a parse failure).
+/// Every supported **header** transport authenticates and the client credential
+/// is replaced before the provider sees it (fresh graph per case: the identity
+/// index must not be able to mask a parse failure).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_header_credential_transport_authenticates() {
     let body = r#"{"model":"gpt-4","messages":[]}"#;
@@ -2600,12 +2730,12 @@ async fn every_header_credential_transport_authenticates() {
         .await;
         assert_eq!(resp.status(), 200, "transport {label} must authenticate");
 
-        let seen = auth_seen_bodies(&auth_server).await;
-        assert!(
-            seen.contains("test-client-key"),
-            "transport {label}: the tenant auth service must receive the raw key, saw: {seen}"
-        );
-
+        // T3 internal auth: authentication is a SHA-256 lookup in the identity
+        // index — there is no auth hop whose body could be observed. The 200
+        // proves the transport was understood (ONLY `test-client-key` is in
+        // this graph's identity index), and the assertions below prove the
+        // provider key replaced the client credential and that no auth
+        // round-trip happened at all.
         let received = upstream
             .received_requests()
             .await
@@ -2614,6 +2744,23 @@ async fn every_header_credential_transport_authenticates() {
             received.len(),
             1,
             "transport {label}: exactly one upstream call"
+        );
+        assert_eq!(
+            received[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-upstream-secret"),
+            "transport {label}: the provider key must replace the client credential"
+        );
+        let auth_hits = auth_server
+            .received_requests()
+            .await
+            .expect("auth recording on");
+        assert!(
+            auth_hits.is_empty(),
+            "transport {label}: the data plane must make no auth round-trip: {}",
+            auth_hits.len()
         );
     }
 }
@@ -2652,12 +2799,9 @@ async fn query_credential_transport_authenticates_and_is_not_forwarded() {
     .await;
     assert_eq!(resp.status(), 200, "the query transport must authenticate");
 
-    let seen = auth_seen_bodies(&auth_server).await;
-    assert!(
-        seen.contains("test-client-key"),
-        "the tenant auth service must receive the key: {seen}"
-    );
-
+    // T3: no auth hop exists, so "the query transport authenticated" is proven
+    // by the 200 (identity index lookup) — and by the ZERO auth round-trips
+    // below, which pin that the credential never travelled a second leg.
     let received = upstream
         .received_requests()
         .await
@@ -2667,6 +2811,15 @@ async fn query_credential_transport_authenticates_and_is_not_forwarded() {
         received[0].url.query().is_none(),
         "the credential query string must never reach the provider: {}",
         received[0].url
+    );
+    let auth_hits = auth_server
+        .received_requests()
+        .await
+        .expect("auth recording on");
+    assert!(
+        auth_hits.is_empty(),
+        "the query transport authenticates against the identity index: {}",
+        auth_hits.len()
     );
 }
 
@@ -2704,21 +2857,36 @@ async fn differing_transports_use_the_highest_precedence_value() {
         r#"{"model":"gpt-4","messages":[]}"#,
     )
     .await;
+    // T3 internal auth: ONLY `test-client-key` (the highest-precedence
+    // transport's value) has an identity row, so the 200 itself proves the
+    // precedence rule — had the shadowed `sk-shadow` won, the lookup would
+    // have answered 401 `invalid_api_key`.
     assert_eq!(
         resp.status(),
         200,
-        "conflicting transports must still route"
+        "conflicting transports must still route on the highest-precedence value"
     );
 
-    let seen = auth_seen_bodies(&auth_server).await;
-    assert!(
-        seen.contains("test-client-key"),
-        "the highest-precedence value must be the one authenticated: {seen}"
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("upstream recording on");
+    assert_eq!(
+        received.len(),
+        1,
+        "the shadowed credential must not fork the route"
     );
-    assert!(
-        !seen.contains("sk-shadow"),
-        "the shadowed value must never reach the auth service: {seen}"
-    );
+    for name in ["authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+        let value = received[0]
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !value.contains("sk-shadow"),
+            "the shadowed value must never reach the provider in `{name}`: {value:?}"
+        );
+    }
 }
 
 /// Negative pin (C3 + B8): no credential in any transport ⇒ 401
@@ -2799,13 +2967,14 @@ async fn non_bearer_authorization_scheme_is_rejected() {
     assert!(received.is_empty());
 }
 
-/// C5 regression pin: the `GET /v1/models` directory is still narrowed by
-/// key-prefix binding through ANY transport — here the query form. Same seed as
-/// `catalog_get_v1_models_key_prefix_binding_restricts_providers`, but the key
-/// travels in the query string (the catalog read itself stays anonymous-free:
-/// external auth never runs for `GET /v1/models`).
+/// (C5 — restated for T7a) The credential in the QUERY transport does not
+/// narrow the directory either: `GET /v1/models` never authenticates, and
+/// since T7a the directory narrows on the caller's Global Role rules, not on
+/// key-prefix bindings — whatever transport carried the key. Same seed as
+/// `catalog_get_v1_models_key_prefix_binding_does_not_narrow_the_directory`,
+/// but the key travels in the query string only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_narrowing_still_works_through_the_query_transport() {
+async fn catalog_key_in_the_query_transport_does_not_narrow_the_directory() {
     let auth_server = allowing_auth_server().await;
     let upstream_a = MockServer::start().await;
     let upstream_b = MockServer::start().await;
@@ -2892,8 +3061,8 @@ async fn catalog_narrowing_still_works_through_the_query_transport() {
     let body = resp.text().await.expect("body");
     assert_eq!(
         body,
-        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"shared","object":"model"}]}"#,
-        "the query transport must feed key-prefix binding exactly like a header: {body}"
+        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"beta","object":"model"},{"id":"shared","object":"model"}]}"#,
+        "the directory is the tenant union, whatever transport carried the key: {body}"
     );
     let auth_calls = auth_server
         .received_requests()
@@ -2901,7 +3070,7 @@ async fn catalog_narrowing_still_works_through_the_query_transport() {
         .expect("auth recording on");
     assert!(
         auth_calls.is_empty(),
-        "GET /v1/models never runs external auth, whatever transport carried the key"
+        "GET /v1/models never authenticates, whatever transport carried the key"
     );
 }
 
@@ -3969,6 +4138,27 @@ fn passthrough_base_cfg(auth_url: &str, p1_endpoint: &str, p2_endpoint: &str) ->
         .insert("t1".into(), HashSet::from(["p1".into(), "p2".into()]));
     cfg.provider_keys.insert("p1".into(), vec!["sk-p1".into()]);
     cfg.provider_keys.insert("p2".into(), vec!["sk-p2".into()]);
+    // T3: the data-plane gate authenticates against the DERIVED identity index,
+    // and `ConfigStore::from_data` does NOT re-derive it (the wire never carries
+    // it) — a hand-built config must therefore carry the identity of the key its
+    // requests present. Same hash the proxy computes from the credential
+    // (`proxy.rs::enforce_auth`), so this is the DB row's mirror, not a bypass.
+    cfg.users_by_api_key_hash.insert(
+        hydra_core::auth::sha256_hex_string(b"test-client-key"),
+        hydra_core::identity::ApiKeyIdentity {
+            principal: hydra_core::identity::ApiPrincipal {
+                tenant_id: "t1".to_string(),
+                user_group_id: "grp-t1".to_string(),
+                user_id: "usr-t1".to_string(),
+                api_key_id: "key-t1".to_string(),
+                billing_status: hydra_core::model::BillingStatus::Active,
+            },
+            key_enabled: true,
+            user_enabled: true,
+            group_enabled: true,
+            expires_at: None,
+        },
+    );
     cfg
 }
 

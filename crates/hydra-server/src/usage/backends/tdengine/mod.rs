@@ -152,7 +152,8 @@ fn bootstrap(cfg: &TdengineConfig) -> Result<(), String> {
 /// The measured column list. `ts` first (TDengine requires the timestamp column first), then the
 /// row's own fields; `tenant_id` is a TAG so each tenant's rows live in their own sub-table.
 const COLUMNS: &str = "ts TIMESTAMP, tenant_id NCHAR(64), provider_id NCHAR(64), \
-     model_key NCHAR(128), client_api_key NCHAR(64), sub_tenant_id NCHAR(64), status_code INT, \
+     model_key NCHAR(128), client_api_key NCHAR(64), user_id NCHAR(64), user_group_id NCHAR(64), \
+     api_key_id NCHAR(64), status_code INT, \
      tokens_in BIGINT, tokens_out BIGINT, cache_hit_tokens BIGINT, latency_ms BIGINT, \
      forward_latency_ms BIGINT, ttft_ms BIGINT, upstream_host NCHAR(128), err NCHAR(256)";
 
@@ -348,7 +349,9 @@ fn row_values(r: &UsageRecord) -> String {
         quoted(&r.provider_id),
         quoted(&r.model_key),
         s(r.client_api_key_masked.as_deref()),
-        s(r.sub_tenant_id.as_deref()),
+        s(r.user_id.as_deref()),
+        s(r.user_group_id.as_deref()),
+        s(r.api_key_id.as_deref()),
         r.status_code.to_string(),
         n(r.tokens_in),
         n(r.tokens_out),
@@ -395,11 +398,15 @@ fn group_expr(g: GroupBy) -> Option<&'static str> {
         GroupBy::None => None,
         GroupBy::Model => Some("model_key"),
         GroupBy::Provider => Some("provider_id"),
-        // `COALESCE` does not exist in TDengine (measured: `Func not exists`), so the empty-key
-        // normalisation the read contract requires is spelled with `CASE`.
-        GroupBy::SubTenant => {
-            Some("CASE WHEN sub_tenant_id IS NULL THEN '' ELSE sub_tenant_id END")
+        // The three attribution columns are NULLABLE, and `COALESCE` does not
+        // exist in TDengine (measured: `Func not exists`), so the empty-key
+        // normalisation the read contract requires is spelled with `CASE`
+        // on each of them.
+        GroupBy::User => Some("CASE WHEN user_id IS NULL THEN '' ELSE user_id END"),
+        GroupBy::UserGroup => {
+            Some("CASE WHEN user_group_id IS NULL THEN '' ELSE user_group_id END")
         }
+        GroupBy::ApiKey => Some("CASE WHEN api_key_id IS NULL THEN '' ELSE api_key_id END"),
         // `TO_CHAR` is supported (measured) and `Day` is the calendar day of the row's own `ts`.
         GroupBy::Day => Some("TO_CHAR(ts, 'YYYY-MM-DD')"),
     }
@@ -586,10 +593,12 @@ mod tests {
         let mut r = rec("t1", "values");
         r.tokens_in = Some(5);
         r.tokens_out = None;
-        r.sub_tenant_id = Some("st1".into());
+        // Attribution: one dimension present, two absent — NULL is what an
+        // unattributed request must write, never the empty string.
+        r.user_id = Some("u1".into());
         r.error = Some("upstream said 'no'".into());
         let values = row_values(&r);
-        // The WHOLE tuple, not a substring: `''st1''` contains `'st1'`, so a `contains` assertion
+        // The WHOLE tuple, not a substring: `''u1''` contains `'u1'`, so a `contains` assertion
         // let a double-quoted literal through and every insert was refused by the server.
         let ts = timestamp(&r);
         assert!(
@@ -604,7 +613,7 @@ mod tests {
         assert_eq!(
             values,
             format!(
-                "('{ts}','t1','p','m',NULL,'st1',200,5,NULL,NULL,1,NULL,NULL,NULL,\
+                "('{ts}','t1','p','m',NULL,'u1',NULL,NULL,200,5,NULL,NULL,1,NULL,NULL,NULL,\
                  'upstream said \\'no\\'')"
             ),
             "{values}"
@@ -628,11 +637,17 @@ mod tests {
     /// The read SQL carries the three measured workarounds, in one place each.
     #[test]
     fn the_grouped_sql_uses_the_measured_workarounds() {
-        let sub = group_expr(GroupBy::SubTenant).expect("sub_tenant groups");
-        assert!(
-            sub.contains("CASE WHEN") && sub.contains("IS NULL"),
-            "coalesce does not exist in TDengine: {sub}"
-        );
+        for (group, column) in [
+            (GroupBy::User, "user_id"),
+            (GroupBy::UserGroup, "user_group_id"),
+            (GroupBy::ApiKey, "api_key_id"),
+        ] {
+            let expr = group_expr(group).expect("attribution groups");
+            assert!(
+                expr.contains("CASE WHEN") && expr.contains("IS NULL") && expr.contains(column),
+                "coalesce does not exist in TDengine, and the key must be {column}: {expr}"
+            );
+        }
         assert_eq!(
             group_expr(GroupBy::Day),
             Some("TO_CHAR(ts, 'YYYY-MM-DD')"),
@@ -726,7 +741,9 @@ mod live {
         r.tenant_id = tenant.to_string();
         r.provider_id = "p1".into();
         r.model_key = "gpt-4o".into();
-        r.sub_tenant_id = Some("st1".into());
+        r.user_id = Some("u1".into());
+        r.user_group_id = Some("g1".into());
+        r.api_key_id = Some("k1".into());
         r.tokens_in = Some(tokens_in);
         r.tokens_out = Some(7);
         r.cache_hit_tokens = None;
@@ -813,8 +830,8 @@ mod live {
         assert_eq!(other.totals.requests, 1);
         assert_eq!(other.totals.tokens_in, 99);
 
-        // 5. Grouping: the second tenant's rows carry `st1` too, so group by
-        //    provider to keep the assertion about buckets rather than about tags.
+        // 5. Grouping: every row written here carries the same attribution (`u1`),
+        //    so group by provider to keep the assertion about buckets rather than about tags.
         let grouped = reader
             .aggregate(
                 "td-live-t1",

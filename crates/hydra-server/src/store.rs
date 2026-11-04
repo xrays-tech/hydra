@@ -20,7 +20,11 @@ use dashmap::DashMap;
 use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
-use hydra_core::model::{LimitRole, ProviderKeyBinding, SubTenant, SubTenantRoute};
+use hydra_core::identity::TenantTokenIdentity;
+use hydra_core::model::{
+    GlobalRole, LimitRole, ProviderKeyBinding, SubTenant, SubTenantRoute, User, UserApiKey,
+    UserGroup,
+};
 use hydra_core::swrr::SwrrState;
 
 use crate::cluster::content::ReplicationContent;
@@ -211,6 +215,46 @@ pub async fn build_config(
         .filter(|r| r.enabled)
         .collect();
 
+    // --- User hierarchy / tenant tokens / Global Roles (plan §3.2 loader) -----
+    //
+    // The filtering asymmetry is load-bearing (plan §3.2):
+    //   * identity rows (groups/users/keys) load FULL — disabled/expired/delinquent
+    //     entities must stay KNOWN (401/402/403 by status, never "unknown" 401-
+    //     equivalent that lets a replica enumerate live keys);
+    //   * tenant_tokens load ENABLED-ONLY — a revoked tenant token is simply
+    //     GONE (the token index is not an enumeration surface);
+    //   * global_roles load ENABLED-ONLY — a disabled rule must match NOTHING,
+    //     not even as a failover candidate.
+
+    let user_groups: Vec<UserGroup> = db::list_user_groups(pool).await?;
+    let users_map: HashMap<String, User> = db::list_users(pool)
+        .await?
+        .into_iter()
+        .map(|u| (u.id.clone(), u))
+        .collect();
+    // FULL key set: reindex_identity derives the identity index from it; the
+    // vector itself is NOT stored in ConfigData (the index is the carrier).
+    let user_api_keys: Vec<UserApiKey> = db::list_user_api_keys(pool).await?;
+    let mut tenant_tokens: HashMap<String, TenantTokenIdentity> = HashMap::new();
+    for tok in db::list_tenant_access_tokens(pool).await? {
+        if !tok.enabled {
+            continue;
+        }
+        tenant_tokens.insert(
+            tok.token_hash.clone(),
+            TenantTokenIdentity {
+                tenant_id: tok.tenant_id.clone(),
+                token_name: tok.name.clone(),
+                expires_at: tok.expires_at.clone(),
+            },
+        );
+    }
+    let global_roles: Vec<GlobalRole> = db::list_global_roles(pool)
+        .await?
+        .into_iter()
+        .filter(|r| r.enabled)
+        .collect();
+
     let mut cfg = ConfigData {
         tenants_by_domain,
         // 派生索引：由紧随其后的 reindex_tenants 填充（唯一写入口，
@@ -225,12 +269,26 @@ pub async fn build_config(
         key_prefix_bindings,
         sub_tenants,
         sub_tenant_routes,
+        // User hierarchy (plan §3.2): rows as loaded, then the derived identity
+        // index below. Empty here too — the two reindex_* calls right after
+        // reindex_tenants fill the three derived fields.
+        user_groups,
+        users: users_map,
+        users_by_api_key_hash: HashMap::new(),
+        tenant_tokens,
+        global_roles,
+        global_roles_by_tenant: HashMap::new(),
+        global_roles_any_tenant: Vec::new(),
         certs,
     };
 
     // 派生索引在这里一次性建好：loader 是 leader 侧唯一的构建点，
     // 与副本侧 hydrate 的调用共用 core 里的同一个实现。
     cfg.reindex_tenants();
+    // Identity index + Global Role indexes (plan §3.2/§3.5): same single-entry-point
+    // rule; the replica hydrate path calls the same two functions (plan §3.5).
+    cfg.reindex_identity(&user_api_keys);
+    cfg.reindex_global_roles();
 
     validate_and_log(&cfg)?;
     Ok(cfg)
@@ -339,6 +397,10 @@ pub struct ConfigStore {
     /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
     /// be forgotten by one of the writers.
     hooks: Arc<std::sync::Mutex<Vec<SnapshotHook>>>,
+    /// Serializes local publish/read-modify-publish coordination without changing
+    /// reload/publish semantics. Shared through `Arc` so `ConfigStore` clones (and
+    /// therefore the whole store view) guard the same lock.
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
     /// The Arachne publisher (ADR-0001), present only in a cluster node built with the `arachne`
     /// feature. `None` in single-node mode, where a local reload IS the whole truth.
     #[cfg(feature = "arachne")]
@@ -439,6 +501,7 @@ impl ConfigStore {
             key_provider,
             replication: Arc::new(arc_swap::ArcSwap::from_pointee(content)),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(feature = "arachne")]
             publisher: None,
         })
@@ -488,7 +551,7 @@ impl ConfigStore {
     ///
     /// Single owner for "something has to follow the config": the resolved TLS
     /// cert store is why it exists. Wiring that re-resolution at each writer is
-    /// how the cluster path was missed — an edge node applied a snapshot
+    /// how the cluster path was missed — an edge node applies a snapshot
     /// containing new tenant certs and kept serving the old ones until a
     /// restart (`main.rs` carried the fossil: `on_poll: None, // edge TLS cert
     /// re-resolution lands with the edge TLS wiring`). Both swap paths
@@ -501,6 +564,11 @@ impl ConfigStore {
     pub fn on_snapshot_change(&self, hook: SnapshotHook) {
         let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
         hooks.push(hook);
+    }
+
+    /// Acquire the publish coordination lock.
+    pub async fn publish_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.publish_lock.lock().await
     }
 
     /// Run every registered hook against the snapshot that was just published.
@@ -645,6 +713,7 @@ mod tests {
                 tenant_models: Vec::new(),
                 sub_tenants: Vec::new(),
                 sub_tenant_routes: Vec::new(),
+                ..crate::cluster::content::FidelityRows::default()
             },
         }
     }

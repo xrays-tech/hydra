@@ -7,27 +7,40 @@
 
 ---
 
+> **⚠ 2026-11-03 重大契约变化（read this first).** 数据面 client-key **鉴权是 now INTERNAL**:Hydra 把 your client's api-key 对照 its **stored `user_api_key` 里 rows** 下 里 the four-level hierarchy `tenant → user_group → user → api_key` — **no `auth_url` is ever consulted any more**, and the auth cache is gone. Consequences:
+> - **§5.2 `auth/cache/invalidate` and §5.4/5.5/5.6 sub-tenant endpoints are RETIRING** — the code still **serves** them (the T10 deletion batch is deferred), but the auth cache they touch is **no longer consulted**, so "invalidate" no longer changes client-key outcomes (revoke / disable / delinquency now flip **immediately**: local node next-request, other nodes ≤5 s via config publish). Do not build new flows on them.
+> - **New self-service endpoints (§5.7)** manage your groups / users / api-keys / billing.
+> - `whoami` STILL echoes `auth_url` (column still NOT NULL at write time, migration `0015` deferred) **but nothing uses it for auth**.
+> - Client api-keys (`hk_…`) and tenant access tokens (`ht_…`) are **hydra-minted, plaintext shown exactly once**; a tenant may hold **multiple** access tokens.
+> - A **delinquent** user's key answers **402 `user_delinquent`** on the data plane (body `{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}`).
+
+---
+
 ## 1. 你能用它做什么
 
-九个端点（**5 个只读 + 4 个写**），都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
+Current endpoints (2026-11-03) — **ACTIVE** = the internal-auth hierarchy (incl. the new §5.7 groups/users/keys/billing) **+ RETIRING** = auth-cache + sub-tenant (still served, pending the deferred T10)，都跑在**你已经在用的那个数据面地址**上（客户端调 `/v1/*` 的同一个域名/端口），因此不需要运维额外为你开放管理口。
 
 | 端点 | 方法 | 用途 |
 |---|---|---|
-| `/tenant/{tenant_id}/api/v1/whoami` | `GET` | 读你自己当前的配置：绑定域名、`auth_url`、是否被停用、配置版本 |
-| `/tenant/{tenant_id}/api/v1/auth/cache/invalidate` | `POST` | **让某个/全部客户端 key 立刻重新鉴权**（欠费停机、付费恢复、封禁某个 key） |
+| `/tenant/{tenant_id}/api/v1/whoami` | `GET` | read your config: domain, `enabled`, `config_version` (`auth_url` is STILL echoed but **no longer used for auth**) |
+| `/tenant/{tenant_id}/api/v1/auth/cache/invalidate` | `POST` | **RETIRING** — still served, but the auth cache is **no longer consulted** on the data plane, so it no longer changes client-key outcomes (§5.2; revoke/delinquency are now immediate via §5.7) |
 | `/tenant/{tenant_id}/api/v1/usage` | `GET` | 查某个时间窗内你实际产生了多少请求/token |
-| `/tenant/{tenant_id}/api/v1/sub-tenants` | `GET` | 只读列出**你自己且启用中的**子租户（前缀、启用状态、配置版本；已停用的不返回） |
-| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `GET` | 只读列出**你自己**的子租户路由（`model → provider`、默认路由、配置版本） |
-| `/tenant/{tenant_id}/api/v1/sub-tenants/{name}` | `PUT` | **自助创建/更新**一个子租户（按名字 upsert）；见 §5.6 |
-| `/tenant/{tenant_id}/api/v1/sub-tenants/{id}` | `DELETE` | **自助删除**一个子租户（按不可变 id，幂等）；见 §5.6 |
-| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `PUT` | **自助创建/更新**一条子租户路由（按 `sub_tenant_id`+`model_key` upsert）；见 §5.6 |
-| `/tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` | `DELETE` | **自助删除**一条子租户路由（按不可变 id，幂等）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/user-groups` | `GET` · `PUT` · `DELETE .../{id}` | list / upsert / delete your user-groups (§5.7; non-empty delete ⇒ 409) |
+| `/tenant/{tenant_id}/api/v1/users` | `GET ?group_id=` · `PUT` · `DELETE .../{id}` | list / upsert / delete your users (`user_group_id` required; delete cascades keys) (§5.7) |
+| `/tenant/{tenant_id}/api/v1/users/{uid}/api-keys` | `GET` · `POST` · `DELETE .../{key_id}` | list / **mint (plaintext `hk_` shown ONCE)** / revoke a key (§5.7) |
+| `/tenant/{tenant_id}/api/v1/users/{uid}/billing` | `PUT` | `active` / `delinquent` (delinquent ⇒ **402** on `/v1/*`) (§5.7) |
+| `/tenant/{tenant_id}/api/v1/sub-tenants` | `GET` | **RETIRING** — 只读列出**你自己且启用中的**子租户（前缀、启用状态、配置版本；已停用的不返回） |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `GET` | **RETIRING** — 只读列出**你自己**的子租户路由（`model → provider`、默认路由、配置版本） |
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{name}` | `PUT` | **RETIRING** — **自助创建/更新**一个子租户（按名字 upsert）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenants/{id}` | `DELETE` | **RETIRING** — **自助删除**一个子租户（按不可变 id，幂等）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes` | `PUT` | **RETIRING** — **自助创建/更新**一条子租户路由（按 `sub_tenant_id`+`model_key` upsert）；见 §5.6 |
+| `/tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` | `DELETE` | **RETIRING** — **自助删除**一条子租户路由（按不可变 id，幂等）；见 §5.6 |
 
 **明确没有的能力**（不是漏做，是刻意不做）：
 
-- **不能改你的租户级配置**。域名、`auth_url`、证书、是否启用，都由运维通过管理 API 设置（本 API 没有这些的写路径，所以没有"字段级越权"的可能）。**子租户与其路由是例外**：你可以用 §5.6 的写端点自助管理**自己的**子租户/路由（仍受配额与前缀规则约束，且只能作用于你自己的资源）。
+- **不能改你的租户级配置**。域名、`auth_url`、证书、是否启用，都由运维通过管理 API 设置（本 API 没有这些的写路径，所以没有"字段级越权"的可能）。**Your own groups / users / api-keys / billing are the writable part** (§5.7) — always scoped to only your own resources; **Global Role scheduling is operator-only** (admin `/api/v1/global-roles`), a tenant never repoints providers. The old §5.6 sub-tenant writes are RETIRING.
 - **不能查明细**。`/usage` 只给聚合数，不给逐条请求记录。
-- **不能按 key 前缀清缓存**。见 §7.3：缓存里存的是 key 的 SHA-256 摘要，前缀不可匹配。只接受**完整 key** 或**整个租户**。
+- **No auth cache any more.** Client-key auth is internal (§4 + the §5.7 truth table); revoke / disable / delinquency flip on the **next** request (no 5-minute window to wait out). MINTING is capped on three axes and always answered `400 hierarchy_limit_exceeded`, never silently sharded: per-tenant api-keys (`HYDRA_MAX_USER_API_KEYS_PER_TENANT`, default 1000), per-tenant users (`HYDRA_MAX_USERS_PER_TENANT`, default 1000), and the total row count of the five identity tables (`HYDRA_MAX_HIERARCHY_ROWS`, default 3000). A cap binds a CREATE only — editing an existing row is never refused (§5.7's error table says which endpoint answers which).
 
 ---
 
@@ -101,7 +114,7 @@ Authorization: Bearer <tenant access token>
 
 ### 4.4 方法约定
 
-**只读端点**方法固定：`whoami`/`usage`/`sub-tenants`/`sub-tenant-routes` 只认 `GET`、`invalidate` 只认 `POST`；用错方法 → `405 method_not_allowed`。**写端点**（§5.6）按 `(方法, 路径)` 解析：`PUT`/`DELETE` 各走各的**路径形状**，形状对不上的组合 → `404 not_found`。保留前缀下**任何**不是这九条路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
+**只读端点**方法固定：`whoami`/`usage`/`sub-tenants`/`sub-tenant-routes` 只认 `GET`、`invalidate` 只认 `POST`；用错方法 → `405 method_not_allowed`。**写端点**（§5.6）按 `(方法, 路径)` 解析：`PUT`/`DELETE` 各走各的**路径形状**，形状对不上的组合 → `404 not_found`。保留前缀下**任何**不是这documented set路由的路径 → `404 not_found`（本 API 自己回答，**不会**落到上游）。
 
 > **405 还是 404 的判定（2026-09-30 逐格实测，此前这一段的例子是错的）**：先看**路径**能不能对上那五条只读路由，再看方法 —— 对上了但方法不对就是 **405**；对不上任何 `(方法, 路径)` 组合就是 **404**。所以同一个"用错方法"会得到两种答案，取决于**该路径形状是否也是一条只读路由**：
 >
@@ -159,7 +172,9 @@ Authorization: Bearer <tenant access token>
 
 ### 5.2 `POST /tenant/{tenant_id}/api/v1/auth/cache/invalidate`
 
-**本 API 最重要的一个端点。** Hydra 会缓存"某个客户端 key 的鉴权结论"（默认 allow 5 分钟 / deny 30 秒），所以你在自己系统里封禁一个 key 之后，Hydra 侧可能还有几分钟在放行。调它即可让结论立刻失效、下次请求强制回你的 `auth_url` 重新判定。
+> ⚠ **RETIRING (2026-11-03).** The endpoint is still served and answers like before, but **client-key auth no longer consults an auth cache at all**, so invalidating changes nothing about `/v1/*` outcomes. Revoke with `DELETE …/users/{uid}/api-keys/{key_id}` and set delinquency with `PUT …/users/{uid}/billing` (§5.7) — both flip on the **next** request. This section stays until the deferred T10 deletion batch; the text below describes **historical** behaviour.
+
+**HISTORICAL (pre-2026-11-03).** Hydra 会缓存"某个客户端 key 的鉴权结论"（默认 allow 5 分钟 / deny 30 秒），所以你在自己系统里封禁一个 key 之后，Hydra 侧可能还有几分钟在放行。调它即可让结论立刻失效、下次请求强制回你的 `auth_url` 重新判定。
 
 #### 请求
 
@@ -261,7 +276,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 |---|---|---|---|
 | `since` | **是** | — | 窗口起点（**含**） |
 | `until` | 否 | 服务端当前时刻 | 窗口终点（**不含**） |
-| `group_by` | 否 | `none` | `none` \| `model` \| `provider` \| `sub_tenant` \| `day`；其他值 → `400 invalid_group_by` |
+| `group_by` | 否 | `none` | `none` \| `model` \| `provider` \| `user` \| `user_group` \| `api_key` \| `day`；其他值 → `400 invalid_group_by` |
 
 **`since` 接受的写法**（一律按 UTC 理解，除自带偏移的）：
 
@@ -303,7 +318,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `since` / `until` | **归一化后**的实际窗口（`until` 不含） |
 | `as_of` | 你在**本次查询的窗口内**最新一条记录的写入时刻（即窗口内 `MAX(created_at)`）；窗口内没有任何记录时为 `null`。默认 `until=now` 时它恰好等于你在存储里的最新一条写入，查历史窗口时约等于窗口上界。用它判断"数据到齐了没有" |
 | `totals` | 整个窗口的合计 |
-| `rows` | 按 `group_by` 分组的行；`group_by=none` 时为空数组。`key` 是分组值（模型名 / provider id / **子租户 id** / `YYYY-MM-DD`）。`group_by=sub_tenant` 时，未命中任何子租户前缀的用量归入空字符串 `""` 分组 |
+| `rows` | 按 `group_by` 分组的行；`group_by=none` 时为空数组。`key` 是分组值（模型名 / provider id / **user id** / **user_group id** / **api_key id** / `YYYY-MM-DD`）。`group_by=user|user_group|api_key` 时，用量缺该归属维度（无 principal，或 principal 的维度为空）归入空字符串 `""` 分组 |
 | `tokens_in` | 请求**发出**的 token（含命中缓存的） |
 | `tokens_out` | 模型**返回**的 token |
 | `cache_hit_tokens` | 命中提示词缓存的 token（是 `tokens_in` 的子集） |
@@ -331,6 +346,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 > **结果过大会返回 `503 usage_store_unavailable`，且重试无效。** 当聚合结果过大（很宽的 `group_by` 叠加很长的窗口）超过网关的响应体上限时，读会失败并返回 `503 usage_store_unavailable`——这不是"重试就好"的故障：缩小 `since`/`until`，或降低 `group_by` 的基数（例如用 `group_by=day` 代替高基数的 `group_by=model`）才有效。
 
 ### 5.4 `GET /tenant/{tenant_id}/api/v1/sub-tenants`
+> ⚠ **RETIRING** (still served, T10 deferred): prefix routing is superseded by Global Role; do not build new flows here.
 
 只读列出**你自己**的子租户。**只读快照、不查库、不访问你的 `auth_url`**，所以在任何节点（含边缘节点）都是瞬时的。只返回 `tenant_id` 与你一致的行——你**永远看不到**别的租户的子租户。
 
@@ -379,6 +395,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 > 这两个端点是**只读**的：要创建/修改/删除子租户或路由，用你自己的**写端点**（§5.6）；运维也可通过管理 API（`/api/v1/sub-tenants`、`/api/v1/sub-tenant-routes`）代管，见 `ops.md` §5.5。
 
 ### 5.6 子租户写端点（v2：自助创建 / 修改 / 删除）
+> ⚠ **RETIRING** (still served, T10 deferred): see the top banner and §7.6.
 
 v2 起，你可以**自助管理自己的子租户与其路由**，不用再等运维。四个写端点都挂在**你已在用的那个数据面地址**的保留前缀下（和只读端点同一个域名/端口），**同样只认你的租户访问令牌**（`Authorization: Bearer`，与只读端点同一道闸门——写端点不会成为更弱的门）：
 
@@ -469,6 +486,59 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 
 ---
 
+### 5.7 The four-level user hierarchy: groups / users / api-keys / billing (2026-11-03)
+
+These endpoints manage **your own** identity rows under `tenant → user_group → user → api_key`. Same access-token gate as everything else (401 / 403 tenant_id_mismatch / 429 / 503 not_ready / config_not_published apply identically). **The four-level rows you create here are exactly what the data plane authenticates against** — no `auth_url`, no auth cache.
+
+#### 5.7.1 Groups
+
+- `GET /user-groups` → `{ "user_groups":[ {id,tenant_id,name,enabled,created_at,updated_at}, … ] }` (incl. `enabled:false`).
+- `PUT /user-groups` body `{"id?":"g…","name":"Internal","enabled":true}` — no `id` creates, `id` updates; an `id` of another tenant reads 404 `not_found`. Names are unique per tenant.
+- `DELETE /user-groups/{id}` — deleting a group that still has users answers **409 group_not_empty** (schema keeps it referenced via `ON DELETE RESTRICT`); the explicit check and the DB race give the same answer.
+
+#### 5.7.2 Users
+
+- `GET /users` lists **all** your users, including disabled ones and those with `billing_status:"delinquent"`. `?group_id=` filters; a `group_id` that is not yours → 400 `invalid_group`.
+- `PUT /users` body `{"id?":"u…","user_group_id":"g…","external_id?":"e…","name":"Alice","enabled":true}` — `user_group_id` is **required** (no group-less users); `external_id` unique per tenant (collision → 409 `duplicate_external_id`).
+- `DELETE /users/{id}` — deleting a user **cascades** its api-keys away (`ON DELETE CASCADE`).
+
+#### 5.7.3 Api-keys — mint once, store only the digest
+
+- `GET /users/{uid}/api-keys` returns only non-secret info per key: `key_prefix`, `key_last4`, `enabled`, `expires_at`. **Never the plaintext** (only a SHA-256 digest is stored).
+- `POST /users/{uid}/api-keys` body `{"name":"ci","expires_at":null|"2026-…"}`. The response carries the plaintext **exactly once**:
+
+  ```json
+  { "key":"hk_…","id":"ak…","key_prefix":"hk_ab12…","key_last4":"9f2c","expires_at":null,"config_version":N }
+  ```
+
+  - `name` empty → 400 `invalid_request`.
+  - `expires_at` unparseable → 400 `invalid_request` (it is **never** silently treated as "no expiry").
+  - At the per-tenant ceiling → 400 `hierarchy_limit_exceeded` (ceiling = `HYDRA_MAX_USER_API_KEYS_PER_TENANT`, default **1000**).
+- `DELETE /users/{uid}/api-keys/{key_id}` revokes it: **immediately** — the next data-plane request with that key answers **401 invalid_api_key** (no TTL to wait out).
+
+#### 5.7.4 Billing (`402` on the data plane)
+
+`PUT /users/{uid}/billing` body `{"status":"active"|"delinquent","reason?":"…"}` (idempotent; unknown user → 404). A user set to `delinquent` answers **402 user_delinquent** on `/v1/*`, body:
+
+```json
+{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}
+```
+
+Back to `active` clears it. **This replaces the old `auth_url`-based "欠费停机" flow** for per-user billing.
+
+#### 5.7.5 Data-plane truth table (what a `hk_` key hitting `/v1/*` gets)
+
+| condition | answer |
+|---|---|
+| key unknown / revoked / expired / disabled | **401** `invalid_api_key` |
+| user, group or tenant `enabled:false` | **403** |
+| key live, user `billing_status:"delinquent"` | **402** `user_delinquent` (body above) |
+| everything enabled & active | passes to the model |
+
+Propagation of any of those flips: **on your node the next request**; other nodes within **≤5 s** (config publish + ~1 s materialise). There is **no auth-cache residual window any more** — see §7.4's rewrite.
+
+---
+
 ## 6. 错误码总表
 
 | code | HTTP | 含义 | 可重试 |
@@ -476,7 +546,7 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 | `unauthorized` | 401 | 令牌缺失 / 错误 / 该租户未配置令牌（三者文案相同） | 否（先检查令牌） |
 | `tenant_id_mismatch` | 403 | 令牌归属与 URL 里的 `tenant_id` 不一致 | 否（检查 base URL） |
 | `not_ready` | 503 | 该节点还没有配置快照 | **是** |
-| `not_found` | 404 | 保留前缀下不是这九条路由的路径；写端点上资源不存在 / 属于别的租户（§5.6） | 否（检查路径拼写 / id） |
+| `not_found` | 404 | 保留前缀下不是这documented set路由的路径；写端点上资源不存在 / 属于别的租户（§5.6） | 否（检查路径拼写 / id） |
 | `method_not_allowed` | 405 | 方法用错 | 否 |
 | `rate_limited` | 429 | 触发频率上限（见 §7.2），带 `Retry-After` | **是**（等 `Retry-After`） |
 | `payload_too_large` | 413 | 请求体超过 1 MiB | 否 |
@@ -497,6 +567,11 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 | `quota_exceeded` | 400 | 子租户 / 路由数量到顶（写端点，§5.6） | 否 |
 | `prefix_generation_failed` | 400 | 自动生成前缀多次尝试仍冲突（写端点，§5.6） | **是** |
 | `name_duplicate` / `prefix_duplicate` | 409 | 名字 / 前缀与同租户既有子租户冲突（写端点，§5.6） | 否 |
+| `invalid_group` | 400 | `?group_id=` filter, or a `PUT` user's `user_group_id`, names a group that is not one of yours (hierarchy endpoints, §5.7) | 否 (create/fix the group first) |
+| `duplicate_name` | 409 | `PUT /user-groups`: another of your groups already uses that name (unique per tenant, §5.7) | 否 |
+| `group_not_empty` | 409 | `DELETE /user-groups/{id}` while the group still has users (`ON DELETE RESTRICT`, §5.7) | 否 (move/delete the users first) |
+| `duplicate_external_id` | 409 | `PUT /users`: another user of this tenant already carries that `external_id` (unique per tenant, §5.7) | 否 |
+| `hierarchy_limit_exceeded` | 400 | A CREATE past a ceiling: `POST .../api-keys` past `HYDRA_MAX_USER_API_KEYS_PER_TENANT` (per tenant, default 1000) **or** `PUT .../users` past `HYDRA_MAX_USERS_PER_TENANT` (per tenant, default 1000) **or** any of `PUT .../user-groups` / `PUT .../users` / `POST .../api-keys` past `HYDRA_MAX_HIERARCHY_ROWS` (global over the five identity tables, default 3000) | 否 (delete a row first — an UPDATE of an existing row is never refused) |
 
 ---
 
@@ -504,19 +579,25 @@ DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}  → 204
 
 ### 7.1 被停用（欠费停机）之后还能做什么
 
-`whoami` 里的 `enabled` 变成 `false` 之后，你的**客户端请求**会被拒绝，但**这些端点全部照常可用**（有测试守着这一点）。这是刻意的：停用是**你的**策略（通过你的 `auth_url` 表达），如果你连恢复路径都进不去，就无法自助恢复。
+`whoami`'s `enabled` becomes `false` ⇒ your **client requests** are rejected, but the tenant API stays fully usable (a test guards this). Deliberate: if the self-service path were also closed, you could never recover. Tenant-level `enabled` is ops-set via the admin API; **per-user 欠费 is now `billing` (§5.7)** — the old `auth_url`-expressed stop no longer gates auth.
 
 典型恢复流程：
 
 ```bash
-# 1) 确认自己被停用了
+# 1) 确认被停用/欠费: whoami + the users' billing_status
 curl -s $HYDRA/tenant/$TID/api/v1/whoami -H "Authorization: Bearer $TOK" | grep enabled
+curl -s $HYDRA/tenant/$TID/api/v1/users -H "Authorization: Bearer $TOK" | grep billing_status
 
-# 2) 充值、在你的鉴权系统里放行
+# 2) 恢复 a delinquent user: flip its billing back (§5.7) — this REPLACES
+#    the old auth_url / invalidate dance
+curl -s -X PUT $HYDRA/tenant/$TID/api/v1/users/$UID/billing \
+  -H "Authorization: Bearer $TOK" -H "content-type: application/json" \
+  -d '{"status":"active"}'
 
-# 3) 让所有客户端立刻恢复（否则最多要等 5 分钟的缓存过期）
-curl -s -X POST $HYDRA/tenant/$TID/api/v1/auth/cache/invalidate \
-  -H "Authorization: Bearer $TOK" -H "content-type: application/json" -d '{}'
+# 3) NO invalidate any more: the billing flip takes effect on the NEXT
+#    request (local node immediately, other nodes ≤5 s via config publish).
+#    A *tenant-level* disable (`enabled:false`) is still ops-set via the admin
+#    API — this API cannot write tenant-level config.
 ```
 
 #### 停用后你的**客户端**看到什么（2026-09-30 实测）
@@ -524,13 +605,18 @@ curl -s -X POST $HYDRA/tenant/$TID/api/v1/auth/cache/invalidate \
 | 请求 | 响应 |
 |---|---|
 | 客户端请求（`/v1/*`）打到**被停用**的租户 | **403**，体 `{"error":{"message":"tenant_disabled","type":"proxy_error"}}` |
-| 同一租户的**租户 API**（本文档其余部分） | 全部照常可用（上表九条路由，含写端点） |
+| key of a `delinquent` user | **402**, body `{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}` |
+| same tenant's **tenant API** (rest of this doc) | fully usable (all ACTIVE + RETIRING routes, incl. write endpoints) |
 
-> ⚠ **数据面 `/v1/*` 的错误信封与本文档 §4.3 的**不是同一个**。数据面（`proxy.rs::short_circuit`）只有
-> `message`（原因串）与 `type`（恒为 `proxy_error`）—— **没有 `code`，也没有 `trace_id`**。实测四个：
-> `401 missing_api_key`、`403 model_not_allowed`、`404 unknown_domain`、`403 tenant_disabled`。
-> 所以**不要**在客户端错误处理里按 `error.code` 分支：那个字段只存在于租户 API 的信封里；
-> 数据面请按 **HTTP 状态 + `error.message`** 判定。（本文档 §4.3/§6 描述的是租户 API。）
+> ⚠ **The data-plane `/v1/*` error envelope is NOT the §4.3 tenant-API envelope.** Two shapes live there:
+> - `short_circuit` / `respond_auth_denial` (`proxy.rs:1847` / `:1856`) send only `message` (reason string) and
+>   `type` (`proxy_error` / `auth_error`) — **no `code`, no `trace_id`**. Measured:
+>   `401 missing_api_key`, `403 model_not_allowed`, `404 unknown_domain`, `403 tenant_disabled`, and (2026-11-03)
+>   **`401 invalid_api_key`** for an unknown / revoked / expired client key (§5.7 truth table).
+> - The delinquency gate is hand-built and DOES carry a `code`: `402` with body
+>   `{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}`.
+> So on the data plane branch by **HTTP status + `error.message`**, and treat `error.code` as present ONLY for
+> `user_delinquent` there. (`error.code` as a stable identifier is the TENANT-API contract — §4.3/§6.)
 
 ### 7.2 限流与锁定
 
@@ -555,21 +641,18 @@ curl -s -X POST $HYDRA/tenant/$TID/api/v1/auth/cache/invalidate \
 - **`403`（URL 写错租户）不消耗已授权额度**：否则一个配错 base URL 的客户端会把整个租户锁在自己的 API 之外。
 - 限额是**每节点**计算的，所以 N 个节点的集群整体上限约为 N 倍。运维可以调（见 `ops.md` §1.1）。
 
-### 7.3 为什么不能按 key 前缀清缓存
+### 7.3 Why you cannot clear a cache by key prefix (HISTORICAL - as of 2026-11-03)
 
-Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis 里都只有摘要**。摘要不可做前缀匹配，所以"清掉所有 `sk-proj-abc*` 的缓存"在当前数据结构下**无法实现**。
+There is **no auth cache on the data plane any more**: client-key auth matches stored `user_api_key` rows (§5.7), so there is nothing to "clear". §5.2's endpoint is still *served* (the T10 deletion batch is deferred) and still accepts its old `api_keys` / whole-tenant forms - but it changes nothing about `/v1/*` outcomes. Historical fact, kept for the still-served endpoint's shape: the cache keyed on `(tenant_id, sha256(api_key))`, so a **prefix** never matched - it was treated as one full key (`invalidated: 0`, silently ineffective). Do the real action via §5.7: `DELETE .../api-keys/{key_id}` (revoke) or `PUT .../billing` (delinquency).
 
-不要试图用前缀调 `api_keys`：它会被当成**一个完整的 key**（于是匹配不到、`invalidated` 为 0，静默无效）。请传完整 key，或清空整个租户。
+### 7.4 How fast does a revoke / ban take effect (was: "residual window")
 
-### 7.4 封禁多久真正生效（"残余窗口"）
+**There is no auth-cache residual window any more.** A revoke, a disable, or a delinquency flip is decided by published config, not by a TTL:
 
-你调 `invalidate` 之后，**正常情况**下等到 `fleet.state == "applied"` 就已经全集群生效。
+- **your node**: the **next** request already sees it;
+- **other nodes**: within **<=5 s** (config publish + ~1 s replica materialise).
 
-但有一种情况需要你知道：某个节点**活着、在收流量，却没能消费到失效事件**（消费者任务异常、与内部总线断连等）。这种节点的兜底就是缓存项**自己的 TTL** —— 而这个 TTL 的上限由运维设定（默认 **300 秒**），也就是说：
-
-> **最坏情况下，一个被停用的 key 可能在被封禁后继续工作到约 5 分钟。**
-
-这不是"没生效"，而是刻意的上限（默认值等于系统原有的 allow TTL，所以对没设长 TTL 的租户零变化）。**要更快收敛**：确认 `fleet.state == "applied"`；持续拿到 `202` 就把 `lagging` 里的节点交给运维（运维有对应告警）。
+To be sure it landed everywhere, compare `config_version` via `whoami` and use the publish/fleet state the write endpoints return (§5.6 transport semantics) - do **not** rely on a `fleet.state == "applied"` from `invalidate`. A persistently `lagging` node is an ops issue (ops has matching alerts).
 
 ### 7.5 用量口径
 
@@ -577,20 +660,11 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 - `requests` 在 ClickHouse 部署下是**近似值**（见 §5.3 边界 2）。
 - 计量存储的保留期由运维决定，超出保留期的历史查不到，会表现为"该窗口没有记录"（`as_of: null`），而不是报错。
 
-### 7.6 子租户前缀的语义边界（**必读**）
+### 7.6 子租户前缀的语义边界 (**must read** - these endpoints are RETIRING)
 
-你看到 `sub-tenants` / `sub-tenant-routes` 返回的前缀和路由后，请理解这三条边界：
-
-1. **前缀不是身份、也不是秘密。** 任何调用方都可以出示任意前缀的 key，但路由**永远**受
-   `model ∩ 你被授权的 provider` 约束（运行时 backstop），且**认证始终发生在你的 `auth_url`**——
-   拿别人前缀的假 key 仍要过你的鉴权。因此**按子租户的归因可信度 = 你自己发 key 的纪律**
-   （你给哪个子租户发了什么前缀的 key，是只有你知道的）。Hydra 不铸造、不验证 key 的归属。
-2. **停用 / 删除子租户 ≠ 吊销。** 删掉一个子租户只是**停止按它的前缀 steering**；那些 key 仍
-   **照常走默认管线**（认证仍过你的 `auth_url`）。**吊销 key 永远是你 `auth_url` 的职责**，
-   不是 Hydra 删子租户的行为。不要以为"删了子租户 = 这些 key 失效了"。
-3. **edge 陈旧窗口。** 路由/子租户变更经控制面轮询收敛（**~1s** + 版本防倒退）；变更之后可能
-   **短暂仍按旧路由**——与一切配置变更同性质。需要立即生效时，确认快照版本已推进
-   （用 `whoami` / 上述端点的 `config_version` 对照）。
+1. **Prefix is not identity, and not a secret.** Any caller may present any prefix, but routing stays bounded by `model ∩ your granted providers` (runtime backstop). **Auth no longer happens at your `auth_url`**: the key must match a stored `user_api_key` row of YOUR tenant (§5.7 truth table) - a stranger wearing someone else's prefix gets **401**, there is no pass-through to an external auth service.
+2. **Stop / delete a sub-tenant is NOT a revoke.** Deleting one only stops prefix steering; its keys keep flowing through the default pipeline (they always did). **Revoking a key is now YOUR §5.7 endpoint** (`DELETE .../users/{uid}/api-keys/{key_id}`, effective on the next request) - sub-tenant deletion never revoked anything.
+3. **Edge staleness.** Route/sub-tenant changes converge via control-plane polling (**~1s** + version no-rewind); you may briefly see the old routing. Same nature as every config change; compare `config_version` from `whoami`.
 
 ---
 
@@ -600,15 +674,16 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 |---|---|---|
 | `401 unauthorized` | 令牌写错/被轮换/该租户没配令牌 | 核对令牌；确认运维没给你轮换过 |
 | `403 tenant_id_mismatch` | URL 里的 `tenant_id` 和令牌不是同一个租户 | 用 `whoami` 返回的 `tenant_id` 拼 URL（`base_url` 字段直接给了前缀） |
-| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这九条之内）；写端点上资源不存在 / 属于别的租户（§5.6） | 对照 §1 的路径表 |
+| `404 not_found` | 路径拼错（例如少了 `api/v1`，或路径不在这documented set之内）；写端点上资源不存在 / 属于别的租户（§5.6） | 对照 §1 的路径表 |
 | `405 method_not_allowed` | 方法用错（例如用 GET 调 invalidate） | `GET` whoami/usage；`POST` invalidate |
 | `429 rate_limited` | 触发限流或锁定 | 读 `Retry-After` 再重试。持**有效令牌**时，429 只会来自每租户**已授权**频率（60/分钟）或失效频率（10/分钟）上限；**失败**锁定（按来源 IP / 令牌摘要）只拦**错误**令牌的来源，不会拦对令牌 |
 | `503 not_ready` | 该节点还没物化配置（启动窗口） | 重试（会落到其他节点） |
 | `503 config_not_published` | 集群**失去多数派**：写已落在这台节点的库上，但没能提交到集群 | **不是你的请求有问题**。等集群恢复后**重发完全相同的请求**（幂等；那次重发才是把改动发布出去的动作）。需要确认时用**同一个节点**重读资源 |
 | `503 usage_store_unavailable` | 计量存储读不到或返回无法解析 | 重试；持续失败把 `X-Hydra-Trace-Id` 给运维 |
 | `202 pending` 一直出现 | 集群里有节点没确认；若 `fleet.nodes_total == 0` 则是该节点还无法枚举存活节点（启动窗口 / 注册表行过期） | `lagging` 有名字就给运维；`nodes_total == 0` 时先重试或换节点，持续如此把 `X-Hydra-Trace-Id` 给运维 |
-| `invalidated: 0` | 那些 key 在本节点本来就没有缓存项 | 正常。下次请求会回源；要确认请用一次请求制造缓存后再调 |
-| 清缓存后客户端仍被放行 | 还在 §7.4 的残余窗口内，或有节点 `lagging` | 看 `fleet.state`；持续如此找运维 |
+| `invalidated: 0` | HISTORICAL: the data plane no longer consults that cache (§5.2 RETIRING) | means nothing for `/v1/*`; revoke via §5.7 instead |
+| key still passes after you "invalidated" | invalidation no longer gates the data plane; or you hit a `lagging` node | `DELETE .../api-keys/{key_id}` (§5.7); check `config_version` / `lagging` |
+| client answers 402 `user_delinquent` | that user's `billing_status` is `delinquent` (§5.7) | intended gate; restore with `PUT .../users/{uid}/billing {"status":"active"}` |
 
 **报障时请附上**：`X-Hydra-Trace-Id`（或响应体里的 `error.trace_id`）、请求的完整 URL（令牌请打码）、时间点。
 
@@ -626,14 +701,25 @@ Hydra 的鉴权缓存键是 `(tenant_id, sha256(api_key))`，**内存和 Redis �
 
 ```
 GET  {HYDRA}/tenant/{TID}/api/v1/whoami
-POST {HYDRA}/tenant/{TID}/api/v1/auth/cache/invalidate[?wait=converged|none][&timeout_ms=1..60000]
-GET  {HYDRA}/tenant/{TID}/api/v1/usage?since=<必填>[&until=][&group_by=none|model|provider|day]
+POST {HYDRA}/tenant/{TID}/api/v1/auth/cache/invalidate[...]   (RETIRING: cache no longer consulted)
+GET  {HYDRA}/tenant/{TID}/api/v1/usage?since=<必填>[&until=][&group_by=none|model|provider|user|user_group|api_key|day]
 GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenants
 GET  {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes
 PUT    {HYDRA}/tenant/{TID}/api/v1/sub-tenants/{name}        body {key_prefix?, enabled}      (upsert by name)
 DELETE {HYDRA}/tenant/{TID}/api/v1/sub-tenants/{id}                                        (delete by immutable id)
 PUT    {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes            body {sub_tenant_id, model_key?, provider_id, enabled} (upsert by (sub_tenant_id, model_key))
 DELETE {HYDRA}/tenant/{TID}/api/v1/sub-tenant-routes/{id}     (delete by immutable id)
+
+GET  {HYDRA}/tenant/{TID}/api/v1/user-groups                 (list)
+PUT    {HYDRA}/tenant/{TID}/api/v1/user-groups                     body {id?,name,enabled?}   (upsert)
+DELETE {HYDRA}/tenant/{TID}/api/v1/user-groups/{id}                 (409 group_not_empty if it still has users)
+GET  {HYDRA}/tenant/{TID}/api/v1/users[?group_id=]                (list; filter must be YOURS)
+PUT    {HYDRA}/tenant/{TID}/api/v1/users                            body {id?,user_group_id,external_id?,name,enabled?}
+DELETE {HYDRA}/tenant/{TID}/api/v1/users/{id}                     (cascades its api-keys)
+GET  {HYDRA}/tenant/{TID}/api/v1/users/{uid}/api-keys             (prefix/last4 only, never plaintext)
+POST   {HYDRA}/tenant/{TID}/api/v1/users/{uid}/api-keys            body {name,expires_at?}    (plaintext shown ONCE; ceiling 1000 by default)
+DELETE {HYDRA}/tenant/{TID}/api/v1/users/{uid}/api-keys/{key_id}  (revoke; next request 401)
+PUT    {HYDRA}/tenant/{TID}/api/v1/users/{uid}/billing             body {status:"active"|"delinquent",reason?} (delinquent => 402 on /v1/*)
 
 Header: Authorization: Bearer <tenant access token>
 Trace:  响应头 X-Hydra-Trace-Id，报障必带
