@@ -1,8 +1,8 @@
 # 实施计划：T10 遗留清理（解耦 → 删除 auth cache / sub-tenant / auth_url）
 
 - **日期**：2026-11-04
-- **状态**：草案（待实施）
-- **前置**：`2026-11-03-user-hierarchy-global-role.md` 的 T1–T9/T11 已落地，全量测试 974 passed / 0 failed；T10 因架构耦合被回滚。
+- **状态**：**已完成（A–E 已 landed 2026-11-04）** — 阶段 A–D 为 four independent commits (`5809d0c` → `52fabb1` → `46bf3f1` → `efeec42`), 阶段 E 为 the docs/ADR/INDEX + guard cleanup in the working tree; the 8 static guards (metrics/env/e2e-contracts/tenant-error-codes/i18n/ci-wiring/cluster-env/source-purity) are all exit 0.
+- **前置**：`2026-11-03-user-hierarchy-global-role.md` 的 T1–T9/T11 已落地，全量测试 974 passed / 0 failed；T10 was previously deferred because of the `cluster/events.rs` ↔ `AuthCache` coupling — this plan breaks that coupling first, so T10 is no longer blocked.
 - **目标**：删除新体系已不再使用的旧结构，使“Global Role = 唯一调度界面”“内部鉴权 = 唯一 API-Key 鉴权”在代码层也成立。
 - **硬约束**：
   1. **禁止**触碰 `tools/`（Go/Python/TS SDK）、`go.work`、`integration/test_sdk_*`、`integration/mock_llm.py`。
@@ -126,3 +126,19 @@
 | 迁移 0015 与代码不同步 | 先删代码+测试，再落 0015；同批 commit |
 
 **回滚**：每步前 `git stash create` + untracked tar；失败 `git checkout <sha> -- .` 恢复。T10 不应触碰当前绿色工作区以外的功能。
+
+---
+
+## 8. 完成记录（2026-11-04）
+
+| 阶段 | 内容 | 落地 |
+|---|---|---|
+| A | `cluster/events.rs` 里 auth-cache 应用段解（stream / watermark / trim / generation 保留） | `5809d0c refactor(cluster): decouple invalidation events from auth cache` |
+| B | 删除外部鉴权：`redis/auth_cache.rs`、`http.rs` `AuthChecker`/`HttpAuthChecker`/`AuthCache`/`AuthConfig`、admin `DELETE /api/v1/auth/cache` + `POST /api/v1/tenants/auth/test`、tenant `auth/cache/invalidate`、`HYDRA_AUTH_*` envs | `52fabb1 refactor(auth): remove external auth cache and endpoints` |
+| C | 删除 sub-tenant / key-prefix binding 全栈 + migration `0015_drop_legacy.sql`（DROP 3 tables） | `46bf3f1 refactor(control-plane): remove sub-tenant and key-prefix binding` |
+| D | 删除 `auth_url` / `access_token_hash`（Tenant DTO、admin tenant PUT、`whoami`、db）+ same migration 2 × DROP COLUMN | `efeec42 refactor(tenant): remove auth_url and access_token_hash` |
+| E | 文档 / ADR / INDEX / guards | 未提交（working tree）：`dev-docs/ops.md`（§5 里 auth-cache ops 改为 "auth is internal"，fleet-converge env 保留里 reword、sub-tenant admin section 里 hierarchy read/write 替换、stale metrics/env rows 删）、`dev-docs/tenant-api-integration.md`（T10 contract banner + endpoint/error-code/throttle/troubleshooting refresh）、`tests/e2e/admin.spec.cjs`（drop stale `auth_url` field）、`admin-ui/i18n.js`（9 dead keys × 4 locales）、`scripts/check_documented_env.cjs`（3 stale `HYDRA_AUTH_FAIL*` prose records removed）、ADR-0003 + `dev-docs/aegis/INDEX.md` status sync |
+
+**Gates（阶段 E, all exit 0）**:`check_documented_metrics.cjs` / `check_documented_env.cjs` / `check_e2e_contracts.cjs` / `check_tenant_error_codes.cjs` / `check_i18n.js` / `check_ci_wiring.cjs` / `check_cluster_env.cjs` / `check_source_purity.cjs`。Guard self-tests `check_documented_env.test.cjs`（33 pass）与 `check_i18n.test.cjs` also green。阶段 A–D 里 `cargo check --all-targets` + 全量 Rust suite were green at their own commits; the Rust suite was NOT re-run in this docs-only phase.
+
+**Residual（documented, intentionally NOT rewritten in this pass）**:`dev-docs/design.md` §11 / §7.1c / §13 and `dev-docs/HANDOFF.md` / `design-sub-tenant.md` / `design-tenant-api.md` still narrate the external-auth + sub-tenant architecture as present tense; they are historical design records and a dedicated prose pass should reconcile them (or archive them) rather than patching them piecemeal.

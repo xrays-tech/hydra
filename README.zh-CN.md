@@ -42,7 +42,7 @@ Agent ──► Pingora ──► [解析租户 → 内部 API-key 鉴权 → �
 - **终止模式代理（Terminate-in-Pingora）**：在 `request_filter` 内读取完整请求体（model 提取适用于任意位置/schema，不再受首 chunk 限制）；通过专用 reqwest client 调用供应商；SSE 响应经 Pingora session 流式回写。返回 `Ok(true)`，Pingora 不拨号 upstream。
 - **路由**：模型名 → 供应商 ∩ 租户授权供应商；平滑加权轮询（Nginx SWRR）。
 - **api-key 前缀绑定闸门**：按原始前缀把客户端 api-key 固定到指定供应商（`sk_aaa_*` → Provider A）；最长前缀优先，fail-closed（绑定供应商不可用 ⇒ 503，绝不回落）。
-- **内部 API-key 鉴权 + 四级用户体系**：客户端出示自己的 api-key（`hk_` + CSPRNG，落库里存 only SHA-256，plaintext shown only at creation）resolved to a user under the four-level hierarchy `tenant → user_group → user → api_key`.unknown/disabled/expired key → **401**,user/group disabled → **403**,delinquent user（set via the tenant API `PUT /users/{id}/billing`)→ **402 `user_delinquent`**.no external `auth_url`,no auth cache.租户 access token（`ht_`,multi-token per tenant）only gate 租户 self-service API.旧 external-auth path（`auth_url` / `HttpAuthChecker` / `AuthCache`)is dead code pending the deferred T10 cleanup.
+- **内部 API-key 鉴权 + 四级用户体系**：客户端出示自己的 api-key（`hk_` + CSPRNG，落库里存 only SHA-256，plaintext shown only at creation）resolved to a user under the four-level hierarchy `tenant → user_group → user → api_key`.unknown/disabled/expired key → **401**,user/group disabled → **403**,delinquent user（set via the tenant API `PUT /users/{id}/billing`)→ **402 `user_delinquent`**.no external `auth_url`,no auth cache.租户 access token（`ht_`,multi-token per tenant）only gate 租户 self-service API.旧 external-auth path（`auth_url` / `HttpAuthChecker` / `AuthCache`)与 sub-tenant / key-prefix routing 里 REMOVED by the T10 cleanup（migration `0015_drop_legacy.sql`)— 打旧路径即 plain 404.
 - **Global Role 调度**：a `global_role` table keyed on `(tenant, user_group, user, api_key, model)`（each dim `*` = any）→ provider set.matched rules' providers are **unioned**（dedup,ordered by `provider_id` ascending）and always intersected with the providers that actually serve that model;wildcard-tenant roles still intersect `tenant_providers`(fail-closed).no session header → weighted SWRR（平滑加权轮询）;with one → session-sticky weighted rendezvous（`HYDRA_SESSION_AFFINITY`,default on).no match → today's `tenant_providers ∩ models_by_key` behavior.
 - **故障转移 + 熔断**：failover 循环依次尝试每个候选供应商；连续失败触发 dead-set，后台探活恢复。全 body 重放 O(1)。
 - **限流**：内存滑动窗口（请求数 + token），按角色，m/h/d 窗口。
@@ -126,7 +126,7 @@ curl -X POST http://localhost:8081/api/v1/providers \
 
 curl -X POST http://localhost:8081/api/v1/tenants \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"id":"acme","name":"ACME","domain":"acme.example.com","auth_url":"https://auth.acme.example.com/v","enabled":true}'
+  -d '{"id":"acme","name":"ACME","domain":"acme.example.com","enabled":true}'
 
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/v1/providers
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/metrics

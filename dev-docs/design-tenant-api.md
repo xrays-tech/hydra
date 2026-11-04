@@ -1,5 +1,8 @@
 # 设计：租户自助 API（Tenant API）——数据面 `/tenant/{tenant_id}/api`
 
+> ⚠ **2026-11-04 — CONTRACT UPDATED (T10 complete).** The `auth/cache/invalidate` endpoint, the sub-tenant read/write endpoints (§5.4–§5.6 at the time of writing), the `auth_url` field in `whoami`, and the internal `x-hydra-tenant-token` forwarding plane are **gone** (T10 Stages B/C/D, migration `0015`): calls to those paths are plain 404s and revoke/billing flip on the next request. The live contract is [`tenant-api-integration.md`](tenant-api-integration.md); this design file keeps its historical decisions (A-1 / A-2 / D-6) but their endpoints have retired.
+
+
 > **对外契约（给租户）在 [`tenant-api-integration.md`](tenant-api-integration.md)**：快速开始、字段表、错误码总表、边界与排障。本文件是**内部设计**：为什么这样设计、备选方案与取舍。
 > 两者冲突时**以代码与测试为准**，并视为缺陷（修复方式：先改代码或先改契约，再把两份文档一起对齐）。
 

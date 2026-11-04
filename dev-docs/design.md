@@ -1,5 +1,8 @@
 # Hydra 详细设计方案
 
+> ⚠ **2026-11-04 — auth & routing sections are historical.** §11 (external `auth_url` auth hop + auth cache), §7.1c (sub-tenant prefix routing) and the related §13 admin rows describe the architecture **before T10**. Since T10 (2026-11-04, Stages A–D + migration `0015`) the data plane authenticates against the stored `user_api_key` rows (internal auth, no cache, no `auth_url` column) and routing is model × tenant providers ∩ Global Role. Read `dev-docs/ops.md` §5 / §5.5 and `dev-docs/tenant-api-integration.md` for the live behaviour.
+
+
 > 基于 `dev-docs/proposal.md` 的 LLM 大模型路由中转服务系统设计与实现方案。
 >
 > 技术栈：Rust + Pingora + SQLite(sqlx)

@@ -4,7 +4,7 @@
  * Covers:
  *   - T2.1 login with admin token
  *   - T2.2 create provider → list shows it → persisted via /api (DB row exists)
- *   - T2.3 tenant with auth_url + associate provider/model
+ *   - T2.3 tenant create + associate provider/model
  *   - T2.5 breaker reset
  *
  * The suite ASSUMES a running hydra instance (start it with seed.sh first; see
@@ -540,21 +540,19 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     await page.keyboard.press('Escape');
   });
 
-  test('T2.3 tenant with auth_url + associate provider/model', async ({ page }) => {
+  test('T2.3 tenant create + associate provider/model', async ({ page }) => {
     await signIn(page);
 
-    // Create a tenant via the UI (auth_url is required).
+    // Create a tenant via the UI.
     await navItem(page, 'tenants').click();
     await newButton(page, 'New tenant').click();
     const tid = `${RUN_ID}-tenant`;
     await page.fill('[data-field="id"]', tid);
     await page.fill('[data-field="name"]', 'Playwright Tenant');
     await page.fill('[data-field="domain"]', `${RUN_ID}.example.com`);
-    await page.fill('[data-field="auth_url"]', 'https://auth.pw.example.com/v1/verify');
     await page.locator('.modal-foot button.btn.primary').click();
     await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
     await expect(page.locator('#content table tbody')).toContainText(tid);
-    await expect(page.locator('#content table tbody')).toContainText('auth.pw.example.com');
 
     // Create a provider + model + key to associate.
     const pid = `${RUN_ID}-tp`;
@@ -635,7 +633,6 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
           updated_at: '',
           name: `pw-cert-${stamp}`,
           domain,
-          auth_url: 'https://auth.example.com/v1/verify',
           cert_file: certFile,
           cert_key: certKey,
           enabled: true,

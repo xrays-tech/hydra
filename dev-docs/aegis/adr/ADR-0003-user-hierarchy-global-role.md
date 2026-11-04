@@ -1,6 +1,6 @@
 # ADR-0003 — 四级用户体系、内部 API-Key 鉴权、Global Role 资源调度
 
-- **Status**：`accepted` **核心已实施（2026-11-03：T1–T9 + T11 全绿，974 passed / 0 failed）**；**T10（`0015` DROP 旧 + 外部鉴权 / sub-tenant / key-prefix-binding 代码、UI、文档 delete）DEFERRED** 到后续批次，故旧路径仍是可编译 / 可服务 dead-ish code。
+- **Status**：`accepted` **全部已实施（2026-11-03：T1–T9 + T11 全绿，974 passed / 0 failed；2026-11-04：T10 已收口** — 四独立提交 `5809d0c`(A: events 解耦) / `52fabb1`(B: auth cache 删除) / `46bf3f1`(C: sub-tenant / key-prefix binding 删除 + `0015`) / `efeec42`(D: `auth_url` / `access_token_hash` 删除) + 文档/guards 收尾（plan `dev-docs/aegis/plans/2026-11-04-t10-legacy-cleanup.md`）;旧路径下不再编译、不再服务、不再可调用).
 - **Date**：`2026-11-03`
 - **Deciders**：用户（四级体系 + 内部鉴权 + 欠费 + 多令牌 + Global Role 五维/通配/并集 + 会话粘性 + 规则收束到单界面）；编排智能体综合 exp-2/exp-3/exp-4 现状测绘。
 - **Source Evidence**：用户需求 1–9（见 plan §0）；本仓直读 —— `migrations/0014_user_hierarchy.sql`（只 CREATE）、`crates/hydra-core/src/{model.rs,identity.rs,affinity.rs,router.rs,role.rs}`、`crates/hydra-server/src/{proxy.rs,tenant_api/handlers.rs,admin/handlers.rs,db.rs,store.rs,cluster/arachne_keys.rs}`。
@@ -15,12 +15,12 @@
 | # | 事实（本次直读） | 证据 |
 |---|---|---|
 | C1 | 客户端 key 不落库:鉴权 = client api-key → `ConfigData.users_by_api_key_hash`（全行,含 disabled/expired/delinquent,由 `reindex_identity` 从全行同源 leader/副本） | `identity.rs:20-165`;`store.rs:221`;`db.rs:2180` |
-| C2 | 旧外部鉴权 = `proxy` 未命中 → `AuthCache`(L1+Redis L2) → POST `tenant.auth_url`;`HttpAuthChecker` 读 `auth_url`.本决策使 it **dead-but-present** | `proxy.rs` (pre-existing hop);`http.rs` `AuthChecker`;`redis/auth_cache.rs` (still compiles) |
-| C3 | 旧 routing 层 = key-prefix `provider_key_binding` + `sub_tenant`/`sub_tenant_route`（前缀路由,operator-binding 优先,fail-closed 交集） | `router.rs` `match_key_binding`/`match_sub_tenant*` (still live until T10) |
+| C2 | 旧外部鉴权 = `proxy` 未命中 → `AuthCache`(L1+Redis L2) → POST `tenant.auth_url`;`HttpAuthChecker` 读 `auth_url`.本决策使 it **dead-but-present（T10 2026-11-04 deleted it outright**） | `proxy.rs` (pre-existing hop);`http.rs` `AuthChecker`;`redis/auth_cache.rs` (removed by T10 Stage B) |
+| C3 | 旧 routing 层 = key-prefix `provider_key_binding` + `sub_tenant`/`sub_tenant_route`（前缀路由,operator-binding 优先,fail-closed 交集） | `router.rs` `match_key_binding`/`match_sub_tenant*` (live until T10 Stage C deleted them) |
 | C4 | 无 user / group / api_key 表;无 `*` 通配;无会话头读取;`ModelProvider.weight` 死,真权重 = `Provider.weight` | pre-batch 现状 |
 | C5 | 控制面 `TOC_FORMAT` was 4;新实体改变 key 布局/decode ⇒ 单调 bump required | `arachne_keys.rs:5` now `TOC_FORMAT = 5` |
 
-一句话:鉴权与 routing 规则 today 分散在外部 auth URL + key-prefix binding + sub-tenant route,没有 user/group dimension,没有 session affinity — a green-field rebuild collapses them to one model (see §2),with the deletion of the old layers deferred.
+一句话:鉴权与 routing 规则 today 分散在外部 auth URL + key-prefix binding + sub-tenant route,没有 user/group dimension,没有 session affinity — a green-field rebuild collapses them to one model (see §2),with the deletion of the old layers deferred at the time of writing (done by T10 on 2026-11-04).
 
 ## 2. 决策（Decision）
 
@@ -40,8 +40,8 @@
 | D-D | session-sticky weighted rendezvous (minimum `-ln(u)/weight`),stateless,failover tail `provider_id` asc | stable + `P(i) ∝ weight` + no memory growth. 被否:`hash%N` (remaps almost all on set change);stateful `swrr::order` |
 | D-E | keys store SHA-256 + prefix/last4,plaintext once (D-7 in plan),`ht_`/`hk_` same shape | matches existing seal policy. 被否:operator-chosen token口令 (weak口令 + hash boundary mismatch) |
 | D-F | `TOC_FORMAT` 4→5,per-row entities carry disabled rows (NOT duplicated into `_fidelity`),seal with `seal_deterministic` | avoid 1 MiB fidelity cliff. 被否:reset to 1 (variant deletion reorders discriminants → old tree silently misread) |
-| D-G | `0014` only CREATE,`0015` + code deletion land SAME batch (T10);T1–T9 keep old code compiling | green-field but drop-before-code breaks loader/proxy mid-batch (BL-2) |
+| D-G | `0014` only CREATE,`0015` + code deletion land SAME batch (T10, done 2026-11-04 in `46bf3f1` + `efeec42`);T1–T9 keep old code compiling | green-field but drop-before-code breaks loader/proxy mid-batch (BL-2) |
 
-## 4. 遗留 (T10-deferred)
+## 4. ~~遗留 (T10-deferred)~~ — 已收口（2026-11-04, T10 complete）
 
-`0015` not applied ⇒ `tenant.auth_url` NOT NULL still write-required (`0014` only adds);`auth/cache/invalidate`, admin `auth/test`, `auth/cache`, and the whole sub-tenant / sub-tenant-route / provider-key-binding stack (core types, ConfigData projections, router gates, tenant-API read/write endpoints, admin UI/i18n pages, `HttpAuthChecker`/`AuthCache`/`redis/auth_cache.rs`) remain compiled & served dead code. `whoami` still echoes `auth_url`. Deleting them is the deferred T10 batch;`TOC_FORMAT=5` refuses old trees by `UnknownEntityKind` (fail-stop) — green-field wipe ⇒ no live exposure.
+At the time of writing this was deferred (`0015` not applied, `tenant.auth_url` NOT NULL still write-required, `auth/cache/invalidate`, admin `auth/test`, `auth/cache`, and the whole sub-tenant / sub-tenant-route / provider-key-binding stack compiled & served as dead code, `whoami` still echoing `auth_url`). **All of it is now CLOSED by T10 (2026-11-04)**: migration `0015_drop_legacy.sql` drops `provider_key_binding` / `sub_tenant_route` / `sub_tenant` and the `access_token_hash` / `auth_url` columns; `HttpAuthChecker` / `AuthCache` / `redis/auth_cache.rs` are deleted; the admin `auth/cache` route and the tenant-plane `auth/cache/invalidate` answer `404`; `TOC_FORMAT=5` refuses old trees by `UnknownEntityKind` (fail-stop) — green-field wipe ⇒ no live exposure.

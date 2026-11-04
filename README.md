@@ -43,7 +43,7 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 - **Two client protocols, format-homogeneous**: accept OpenAI (`POST /v1/chat/completions`) **and** Anthropic (`POST /v1/messages`). The path you call selects the format end-to-end — the upstream URL, request body, and usage parser all match (no OpenAI↔Anthropic conversion). `UsageScanner` picks `ProviderKind::Anthropic` for `/v1/messages` (parses `input_tokens`/`output_tokens`/`cache_read_input_tokens`), `Generic` otherwise.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
 - **Key-prefix binding gate**: pin client api-keys by raw prefix to one provider (`sk_aaa_*` → Provider A); longest prefix wins, fail-closed (bound provider unavailable ⇒ 503, never falls back).
-- **Internal API-key auth + four-level user hierarchy**: a client presents its own api-key (`hk_` + CSPRNG, stored only as SHA-256; plaintext shown once at creation), resolved to a user under `tenant → user_group → user → api_key`. Unknown/disabled/expired key → **401**, disabled user/group → **403**, a user flagged delinquent via the tenant API → **402 `user_delinquent`**. No external `auth_url`, no auth cache. Tenant access tokens (`ht_`, multi-token per tenant) gate the tenant self-service API only. The old external-auth path (`auth_url` / `HttpAuthChecker` / `AuthCache`) is dead code pending the deferred T10 cleanup.
+- **Internal API-key auth + four-level user hierarchy**: a client presents its own api-key (`hk_` + CSPRNG, stored only as SHA-256; plaintext shown once at creation), resolved to a user under `tenant → user_group → user → api_key`. Unknown/disabled/expired key → **401**, disabled user/group → **403**, a user flagged delinquent via the tenant API → **402 `user_delinquent`**. No external `auth_url`, no auth cache. Tenant access tokens (`ht_`, multi-token per tenant) gate the tenant self-service API only. The old external-auth path (`auth_url` / `HttpAuthChecker` / `AuthCache`) and the sub-tenant / key-prefix routing layer were REMOVED by the T10 cleanup (migration `0015_drop_legacy.sql`); calls to those old paths are plain 404s.
 - **Global Role routing**: a `global_role` table keyed on `(tenant, user_group, user, api_key, model)` — each dimension `*` = any — maps to a provider set. Matched rules' providers are **unioned** (dedup, `provider_id` ascending) and always intersected with providers actually serving that model; wildcard-tenant roles still intersect `tenant_providers` (fail-closed). Weighted SWRR by default, or session-sticky weighted rendezvous (`HYDRA_SESSION_AFFINITY`, default on). No match → today's `tenant_providers ∩ models_by_key` behavior.
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.
@@ -126,10 +126,10 @@ curl -X POST http://localhost:8081/api/v1/providers \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"id":"openai","key":"openai","name":"OpenAI","endpoint":"https://api.openai.com","weight":1}'
 
-# create a tenant (auth_url mandatory) + grant provider + model access
+# create a tenant + grant provider + model access
 curl -X POST http://localhost:8081/api/v1/tenants \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"id":"acme","name":"ACME","domain":"acme.example.com","auth_url":"https://auth.acme.example.com/v","enabled":true}'
+  -d '{"id":"acme","name":"ACME","domain":"acme.example.com","enabled":true}'
 
 # list / reload / metrics
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/v1/providers

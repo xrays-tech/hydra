@@ -77,9 +77,6 @@ const NOT_READ_MARKERS = [/not read/i, /未读取/, /未接线/, /不存在该�
 // staleness check applies to whichever list is in force.
 const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_LOG', 'ops.md says outright that it is **NOT read** (the `RUST_LOG` row documents the removal of the alias)'],
-  ['HYDRA_FAIL_MODE', 'a note recording the names that do NOT select the auth fail mode (measured 2026-09-30: each still answers 503)'],
-  ['HYDRA_AUTH_FAIL_MODE', 'same note — a rejected spelling, not a knob'],
-  ['HYDRA_AUTH_FAILMODE', 'same note — a rejected spelling, not a knob'],
   ['HYDRA_FAILOVER_GRACE_MS', 'ops.md lists it among the knobs that are documented but NOT wired (round 166 measurements)'],
   ['HYDRA_LEADER_LEASE_MS', 'a knob RETIRED by ADR-0001 T4.1: ops.md §13.3b lists it among the retired names (nothing reads it, and `RETIRED_CLUSTER_ENV` says so in code)'],
   ['HYDRA_CONTROL_URL', 'RETIRED by ADR-0001 T4.1 (the snapshot channel is gone): listed in ops.md §13.3b as a name to remove from manifests'],

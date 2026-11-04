@@ -5,6 +5,10 @@
 **Status:** Production-ready (evaluation report verdict **9.2/10**, up from 7.8/10).
 **Purpose:** This document is the starting point for the next development round — it captures the architecture as it now stands, what was built/verified this round, where things live, and what is deliberately deferred.
 
+
+> ⚠ **Archive warning (2026-11-04).** The external-auth cache (`auth_url`, `AuthCache`, `auth/cache*`), the sub-tenant / key-prefix routing plane and `usage_record.sub_tenant_id` described below **were all REMOVED by T10** (Stages B/C/D, migration `0015_drop_legacy.sql`). Treat every such mention as the state at the archive date, not the current architecture — the live picture is `dev-docs/ops.md` + `dev-docs/tenant-api-integration.md` + `dev-docs/aegis/adr/ADR-0003-user-hierarchy-global-role.md`.
+
+
 ---
 
 ## 0. Quick start

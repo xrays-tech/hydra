@@ -5,7 +5,7 @@
 > §12 TLS, §13 admin, §15 deploy, §16 security, §17 metrics).
 
 This runbook covers **deployment, configuration, graceful zero-downtime upgrade,
-cert rotation, rate-limit tuning, auth-cache invalidation, breaker operations,
+cert rotation, rate-limit tuning, breaker operations,
 troubleshooting**, and the **load baseline** established in wave-6. It is the
 single source of truth for ops; the design doc is the source of truth for
 behaviour.
@@ -64,7 +64,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. **Do not put a path in this URL** — the sink always POSTs to `/`; a path is *trimmed* rather than used (measured 2026-09-30: before that fix `http://host:8123/clickhouse` failed at connect with `invalid port value`, because the path was still glued to the port when it was parsed). **What the sink actually puts on the wire** (measured 2026-09-30 against a mock ClickHouse, `integration/test_clickhouse_sink_wire.py`): `POST /?<your params>&query=INSERT%20INTO%20usage_record%20(…)%20SETTINGS%20…%20FORMAT%20JSONEachRow`, with the usage **row values in the request BODY** as one JSON object per line — **not** as `param_*` query parameters (that binding form belongs to the usage *reader*, `usage/backends/clickhouse/mod.rs` — moved there from `usage_query.rs` by ADR-0002 T1.3). Useful when diagnosing from a network capture: the SQL appears percent-encoded in the URL, the row values do not, and `client_api_key` in the body is **masked** (`sk*******-1`), never the tenant's real key. |
 | `RUST_LOG` | `info` (set by the image + every compose file) | `tracing` env filter — `main.rs:172` uses `EnvFilter::from_default_env()`. **`HYDRA_LOG` is NOT read**: it was listed here as an alias until 2026-09-29 and has never existed in code (`grep -rn HYDRA_LOG crates/ scripts/ tools/ environment/` is empty). Measured 2026-09-29 on a live instance: started with **only** `HYDRA_LOG=debug` it logs **0 lines** (while `/health` and the API still answer 200), with `RUST_LOG=debug` it logs ~130 lines — so an operator reaching for the documented alias during an incident gets no extra logging. Also note `info` is a **deployment** default, not a binary default: with neither variable set the same instance logs **0 lines** (`from_default_env()` defaults to ERROR-level), and the shipped `Dockerfile`/compose files are what set `RUST_LOG=info`. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
-| `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long `auth/cache/invalidate` waits for the fleet to confirm before answering `202` with `lagging`. |
+| `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` | `2000` | How long the **fleet-converge barrier** waits for every live node to confirm an invalidation-stream event before reporting `pending` (`202` with `lagging`). The auth cache it originally served is gone (T10); the value is still read (`crates/hydra-server/src/tenant_api/mod.rs`) and wired into the admin fleet reporting for config-publish convergence. |
 | `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` | `60` | Per-tenant cap on AUTHORISED requests (429 beyond it) — counts every authenticated request the node accepts for the tenant, including ones it then rejects with 4xx/5xx (only the 403 URL-tenant mismatch is exempt). The amplification budget: one tenant's credential must not be able to spend other tenants' availability. |
 | `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` | `10` | Cap on FAILED authentications, per **source IP** and per **token digest** independently. |
 | `HYDRA_TENANT_API_LOCKOUT_SECS` | `900` | Once a dimension exceeds its failure budget it is locked for this long. **The lockout is consulted only on the authentication-failure path**: a request with a valid token is never refused by it, so a locked-out guesser **can** distinguish `429` (wrong token) from `200` (right token) — the no-validity-oracle property is deliberately given up (marginal guessing value ≈ 0 at ≥16-char tokens, and the `403` URL-tenant-mismatch channel already exposes validity). |
@@ -73,7 +73,6 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_SESSION_AFFINITY` | `on` | Session-sticky routing switch. With a session header (priority `X-Opencode-Session` → `Session-Id` → `x-conversation-id`; first non-empty after trim, ≤256 B wins), the same `(tenant_id, model_key, api_key_id, session)` resolves to a STABLE provider via weighted rendezvous: `score = -ln(u)/weight`, **minimum** wins (ties by `provider_id` ascending), so `P(i) ∝ weight` — NOT argmax-of-hash. `off`/`false`/`0` ⇒ the no-session-header path (legacy SWRR). Parse is **TOTAL**: unset or an unrecognised value falls back to the default `on` and does NOT refuse startup (a routing hint, not a safety control). Only ever picks *within* the matched `global_role` union; breaker / admission / rate limits still apply. Read at `main.rs:667` (`std::env::var("HYDRA_SESSION_AFFINITY")`). |
 | `HYDRA_MAX_USERS_PER_TENANT` | `1000` | Ceiling on ONE tenant's `user` rows (plan §3.5). Enforced on the CREATE path of `PUT /tenant/{tid}/api/v1/users` ONLY — updating an existing row adds no row, so a tenant at its ceiling can still edit what it has. Over it ⇒ **400 `hierarchy_limit_exceeded`** naming this env. Unset / `0` / unparseable falls back to `1000`. Read via `env_positive_u32("HYDRA_MAX_USERS_PER_TENANT", DEFAULT_MAX_USERS_PER_TENANT)` in `crates/hydra-server/src/tenant_api/mod.rs`. |
 | `HYDRA_MAX_HIERARCHY_ROWS` | `3000` | Ceiling on the TOTAL rows of the FIVE identity tables (`user_group` + `user` + `user_api_key` + `tenant_access_token` + `global_role`) — plan §3.5, sized for headroom under the `multi_put` 4096-entry publish budget. Enforced on EVERY hierarchy CREATE: `PUT .../user-groups`, `PUT .../users`, `POST .../api-keys` (updates are not checked, they add no row). Over it ⇒ **400 `hierarchy_limit_exceeded`** naming this env. The count is taken from the PINNED config snapshot (no extra DB read on a write path); `user_group`/`user` rows and EVERY api-key row are all counted, `tenant_access_token`/`global_role` count only ENABLED rows, so disabled rows in those two tables make the ceiling slightly LOOSE — the direction that admits a create rather than refusing one. Unset / `0` / unparseable falls back to `3000`. Read via `env_positive_u32("HYDRA_MAX_HIERARCHY_ROWS", DEFAULT_MAX_HIERARCHY_ROWS)` in `crates/hydra-server/src/tenant_api/mod.rs`. |
-| `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` | `300` | Ceiling on an **allow** entry's TTL, including one a tenant asked for via `expires_in`. Bounds how long a revoked key can keep working on a node that missed the invalidation. Fails startup on a non-positive value. |
 | `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
 | `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS` | `15000` | Deadline for ONE write attempt (the response to an `INSERT`). A flush that trips it is **retried** with the same `insert_deduplication_token`, so a slow ClickHouse costs latency inside the flush budget rather than a lost batch; the buffer keeps up to `MAX_RETAINED` (10 000) rows in the meantime. |
 | `HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS` | `3000` | Deadline for the TCP connect to ClickHouse. Distinct from the write deadline on purpose: a black-holed host must fail the batch quickly so the retry/backoff loop can report it (`hydra_usage_records_dropped_total`) instead of holding the flush for the full write budget. |
@@ -101,7 +100,7 @@ disk at runtime. The release binary is the only artefact you ship.
 > *current* mechanism). Prefer env for secrets; `hydra.toml` may carry
 > non-secret defaults.
 
-> **Auth is now INTERNAL (no `auth_url` is ever consulted).** A data-plane request is authenticated by its client api-key matched against the tenant's stored `user_api_key` rows (`ConfigData.users_by_api_key_hash`): unknown / disabled / expired key → **401 `invalid_api_key`**; user / group / tenant disabled → **403**; a user flagged `billing_status = delinquent` (set via the tenant API `PUT /users/{id}/billing`) → **402 `user_delinquent`** (`{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}`). No external auth hop, no auth cache, no `auth/cache/invalidate` round-trip — a revoke or a delinquency flips on the next request (SLO ≤5 s across nodes via config publish + 1 s materialise). Tenant access tokens (`tenant_access_token`, now **multi-token** per tenant, `ht_` prefix, plaintext shown exactly once at creation) gate ONLY the tenant self-service API. The tenant's `auth_url` column is STILL required at write time (NOT NULL — migration `0015` / T10 is deferred), but NOTHING sends a request to it any more: the old `HttpAuthChecker` / `AuthCache` / `redis/auth_cache.rs` are dead code pending T10.
+> **Auth is now INTERNAL (no `auth_url` is ever consulted).** A data-plane request is authenticated by its client api-key matched against the tenant's stored `user_api_key` rows (`ConfigData.users_by_api_key_hash`): unknown / disabled / expired key → **401 `invalid_api_key`**; user / group / tenant disabled → **403**; a user flagged `billing_status = delinquent` (set via the tenant API `PUT /users/{id}/billing`) → **402 `user_delinquent`** (`{"error":{"message":"user_delinquent","type":"insufficient_quota","code":"user_delinquent"}}`). No external auth hop, no auth cache, no `auth/cache/invalidate` round-trip — a revoke or a delinquency flips on the next request (SLO ≤5 s across nodes via config publish + 1 s materialise). Tenant access tokens (`tenant_access_token`, now **multi-token** per tenant, `ht_` prefix, plaintext shown exactly once at creation) gate ONLY the tenant self-service API. The `auth_url` and `access_token_hash` columns are DROPPED (migration `0015` / T10 complete), and so is the old `HttpAuthChecker` / `AuthCache` / `redis/auth_cache.rs` surface — nothing sends a request to an external auth service any more. `DELETE /api/v1/auth/cache` and the tenant-plane `POST /tenant/{tid}/api/v1/auth/cache/invalidate` are REMOVED; calls to those paths are ordinary 404s.
 
 > **Hierarchy ceilings (capacity, plan §3.5) — ALL THREE WIRED.** The tenant self-service API refuses a mint past its ceiling with **400 `hierarchy_limit_exceeded`** (never a silent shard), and it never refuses an update of an EXISTING row: these ceilings count ROWS, and an update adds none. Read in `TenantApiConfig::from_env` (`crates/hydra-server/src/tenant_api/mod.rs`, the three multi-line `env_positive_u32` calls at `:278-293`) — `HYDRA_MAX_USER_API_KEYS_PER_TENANT` (default `1000`, per tenant, enforced in `handlers::user_api_key_create`), `HYDRA_MAX_USERS_PER_TENANT` (default `1000`, per tenant, `handlers::user_upsert`), `HYDRA_MAX_HIERARCHY_ROWS` (default `3000`, GLOBAL over the five identity tables, enforced on all three hierarchy creates; the count comes from the PINNED snapshot — the table row above says exactly which rows it includes, and in which direction it can be loose). Before this wiring only the api-keys ceiling was live, and the `multi_put` 4096-entry publish budget was the only bound on the rest of the identity surface.
 
@@ -221,7 +220,7 @@ no-op for backward-compat but never reveals plaintext (§16.2).
 ### 1.4 Backup & restore (added 2026-09-29 — this section did not exist)
 
 Everything the node needs to come back — providers, **sealed** provider keys,
-tenants, their certificates, limit roles, sub-tenants — lives in ONE SQLite file,
+tenants, their certificates, limit roles — lives in ONE SQLite file,
 in **WAL mode** (`db.rs:55` `journal_mode(WAL)`). Two consequences for a backup and
 one for a restore, all measured against a live node — and all three are now pinned by
 `integration/test_backup_restore.py` (CI `integration` job + the local gate), so this
@@ -447,7 +446,7 @@ install -m 0600 acme.2026.key /opt/hydra/data/certs/acme.key
 curl -X PUT http://127.0.0.1:8081/api/v1/tenants/t1 \
   -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" \
   -H "content-type: application/json" \
-  -d '{"id":"t1","name":"Acme","domain":"acme.com","auth_url":"https://auth.acme.com/v","cert_file":"data/certs/acme.crt","cert_key":"data/certs/acme.key","enabled":true,"created_at":"x","updated_at":""}'
+  -d '{"id":"t1","name":"Acme","domain":"acme.com","cert_file":"data/certs/acme.crt","cert_key":"data/certs/acme.key","enabled":true,"created_at":"x","updated_at":""}'
 ```
 
 The PUT triggers `ConfigStore::reload_all()` and the W4b cert-reload contract
@@ -637,7 +636,7 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   treatment the inert `matching_provider` dimension already had (D-11), a warning rather than an
 >   error because a deliberately shared budget is legitimate, it just must not be accidental.
 >
-> `matching_model` and `matching_tenant` are **exact** matches (not prefixes like the sub-tenant and
+> `matching_model` and `matching_tenant` are **exact** matches (not prefixes).
 > operator key-prefix mechanisms). `matching_provider` is inert — the pre-routing gate runs before a
 > provider is chosen — and **decision D-11 (2026-10-09) made the admin write boundary refuse any
 > non-NULL value** with `400 matching_provider_cannot_match`; the config-load Warn remains as the
@@ -651,212 +650,56 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 
 ---
 
-## 5. Auth-cache invalidation (design §11.7 / §13.2)
+## 5. Auth is internal — no auth cache, no `auth_url` (T10 complete)
 
-Hydra caches `sha256(api_key) → verdict` per `(tenant, key)` with a TTL (default
-allow 5 min / deny 30 s). Exception (2026-09-09): **402 insufficient-balance
-denials are never cached** — balance is fast-changing, and a cached 402 would
-degrade into a 401 within the deny TTL (design §11.3). The tenant auth service
-can force a re-check by invalidating entries:
+There is **no auth cache on the data plane**: a client api-key (`hk_…`) is matched
+against the tenant's stored `user_api_key` rows. Unknown / revoked / expired / disabled key ⇒
+**401 `invalid_api_key`**; user / group / tenant `enabled:false` ⇒ **403**; a `delinquent` user ⇒
+**402 `user_delinquent`**. A revoke or a billing flip therefore needs **no cache-busting call**:
+it takes effect on the **next** request on the node that received the write, and on the other nodes
+within **≤5 s** (config publish + ~1 s materialise).
 
-```bash
-# Invalidate specific keys for a tenant:
-curl -X DELETE http://127.0.0.1:8081/api/v1/auth/cache \
-  -H "Authorization: Bearer $HYDRA_ADMIN_TOKEN" \
-  -d '{"tenant_id":"t-acme","api_keys":["sk-aaa","sk-bbb"]}'
-# → {"invalidated":2,"tenant_id":"t-acme"}
+- The `auth_url` / `access_token_hash` columns and the legacy tables were DROPPED by migration `0015`;
+  `DELETE /api/v1/auth/cache` and `POST /tenant/{tid}/api/v1/auth/cache/invalidate` are gone — both
+  answer `404 not_found` now.
+- The **invalidation bus** itself still exists for cross-node cache/config invalidation (cluster P4).
+  Its health is watched on `hydra_invalidation_consumer_applied_id` /
+  `hydra_invalidation_consumer_lag_events` / `hydra_invalidation_consumer_stalled_seconds` (§9.1 / §13.x)
+  — a stalled consumer is the "one node is behind" alert, not a `202` from a retired endpoint.
 
-# Invalidate ALL keys for a tenant (e.g. suspected key compromise):
-curl -X DELETE .../api/v1/auth/cache -d '{"tenant_id":"t-acme"}'
-```
+### 5.1 Tenant self-service API — **on the DATA plane**
 
-Response (2026-09-17): the flat `invalidated`/`tenant_id` body gained
-`checked` / `scope` / **`fleet`**, and the `published: bool` field is GONE:
-
-```jsonc
-{"invalidated":2,"checked":2,"tenant_id":"t-acme","scope":"keys",
- "fleet":{"state":"applied","nodes_total":3,"nodes_applied":3,
-          "lagging":[],"event_id":"1737-0","waited_ms":41}}
-```
-
-`fleet.state` is **`applied`** (200 — every live node confirmed), **`pending`**
-(202 — published, not all confirmed; `lagging` **names the nodes that did not confirm**, or is **empty** when the node could not enumerate the live fleet — see the three-state note below), **`single_node`**
-(200 — this node is the whole data plane) or **`unavailable`** (503 — the channel
-exists but did not answer; **the fleet was NOT told**).
-
-> **This admin endpoint's three states — `202` is NOT "failure".** `DELETE
-> /api/v1/auth/cache` answers `200` / `202` / `503`, and only `200` means "done":
->
-> | HTTP | `fleet.state` | when | what it means |
-> |---|---|---|---|
-> | `200` | `applied` | every live node confirmed | done |
-> | `200` | `single_node` | not a cluster node (its own local clear IS the whole answer) | done |
-> | `202` | `pending` | published, not confirmed everywhere — **including the deterministic empty-fleet case below** | **in flight, not a failure**; retry (idempotent) or check `lagging` |
-> | `503` | `unavailable` | no invalidation stream **or** publish failed, or the watermark read failed | the fleet was **not** told — retry / escalate |
->
-> **The deterministic `202`: an empty live-fleet view.** The handler always *waits* on
-> the convergence barrier — the admin endpoint has **no** `wait=` parameter (that
-> switch exists only on the tenant plane), so the handler passes
-> `Some(converge_timeout)` unconditionally (the `let report = { … }` block in the
-> `DELETE /api/v1/auth/cache` handler in `crates/hydra-server/src/admin/handlers.rs`).
-> With `nodes_total == 0` — i.e. the live-node closure returned an empty set,
-> which is the normal state during the boot window before the registry refresh ticker
-> first populates it, and after registry rows expire while Redis is still reachable —
-> `await_applied` takes its empty-live-set arm and returns `Pending { nodes_applied: 0,
-> nodes_total: 0, lagging: [] }` (`crates/hydra-server/src/cluster/events.rs`, the
-> `if live_nodes.is_empty()` arm), which maps to **`202`**. It is deliberately *not*
-> `Applied`: nothing was checked, so "converged" must not be asserted (fail-closed —
-> this is the `Applied(200) → Pending(202)` flip from commit `c3eaa6f`). So on a
-> healthy single-node-ish deployment you can see a **steady `202` with `nodes_total:
-> 0`**: that is the honest "nobody was checked" answer, **not** an error and **not** a
-> sign the invalidation failed. Watch `hydra_tenant_api_invalidate_pending_total` /
-> the `fleet.lagging` list, not the status code alone. The tenant-plane equivalent
-> (`POST /tenant/{tid}/api/v1/auth/cache/invalidate`) documents the same three states
-> in `dev-docs/tenant-api-integration.md` §5.2.
->
-> `event_id` is **`null`** for `single_node` and for the *publish-failure* variant of
-> `unavailable` (nothing was enqueued), and `waited_ms` is hard-coded `0` on the
-> `single_node` path (`FleetReport::single_node()` never calls `.measured()`), so
-> neither field is a reliable convergence signal on its own.
-
-`published` was removed because it could not be false when there was no
-invalidation stream: it defaulted to `true` and only flipped on a publish error, so
-a single-node build asserted a broadcast that never happened. Never treat a 202 as
-"done" — retry or investigate the named `lagging` nodes. The next request for an
-invalidated key re-hits the tenant `auth_url`. The `hydra_auth_cache_size` gauge
-is refreshed after mutation (§17).
-
-> **Security trade-off**: within the cache window, a key revoked by the tenant
-> side can still pass. Shorten `[auth] allow_ttl_secs` or call invalidate
-> proactively on tenant-side revocation (design §16.1).
-
-> 租户侧的完整对接说明（字段表、错误码、边界、排障）在
-> [`tenant-api-integration.md`](tenant-api-integration.md) —— 给租户看，不是给你看的。
-> 本节只讲运维关心的部分。
-
-### 5.1 Tenant self-service API — **on the DATA plane** (2026-09-17)
-
-Each tenant can be given an **Access Token** (admin UI Tenants form →
-`Access token` field + Generate button; stored as a SHA-256 hash, never echoed,
-rotate by setting a new value). The tenant then serves itself, on the
+Each tenant can hold one or more **Access Tokens** (`tenant_access_token` rows, `ht_` prefix,
+created via the admin Tenants form / API, stored as SHA-256 hashes, plaintext shown exactly once;
+rotate by creating a new one and deleting the old). The tenant then serves itself, on the
 **data-plane listener** (`HYDRA_LISTEN`, i.e. the port its clients already use):
 
 | endpoint | what it does |
 | --- | --- |
 | `GET  /tenant/{tid}/api/v1/whoami` | the tenant's own non-secret config + snapshot version |
-| `POST /tenant/{tid}/api/v1/auth/cache/invalidate` | clear the tenant's cache **across every data-plane node** |
-| `GET  /tenant/{tid}/api/v1/usage?since=…&until=…&group_by=…` | token usage in a window (SQLite single node, ClickHouse in a cluster) |
+| `GET  /tenant/{tid}/api/v1/usage?since=…&until=…&group_by=…` | token usage in a window (`source: clickhouse`, or `503 usage_store_unavailable` when `HYDRA_USAGE_SINK=none`) |
+| `GET /tenant/{tid}/api/v1/user-groups` · `PUT …/user-groups` · `DELETE …/user-groups/{id}` | list / upsert / delete your groups (non-empty delete ⇒ `409 group_not_empty`) |
+| `GET /tenant/{tid}/api/v1/users[?group_id=]` · `PUT …/users` · `DELETE …/users/{id}` | list / upsert / delete your users (`user_group_id` required; delete cascades keys) |
+| `GET …/users/{uid}/api-keys` · `POST …` · `DELETE …/{key_id}` | list / **mint (plaintext `hk_` shown ONCE)** / revoke a key |
+| `PUT  …/users/{uid}/billing` | `active` / `delinquent` (delinquent ⇒ **402** on `/v1/*`) |
 
 ```bash
-# 欠费停机 / 付费恢复: force re-auth for one key, everywhere
-curl -X POST http://<data-plane-addr>/tenant/t-acme/api/v1/auth/cache/invalidate \
-  -H "Authorization: Bearer <tenant-access-token>" \
-  -H "content-type: application/json" \
-  -d '{"api_keys":["sk-aaa"]}'     # optional; empty body = clear ALL for the tenant
-→ {"invalidated":1,"checked":1,"tenant_id":"t-acme","scope":"keys",
-   "fleet":{"state":"applied","nodes_total":3,"nodes_applied":3,"lagging":[],"event_id":"1737-0","waited_ms":41}}
+# who you are / what your config says
+curl -s http://<data-plane-addr>/tenant/t-acme/api/v1/whoami   -H "Authorization: Bearer <tenant-access-token>"
+
+# revoke one client key — effective on the NEXT request (no cache, no TTL)
+curl -s -X DELETE http://<data-plane-addr>/tenant/t-acme/api/v1/users/$UID/api-keys/$KID   -H "Authorization: Bearer <tenant-access-token>"
 ```
 
-**Two optional query parameters control the wait** (design §4.2.2 / Q10):
+> There are **no `wait=` / `timeout_ms` parameters any more** (they belonged to the retired
+> invalidate endpoint). A write that lands locally but cannot be committed cluster-wide answers
+> **`503 config_not_published`** — re-read on the same node and re-send the identical request once
+> the cluster has a majority (§5.5 write semantics).
 
-| parameter | values | effect |
-|---|---|---|
-| `wait` | `converged` (default) \| `none` | `none` publishes and answers `202` immediately with the `event_id` — use it in bulk scripting where blocking per call is not worth it, then reconcile later |
-| `timeout_ms` | `1`..`60000` | overrides `HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS` for this one request |
+> 租户侧的完整对接说明（字段表、错误码、边界、排障）在
+> [`tenant-api-integration.md`](tenant-api-integration.md) —— 给租户看，不是给你看的.
+> 本节只讲运维关心的部分.
 
-Both are **validated, not tolerated**: an unknown `wait` is `400 invalid_wait` and an
-out-of-range `timeout_ms` is `400 invalid_timeout_ms`. A misspelt value that behaved
-like the default would leave you believing you had asked for (or skipped) a wait you
-never got.
-
-> `wait=none` returning `202` with `"lagging"` listing the nodes is **not** a claim
-> that those nodes are behind — nobody looked. Treat it as "in flight" and reconcile
-> with `event_id`. If you need to know, use the default.
-
-**The old management-plane route is deleted.** It was
-`POST /api/v1/tenants/{id}/auth/cache/invalidate`, and it ran *before* the admin
-gate — so exposing it meant exposing every operator endpoint on the same port,
-which is why the management port can stay bound to loopback.
-
-Identity comes from the **token only**: the URL's `{tenant_id}` is a
-cross-check (mismatch → 403 `tenant_id_mismatch`), and `Host` plays no part.
-An invalid/missing/unconfigured token is 401 (fail-closed), worded identically
-for "no token" and "wrong token". Lost token ⇒ the operator rotates it (the API
-never returns it).
-
-The failure budget is a **lockout**, not just throttling: when a dimension (per
-**source IP**, per **token digest**, or per **tenant**) exceeds its budget it is
-locked for `HYDRA_TENANT_API_LOCKOUT_SECS` (default 900), and once that failure
-window rolls the attacker can re-trip it (~11 requests / 15 min) — so the
-interruption is effectively renewable. Under B1 the lockout is consulted **only on
-the authentication-failure path**: a request carrying a **valid token is never
-refused** by it. The old whole-API blackout for co-located tenants therefore no
-longer occurs — what remains is that **failed** attempts from clients sharing an
-egress IP are counted together. The budget keys on the **socket peer IP**, never
-`X-Forwarded-For` (a caller-controlled header must not choose its own bucket);
-behind a load balancer every request shares the balancer's address, so the per-IP
-budget is effectively fleet-wide there. **Do not** "fix" legitimate-client
-throttling by raising `HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN` — raising it
-proportionally raises the token-guessing budget (the dimension's purpose), so it is
-not a free mitigation. Instead configure `HYDRA_TRUSTED_PROXIES` when behind a
-trusted LB (so the per-IP dimension keys on the real client), and/or rate-limit per
-real client IP at the LB/WAF. All windows are per-process, so an N-node fleet
-allows N times the configured rate; the per-node bound is what the fan-out actually
-depends on.
-
-> **`HYDRA_TRUSTED_PROXIES` deployment checklist (read before setting it):**
-> - **Confirm the LB both appends and strips.** It must **append** the real client IP to `X-Forwarded-For` **and** **strip/override any inbound `X-Forwarded-For`** from the client. Trusting a proxy that forwards a client-supplied XFF unmodified lets clients forge the header and rotate limiter buckets — the per-IP budget is **silently defeated**.
-> - **Multiple header lines are handled.** The node reads **all** `X-Forwarded-For` header lines (in order) and walks right-to-left skipping trusted proxies, so both the merged-single-header form and the separate-line append form (common in HAProxy) resolve correctly.
-> - **Catch-all does NOT make the dimension forgeable — it makes every client SHARE one bucket** (corrected 2026-09-29 after measuring; the old wording here said the opposite). A `0.0.0.0/0` or `::/0` entry trusts *every* candidate, and the resolver then falls back to the peer address (`resolve_client_ip`; its unit test is literally named `an_all_trusted_or_absent_xff_falls_back_to_the_peer`). So the per-IP dimension keys on the **peer** — behind an LB that means the LB's address for everyone. Measured with a catch-all: 14 requests carrying 14 different XFF values (and 14 different bad tokens, so the per-token dimension could not be what tripped) still hit `429` at the 11th, and a **fresh XFF + fresh token** was refused as well ⇒ every client shares the peer's bucket, and a handful of bad tokens locks the tenant API for **all** of them for `HYDRA_TENANT_API_LOCKOUT_SECS` (900 s by default). The node **warns loudly at startup** but does not refuse to start.
-> - **The forgeable case is the narrow allowlist + a non-stripping LB** (the first bullet above): with `HYDRA_TRUSTED_PROXIES=127.0.0.1` — a *trusted* peer whose LB passes an attacker-supplied header through — 14 requests with 14 different `X-Forwarded-For` values produced **no** `429` at all, i.e. the caller rotated its own bucket. Skipping/overriding inbound XFF at the LB is what makes the allowlist safe.
-> - **Observability.** Watch `hydra_tenant_api_auth_failures_total{reason}`: many **distinct IPs accelerating in unison** is the signature of a misconfigured (non-stripping) trusted proxy, not a single-source guesser.
-
-`503 not_ready` means this node has no configuration snapshot yet — retry.
-`429 rate_limited` carries `Retry-After`; invalidations are capped per tenant per
-minute (default 10) because each one fans out to every node and re-hits the
-tenant's `auth_url` from all of them.
-
-> **Known limitation (no fix promised):** when a tenant-API request body exceeds the 1 MiB cap, the node replies `413` and closes the connection **without draining the rest of the body** — a client still uploading a large body may observe a connection reset before it reads the `413` body.
->
-> **Measured 2026-09-30** (`integration/test_body_cap_drain.py`), which sharpens the wording in both directions: the node answered after consuming **1 081 344 of the 2 097 147 bytes** it was sent — i.e. it stops reading right at the cap and leaves ~1 MiB on the wire, which is the fact behind "does not drain" — while a client that **stops pushing as soon as the response becomes readable reads its `413 payload_too_large` normally** (`write_error=None`). The reset the note warns about therefore needs a client that **keeps pushing** after the response; the DATA plane behaves differently: it drains the rest of the upload first (**all 131 125 bytes consumed**, `413 request_body_too_large` always readable). If you are writing a client, stop writing when the connection becomes readable.
-
-### 5.2 How long can a revoked key keep working? (`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`)
-
-The honest answer, in order:
-
-1. **Normal case**: as long as the invalidation takes to converge — the response's
-   `fleet.state: applied` means every live node has applied it. If you get a
-   `202`, the named `lagging` nodes are still serving the old verdict.
-2. **A node that is alive and serving traffic but whose consumer is NOT
-   advancing** (consumer task died, network partition to Redis, node not in the
-   registry): nothing clears its L1, so the fallback is the entry's own TTL — and
-   that TTL used to be whatever the TENANT asked for via `expires_in`.
-   `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` (default **300**) now bounds it. Lower it to
-   make revocation take effect faster on such a node; raise it to reduce
-   `auth_url` traffic. It never caps a DENY (those are already short).
-   *Lowering it does not retroactively shorten entries already written to Redis —
-   use an invalidation for that.*
-3. **Watch `hydra_invalidation_consumer_stalled_seconds`**: it measures how long
-   a node's applied watermark has not advanced. **Alert above 60 s** — that is the
-   signal that case 2 is happening, and before this metric existed the condition
-   was completely invisible. The series is emitted by the cluster events consumer,
-   so it appears in **cluster mode only**: on a single-node instance there is no
-   consumer, the gauge vector has no children, and the family is absent from
-   `/metrics` (verified 2026-09-29 — an alert rule on a series that never appears
-   is a silent monitoring gap, so it must be deployed with the cluster topology).
-
-Measured 2026-09-29 (single node, a switchable auth service, tenant asking for
-`expires_in=3600`):
-
-| Case | Measured | Note |
-|------|----------|------|
-| allow cached, tenant asks 3600 s, `HYDRA_AUTH_ALLOW_TTL_MAX_SECS=2` | the gateway kept allowing for **2.07 s**, then refused — and re-asked the auth service exactly once | the knob bounds what a tenant may ask for |
-| same flow with `…=3600` | still allowing 4 s later | control: the cap is what bounded the row above |
-| explicit invalidation (`DELETE /api/v1/auth/cache`, `tenant_id`) with the allow cached for an hour | **refused on the very next request**; body `{"invalidated":1,…,"fleet":{"state":"single_node",…}}` | invalidation is the lever, not the TTL |
-| a cached **DENY**, then the auth service starts allowing again | the node kept refusing for **30.41 s** (2 auth calls in total) | i.e. the fixed `deny_ttl` below — "denies are already short" is exactly 30 s, and this knob does not touch it |
-
-So for an incident: **an explicit invalidation is immediate; without one, an allow
-lives at most `min(tenant expires_in, cap)` and a deny at most the fixed `deny_ttl`.
 
 ### 5.3 Usage accounting: two rates that legitimately disagree
 
@@ -894,18 +737,6 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 
 > **ClickHouse usage reads are response-size-capped (~64 KiB — `MAX_CLICKHOUSE_RESPONSE` in `crates/hydra-server/src/clickhouse.rs`).** A result that exceeds the cap (a very wide `group_by` over a long window) fails the read and surfaces as `503 usage_store_unavailable` with a "narrow the query" message — **not** a retryable error. Narrow `since`/`until` or reduce `group_by` cardinality (e.g. `day` instead of `model`).
 
-> **v3 schema migration — sub-tenant usage attribution (2026-09-18).** `usage_record`
-> gained a nullable `sub_tenant_id` column (derived at record time from the RAW api-key
-> prefix). **Fresh** ClickHouse instances get it from `environment/clickhouse/init.sql`;
-> an **already-initialised** instance needs a one-off
-> `ALTER TABLE usage_record ADD COLUMN IF NOT EXISTS sub_tenant_id Nullable(String)`
-> (**no backfill** — pre-existing rows stay NULL; `CREATE TABLE IF NOT EXISTS` does not
-> add columns to an existing table). SQLite applies migration `0011` automatically.
-> **Run it before the first v3 binary writes to that instance**: the ClickHouse insert
-> names the column, and ClickHouse rejects an insert naming a column that does not exist
-> (`NO_SUCH_COLUMN_IN_TABLE`, verified against the bundled instance on a throwaway table),
-> so usage flushes for that instance fail until the `ALTER` is applied.
-
 > **Retry-idempotency migration — `non_replicated_deduplication_window` (2026-09-29).**
 > The sink now sends a **stable `insert_deduplication_token` per flush**, so a batch
 > whose response was lost *after* the insert committed is re-sent as a no-op instead
@@ -941,184 +772,38 @@ tenant's own control-plane calls leave `ctx.selected` empty).
 > column the old table does not have, so it must be rebuilt first (new table + copy +
 > rename), see the migration steps below.
 
-### 5.5 Sub-tenant configuration (admin API)
+### 5.5 The user hierarchy: admin READS, tenant WRITES (plan §3.5)
 
-Sub-tenants and their routes are operator-managed through the admin API; the
-tenant-facing **read-only** mirrors are the two `GET /tenant/{tid}/api/v1/sub-tenants` /
-`sub-tenant-routes` endpoints (documented in `tenant-api-integration.md` §5.4–§5.5).
-The v1 operator write path adds **no new cluster mechanism**: it is the existing
-admin-CRUD pattern, which inherits the automatic leader forwarding of
-`maybe_forward_mutation`.
+The hierarchy (`user_group` -> `user` -> `user_api_key`) is written **only** through the
+tenant self-service API (§5.1). Admin is the **read** half:
 
-> **v2 (2026-09-18) adds a tenant self-service WRITE path** — the four data-plane
-> write endpoints plus the four internal `/api/v1/internal/tenant-config/...` routes
-> (cluster-token gated, leader-only). See **§5.5a** below and the tenant contract in
-> `tenant-api-integration.md` §5.6. The v1 operator admin-CRUD above is unchanged.
+- `GET /api/v1/user-groups`, `GET /api/v1/users`, `GET /api/v1/user-api-keys` — operator
+  inventory, filtered by `?tenant_id=`. Key material is **always masked** in admin responses
+  (no plaintext, no `key_hash`).
+- `POST`/`PUT`/`DELETE` on those admin paths are plain **404s** — there is no operator write
+  path for the hierarchy. If you need to change a user/group/key, call it as the tenant
+  on `/tenant/{tid}/api/v1/...` with that tenant's access token.
 
-**Resources** (flat, under `/api/v1/`, admin-token gated, design §13.2):
+**Write semantics** (ADR-0001 D-6 — the write executes on the RECEIVING node):
+local SQLite transaction -> publish to the cluster -> every node re-materialises its snapshot
+within **≤5 s**. Consequences:
 
-| resource | paths |
-|---|---|
-| `sub-tenants` | `GET/POST /api/v1/sub-tenants`, `GET/PUT/DELETE /api/v1/sub-tenants/{id}` |
-| `sub-tenant-routes` | `GET/POST /api/v1/sub-tenant-routes`, `GET/PUT/DELETE /api/v1/sub-tenant-routes/{id}` |
+- `503 config_not_published` = committed **locally**, not cluster-wide. Re-read via `whoami`
+  on the same node, then re-send the identical request; hierarchy writes are upsert/idempotent
+  (except `POST .../api-keys`, which mints a NEW key on every retry — §5.7.5 of the tenant doc).
+- The `config_version` in a 200 body is the reconciliation baseline; a node whose snapshot
+  lags answers from the previous version until the ≤5 s deadline, then fails loud.
+- Failed publishes log at `error` level, `target: "hydra::tenant_api"` with
+  `tenant` / `trace_id` / `reason`. (The dedicated `hydra::tenant_config_write` audit record
+  belonged to the retired internal endpoint and is gone.)
 
-- List supports `?tenant_id=` (sub-tenants) / `?sub_tenant_id=` (routes) filters.
-- Create a sub-tenant **without** a `key_prefix` → the leader auto-generates one
-  (8 chars `[A-Z0-9]` + a `_` separator, e.g. `QQCX_`); the generate→validate→insert
-  loop retries up to 5 times on **both** a DB `UNIQUE` race and a validator overlap
-  rejection (a generated 9-char prefix can be a superstring of an existing shorter
-  one). An explicit empty prefix is `400`.
-- On a successful mutation the snapshot is reloaded (`reload_best_effort`).
+**What was removed here (T10 Stage C, migration `0015`):** the whole sub-tenant / key-prefix
+plane — `sub_tenant`, `sub_tenant_route`, `provider_key_binding` tables, the `sub-tenants` /
+`sub-tenant-routes` admin + tenant API paths, auto-generated key prefixes, the
+`x-hydra-tenant-token` header, and `validate_sub_tenant_write`. Requests to those paths are
+ordinary 404s; per-(tenant, user, model, key, session) pinning is **Global Role** scheduling
+(`GET /api/v1/global-roles`), not prefixes.
 
-**Write validation is error-level, fail-closed** (pure `validate_sub_tenant_write`,
-`crates/hydra-core/src/sub_tenant.rs`): a rejected write is never persisted. Duplicates
-are `409`; every other rule violation is `400`:
-
-| condition | code | HTTP |
-|---|---|---|
-| `name` already used by another sub-tenant in the tenant | `name_duplicate` | 409 |
-| `key_prefix` already used by another sub-tenant in the tenant | `prefix_duplicate` | 409 |
-| route's `provider_id` is not a known provider | `provider_not_found` | 400 |
-| `provider_id` known but not in the tenant's `tenant_providers` | `provider_not_in_tenant` | 400 |
-| `model_key` outside the tenant's `tenant_models` (only when the tenant has a mapping) | `model_not_in_tenant` | 400 |
-| `provider_id` does not serve `model_key` | `model_not_served_by_provider` | 400 |
-| `key_prefix` empty | `empty_key_prefix` | 400 |
-| `key_prefix` non-ASCII | `invalid_key_prefix` | 400 |
-| `key_prefix` has no separator (`_`/`-`) | `invalid_key_prefix` | 400 |
-| `key_prefix` overlaps a same-tenant prefix or an enabled operator binding | `key_prefix_overlap` | 400 |
-| tenant already at the sub-tenant quota | `quota_exceeded` | 400 |
-| sub-tenant already at the route quota | `quota_exceeded` | 400 |
-
-**Per-tenant quotas** (config-DoS guard, `crates/hydra-core/src/sub_tenant.rs`):
-`MAX_SUB_TENANTS_PER_TENANT = 64`, `MAX_ROUTES_PER_SUB_TENANT = 32`.
-
-**Snapshot-side backstop** (`config::validate`, Warn-only, *not* the sole line of
-defence): warns on a route referencing an unknown sub-tenant/provider, a prefix
-without a separator, and same-tenant prefix overlap.
-
-**Default-route semantics (Q11, strict (a′))**: a **default route** (`model_key = NULL`)
-pins the sub-tenant's traffic to **one** provider; any model that provider does not
-serve becomes **unroutable for that prefix** (fail-closed `503 NoAvailableProvider`).
-This mirrors the fail-closed operator binding and is intentional — do not expect a
-model to "fall back" to normal routing when the default route's provider lacks it.
-
-**Operator-binding overlap is one-sided** (noted in the post-implementation
-review): a sub-tenant write rejects a prefix that overlaps an enabled operator
-binding, but an operator binding write does **not** check sub-tenant prefixes.
-An operator can therefore later add a binding that supersedes a sub-tenant
-prefix; by (a′) the operator wins and the sub-tenant route silently never fires
-for those keys (deterministic, and the catalog stays honest). Add such a binding
-with intent.
-
-**Observability**: v1 adds **no new Prometheus metrics** for sub-tenant routing (per
-plan; catalog consistency is pinned by core tests, not a metric).
-
-**Availability**: admin CRUD is available on **every cluster node** — each one serves its own admin
-API and applies its own writes (ADR-0001 D-2/D-6), so point the admin UI or a script at any node. The
-old rule ("only leader/standby; an edge 404s every admin path") went with the `edge` role.
-
-### 5.5a Tenant self-service write path (v2, A′ — **as of 2026-10-05: applied by the receiving node**)
-
-A tenant can CRUD its **own** sub-tenants and routes on the **data plane**, without an operator.
-
-**Four data-plane endpoints** (tenant-token gated, on the data-plane port; the tenant sees a normal
-response):
-
-| endpoint | what it does |
-| --- | --- |
-| `PUT    /tenant/{tid}/api/v1/sub-tenants/{name}` | upsert by `(tenant_id, name)`; body `{key_prefix?, enabled}` |
-| `DELETE /tenant/{tid}/api/v1/sub-tenants/{id}` | delete by immutable id (idempotent) |
-| `PUT    /tenant/{tid}/api/v1/sub-tenant-routes` | upsert by `(sub_tenant_id, model_key)`; body `{sub_tenant_id, model_key?, provider_id, enabled}` |
-| `DELETE /tenant/{tid}/api/v1/sub-tenant-routes/{id}` | delete by immutable id (idempotent) |
-
-> **The four internal routes are GONE** (`/api/v1/internal/tenant-config/*`), together with the
-> `x-hydra-tenant-token` header and the cluster-token-gated leader-only write face (ADR-0001 D-6,
-> 乙-full). A request to that path is now an ordinary 404.
-
-**What happens on a write**: the node that received the request authenticates the tenant (the same
-token gate as the read endpoints), then:
-
-1. **authorization binding** — the write target must be the authenticated tenant's own resources
-   (`body.tenant_id != T` → `403` by pure string comparison before any lookup; a route whose
-   `sub_tenant_id` is missing or foreign → `404`, deliberately indistinguishable);
-2. **write** — the shared transactional write core (`admin/sub_tenant_write.rs`);
-3. **reload + publish** — the snapshot is reloaded and the resulting config is published to the
-   control plane (Arachne). The raft library forwards the publish — the whole batch (missing
-   entities + toc + head) as ONE atomic `multi_put`, a single log entry — to the leader, so the write
-   needs this node to be able to COMMIT, not to be the leader;
-4. **audit** — one structured record per write (below).
-
-**Why there is no forwarding any more**: under raft the write does not need a leader to LAND, only
-to be COMMITTED, and the identity gate was always at the entry node. The old model relayed the whole
-request to the lease holder's internal endpoint with the tenant's bearer in a dedicated header; both
-the endpoint family and the header are retired, and the tenant credential no longer travels.
-
-**Two properties that were given up deliberately** (recorded, not hidden):
-
-* **No freshness gate.** The old leader re-authenticated the tenant against ITS OWN snapshot (the
-  newest one) before executing. Now the entry node validates against the snapshot it holds, which
-  can be marginally behind the head. The write is still validated against the LIVE database inside
-  the transaction (that is where quota, prefix-overlap and existence checks run), so the exposure is
-  limited to "a tenant whose token was revoked microseconds ago may still be accepted once" — the
-  same window the data-plane read gate already has, bounded by the snapshot poll. A freshness gate
-  was considered and rejected (D-6).
-* **A compromised entry node can impersonate any tenant.** Note this is NOT a new capability: any
-  cluster node holds `HYDRA_ENCRYPTION_KEY` and a full config snapshot (it can decrypt provider keys
-  and certificate private keys), so compromising ONE node was already a fleet-wide compromise. What
-  changes is the shape: it is now "any tenant" rather than "tenant A becomes tenant B".
-
-**Write-rate accounting (quantified)**: the per-tenant config-write throttle that used to live on
-the leader's internal endpoint is gone with it. Writes are now bounded by the general tenant-API
-per-tenant request budget, which is **per node** — so the cluster-wide ceiling for sub-tenant writes
-is **N x single-window** for N nodes, not one window. That is a real relaxation of the anti-DoS
-bound, accepted with the D-6 ruling (it was never a durability guarantee: the old window was
-process-local and reset on failover anyway).
-
-**Audit log (D7)**: each successful config write emits one `tracing` record
-(`target = "hydra::tenant_config_write"`) carrying `tenant_id`, `trace_id`, `action`
-(`upsert`/`delete`), `resource` (`sub_tenant`/`sub_tenant_route`), `resource_id`, and
-`config_version`. The tenant **bearer** and the **request body are NEVER logged**.
-
-**D5 tightening (quota)**: the write core counts the per-tenant quota against **ALL DB
-rows, including disabled ones** (not just the enabled-only snapshot). This fixes v1
-review finding 1 — "disable → re-create" can no longer bypass
-`MAX_SUB_TENANTS_PER_TENANT` (64) / `MAX_ROUTES_PER_SUB_TENANT` (32). It also re-validates
-prefix overlap inside the write transaction (finding 2, closing the
-validate-then-insert TOCTOU).
-
-**Disable/delete ≠ revoke**: deleting a sub-tenant only stops steering; its keys keep
-flowing through normal routing and are revoked only by the tenant's `auth_url` (see
-`tenant-api-integration.md` §7.6).
-
----
-
-### 5.x When the tenant's `auth_url` cannot be reached (measured 2026-09-30)
-
-`integration/test_auth_hop_failmode.py` runs this hop against a black-holed route (TEST-NET-1, so
-nothing on the network is contacted) and against a refused port:
-
-| Situation | What the tenant sees | Cost |
-|---|---|---|
-| `auth_url` unreachable (SYN dropped: dead route, firewalled peer) | `503 auth_upstream_unavailable` (`error.type: auth_error`) | **~2 s per request** — the documented 2000 ms round-trip timeout — and the provider is **never** called |
-| `auth_url` refusing (nothing listening) | the same `503` | **~1 ms** |
-| the auth service answers again | the **very next** request is served | — |
-| auth service answers 401/403 | `401 denied` | cached, with the deny TTL (30 s) |
-| auth service answers 5xx / unparseable 2xx | `503 auth_upstream_unavailable` | **never cached** |
-
-Two operational consequences. **A dead auth route costs its timeout on EVERY request** (the outage
-is deliberately not cached — measured: three requests in a row each paid 2 s; caching it would be
-worse, because the tenant would stay blocked for the deny TTL *after* the service recovered — that
-regression was planted and it turned the next requests into instant `401`s, including after
-recovery). And **attribution is available**: `hydra_auth_upstream_error_total{tenant}` plus
-`hydra_auth_decisions_total{tenant,verdict="denied",source="miss"}`.
-
-> **`fail_mode` is not selectable (recorded, not fixed).** `design.md` §11.4 presents
-> `[auth] fail_mode` as configuration and `http.rs` implements `FailMode::Open`
-> ("availability-first": serve without a verdict when the auth service is down) — but `main.rs`
-> takes `AuthConfig { ..AuthConfig::default() }`, whose default is `Closed`, and **no environment
-> variable selects the open mode** (measured: `HYDRA_AUTH_FAIL_MODE=open`, `HYDRA_FAIL_MODE=open`
-> and `HYDRA_AUTH_FAILMODE=open` all still answer `503`). Turning it on is a security decision
-> (unauthenticated traffic during an auth outage), so it is recorded here rather than wired.
 
 ## 6. Circuit-breaker operations (design §8.4)
 
@@ -1242,7 +927,7 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
 |-----|---------|----------------------|
 | ~~`max_request_body` (soft)~~ | ~~8 MiB~~ | **已删除（terminate-mode 不使用）**：terminate-mode 读全 body，故障转移用 `Bytes::clone` O(1) 重放，无"软上限禁用重放"机制。 |
 | `HYDRA_MAX_REQUEST_BODY_HARD` | 32 MiB (= 33554432 **bytes**) | **413 Payload Too Large**（体为 `{"error":{"message":"request_body_too_large","type":"proxy_error"}}`）立即返回并关闭连接（`set_keepalive(None)`，§6.7）。在 `request_filter` 的全 body 读取循环中检测。**值按字节给**（例：`4194304` = 4 MiB）；`0`/非法值被拒绝并回落默认。2026-09-29 起可配置 —— 此前该值只来自 `ProxyConfig::default()`，本表下面那句"调低它降内存"的建议**根本无法执行**（实测：`HYDRA_MAX_REQUEST_BODY_HARD=1048576` 时 2 MiB 的体被 413，未设置时同一请求正常通过）。 |
-| `HYDRA_REQUEST_BODY_TIMEOUT_SECS` | 60 s | **408 Request Timeout** + 关闭连接（不排空——这个客户端本来就不在发送）。这是**整个 body** 的总期限，不是空闲期限：pingora 对 HTTP/1 的 body 读取只有 per-read 期限（每个字节都会重置它），HTTP/2 则完全没有读超时，所以只有总期限挡得住"发一半就不发了"的客户端。**可达性（2026-09-29 实测修正）**：body 读取发生在**租户解析与认证跳之后**（`proxy.rs`：`resolve_tenant` → 认证 → 读全 body），所以这个洞**不是**任意匿名客户端都能触发 —— 认证跳拒绝的请求会在大体上传之前就被答复（实测：认证上游不可达时，33 MiB 的客户端拿到 `503 auth_upstream_unavailable` 且 `size_upload=0`）。但只要该租户的 `auth_url` 对**任意** key 都放行（开发/宽松鉴权很常见，也可能是有意设计），任何知道租户域名的调用者都能走到这一步；且认证缓存会给**已放行过**的 key 续命（TLL 内即使 auth 服务已挂，仍能到达读 body 阶段）。因此这条仍是**跨租户可用性**风险，只是前提写清楚：它成立的条件是"该租户的鉴权服务放行这次请求"。默认值按 `max_request_body_hard`（32 MiB）标定：60 s ≈ 0.5 MB/s 传满上限，慢链路请显式调大。`0` 被拒绝（那会 408 掉所有带 body 的请求）。 |
+| `HYDRA_REQUEST_BODY_TIMEOUT_SECS` | 60 s | **408 Request Timeout** + 关闭连接（不排空——这个客户端本来就不在发送）。这是**整个 body** 的总期限，不是空闲期限：pingora 对 HTTP/1 的 body 读取只有 per-read 期限（每个字节都会重置它），HTTP/2 则完全没有读超时，所以只有总期限挡得住"发一半就不发了"的客户端。**可达性（2026-09-29 实测，T10 更新）**：body 读取发生在**租户解析与认证之后**（`proxy.rs`：`resolve_tenant` → 认证 → 读全 body），so this hole is NOT triggerable by arbitrary anonymous clients — an authentication-rejected request gets answered before large-body upload (measured then: auth upstream unreachable ⇒ 33 MiB client got `503 auth_upstream_unavailable` with `size_upload=0`; since T10 the same shape is `401 invalid_api_key`). But ANY caller holding a valid api-key for the tenant reaches this step (there is no external auth service left whose laxity or absence gates it), so it remains a **cross-tenant availability** risk; the premise is simply "this request authenticates"。默认值按 `max_request_body_hard`（32 MiB）标定：60 s ≈ 0.5 MB/s 传满上限，慢链路请显式调大。`0` 被拒绝（那会 408 掉所有带 body 的请求）。 |
 | body 读取出错 | — | **400 `request_body_read_error`** + 关闭。读取错误曾被当作"body 正常结束"，把**截断的** body 当完整请求转发给上游（静默损坏路径）；现在 fail-closed。 |
 
 **Trade-off**（terminate-mode）：~~更大的软上限意味着更多请求可以安全故障转移（有利于可用性）~~ **不再适用**——全 body 已缓存，所有候选都能 O(1) 重放。内存占用 = 并发请求数 × 平均 body 大小（500 并发 × 2MB avg ≈ 1GB）。如需降低内存峰值，调低 **`HYDRA_MAX_REQUEST_BODY_HARD`**（字节；超过即 413——设置它需要重启进程）。
@@ -1267,7 +952,7 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
   token-free on purpose — a load balancer must be able to probe without a secret.
   Key series: `hydra_requests_total`, `hydra_request_duration_seconds`,
   `hydra_upstream_duration_seconds`, `hydra_retries_total`,
-  `hydra_tokens_total`, `hydra_auth_decisions_total`, `hydra_auth_cache_size`,
+  `hydra_tokens_total`, `hydra_auth_decisions_total`,
   `hydra_breaker_dead`, `hydra_breaker_state_transitions_total`,
   `hydra_limit_rejected_total`, `hydra_sni_host_mismatch_total`,
   `hydra_route_errors_total`, `hydra_mid_stream_errors_total`,
@@ -1510,8 +1195,7 @@ distribution and breaker-under-failure avoidance without external tools).
 |----------|-----|-----|-------|
 | SWRR 3:1 distribution (echo upstream) | — | — | Distribution matches weights within ±2% over 1000 req (see `load_breaker_swrr.rs`). |
 | Breaker under failure | — | — | Dead upstream receives 0 requests after `threshold`; revives on probe. |
-| Auth-cache hit (cached allow) | *measure* | *measure* | Sub-ms added latency; no upstream auth call. |
-| Auth-cache miss (wiremock auth) | *measure* | *measure* | One extra round-trip to `auth_url`. |
+| Auth hop (local api-key match) | *measure* | *measure* | Hash lookup against the tenant's `user_api_key` rows — no network hop (T10: there is no auth service). |
 
 Run `scripts/load_test.sh` against a staging instance to populate the numeric
 cells for your environment; record them here as the v1 regression baseline.
@@ -1531,7 +1215,7 @@ is longer than the test window.
 - **Single instance is the default, not the ceiling.** The default single-node
   mode remains one process with a local SQLite; **cluster mode is now
   implemented** (Redis-backed, see §13): multi-instance with shared rate-limit
-  counters, shared circuit breaker, shared auth cache L2 and a leader-lease
+  counters, shared circuit breaker, the invalidation bus + config publish, and a leader-lease
   failover is available in cluster mode (the member list replaced the retired role selector) — no longer a v2 backlog
   item (design §16.6 updated).
 - **Single static admin token.** No RBAC, no token rotation (v2, §16.6 / §13.3).
@@ -1837,7 +1521,7 @@ item 3.
   that never moved): a sustained non-zero rate means a node cannot materialize the config tree and is
   therefore **not eligible to be the writer** — alert on it.
 - The invalidation stream is trimmed by `MAXLEN` (10 000) every 30 s, and the
-  generation is bumped — every node clears its whole auth cache (L1+L2) — **only
+  generation is bumped — every consumer must treat its previously cached state as stale (the bus is pure: there is no auth cache to clear, §13.7) — **only
   when a dropped entry had not been applied by every live node**. Watch
   `hydra_invalidation_generation_bumps_total`: a sustained non-zero rate means a
   consumer is behind (or the event rate exceeds `maxlen / 30 s ≈ 333 events/s`
