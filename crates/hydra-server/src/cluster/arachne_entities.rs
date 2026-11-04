@@ -54,8 +54,8 @@ use std::collections::HashSet;
 use hydra_core::config::{CertMeta, ConfigData};
 use hydra_core::identity::TenantTokenIdentity;
 use hydra_core::model::{
-    GlobalRole, LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant,
-    SubTenantRoute, TenantAccessToken, TenantModel, TenantProvider, User, UserApiKey, UserGroup,
+    GlobalRole, LimitRole, ProviderKey, ProviderModel, TenantAccessToken, TenantModel,
+    TenantProvider, User, UserApiKey, UserGroup,
 };
 
 use super::arachne_keys::{
@@ -104,8 +104,6 @@ pub struct CertTreeEntity {
 pub struct FidelityTreeEntity {
     /// Full `limit_role` rows, DISABLED included, each with its `matching_key` sealed.
     pub limit_roles: Vec<LimitRole>,
-    /// Full `provider_key_binding` rows, DISABLED included.
-    pub key_prefix_bindings: Vec<ProviderKeyBinding>,
     /// Full `provider_model` rows, OFFLINE (`status != 1`) included — the derived
     /// `models_by_key` drops those, and a replica must still have them.
     pub provider_models: Vec<ProviderModel>,
@@ -113,10 +111,6 @@ pub struct FidelityTreeEntity {
     pub tenant_providers: Vec<TenantProvider>,
     /// Full `tenant_model` rows, ids preserved.
     pub tenant_models: Vec<TenantModel>,
-    /// Full `sub_tenant` rows, DISABLED included.
-    pub sub_tenants: Vec<SubTenant>,
-    /// Full `sub_tenant_route` rows, DISABLED included.
-    pub sub_tenant_routes: Vec<SubTenantRoute>,
     /// Provider api-keys WITH their row identity, sealed.
     pub sealed_provider_keys: Vec<SealedProviderKey>,
     /// `tenant_id` → sealed access-token hash.
@@ -320,14 +314,11 @@ impl FidelityTreeEntity {
 
         Ok(FidelityRows {
             limit_roles,
-            key_prefix_bindings: self.key_prefix_bindings.clone(),
             provider_keys,
             tenant_token_hashes,
             provider_models: self.provider_models.clone(),
             tenant_providers: self.tenant_providers.clone(),
             tenant_models: self.tenant_models.clone(),
-            sub_tenants: self.sub_tenants.clone(),
-            sub_tenant_routes: self.sub_tenant_routes.clone(),
             // The user-hierarchy fields are deliberately not carried by `_fidelity`; they arrive
             // through their own `user_group/<id>`, `user/<id>`, ... entity paths.
             ..FidelityRows::default()
@@ -385,12 +376,9 @@ impl FidelityTreeEntity {
         }
         Ok(Self {
             limit_roles,
-            key_prefix_bindings: rows.key_prefix_bindings.clone(),
             provider_models: rows.provider_models.clone(),
             tenant_providers: rows.tenant_providers.clone(),
             tenant_models: rows.tenant_models.clone(),
-            sub_tenants: rows.sub_tenants.clone(),
-            sub_tenant_routes: rows.sub_tenant_routes.clone(),
             sealed_provider_keys,
             sealed_tenant_token_hashes,
         })
@@ -696,21 +684,6 @@ fn config_entities(
         // — the exact thing decision D-16 was taken to stop. Deterministic for the same reason.
         out.push(encode(&path, &sealed_limit_role(role, kp)?)?);
     }
-    for binding in &cfg.key_prefix_bindings {
-        let path = EntityPath::KeyBinding(binding.id.clone());
-        check(&path)?;
-        out.push(encode(&path, binding)?);
-    }
-    for sub in &cfg.sub_tenants {
-        let path = EntityPath::SubTenant(sub.id.clone());
-        check(&path)?;
-        out.push(encode(&path, sub)?);
-    }
-    for route in &cfg.sub_tenant_routes {
-        let path = EntityPath::SubTenantRoute(route.id.clone());
-        check(&path)?;
-        out.push(encode(&path, route)?);
-    }
     for (domain, cert) in &cfg.certs {
         let path = EntityPath::Cert(domain.clone());
         check(&path)?;
@@ -876,18 +849,6 @@ pub fn build_config_with_fidelity(
                 let role = decode::<LimitRole>(path, bytes)?;
                 cfg.limit_roles.push(opened_limit_role(&role, path, kp)?);
             }
-            EntityPath::KeyBinding(_) => {
-                let binding = decode::<ProviderKeyBinding>(path, bytes)?;
-                cfg.key_prefix_bindings.push(binding);
-            }
-            EntityPath::SubTenant(_) => {
-                let sub = decode::<SubTenant>(path, bytes)?;
-                cfg.sub_tenants.push(sub);
-            }
-            EntityPath::SubTenantRoute(_) => {
-                let route = decode::<SubTenantRoute>(path, bytes)?;
-                cfg.sub_tenant_routes.push(route);
-            }
             EntityPath::Cert(domain) => {
                 let entity = decode::<CertTreeEntity>(path, bytes)?;
                 let mut meta = entity.meta;
@@ -919,14 +880,11 @@ pub fn build_config_with_fidelity(
                 // entities, so assigning the whole `FidelityRows` here could erase rows already
                 // decoded from `user_group/<id>`, `user/<id>`, etc. depending on path order.
                 fidelity.limit_roles = legacy.limit_roles;
-                fidelity.key_prefix_bindings = legacy.key_prefix_bindings;
                 fidelity.provider_keys = legacy.provider_keys;
                 fidelity.tenant_token_hashes = legacy.tenant_token_hashes;
                 fidelity.provider_models = legacy.provider_models;
                 fidelity.tenant_providers = legacy.tenant_providers;
                 fidelity.tenant_models = legacy.tenant_models;
-                fidelity.sub_tenants = legacy.sub_tenants;
-                fidelity.sub_tenant_routes = legacy.sub_tenant_routes;
             }
             EntityPath::UserGroup(_) => {
                 let group = decode::<UserGroup>(path, bytes)?;
@@ -1025,36 +983,21 @@ pub fn build_config_with_fidelity(
     //
     // The tree stores one entity per row and this rebuilds the vectors by re-collecting them, so
     // the order has to be reproduced here — and it must be the order the LEADER's loader produced,
-    // not one invented here. The four keys below mirror `store.rs`'s `ORDER BY`s exactly:
+    // not one invented here. The one key below mirrors `store.rs`'s `ORDER BY` exactly:
     //
     //   limit_role           ORDER BY created_at, id
-    //   provider_key_binding ORDER BY key_prefix
-    //   sub_tenant           ORDER BY tenant_id, name
-    //   sub_tenant_route     ORDER BY sub_tenant_id, model_key
     //
-    // Each SQL key is backed by a UNIQUE constraint (`limit_role.id` is the PK;
-    // `provider_key_binding.key_prefix` is UNIQUE; `sub_tenant` is UNIQUE(tenant_id, name);
-    // `sub_tenant_route` is UNIQUE(sub_tenant_id, model_key)), so those orders are TOTAL and the
-    // trailing `id` below only makes the sort deterministic, never reorders a tie. SQLite sorts
-    // NULL first and so does `Option`'s `Ord`, which is what keeps the `model_key` column's
-    // nullable default route in the same place on both sides.
+    // That SQL key is backed by a UNIQUE constraint (`limit_role.id` is the PK), so the order is
+    // TOTAL and the trailing `id` below only makes the sort deterministic, never reorders a tie.
     //
-    // An earlier version sorted all four by `id`. It looked tidy and was a rule the loader never
-    // used, so the replica held a differently-ordered config than the leader. Today that changes
-    // no behaviour (all matching limit roles are enforced as independent keys; binding and
-    // sub-tenant matching take the LONGEST prefix; route lookup is by unique key), which is
+    // An earlier version sorted every vector by `id`. It looked tidy and was a rule the loader
+    // never used, so the replica held a differently-ordered config than the leader. Today that
+    // changes no behaviour (all matching limit roles are enforced as independent keys), which is
     // exactly why it survived review — but "this tree names this config" is only checkable by
     // EQUALITY, and a silently reordered decode makes every such comparison worthless. Caught by
     // `tests/arachne_order_fidelity.rs`, whose fixture makes the two orders disagree.
     cfg.limit_roles
         .sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
-    cfg.key_prefix_bindings
-        .sort_by(|a, b| (&a.key_prefix, &a.id).cmp(&(&b.key_prefix, &b.id)));
-    cfg.sub_tenants
-        .sort_by(|a, b| (&a.tenant_id, &a.name, &a.id).cmp(&(&b.tenant_id, &b.name, &b.id)));
-    cfg.sub_tenant_routes.sort_by(|a, b| {
-        (&a.sub_tenant_id, &a.model_key, &a.id).cmp(&(&b.sub_tenant_id, &b.model_key, &b.id))
-    });
 
     // User-hierarchy vectors restore the loader's SQL orders (plan §3.2/§3.5):
     //   user_group           ORDER BY tenant_id, name
@@ -1206,14 +1149,6 @@ mod tests {
                     created_at: "2026-01-02T00:00:00Z".into(),
                 },
             ],
-            key_prefix_bindings: vec![ProviderKeyBinding {
-                id: "b-disabled".into(),
-                key_prefix: "sk_disabled_".into(),
-                provider_id: "p1".into(),
-                enabled: false,
-                created_at: "2026-01-03T00:00:00Z".into(),
-                updated_at: "2026-01-03T00:00:00Z".into(),
-            }],
             provider_keys: vec![
                 ProviderKey {
                     id: "pk-1".into(),
@@ -1254,24 +1189,6 @@ mod tests {
                 id: "tm-1".into(),
                 tenant_id: "t1".into(),
                 model_key: "gpt-x".into(),
-            }],
-            sub_tenants: vec![SubTenant {
-                id: "st-1".into(),
-                tenant_id: "t1".into(),
-                name: "sub".into(),
-                key_prefix: "ACME_".into(),
-                enabled: false,
-                created_at: String::new(),
-                updated_at: String::new(),
-            }],
-            sub_tenant_routes: vec![SubTenantRoute {
-                id: "sr-1".into(),
-                sub_tenant_id: "st-1".into(),
-                model_key: None,
-                provider_id: "p1".into(),
-                enabled: false,
-                created_at: String::new(),
-                updated_at: String::new(),
             }],
             // This fixture predates the T2 user-hierarchy paths; keep those fields empty here
             // so the test below remains about the legacy fidelity carrier it was written for.

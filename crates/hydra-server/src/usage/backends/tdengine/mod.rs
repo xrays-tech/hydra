@@ -339,7 +339,7 @@ fn row_values(r: &UsageRecord) -> String {
     };
     // Built from quoted literals rather than a hand-written format string: every element here is
     // either a literal the helpers already quoted or a bare number, and a format string with mixed
-    // quoting is exactly how `sub_tenant_id` became `''st1''` — invalid SQL that made the store
+    // quoting is exactly how a nullable id column once became `''x''` — invalid SQL that made the store
     // refuse EVERY batch while the node looked healthy (found by the live test, which writes and then
     // reads back).
     let quoted = |v: &str| format!("'{}'", escape_sql_string(v));

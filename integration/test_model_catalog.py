@@ -287,84 +287,6 @@ def main():
         check("C5: an authorized provider's model the tenant is NOT whitelisted for is omitted",
               "m2" not in (ids or []), f"ids={ids} (m2 belongs to p1, not in tenant-models)")
 
-        # ---- C6: what a presented key does to the listing ------------------------
-        # Two DIFFERENT binding mechanisms narrow the catalog, and they are not the same:
-        #   (3.5) an operator `provider-key-bindings` row  -> keep only that provider
-        #   (3.6) a sub-tenant whose route covers THIS model -> keep that route's provider,
-        #         while a model the sub-tenant has no route for is NOT restricted (the
-        #         documented "routes are overrides; otherwise the tenant default applies").
-        st_opb, out_opb = admin("POST", "/provider-key-bindings",
-                                {"id": "opb1", "key_prefix": "OPB_", "provider_id": "p1",
-                                 "enabled": True, "created_at": "", "updated_at": ""})
-        st_list, out_list = admin("GET", "/provider-key-bindings")
-        announce("C6 the operator binding", f"create HTTP {st_opb} {out_opb[:90]} | list {out_list[:120]}")
-        check("C6 (precondition): the operator key-prefix binding exists in the snapshot",
-              st_opb in (200, 201) and "OPB_" in out_list, f"HTTP {st_opb}")
-        admin("POST", "/reload", {})
-        time.sleep(0.3)
-        st_op, _, _, ids_op = catalog(key="OPB_xyz789")
-        announce("C6 an operator prefix binding (OPB_ -> p1)", f"HTTP {st_op} ids={ids_op}")
-        check("C6: an operator key-prefix binding narrows the whole listing to its provider",
-              st_op == 200 and ids_op == ["m1"],
-              f"HTTP {st_op} ids={ids_op} (anonymous {ids}; m3 is served only by p2)")
-
-        st, out = admin("POST", "/sub-tenants",
-                        {"id": "steer", "tenant_id": "t1", "name": "steer",
-                         "key_prefix": SUB_PREFIX, "enabled": True, "created_at": ""})
-        st_route, out_route = admin("POST", "/sub-tenant-routes",
-                                    {"id": "str1", "sub_tenant_id": "steer", "model_key": "m1",
-                                     "provider_id": "p1", "enabled": True, "created_at": "",
-                                     "updated_at": ""})
-        # PREMISE, asserted (round 172). The sub-tenant half of C6 used to reduce to
-        # "`m1` is in the listing and `m3` is in the listing" — and m1/m3 ARE the anonymous set, so
-        # both assertions held for every listing that contains them, including the anonymous one: if
-        # the sub-tenant or its route had never been created (or never reached the snapshot), the legs
-        # passed while proving nothing. The operator half above carries exactly this kind of
-        # precondition check; the sub-tenant half did not.
-        st_read, out_read = admin("GET", "/sub-tenant-routes")
-        read_back = "str1" in (out_read or "")
-        check("C6 (precondition): the sub-tenant AND its route really exist (the route is read back "
-              "from the admin API, not assumed from a 2xx)",
-              st in (200, 201) and st_route in (200, 201) and st_read == 200 and read_back,
-              f"sub-tenant -> {st} {out[:60]!r}; route -> {st_route} {out_route[:60]!r}; "
-              f"GET /sub-tenant-routes -> {st_read} contains str1={read_back}")
-        admin("POST", "/reload", {})
-        time.sleep(0.3)
-        st_sub, _, _, ids_sub = catalog(key=SUB_PREFIX + "abc123")
-        # CONTROL: a key whose prefix matches NO sub-tenant. `design.md` §632 documents `/v1/models`
-        # as readable with OR without a key, narrowed only by prefixes it knows — so this key must see
-        # the full anonymous listing. Without this control, "the route narrowed the listing" and
-        # "every key sees everything" are the same observation.
-        st_unk, _, out_unk, ids_unk = catalog(key="NOPE_abc123")
-        announce("C6 a sub-tenant key and an unknown-prefix key",
-                 f"sub={ids_sub} unknown={ids_unk} anon={ids}")
-        check("C6 (control): a key whose prefix matches NO sub-tenant sees the FULL anonymous "
-              "catalog (the endpoint identifies no tenant from the key, so an unknown prefix narrows "
-              "nothing)",
-              st_unk == 200 and ids_unk == ids, f"HTTP {st_unk} ids={ids_unk} anon={ids}")
-        # The route above covers `m1` only, and p1 genuinely serves m1 ⇒ m1 stays; m3 has NO route ⇒
-        # the documented per-model fallback applies and the listing equals the anonymous one. This
-        # state alone cannot distinguish "the gate is active" from "no gate", which is exactly why the
-        # next step adds the discriminating route.
-        check("C6: with a route covering only `m1`, the sub-tenant key sees the tenant's catalog "
-              "UNCHANGED — the documented per-model fallback (`无命中 ⇒ 行为与今天完全一致`), not a "
-              "whitelist",
-              st_sub == 200 and ids_sub == ids, f"HTTP {st_sub} ids={ids_sub} anon={ids}")
-        # The WRITE boundary is fail-closed too, and that is measured here rather than assumed: a
-        # route pinning a model to a provider that does NOT serve it is REFUSED, so the "empty
-        # intersection" the catalog mirror drops on cannot be created directly — it can only arise
-        # from a LATER change (C6b below builds it with a breaker-dead provider).
-        st_bad, out_bad = admin("POST", "/sub-tenant-routes",
-                                {"id": "str-bad", "sub_tenant_id": "steer", "model_key": "m3",
-                                 "provider_id": "p1", "enabled": True, "created_at": "",
-                                 "updated_at": ""})
-        check("C6: the write path REFUSES a route pinning a model to a provider that does not serve "
-              "it (`fail-closed` at the boundary, so the broken fixture cannot be written)",
-              st_bad == 400, f"HTTP {st_bad} {out_bad[:90]}")
-        check("C6 (security): neither binding can WIDEN the anonymous union",
-              set(ids_op or []) <= set(ids or []) and set(ids_sub or []) <= set(ids or []),
-              f"op={ids_op} sub={ids_sub} anonymous={ids}")
-
         # ---- C4: the online filter, measured as a TRANSITION ---------------------
         # `m3`'s provider points at a closed port. Until it has actually failed it is still
         # "online" (C1 saw it listed), so the honest way to test the filter is: trip the
@@ -381,44 +303,6 @@ def main():
         announce("C4 the catalog after the provider is dead", f"HTTP {st4} ids={ids_after}")
         check("C4: a model whose provider is DEAD disappears from the catalog (online filter)",
               st4 == 200 and ids_after == ["m1"], f"ids={ids_after} (was {ids})")
-
-        # ---- C6b: the sub-tenant CATALOG MIRROR, made observable (round 172) --------------------
-        # `design.md` §7.1c promises the catalog mirrors the sub-tenant gate ("fail-closed 求交：命中
-        # 一条启用路由 ⇒ 候选集 ∩= {route.provider_id}，空 ⇒ 503"), and `router::accessible_models`
-        # implements the empty intersection as "drop the model". Observed only by constructing the
-        # empty set the way production does, because the write path refuses the direct fixture (C6
-        # measured that 400): give `m3` a SECOND provider (p1), pin the route to the other one (p2),
-        # and let p2 be breaker-DEAD — which the C4 legs just produced. The anonymous view then keeps
-        # `m3` through p1 while the sub-tenant key must lose it; without this construction the mirror
-        # was untestable and the older `in`-assertions could not fail.
-        st_pm, out_pm = admin("POST", "/provider-models",
-                              {"id": "pm3b", "key": "m3", "name": "M3 via p1", "provider_id": "p1",
-                               "status": 1, "created_at": "", "updated_at": ""})
-        st_route2, out_route2 = admin("POST", "/sub-tenant-routes",
-                                      {"id": "str2", "sub_tenant_id": "steer", "model_key": "m3",
-                                       "provider_id": "p2", "enabled": True, "created_at": "",
-                                       "updated_at": ""})
-        admin("POST", "/reload", {})
-        time.sleep(0.3)
-        st_sub2, _, _, ids_sub2 = catalog(key=SUB_PREFIX + "abc123")
-        st_unk2, _, _, ids_unk2 = catalog(key="NOPE_abc123")
-        st_anon2, _, _, ids_anon2 = catalog(key="sk-tenant-1")   # re-read: `ids_after` is stale here
-        st_m3, _, out_m3 = chat("m3", SUB_PREFIX + "abc123")
-        announce("C6b after giving `m3` a second provider and pinning the sub-tenant to the dead one",
-                 f"provider-model={st_pm} route={st_route2} sub={ids_sub2} unknown={ids_unk2} "
-                 f"tenant={ids_anon2}; call m3 with the sub-tenant key -> HTTP {st_m3} {out_m3[:60]!r}")
-        check("C6b (premise): both writes were accepted — a route may name the DEAD provider because "
-              "breaker state is runtime, not config",
-              st_pm in (200, 201) and st_route2 in (200, 201),
-              f"provider-model -> {st_pm} {out_pm[:60]!r}; route -> {st_route2} {out_route2[:60]!r}")
-        check("C6b: the mirror is REAL — pinning `m3` to the breaker-dead p2 empties its provider set, "
-              "so the sub-tenant key DROPS m3 while the anonymous and unknown-prefix keys keep it "
-              "through p1",
-              ids_sub2 == ["m1"] and "m3" in (ids_unk2 or []) and "m3" in (ids_anon2 or []),
-              f"sub={ids_sub2} unknown={ids_unk2} tenant={ids_anon2}")
-        check("C6b: ...and the CALL path empties the same intersection (`503`, the documented "
-              "fail-closed answer, not a fallback to the other provider)",
-              st_m3 == 503, f"HTTP {st_m3} {out_m3[:90]!r}")
 
         # ---- C8: only GET on the exact path is intercepted ----------------------
         st_post, _, out_post = call("POST", f"http://127.0.0.1:{DATA}/v1/models",
@@ -440,7 +324,7 @@ def main():
         print(f"MODEL CATALOG: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print("MODEL CATALOG: PASSED (public + local directory, no external auth, online filter, "
-          "whitelist, prefix narrowing never widens, only GET on the exact path)")
+          "whitelist, only GET on the exact path)")
     return 0
 
 

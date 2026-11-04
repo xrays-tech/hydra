@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{ApiKeyIdentity, ApiPrincipal, TenantTokenIdentity};
 use crate::model::{GlobalRole, User, UserApiKey, UserGroup};
-use crate::model::{LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
+use crate::model::{LimitRole, Provider, Tenant};
 
 /// In-memory configuration snapshot. All indexes are built once at load time
 /// and read lock-free thereafter (the server holds it inside `ArcSwap`).
@@ -72,21 +72,6 @@ pub struct ConfigData {
 
     /// Enabled limit roles (priority order decided by the loader).
     pub limit_roles: Vec<LimitRole>,
-
-    /// Enabled api-key-prefix → provider bindings (design §7.1b; only
-    /// `enabled == true` rows, like `limit_roles`). Matching is longest-prefix
-    /// wins; see [`crate::router::match_key_binding`].
-    pub key_prefix_bindings: Vec<ProviderKeyBinding>,
-
-    /// Enabled sub-tenants (design-sub-tenant.md §3.1). These carry the
-    /// `key_prefix` — the source of the api-key-prefix routing gate (step 3.6).
-    /// Only `enabled == true` rows (mirrors `key_prefix_bindings`).
-    pub sub_tenants: Vec<SubTenant>,
-
-    /// Enabled sub-tenant routes (design-sub-tenant.md §3.1). Each row pins a
-    /// sub-tenant's traffic to a single provider, optionally scoped to a model.
-    /// Only `enabled == true` rows (mirrors `key_prefix_bindings`).
-    pub sub_tenant_routes: Vec<SubTenantRoute>,
 
     // --- User hierarchy + internal auth (plan §3.1/§3.2; T1 additive) -----
     //
@@ -559,99 +544,6 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
             // the raw key, so two keys that share a mask have two windows — the warning's condition
             // cannot occur, and a warning that cannot fire is noise that trains operators to skip the
             // list. `hydra-core/tests/validate.rs` pins its absence so it cannot come back by accident.
-        }
-    }
-
-    // provider_key_bindings → prefix must be USABLE (the shared shape rule; the
-    // admin write boundary enforces the same one) + provider must exist +
-    // the prefix must not swallow a sub-tenant prefix.
-    for b in &cfg.key_prefix_bindings {
-        match crate::sub_tenant::validate_prefix_shape(&b.key_prefix) {
-            Ok(()) => {}
-            // Keep the original wording: runbooks and the alert text quote it.
-            Err(crate::sub_tenant::PrefixShapeError::Empty) => {
-                issues.push(ValidationIssue::warn(format!(
-                    "provider_key_binding '{}' has an empty key_prefix; it can never match",
-                    b.id
-                )));
-            }
-            Err(e) => issues.push(ValidationIssue::warn(format!(
-                "provider_key_binding '{}' has an unusable key_prefix '{}': {e}; a binding \
-                 match is GLOBAL and wins over the sub-tenant routing gate, so a bare prefix \
-                 re-routes every tenant whose key starts with it",
-                b.id, b.key_prefix
-            ))),
-        }
-        if !cfg.providers.contains_key(&b.provider_id) {
-            issues.push(ValidationIssue::warn(format!(
-                "provider_key_binding '{}' references unknown provider_id '{}'",
-                b.id, b.provider_id
-            )));
-        }
-        // Cross-namespace collision: a binding that overlaps a sub-tenant prefix
-        // silently disables that sub-tenant's steering (the binding wins), so it
-        // is exactly the kind of overlap the sub-tenant write path rejects — but
-        // a binding can be created AFTER the sub-tenant exists, which no write
-        // boundary can see. Surface it here instead of at request time.
-        for st in &cfg.sub_tenants {
-            if crate::sub_tenant::prefixes_collide(&st.key_prefix, &b.key_prefix) {
-                issues.push(ValidationIssue::warn(format!(
-                    "provider_key_binding '{}' (key_prefix '{}') overlaps sub_tenant '{}' \
-                     (key_prefix '{}'); the binding wins, so that sub-tenant's routing is \
-                     silently bypassed",
-                    b.id, b.key_prefix, st.id, st.key_prefix
-                )));
-            }
-        }
-    }
-
-    // sub_tenants → key_prefix must be non-empty and contain a separator
-    // (`_` or `-`); a bare prefix would swallow longer, unrelated prefixes.
-    for st in &cfg.sub_tenants {
-        if st.key_prefix.is_empty() || !st.key_prefix.contains(['_', '-']) {
-            issues.push(ValidationIssue::warn(format!(
-                "sub_tenant '{}' has an invalid key_prefix '{}'; it must be \
-                 non-empty and contain a separator ('_' or '-')",
-                st.id, st.key_prefix
-            )));
-        }
-    }
-
-    // sub_tenant_routes → the referenced sub-tenant must exist and the
-    // provider must exist (referential-integrity orphans, Warn).
-    let sub_tenant_ids: HashSet<&str> = cfg.sub_tenants.iter().map(|st| st.id.as_str()).collect();
-    for r in &cfg.sub_tenant_routes {
-        if !sub_tenant_ids.contains(r.sub_tenant_id.as_str()) {
-            issues.push(ValidationIssue::warn(format!(
-                "sub_tenant_route '{}' references unknown sub_tenant_id '{}'",
-                r.id, r.sub_tenant_id
-            )));
-        }
-        if !cfg.providers.contains_key(&r.provider_id) {
-            issues.push(ValidationIssue::warn(format!(
-                "sub_tenant_route '{}' references unknown provider_id '{}'",
-                r.id, r.provider_id
-            )));
-        }
-    }
-
-    // sub_tenants → prefix overlap within the same tenant (either direction
-    // `starts_with`). The store loads enabled rows only, so this is the runtime
-    // backstop for drift the write path (T6) should have rejected at submit time.
-    for i in 0..cfg.sub_tenants.len() {
-        for j in (i + 1)..cfg.sub_tenants.len() {
-            let a = &cfg.sub_tenants[i];
-            let b = &cfg.sub_tenants[j];
-            if a.tenant_id != b.tenant_id {
-                continue;
-            }
-            if a.key_prefix.starts_with(&b.key_prefix) || b.key_prefix.starts_with(&a.key_prefix) {
-                issues.push(ValidationIssue::warn(format!(
-                    "sub_tenant '{}' and '{}' have overlapping key_prefix within \
-                     tenant '{}' ('{}' vs '{}')",
-                    a.id, b.id, a.tenant_id, a.key_prefix, b.key_prefix
-                )));
-            }
         }
     }
 

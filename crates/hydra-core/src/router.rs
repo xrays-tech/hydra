@@ -40,14 +40,10 @@
 //!      so [`resolve_detailed`] (principal-less legacy callers) keeps legacy behaviour
 //!      unless the snapshot contains rules whose identity dims are all `*`.
 //! 3. **Intersection with (1)**; empty ⇒ [`RouteError::NoAvailableProvider`].
-//!    - **Key-prefix binding gate** (3.5) — a client api-key matching an enabled
-//!      operator prefix binding restricts the set to the bound provider
-//!      (fail-closed; longest prefix wins; no match ⇒ no restriction).
-//!    - **Sub-tenant route gate** (3.6, design-sub-tenant.md §4.1) — applied only
-//!      when (3.5) did **not** match (the operator's explicit disposition wins,
-//!      ruling a′). A client api-key matching an enabled sub-tenant prefix is
-//!      restricted to that route's provider (model-specific route wins over the
-//!      default; fail-closed); no match ⇒ the set is unchanged (opt-in steering).
+//!    - (The raw-key gates this pipeline once ran — the operator key-prefix
+//!      binding (3.5) and the sub-tenant route gate (3.6) — are retired: the
+//!      routing interface is Global Role (step 2) plus the tenant's own grants.
+//!      A client api-key therefore never narrows the candidate set.)
 //! 4. **Filter** — drop dead (`breaker.is_dead`), keyless (no api-keys), and
 //!    soft-disabled (`weight == 0` = a deliberate action, `weight < 0` = a
 //!    configuration error). Every drop is reported in
@@ -67,7 +63,7 @@
 //! it walks every `models_by_key` row (loader-guaranteed `status == 1`) and
 //! emits one [`CatalogEntry`] per model that keeps ≥ 1 routable provider,
 //! mirroring the same gates (tenant_models whitelist → serving providers ∩
-//! tenant_providers → key-prefix binding → dead / weight / api-key filter).
+//! tenant_providers → dead / weight / api-key filter).
 //! [`accessible_models_with_principal`] mirrors [`resolve_with_principal`]: the
 //! same walk, but per model the candidate base comes from the Global Role union
 //! when the principal matches a rule with a non-empty provider set, and from the
@@ -86,100 +82,9 @@ use serde::{Deserialize, Serialize};
 use crate::breaker::BreakerView;
 use crate::config::ConfigData;
 use crate::identity::ApiPrincipal;
-use crate::model::{ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant};
+use crate::model::Tenant;
 
 pub use crate::model::{Candidate, ExcludedCandidate, ExclusionReason, ResolveOutcome, RouteError};
-
-/// Longest-prefix match of a client api-key against the enabled prefix
-/// bindings (design §7.1b). Returns the binding with the longest `key_prefix`
-/// that `api_key` starts with; `None` when no enabled binding matches
-/// (⇒ no routing restriction).
-pub fn match_key_binding<'a>(
-    bindings: &'a [ProviderKeyBinding],
-    api_key: &str,
-) -> Option<&'a ProviderKeyBinding> {
-    bindings
-        .iter()
-        .filter(|b| b.enabled && api_key.starts_with(&b.key_prefix))
-        .max_by_key(|b| b.key_prefix.len())
-}
-
-/// Key-level sub-tenant prefix match (design-sub-tenant.md §4.1, step 3.6):
-/// the enabled [`SubTenant`] of `tenant_id` whose `key_prefix` is a prefix of
-/// `api_key`. Prefixes are unique and non-overlapping within a tenant
-/// (enforced on the write path), so at most one sub-tenant matches; the
-/// `max_by_key` longest-prefix pick is a defensive backstop. `None` when no
-/// sub-tenant prefix matches (⇒ no routing restriction).
-fn match_sub_tenant<'a>(
-    cfg: &'a ConfigData,
-    tenant_id: &str,
-    api_key: &str,
-) -> Option<&'a SubTenant> {
-    cfg.sub_tenants
-        .iter()
-        .filter(|st| st.enabled && st.tenant_id == tenant_id && api_key.starts_with(&st.key_prefix))
-        .max_by_key(|st| st.key_prefix.len())
-}
-
-/// The sub-tenant id a request belongs to, for **usage attribution** (v3):
-/// the enabled sub-tenant of `tenant_id` whose `key_prefix` prefixes `api_key`.
-///
-/// Model-free and binding-free on purpose: attribution answers "which group does
-/// this key belong to", independent of whether routing gate (3.6) fired or an
-/// operator key-prefix binding matched. `None` when no enabled prefix matches
-/// (⇒ unattributed). Never reconstructed from the stored masked key
-/// (design-sub-tenant.md §7.1).
-pub fn sub_tenant_id_for_key<'a>(
-    cfg: &'a ConfigData,
-    tenant_id: &str,
-    api_key: &str,
-) -> Option<&'a str> {
-    match_sub_tenant(cfg, tenant_id, api_key).map(|st| st.id.as_str())
-}
-
-/// Model-level route selection within one sub-tenant: a model-specific route
-/// (`model_key == Some(model)`) wins over the default route (`model_key =
-/// None`); when `model_key` is `None` (the model-less passthrough path, Q10)
-/// only the default route applies. `None` when the sub-tenant has no
-/// applicable route (⇒ no restriction).
-fn select_sub_tenant_route<'a>(
-    routes: &'a [SubTenantRoute],
-    sub_tenant_id: &str,
-    model_key: Option<&str>,
-) -> Option<&'a SubTenantRoute> {
-    let applicable: Vec<&'a SubTenantRoute> = routes
-        .iter()
-        .filter(|r| r.enabled && r.sub_tenant_id == sub_tenant_id)
-        .collect();
-    let default = applicable.iter().find(|r| r.model_key.is_none()).copied();
-    match model_key {
-        Some(model) => applicable
-            .iter()
-            .find(|r| r.model_key.as_deref() == Some(model))
-            .copied()
-            .or(default),
-        None => default,
-    }
-}
-
-/// Tenant-scoped sub-tenant route lookup by raw api-key prefix
-/// (design-sub-tenant.md §4.1, step 3.6).
-///
-/// Prefixes are unique/non-overlapping within a tenant, so at most one
-/// sub-tenant matches; within it, a model-specific route
-/// (`model_key == Some(model)`) wins over the default (`None`).
-/// `model_key = None` means "default route only" (the model-less passthrough
-/// path, per Q10). `None` when no sub-tenant prefix or no applicable route
-/// matches (⇒ no routing restriction — opt-in steering, not a whitelist).
-pub fn match_sub_tenant_route<'a>(
-    cfg: &'a ConfigData,
-    tenant_id: &str,
-    model_key: Option<&str>,
-    api_key: &str,
-) -> Option<&'a SubTenantRoute> {
-    match_sub_tenant(cfg, tenant_id, api_key)
-        .and_then(|st| select_sub_tenant_route(&cfg.sub_tenant_routes, &st.id, model_key))
-}
 
 /// [`resolve_detailed`], candidates only.
 ///
@@ -191,9 +96,8 @@ pub fn resolve(
     breaker: &dyn BreakerView,
     tenant: &Tenant,
     model_key: &str,
-    client_api_key: Option<&str>,
 ) -> Result<Vec<Candidate>, RouteError> {
-    let outcome = resolve_detailed(cfg, breaker, tenant, model_key, client_api_key)?;
+    let outcome = resolve_detailed(cfg, breaker, tenant, model_key)?;
     if outcome.candidates.is_empty() {
         // Every candidate was dropped in step 4 — the same failure this function
         // has always reported (and what `route_error_status` maps to 503).
@@ -224,9 +128,8 @@ pub fn resolve_detailed(
     breaker: &dyn BreakerView,
     tenant: &Tenant,
     model_key: &str,
-    client_api_key: Option<&str>,
 ) -> Result<ResolveOutcome, RouteError> {
-    resolve_impl(cfg, breaker, tenant, model_key, client_api_key, None)
+    resolve_impl(cfg, breaker, tenant, model_key, None)
 }
 
 /// [`resolve_detailed`]'s pipeline with the request's api-key PRINCIPAL instead
@@ -259,23 +162,22 @@ pub fn resolve_with_principal(
     model_key: &str,
     principal: Option<&ApiPrincipal>,
 ) -> Result<ResolveOutcome, RouteError> {
-    resolve_impl(cfg, breaker, tenant, model_key, None, principal)
+    resolve_impl(cfg, breaker, tenant, model_key, principal)
 }
 
 /// Wildcard literal on a Global Role dimension (decision D-2; `crate::role`
 /// owns the matcher and keeps its own private copy of this constant).
 const WILDCARD: &str = "*";
 
-/// The ONE resolve pipeline, seen through both entry points: `client_api_key`
-/// drives the raw-key gates (3.5 / 3.6), `principal` drives the Global Role
-/// gate (step 2). Both wrappers pass one and leave the other `None`, so
-/// neither gate can fork into a second implementation.
+/// The ONE resolve pipeline, seen through both entry points: `principal` drives
+/// the Global Role gate (step 2) and `None` selects the legacy candidate base.
+/// Both wrappers share this body, so neither can fork into a second
+/// implementation.
 fn resolve_impl(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
     tenant: &Tenant,
     model_key: &str,
-    client_api_key: Option<&str>,
     principal: Option<&ApiPrincipal>,
 ) -> Result<ResolveOutcome, RouteError> {
     // (0) TenantModel access gate (design §7.1, revised — default-open): a
@@ -331,37 +233,6 @@ fn resolve_impl(
     intersection.retain(|pid| by_model.contains(pid));
     if intersection.is_empty() {
         return Err(RouteError::NoAvailableProvider);
-    }
-
-    // (3.5) Key-prefix binding gate (design §7.1b): a client api-key whose raw
-    // value matches an enabled prefix binding restricts the candidate set to
-    // the bound provider — fail-closed (never falls back to unbound
-    // providers). Longest prefix wins; no match ⇒ no restriction.
-    let mut binding_matched = false;
-    if let Some(api_key) = client_api_key {
-        if let Some(binding) = match_key_binding(&cfg.key_prefix_bindings, api_key) {
-            binding_matched = true;
-            intersection.retain(|pid| pid == &binding.provider_id);
-            if intersection.is_empty() {
-                return Err(RouteError::NoAvailableProvider);
-            }
-        }
-    }
-
-    // (3.6) Sub-tenant route gate (design-sub-tenant.md §4.1): applied only
-    // when the operator binding did NOT match — the operator's explicit
-    // disposition wins (ruling a′). A matching enabled sub-tenant route
-    // restricts the candidate set to its provider (fail-closed); no match
-    // leaves the set unchanged (opt-in steering, not a whitelist).
-    if !binding_matched {
-        if let Some(api_key) = client_api_key {
-            if let Some(route) = match_sub_tenant_route(cfg, &tenant.id, Some(model_key), api_key) {
-                intersection.retain(|pid| pid == &route.provider_id);
-                if intersection.is_empty() {
-                    return Err(RouteError::NoAvailableProvider);
-                }
-            }
-        }
     }
 
     // (4) Filter: not dead, has ≥1 api-key, weight > 0.
@@ -445,11 +316,9 @@ pub struct CatalogEntry {
 /// Mirrors [`resolve`] gate-for-gate across **all** rows of
 /// `models_by_key` (which the loader guarantees are `status == 1`):
 /// tenant_models whitelist (default-open) → serving providers ∩
-/// `tenant_providers` → key-prefix binding gate ([`match_key_binding`];
-/// `client_api_key` is `None` or unmatched ⇒ no restriction) → sub-tenant
-/// route gate (3.6, only when the binding did not match; a model whose
-/// intersection empties is dropped — fail-closed, mirroring `resolve`) →
-/// filter.
+/// `tenant_providers` → runtime filter. (The key-prefix binding and sub-tenant
+/// route gates this once mirrored are gone — the routing interface is Global
+/// Role.) `client_api_key` is accepted for call-compatibility only.
 ///
 /// Equivalent to [`accessible_models_with_principal`] with `principal = None`:
 /// no request identity, so a Global Role rule can only be accepted when its
@@ -480,9 +349,8 @@ pub fn accessible_models(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
     tenant_id: &str,
-    client_api_key: Option<&str>,
 ) -> Vec<CatalogEntry> {
-    accessible_models_impl(cfg, breaker, tenant_id, client_api_key, None)
+    accessible_models_impl(cfg, breaker, tenant_id, None)
 }
 
 /// [`accessible_models`]'s catalog walk with the request's api-key PRINCIPAL,
@@ -507,17 +375,16 @@ pub fn accessible_models_with_principal(
     tenant_id: &str,
     principal: Option<&ApiPrincipal>,
 ) -> Vec<CatalogEntry> {
-    accessible_models_impl(cfg, breaker, tenant_id, None, principal)
+    accessible_models_impl(cfg, breaker, tenant_id, principal)
 }
 
 /// The ONE catalog walk, seen through both entry points (same single-implementation
-/// rule as [`resolve_impl`]): `client_api_key` drives the raw-key gates,
-/// `principal` drives the Global Role gate.
+/// rule as [`resolve_impl`]): `principal` drives the Global Role gate and
+/// `None` selects the legacy candidate base.
 fn accessible_models_impl(
     cfg: &ConfigData,
     breaker: &dyn BreakerView,
     tenant_id: &str,
-    client_api_key: Option<&str>,
     principal: Option<&ApiPrincipal>,
 ) -> Vec<CatalogEntry> {
     // (2) Tenant-authorised providers — legacy-fallback branch only (catalog
@@ -526,18 +393,6 @@ fn accessible_models_impl(
     // Global Role candidate base does not need it unless a matched rule pins
     // the `*` tenant, so the lookup is hoisted, not an early return.
     let tenant_ok: Option<&HashSet<String>> = cfg.tenant_providers.get(tenant_id);
-
-    // Key-level (3.5)/(3.6) predicates — they depend only on the api-key, not
-    // the model, so they are computed once, outside the per-model loop. The
-    // operator binding wins (ruling a′): when it matches, the sub-tenant gate
-    // is skipped entirely (`matched_sub_tenant` stays `None`).
-    let (operator_binding, matched_sub_tenant) = match client_api_key {
-        Some(api_key) => match match_key_binding(&cfg.key_prefix_bindings, api_key) {
-            Some(binding) => (Some(binding), None),
-            None => (None, match_sub_tenant(cfg, tenant_id, api_key)),
-        },
-        None => (None, None),
-    };
 
     let mut entries: Vec<CatalogEntry> = Vec::new();
 
@@ -560,7 +415,7 @@ fn accessible_models_impl(
             serving.iter().map(|row| row.provider_id.clone()).collect();
         let roles = crate::role::match_global_roles(cfg, tenant_id, principal, model_key);
         let role_union = crate::role::union_role_providers(&roles);
-        let mut providers: Vec<String> = if role_union.is_empty() {
+        let providers: Vec<String> = if role_union.is_empty() {
             // No Global Role candidate ⇒ legacy intersection. Catalog semantics:
             // a tenant with no `tenant_providers` entry has NO models (per-request
             // `resolve` would answer TenantForbidden there).
@@ -589,26 +444,6 @@ fn accessible_models_impl(
                 role_candidates.collect()
             }
         };
-
-        // (3.5) Key-prefix binding gate — match ⇒ keep only the bound provider
-        // (fail-closed); no match (or None key) ⇒ no restriction.
-        if let Some(binding) = operator_binding {
-            providers.retain(|pid| *pid == binding.provider_id);
-        }
-
-        // (3.6) Sub-tenant route gate (design-sub-tenant.md §4.1) — only when
-        // the operator binding did not match (a′). Route selection is
-        // per-model (model-specific > default); an empty intersection drops
-        // the model (fail-closed, mirroring resolve).
-        if operator_binding.is_none() {
-            if let Some(sub_tenant) = matched_sub_tenant {
-                if let Some(route) =
-                    select_sub_tenant_route(&cfg.sub_tenant_routes, &sub_tenant.id, Some(model_key))
-                {
-                    providers.retain(|pid| *pid == route.provider_id);
-                }
-            }
-        }
 
         // (4) Runtime filter — existence guard first (never a bare index into
         // cfg.providers): drop orphan references, breaker-dead providers,
@@ -1043,7 +878,7 @@ mod tests {
         // principal-aware entry point and the legacy set.
         let cfg = base_cfg();
         let detailed =
-            resolve_detailed(&cfg, &alive(), &tenant(), "gpt-4o", None).expect("legacy resolve");
+            resolve_detailed(&cfg, &alive(), &tenant(), "gpt-4o").expect("legacy resolve");
         let principal_less =
             resolve_with_principal(&cfg, &alive(), &tenant(), "gpt-4o", None).expect("same path");
         assert_eq!(detailed, principal_less, "wrapper delegates, does not fork");
@@ -1052,7 +887,7 @@ mod tests {
             vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string(),],
         );
         assert_eq!(
-            accessible_models(&cfg, &alive(), "t_acme", None),
+            accessible_models(&cfg, &alive(), "t_acme"),
             accessible_models_with_principal(&cfg, &alive(), "t_acme", None),
             "catalog wrappers agree when no rules exist",
         );
@@ -1069,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             ids_of(
-                &resolve_detailed(&identified_only, &alive(), &tenant(), "gpt-4o", None)
+                &resolve_detailed(&identified_only, &alive(), &tenant(), "gpt-4o")
                     .expect("anonymous → legacy"),
             ),
             vec!["p_a".to_string(), "p_b".to_string(), "p_c".to_string(),],
@@ -1084,7 +919,7 @@ mod tests {
         );
         assert_eq!(
             ids_of(
-                &resolve_detailed(&all_wild, &alive(), &tenant(), "gpt-4o", None)
+                &resolve_detailed(&all_wild, &alive(), &tenant(), "gpt-4o")
                     .expect("all-* rule matches the anonymous request"),
             ),
             vec!["p_z".to_string()],

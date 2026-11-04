@@ -5,10 +5,10 @@ What this pins, and why it needed measuring: since D-6 (乙-full) the entry node
 tenant self-service write itself, and the publish step rides on the post-write `reload_all`. When the
 control plane cannot commit (no majority), the SQLite transaction has ALREADY committed — so the node
 serves the new config while the cluster does not have it. **Measured 2026-10-05: with 2 of 3 members
-killed, `PUT /tenant/t1/api/v1/sub-tenants/s2` answered `200 {"config_version":3,…}`** and the head
+killed, `PUT /tenant/t1/api/v1/user-groups` (a user-group upsert) answered `200 {"config_version":3,…}`** and the head
 was uncommittable. A tenant reads `config_version` as its reconciliation baseline (documented in
 `tenant-api-integration.md`), so a `200` there is a lie the tenant cannot detect: no other node will
-ever see the sub-tenant, and an LB that moves the next request elsewhere silently loses it.
+ever see the user-group, and an LB that moves the next request elsewhere silently loses it.
 
 The admin path has answered `503 config_not_published` for this exact failure since T3.2. The tenant
 path was left behind when the write moved to the entry node; this drill is the executable form of
@@ -22,9 +22,9 @@ Gates:
      bad"), which is what tells an integrator to retry rather than to fix the payload
   D  the survivor is still healthy and still serving its materialized config (`/api/v1/health` 200):
      a refused publish must not take the node down
-  E  quorum restored: retrying the SAME request answers 200 (the write is idempotent — a sub-tenant
-     is an upsert on `(tenant_id, name)`)
-  F  ...and the retry is what PUBLISHES it: a different node, asked for the tenant's own sub-tenants,
+  E  quorum restored: retrying the SAME request answers 200 (the write is idempotent — a user-group
+     upsert converges on the row id supplied in the body)
+  F  ...and the retry is what PUBLISHES it: a different node, asked for the tenant's own user-groups,
      now lists it (the cluster actually converged)
 
 Run:  python3 integration/test_tenant_write_publish_failure.py
@@ -210,18 +210,18 @@ def seed(node, upstream):
 
 
 def tenant_write(node, name):
-    """The tenant self-service write under test (an upsert on `(tenant_id, name)`)."""
+    """The tenant self-service write under test (a flat user-group upsert keyed by BODY id)."""
     return http(
         node.data_port,
         "PUT",
-        f"/tenant/t1/api/v1/sub-tenants/{name}",
+        "/tenant/t1/api/v1/user-groups",
         token=TENANT_TOKEN,
-        body={"enabled": True},
+        body={"id": name, "name": name, "enabled": True},
     )
 
 
 def tenant_list(node):
-    return http(node.data_port, "GET", "/tenant/t1/api/v1/sub-tenants", token=TENANT_TOKEN)
+    return http(node.data_port, "GET", "/tenant/t1/api/v1/user-groups", token=TENANT_TOKEN)
 
 
 def wait_for(cond, budget, what):
@@ -353,11 +353,11 @@ def main():
         other = next(n for n in nodes if n is not entry)
         ok = wait_for(
             lambda: any(st.get("name") == "s-nopublish"
-                        for st in (tenant_list(other)[1].get("sub_tenants") or [])),
+                        for st in (tenant_list(other)[1].get("user_groups") or [])),
             20,
-            "the OTHER node to list the retried sub-tenant",
+            "the OTHER node to list the retried user-group",
         )
-        names = [st.get("name") for st in (tenant_list(other)[1].get("sub_tenants") or [])]
+        names = [st.get("name") for st in (tenant_list(other)[1].get("user_groups") or [])]
         check("F: ...and the retry is what PUBLISHES it — another node now serves it (the cluster "
               "converged)", ok, f"{other.name} sees {names}")
     finally:
@@ -369,7 +369,7 @@ def main():
         print(f"TENANT WRITE PUBLISH FAILURE: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print("TENANT WRITE PUBLISH FAILURE: PASSED (503 config_not_published without a quorum, "
-          "idempotent retry republishes it)")
+          "idempotent user-group retry republishes it)")
     return 0
 
 

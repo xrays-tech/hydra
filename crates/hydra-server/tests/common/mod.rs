@@ -170,7 +170,7 @@ pub async fn setup_pool() -> SqlitePool {
 /// Hand-assigning means two files CAN claim the same number, and then each one
 /// `FLUSHDB`s the other's keys mid-assertion: a flaky failure whose cause is
 /// invisible from the failing test (`registry_reaping.rs` and
-/// `sub_tenant_data_plane_write.rs` both used 47 until round 10). That rule is
+/// `loader.rs` both used 47 until round 10). That rule is
 /// enforced now by `tests/redis_db_partition.rs`, which scans the sibling test
 /// sources and fails when a number is claimed twice.
 // Each test target compiles this module on its own, so a helper used by one
@@ -281,14 +281,11 @@ pub fn hydrated(
         cfg,
         fidelity: hydra_server::cluster::content::FidelityRows {
             limit_roles: Vec::new(),
-            key_prefix_bindings: Vec::new(),
             provider_keys: Vec::new(),
             tenant_token_hashes: Vec::new(),
             provider_models: Vec::new(),
             tenant_providers: Vec::new(),
             tenant_models: Vec::new(),
-            sub_tenants: Vec::new(),
-            sub_tenant_routes: Vec::new(),
             user_groups: Vec::new(),
             users: Vec::new(),
             user_api_keys: Vec::new(),

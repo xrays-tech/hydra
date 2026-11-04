@@ -24,22 +24,20 @@
 
 mod common;
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
-use hydra_core::config::ConfigData;
 use hydra_core::model::{
-    LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant, SubTenantRoute,
-    Tenant, TenantModel, TenantProvider, UsageRecord,
+    LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
+    UsageRecord,
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
-use hydra_server::proxy::config::{NonRouteStrategy, ProxyConfig};
+use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
 use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::store::ConfigStore;
@@ -1576,8 +1574,8 @@ async fn admission_capped_provider_does_not_block_second_request() {
 // of the principal that resolved the request, and invents nothing when there is
 // no principal.
 //
-// This leg used to assert sub-tenant-prefix attribution (`UsageRecord.sub_tenant_id`);
-// that column is gone — attribution now comes from the resolved
+// This leg used to assert a legacy per-request attribution column that no longer
+// exists on `UsageRecord`; attribution now comes from the resolved
 // `ApiPrincipal` (`user_id` / `user_group_id` / `api_key_id`), which the
 // internal api-key path puts on the context. What is pinned here is the
 // half that does NOT need a seeded principal, and it is the half that fails
@@ -2101,145 +2099,6 @@ async fn catalog_get_v1_models_tenant_without_providers_returns_empty() {
     );
 }
 
-/// (Task 2e — restated for T7a) Key-prefix binding does NOT narrow the
-/// directory: `accessible_models_with_principal` takes no raw api-key, so the
-/// binding's fail-closed rule lives on the ROUTING side only. pA serves alpha
-/// + shared; pB serves beta + shared; no tenant_models rows (default-open).
-/// With `test-client-key` bound to pA the catalog lists the whole union —
-/// pB's beta is NOT dropped — and the binding still decides which provider
-/// answers a chat request for a model only it serves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catalog_get_v1_models_key_prefix_binding_does_not_narrow_the_directory() {
-    let auth_server = allowing_auth_server().await;
-    let upstream_a = MockServer::start().await;
-    let upstream_b = MockServer::start().await;
-    // Only pA answers; an unmounted pB would surface as a wiremock 404 AND a
-    // recorded hit, so the routing assertion below stays observable.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"served-by-pA"}"#))
-        .mount(&upstream_a)
-        .await;
-
-    let pool = common::setup_pool().await;
-    seed_provider(&pool, "pA", "provA", "ProviderA", &upstream_a.uri()).await;
-    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
-    for (mid, pid, key) in [
-        ("m_a_alpha", "pA", "alpha"),
-        ("m_a_shared", "pA", "shared"),
-        ("m_b_beta", "pB", "beta"),
-        ("m_b_shared", "pB", "shared"),
-    ] {
-        repo::insert_provider_model(
-            &pool,
-            &ProviderModel {
-                id: mid.into(),
-                key: key.into(),
-                name: key.into(),
-                provider_id: pid.into(),
-                status: 1,
-            },
-        )
-        .await
-        .expect("insert provider_model");
-    }
-    seed_tenant(
-        &pool,
-        "t1",
-        "localhost",
-        &format!("{}/auth", auth_server.uri()),
-    )
-    .await;
-    for (tpid, pid) in [("tp_a", "pA"), ("tp_b", "pB")] {
-        repo::insert_tenant_provider(
-            &pool,
-            &TenantProvider {
-                id: tpid.into(),
-                tenant_id: "t1".into(),
-                provider_id: pid.into(),
-            },
-        )
-        .await
-        .expect("insert tenant_provider");
-    }
-    // NOTE: no tenant_models rows — default-open gate.
-    seed_key(
-        &pool,
-        &StaticKeyProvider::new([1u8; 32], 1),
-        "pk_a",
-        "pA",
-        "sk-a",
-    )
-    .await;
-    seed_key(
-        &pool,
-        &StaticKeyProvider::new([1u8; 32], 1),
-        "pk_b",
-        "pB",
-        "sk-b",
-    )
-    .await;
-    // Bind the client key prefix `test-client` to provider pA.
-    repo::insert_provider_key_binding(
-        &pool,
-        &ProviderKeyBinding {
-            id: "bind_test_client".into(),
-            key_prefix: "test-client".into(),
-            provider_id: "pA".into(),
-            enabled: true,
-            created_at: NOW.into(),
-            updated_at: NOW.into(),
-        },
-    )
-    .await
-    .expect("insert provider_key_binding");
-    seed_default_role(&pool, "t1").await;
-
-    let state = build_state(&pool).await;
-    let root = start_proxy(state);
-    let client = test_client();
-
-    let resp = get_until_ready(&client, &format!("{root}/v1/models"), "test-client-key").await;
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.expect("body");
-    assert_eq!(
-        body,
-        r#"{"object":"list","data":[{"id":"alpha","object":"model"},{"id":"beta","object":"model"},{"id":"shared","object":"model"}]}"#,
-        "the directory is the tenant union; a key-prefix binding no longer narrows it: {body}"
-    );
-
-    // The binding still decides ROUTING: `alpha` is served only by pA, and the
-    // binding pins this client key to pA, so pB must receive nothing.
-    let resp = send_until_ready(
-        &client,
-        &format!("{root}/v1/chat/completions"),
-        r#"{"model":"alpha","messages":[]}"#,
-    )
-    .await;
-    assert_eq!(
-        resp.status(),
-        200,
-        "the bound provider must serve its own model"
-    );
-    let _ = resp.text().await;
-    let a_hits = upstream_a
-        .received_requests()
-        .await
-        .expect("upstream_a recording on");
-    assert!(
-        a_hits.iter().any(|r| r.method.as_str() == "POST"),
-        "the bound provider (pA) must receive the routed request"
-    );
-    let b_hits = upstream_b
-        .received_requests()
-        .await
-        .expect("upstream_b recording on");
-    assert!(
-        b_hits.is_empty(),
-        "the unbound provider (pB) must receive nothing: {}",
-        b_hits.len()
-    );
-}
 // ===========================================================================
 // Tenant model catalog — PUBLIC read revision (anonymous AND keyed access:
 // with or without a presented api-key the exact GET /v1/models reads locally)
@@ -2920,10 +2779,9 @@ async fn non_bearer_authorization_scheme_is_rejected() {
 
 /// (C5 — restated for T7a) The credential in the QUERY transport does not
 /// narrow the directory either: `GET /v1/models` never authenticates, and
-/// since T7a the directory narrows on the caller's Global Role rules, not on
-/// key-prefix bindings — whatever transport carried the key. Same seed as
-/// `catalog_get_v1_models_key_prefix_binding_does_not_narrow_the_directory`,
-/// but the key travels in the query string only.
+/// since T7a the directory narrows on the caller's Global Role rules — whatever
+/// transport carried the key. Same seed as the directory-catalogue cases, but
+/// the key travels in the query string only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn catalog_key_in_the_query_transport_does_not_narrow_the_directory() {
     let auth_server = allowing_auth_server().await;
@@ -2987,19 +2845,6 @@ async fn catalog_key_in_the_query_transport_does_not_narrow_the_directory() {
         "sk-b",
     )
     .await;
-    repo::insert_provider_key_binding(
-        &pool,
-        &ProviderKeyBinding {
-            id: "bind_test_client".into(),
-            key_prefix: "test-client".into(),
-            provider_id: "pA".into(),
-            enabled: true,
-            created_at: NOW.into(),
-            updated_at: NOW.into(),
-        },
-    )
-    .await
-    .expect("insert provider_key_binding");
     seed_default_role(&pool, "t1").await;
 
     let root = start_proxy(build_state(&pool).await);
@@ -4040,272 +3885,9 @@ async fn non_route_strategy_reject_refuses_a_model_less_body() {
 // ===========================================================================
 
 /// A single provider (weight 1, endpoint pointed at `endpoint`).
-fn provider_cfg(id: &str, endpoint: &str) -> Provider {
-    Provider {
-        id: id.into(),
-        key: format!("k_{id}"),
-        name: id.into(),
-        endpoint: endpoint.into(),
-        weight: 1,
-        created_at: NOW.into(),
-        updated_at: NOW.into(),
-        max_concurrency: None,
-        max_queue_depth: None,
-        queue_wait_timeout_ms: None,
-    }
-}
-
 /// Base passthrough config: tenant `t1` (domain `localhost`) with two providers
 /// `p1` and `p2`, both authorised and keyed. `models_by_key`/`tenant_models` are
 /// left empty — the passthrough path does not consult them (there is no model).
-fn passthrough_base_cfg(auth_url: &str, p1_endpoint: &str, p2_endpoint: &str) -> ConfigData {
-    let mut cfg = ConfigData::default();
-    let tenant = Tenant {
-        id: "t1".into(),
-        name: "t1".into(),
-        domain: "localhost".into(),
-        auth_url: auth_url.into(),
-        cert_key: None,
-        cert_file: None,
-        enabled: true,
-        created_at: NOW.into(),
-        updated_at: NOW.into(),
-    };
-    cfg.tenants_by_domain.insert("localhost".into(), tenant);
-    cfg.reindex_tenants();
-    cfg.providers
-        .insert("p1".into(), provider_cfg("p1", p1_endpoint));
-    cfg.providers
-        .insert("p2".into(), provider_cfg("p2", p2_endpoint));
-    cfg.tenant_providers
-        .insert("t1".into(), HashSet::from(["p1".into(), "p2".into()]));
-    cfg.provider_keys.insert("p1".into(), vec!["sk-p1".into()]);
-    cfg.provider_keys.insert("p2".into(), vec!["sk-p2".into()]);
-    // T3: the data-plane gate authenticates against the DERIVED identity index,
-    // and `ConfigStore::from_data` does NOT re-derive it (the wire never carries
-    // it) — a hand-built config must therefore carry the identity of the key its
-    // requests present. Same hash the proxy computes from the credential
-    // (`proxy.rs::enforce_auth`), so this is the DB row's mirror, not a bypass.
-    cfg.users_by_api_key_hash.insert(
-        hydra_core::auth::sha256_hex_string(b"test-client-key"),
-        hydra_core::identity::ApiKeyIdentity {
-            principal: hydra_core::identity::ApiPrincipal {
-                tenant_id: "t1".to_string(),
-                user_group_id: "grp-t1".to_string(),
-                user_id: "usr-t1".to_string(),
-                api_key_id: "key-t1".to_string(),
-                billing_status: hydra_core::model::BillingStatus::Active,
-            },
-            key_enabled: true,
-            user_enabled: true,
-            group_enabled: true,
-            expires_at: None,
-        },
-    );
-    cfg
-}
-
-/// A sub-tenant whose `key_prefix` matches the test client key `test-client-key`.
-fn sub_tenant_cfg(tenant_id: &str, key_prefix: &str) -> SubTenant {
-    SubTenant {
-        id: "st1".into(),
-        tenant_id: tenant_id.into(),
-        name: "st1".into(),
-        key_prefix: key_prefix.into(),
-        enabled: true,
-        created_at: NOW.into(),
-        updated_at: NOW.into(),
-    }
-}
-
-/// A sub-tenant route pinning the sub-tenant to `provider_id` (`model_key = None`
-/// ⇒ the sub-tenant's default route).
-fn sub_tenant_route_cfg(
-    sub_tenant_id: &str,
-    model_key: Option<&str>,
-    provider_id: &str,
-) -> SubTenantRoute {
-    SubTenantRoute {
-        id: "r1".into(),
-        sub_tenant_id: sub_tenant_id.into(),
-        model_key: model_key.map(|m| m.to_string()),
-        provider_id: provider_id.into(),
-        enabled: true,
-        created_at: NOW.into(),
-        updated_at: NOW.into(),
-    }
-}
-
-/// Build an `AppState` from a hand-crafted `ConfigData` (bypasses the DB loader).
-///
-/// The store is `from_data` over a migrated in-memory database: the config this test drives is
-/// injected, but every `ConfigStore` now owns a real pool, and reading the version watermark is a
-/// query against it — hence `async`.
-async fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<AppState> {
-    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
-    let store = ConfigStore::from_data(common::setup_pool().await, cfg, key_provider)
-        .await
-        .expect("from_data");
-    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
-    let limiter = Arc::new(RateLimiter::new());
-    let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
-    AppState::for_tests(
-        store,
-        breaker,
-        limiter,
-        sink,
-        proxy,
-        hydra_server::tenant_api::TenantApiConfig::default(),
-    )
-}
-
-/// T5 — a model-less passthrough request whose key matches a sub-tenant DEFAULT
-/// route is narrowed to that route's provider (not the first live provider).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn passthrough_sub_tenant_default_route_narrows_to_provider() {
-    let auth_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
-        )
-        .mount(&auth_server)
-        .await;
-
-    let upstream_p1 = MockServer::start().await;
-    let upstream_p2 = MockServer::start().await;
-    // p2 is the sub-tenant default-route target — it must receive the request.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p2"}"#))
-        .expect(1)
-        .mount(&upstream_p2)
-        .await;
-    // p1 is a decoy (the first live provider) — it must NOT receive the request.
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p1"}"#))
-        .mount(&upstream_p1)
-        .await;
-
-    let mut cfg = passthrough_base_cfg(
-        &format!("{}/auth", auth_server.uri()),
-        &upstream_p1.uri(),
-        &upstream_p2.uri(),
-    );
-    // Sub-tenant default route → p2. The test client key is `test-client-key`,
-    // which starts with the prefix `test-client-`.
-    cfg.sub_tenants.push(sub_tenant_cfg("t1", "test-client-"));
-    cfg.sub_tenant_routes
-        .push(sub_tenant_route_cfg("st1", None, "p2"));
-
-    let proxy = ProxyConfig {
-        non_route_strategy: NonRouteStrategy::Passthrough,
-        ..ProxyConfig::default()
-    };
-    let state = build_state_from_config(cfg, proxy).await;
-    let root = start_proxy(state);
-    let url = format!("{root}/v1/chat/completions");
-    let client = test_client();
-
-    // Model-less request (no `model` field) → passthrough path.
-    let resp = send_until_ready(
-        &client,
-        &url,
-        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "narrowed passthrough should succeed");
-    let _ = resp.text().await;
-
-    // The request went to p2 (the default-route provider), not p1 (first live).
-    let p2_hits = upstream_p2.received_requests().await.expect("recording");
-    assert!(
-        p2_hits.iter().any(|r| r.method.as_str() == "POST"),
-        "p2 (the default-route provider) must receive the request"
-    );
-    let p1_hits = upstream_p1.received_requests().await.expect("recording");
-    assert!(
-        p1_hits.is_empty(),
-        "p1 (the first live provider) must NOT receive the request: {} hits",
-        p1_hits.len()
-    );
-}
-
-/// T5 — fail-closed (Q11): when the sub-tenant DEFAULT route's provider is
-/// unavailable (keyless), a model-less passthrough request is refused (503)
-/// rather than silently allowed onto another provider.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn passthrough_sub_tenant_default_route_fail_closed_503() {
-    let auth_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": true })),
-        )
-        .mount(&auth_server)
-        .await;
-
-    let upstream_p1 = MockServer::start().await;
-    let upstream_p2 = MockServer::start().await;
-    // p2 is the decoy that a non-fail-closed implementation would fall back to.
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p2"}"#))
-        .mount(&upstream_p2)
-        .await;
-    // p1 (the default-route target) is keyless and must never be called.
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"p1"}"#))
-        .mount(&upstream_p1)
-        .await;
-
-    let mut cfg = passthrough_base_cfg(
-        &format!("{}/auth", auth_server.uri()),
-        &upstream_p1.uri(),
-        &upstream_p2.uri(),
-    );
-    // Make p1 unavailable (keyless) while it is the default-route target.
-    cfg.provider_keys.remove("p1");
-    cfg.sub_tenants.push(sub_tenant_cfg("t1", "test-client-"));
-    cfg.sub_tenant_routes
-        .push(sub_tenant_route_cfg("st1", None, "p1"));
-
-    let proxy = ProxyConfig {
-        non_route_strategy: NonRouteStrategy::Passthrough,
-        ..ProxyConfig::default()
-    };
-    let state = build_state_from_config(cfg, proxy).await;
-    let root = start_proxy(state);
-    let url = format!("{root}/v1/chat/completions");
-    let client = test_client();
-
-    // Model-less request → passthrough path. The default route pins to p1,
-    // which is keyless ⇒ fail-closed (503), NOT a silent fallback to p2.
-    let resp = send_until_ready(
-        &client,
-        &url,
-        r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-    )
-    .await;
-    assert_eq!(
-        resp.status(),
-        503,
-        "a keyless default-route provider must fail closed (503), not fall back"
-    );
-    let _ = resp.text().await;
-
-    // Neither provider may have been called — the request was refused at routing.
-    let p2_hits = upstream_p2.received_requests().await.expect("recording");
-    assert!(
-        p2_hits.is_empty(),
-        "the request must NOT silently fall back to p2: {} hits",
-        p2_hits.len()
-    );
-    let p1_hits = upstream_p1.received_requests().await.expect("recording");
-    assert!(
-        p1_hits.is_empty(),
-        "the keyless p1 must not be called: {} hits",
-        p1_hits.len()
-    );
-}
-
 /// Round 46 (plan §2r) — a provider that dropped out of rotation is NAMED, in the
 /// case that used to leave no trace at all.
 ///

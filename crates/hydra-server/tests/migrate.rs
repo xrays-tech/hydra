@@ -46,10 +46,9 @@ async fn migrate_creates_all_tables() {
     }
 }
 
-// `the_sub_tenant_usage_index_exists` stood here, asserting `idx_usage_record_sub_tenant` on
-// `(tenant_id, sub_tenant_id, created_at)`. Migration 0013 drops the table, and an index cannot
-// outlive it, so the subject is gone rather than unasserted — `usage_record_is_gone` below asserts
-// the outcome that matters now.
+// An index-existence assertion stood here for the usage table's secondary index. Migration
+// 0013 drops the table, and an index cannot outlive it, so the subject is gone rather than
+// unasserted — `usage_record_is_gone` below asserts the outcome that matters now.
 
 /// Migration 0013 must have DROPPED the local usage table (ADR-0002 D-3).
 ///

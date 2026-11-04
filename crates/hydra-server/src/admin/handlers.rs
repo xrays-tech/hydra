@@ -13,11 +13,9 @@ use std::sync::Arc;
 use http::Response;
 use hydra_core::auth::sha256_hex;
 use hydra_core::model::{
-    GlobalRole, LimitRole, Provider, ProviderKey, ProviderKeyBinding, ProviderKeyDto,
-    ProviderModel, SubTenant, SubTenantRoute, Tenant, TenantAccessToken, TenantModel,
-    TenantProvider, User, UserGroup,
+    GlobalRole, LimitRole, Provider, ProviderKey, ProviderKeyDto, ProviderModel, Tenant,
+    TenantAccessToken, TenantModel, TenantProvider, User, UserGroup,
 };
-use hydra_core::sub_tenant::SubTenantWriteError;
 use pingora_core::protocols::http::ServerSession;
 use serde::{Deserialize, Serialize};
 // `Engine` and `RngCore` look unused: both are METHOD PROVIDERS — `Engine` for
@@ -27,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use base64::Engine;
 use rand::RngCore;
 
-use super::sub_tenant_write;
 use super::AdminState;
 use crate::admin::metrics;
 
@@ -61,40 +58,6 @@ pub(super) fn err_json(status: u16, code: &str, message: &str, trace_id: &str) -
         },
     };
     json_response(status, to_json(&body))
-}
-
-/// Shape-check an operator `key_prefix_binding` prefix, returning the 400 to
-/// send when it is unusable.
-///
-/// A binding prefix is a GLOBAL namespace match that wins over the sub-tenant
-/// routing gate (`router::match_key_binding`), so a bare prefix like `"s"` or
-/// `"sk-"` silently re-routes — or 503s — every tenant whose key happens to
-/// start with it. The sub-tenant write path has always enforced the shape rules
-/// (`hydra_core::sub_tenant::validate_prefix_shape`); this boundary checked only
-/// "not empty", so the same mistake was accepted here with far wider blast
-/// radius. Both now call the one shared rule.
-fn key_prefix_shape_error(prefix: &str, trace_id: &str) -> Option<Resp> {
-    let err = match hydra_core::sub_tenant::validate_prefix_shape(prefix) {
-        Ok(()) => return None,
-        Err(e) => e,
-    };
-    let (code, message) = match err {
-        hydra_core::sub_tenant::PrefixShapeError::Empty => (
-            "empty_key_prefix",
-            "key_prefix must be a non-empty string".to_string(),
-        ),
-        hydra_core::sub_tenant::PrefixShapeError::NonAscii => {
-            ("invalid_key_prefix", err.to_string())
-        }
-        hydra_core::sub_tenant::PrefixShapeError::NoSeparator => (
-            "invalid_key_prefix",
-            format!(
-                "{err}; a bare prefix would match unrelated keys across EVERY tenant, so it \
-                 must carry its separator (e.g. \"acme_\")"
-            ),
-        ),
-    };
-    Some(err_json(400, code, &message, trace_id))
 }
 
 /// `err_json` plus `Retry-After`, for a rate-limited answer (the admin-plane
@@ -358,10 +321,23 @@ pub(crate) fn now_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// The value of a single query parameter from a raw query string (`None` when
+/// the key is absent).
+fn query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query.and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let mut it = kv.splitn(2, '=');
+            match (it.next(), it.next()) {
+                (Some(k), Some(v)) if k == key => Some(v),
+                _ => None,
+            }
+        })
+    })
+}
+
 /// A fresh opaque id (`id-<nanos>-<len(thread id)>`).
 ///
-/// `pub(crate)` because the shared tenant-config write core
-/// ([`crate::admin::sub_tenant_write::apply_config_write`]) needs it too: that core moved out of
+/// `pub(crate)` because the data-plane write paths need it too: they moved out of
 /// the module that used to own the internal endpoint, and this is the ONE id generator — a second
 /// copy is how two faces of the same write start minting different shapes of id.
 pub(crate) fn gen_id() -> String {
@@ -1450,11 +1426,7 @@ struct TenantModelCatalog {
 /// flagged online:false. The data-plane GET /v1/models (and accessible_models)
 /// return the runtime online view; this endpoint exists so operators can see
 /// the full configured set and diagnose WHY a model is currently unroutable.
-/// No key-scoped routing gate applies (client_api_key is None on admin reads ⇒
-/// both the (3.5) operator key-prefix binding, `match_key_binding`, and the
-/// (3.6) sub-tenant route gate, `match_sub_tenant_route`, never fire — both are
-/// key-scoped, so this keyless view is a structural no-op for them, mirroring
-/// router::accessible_models). A
+/// The view is keyless, so this key-scoped no-op mirrors router::accessible_models. A
 /// model is listed as long as it keeps ≥ 1 configured AND existing
 /// (cfg.providers-present) authorised provider.
 ///
@@ -1687,487 +1659,6 @@ pub(super) async fn limit_role_item(
                 empty(204)
             }
             Err(e) => db_err_resp(e, trace_id),
-        },
-        _ => method_not_allowed(trace_id),
-    }
-}
-
-// ===========================================================================
-// Provider key bindings (design §7.1b)
-// ===========================================================================
-
-pub(super) async fn provider_key_binding_collection(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    trace_id: &str,
-) -> Resp {
-    if method == "GET" {
-        match crate::db::list_provider_key_bindings(state.db()).await {
-            Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
-        }
-    } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        if let Some(resp) = key_prefix_shape_error(&b.key_prefix, trace_id) {
-            return resp;
-        }
-        if b.id.is_empty() {
-            b.id = gen_id();
-        }
-        let ts = now_ts();
-        if b.created_at.is_empty() {
-            b.created_at = ts.clone();
-        }
-        if b.updated_at.is_empty() {
-            b.updated_at = ts;
-        }
-        match crate::db::insert_provider_key_binding(state.db(), &b).await {
-            Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
-        }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
-            return r;
-        }
-        ok_json(201, &b)
-    } else {
-        method_not_allowed(trace_id)
-    }
-}
-
-pub(super) async fn provider_key_binding_item(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    id: &str,
-    trace_id: &str,
-) -> Resp {
-    match method {
-        "GET" => match crate::db::get_provider_key_binding(state.db(), id).await {
-            Ok(b) => ok_json(200, &b),
-            Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "provider_key_binding not found", trace_id)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        },
-        "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let mut b: ProviderKeyBinding = match parse_body(&body, trace_id) {
-                Ok(b) => b,
-                Err(resp) => return resp,
-            };
-            if let Some(resp) = key_prefix_shape_error(&b.key_prefix, trace_id) {
-                return resp;
-            }
-            b.id = id.to_string();
-            b.updated_at = now_ts();
-            match crate::db::update_provider_key_binding(state.db(), &b).await {
-                Ok(()) => {}
-                Err(e) => return db_err_resp(e, trace_id),
-            }
-            match crate::db::get_provider_key_binding(state.db(), id).await {
-                Ok(b) => {
-                    if let Some(r) = reload_best_effort(state, trace_id).await {
-                        return r;
-                    }
-                    ok_json(200, &b)
-                }
-                Err(_) => err_json(404, "not_found", "provider_key_binding not found", trace_id),
-            }
-        }
-        "DELETE" => match crate::db::delete_provider_key_binding(state.db(), id).await {
-            Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
-                    return r;
-                }
-                empty(204)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        },
-        _ => method_not_allowed(trace_id),
-    }
-}
-
-// ===========================================================================
-// Sub-tenants & sub-tenant routes (design-sub-tenant.md §3.1, T6)
-// ===========================================================================
-//
-// Write path is error-level fail-closed and **transactional** (sub-tenant v2,
-// D5): every create / update / delete goes through the shared write core
-// [`sub_tenant_write`], which in ONE transaction reads the FULL set of DB rows
-// (incl. disabled), validates the write against that live snapshot + the
-// current `ConfigData`, then inserts / upserts / updates / deletes and
-// commits. A rejected write is never persisted (no silent accept). This closes
-// the two v1 post-implementation findings:
-//  * finding 1 — the quota now counts **all** DB rows (not just the enabled
-//    snapshot), so disable-then-recreate cannot grow the DB past the cap;
-//  * finding 2 — the prefix-overlap check runs against the live in-transaction
-//    rows, closing the validate-then-insert TOCTOU.
-//
-// On a successful mutation the snapshot is reloaded (`reload_best_effort`) and
-// the request inherits the automatic leader forwarding of
-// `maybe_forward_mutation`.
-
-/// Map a [`SubTenantWriteError`] to a semantic 400/409 response. Duplicates
-/// (name / prefix) are 409; every other rule violation is 400.
-fn sub_tenant_write_err_resp(e: &SubTenantWriteError, trace_id: &str) -> Resp {
-    let (status, code) = match e {
-        SubTenantWriteError::NameDuplicate => (409, "name_duplicate"),
-        SubTenantWriteError::PrefixDuplicate => (409, "prefix_duplicate"),
-        SubTenantWriteError::ProviderNotFound => (400, "provider_not_found"),
-        SubTenantWriteError::ProviderNotInTenant => (400, "provider_not_in_tenant"),
-        SubTenantWriteError::ModelNotInTenant => (400, "model_not_in_tenant"),
-        SubTenantWriteError::ModelNotServedByProvider => (400, "model_not_served_by_provider"),
-        SubTenantWriteError::NameInvalid => (400, "invalid_name"),
-        SubTenantWriteError::PrefixEmpty => (400, "empty_key_prefix"),
-        SubTenantWriteError::PrefixNonAscii => (400, "invalid_key_prefix"),
-        SubTenantWriteError::PrefixNoSeparator => (400, "invalid_key_prefix"),
-        SubTenantWriteError::PrefixOverlap => (400, "key_prefix_overlap"),
-        SubTenantWriteError::SubTenantQuotaExceeded => (400, "quota_exceeded"),
-        SubTenantWriteError::RouteQuotaExceeded => (400, "quota_exceeded"),
-    };
-    err_json(status, code, &e.to_string(), trace_id)
-}
-
-/// Map a write-core [`sub_tenant_write::CoreError`] to an HTTP response.
-/// `not_found_msg` is the resource-specific 404 message (the core does not
-/// know which resource was targeted).
-fn sub_tenant_core_err_resp(
-    e: sub_tenant_write::CoreError,
-    trace_id: &str,
-    not_found_msg: &str,
-) -> Resp {
-    match e {
-        sub_tenant_write::CoreError::Validation(v) => sub_tenant_write_err_resp(&v, trace_id),
-        sub_tenant_write::CoreError::Db(d) => db_err_resp(d, trace_id),
-        sub_tenant_write::CoreError::PrefixGenerationFailed => err_json(
-            400,
-            "prefix_generation_failed",
-            &format!(
-                "could not generate a non-conflicting key_prefix after \
-                 {} attempts",
-                sub_tenant_write::PREFIX_ATTEMPTS
-            ),
-            trace_id,
-        ),
-        sub_tenant_write::CoreError::NotFound => {
-            err_json(404, "not_found", not_found_msg, trace_id)
-        }
-    }
-}
-
-/// The value of a single query parameter from a raw query string (`None` when
-/// the key is absent).
-fn query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
-    query.and_then(|q| {
-        q.split('&').find_map(|kv| {
-            let mut it = kv.splitn(2, '=');
-            match (it.next(), it.next()) {
-                (Some(k), Some(v)) if k == key => Some(v),
-                _ => None,
-            }
-        })
-    })
-}
-
-/// Admin create/update request body for a sub-tenant. `key_prefix` is
-/// `Option`: **omitted** (`None`) ⇒ the leader auto-generates one (Q13); an
-/// explicit **empty string** is invalid (400 `empty_key_prefix`) and is
-/// distinct from omitted. `created_at` / `updated_at` are NOT accepted: the
-/// transactional write core (D4 idempotent upsert) sets them server-side
-/// (`datetime('now')`), so client-supplied timestamps are ignored.
-#[derive(Deserialize)]
-struct SubTenantWriteReq {
-    #[serde(default)]
-    id: String,
-    tenant_id: String,
-    name: String,
-    /// Omitted ⇒ auto-generate; an explicit value (incl. `""`) is validated.
-    #[serde(default)]
-    key_prefix: Option<String>,
-    #[serde(default = "default_true")]
-    enabled: bool,
-}
-
-/// Admin create/update request body for a sub-tenant route. `model_key` is
-/// `Option`: omitted / `null` ⇒ the sub-tenant's **default route**. Timestamps
-/// are NOT accepted (set server-side by the write core, D4).
-#[derive(Deserialize)]
-struct SubTenantRouteWriteReq {
-    #[serde(default)]
-    id: String,
-    sub_tenant_id: String,
-    #[serde(default)]
-    model_key: Option<String>,
-    provider_id: String,
-    #[serde(default = "default_true")]
-    enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-pub(super) async fn sub_tenant_collection(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    query: Option<&str>,
-    trace_id: &str,
-) -> Resp {
-    if method == "GET" {
-        match crate::db::list_sub_tenants(state.db()).await {
-            Ok(rows) => {
-                let by_tenant = query_param(query, "tenant_id");
-                let out: Vec<SubTenant> = match by_tenant {
-                    Some(tid) => rows.into_iter().filter(|s| s.tenant_id == tid).collect(),
-                    None => rows,
-                };
-                ok_json(200, &out)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        }
-    } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let req: SubTenantWriteReq = match parse_body(&body, trace_id) {
-            Ok(req) => req,
-            Err(r) => return r,
-        };
-        // The row id: client-supplied or generated (D4: on a name conflict the
-        // existing row's id is retained, so this is only used for new rows).
-        let id = if req.id.is_empty() { gen_id() } else { req.id };
-        let cfg = std::sync::Arc::clone(&*state.store.snapshot());
-
-        // Transactional write core (D5): reads ALL rows in the tx, validates
-        // (all-rows quota + overlap), upserts by (tenant_id, name), commits.
-        // `key_prefix = None` ⇒ auto-generate with retry (Q13 / F3).
-        let created = match sub_tenant_write::create_sub_tenant(
-            state.db(),
-            &cfg,
-            &req.tenant_id,
-            &req.name,
-            req.key_prefix.as_deref(),
-            &id,
-            req.enabled,
-        )
-        .await
-        {
-            Ok(st) => st,
-            Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
-        };
-        if let Some(r) = reload_best_effort(state, trace_id).await {
-            return r;
-        }
-        ok_json(201, &created)
-    } else {
-        method_not_allowed(trace_id)
-    }
-}
-
-pub(super) async fn sub_tenant_item(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    id: &str,
-    trace_id: &str,
-) -> Resp {
-    match method {
-        "GET" => match crate::db::get_sub_tenant(state.db(), id).await {
-            Ok(st) => ok_json(200, &st),
-            Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "sub_tenant not found", trace_id)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        },
-        "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let req: SubTenantWriteReq = match parse_body(&body, trace_id) {
-                Ok(req) => req,
-                Err(r) => return r,
-            };
-            // An update must set an explicit prefix (omitting is NOT auto-generate).
-            let Some(prefix) = req.key_prefix else {
-                return err_json(
-                    400,
-                    "empty_key_prefix",
-                    "key_prefix is required on update",
-                    trace_id,
-                );
-            };
-            let cfg = std::sync::Arc::clone(&*state.store.snapshot());
-
-            // Transactional write core (D5): in-transaction existence check
-            // (404), all-rows validation (the row's own prefix is self-excluded),
-            // update by immutable id, commit, re-read. `tenant_id` is immutable
-            // and authoritative from the existing row (the core enforces this).
-            let updated = match sub_tenant_write::update_sub_tenant(
-                state.db(),
-                &cfg,
-                id,
-                &req.name,
-                &prefix,
-                req.enabled,
-            )
-            .await
-            {
-                Ok(st) => st,
-                Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
-            };
-            if let Some(r) = reload_best_effort(state, trace_id).await {
-                return r;
-            }
-            ok_json(200, &updated)
-        }
-        "DELETE" => match sub_tenant_write::delete_sub_tenant(state.db(), id).await {
-            Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
-                    return r;
-                }
-                empty(204)
-            }
-            Err(e) => sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
-        },
-        _ => method_not_allowed(trace_id),
-    }
-}
-
-pub(super) async fn sub_tenant_route_collection(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    query: Option<&str>,
-    trace_id: &str,
-) -> Resp {
-    if method == "GET" {
-        match crate::db::list_sub_tenant_routes(state.db()).await {
-            Ok(rows) => {
-                let by_st = query_param(query, "sub_tenant_id");
-                let out: Vec<SubTenantRoute> = match by_st {
-                    Some(sid) => rows
-                        .into_iter()
-                        .filter(|r| r.sub_tenant_id == sid)
-                        .collect(),
-                    None => rows,
-                };
-                ok_json(200, &out)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        }
-    } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let req: SubTenantRouteWriteReq = match parse_body(&body, trace_id) {
-            Ok(req) => req,
-            Err(resp) => return resp,
-        };
-        // The row id: client-supplied or generated (D4: on a key conflict the
-        // existing row's id is retained, so this is only used for new rows).
-        let id = if req.id.is_empty() { gen_id() } else { req.id };
-        let cfg = std::sync::Arc::clone(&*state.store.snapshot());
-
-        // Transactional write core (D5): in-transaction sub-tenant (FK)
-        // resolution (404), all-rows validation, upsert by (sub_tenant_id,
-        // model_key), commit.
-        let created = match sub_tenant_write::create_route(
-            state.db(),
-            &cfg,
-            &req.sub_tenant_id,
-            &req.provider_id,
-            req.model_key.as_deref(),
-            &id,
-            req.enabled,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return sub_tenant_core_err_resp(e, trace_id, "sub_tenant not found"),
-        };
-        if let Some(r) = reload_best_effort(state, trace_id).await {
-            return r;
-        }
-        ok_json(201, &created)
-    } else {
-        method_not_allowed(trace_id)
-    }
-}
-
-pub(super) async fn sub_tenant_route_item(
-    state: &AdminState,
-    session: &mut ServerSession,
-    method: &str,
-    id: &str,
-    trace_id: &str,
-) -> Resp {
-    match method {
-        "GET" => match crate::db::get_sub_tenant_route(state.db(), id).await {
-            Ok(r) => ok_json(200, &r),
-            Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "sub_tenant_route not found", trace_id)
-            }
-            Err(e) => db_err_resp(e, trace_id),
-        },
-        "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let req: SubTenantRouteWriteReq = match parse_body(&body, trace_id) {
-                Ok(req) => req,
-                Err(resp) => return resp,
-            };
-            let cfg = std::sync::Arc::clone(&*state.store.snapshot());
-
-            // Transactional write core (D5): in-transaction existence check
-            // (404), sub-tenant (FK) resolution, all-rows validation (the
-            // route's own row is self-excluded), update by immutable id, commit,
-            // re-read. `sub_tenant_id` is immutable and authoritative from the
-            // existing row (the core enforces this).
-            let updated = match sub_tenant_write::update_route(
-                state.db(),
-                &cfg,
-                id,
-                &req.provider_id,
-                req.model_key.as_deref(),
-                req.enabled,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    return sub_tenant_core_err_resp(e, trace_id, "sub_tenant_route not found")
-                }
-            };
-            if let Some(r) = reload_best_effort(state, trace_id).await {
-                return r;
-            }
-            ok_json(200, &updated)
-        }
-        "DELETE" => match sub_tenant_write::delete_route(state.db(), id).await {
-            Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
-                    return r;
-                }
-                empty(204)
-            }
-            Err(e) => sub_tenant_core_err_resp(e, trace_id, "sub_tenant_route not found"),
         },
         _ => method_not_allowed(trace_id),
     }

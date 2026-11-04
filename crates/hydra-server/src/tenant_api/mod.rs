@@ -325,10 +325,10 @@ pub async fn dispatch(
     let method = session.req_header().method.as_str();
 
     // 1. Method-aware route resolution. A request under the reserved prefix is
-    //    EITHER a WRITE route (PUT/DELETE, method-specific, sub-tenant v2 D9) OR
+    //    EITHER a WRITE route (PUT/DELETE, method-specific, identity-plane D9) OR
     //    a READ route (path-only). Resolve the write route FIRST for PUT/DELETE,
-    //    because the flat `PUT /sub-tenant-routes` shares its path with the GET
-    //    list endpoint and the method-agnostic read parse would mis-attribute it.
+    //    because the flat user-group and user upserts share their paths with the
+    //    list endpoints and a method-agnostic read parse would mis-attribute them.
     //    A near-miss is a LOCAL 404 — never a fall-through to the proxy pipeline,
     //    where a tenant token would be read as a client api-key (design §3.2).
     if method == "PUT" || method == "DELETE" {
@@ -375,8 +375,6 @@ pub async fn dispatch(
     ctx.tenant_api_endpoint = Some(match route.endpoint {
         Endpoint::Whoami => "whoami",
         Endpoint::Usage => "usage",
-        Endpoint::ListSubTenants => "sub-tenants",
-        Endpoint::ListSubTenantRoutes => "sub-tenant-routes",
         // T5 reads: the label is the ROUTE, not the row set — no user or group
         // id enters a metric label (unbounded cardinality).
         Endpoint::ListUserGroups => "user-groups",
@@ -395,8 +393,6 @@ pub async fn dispatch(
     let expected = match route.endpoint {
         Endpoint::Whoami
         | Endpoint::Usage
-        | Endpoint::ListSubTenants
-        | Endpoint::ListSubTenantRoutes
         | Endpoint::ListUserGroups
         | Endpoint::ListUsers
         | Endpoint::ListUserApiKeys => "GET",
@@ -428,7 +424,7 @@ pub async fn dispatch(
     // usage must not itself count as usage.
     ctx.tenant = Some(authenticated.tenant.clone());
 
-    // 4. Route. All five endpoints are served; a path under the reserved prefix
+    // 4. Route. The remaining endpoints are served; a path under the reserved prefix
     //    that is not one of them was refused a local 404 above, so this match is
     //    exhaustive over the routes `parse_route` can produce.
     match route.endpoint {
@@ -438,12 +434,6 @@ pub async fn dispatch(
         Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
         // Read-only, snapshot-fed: no DB, no upstream — an edge serves them
         // exactly like `whoami`.
-        Endpoint::ListSubTenants => {
-            handlers::list_sub_tenants(state, session, ctx, &authenticated).await
-        }
-        Endpoint::ListSubTenantRoutes => {
-            handlers::list_sub_tenant_routes(state, session, ctx, &authenticated).await
-        }
         // T6 (D-7/D-5 read face): the caller's OWN keys under one of its OWN users.
         // Fed from the DB rows, not the snapshot — the snapshot's api-key index is
         // `#[serde(skip)]` and carries only routing atoms, so the display fields
@@ -459,7 +449,7 @@ pub async fn dispatch(
             None => respond_error(session, ctx, 404, "not_found", "unknown path").await,
         },
         // T5 reads — the tenant's OWN user groups and users, snapshot-fed exactly
-        // like the sub-tenant lists above: the rows and the `config_version` they
+        // like the read-only lists above: the rows and the `config_version` they
         // are attributed to come from ONE guard, so a replica that has not
         // materialized a row itself answers like the node that wrote it.
         // `?group_id=` on `/users` never reaches `parse_route` (`proxy.rs` hands

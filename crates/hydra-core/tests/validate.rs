@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use hydra_core::config::{validate, ConfigData, ModelProvider, Severity, ValidationIssue};
-use hydra_core::model::{GlobalRole, LimitRole, Provider, SubTenant, SubTenantRoute, Tenant};
+use hydra_core::model::{GlobalRole, LimitRole, Provider, Tenant};
 use pretty_assertions::assert_eq;
 
 // --- fixtures ---------------------------------------------------------------
@@ -416,31 +416,6 @@ fn validate_empty_config_is_clean() {
     assert!(validate(&cfg).is_empty());
 }
 
-fn binding(id: &str, prefix: &str, provider_id: &str) -> hydra_core::model::ProviderKeyBinding {
-    hydra_core::model::ProviderKeyBinding {
-        id: id.into(),
-        key_prefix: prefix.into(),
-        provider_id: provider_id.into(),
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    }
-}
-
-/// T9.8 — provider_key_binding references an unknown provider ⇒ Warn.
-#[test]
-fn validate_binding_unknown_provider() {
-    let mut cfg = clean_config();
-    cfg.key_prefix_bindings.push(binding("b1", "sk_", "ghost"));
-    let warns = warn_messages(&validate(&cfg));
-    assert!(
-        warns
-            .iter()
-            .any(|m| m.contains("ghost") && m.contains("provider_key_binding")),
-        "expected a dangling-provider warning, got {warns:?}"
-    );
-}
-
 /// A provider with a NEGATIVE weight is discarded by the router (`weight > 0` is
 /// required) but used to pass validation untouched, because this check skipped
 /// only `weight == 0`. It is exactly the "validated clean, can never serve" case
@@ -477,139 +452,6 @@ fn validate_soft_disabled_provider_without_key_is_silent() {
     assert!(
         !warns.iter().any(|m| m.contains("api_key")),
         "a soft-disabled provider needs no key, got {warns:?}"
-    );
-}
-
-/// T9.9 — provider_key_binding with an empty prefix ⇒ Warn.
-#[test]
-fn validate_binding_empty_prefix() {
-    let mut cfg = clean_config();
-    cfg.key_prefix_bindings.push(binding("b1", "", "p1"));
-    let warns = warn_messages(&validate(&cfg));
-    assert!(
-        warns.iter().any(|m| m.contains("empty key_prefix")),
-        "expected an empty-prefix warning, got {warns:?}"
-    );
-}
-
-// --- sub-tenant fixtures (design-sub-tenant.md) -----------------------------
-
-fn sub_tenant(id: &str, tenant_id: &str, key_prefix: &str) -> SubTenant {
-    SubTenant {
-        id: id.into(),
-        tenant_id: tenant_id.into(),
-        name: format!("{id} name"),
-        key_prefix: key_prefix.into(),
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    }
-}
-
-fn sub_tenant_route(
-    id: &str,
-    sub_tenant_id: &str,
-    model_key: Option<&str>,
-    provider_id: &str,
-) -> SubTenantRoute {
-    SubTenantRoute {
-        id: id.into(),
-        sub_tenant_id: sub_tenant_id.into(),
-        model_key: model_key.map(str::to_string),
-        provider_id: provider_id.into(),
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    }
-}
-
-/// Sub-tenant route whose `sub_tenant_id` is not present in `sub_tenants` ⇒
-/// Warn (orphan), not Fatal.
-#[test]
-fn validate_sub_tenant_route_orphan_sub_tenant_warns() {
-    let mut cfg = clean_config();
-    // Route points at a sub-tenant that does not exist; provider p1 is known.
-    cfg.sub_tenant_routes
-        .push(sub_tenant_route("r1", "st_ghost", Some("gpt-4o"), "p1"));
-
-    let issues = validate(&cfg);
-    let warns = warn_messages(&issues);
-    assert!(
-        warns
-            .iter()
-            .any(|m| m.contains("r1") && m.contains("st_ghost")),
-        "expected an orphan-sub-tenant warning, got {warns:?}"
-    );
-    assert!(
-        issues.iter().all(|i| i.severity != Severity::Fatal),
-        "orphan sub-tenant must be Warn, not Fatal; got {issues:?}"
-    );
-}
-
-/// Sub-tenant route whose `provider_id` is not present in `providers` ⇒ Warn
-/// (unknown provider), not Fatal.
-#[test]
-fn validate_sub_tenant_route_unknown_provider_warns() {
-    let mut cfg = clean_config();
-    // Valid sub-tenant, but the route references a provider that does not exist.
-    cfg.sub_tenants.push(sub_tenant("st1", "t1", "QQCX_"));
-    cfg.sub_tenant_routes
-        .push(sub_tenant_route("r1", "st1", Some("gpt-4o"), "ghost"));
-
-    let issues = validate(&cfg);
-    let warns = warn_messages(&issues);
-    assert!(
-        warns
-            .iter()
-            .any(|m| m.contains("r1") && m.contains("ghost")),
-        "expected an unknown-provider warning, got {warns:?}"
-    );
-    assert!(
-        issues.iter().all(|i| i.severity != Severity::Fatal),
-        "unknown provider must be Warn, not Fatal; got {issues:?}"
-    );
-}
-
-/// Sub-tenant whose `key_prefix` has no separator (`_` or `-`) ⇒ Warn (invalid
-/// prefix), not Fatal.
-#[test]
-fn validate_sub_tenant_prefix_without_separator_warns() {
-    let mut cfg = clean_config();
-    // Bare prefix: no `_` / `-`, so a `starts_with` match would swallow longer
-    // unrelated prefixes (e.g. `QQCXWEB_`).
-    cfg.sub_tenants.push(sub_tenant("st1", "t1", "QQCX"));
-
-    let issues = validate(&cfg);
-    let warns = warn_messages(&issues);
-    assert!(
-        warns.iter().any(|m| m.contains("st1")),
-        "expected an invalid-key_prefix warning, got {warns:?}"
-    );
-    assert!(
-        issues.iter().all(|i| i.severity != Severity::Fatal),
-        "invalid prefix must be Warn, not Fatal; got {issues:?}"
-    );
-}
-
-/// Two sub-tenants in the SAME tenant with overlapping prefixes (either
-/// direction `starts_with`) ⇒ Warn (overlap), not Fatal.
-#[test]
-fn validate_sub_tenant_prefix_overlap_within_tenant_warns() {
-    let mut cfg = clean_config();
-    // Both prefixes are individually valid (contain a separator), but
-    // `QQCX_W` is a superstring of `QQCX_` ⇒ overlap within tenant t1.
-    cfg.sub_tenants.push(sub_tenant("st1", "t1", "QQCX_"));
-    cfg.sub_tenants.push(sub_tenant("st2", "t1", "QQCX_W"));
-
-    let issues = validate(&cfg);
-    let warns = warn_messages(&issues);
-    assert!(
-        warns.iter().any(|m| m.contains("st1") && m.contains("st2")),
-        "expected a prefix-overlap warning, got {warns:?}"
-    );
-    assert!(
-        issues.iter().all(|i| i.severity != Severity::Fatal),
-        "prefix overlap must be Warn, not Fatal; got {issues:?}"
     );
 }
 

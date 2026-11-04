@@ -152,11 +152,6 @@ pub fn normalize_as_of(raw: Option<&str>) -> Option<String> {
 pub enum Endpoint {
     Whoami,
     Usage,
-    /// `GET /sub-tenants` — the tenant's own sub-tenants (read-only, snapshot-fed).
-    ListSubTenants,
-    /// `GET /sub-tenant-routes` — the tenant's own sub-tenant routes (read-only,
-    /// snapshot-fed).
-    ListSubTenantRoutes,
     /// `GET /user-groups` — the tenant's own user groups (read-only, snapshot-fed).
     ListUserGroups,
     /// `GET /users` — the tenant's own users, optionally filtered by
@@ -201,12 +196,9 @@ pub fn parse_route<'a>(path: &'a str) -> Option<TenantApiRoute<'a>> {
     let (endpoint, user_id): (Endpoint, Option<&'a str>) = match suffix {
         "api/v1/whoami" => (Endpoint::Whoami, None),
         "api/v1/usage" => (Endpoint::Usage, None),
-        // Read-only, flat paths matching the admin resource shape (T6). Both are
-        // list endpoints owned by the tenant in the URL; the item id is never
-        // part of the route, so `.../sub-tenants/{id}` is a near miss.
-        "api/v1/sub-tenants" => (Endpoint::ListSubTenants, None),
-        "api/v1/sub-tenant-routes" => (Endpoint::ListSubTenantRoutes, None),
-        // Same flat shape as the sub-tenant lists (user hierarchy, T5): list endpoints
+        // Read-only, flat list endpoints owned by the tenant in the URL (user
+        // hierarchy, T5); the item id is never part of the route, so
+        // `.../user-groups/{id}` is a near miss.
         // owned by the tenant in the URL, so `.../user-groups/{id}` and `.../users/{id}`
         // are NOT read routes — they are the DELETE write routes below.
         "api/v1/user-groups" => (Endpoint::ListUserGroups, None),
@@ -284,28 +276,14 @@ fn user_api_key_pair(suffix: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// A method-aware tenant API **write** route (sub-tenant v2 D9 + user hierarchy T5).
+/// A method-aware tenant API **write** route (user hierarchy T5/T6).
 ///
-/// The self-service write endpoints. Their path shapes collide across
-/// methods — `PUT /sub-tenants/{name}` and `DELETE /sub-tenants/{id}` share a
-/// shape — and the flat `PUT /sub-tenant-routes` shares its path with the GET
-/// list endpoint, so these are resolved by `(method, path)` together, never by
-/// path alone. The user-hierarchy upserts are flat for the same reason: their
-/// row id is in the BODY.
+/// The self-service write endpoints. Path shapes collide across methods — a
+/// flat `PUT /users` (row id in the BODY) shares its path with nothing, while
+/// `DELETE /users/{id}` carries the id in the URL — so these are resolved by
+/// `(method, path)` together, never by path alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TenantWriteRoute<'a> {
-    /// `PUT /tenant/{tenant_id}/api/v1/sub-tenants/{name}` — upsert by
-    /// `(tenant_id, name)`.
-    UpsertSubTenant { tenant_id: &'a str, name: &'a str },
-    /// `DELETE /tenant/{tenant_id}/api/v1/sub-tenants/{id}` — delete by immutable
-    /// id.
-    DeleteSubTenant { tenant_id: &'a str, id: &'a str },
-    /// `PUT /tenant/{tenant_id}/api/v1/sub-tenant-routes` — upsert by
-    /// `(sub_tenant_id, model_key)` (both carried in the body).
-    UpsertRoute { tenant_id: &'a str },
-    /// `DELETE /tenant/{tenant_id}/api/v1/sub-tenant-routes/{id}` — delete by
-    /// immutable id.
-    DeleteRoute { tenant_id: &'a str, id: &'a str },
     /// `PUT /tenant/{tenant_id}/api/v1/user-groups` — upsert; the row id is the
     /// optional `id` in the BODY (absent ⇒ create with a server-generated id),
     /// never a path segment (user hierarchy, T5).
@@ -351,11 +329,7 @@ impl<'a> TenantWriteRoute<'a> {
     #[must_use]
     pub fn tenant_id(self) -> &'a str {
         match self {
-            TenantWriteRoute::UpsertSubTenant { tenant_id, .. }
-            | TenantWriteRoute::DeleteSubTenant { tenant_id, .. }
-            | TenantWriteRoute::UpsertRoute { tenant_id, .. }
-            | TenantWriteRoute::DeleteRoute { tenant_id, .. }
-            | TenantWriteRoute::UpsertUserGroup { tenant_id, .. }
+            TenantWriteRoute::UpsertUserGroup { tenant_id, .. }
             | TenantWriteRoute::DeleteUserGroup { tenant_id, .. }
             | TenantWriteRoute::UpsertUser { tenant_id, .. }
             | TenantWriteRoute::DeleteUser { tenant_id, .. }
@@ -371,10 +345,6 @@ impl TenantWriteRoute<'_> {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            TenantWriteRoute::UpsertSubTenant { .. } => "sub-tenant-upsert",
-            TenantWriteRoute::DeleteSubTenant { .. } => "sub-tenant-delete",
-            TenantWriteRoute::UpsertRoute { .. } => "sub-tenant-route-upsert",
-            TenantWriteRoute::DeleteRoute { .. } => "sub-tenant-route-delete",
             TenantWriteRoute::UpsertUserGroup { .. } => "user-group-upsert",
             TenantWriteRoute::DeleteUserGroup { .. } => "user-group-delete",
             TenantWriteRoute::UpsertUser { .. } => "user-upsert",
@@ -386,7 +356,7 @@ impl TenantWriteRoute<'_> {
     }
 }
 
-/// Parse a tenant API **write** route, method-aware (sub-tenant v2 D9 + user hierarchy T5).
+/// Parse a tenant API **write** route, method-aware (user hierarchy T5/T6).
 ///
 /// Unlike [`parse_route`] (path-only), the write routes are method-specific and
 /// their path shapes overlap the flat read paths, so this accepts only the exact
@@ -396,9 +366,9 @@ impl TenantWriteRoute<'_> {
 /// never fall through to the proxy pipeline, where a tenant token would be read
 /// as a client api-key and POSTed to the tenant's `auth_url`).
 ///
-/// The `{name}` / `{id}` segment is the **raw** path segment: a valid sub-tenant
-/// `name` is printable ASCII with no `/` (D9), so the raw segment and the stored
-/// value are compared directly, with no percent-decoding asymmetry between the
+/// The `{id}` segment is the **raw** path segment: an identity-plane row id is
+/// printable ASCII with no `/` (D9), so the raw segment and the stored value are
+/// compared directly, with no percent-decoding asymmetry between the
 /// edge and the leader.
 #[must_use]
 pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteRoute<'a>> {
@@ -419,17 +389,10 @@ pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteR
     };
     match method {
         "PUT" => {
-            if let Some(name) = suffix.strip_prefix("api/v1/sub-tenants/").and_then(segment) {
-                return Some(TenantWriteRoute::UpsertSubTenant { tenant_id, name });
-            }
-            if suffix == "api/v1/sub-tenant-routes" {
-                return Some(TenantWriteRoute::UpsertRoute { tenant_id });
-            }
-            // The two user-hierarchy upserts (T5) are FLAT like the route upsert:
-            // the row id is in the BODY (`{id?, …}`), so there is no `{name}` /
-            // `{id}` segment to confuse with the DELETE item routes below. A
-            // trailing segment (`.../users/x`) is therefore a near miss, not an
-            // upsert of row `x`.
+            // The two user-hierarchy upserts (T5) are FLAT: the row id is in the
+            // BODY (`{id?, …}`), so there is no `{name}` / `{id}` segment to
+            // confuse with the DELETE item routes below. A trailing segment
+            // (`.../users/x`) is therefore a near miss, not an upsert of row `x`.
             if suffix == "api/v1/user-groups" {
                 return Some(TenantWriteRoute::UpsertUserGroup { tenant_id });
             }
@@ -453,18 +416,9 @@ pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteR
             None
         }
         "DELETE" => {
-            if let Some(id) = suffix.strip_prefix("api/v1/sub-tenants/").and_then(segment) {
-                return Some(TenantWriteRoute::DeleteSubTenant { tenant_id, id });
-            }
-            if let Some(id) = suffix
-                .strip_prefix("api/v1/sub-tenant-routes/")
-                .and_then(segment)
-            {
-                return Some(TenantWriteRoute::DeleteRoute { tenant_id, id });
-            }
-            // The two user-hierarchy deletes take the immutable id in the path,
-            // like the sub-tenant/route deletes: a single raw segment, so a
-            // trailing slash or an extra `/` is a near miss (local 404).
+            // The user-hierarchy deletes take the immutable id in the path: a
+            // single raw segment, so a trailing slash or an extra `/` is a
+            // near miss (local 404).
             // The per-user key DELETE (T6) is checked FIRST: `.../users/{uid}/api-keys/{kid}`
             // would otherwise be an over-long `DeleteUser` segment.
             if let Some((user_id, key_id)) = user_api_key_pair(suffix) {

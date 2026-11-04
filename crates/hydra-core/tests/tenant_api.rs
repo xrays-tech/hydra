@@ -165,164 +165,69 @@ fn the_two_flat_read_endpoints_parse() {
     );
 }
 
-/// T7.1: the two read-only sub-tenant endpoints parse. They are FLAT paths
-/// (`api/v1/sub-tenants`, `api/v1/sub-tenant-routes`), matching the admin
-/// resource shape, so `parse_route` keeps returning the same
-/// `(tenant_id, endpoint)` pair — no new `TenantApiRoute` shape.
-#[test]
-fn the_sub_tenant_endpoints_parse() {
-    assert_eq!(
-        parse_route("/tenant/t1/api/v1/sub-tenants"),
-        Some(TenantApiRoute {
-            endpoint: Endpoint::ListSubTenants,
-            tenant_id: "t1",
-            user_id: None
-        })
-    );
-    assert_eq!(
-        parse_route("/tenant/t1/api/v1/sub-tenant-routes"),
-        Some(TenantApiRoute {
-            endpoint: Endpoint::ListSubTenantRoutes,
-            tenant_id: "t1",
-            user_id: None
-        })
-    );
-}
-
 #[test]
 fn near_misses_do_not_parse() {
     for bad in [
-        "/tenant//api/v1/whoami",               // empty tenant id
-        "/tenant/a/b/api/v1/whoami",            // tenant id contains '/'
-        "/tenant/t1/api/v1",                    // no endpoint
-        "/tenant/t1/api/v1/usage/",             // trailing slash
-        "/tenant/t1/api/v1/whoami/extra",       // extra segment
-        "/tenant/t1/api/v2/whoami",             // wrong version
-        "/tenant/t1/api/v1/models",             // not one of ours
-        "/tenant/t1/api/v1/auth/cache",         // the retired write shape
-        "/tenant/t1/api/v1/typo",               // typo
-        "/tenant/t1/api/v1/Whoami",             // case matters
-        "/tenant/t1/api/v1/sub-tenant",         // one char short of `sub-tenants`
-        "/tenant/t1/api/v1/sub-tenants/",       // trailing slash
-        "/tenant/t1/api/v1/sub-tenants/1",      // an item id is not a route
-        "/tenant/t1/api/v1/sub-tenant-route",   // one char short of `sub-tenant-routes`
-        "/tenant/t1/api/v1/sub-tenant-routes/", // trailing slash
-        "/tenantapi/v1/whoami",                 // prefix glued
-        "/tenant/",                             // nothing after the prefix
-        "/tenant",                              // no prefix slash
-        "/v1/chat/completions",                 // ordinary data-plane path
-        "",                                     // empty
-        "/",                                    // root
+        "/tenant//api/v1/whoami",         // empty tenant id
+        "/tenant/a/b/api/v1/whoami",      // tenant id contains '/'
+        "/tenant/t1/api/v1",              // no endpoint
+        "/tenant/t1/api/v1/usage/",       // trailing slash
+        "/tenant/t1/api/v1/whoami/extra", // extra segment
+        "/tenant/t1/api/v2/whoami",       // wrong version
+        "/tenant/t1/api/v1/models",       // not one of ours
+        "/tenant/t1/api/v1/auth/cache",   // the retired write shape
+        "/tenant/t1/api/v1/typo",         // typo
+        "/tenant/t1/api/v1/Whoami",       // case matters
+        "/tenant/t1/api/v1/user-group",   // one char short of `user-groups`
+        "/tenant/t1/api/v1/users/",       // trailing slash
+        "/tenant/t1/api/v1/users/1",      // an item id is not a read route
+        "/tenantapi/v1/whoami",           // prefix glued
+        "/tenant/",                       // nothing after the prefix
+        "/tenant",                        // no prefix slash
+        "/v1/chat/completions",           // ordinary data-plane path
+        "",                               // empty
+        "/",                              // root
     ] {
         assert!(parse_route(bad).is_none(), "{bad:?} must not parse");
     }
 }
 
 // ---------------------------------------------------------------------------
-// method-aware write-route parsing (sub-tenant v2, D9)
+// method-aware write-route parsing
 // ---------------------------------------------------------------------------
 
-/// The four write endpoints parse to their (method, path)-determined routes.
-/// `PUT /sub-tenants/{name}` and `DELETE /sub-tenants/{id}` share a path shape
-/// but are distinguished by method (name vs. immutable id); the flat
-/// `PUT /sub-tenant-routes` is a write, not the GET list endpoint.
+/// Method-aware parsing, pinned on live shapes: the same path under different
+/// methods must not silently select a write, and a segment is taken RAW (no
+/// percent-decoding) — the write core's charset rule rejects an invalid id, not
+/// the route parse.
 #[test]
-fn the_write_endpoints_parse() {
+fn write_shapes_are_method_determined_and_segments_are_raw() {
     assert_eq!(
-        parse_write_route("PUT", "/tenant/t1/api/v1/sub-tenants/team-a"),
-        Some(TenantWriteRoute::UpsertSubTenant {
+        parse_write_route("PUT", "/tenant/t1/api/v1/users"),
+        Some(TenantWriteRoute::UpsertUser { tenant_id: "t1" })
+    );
+    assert!(parse_write_route("PUT", "/tenant/t1/api/v1/users/").is_none());
+    assert_eq!(
+        parse_write_route("DELETE", "/tenant/t1/api/v1/users/a%2Fb"),
+        Some(TenantWriteRoute::DeleteUser {
             tenant_id: "t1",
-            name: "team-a"
+            id: "a%2Fb"
         })
     );
-    assert_eq!(
-        parse_write_route("DELETE", "/tenant/t1/api/v1/sub-tenants/id-123"),
-        Some(TenantWriteRoute::DeleteSubTenant {
-            tenant_id: "t1",
-            id: "id-123"
-        })
-    );
-    assert_eq!(
-        parse_write_route("PUT", "/tenant/t1/api/v1/sub-tenant-routes"),
-        Some(TenantWriteRoute::UpsertRoute { tenant_id: "t1" })
-    );
-    assert_eq!(
-        parse_write_route("DELETE", "/tenant/t1/api/v1/sub-tenant-routes/r-9"),
-        Some(TenantWriteRoute::DeleteRoute {
-            tenant_id: "t1",
-            id: "r-9"
-        })
-    );
-}
-
-/// The same path shape resolves to a different route under a different method
-/// (D9's reason for a method-aware parse): `.../sub-tenants/x` is an upsert-by-
-/// name under PUT and a delete-by-id under DELETE.
-#[test]
-fn the_same_path_shape_differs_by_method() {
-    assert!(matches!(
-        parse_write_route("PUT", "/tenant/t1/api/v1/sub-tenants/x"),
-        Some(TenantWriteRoute::UpsertSubTenant { .. })
-    ));
-    assert!(matches!(
-        parse_write_route("DELETE", "/tenant/t1/api/v1/sub-tenants/x"),
-        Some(TenantWriteRoute::DeleteSubTenant { .. })
-    ));
-    // A method the endpoint does not define is a miss, not a guess.
-    assert!(parse_write_route("GET", "/tenant/t1/api/v1/sub-tenants/x").is_none());
-    assert!(parse_write_route("PATCH", "/tenant/t1/api/v1/sub-tenants/x").is_none());
-    assert!(parse_write_route("POST", "/tenant/t1/api/v1/sub-tenant-routes").is_none());
-}
-
-/// Every write-route near-miss is `None` (a local 404, never a fall-through):
-/// wrong method, missing/extra segment, wrong version, empty tenant id, a `/`
-/// in the segment, or the flat read path under a write method.
-#[test]
-fn write_route_near_misses_do_not_parse() {
     for (method, bad) in [
-        // Missing the trailing segment.
-        ("PUT", "/tenant/t1/api/v1/sub-tenants"),
-        ("DELETE", "/tenant/t1/api/v1/sub-tenants"),
-        ("DELETE", "/tenant/t1/api/v1/sub-tenant-routes"),
-        // Extra segments (a `/` in the segment / a deeper path).
-        ("PUT", "/tenant/t1/api/v1/sub-tenants/a/b"),
-        ("DELETE", "/tenant/t1/api/v1/sub-tenant-routes/a/b"),
-        // Trailing slash leaves an empty segment.
-        ("PUT", "/tenant/t1/api/v1/sub-tenants/"),
-        ("DELETE", "/tenant/t1/api/v1/sub-tenant-routes/"),
-        // Wrong method for a read (flat) path.
-        ("GET", "/tenant/t1/api/v1/sub-tenant-routes"),
-        ("POST", "/tenant/t1/api/v1/sub-tenant-routes"),
-        // Wrong version / wrong resource.
-        ("PUT", "/tenant/t1/api/v2/sub-tenant-routes"),
-        ("PUT", "/tenant/t1/api/v1/sub-tenant"),
-        ("DELETE", "/tenant/t1/api/v1/sub-tenant-rout"),
-        // Empty tenant id.
-        ("PUT", "/tenant//api/v1/sub-tenant-routes"),
-        // Prefix glued.
-        ("PUT", "/tenantapi/v1/sub-tenant-routes"),
-        // A name that is just a slash.
-        ("PUT", "/tenant/t1/api/v1/sub-tenants//"),
+        ("GET", "/tenant/t1/api/v1/users"),
+        ("PATCH", "/tenant/t1/api/v1/users"),
+        ("DELETE", "/tenant/t1/api/v1/users"),
+        ("DELETE", "/tenant/t1/api/v1/users//"),
+        ("DELETE", "/tenant/t1/api/v2/users/u_9"),
+        ("PUT", "/tenant//api/v1/users"),
+        ("PUT", "/tenant/t1/api/v1/users/x"),
     ] {
         assert!(
             parse_write_route(method, bad).is_none(),
             "{method} {bad:?} must not parse"
         );
     }
-}
-
-/// The `{name}` / `{id}` segment is taken raw (no percent-decoding): a literal
-/// `%2F` in the segment is a legal single segment for the parser (the write core
-/// / D9 charset rule is what rejects an invalid `name`, not the route parse).
-#[test]
-fn the_write_route_segment_is_read_raw() {
-    assert_eq!(
-        parse_write_route("PUT", "/tenant/t1/api/v1/sub-tenants/a%2Fb"),
-        Some(TenantWriteRoute::UpsertSubTenant {
-            tenant_id: "t1",
-            name: "a%2Fb"
-        })
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -513,31 +418,6 @@ fn identity_path_near_misses_do_not_parse() {
 fn write_route_labels_are_pinned() {
     let cases: &[(&'static str, TenantWriteRoute<'static>)] = &[
         (
-            "sub-tenant-upsert",
-            TenantWriteRoute::UpsertSubTenant {
-                tenant_id: "t",
-                name: "n",
-            },
-        ),
-        (
-            "sub-tenant-delete",
-            TenantWriteRoute::DeleteSubTenant {
-                tenant_id: "t",
-                id: "i",
-            },
-        ),
-        (
-            "sub-tenant-route-upsert",
-            TenantWriteRoute::UpsertRoute { tenant_id: "t" },
-        ),
-        (
-            "sub-tenant-route-delete",
-            TenantWriteRoute::DeleteRoute {
-                tenant_id: "t",
-                id: "i",
-            },
-        ),
-        (
             "user-group-upsert",
             TenantWriteRoute::UpsertUserGroup { tenant_id: "t" },
         ),
@@ -592,20 +472,7 @@ fn write_route_labels_are_pinned() {
 /// would silently drop that check, so EVERY variant is covered here.
 #[test]
 fn every_write_route_names_its_tenant() {
-    let routes: [TenantWriteRoute<'static>; 11] = [
-        TenantWriteRoute::UpsertSubTenant {
-            tenant_id: "t_1",
-            name: "n",
-        },
-        TenantWriteRoute::DeleteSubTenant {
-            tenant_id: "t_1",
-            id: "i",
-        },
-        TenantWriteRoute::UpsertRoute { tenant_id: "t_1" },
-        TenantWriteRoute::DeleteRoute {
-            tenant_id: "t_1",
-            id: "i",
-        },
+    let routes: [TenantWriteRoute<'static>; 7] = [
         TenantWriteRoute::UpsertUserGroup { tenant_id: "t_1" },
         TenantWriteRoute::DeleteUserGroup {
             tenant_id: "t_1",

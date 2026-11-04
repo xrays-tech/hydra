@@ -251,64 +251,10 @@ def main():
             check(f"§4.4: {wrong} on the read route {path.split('?')[0]} is 405",
                   st == 405, f"HTTP {st} {text[:60]}")
 
-        # The 405-vs-404 rule, measured cell by cell (the corrected §4.4 table):
-        # a path that IS one of the five read routes answers 405 for a wrong method, while a
-        # path SHAPE that only exists for writes answers 404 for a method it does not have.
-        # (The doc used to give `POST /sub-tenant-routes` as its 404 example; that path is
-        # also the read route `sub-tenant-routes`, so the real answer is 405.)
-        for method, path, want, why in (
-            ("GET", "/sub-tenants/QQ", 404, "a write-only path SHAPE has no GET combination"),
-            ("POST", "/sub-tenants/QQ", 404, "a write-only path SHAPE has no POST combination"),
-            ("POST", "/sub-tenant-routes", 405, "that path is ALSO the read route (GET only)"),
-            ("DELETE", "/sub-tenant-routes", 404, "the delete shape is /sub-tenant-routes/{id}"),
-            ("PUT", "/sub-tenants", 404, "the write shape is /sub-tenants/{name}"),
-        ):
-            st, _, text = tenant(method, path, body={} if method == "POST" else None)
-            check(f"§4.4: {method} {path} -> {want} ({why})", st == want, f"HTTP {st} {text[:60]}")
-
         # anything else under the reserved prefix is 404, answered locally
         st, hdrs, text = tenant("GET", "/not-a-documented-route")
         envelope_ok(st, hdrs, text, "not_found", "§4.4 unknown path under the reserved prefix")
         check("§4.4: ...and it is 404", st == 404, f"HTTP {st}")
-
-        # ---- §4.5/§5.6 the write endpoints -------------------------------------
-        st, _, text = tenant("PUT", "/sub-tenants/QQ", body={"key_prefix": "QQCX_", "enabled": True})
-        try:
-            row1 = json.loads(text)["sub_tenant"]
-            ver1 = json.loads(text).get("config_version")
-        except Exception:
-            row1, ver1 = {}, None
-        check("§5.6: PUT sub-tenants/{name} returns 200 with the row and a config_version",
-              st == 200 and row1.get("id") and isinstance(ver1, int),
-              f"HTTP {st} id={row1.get('id')} version={ver1} {text[:80]}")
-        st, _, text = tenant("PUT", "/sub-tenants/QQ", body={"key_prefix": "QQCX_", "enabled": False})
-        row2 = {}
-        try:
-            row2 = json.loads(text)["sub_tenant"]
-        except Exception:
-            pass
-        check("§4.5: a repeated PUT converges on the SAME immutable id (and updates the fields)",
-              st == 200 and row2.get("id") == row1.get("id") and row2.get("enabled") is False,
-              f"HTTP {st} id={row2.get('id')} enabled={row2.get('enabled')}")
-
-        st, _, text = tenant("PUT", "/sub-tenant-routes",
-                             body={"sub_tenant_id": row1.get("id"), "provider_id": "p1",
-                                   "model_key": None, "enabled": True})
-        route = {}
-        try:
-            route = json.loads(text)["route"]
-        except Exception:
-            pass
-        check("§5.6: PUT sub-tenant-routes returns 200 with the route row",
-              st == 200 and route.get("id") and route.get("model_key") is None,
-              f"HTTP {st} {text[:90]}")
-
-        st_d1, _, _ = tenant("DELETE", f"/sub-tenant-routes/{route.get('id')}")
-        st_d2, _, _ = tenant("DELETE", f"/sub-tenant-routes/{route.get('id')}")
-        check("§4.5: DELETE is 204 and deleting an already-missing id is a no-op",
-              st_d1 == 204 and st_d2 == 204, f"first={st_d1} second={st_d2}")
-        st_d3, _, _ = tenant("DELETE", f"/sub-tenants/{row1.get('id')}")
-        check("§5.6: DELETE sub-tenants/{id} is 204", st_d3 == 204, f"HTTP {st_d3}")
 
         # ---- §5.3 parameter validation -----------------------------------------
         for path, code, why in (
@@ -322,21 +268,6 @@ def main():
             envelope_ok(st, hdrs, text, code, why)
             check(f"{why}: status is 400", st == 400, f"HTTP {st}")
 
-        # ---- §5.6 body validation ----------------------------------------------
-        st, hdrs, text = tenant("PUT", "/sub-tenants/QQ2", raw_body="{not json")
-        envelope_ok(st, hdrs, text, "invalid_request", "§5.6 a body that is not JSON")
-        check("§5.6: ...and it is 400", st == 400, f"HTTP {st}")
-        st, hdrs, text = tenant("PUT", "/sub-tenants/QQ3", body={"key_prefix": "", "enabled": True})
-        check("§5.6: an empty key_prefix is refused as documented (400 invalid_key_prefix/empty_key_prefix)",
-              st == 400 and json.loads(text or "{}").get("error", {}).get("code", "")
-              in ("empty_key_prefix", "invalid_key_prefix"),
-              f"HTTP {st} {text[:90]}")
-
-        # ---- §5 writes keep the read side consistent ---------------------------
-        st, _, text = tenant("GET", "/sub-tenants")
-        ids = [r.get("name") for r in json.loads(text or "{}").get("sub_tenants", [])]
-        check("§5.4: a written sub-tenant is gone from the list after DELETE (and the reads stay consistent)",
-              st == 200 and "QQ" not in ids and "QQ2" not in ids, f"names={ids}")
     finally:
         stop(node)
         MOCK.stop()

@@ -21,10 +21,7 @@ use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
 use hydra_core::identity::TenantTokenIdentity;
-use hydra_core::model::{
-    GlobalRole, LimitRole, ProviderKeyBinding, SubTenant, SubTenantRoute, User, UserApiKey,
-    UserGroup,
-};
+use hydra_core::model::{GlobalRole, LimitRole, User, UserApiKey, UserGroup};
 use hydra_core::swrr::SwrrState;
 
 use crate::cluster::content::ReplicationContent;
@@ -194,27 +191,6 @@ pub async fn build_config(
         .filter(|r| r.enabled)
         .collect();
 
-    // provider_key_bindings: only enabled bindings participate (design §7.1b).
-    let key_prefix_bindings: Vec<ProviderKeyBinding> = db::list_provider_key_bindings(pool)
-        .await?
-        .into_iter()
-        .filter(|b| b.enabled)
-        .collect();
-
-    // sub_tenants: only enabled sub-tenants carry the api-key-prefix routing
-    // gate (design-sub-tenant.md §4.1, step 3.6; mirrors `key_prefix_bindings`).
-    let sub_tenants: Vec<SubTenant> = db::list_sub_tenants(pool)
-        .await?
-        .into_iter()
-        .filter(|s| s.enabled)
-        .collect();
-    // sub_tenant_routes: only enabled routes steer traffic (design §3.1).
-    let sub_tenant_routes: Vec<SubTenantRoute> = db::list_sub_tenant_routes(pool)
-        .await?
-        .into_iter()
-        .filter(|r| r.enabled)
-        .collect();
-
     // --- User hierarchy / tenant tokens / Global Roles (plan §3.2 loader) -----
     //
     // The filtering asymmetry is load-bearing (plan §3.2):
@@ -266,9 +242,6 @@ pub async fn build_config(
         providers,
         provider_keys,
         limit_roles,
-        key_prefix_bindings,
-        sub_tenants,
-        sub_tenant_routes,
         // User hierarchy (plan §3.2): rows as loaded, then the derived identity
         // index below. Empty here too — the two reindex_* calls right after
         // reindex_tenants fill the three derived fields.
@@ -705,14 +678,11 @@ mod tests {
             cfg,
             fidelity: crate::cluster::content::FidelityRows {
                 limit_roles: Vec::new(),
-                key_prefix_bindings: Vec::new(),
                 provider_keys: Vec::new(),
                 tenant_token_hashes: Vec::new(),
                 provider_models: Vec::new(),
                 tenant_providers: Vec::new(),
                 tenant_models: Vec::new(),
-                sub_tenants: Vec::new(),
-                sub_tenant_routes: Vec::new(),
                 ..crate::cluster::content::FidelityRows::default()
             },
         }

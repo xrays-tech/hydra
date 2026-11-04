@@ -19,9 +19,6 @@ use super::{crypto_to_sqlx, seal_limit_key};
 /// table name.
 #[derive(Clone, Copy, Debug)]
 enum WipedTable {
-    SubTenantRoute,
-    SubTenant,
-    ProviderKeyBinding,
     LimitRole,
     TenantModel,
     TenantProvider,
@@ -61,9 +58,6 @@ impl WipedTable {
             WipedTable::ProviderKey => "DELETE FROM provider_key",
             WipedTable::ProviderModel => "DELETE FROM provider_model",
             WipedTable::Provider => "DELETE FROM provider",
-            WipedTable::SubTenantRoute => "DELETE FROM sub_tenant_route",
-            WipedTable::SubTenant => "DELETE FROM sub_tenant",
-            WipedTable::ProviderKeyBinding => "DELETE FROM provider_key_binding",
         }
     }
 }
@@ -91,19 +85,11 @@ pub async fn restore_config(
 
     // Wipe children before parents (static table names, no `format!`).
     //
-    // `sub_tenant_route` is wiped FIRST: it references BOTH `sub_tenant` and
-    // `provider`, so it must precede the deletion of either (FK is ON,
-    // `db.rs`). `sub_tenant` references `tenant`, so it must precede the
-    // `tenant` wipe below.
-    //
     // The new hierarchy wipes children before parents too: `global_role_provider`
     // before both `global_role` and `provider`; `user_api_key` before `user`; and `user`
     // before `user_group` (the FK direction is user -> group). `tenant_access_token`
     // references tenant, so it clears before the tenant wipe.
     for table in [
-        WipedTable::SubTenantRoute,
-        WipedTable::SubTenant,
-        WipedTable::ProviderKeyBinding,
         WipedTable::LimitRole,
         WipedTable::TenantModel,
         WipedTable::TenantProvider,
@@ -285,62 +271,6 @@ pub async fn restore_config(
         .bind(&r.window)
         .bind(r.enabled)
         .bind(&r.created_at)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    // api-key prefix bindings — from `fidelity` for the same reason (G1); the
-    // runtime config carries only the enabled ones.
-    for b in &fidelity.key_prefix_bindings {
-        sqlx::query(
-            "INSERT INTO provider_key_binding (id, key_prefix, provider_id, enabled, created_at, \
-              updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&b.id)
-        .bind(&b.key_prefix)
-        .bind(&b.provider_id)
-        .bind(b.enabled)
-        .bind(&b.created_at)
-        .bind(&b.updated_at)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    // Sub-tenants — from `fidelity` (FULL rows, disabled included): the runtime
-    // `cfg.sub_tenants` keeps only the enabled ones (G1, like the bindings above).
-    // `tenant` (the FK) is already inserted above.
-    for s in &fidelity.sub_tenants {
-        sqlx::query(
-            "INSERT INTO sub_tenant (id, tenant_id, name, key_prefix, enabled, created_at, \
-              updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&s.id)
-        .bind(&s.tenant_id)
-        .bind(&s.name)
-        .bind(&s.key_prefix)
-        .bind(s.enabled)
-        .bind(&s.created_at)
-        .bind(&s.updated_at)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    // Sub-tenant routes — from `fidelity` (FULL rows). Each row pins a
-    // sub-tenant's traffic to one provider, optionally scoped to a model
-    // (`model_key = NULL` is the default route). Both FKs — `sub_tenant` and
-    // `provider` — are already inserted above.
-    for r in &fidelity.sub_tenant_routes {
-        sqlx::query(
-            "INSERT INTO sub_tenant_route (id, sub_tenant_id, model_key, provider_id, enabled, \
-              created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&r.id)
-        .bind(&r.sub_tenant_id)
-        .bind(&r.model_key)
-        .bind(&r.provider_id)
-        .bind(r.enabled)
-        .bind(&r.created_at)
-        .bind(&r.updated_at)
         .execute(&mut *tx)
         .await?;
     }

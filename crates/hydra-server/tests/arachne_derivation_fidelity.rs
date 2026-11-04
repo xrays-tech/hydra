@@ -6,18 +6,17 @@
 //! `store::build_config`, and that derivation is lossy in two ways the tree has to reproduce
 //! rather than re-invent:
 //!
-//! 1. **`Vec` order.** Four vectors take their order from the loader's `ORDER BY`. The tree stores
-//!    one entity per row and rebuilds them by re-collecting, and the first version sorted all four
-//!    BY `id` — a rule the loader never used, so a replica held a differently-ordered config than
-//!    the leader.
+//! 1. **`Vec` order.** The one vector that takes its order from the loader's `ORDER BY` is
+//!    `limit_role`. The tree stores one entity per row and rebuilds the vector by re-collecting
+//!    it, and the first version sorted it BY `id` — a rule the loader never used, so a replica
+//!    held a differently-ordered config than the leader.
 //! 2. **Map keys.** `tenants_by_domain` is keyed by the tenant's LOWERCASED domain, while the
 //!    `Tenant` value keeps the domain verbatim. The decode re-derived the key from the value, so a
 //!    tenant whose stored domain is not lowercase landed under a DIFFERENT key on a replica.
 //!
-//! Today the orders happen not to be behaviourally load-bearing — every matching limit role is
-//! enforced (they are independent keys, not first-match-wins), `match_key_binding` /
-//! `match_sub_tenant` take the LONGEST prefix rather than the first, and route selection is by
-//! unique `(sub_tenant_id, model_key)` — but the domain KEY is: `proxy::resolve_tenant` looks up
+//! Today the order happens not to be behaviourally load-bearing — every matching limit role is
+//! enforced (they are independent keys, not first-match-wins) — but the domain KEY is:
+//! `proxy::resolve_tenant` looks up
 //! by the lowercase `Host`, so a mixed-case row resolves on the leader and not on a replica.
 //!
 //! All of it matters for a second reason too: "this tree names exactly this config" is only
@@ -35,9 +34,7 @@ mod common;
 use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
-use hydra_core::model::{
-    LimitRole, Provider, ProviderKeyBinding, SubTenant, SubTenantRoute, Tenant,
-};
+use hydra_core::model::{LimitRole, Provider, Tenant};
 use hydra_server::cluster::arachne_entities::{build_config, split_config, tree_of};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
@@ -105,41 +102,6 @@ fn role(id: &str, created_at: &str) -> LimitRole {
     }
 }
 
-fn binding(id: &str, key_prefix: &str) -> ProviderKeyBinding {
-    ProviderKeyBinding {
-        id: id.into(),
-        key_prefix: key_prefix.into(),
-        provider_id: "p1".into(),
-        enabled: true,
-        created_at: "2026-01-01 00:00:00".into(),
-        updated_at: "2026-01-01 00:00:00".into(),
-    }
-}
-
-fn sub_tenant(id: &str, name: &str, key_prefix: &str) -> SubTenant {
-    SubTenant {
-        id: id.into(),
-        tenant_id: "t1".into(),
-        name: name.into(),
-        key_prefix: key_prefix.into(),
-        enabled: true,
-        created_at: "2026-01-01 00:00:00".into(),
-        updated_at: "2026-01-01 00:00:00".into(),
-    }
-}
-
-fn route(id: &str, sub_tenant_id: &str, model_key: &str) -> SubTenantRoute {
-    SubTenantRoute {
-        id: id.into(),
-        sub_tenant_id: sub_tenant_id.into(),
-        model_key: Some(model_key.into()),
-        provider_id: "p1".into(),
-        enabled: true,
-        created_at: "2026-01-01 00:00:00".into(),
-        updated_at: "2026-01-01 00:00:00".into(),
-    }
-}
-
 /// Every row is seeded so that the loader's ORDER BY key and the row `id` DISAGREE in direction:
 /// the row the loader puts FIRST has the id that sorts LAST.
 async fn seed_disagreeing_orders(pool: &sqlx::SqlitePool) {
@@ -149,24 +111,6 @@ async fn seed_disagreeing_orders(pool: &sqlx::SqlitePool) {
         repo::insert_limit_role(pool, kp().as_ref(), &role(id, created_at))
             .await
             .expect("insert limit role");
-    }
-    // `ORDER BY key_prefix`: "sk-aaa-" sorts before "sk-zzz-" but its id sorts later.
-    for (id, prefix) in [("b-z", "sk-aaa-"), ("b-a", "sk-zzz-")] {
-        repo::insert_provider_key_binding(pool, &binding(id, prefix))
-            .await
-            .expect("insert binding");
-    }
-    // `ORDER BY tenant_id, name`: "alpha" before "zeta", ids the other way round.
-    for (id, name, prefix) in [("s-z", "alpha", "AA_"), ("s-a", "zeta", "ZZ_")] {
-        repo::insert_sub_tenant(pool, &sub_tenant(id, name, prefix))
-            .await
-            .expect("insert sub tenant");
-    }
-    // `ORDER BY sub_tenant_id, model_key`: same trick on the route rows.
-    for (id, model) in [("sr-z", "aaa"), ("sr-a", "zzz")] {
-        repo::insert_sub_tenant_route(pool, &route(id, "s-z", model))
-            .await
-            .expect("insert route");
     }
 }
 
@@ -199,21 +143,6 @@ async fn a_replica_reproduces_the_loader_order_not_an_invented_one() {
         vec!["r-z", "r-a"],
         "fixture: the loader orders limit roles by created_at, so the later id comes first"
     );
-    assert_eq!(
-        ids(&cfg.key_prefix_bindings, |b| b.id.clone()),
-        vec!["b-z", "b-a"],
-        "fixture: the loader orders bindings by key_prefix"
-    );
-    assert_eq!(
-        ids(&cfg.sub_tenants, |s| s.id.clone()),
-        vec!["s-z", "s-a"],
-        "fixture: the loader orders sub-tenants by (tenant_id, name)"
-    );
-    assert_eq!(
-        ids(&cfg.sub_tenant_routes, |r| r.id.clone()),
-        vec!["sr-z", "sr-a"],
-        "fixture: the loader orders routes by (sub_tenant_id, model_key)"
-    );
 
     let replica = round_trip(&cfg, key_provider.as_ref()).await;
 
@@ -224,21 +153,6 @@ async fn a_replica_reproduces_the_loader_order_not_an_invented_one() {
         "the replica must hold limit roles in the LOADER's order (created_at, id); sorting them \
          by id is a rule the loader does not use, so the two nodes would read the same config \
          differently the day a first-match rule is introduced"
-    );
-    assert_eq!(
-        ids(&replica.key_prefix_bindings, |b| b.id.clone()),
-        ids(&cfg.key_prefix_bindings, |b| b.id.clone()),
-        "the replica must hold key-prefix bindings in the loader's order"
-    );
-    assert_eq!(
-        ids(&replica.sub_tenants, |s| s.id.clone()),
-        ids(&cfg.sub_tenants, |s| s.id.clone()),
-        "the replica must hold sub-tenants in the loader's order"
-    );
-    assert_eq!(
-        ids(&replica.sub_tenant_routes, |r| r.id.clone()),
-        ids(&cfg.sub_tenant_routes, |r| r.id.clone()),
-        "the replica must hold sub-tenant routes in the loader's order"
     );
 
     // ...and therefore the whole value is equal, which is the property the tree claims.

@@ -1,11 +1,10 @@
 //! The single owner of "what a replica must reproduce" (plan T1/T6).
 //!
 //! `ConfigData` is the RUNTIME snapshot: by design the loader keeps only ENABLED
-//! `limit_role` / `provider_key_binding` rows, because those are what the hot
-//! path matches against. That filter is correct for routing and fatally wrong as
-//! a REBUILD source: `db::restore_config` wipes both tables and used to rebuild
-//! them from `ConfigData`, so every materialization destroyed the replica's
-//! disabled rows.
+//! `limit_role` rows, because those are what the hot path matches against. That
+//! filter is correct for routing and fatally wrong as a REBUILD source: `db::restore_config`
+//! wipes the table and used to rebuild it from `ConfigData`, so every materialization
+//! destroyed the replica's disabled rows.
 //!
 //! This module separates the two roles. [`ReplicationContent`] is the rebuild
 //! source (FULL rows), and it is also the object the generation predicate is
@@ -16,8 +15,8 @@ use std::sync::Arc;
 
 use hydra_core::config::ConfigData;
 use hydra_core::model::{
-    GlobalRole, LimitRole, ProviderKey, ProviderKeyBinding, ProviderModel, SubTenant,
-    SubTenantRoute, TenantAccessToken, TenantModel, TenantProvider, User, UserApiKey, UserGroup,
+    GlobalRole, LimitRole, ProviderKey, ProviderModel, TenantAccessToken, TenantModel,
+    TenantProvider, User, UserApiKey, UserGroup,
 };
 use sqlx::SqlitePool;
 
@@ -40,8 +39,6 @@ pub type TenantTokenHashes = Vec<(String, String)>;
 pub struct FidelityRows {
     /// FULL `limit_role` rows — including `enabled == false`.
     pub limit_roles: Vec<LimitRole>,
-    /// FULL `provider_key_binding` rows — including `enabled == false`.
-    pub key_prefix_bindings: Vec<ProviderKeyBinding>,
     /// `provider_key` rows WITH their identity (`id`, `created_at`) so the
     /// replica keeps the leader's primary keys instead of minting new ones.
     pub provider_keys: Vec<ProviderKey>,
@@ -52,11 +49,6 @@ pub struct FidelityRows {
     /// Join rows with their ids preserved.
     pub tenant_providers: Vec<TenantProvider>,
     pub tenant_models: Vec<TenantModel>,
-    /// FULL `sub_tenant` rows — including `enabled == false`.
-    pub sub_tenants: Vec<SubTenant>,
-    /// FULL `sub_tenant_route` rows — including `enabled == false`.
-    pub sub_tenant_routes: Vec<SubTenantRoute>,
-
     // --- User hierarchy / tenant tokens / Global Roles (plan §3.5 / D-13) ----
     //
     // These are FULL row sets for the per-row Arachne entities, including disabled rows.
@@ -205,13 +197,10 @@ impl ReplicationContent {
         );
 
         let limit_roles = crate::db::list_limit_roles_on(&mut *tx, kp).await?;
-        let key_prefix_bindings = crate::db::list_provider_key_bindings_on(&mut *tx).await?;
         let tenant_token_hashes = crate::db::list_tenant_access_token_hashes_on(&mut *tx).await?;
         let provider_models = crate::db::list_provider_models_on(&mut *tx).await?;
         let tenant_providers = crate::db::list_tenant_providers_on(&mut *tx).await?;
         let tenant_models = crate::db::list_tenant_models_on(&mut *tx).await?;
-        let sub_tenants = crate::db::list_sub_tenants_on(&mut *tx).await?;
-        let sub_tenant_routes = crate::db::list_sub_tenant_routes_on(&mut *tx).await?;
         // User-hierarchy rows (plan §3.5 / D-13): the FULL table views the per-row tree entities
         // need. Keep them in the SAME read snapshot as the legacy row sets; otherwise a user could
         // be restored whose key, group or role came from different revisions.
@@ -228,14 +217,11 @@ impl ReplicationContent {
             cfg: Arc::new(cfg),
             fidelity: FidelityRows {
                 limit_roles,
-                key_prefix_bindings,
                 provider_keys,
                 tenant_token_hashes,
                 provider_models,
                 tenant_providers,
                 tenant_models,
-                sub_tenants,
-                sub_tenant_routes,
                 user_groups,
                 users,
                 user_api_keys,
@@ -319,21 +305,6 @@ mod tests {
             )
             .await
             .expect("insert limit role");
-        }
-        for id in ["b-b", "b-a"] {
-            crate::db::insert_provider_key_binding(
-                pool,
-                &hydra_core::model::ProviderKeyBinding {
-                    id: id.into(),
-                    key_prefix: format!("sk-{id}-"),
-                    provider_id: "p1".into(),
-                    enabled: false,
-                    created_at: "2026-01-01 00:00:00".into(),
-                    updated_at: "2026-01-01 00:00:00".into(),
-                },
-            )
-            .await
-            .expect("insert binding");
         }
         crate::db::insert_tenant(
             pool,
@@ -423,19 +394,14 @@ mod tests {
         // Non-vacuous: the vectors this compares are actually populated.
         assert_eq!(first.fidelity().provider_keys.len(), 2);
         assert_eq!(first.fidelity().limit_roles.len(), 2);
-        assert_eq!(first.fidelity().key_prefix_bindings.len(), 2);
         assert_eq!(first.fidelity().tenant_token_hashes.len(), 1);
         assert_eq!(first.fidelity().provider_models.len(), 1);
         assert_eq!(first.fidelity().tenant_providers.len(), 1);
         assert_eq!(first.fidelity().tenant_models.len(), 1);
-        // The DISABLED limit role / binding are in the fidelity rows but NOT in
-        // `cfg` — the distinction G1 turns on.
+        // The DISABLED limit role is in the fidelity rows but NOT in `cfg` —
+        // the distinction G1 turns on.
         assert!(
             first.cfg.limit_roles.is_empty(),
-            "cfg keeps enabled rows only"
-        );
-        assert!(
-            first.cfg.key_prefix_bindings.is_empty(),
             "cfg keeps enabled rows only"
         );
 
@@ -488,13 +454,6 @@ mod tests {
                 content.cfg.providers.contains_key(&key.provider_id),
                 "a provider_key references a provider absent from THIS load: {} (a torn read)",
                 key.provider_id
-            );
-        }
-        for binding in &content.fidelity().key_prefix_bindings {
-            assert!(
-                content.cfg.providers.contains_key(&binding.provider_id),
-                "a key-prefix binding references an absent provider: {}",
-                binding.provider_id
             );
         }
         for grant in &content.fidelity().tenant_providers {

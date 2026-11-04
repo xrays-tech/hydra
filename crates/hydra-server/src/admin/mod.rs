@@ -48,7 +48,6 @@ mod static_files;
 /// Shared transactional sub-tenant / route write core (sub-tenant v2, D5). The
 /// single write path used by the v1 admin handlers now and the v2 leader
 /// internal handler later; not HTTP-specific (typed results, not `Resp`).
-pub mod sub_tenant_write;
 /// Leader internal tenant-config write endpoint (sub-tenant v2, D3/D5/D6/D7):
 /// the A-2 receiver-side gates (lease assertion, tenant re-auth, authorization
 /// family. Cluster-token gated in `AdminService::response`.
@@ -629,24 +628,6 @@ impl AdminService {
             }
             ("limit-roles", Some(id)) => {
                 handlers::limit_role_item(state, session, method, id, trace_id).await
-            }
-            ("provider-key-bindings", None) => {
-                handlers::provider_key_binding_collection(state, session, method, trace_id).await
-            }
-            ("provider-key-bindings", Some(id)) => {
-                handlers::provider_key_binding_item(state, session, method, id, trace_id).await
-            }
-            ("sub-tenants", None) => {
-                handlers::sub_tenant_collection(state, session, method, query, trace_id).await
-            }
-            ("sub-tenants", Some(id)) => {
-                handlers::sub_tenant_item(state, session, method, id, trace_id).await
-            }
-            ("sub-tenant-routes", None) => {
-                handlers::sub_tenant_route_collection(state, session, method, query, trace_id).await
-            }
-            ("sub-tenant-routes", Some(id)) => {
-                handlers::sub_tenant_route_item(state, session, method, id, trace_id).await
             }
             // Global Roles (plan §3.4): GET answers every rule incl. the DISABLED
             // ones, PUT create-or-replaces the rule AND its provider set in ONE

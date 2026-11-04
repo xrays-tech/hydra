@@ -170,7 +170,7 @@ fn insert_columns() -> Vec<String> {
 /// ClickHouse reject EVERY usage insert, and the sink can only COUNT the loss
 /// (`hydra_usage_records_dropped_total`) — the node stops metering usage/quota/
 /// billing without any test failing. Measured live on 2026-09-29: the local
-/// stack's `default.usage_record` predated `sub_tenant_id`, i.e. exactly this
+/// stack's `default.usage_record` predated a nullable id column, i.e. exactly this
 /// state, and the current binary could not have written to it.
 ///
 /// Falsification: add a column to the INSERT list, or delete one from

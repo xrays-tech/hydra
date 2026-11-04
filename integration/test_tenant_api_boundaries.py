@@ -260,20 +260,20 @@ def main():
             who = {}
         check("§7.1 step 1: `whoami` still works and SHOWS the suspension",
               st == 200 and who.get("enabled") is False, f"HTTP {st} enabled={who.get('enabled')}")
-        for path in (f"/usage?since={SINCE}", "/sub-tenants", "/sub-tenant-routes"):
+        for path in (f"/usage?since={SINCE}", "/user-groups", "/users"):
             st, text = tenant("GET", path)
             check(f"§7.1: the read route {path.split('?')[0]} still works while suspended",
                   st == 200, f"HTTP {st} {text[:60]}")
-        st, text = tenant("PUT", "/sub-tenants/SUSP", body={"key_prefix": "SUSP_", "enabled": True})
-        sub_id = ""
+        st, text = tenant("PUT", "/user-groups", body={"id": "SUSP", "name": "SUSP", "enabled": True})
+        group_id = ""
         try:
-            sub_id = json.loads(text)["sub_tenant"]["id"]
+            group_id = json.loads(text)["user_group"]["id"]
         except Exception:
             pass
         check("§7.1: the WRITE routes still work while suspended (that is the self-service path)",
-              st == 200 and bool(sub_id), f"HTTP {st} {text[:80]}")
-        if sub_id:
-            st, _ = tenant("DELETE", f"/sub-tenants/{sub_id}")
+              st == 200 and bool(group_id), f"HTTP {st} {text[:80]}")
+        if group_id:
+            st, _ = tenant("DELETE", f"/user-groups/{group_id}")
             check("§7.1: ...and so does cleanup", st == 204, f"HTTP {st}")
 
         set_enabled(True)

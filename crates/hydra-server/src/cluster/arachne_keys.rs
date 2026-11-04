@@ -82,7 +82,14 @@ use std::hash::{Hash, Hasher};
 /// singleton. A build speaking 4 has no decoder arms for the new paths and must refuse this tree by
 /// name rather than ignore it: ignoring new rows would silently rebuild a replica with no users, keys
 /// or roles while still naming a tree that says it has them.
-pub const TOC_FORMAT: u32 = 5;
+///
+/// **6** — the legacy routing entities (`key_binding` and the sub-tenant family) are GONE:
+/// this build neither writes nor decodes those paths, and the `_fidelity` singleton no longer carries
+/// their rows. A build speaking 5 publishes them, so the two must refuse each other by name — a 5-era
+/// node would otherwise half-materialize a tree whose routing rows this one has dropped (or this node
+/// would meet an unknown discriminant and fail the whole read). Discriminants **6/7/8** stay reserved
+/// (never reused) so a stray 5-era byte still fails loudly rather than silently becoming another kind.
+pub const TOC_FORMAT: u32 = 6;
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";
@@ -155,12 +162,6 @@ pub enum EntityPath {
     Model(String),
     /// `limit_role/<id>`
     LimitRole(String),
-    /// `key_binding/<id>`
-    KeyBinding(String),
-    /// `sub_tenant/<id>`
-    SubTenant(String),
-    /// `sub_tenant_route/<id>`
-    SubTenantRoute(String),
     /// `tenant_provider/<tenant_id>` — the provider ids a tenant may use.
     TenantProvider(String),
     /// `tenant_model/<tenant_id>` — the model keys a tenant may use.
@@ -200,9 +201,6 @@ impl EntityPath {
             Self::ProviderKey(id) => format!("provider_key/{id}"),
             Self::Model(key) => format!("model/{key}"),
             Self::LimitRole(id) => format!("limit_role/{id}"),
-            Self::KeyBinding(id) => format!("key_binding/{id}"),
-            Self::SubTenant(id) => format!("sub_tenant/{id}"),
-            Self::SubTenantRoute(id) => format!("sub_tenant_route/{id}"),
             Self::TenantProvider(id) => format!("tenant_provider/{id}"),
             Self::TenantModel(id) => format!("tenant_model/{id}"),
             Self::Token(id) => format!("token/{id}"),
@@ -226,9 +224,8 @@ impl EntityPath {
             Self::ProviderKey(_) => 3,
             Self::Model(_) => 4,
             Self::LimitRole(_) => 5,
-            Self::KeyBinding(_) => 6,
-            Self::SubTenant(_) => 7,
-            Self::SubTenantRoute(_) => 8,
+            // 6 / 7 / 8 are the retired `key_binding` and sub-tenant-family
+            // discriminants: left reserved, never reused.
             Self::Token(_) => 9,
             Self::Cert(_) => 10,
             Self::Meta => 11,
@@ -252,9 +249,6 @@ impl EntityPath {
             | Self::ProviderKey(id)
             | Self::Model(id)
             | Self::LimitRole(id)
-            | Self::KeyBinding(id)
-            | Self::SubTenant(id)
-            | Self::SubTenantRoute(id)
             | Self::TenantProvider(id)
             | Self::TenantModel(id)
             | Self::Token(id)
@@ -397,9 +391,6 @@ fn kind_name(path: &EntityPath) -> &'static str {
         EntityPath::ProviderKey(_) => "provider_key",
         EntityPath::Model(_) => "model",
         EntityPath::LimitRole(_) => "limit_role",
-        EntityPath::KeyBinding(_) => "key_binding",
-        EntityPath::SubTenant(_) => "sub_tenant",
-        EntityPath::SubTenantRoute(_) => "sub_tenant_route",
         EntityPath::TenantProvider(_) => "tenant_provider",
         EntityPath::TenantModel(_) => "tenant_model",
         EntityPath::Token(_) => "token",
@@ -583,9 +574,9 @@ impl Toc {
                         3 => EntityPath::ProviderKey(id),
                         4 => EntityPath::Model(id),
                         5 => EntityPath::LimitRole(id),
-                        6 => EntityPath::KeyBinding(id),
-                        7 => EntityPath::SubTenant(id),
-                        8 => EntityPath::SubTenantRoute(id),
+                        // 6/7/8 (the retired routing kinds) fall through to
+                        // the unknown-discriminant error below; a 5-era tree is
+                        // refused by the format check long before it gets here.
                         9 => EntityPath::Token(id),
                         _ => EntityPath::Cert(id),
                     }
@@ -713,9 +704,6 @@ mod tests {
             EntityPath::ProviderKey("x".into()),
             EntityPath::Model("x".into()),
             EntityPath::LimitRole("x".into()),
-            EntityPath::KeyBinding("x".into()),
-            EntityPath::SubTenant("x".into()),
-            EntityPath::SubTenantRoute("x".into()),
             EntityPath::TenantProvider("x".into()),
             EntityPath::TenantModel("x".into()),
             EntityPath::Token("x".into()),
@@ -848,7 +836,7 @@ mod tests {
     #[test]
     fn the_toc_format_is_pinned_with_its_reason() {
         assert_eq!(
-            TOC_FORMAT, 5,
+            TOC_FORMAT, 6,
             "if you changed what an entity's bytes MEAN, bump this number AND add its entry to the \
              doc above (the history is the reason the constant exists); if you did not, this test \
              is the reminder that a bump happened and older builds now refuse this tree by name"

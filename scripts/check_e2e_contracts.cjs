@@ -51,7 +51,6 @@
 const fs = require("fs");
 const { records, audit } = require("./recorded_exceptions.cjs");
 const path = require("path");
-
 // The root is overridable so the two rules about the UI SOURCE LIST (existence, completeness) can be
 // exercised against a fixture tree, like every other guard's root (round 186).
 const ROOT = process.env.E2E_CONTRACTS_ROOT
@@ -65,13 +64,11 @@ const UI_FILES = ["admin-ui/app.js", "admin-ui/stats.js", "admin-ui/api-docs.js"
 // exception (a vendored asset, a generated bundle) gets RECORDED instead of skipped (round 186).
 const UNSCANNED_UI_OK = records(process.env.E2E_CONTRACTS_UNSCANNED_UI, []);
 const UI_SOURCE_EXT = /\.(js|cjs|mjs|ts|html|css)$/;
-
 /** Minimum number of tokens that must be extracted, or the run is meaningless.
  *  Overridable so a focused fixture (a two-line spec exercising one rule) does not
  *  have to pad itself with selectors it does not care about; the default is what
  *  guards the real suite against a broken extraction. */
 const { maskJsLiteralsReport } = require("./js_blank.cjs");
-
 const MIN_TOKENS = Number(process.env.E2E_CONTRACTS_MIN_TOKENS ?? 40);
 // Floor on api('POST'|'PUT', …) calls: the real suite has 7, and a call regex that stops matching
 // must FAIL rather than report "no problems found".
@@ -79,7 +76,6 @@ const MIN_API_SITES = Number(process.env.E2E_CONTRACTS_MIN_API_SITES ?? 5);
 // Floor on the files the pkill rule walks: that walk had no count at all, so renaming a harness
 // directory would have turned "never kill by process name" into a silent no-op that still said OK.
 const MIN_HARNESS_FILES = Number(process.env.E2E_CONTRACTS_MIN_HARNESS_FILES ?? 30);
-
 /** The brace-balanced object literal starting at `open`, as `{ text, end }` (or null). */
 function balancedObject(src, open) {
   if (src[open] !== "{") return null;
@@ -94,7 +90,6 @@ function balancedObject(src, open) {
   }
   return null;
 }
-
 /** The text of `const|let|var <name> = { … }` in the same file, or null. */
 function objectLiteralOf(src, name) {
   const m = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*\\{`).exec(src);
@@ -103,7 +98,6 @@ function objectLiteralOf(src, name) {
   const obj = balancedObject(src, open);
   return obj ? obj.text : null;
 }
-
 function readSpecs(argv) {
   const i = argv.indexOf("--spec");
   if (i !== -1) {
@@ -121,7 +115,6 @@ function readSpecs(argv) {
     .sort()
     .map((f) => path.join(dir, f));
 }
-
 /** Every quoted argument of a selector-taking Playwright call. */
 function selectorsIn(src) {
   const out = [];
@@ -130,7 +123,6 @@ function selectorsIn(src) {
   while ((m = calls.exec(src))) out.push({ raw: m[2], index: m.index });
   return out;
 }
-
 /** `navItem(page, 'key')` section keys. */
 function navKeysIn(src) {
   const out = [];
@@ -139,7 +131,6 @@ function navKeysIn(src) {
   while ((m = re.exec(src))) out.push({ raw: m[2], index: m.index });
   return out;
 }
-
 // REMOVED (round 190): a `assertedStringsIn()` helper used to sit here — it collected the literal
 // strings a spec asserts are on screen (`toContainText('…')`), and NOTHING called it. The obvious rule
 // it was written for ("every asserted literal must exist in a UI source") is UNSOUND, and that is
@@ -149,11 +140,9 @@ function navKeysIn(src) {
 // false drift on a correct suite, so the helper is gone instead of wired up for its own sake. The
 // decision is pinned by a case in `check_e2e_contracts.test.cjs` ("a runtime-created asserted value is
 // not drift"), so re-adding the naive rule reddens that test first.
-
 function lineOf(src, index) {
   return src.slice(0, index).split("\n").length;
 }
-
 /**
  * 1-based line numbers of lines that kill a process by NAME, in any of the harness files.
  *
@@ -178,14 +167,12 @@ function nameKillLines(src) {
   }
   return hits;
 }
-
 function main() {
   const specFiles = readSpecs(process.argv.slice(2));
   if (!specFiles.length) {
     console.error("error: no spec files found");
     process.exit(2);
   }
-
   // PRECONDITIONS about the list itself (round 186). Both directions are findings:
   //   * a LISTED file that is missing made every selector check read an EMPTY source, so the guard
   //     reported dozens of false drifts ("no admin-ui source declares id X") instead of the one fact
@@ -228,12 +215,10 @@ function main() {
     console.error(`${uiProblems.length} UI-source list problem(s)`);
     process.exit(1);
   }
-
   const ui = UI_FILES.map((f) => {
     const p = path.join(ROOT, f);
     return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
   }).join("\n");
-
   /** Does the UI source contain this token at all? */
   const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   /** A quote character class, built once so the patterns below stay readable. */
@@ -253,14 +238,11 @@ function main() {
       new RegExp("dataset:\\s*\\{[^}]*\\b" + esc(camel) + "\\b").test(ui) && hasEnglishValue(val);
     return literal || viaDataset;
   };
-
   const problems = [];
   let checked = 0;
-
   for (const file of specFiles) {
     const src = fs.readFileSync(file, "utf8");
     const rel = path.relative(ROOT, file);
-
     for (const { raw, index } of selectorsIn(src)) {
       // Split a compound selector into the tokens that name something in the UI.
       const at = `${rel}:${lineOf(src, index)}`;
@@ -296,7 +278,6 @@ function main() {
         }
       }
     }
-
     for (const { raw, index } of navKeysIn(src)) {
       checked++;
       const at = `${rel}:${lineOf(src, index)}`;
@@ -306,7 +287,6 @@ function main() {
       }
     }
   }
-
   /* Required timestamp fields in API-based fixtures ----------------------------
    * Deliberately narrow: only `created_at`/`updated_at`, and only for resources
    * whose entity struct declares them as required. A general "send every field"
@@ -319,8 +299,6 @@ function main() {
     "/provider-models": "ProviderModel",
     "/tenants": "Tenant",
     "/limit-roles": "LimitRole",
-    "/sub-tenants": "SubTenant",
-    "/key-prefix-bindings": "ProviderKeyBinding",
     "/tenant-models": "TenantModel",
     "/tenant-providers": "TenantProvider",
   };
@@ -340,7 +318,6 @@ function main() {
   if (modelSrc && requiredTimestamps.size < 3) {
     problems.push(`only ${requiredTimestamps.size} entity struct(s) with required timestamps parsed from model.rs; the pattern is probably wrong`);
   }
-
   let apiSites = 0; // every api('POST'|'PUT', …) call in every spec
   let requiring = 0; // …of those, the ones whose resource REQUIRES timestamps
   let payloadsRead = 0; // …of those, the ones whose payload this guard actually read
@@ -377,7 +354,6 @@ function main() {
       const structName = STRUCT_OF_RESOURCE[resource];
       if (!structName || !requiredTimestamps.has(structName)) continue;
       requiring += 1;
-
       // The request options object: the next brace-balanced literal after the path.
       const open = masked.indexOf("{", m.index + m[0].length);
       const options = open === -1 ? null : balancedObject(masked, open);
@@ -426,14 +402,12 @@ function main() {
   if (apiSites < MIN_API_SITES) {
     problems.push(`only ${apiSites} api('POST'|'PUT', …) call(s) found in ${specFiles.length} spec file(s) (< floor ${MIN_API_SITES}); the call regex is probably wrong`);
   }
-
   // NOTE: this floor used to `process.exit(1)` here, which made everything after it unreachable —
   // including the name-kill scan and its own `MIN_HARNESS_FILES` floor (round 129). It is recorded
   // as a problem instead and the run continues to the end.
   if (checked < MIN_TOKENS) {
     problems.push(`only ${checked} token(s) examined (< ${MIN_TOKENS}); the extraction regexes are probably broken`);
   }
-
   // A suite must never clean up by PROCESS NAME. `pkill -x hydra` also matched the local
   // dev stack: the containers of environment/docker-compose.local.yml run a process named
   // exactly `hydra` from /usr/local/bin/hydra, owned by the same uid, so every suite run
@@ -487,14 +461,11 @@ function main() {
     console.error(`${problems.length} e2e contract drift issue(s)`);
     process.exit(1);
   }
-
   const specs = specFiles.map((f) => path.relative(ROOT, f)).join(", ");
   // Round 196: the UI-source audit above (every `admin-ui/` source is either in `UI_FILES` or
   // RECORDED in `UNSCANNED_UI_OK`) was invisible on the success path — its findings only printed on
   // failure, so a reader could not tell how much of the list was leaning on recorded exceptions.
   console.log(`OK  (${checked} selector/nav tokens across ${specFiles.length} spec file(s): ${specs}; ${apiSites} api call(s) seen, ${payloadsRead} payload(s) verified; ${harnessScanned} harness file(s) scanned for name-kill commands; ${UI_FILES.length} UI source(s) judged against the list, ${UNSCANNED_UI_OK.size} recorded as deliberately unscanned (${[...UNSCANNED_UI_OK.keys()].join(', ') || 'none'}))`);
 }
-
 if (require.main === module) main();
-
 module.exports = { selectorsIn, navKeysIn, nameKillLines };

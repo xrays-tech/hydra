@@ -804,7 +804,6 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
         cfg,
         fidelity: FidelityRows {
             limit_roles: vec![],
-            key_prefix_bindings: vec![],
             provider_keys: vec![],
             tenant_token_hashes: vec![(
                 "t1".to_string(),
@@ -813,8 +812,6 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
             provider_models: vec![],
             tenant_providers: vec![],
             tenant_models: vec![],
-            sub_tenants: vec![],
-            sub_tenant_routes: vec![],
             user_groups: vec![],
             users: vec![],
             user_api_keys: vec![],
@@ -1309,400 +1306,11 @@ async fn get_tenant_json(root: &str, tenant: &str, token: &str, suffix: &str) ->
 }
 
 // ---------------------------------------------------------------------------
-// T7 — E4 `GET /sub-tenants` and `GET /sub-tenant-routes`
-//       (read-only, snapshot-fed; an edge with no DB serves them)
-// ---------------------------------------------------------------------------
-
-/// Seed a provider plus sub-tenants and routes for BOTH `t1` and `t2`, so the
-/// isolation assertions below are non-vacuous: each tenant has rows of its own
-/// AND rows belonging to the other tenant that it must never see.
-async fn seed_sub_tenants(pool: &sqlx::SqlitePool) {
-    hydra_server::db::insert_provider(
-        pool,
-        &hydra_core::model::Provider {
-            id: "p1".into(),
-            key: "prov1".into(),
-            name: "P1".into(),
-            endpoint: "http://127.0.0.1:1/".into(),
-            weight: 1,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            max_concurrency: None,
-            max_queue_depth: None,
-            queue_wait_timeout_ms: None,
-        },
-    )
-    .await
-    .expect("insert provider");
-
-    for (id, tenant, name, prefix) in [
-        ("st1", "t1", "st-one", "QQCX_"),
-        ("st2", "t1", "st-two", "QQCY_"),
-        ("st9", "t2", "st-other", "ZZZZ_"),
-    ] {
-        hydra_server::db::insert_sub_tenant(
-            pool,
-            &hydra_core::model::SubTenant {
-                id: id.into(),
-                tenant_id: tenant.into(),
-                name: name.into(),
-                key_prefix: prefix.into(),
-                enabled: true,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            },
-        )
-        .await
-        .expect("insert sub-tenant");
-    }
-
-    // `st1` (t1) has two routes: one model-specific and the default (`None`).
-    // `st9` (t2) has one. `st2` (t1) has none.
-    for (id, st, model) in [
-        ("r1", "st1", Some("gpt-4".to_string())),
-        ("r2", "st1", None),
-        ("r9", "st9", Some("gpt-4".to_string())),
-    ] {
-        hydra_server::db::insert_sub_tenant_route(
-            pool,
-            &hydra_core::model::SubTenantRoute {
-                id: id.into(),
-                sub_tenant_id: st.into(),
-                model_key: model,
-                provider_id: "p1".into(),
-                enabled: true,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            },
-        )
-        .await
-        .expect("insert sub-tenant route");
-    }
-}
-
-/// T7: `GET /sub-tenants` answers from the snapshot (no DB), returns only the
-/// tenant's own rows, and carries the snapshot `config_version` as the v2
-/// reconciliation baseline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn list_sub_tenants_returns_only_the_tenants_own_rows() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
-    seed_sub_tenants(&pool).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let expected_version = state.store.version();
-    let root = start_proxy(state);
-    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
-    assert_eq!(status, 200, "got {v}");
-    // The version the snapshot was read at — the reconciliation baseline a
-    // tenant polls to see when its change is live.
-    assert_eq!(
-        v["config_version"].as_u64(),
-        Some(expected_version),
-        "the response must carry the snapshot version: {v}"
-    );
-    // t1 sees exactly its two sub-tenants, never t2's.
-    let arr = v["sub_tenants"].as_array().expect("sub_tenants array");
-    assert_eq!(arr.len(), 2, "got {v}");
-    let names: Vec<&str> = arr
-        .iter()
-        .map(|x| x["name"].as_str().unwrap_or_default())
-        .collect();
-    assert!(
-        names.contains(&"st-one") && names.contains(&"st-two"),
-        "got {names:?}"
-    );
-    assert!(
-        names.iter().all(|n| *n != "st-other"),
-        "t2's sub-tenant leaked into t1's view: {v}"
-    );
-}
-
-/// T7: `GET /sub-tenant-routes` answers from the snapshot and returns only the
-/// routes whose sub-tenant belongs to the caller's tenant. A route is
-/// tenant-scoped THROUGH its sub-tenant, so another tenant's route can never
-/// appear — even though the route row itself names no `tenant_id`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn list_sub_tenant_routes_returns_only_the_tenants_own_routes() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
-    seed_sub_tenants(&pool).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let expected_version = state.store.version();
-    let root = start_proxy(state);
-    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenant-routes").await;
-    assert_eq!(status, 200, "got {v}");
-    assert_eq!(
-        v["config_version"].as_u64(),
-        Some(expected_version),
-        "the response must carry the snapshot version: {v}"
-    );
-    // t1's sub-tenant `st1` has two routes (one model-specific, one default);
-    // `st2` has none; t2's `r9` (via `st9`) must NOT appear.
-    let arr = v["sub_tenant_routes"]
-        .as_array()
-        .expect("sub_tenant_routes array");
-    assert_eq!(arr.len(), 2, "got {v}");
-    let sub_ids: Vec<&str> = arr
-        .iter()
-        .map(|x| x["sub_tenant_id"].as_str().unwrap_or_default())
-        .collect();
-    assert!(
-        sub_ids.iter().all(|s| *s == "st1"),
-        "only t1's own sub-tenant's routes may appear: {v}"
-    );
-    assert!(
-        arr.iter().any(|x| x["model_key"].is_null()),
-        "the default route must be present: {v}"
-    );
-    assert!(
-        arr.iter()
-            .any(|x| x["model_key"] == serde_json::json!("gpt-4")),
-        "the model-specific route must be present: {v}"
-    );
-}
-
-/// T7: like every tenant endpoint, both read-only endpoints sit behind the same
-/// token gate — no token is a 401 from the gate, never a fall-through to the
-/// proxy pipeline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_read_only_endpoints_require_a_token() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-    let c = client();
-    for endpoint in ["sub-tenants", "sub-tenant-routes"] {
-        let (status, v) = body_json(
-            send_until_ready(
-                &c,
-                &format!("{root}/tenant/t1/api/v1/{endpoint}"),
-                None,
-                None,
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, 401, "{endpoint}: got {v}");
-        assert_eq!(v["error"]["code"], "unauthorized", "{endpoint}: {v}");
-    }
-}
-
-/// T7: the whole security property of the read-only view. A tenant sees ONLY
-/// its own sub-tenants and routes; `t2` must not read `t1`'s rows, and the gate
-/// still enforces the URL cross-check (`t1`'s token on `t2`'s URL is a 403).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_read_only_view_is_scoped_to_the_authenticated_tenant() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
-    seed_sub_tenants(&pool).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-
-    // t2 sees exactly its own sub-tenant (st-other) — never t1's two.
-    let (s, v) = get_tenant_json(&root, "t2", OTHER_TOKEN, "sub-tenants").await;
-    assert_eq!(s, 200, "got {v}");
-    let arr = v["sub_tenants"].as_array().expect("array");
-    assert_eq!(arr.len(), 1, "t2 must see only its own sub-tenant: {v}");
-    assert_eq!(arr[0]["name"], "st-other");
-    assert_eq!(arr[0]["tenant_id"], "t2", "the row must belong to t2: {v}");
-
-    // t2 sees exactly its own route (r9, via st9) — never t1's routes.
-    let (s2, v2) = get_tenant_json(&root, "t2", OTHER_TOKEN, "sub-tenant-routes").await;
-    assert_eq!(s2, 200, "got {v2}");
-    let arr2 = v2["sub_tenant_routes"].as_array().expect("array");
-    assert_eq!(arr2.len(), 1, "t2 must see only its own route: {v2}");
-    assert_eq!(arr2[0]["sub_tenant_id"], "st9");
-    assert_eq!(arr2[0]["id"], "r9");
-
-    // The gate still enforces the URL cross-check: t1's token on t2's URL is 403.
-    let (s3, v3) = get_tenant_json(&root, "t2", TENANT_TOKEN, "sub-tenants").await;
-    assert_eq!(s3, 403, "a token for another tenant must be 403: {v3}");
-    assert_eq!(v3["error"]["code"], "tenant_id_mismatch", "got {v3}");
-}
-
-/// T7: a suspended (disabled) tenant still reads its own sub-tenant view —
-/// self-recovery depends on it, exactly as for `whoami`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_suspended_tenant_can_still_list_its_sub_tenants() {
-    let pool = common::setup_pool().await;
-    // `t2` is seeded so the fixture's cross-tenant rows have their tenant to
-    // reference (the assertion is purely about the suspended `t1`).
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
-    seed_sub_tenants(&pool).await;
-    let mut t = hydra_server::db::get_tenant(&pool, "t1")
-        .await
-        .expect("get");
-    t.enabled = false;
-    hydra_server::db::update_tenant(&pool, &t)
-        .await
-        .expect("disable");
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-    let (status, v) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
-    assert_eq!(
-        status, 200,
-        "a suspended tenant must still read its own state: {v}"
-    );
-    let arr = v["sub_tenants"].as_array().expect("array");
-    assert_eq!(
-        arr.len(),
-        2,
-        "the two enabled sub-tenants are still listed: {v}"
-    );
-}
-
-/// T7: an EDGE node has no local database. The two read-only endpoints must
-/// still answer, from the replicated snapshot alone — the same property that
-/// makes `whoami` work on an edge, and the whole point of "snapshot-fed": an
-/// edge with no DB serves the tenant's own sub-tenant view locally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_read_only_endpoints_work_from_a_materialized_snapshot_alone() {
-    use hydra_server::cluster::content::FidelityRows;
-    use hydra_server::cluster::snapshot::HydratedWire;
-
-    let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
-        Arc::new(StaticKeyProvider::new([7u8; 32], 1));
-
-    // The replica shape: a store whose own database holds nothing, fed one snapshot — its config
-    // comes from the materializer, not from its tables, and the read-only endpoints must not care.
-    let store = ConfigStore::from_data(
-        common::setup_pool().await,
-        hydra_core::config::ConfigData::default(),
-        kp,
-    )
-    .await
-    .expect("from_data");
-    let mut cfg = hydra_core::config::ConfigData::default();
-    let t = Tenant {
-        id: "t1".into(),
-        name: "edge-tenant".into(),
-        domain: "edge.example".into(),
-        auth_url: "https://auth.edge.example/verify".into(),
-        cert_key: None,
-        cert_file: None,
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    };
-    cfg.tenants_by_domain.insert(t.domain.clone(), t);
-    let st = hydra_core::model::SubTenant {
-        id: "st1".into(),
-        tenant_id: "t1".into(),
-        name: "edge-sub".into(),
-        key_prefix: "QQCX_".into(),
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    };
-    cfg.sub_tenants.push(st.clone());
-    let route = hydra_core::model::SubTenantRoute {
-        id: "r1".into(),
-        sub_tenant_id: "st1".into(),
-        model_key: None, // the default route
-        provider_id: "p1".into(),
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    };
-    cfg.sub_tenant_routes.push(route.clone());
-    // The gate authenticates from `ConfigData.tenant_tokens` (hash → identity);
-    // `hydrate` fills it from the `tenant_access_tokens` fidelity rows, and here
-    // we are the producer of the wire, so we state the same identity directly.
-    cfg.tenant_tokens.insert(
-        sha256_hex_string(TENANT_TOKEN.as_bytes()),
-        hydra_core::identity::TenantTokenIdentity {
-            tenant_id: "t1".into(),
-            token_name: "edge-token".into(),
-            expires_at: None,
-        },
-    );
-    // `hydrate` does this in production; here we are the producer of the wire.
-    cfg.reindex_tenants();
-    store.apply_snapshot(HydratedWire {
-        version: 9,
-        cfg,
-        fidelity: FidelityRows {
-            limit_roles: vec![],
-            key_prefix_bindings: vec![],
-            provider_keys: vec![],
-            tenant_token_hashes: vec![(
-                "t1".to_string(),
-                sha256_hex_string(TENANT_TOKEN.as_bytes()),
-            )],
-            provider_models: vec![],
-            tenant_providers: vec![],
-            tenant_models: vec![],
-            sub_tenants: vec![st],
-            sub_tenant_routes: vec![route],
-            user_groups: vec![],
-            users: vec![],
-            user_api_keys: vec![],
-            tenant_access_tokens: vec![hydra_core::model::TenantAccessToken {
-                id: "tok-edge".into(),
-                tenant_id: "t1".into(),
-                name: "edge-token".into(),
-                token_hash: sha256_hex_string(TENANT_TOKEN.as_bytes()),
-                token_prefix: "sk-tenant".into(),
-                token_last4: "cdef".into(),
-                enabled: true,
-                expires_at: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            }],
-            global_roles: vec![],
-        },
-    });
-
-    let state = AppState::for_tests(
-        store,
-        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
-        Arc::new(RateLimiter::new()),
-        Arc::new(NoopSink) as Arc<dyn UsageSink>,
-        ProxyConfig::default(),
-        TenantApiConfig::default(),
-    );
-    let root = start_proxy(state);
-
-    // The edge serves both read-only endpoints from its snapshot alone.
-    let (s1, v1) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenants").await;
-    assert_eq!(
-        s1, 200,
-        "an edge must serve /sub-tenants from its snapshot: {v1}"
-    );
-    assert_eq!(
-        v1["config_version"].as_u64(),
-        Some(9),
-        "the snapshot version: {v1}"
-    );
-    let arr1 = v1["sub_tenants"].as_array().expect("array");
-    assert_eq!(arr1.len(), 1);
-    assert_eq!(arr1[0]["name"], "edge-sub");
-
-    let (s2, v2) = get_tenant_json(&root, "t1", TENANT_TOKEN, "sub-tenant-routes").await;
-    assert_eq!(
-        s2, 200,
-        "an edge must serve /sub-tenant-routes from its snapshot: {v2}"
-    );
-    assert_eq!(
-        v2["config_version"].as_u64(),
-        Some(9),
-        "the snapshot version: {v2}"
-    );
-    let arr2 = v2["sub_tenant_routes"].as_array().expect("array");
-    assert_eq!(arr2.len(), 1);
-    assert_eq!(arr2[0]["id"], "r1");
-}
-
-// ---------------------------------------------------------------------------
-// V5 — D9 data-plane tenant config writes (PUT/DELETE sub-tenants & routes)
+// V5 — D9 data-plane identity-plane writes (user groups, users, api keys)
 //
 // These run on the single-node shape (`AppState::for_tests` installs NO
-// forwarder), so every write exercises the D8 LOCAL path: gate → binding →
-// `apply_config_write` → `reload_all` → `config_version` advances. The forward
+// forwarder), so every write exercises the D8 LOCAL path: gate → handler
+// statement → reload/publish tail → `config_version` advances. The forward
 // path is covered separately in the `cluster-redis` e2e target.
 // ---------------------------------------------------------------------------
 
@@ -1790,21 +1398,47 @@ async fn send_write(
     panic!("proxy never became ready at {url}");
 }
 
-/// PUT a sub-tenant and return the produced row id.
-async fn put_sub_tenant(root: &str, tenant: &str, token: &str, name: &str) -> (u16, Value) {
+/// PUT a user-group row with an explicit id, so a repeated PUT can be shown to
+/// converge on the SAME row rather than mint a new one.
+async fn put_user_group(
+    root: &str,
+    tenant: &str,
+    token: &str,
+    id: &str,
+    name: &str,
+) -> (u16, Value) {
     send_write(
         root,
         reqwest::Method::PUT,
-        &format!("/tenant/{tenant}/api/v1/sub-tenants/{name}"),
+        &format!("/tenant/{tenant}/api/v1/user-groups"),
         Some(token),
-        Some(json!({ "key_prefix": "QQCX_", "enabled": true })),
+        Some(json!({ "id": id, "name": name, "enabled": true })),
+    )
+    .await
+}
+
+/// PUT a user row in `group_id`, with an explicit id for the same reason.
+async fn put_user(
+    root: &str,
+    tenant: &str,
+    token: &str,
+    id: &str,
+    group_id: &str,
+    name: &str,
+) -> (u16, Value) {
+    send_write(
+        root,
+        reqwest::Method::PUT,
+        &format!("/tenant/{tenant}/api/v1/users"),
+        Some(token),
+        Some(json!({ "id": id, "user_group_id": group_id, "name": name, "enabled": true })),
     )
     .await
 }
 
 /// The D8 local write path, end to end: a single-node node applies the write
-/// itself, `config_version` advances, and a repeated PUT is idempotent (the
-/// same row id is returned).
+/// itself, `config_version` advances, and a repeated PUT with the SAME row id
+/// converges on that row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_local_write_put_is_idempotent_and_advances_version() {
     let pool = common::setup_pool().await;
@@ -1813,10 +1447,11 @@ async fn single_node_local_write_put_is_idempotent_and_advances_version() {
     let version_before = state.store.version();
     let root = start_proxy(state.clone());
 
-    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    let (status, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-a", "team-a").await;
     assert_eq!(status, 200, "got {v}");
-    let id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
-    assert_eq!(v["sub_tenant"]["name"], "team-a");
+    let id = v["user_group"]["id"].as_str().expect("id").to_string();
+    assert_eq!(id, "grp-a");
+    assert_eq!(v["user_group"]["name"], "team-a");
     let version_after = v["config_version"].as_u64().expect("version");
     assert!(
         version_after > version_before,
@@ -1825,123 +1460,127 @@ async fn single_node_local_write_put_is_idempotent_and_advances_version() {
     // The write landed in the snapshot the data plane reads.
     let snap = state.store.snapshot();
     assert!(
-        snap.sub_tenants.iter().any(|s| s.id == id),
+        snap.user_groups.iter().any(|g| g.id == id),
         "the row is in the snapshot"
     );
     drop(snap);
 
-    // Idempotent: a repeated PUT by name converges to the SAME row.
-    let (status2, v2) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    // A repeated PUT by the same id converges to the SAME row.
+    let (status2, v2) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-a", "team-a").await;
     assert_eq!(status2, 200, "got {v2}");
     assert_eq!(
-        v2["sub_tenant"]["id"].as_str().expect("id"),
+        v2["user_group"]["id"].as_str().expect("id"),
         id,
-        "a repeated PUT by name converges to the existing row"
+        "a repeated PUT with the same id converges to the existing row"
     );
 }
 
-/// DELETE is idempotent: the first delete removes the row (204); a repeat is a
-/// no-op that still answers 204 (never 404, so a late replay cannot error).
+/// A deletion is reported by ABSENCE: 204 the first time, then 404 `not_found`
+/// once the row is gone (the immutable id is never silently invented back).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_node_local_write_delete_is_idempotent() {
+async fn single_node_local_write_delete_reports_absence() {
     let pool = common::setup_pool().await;
     seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state);
 
-    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    let (status, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-del", "team-del").await;
     assert_eq!(status, 200, "got {v}");
-    let id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+    let id = v["user_group"]["id"].as_str().expect("id").to_string();
+    assert_eq!(id, "grp-del");
 
     let (s1, _) = send_write(
         &root,
         reqwest::Method::DELETE,
-        &format!("/tenant/t1/api/v1/sub-tenants/{id}"),
+        &format!("/tenant/t1/api/v1/user-groups/{id}"),
         Some(TENANT_TOKEN),
         None,
     )
     .await;
     assert_eq!(s1, 204, "first delete removes the row");
-    let (s2, _) = send_write(
+
+    let (s2, v2) = send_write(
         &root,
         reqwest::Method::DELETE,
-        &format!("/tenant/t1/api/v1/sub-tenants/{id}"),
+        &format!("/tenant/t1/api/v1/user-groups/{id}"),
         Some(TENANT_TOKEN),
         None,
     )
     .await;
-    assert_eq!(
-        s2, 204,
-        "a repeated delete is an idempotent no-op (204, not 404)"
-    );
+    assert_eq!(s2, 404, "the deleted id is now absent: {v2}");
+    assert_eq!(v2["error"]["code"], "not_found", "got {v2}");
 }
 
-/// A route write upserts by `(sub_tenant_id, model_key)`; a repeated PUT
-/// converges to the same route row, and the route delete is idempotent.
+/// The user upsert is FLAT too: the row id is in the BODY, and the DELETE
+/// removes that immutable id again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_node_local_route_write_upsert_and_idempotent_delete() {
+async fn single_node_local_user_write_upsert_and_delete() {
     let pool = common::setup_pool().await;
     seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let version_before = state.store.version();
     let root = start_proxy(state);
 
-    let (status, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
-    assert_eq!(status, 200, "got {v}");
-    let st_id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
+    let (gs, gv) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-user-parent", "parent").await;
+    assert_eq!(gs, 200, "got {gv}");
+    let group_id = gv["user_group"]["id"]
+        .as_str()
+        .expect("group id")
+        .to_string();
 
-    let route_body = json!({ "sub_tenant_id": st_id, "provider_id": "p1", "model_key": "gpt-4o", "enabled": true });
-    let (r1, rv1) = send_write(
+    let (us, uv) = put_user(
         &root,
-        reqwest::Method::PUT,
-        "/tenant/t1/api/v1/sub-tenant-routes",
-        Some(TENANT_TOKEN),
-        Some(route_body.clone()),
+        "t1",
+        TENANT_TOKEN,
+        "usr-1",
+        group_id.as_str(),
+        "named-user",
     )
     .await;
-    assert_eq!(r1, 200, "got {rv1}");
-    let route_id = rv1["route"]["id"].as_str().expect("id").to_string();
-    assert_eq!(rv1["route"]["model_key"], "gpt-4o");
+    assert_eq!(us, 200, "got {uv}");
+    assert_eq!(uv["user"]["id"].as_str().expect("id"), "usr-1");
+    assert_eq!(uv["user"]["user_group_id"], group_id);
     assert!(
-        rv1["config_version"].as_u64().expect("version") > version_before,
-        "a route write must advance config_version"
+        uv["config_version"].as_u64().expect("version") > version_before,
+        "a user write must advance config_version"
     );
 
-    // Idempotent: a repeated PUT by (sub_tenant_id, model_key) converges.
-    let (r2, rv2) = send_write(
+    let (us2, uv2) = put_user(
         &root,
-        reqwest::Method::PUT,
-        "/tenant/t1/api/v1/sub-tenant-routes",
-        Some(TENANT_TOKEN),
-        Some(route_body),
+        "t1",
+        TENANT_TOKEN,
+        "usr-1",
+        group_id.as_str(),
+        "named-user",
     )
     .await;
-    assert_eq!(r2, 200, "got {rv2}");
+    assert_eq!(us2, 200, "got {uv2}");
     assert_eq!(
-        rv2["route"]["id"].as_str().expect("id"),
-        route_id,
-        "a repeated route PUT by (sub_tenant_id, model_key) converges"
+        uv2["user"]["id"].as_str().expect("id"),
+        "usr-1",
+        "a repeated user PUT with the same id converges"
     );
 
-    // Idempotent delete.
-    let (d1, _) = send_write(
+    let (ds, _) = send_write(
         &root,
         reqwest::Method::DELETE,
-        &format!("/tenant/t1/api/v1/sub-tenant-routes/{route_id}"),
+        "/tenant/t1/api/v1/users/usr-1",
         Some(TENANT_TOKEN),
         None,
     )
     .await;
-    assert_eq!(d1, 204, "first route delete");
-    let (d2, _) = send_write(
+    assert_eq!(ds, 204, "first user delete");
+
+    let (ds2, dv) = send_write(
         &root,
         reqwest::Method::DELETE,
-        &format!("/tenant/t1/api/v1/sub-tenant-routes/{route_id}"),
+        "/tenant/t1/api/v1/users/usr-1",
         Some(TENANT_TOKEN),
         None,
     )
     .await;
-    assert_eq!(d2, 204, "a repeated route delete is an idempotent no-op");
+    assert_eq!(ds2, 404, "the deleted id is now absent: {dv}");
+    assert_eq!(dv["error"]["code"], "not_found", "got {dv}");
 }
 
 /// No credential at all: 401 from the gate (the same gate a read uses).
@@ -1954,9 +1593,9 @@ async fn write_with_no_token_is_401() {
     let (status, v) = send_write(
         &root,
         reqwest::Method::PUT,
-        "/tenant/t1/api/v1/sub-tenants/evil",
+        "/tenant/t1/api/v1/user-groups",
         None,
-        Some(json!({ "key_prefix": "EVIL_" })),
+        Some(json!({ "id": "evil", "name": "evil", "enabled": true })),
     )
     .await;
     assert_eq!(status, 401, "got {v}");
@@ -1975,8 +1614,8 @@ async fn write_with_no_token_is_401() {
 /// drift, i.e. a code/config bug) was actually credential guessing against the
 /// write endpoints. The READ path always set the label before its gate.
 ///
-/// `sub-tenant-route-delete` is the low-cardinality label for
-/// `DELETE /sub-tenant-routes/{id}`; no other test in this binary rejects that
+/// `user-group-delete` is the low-cardinality label for
+/// `DELETE /user-groups/{id}`; no other test in this binary rejects that
 /// route, so the exact `+1` is safe under a parallel test run.
 ///
 /// Falsification: move the assignment back below `run_gate` and this fails with
@@ -1989,23 +1628,22 @@ async fn a_refused_write_is_attributed_to_its_route_not_to_unrouted() {
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state);
 
-    let before = metrics::tenant_api_requests_total("sub-tenant-route-delete", 401);
+    let before = metrics::tenant_api_requests_total("user-group-delete", 401);
     let (status, v) = send_write(
         &root,
         reqwest::Method::DELETE,
-        "/tenant/t1/api/v1/sub-tenant-routes/rt-never-seeded",
+        "/tenant/t1/api/v1/user-groups/never-seeded",
         None,
         None,
     )
     .await;
     assert_eq!(status, 401, "got {v}");
     assert_eq!(v["error"]["code"], "unauthorized", "got {v}");
-    let after = metrics::tenant_api_requests_total("sub-tenant-route-delete", 401);
+    let after = metrics::tenant_api_requests_total("user-group-delete", 401);
     assert_eq!(
         after,
         before + 1.0,
-        "a refused write must be counted under its own route label, not `unrouted` \
-         (before={before}, after={after})"
+        "a refused write must be counted under its own route label, not `unrouted` (before={before}, after={after})"
     );
 }
 
@@ -2017,69 +1655,67 @@ async fn write_url_token_mismatch_is_403() {
     let pool = common::setup_pool().await;
     seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     // t2 only needs a token: the mismatch is decided at the gate, before any
-    // provider check, so no provider/model rows are required for it.
+    // handler statement, so no provider/model rows are required for it.
     seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state);
     let (status, v) = send_write(
         &root,
         reqwest::Method::PUT,
-        "/tenant/t2/api/v1/sub-tenants/evil",
+        "/tenant/t2/api/v1/user-groups",
         Some(TENANT_TOKEN),
-        Some(json!({ "key_prefix": "EVIL_" })),
+        Some(json!({ "id": "evil", "name": "evil", "enabled": true })),
     )
     .await;
     assert_eq!(status, 403, "got {v}");
     assert_eq!(v["error"]["code"], "tenant_id_mismatch", "got {v}");
 }
 
-/// Cross-tenant isolation: `t2`'s token cannot create a sub-tenant under `t1`,
-/// and `t1`'s existing sub-tenant is left intact by the attempt.
+/// Cross-tenant isolation: `t2`'s token cannot create a user-group under `t1`,
+/// and `t1`'s existing row is left intact by the attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_cross_tenant_is_rejected_and_leaves_rows_intact() {
     let pool = common::setup_pool().await;
     seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
     // t2 only needs a token: its write is refused at the gate (403) before any
-    // provider check, so no provider/model rows are required for it.
+    // handler statement, so no provider/model rows are required for it.
     seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state.clone());
 
-    // t1 owns a sub-tenant.
-    let (s, v) = put_sub_tenant(&root, "t1", TENANT_TOKEN, "team-a").await;
+    // t1 owns a user-group.
+    let (s, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-real", "team-a").await;
     assert_eq!(s, 200, "got {v}");
-    let t1_id = v["sub_tenant"]["id"].as_str().expect("id").to_string();
 
     // t2's token cannot write to t1's namespace: 403 (URL cross-check).
     let (s2, v2) = send_write(
         &root,
         reqwest::Method::PUT,
-        "/tenant/t1/api/v1/sub-tenants/evil",
+        "/tenant/t1/api/v1/user-groups",
         Some(OTHER_TOKEN),
-        Some(json!({ "key_prefix": "EVIL_" })),
+        Some(json!({ "id": "evil", "name": "evil", "enabled": true })),
     )
     .await;
-    assert_eq!(s2, 403, "t2 cannot write t1's sub-tenants: {v2}");
+    assert_eq!(s2, 403, "t2 cannot write t1's user-groups: {v2}");
     assert_eq!(v2["error"]["code"], "tenant_id_mismatch", "got {v2}");
 
     // t1's row is untouched by t2's attempt.
     let snap = state.store.snapshot();
     let names: Vec<String> = snap
-        .sub_tenants
+        .user_groups
         .iter()
-        .filter(|s| s.tenant_id == "t1")
-        .map(|s| s.name.clone())
+        .filter(|g| g.tenant_id == "t1")
+        .map(|g| g.name.clone())
         .collect();
     drop(snap);
     assert!(
         names.contains(&"team-a".to_string()),
-        "t1 keeps its sub-tenant"
+        "t1 keeps its user-group"
     );
     assert!(
         !names.contains(&"evil".to_string()),
         "t2's write did not land"
     );
-    let _ = t1_id;
 }
 
 /// A near miss under the reserved prefix is answered with a LOCAL 404 — it must
@@ -2092,19 +1728,18 @@ async fn write_near_miss_is_a_local_404_not_a_fallthrough() {
     let state = build_state(&pool, TenantApiConfig::default()).await;
     let root = start_proxy(state);
     for (method, path) in [
-        // PUT with no name segment (the GET list path, not a write path).
-        (reqwest::Method::PUT, "/tenant/t1/api/v1/sub-tenants"),
-        // PUT with an empty name.
-        (reqwest::Method::PUT, "/tenant/t1/api/v1/sub-tenants/"),
+        // A flat upsert path with an extra segment is not an item route.
+        (reqwest::Method::PUT, "/tenant/t1/api/v1/user-groups/extra"),
+        // A trailing slash on the flat upsert path.
+        (reqwest::Method::PUT, "/tenant/t1/api/v1/user-groups/"),
         // PUT on a made-up resource.
         (reqwest::Method::PUT, "/tenant/t1/api/v1/typo"),
         // DELETE with no id.
-        (reqwest::Method::DELETE, "/tenant/t1/api/v1/sub-tenants/"),
-        // DELETE on a made-up resource.
-        (
-            reqwest::Method::DELETE,
-            "/tenant/t1/api/v1/sub-tenant-routes",
-        ),
+        (reqwest::Method::DELETE, "/tenant/t1/api/v1/user-groups/"),
+        // DELETE with no id segment.
+        (reqwest::Method::DELETE, "/tenant/t1/api/v1/user-groups"),
+        // POST on a user-shaped path that is not the api-key mint route.
+        (reqwest::Method::POST, "/tenant/t1/api/v1/users/extra"),
     ] {
         let (status, v) = send_write(&root, method, path, Some(TENANT_TOKEN), None).await;
         assert_eq!(status, 404, "{path} must be a local 404, got {v}");
