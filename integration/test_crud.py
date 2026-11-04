@@ -30,7 +30,6 @@ edge cases and non-CRUD endpoints covered by the Rust suite:
   Non-CRUD:
     - GET  /api/v1/health      → 200 {status:ok, db:ok}
     - POST /api/v1/reload      → 200 {status:reloaded}
-    - DELETE /api/v1/auth/cache → 200 {invalidated:<int>}
     - GET  /api/v1/breaker     → 200 {dead:[…]}
     - GET  /api/v1/stats/usage → 200 {totals, by_tenant, by_provider} (usage stats)
 
@@ -471,8 +470,8 @@ def test_auth_and_routing() -> None:
 # Non-CRUD endpoints
 # ---------------------------------------------------------------------------
 
-def test_health_reload_authcache_breaker() -> None:
-    print("\n[health/reload/auth-cache/breaker] non-CRUD endpoints")
+def test_health_reload_breaker() -> None:
+    print("\n[health/reload/breaker] non-CRUD endpoints")
 
     # health
     s, j = req("GET", "/api/v1/health", expect=200)
@@ -488,23 +487,6 @@ def test_health_reload_authcache_breaker() -> None:
     if d:
         assert_eq("  reload status", d.get("status"), "reloaded")
         check("  reload returns providers count", "providers" in d)
-
-    # auth cache invalidation (unknown key -> invalidated 0, no error)
-    s, j = req("DELETE", "/api/v1/auth/cache",
-               body={"tenant_id": "it-tenant", "api_keys": ["sk-nonexistent-aaa"]},
-               expect=200)
-    d = as_dict(j)
-    if d:
-        check("  auth/cache invalidated is int",
-              isinstance(d.get("invalidated"), int))
-        check("  auth/cache returns tenant_id", "tenant_id" in d)
-    # Whole-tenant invalidation (no keys)
-    s, j = req("DELETE", "/api/v1/auth/cache",
-               body={"tenant_id": "it-tenant"}, expect=200)
-    d = as_dict(j)
-    if d:
-        check("  auth/cache tenant-only invalidated is int",
-              isinstance(d.get("invalidated"), int))
 
     # breaker inspect -> 200, dead is a list
     s, j = req("GET", "/api/v1/breaker", expect=200)
@@ -582,7 +564,7 @@ def main() -> None:
     test_tenant_providers(provider_body=provider_body(), tenant_body=tenant_body())
     test_tenant_models(tenant_body=tenant_body(), model_key="gpt-4-it")
     test_limit_roles()
-    test_health_reload_authcache_breaker()
+    test_health_reload_breaker()
 
     print()
     total = _passed + _failed

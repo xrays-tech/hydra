@@ -146,19 +146,11 @@ fn as_of_maps_empty_string_and_absent_to_none() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_three_endpoints_parse() {
+fn the_two_flat_read_endpoints_parse() {
     assert_eq!(
         parse_route("/tenant/t1/api/v1/whoami"),
         Some(TenantApiRoute {
             endpoint: Endpoint::Whoami,
-            tenant_id: "t1",
-            user_id: None
-        })
-    );
-    assert_eq!(
-        parse_route("/tenant/t1/api/v1/auth/cache/invalidate"),
-        Some(TenantApiRoute {
-            endpoint: Endpoint::InvalidateAuthCache,
             tenant_id: "t1",
             user_id: None
         })
@@ -207,6 +199,7 @@ fn near_misses_do_not_parse() {
         "/tenant/t1/api/v1/whoami/extra",       // extra segment
         "/tenant/t1/api/v2/whoami",             // wrong version
         "/tenant/t1/api/v1/models",             // not one of ours
+        "/tenant/t1/api/v1/auth/cache",         // the retired write shape
         "/tenant/t1/api/v1/typo",               // typo
         "/tenant/t1/api/v1/Whoami",             // case matters
         "/tenant/t1/api/v1/sub-tenant",         // one char short of `sub-tenants`

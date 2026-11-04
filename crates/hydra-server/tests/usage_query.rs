@@ -22,7 +22,6 @@ use std::time::Duration;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::Tenant;
 use hydra_server::crypto::StaticKeyProvider;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -109,16 +108,8 @@ async fn build_state(
     let store = ConfigStore::load(pool.clone(), kp)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     AppState::for_tests_with_usage(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         Arc::new(NoopSink) as Arc<dyn UsageSink>,

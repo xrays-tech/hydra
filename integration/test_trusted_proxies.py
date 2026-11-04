@@ -109,8 +109,18 @@ def wait_healthy(admin, budget=25.0):
 
 
 def bad_auth(data, xff, token):
+    """A FAILED authentication under a given `X-Forwarded-For`."""
     headers = {"X-Forwarded-For": xff} if xff else {}
-    return post(f"http://127.0.0.1:{data}/tenant/t1/api/v1/auth/cache/invalidate", {}, token=token, headers=headers)
+    headers["Authorization"] = f"Bearer {token}"
+    url = f"http://127.0.0.1:{data}/tenant/t1/api/v1/whoami"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=4) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        e.read()
+        return e.code
+    except Exception:
+        return 0
 
 
 def codes(node, data, xff_for, token_for, count=N):

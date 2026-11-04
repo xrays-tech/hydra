@@ -12,7 +12,7 @@ Legs (only `target/debug/hydra` + node are needed; ports 1875x, no Redis):
   1 configuration: the documented env vars work, and global options may appear
     before OR after the subcommand (README says both);
   2 service commands: health / reload / metrics / concurrency / breaker / stats usage /
-    cluster status / auth-cache invalidate / tenants auth-test — each exits 0;
+    cluster status — each exits 0;
   3 CRUD for all 8 entity groups, each create/list/get/update/delete verified through
     the REST API directly (the CLI's exit code alone is not evidence);
   4 the mapping-only groups refuse `update`, as the README says;
@@ -221,24 +221,6 @@ def main():
         rc, out, _ = run_cli(["stats", "usage", "--json"])
         check("`stats usage --json` prints JSON", rc == 0 and "totals" in json.loads(out),
               f"rc={rc}")
-        rc, out, _ = run_cli(["auth-cache", "invalidate"])
-        check("`auth-cache invalidate` exits 0", rc == 0, f"rc={rc} out={out.strip()[:70]}")
-        rc, out, err = run_cli(["tenants", "auth-test", f"http://127.0.0.1:{AUTH}/auth",
-                                "--tenant-id", "t-cli"])
-        check("`tenants auth-test <url>` reaches the probe and reports a verdict "
-              "(before 2026-09-30 it printed a tenant LIST and exited 0)",
-              rc == 0 and "verdict=" in out and "domain" not in out,
-              f"rc={rc} out={out.strip()[:90]}")
-        rc, out, err = run_cli(["tenants", "auth-test", f"http://127.0.0.1:{AUTH}/auth",
-                                "--tenant-id", "t-cli", "--json"])
-        try:
-            probed = json.loads(out)
-        except Exception:
-            probed = None
-        check("`tenants auth-test --tenant-id ... --json` returns the documented probe result",
-              rc == 0 and isinstance(probed, dict) and probed.get("reachable") is True,
-              f"rc={rc} out={out.strip()[:90]}")
-
         # ---- 4: table output vs --json (both documented) -----------------------
         rc, table_out, _ = run_cli(["providers", "list"])
         rc2, json_out, _ = run_cli(["providers", "list", "--json"])

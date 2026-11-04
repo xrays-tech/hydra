@@ -1,6 +1,6 @@
 //! Per-request context (`RequestContext`) shared across Pingora hooks.
 //!
-//! Holds everything `request_filter` decides (tenant, auth verdict, route
+//! Holds everything `request_filter` decides (tenant, principal, route
 //! candidates, selected provider/key) plus the incremental usage scanner
 //! populated during the response stream-back loop. One `RequestContext` is
 //! created per request via [`crate::proxy::HydraProxy::new_ctx`] and dropped at
@@ -18,7 +18,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hydra_core::auth::AuthVerdict;
 use hydra_core::config::ConfigData;
 use hydra_core::model::{Candidate, RouteError, Tenant, Usage};
 use hydra_core::sse::UsageScanner;
@@ -30,8 +29,8 @@ use crate::proxy::SelectedRoute;
 /// In terminate mode the only hooks that run are `request_filter` (which does
 /// the whole gateway job) and `logging` (which reads back the fields below).
 /// Fields are grouped by the phase that writes them:
-/// - *request_filter*: `tenant`, `client_api_key`, `session_id`, `auth_verdict`, `model_key`,
-///   `candidates`, `route_error`, `trace_id`, `started_at`, `selected`,
+/// - *request_filter*: `tenant`, `client_api_key`, `session_id`, `principal`,
+///   `model_key`, `candidates`, `route_error`, `trace_id`, `started_at`, `selected`,
 ///   `upstream_host`, `upstream_started_at`, `status_code`.
 /// - *request_filter (stream-back)*: `scanner` (mutated per response chunk).
 /// - *logging*: reads `scanner` → `usage`, then emits metrics + the record.
@@ -66,8 +65,6 @@ pub struct RequestContext {
     /// ordering stays pure SWRR. It is a ROUTING hint only: never logged, never
     /// an authorization input.
     pub session_id: Option<String>,
-    /// The external-auth verdict (carries the HTTP status to write back).
-    pub auth_verdict: Option<AuthVerdict>,
     /// `model_key` extracted from the full request body via `memchr` (None ⇒
     /// non-JSON / no-model ⇒ passthrough degenerate forward or 400 reject).
     pub model_key: Option<String>,
@@ -125,7 +122,6 @@ impl RequestContext {
             cfg: None,
             principal: None,
             session_id: None,
-            auth_verdict: None,
             model_key: None,
             candidates: Vec::new(),
             selected: None,

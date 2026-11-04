@@ -154,9 +154,7 @@ def main():
     # ── phase 2: the documented request BODIES ────────────────────────────────
     # Endpoints whose body triggers an OUTBOUND request are skipped: probing them is
     # a different test (and they are slow / non-deterministic).
-    SKIP_BODIES = {
-        ("POST", "/api/v1/tenants/auth/test"): "makes the server call the auth_url",
-    }
+    SKIP_BODIES = {}
     bodies = [(e["method"], e["path"], e["body"]) for e in endpoints if e["body"]]
     checked_bodies = 0
     for method, path, body in bodies:

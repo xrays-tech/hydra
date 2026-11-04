@@ -5,7 +5,6 @@
  *   - T2.1 login with admin token
  *   - T2.2 create provider → list shows it → persisted via /api (DB row exists)
  *   - T2.3 tenant with auth_url + associate provider/model
- *   - T2.4 auth-cache invalidate
  *   - T2.5 breaker reset
  *
  * The suite ASSUMES a running hydra instance (start it with seed.sh first; see
@@ -670,16 +669,6 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  test('T2.4 auth-cache invalidate', async ({ page }) => {
-    await signIn(page);
-    await navItem(page, 'auth-cache').click();
-    await page.fill('#inv-tenant', 't-seed');
-    await page.fill('#inv-keys', 'sk-nonexistent-aaa, sk-nonexistent-bbb');
-    await page.getByRole('button', { name: /Invalidate/ }).click();
-    // No entries match ⇒ invalidated: 0, but no error.
-    await expect(page.locator('#inv-result')).toContainText(/Invalidated 0/);
   });
 
   test('T2.5 breaker view + force reset', async ({ page, request }) => {

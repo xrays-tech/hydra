@@ -2,13 +2,14 @@
 //! set / rotate / clear, the `has_access_token` view, and that the token is
 //! never echoed back.
 //!
-//! The self-service endpoints themselves moved to the **data plane**, where a
-//! tenant can actually reach them without the operator exposing the whole
-//! management API: `POST /tenant/{tenant_id}/api/v1/auth/cache/invalidate` and
-//! friends. Their tests live in `tests/tenant_api.rs` (single node) and
-//! `tests/tenant_api_cluster.rs` (real Redis), and the contract is
+//! The self-service surface lives on the **data plane**, where a tenant can
+//! reach it without the operator exposing the whole management API: the read
+//! endpoints under `/tenant/{tenant_id}/api/v1/`. (The cache-invalidation
+//! endpoint that used to headline that surface was retired with the external-auth
+//! surface, T10 Stage B.) Their tests live in `tests/tenant_api.rs` (single node)
+//! and `tests/tenant_api_cluster.rs` (real Redis), and the contract is
 //! `dev-docs/design-tenant-api.md`. The five tests that used to live here drove
-//! the deleted `POST /api/v1/tenants/{id}/auth/cache/invalidate` route; each of
+//! the old management-plane invalidation route; each of
 //! their assertions is carried by a data-plane test (see the T9 record in
 //! `dev-docs/aegis/plans/2026-09-17-tenant-api.md`), so this file no longer
 //! asserts anything about cache invalidation.
@@ -23,7 +24,6 @@ use std::time::Duration;
 use hydra_core::breaker::BreakerConfig;
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
@@ -45,18 +45,10 @@ async fn admin_state() -> Arc<AdminState> {
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     Arc::new(AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
@@ -230,10 +222,11 @@ async fn tenant_token_too_short_rejected_400() {
 // C16 — the old management-plane tenant route is GONE
 // ---------------------------------------------------------------------------
 
-/// The tenant's self-service endpoint used to live on the management API, at
-/// `POST /api/v1/tenants/{id}/auth/cache/invalidate`, reachable with a TENANT
-/// token through a special branch placed **before** the admin gate. It is now
-/// served on the data plane only.
+/// Both invalidation shapes used to be reachable from here: the tenant self-service
+/// one sat on the management API in a special branch placed **before** the admin
+/// gate, and the operator one was an ordinary admin route. Both are gone (retired
+/// with the external-auth surface, T10 Stage B), so the ADMIN gate is what answers
+/// now — for a tenant token, and an unknown-path 404 for an admin token.
 ///
 /// **Both credentials must be asserted, because only one of them is a
 /// falsification signal** (measured on the router, not assumed):
@@ -241,15 +234,15 @@ async fn tenant_token_too_short_rejected_400() {
 /// | credential | before the deletion | after | is it evidence? |
 /// |---|---|---|---|
 /// | tenant token | `200` (the special branch ran first) | `401` (falls through to the admin gate) | **yes** — 200→401 is the signal |
-/// | admin token | `404` (`parts.len() > 2` refuses the deep path) | `404` | **no** — identical either way |
+/// | admin token | `200` (the operator route ran) | `404` (unknown path) | **yes** — 200→404 is the signal |
 ///
 /// Asserting only the 404 would therefore be a test that can never fail, and
 /// asserting only "404" for the tenant token would be a test that can never pass.
 #[tokio::test]
-async fn the_old_management_plane_tenant_route_is_gone() {
+async fn the_retired_auth_cache_management_shapes_are_gone() {
     let port = start_admin(admin_state().await);
     create_tenant(port, "t-gone", Some(TENANT_TOKEN)).await;
-    let url = format!("http://127.0.0.1:{port}/api/v1/tenants/t-gone/auth/cache/invalidate");
+    let url = format!("http://127.0.0.1:{port}/api/v1/auth/cache");
 
     // (a) The tenant token: 200 while the old route existed, 401 now.
     let r = client()
@@ -269,8 +262,8 @@ async fn the_old_management_plane_tenant_route_is_gone() {
         "it must be the ADMIN gate that refuses it, not a stray route: {body}"
     );
 
-    // (b) The admin token: 404, which proves the path is not an operator
-    //     resource either. Same before and after, so it is a guard, not a signal.
+    // (b) The admin token: 404, which proves the operator route is retired rather
+    //     than merely hidden (it used to answer here).
     let r = client()
         .post(&url)
         .header("authorization", format!("Bearer {TOKEN}"))

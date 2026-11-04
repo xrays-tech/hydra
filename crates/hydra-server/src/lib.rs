@@ -86,7 +86,7 @@ pub mod cluster;
 pub mod redis;
 
 // --- W3: external boundaries ----------------------------------------------
-/// `HttpAuthChecker` (reqwest) + admin `ServeHttp` HTTP helpers.
+/// Upstream-response protocol helpers + admin `ServeHttp` HTTP helpers.
 #[cfg(feature = "http-client")]
 pub mod http;
 /// Tenant self-service API: the reserved `/tenant/` prefix on the DATA-PLANE

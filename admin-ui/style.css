@@ -431,7 +431,7 @@ td.actions .row-actions { display: inline-flex; gap: 4px; }
 .toast .tx:hover { color: var(--text); }
 .toast .tx svg { width: 15px; height: 15px; display: block; }
 
-/* ===================== misc panels (auth-cache / breaker / health) ===================== */
+/* ===================== misc panels (breaker / health) ===================== */
 .field-row { display: flex; gap: 12px; flex-wrap: wrap; }
 .field-row .input-group { flex: 1; min-width: 200px; }
 .note { font-size: 12px; color: var(--muted); margin: 0 0 12px; }

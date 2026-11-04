@@ -47,7 +47,6 @@ use hydra_core::breaker::BreakerConfig;
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto;
 use hydra_server::db;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::{spawn_probe_task, CircuitBreaker};
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::{spawn_gc_task, RateLimiter};
@@ -102,28 +101,6 @@ fn non_route_strategy_from_env() -> Result<hydra_server::proxy::config::NonRoute
                 "HYDRA_NON_ROUTE_STRATEGY={other:?} is not a known strategy (expected \"passthrough\" or \"reject\")"
             )),
         },
-    }
-}
-
-/// `HYDRA_AUTH_ALLOW_TTL_MAX_SECS` (T7, design §4.2.5): the ceiling on an
-/// ALLOW auth-cache TTL, including one the tenant auth service asked for via
-/// `expires_in`. Default 300 s = the default `allow_ttl`, so an unconfigured
-/// deployment is unchanged; the knob only *lowers* what a tenant can ask for.
-///
-/// Deliberately fails startup on a bad value, for the same reason as
-/// `HYDRA_NON_ROUTE_STRATEGY` above: an operator who typed `60` and silently
-/// got 300 would believe a safety bound was in force when it was not.
-fn allow_ttl_max_from_env() -> Result<Duration, String> {
-    let Ok(raw) = std::env::var("HYDRA_AUTH_ALLOW_TTL_MAX_SECS") else {
-        return Ok(Duration::from_secs(
-            hydra_server::http::DEFAULT_ALLOW_TTL_MAX_SECS,
-        ));
-    };
-    match raw.trim().parse::<u64>() {
-        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
-        _ => Err(format!(
-            "HYDRA_AUTH_ALLOW_TTL_MAX_SECS={raw:?} is not a positive integer number of seconds"
-        )),
     }
 }
 
@@ -537,7 +514,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
     // (2c-redis) Cluster Redis backbone (P4): every cluster node (leader AND
     // edge) shares one Redis for the lease, registry, invalidation bus,
-    // shared limits / breaker and the auth-cache L2.
+    // shared limits / breaker.
     #[cfg(feature = "cluster-redis")]
     let redis_backend: Option<hydra_server::redis::RedisBackend> = if role.is_cluster() {
         Some(
@@ -560,28 +537,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // heartbeats into Redis, and edges followed the active leader through it. Retired (ADR-0001
     // T4.1) — membership is the static member list, leadership is raft's, and no node polls a peer.
 
-    // (2c) Auth checker (with the Redis L2 in cluster mode: L1 misses are
-    // served verdicts the cluster already resolved).
-    // T7: the ceiling is read HERE (the single construction site) and applied
-    // to BOTH the cache and the config it is handed, so the value cannot reach
-    // one and miss the other.
-    let auth_config = AuthConfig {
-        allow_ttl_max: allow_ttl_max_from_env().map_err(Box::<dyn std::error::Error>::from)?,
-        ..AuthConfig::default()
-    };
-    let auth_cache_base = AuthCache::new(auth_config.allow_ttl, auth_config.deny_ttl)
-        .with_allow_ttl_max(auth_config.allow_ttl_max);
-    #[cfg(feature = "cluster-redis")]
-    let auth_cache = match &redis_backend {
-        Some(b) => auth_cache_base.with_l2(Arc::new(
-            hydra_server::redis::auth_cache::RedisAuthL2::new(b.pool().clone()),
-        )),
-        None => auth_cache_base,
-    };
-    #[cfg(not(feature = "cluster-redis"))]
-    let auth_cache = auth_cache_base;
-    let auth = Arc::new(HttpAuthChecker::new(auth_cache, auth_config)?);
-    info!("auth checker initialised");
+    // (2c) The external auth checker went with the auth-cache surface (T10 stage
+    // B): client api-keys are decided only against the identity index on the
+    // pinned config snapshot (`decide_api_key`), so there is no cache, no L2
+    // and no upstream verdict to construct here. `redis_backend` stays: the
+    // lease, shared limits, breaker sync and the invalidation bus still need it.
 
     // (2d) The usage backend — ONE call for both halves (ADR-0002).
     //
@@ -799,11 +759,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         proxy_cfg.breaker.probe_interval,
     );
     spawn_gc_task(limiter.clone(), std::time::Duration::from_secs(30));
-    // Auth-cache L1 sweep: `AuthCache::gc` had no caller, so expired verdicts
-    // were never evicted (unbounded memory for rotating keys, and — before the
-    // guard fix in `check` — a permanently available deadlock precondition).
-    hydra_server::http::spawn_gc_task(auth.clone(), std::time::Duration::from_secs(60));
-    let tenant_api_throttle = Arc::new(hydra_server::tenant_api::throttle::Throttle::new());
     let tenant_api_limiter = Arc::new(hydra_server::tenant_api::limit::TenantApiLimiter::new());
     // The tenant API's windows are keyed by source IP (caller-chosen) as well as
     // by tenant, so they MUST be swept: without this the failure map grows with
@@ -812,12 +767,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // constructed above and moved into it below.
     hydra_server::tenant_api::limit::spawn_gc_task(
         tenant_api_limiter.clone(),
-        tenant_api_throttle.clone(),
         std::time::Duration::from_secs(60),
     );
 
     // (2f-redis) Invalidation consumer (P4): every node consumes the
-    // invalidation stream so auth-cache invalidations propagate cluster-wide.
+    // invalidation stream so config invalidations propagate cluster-wide.
     #[cfg(feature = "cluster-redis")]
     let invalidation_stream = if let Some(b) = &redis_backend {
         let stream = hydra_server::cluster::events::InvalidationStream::new(b.pool().clone());
@@ -891,7 +845,9 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             );
         }
     }
-    // The live-node view the tenant API's E2 and `DELETE /api/v1/auth/cache` share. It used to be
+    // The live-node view the admin service's fleet reporting uses. (The tenant
+    // API's own converge-and-confirm consumer of this view was retired with the
+    // external-auth surface.) It used to be
     // refreshed from the registry's heartbeat table; with the registry retired (ADR-0001 T4.1) the
     // honest membership is the CONFIGURED member list, which is what the convergence barrier can
     // verify against (a peer that is down cannot answer, and the barrier's timeout is what
@@ -937,14 +893,12 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
 
     let state = Arc::new(AppState {
         store: store.clone(),
-        auth: auth.clone(),
         breaker: breaker.clone(),
         limiter: limiter.clone(),
         admission: admission.clone(),
         sink,
         proxy: proxy_cfg.clone(),
         tenant_api: tenant_api_cfg.clone(),
-        tenant_api_throttle,
         tenant_api_limiter,
         #[cfg(feature = "cluster-redis")]
         invalidation: invalidation_stream.clone(),
@@ -1000,7 +954,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     Ok(BootstrapComponents {
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         state,
@@ -1024,13 +977,12 @@ struct BootstrapComponents {
     // rather than kept as dead weight that a reader would have to check.
     pool: sqlx::SqlitePool,
     store: ConfigStore,
-    auth: Arc<HttpAuthChecker>,
     breaker: Arc<CircuitBreaker>,
     key_provider: Arc<dyn crypto::KeyProvider>,
     state: Arc<AppState>,
     leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Invalidation bus publisher (cluster P4): handed to the admin service so
-    /// `DELETE /api/v1/auth/cache` broadcasts cluster-wide.
+    /// config invalidation broadcasts cluster-wide.
     #[cfg(feature = "cluster-redis")]
     invalidation_stream: Option<hydra_server::cluster::events::InvalidationStream>,
     #[cfg(not(feature = "cluster-redis"))]
@@ -1271,7 +1223,6 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     let mut admin_state = AdminState::new(
         c.pool,
         c.store,
-        c.auth,
         c.breaker,
         c.key_provider.clone(),
         admin_token.clone(),
@@ -1282,14 +1233,14 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         // which for a primary leader candidate points at this node itself.
         c.leader_ready,
     );
-    // Invalidation bus publisher (P4): admin auth-cache invalidations are
+    // Invalidation bus publisher (P4): admin config invalidations are
     // broadcast cluster-wide, not just applied locally.
     #[cfg(feature = "cluster-redis")]
     {
         admin_state.invalidation = c.invalidation_stream;
     }
-    // The same live-node view and convergence budget the tenant API got, so
-    // `DELETE /api/v1/auth/cache` can report the fleet honestly (and so the two
+    // The live-node view and convergence budget the admin service reports
+    // against, so it can answer fleet questions honestly (and so the two
     // entry points cannot disagree about what "applied" means).
     #[cfg(feature = "cluster-redis")]
     let admin_state = match c.fleet_live {

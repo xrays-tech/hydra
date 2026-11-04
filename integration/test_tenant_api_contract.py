@@ -15,8 +15,7 @@ header, the identity rules, idempotency and the parameter validation. Round 88 p
   §4.4 read endpoints accept ONLY their one method (else 405), while the WRITE paths answer
        404 for a wrong method (they are method-sensitive) — and anything else under the
        reserved prefix is 404, answered locally
-  §4.5 repeated `invalidate` is safe (`invalidated` drops to 0, not an error); repeated PUT
-       converges on the SAME immutable id; DELETE of a missing id is a no-op (204)
+  §4.5 repeated PUT converges on the SAME immutable id; DELETE of a missing id is a no-op (204)
   §5.3/§5.6 parameter validation: missing `since` / unknown `group_by` / a too-wide window
        are the documented 400s, and the write endpoints answer the documented shapes
 
@@ -263,7 +262,6 @@ def main():
             ("POST", "/sub-tenant-routes", 405, "that path is ALSO the read route (GET only)"),
             ("DELETE", "/sub-tenant-routes", 404, "the delete shape is /sub-tenant-routes/{id}"),
             ("PUT", "/sub-tenants", 404, "the write shape is /sub-tenants/{name}"),
-            ("GET", "/auth/cache/invalidate", 405, "that path is the read route (POST only)"),
         ):
             st, _, text = tenant(method, path, body={} if method == "POST" else None)
             check(f"§4.4: {method} {path} -> {want} ({why})", st == want, f"HTTP {st} {text[:60]}")
@@ -272,20 +270,6 @@ def main():
         st, hdrs, text = tenant("GET", "/not-a-documented-route")
         envelope_ok(st, hdrs, text, "not_found", "§4.4 unknown path under the reserved prefix")
         check("§4.4: ...and it is 404", st == 404, f"HTTP {st}")
-
-        # ---- §4.5 idempotency: invalidate ---------------------------------------
-        st1, _, t1 = tenant("POST", "/auth/cache/invalidate")
-        st2, _, t2 = tenant("POST", "/auth/cache/invalidate")
-        try:
-            first = json.loads(t1)["invalidated"]
-            second = json.loads(t2)["invalidated"]
-        except Exception:
-            first = second = None
-        announce("§4.5 repeated invalidate", f"invalidated={first} then {second}")
-        check("§4.5: repeating the invalidation is safe (200 twice)",
-              st1 == 200 and st2 == 200, f"{st1}/{st2}")
-        check("§4.5: ...and the second one reports 0 removed, which is NOT an error",
-              isinstance(second, int) and second == 0, f"second={second}")
 
         # ---- §4.5/§5.6 the write endpoints -------------------------------------
         st, _, text = tenant("PUT", "/sub-tenants/QQ", body={"key_prefix": "QQCX_", "enabled": True})

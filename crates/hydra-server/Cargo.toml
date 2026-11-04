@@ -139,8 +139,8 @@ usage-clickhouse = ["dep:base64"]
 # Not a delivered backend: see `dev-docs/usage-backends.md`.
 usage-tdengine = []
 
-# Redis backbone (cluster P2+): leader lease, shared rate limits / breaker,
-# auth-cache L2 and the invalidation stream all ride one Redis. Opt-in so the
+# Redis backbone (cluster P2+): leader lease, shared rate limits / breaker
+# and the invalidation stream all ride one Redis. Opt-in so the
 # default single-node build keeps zero external deps. `fred` is the fixed
 # client choice (v8 plan Q8): full single/sentinel/cluster/streams/Lua
 # support; `mocks` powers in-process command-level test doubles; `i-scripts`

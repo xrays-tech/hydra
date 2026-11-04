@@ -151,7 +151,6 @@ pub fn normalize_as_of(raw: Option<&str>) -> Option<String> {
 #[serde(rename_all = "snake_case")]
 pub enum Endpoint {
     Whoami,
-    InvalidateAuthCache,
     Usage,
     /// `GET /sub-tenants` — the tenant's own sub-tenants (read-only, snapshot-fed).
     ListSubTenants,
@@ -201,7 +200,6 @@ pub fn parse_route<'a>(path: &'a str) -> Option<TenantApiRoute<'a>> {
     // route keeps `None`, so the flat routes still resolve exactly as before.
     let (endpoint, user_id): (Endpoint, Option<&'a str>) = match suffix {
         "api/v1/whoami" => (Endpoint::Whoami, None),
-        "api/v1/auth/cache/invalidate" => (Endpoint::InvalidateAuthCache, None),
         "api/v1/usage" => (Endpoint::Usage, None),
         // Read-only, flat paths matching the admin resource shape (T6). Both are
         // list endpoints owned by the tenant in the URL; the item id is never

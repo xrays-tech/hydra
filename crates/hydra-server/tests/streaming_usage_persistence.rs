@@ -29,7 +29,6 @@ use hydra_core::model::{
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -276,20 +275,12 @@ async fn build_state_with_recording_sink(
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = std::sync::Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = std::sync::Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = std::sync::Arc::new(RateLimiter::new());
     let recording = RecordingSink::default();
     let sink: std::sync::Arc<dyn UsageSink> = std::sync::Arc::new(recording.clone());
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         sink,

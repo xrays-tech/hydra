@@ -7,7 +7,6 @@
 //! `.github/workflows/ci.yml`; this test mirrors it locally so
 //! `cargo test -p hydra-core` fails fast if a forbidden dep leaks in.
 
-use hydra_core::auth::{AuthVerdict, CacheSource, Verdict};
 use hydra_core::breaker::BreakerView;
 use hydra_core::config::{CertMeta, ConcurrencyPolicy, ConfigData, ModelProvider};
 use hydra_core::limit::MatchCtx;
@@ -79,10 +78,6 @@ fn public_types_are_send_sync() {
     assert_send_sync::<SwrrState>();
     assert_send_sync::<EndpointUrl>();
     assert_send_sync::<MatchCtx<'static>>();
-
-    assert_send_sync::<Verdict>();
-    assert_send_sync::<CacheSource>();
-    assert_send_sync::<AuthVerdict>();
 
     // The breaker trait object must be usable across threads (the server holds
     // it behind `Arc<CircuitBreaker>`).

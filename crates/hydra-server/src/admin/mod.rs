@@ -37,7 +37,6 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::crypto::KeyProvider;
-use crate::http::HttpAuthChecker;
 use crate::proxy::admission::AdmissionControl;
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::store::ConfigStore;
@@ -205,7 +204,6 @@ pub struct AdminState {
     /// longer carries an `expect` that could only fire on a node that cannot exist.
     pub pool: SqlitePool,
     pub store: ConfigStore,
-    pub auth: Arc<HttpAuthChecker>,
     pub breaker: Arc<CircuitBreaker>,
     /// Master-key provider for sealing/opening provider upstream api-keys
     /// (design §16.2). Every `db::insert/get/list_provider_key[s]` call threads
@@ -270,9 +268,9 @@ pub struct AdminState {
     pub auth_fail_throttle: Arc<crate::tenant_api::throttle::Throttle>,
     /// See [`admin_auth_fail_limit_per_min_from_env`].
     pub auth_fail_per_min: u32,
-    /// Invalidation-stream publisher (cluster P4): `DELETE /api/v1/auth/cache`
-    /// broadcasts the invalidation cluster-wide instead of clearing only the
-    /// local cache. `None` off-cluster / on the single-node build.
+    /// Invalidation-stream publisher (cluster P4): publishes cache invalidations
+    /// cluster-wide instead of only affecting local state. `None` off-cluster /
+    /// on the single-node build.
     #[cfg(feature = "cluster-redis")]
     pub invalidation: Option<crate::cluster::events::InvalidationStream>,
     /// Placeholder so single-node builds keep a uniform shape.
@@ -280,7 +278,7 @@ pub struct AdminState {
     #[allow(dead_code)]
     pub invalidation: Option<()>,
     /// The ids of the LIVE data-plane nodes, or `None` when this process did
-    /// not inject them. Used by `DELETE /api/v1/auth/cache` to WAIT for the
+    /// not inject them. Used by invalidation/fleet reporting to WAIT for the
     /// fleet to confirm an invalidation instead of reporting a boolean that
     /// could not be false.
     ///
@@ -291,7 +289,7 @@ pub struct AdminState {
     /// so the operator's report and a tenant's report cannot disagree.
     #[cfg(feature = "cluster-redis")]
     pub live_nodes: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
-    /// How long `DELETE /api/v1/auth/cache` waits for confirmation.
+    /// How long invalidation/fleet reporting waits for confirmation.
     #[cfg(feature = "cluster-redis")]
     pub converge_timeout: std::time::Duration,
     /// The CONFIGURED member list (ADR-0001): the fleet, as far as any single node can know it.
@@ -329,7 +327,6 @@ impl AdminState {
     pub fn new(
         pool: SqlitePool,
         store: ConfigStore,
-        auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
@@ -339,7 +336,6 @@ impl AdminState {
         Self {
             pool,
             store,
-            auth,
             breaker,
             key_provider,
             admin_token,
@@ -373,8 +369,8 @@ impl AdminState {
         }
     }
 
-    /// Inject the live-node view and the convergence budget for
-    /// `DELETE /api/v1/auth/cache` (cluster mode).
+    /// Inject the live-node view and the convergence budget for the admin
+    /// service's fleet-confirmed writes (cluster mode).
     #[cfg(feature = "cluster-redis")]
     #[must_use]
     pub fn with_fleet(
@@ -500,10 +496,9 @@ impl AdminService {
                 .unwrap_or(false);
             return cluster_api::reload(&self.state, force, trace_id).await;
         }
-        // Auth cache invalidation.
-        if parts == ["auth", "cache"] && method == "DELETE" {
-            return handlers::auth_cache_invalidate(&self.state, session, trace_id).await;
-        }
+        // Auth cache invalidation was HERE (`DELETE /api/v1/auth/cache`). It is retired with
+        // the external auth-cache surface, so requests to that path now fall through to the
+        // unknown-path 404 below.
         // Breaker inspect / reset.
         if parts == ["breaker"] && method == "GET" {
             return handlers::breaker_list(&self.state);
@@ -535,13 +530,9 @@ impl AdminService {
         if parts == ["cluster", "status"] && method == "GET" {
             return cluster_api::cluster_status(&self.state, trace_id).await;
         }
-        // Tenant auth-url probe (Admin UI "Test" button on the Tenants form):
-        // POSTs a simulated auth request to the given auth_url and reports
-        // reachability / protocol / verdict. Non-mutating (no DB write), but
-        // POST so it carries the URL in the body.
-        if parts == ["tenants", "auth", "test"] && method == "POST" {
-            return handlers::tenant_auth_test(&self.state, session, trace_id).await;
-        }
+        // The tenant auth-url probe used to be served here. It was retired with
+        // the external auth surface (T10 Stage B); `tenant.auth_url` remains a stored
+        // tenant field, but there is no admin probe route for it now.
         // Tenant model catalog (design-tenant-model-catalog §2.3, P1): GET
         // /api/v1/tenants/{tenant_id}/models — read-only aggregate over the
         // config snapshot (static full-set view with per-provider online

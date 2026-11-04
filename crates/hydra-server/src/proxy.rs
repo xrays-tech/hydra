@@ -56,7 +56,6 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use hydra_core::apikey::{extract_client_key, ClientKeyInput, KeyExtraction};
-use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::{extract_model_field, ModelField};
 use hydra_core::identity::{decide_api_key, AuthDecision};
@@ -75,8 +74,6 @@ use pingora_proxy::{ProxyHttp, Session};
 use rand::seq::SliceRandom;
 use tracing::{debug, info, warn};
 
-#[allow(unused_imports)]
-use crate::http::{AuthChecker, HttpAuthChecker};
 use crate::proxy::admission::{AdmissionControl, AdmissionError};
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::proxy::config::ProxyConfig;
@@ -113,10 +110,6 @@ pub struct SelectedRoute {
 pub struct AppState {
     /// Hot-reload config centre (`ArcSwap<ConfigData>` + SWRR state map).
     pub store: ConfigStore,
-    /// External auth boundary (W3 `HttpAuthChecker` held concretely — its
-    /// `check` returns an RPITIT future which is not dyn-compatible, so we
-    /// hold the concrete production impl and call it directly).
-    pub auth: Arc<HttpAuthChecker>,
     /// Concurrent circuit breaker (feeds `router::resolve` via `BreakerView`).
     pub breaker: Arc<CircuitBreaker>,
     /// Rate limiter (in-memory on single node; Redis-backed in cluster, P4).
@@ -134,11 +127,6 @@ pub struct AppState {
     /// Tenant API runtime configuration. See [`crate::tenant_api`].
     #[cfg(feature = "proxy")]
     pub tenant_api: crate::tenant_api::TenantApiConfig,
-
-    /// Per-tenant rate window for `POST /auth/cache/invalidate`. State, not
-    /// configuration — which is why it is not inside `TenantApiConfig`.
-    #[cfg(feature = "proxy")]
-    pub tenant_api_throttle: Arc<crate::tenant_api::throttle::Throttle>,
 
     /// Admission control for the whole tenant API: the per-tenant success budget,
     /// the per-IP / per-token-digest failure budgets and the lockout state.
@@ -182,7 +170,6 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn for_tests(
         store: ConfigStore,
-        auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
         limiter: Arc<dyn crate::proxy::limiter::Limiter>,
         sink: Arc<dyn UsageSink>,
@@ -197,7 +184,6 @@ impl AppState {
         let usage: Option<Arc<dyn crate::usage::query::UsageQuery>> = None;
         Self::for_tests_with_usage(
             store,
-            auth,
             breaker,
             limiter,
             sink,
@@ -220,7 +206,6 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn for_tests_with_usage(
         store: ConfigStore,
-        auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
         limiter: Arc<dyn crate::proxy::limiter::Limiter>,
         sink: Arc<dyn UsageSink>,
@@ -230,14 +215,12 @@ impl AppState {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            auth,
             breaker,
             limiter,
             admission: crate::proxy::admission::AdmissionControl::new(),
             sink,
             proxy,
             tenant_api,
-            tenant_api_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             tenant_api_limiter: Arc::new(crate::tenant_api::limit::TenantApiLimiter::new()),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
@@ -430,9 +413,6 @@ impl HydraProxy {
         match decision {
             AuthDecision::Allow => {
                 crate::admin::metrics::record_auth_decision(&tenant.id, "allowed", "internal");
-                ctx.auth_verdict = Some(AuthVerdict::Allowed {
-                    source: CacheSource::Local,
-                });
                 ctx.principal = identity.map(|id| id.principal.clone());
                 Ok(false)
             }
@@ -701,7 +681,8 @@ impl ProxyHttp for HydraProxy {
         };
         ctx.client_api_key = Some(api_key.clone());
 
-        // (4) External auth (§6.3 §4 / §11). Cache-first via AuthChecker.
+        // (4) Internal api-key auth (§6.3 §4 / §11): the identity index on the
+        //     pinned config snapshot, via `decide_api_key`.
         if self.enforce_auth(session, ctx, &tenant, &api_key).await? {
             return Ok(true);
         }
@@ -2022,11 +2003,6 @@ fn pingora_err<S: Into<String>>(msg: S) -> Box<PingoraError> {
 /// (which has no chrono dependency). Second precision matches the sink schema.
 fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
-#[allow(dead_code)]
-fn _unused_cache_source_marker() -> CacheSource {
-    CacheSource::Local
 }
 
 // ---------------------------------------------------------------------------

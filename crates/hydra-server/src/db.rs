@@ -1047,14 +1047,14 @@ pub async fn update_tenant_cert(
 }
 
 // ---------------------------------------------------------------------------
-// Tenant access token (migration 0009, self-service auth-cache invalidation)
+// Tenant access token (migration 0009, the tenant self-service credential)
 // ---------------------------------------------------------------------------
 //
 // The tenant self-service credential is stored as a SHA-256 hex HASH only —
 // one-way, never echoed, never recoverable (lost token => rotate via the
 // admin API / UI). It is compared, never used for outbound calls, so a hash
-// is the correct primitive (same reasoning as the AuthCache's api-key
-// digests).
+// is the correct primitive (same reasoning as the api-key digests the
+// limiter keys on).
 
 /// Set (or clear, `None`) a tenant's access-token hash.
 pub async fn set_tenant_access_token_hash(

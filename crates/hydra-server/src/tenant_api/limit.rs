@@ -3,19 +3,18 @@
 //!
 //! ## Why the data-plane listener needs this and the admin one did not
 //!
-//! `POST /api/v1/tenants/{id}/auth/cache/invalidate` used to sit on the
-//! management port, which binds `127.0.0.1` by default and is behind a token an
-//! operator chose. The data plane is internet-facing and its credential is a
-//! tenant's own access token, so two things that were merely theoretical become
-//! live (design §5.1):
+//! The management port binds `127.0.0.1` by default and is behind a token an
+//! operator chose; the data plane is internet-facing and its credential is a
+//! tenant's own access token, so two things that were merely theoretical on the
+//! management port become live here (design §5.1):
 //!
 //! - **token guessing**: an unauthenticated caller can drive the gate as fast as
 //!   it can open connections. The gate itself is now zero-I/O (it reads the
 //!   config snapshot), so the cost per attempt is small — but "small" times
 //!   "unbounded" is still an amplifier, and a guess that succeeds is a
 //!   cross-tenant compromise.
-//! - **resource amplification**: each successful `invalidate` fans out to every
-//!   node and sends every affected client back to the tenant's `auth_url`. One
+//! - **resource amplification**: an accepted write is a database write plus a
+//!   cluster event, and the read endpoints answer from the usage backends. One
 //!   tenant's credential must not be able to spend other tenants' availability.
 //!
 //! ## Three dimensions, two budgets
@@ -239,14 +238,10 @@ pub const GC_IDLE: Duration = Duration::from_secs(120);
 /// the last `GC_IDLE`", which is proportional to the attack's own rate rather
 /// than to its total volume.
 ///
-/// Same shape as `proxy::limiter::spawn_gc_task` and `http::spawn_gc_task`: one
-/// background task per process, driven by an interval, with the clock read once
-/// per tick so every map is swept against the same `now`.
-pub fn spawn_gc_task(
-    limiter: std::sync::Arc<TenantApiLimiter>,
-    invalidate_throttle: std::sync::Arc<super::throttle::Throttle>,
-    interval: Duration,
-) {
+/// Same shape as `proxy::limiter::spawn_gc_task`: one background task per
+/// process, driven by an interval, with the clock read once per tick so every
+/// map is swept against the same `now`.
+pub fn spawn_gc_task(limiter: std::sync::Arc<TenantApiLimiter>, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // The first tick completes immediately; drop it so the first sweep is a
@@ -255,7 +250,7 @@ pub fn spawn_gc_task(
         loop {
             ticker.tick().await;
             let now = Instant::now();
-            let dropped = limiter.gc(GC_IDLE, now) + invalidate_throttle.gc(GC_IDLE, now);
+            let dropped = limiter.gc(GC_IDLE, now);
             if dropped > 0 {
                 tracing::debug!(
                     target: "hydra::tenant_api",
@@ -268,8 +263,8 @@ pub fn spawn_gc_task(
 }
 
 /// SHA-256 hex of a presented token, for use as a limiter key. Owned here so the
-/// limiter never sees a plaintext token (the same shared helper the L1/L2 auth
-/// cache keys use).
+/// limiter never sees a plaintext token (the same digest the tenant gate compares
+/// against `tenant.access_token_hash`).
 #[must_use]
 pub fn token_digest(token: &str) -> String {
     hydra_core::auth::sha256_hex_string(token.as_bytes())

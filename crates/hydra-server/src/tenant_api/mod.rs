@@ -34,8 +34,8 @@
 //! ## What this module owns
 //!
 //! Routing, the gate, and the response shape. Business logic is delegated: the
-//! cache primitives to [`crate::http::AuthCache`], cache-clearing fan-out and its
-//! convergence barrier to [`crate::cluster::events::InvalidationStream`], and
+//! cache primitives to [`crate::http`] (protocol helpers), cluster event fan-out and
+//! its convergence barrier to [`crate::cluster::events::InvalidationStream`], and
 //! usage reads to [`crate::usage::query::UsageQuery`]. The interception in
 //! `proxy::request_filter` is one call into [`dispatch`].
 
@@ -111,8 +111,10 @@ pub struct TenantApiConfig {
     /// does not intercept anything under `/tenant/` and the process behaves
     /// exactly as it did before this API existed.
     pub enabled: bool,
-    /// How long `POST /auth/cache/invalidate` waits for the fleet to confirm.
-    /// Elapsing is not an error — it produces `202` with the lagging nodes named.
+    /// The fleet-converge wait budget (`HYDRA_TENANT_API_CONVERGE_TIMEOUT_MS`).
+    /// `main` feeds it to the surviving convergence consumers (the admin plane's
+    /// fleet view). Elapsing is not an error — it produces `202` with the lagging
+    /// nodes named.
     pub converge_timeout: std::time::Duration,
     /// Cap on AUTHORISED requests per tenant per minute (design §5.1),
     /// `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN`. This is the amplification budget:
@@ -127,12 +129,6 @@ pub struct TenantApiConfig {
     /// How long a dimension stays locked once it exceeds its failure budget
     /// (`HYDRA_TENANT_API_LOCKOUT_SECS`).
     pub lockout_secs: u64,
-    /// Cap on invalidations per tenant per minute. Each one costs the auth-cache
-    /// fan-out, an upstream re-verification wave on every affected node, and — if
-    /// the stream is trimmed past a lagging consumer — a fleet-wide whole-cache
-    /// clear. That is too much power to hand a single tenant's credential without
-    /// a ceiling.
-    pub invalidate_per_min: u32,
     /// Ceiling on the E3 window, in days
     /// (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`, default 31).
     ///
@@ -195,7 +191,6 @@ impl std::fmt::Debug for TenantApiConfig {
         f.debug_struct("TenantApiConfig")
             .field("enabled", &self.enabled)
             .field("converge_timeout", &self.converge_timeout)
-            .field("invalidate_per_min", &self.invalidate_per_min)
             .field("rate_limit_per_min", &self.rate_limit_per_min)
             .field("auth_fail_limit_per_min", &self.auth_fail_limit_per_min)
             .field("lockout_secs", &self.lockout_secs)
@@ -220,7 +215,6 @@ impl Default for TenantApiConfig {
             rate_limit_per_min: 60,
             auth_fail_limit_per_min: 10,
             lockout_secs: 900,
-            invalidate_per_min: 10,
             usage_max_window_days: time_bound::DEFAULT_USAGE_MAX_WINDOW_DAYS,
             max_user_api_keys_per_tenant: DEFAULT_MAX_USER_API_KEYS_PER_TENANT,
             max_users_per_tenant: DEFAULT_MAX_USERS_PER_TENANT,
@@ -260,7 +254,6 @@ impl TenantApiConfig {
         let auth_fail_limit_per_min =
             env_positive_u32("HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN", 10);
         let lockout_secs = u64::from(env_positive_u32("HYDRA_TENANT_API_LOCKOUT_SECS", 900));
-        let invalidate_per_min = env_positive_u32("HYDRA_TENANT_API_INVALIDATE_PER_MIN", 10);
         // A missing, unparseable or zero value falls back to the default: 0
         // would reject every request, which is a denial of service triggered by
         // a typo.
@@ -290,7 +283,6 @@ impl TenantApiConfig {
             rate_limit_per_min,
             auth_fail_limit_per_min,
             lockout_secs,
-            invalidate_per_min,
             usage_max_window_days,
             max_user_api_keys_per_tenant,
             max_users_per_tenant,
@@ -382,7 +374,6 @@ pub async fn dispatch(
     // than threaded through the four writers, which would change every call site.
     ctx.tenant_api_endpoint = Some(match route.endpoint {
         Endpoint::Whoami => "whoami",
-        Endpoint::InvalidateAuthCache => "invalidate",
         Endpoint::Usage => "usage",
         Endpoint::ListSubTenants => "sub-tenants",
         Endpoint::ListSubTenantRoutes => "sub-tenant-routes",
@@ -396,9 +387,9 @@ pub async fn dispatch(
         Endpoint::ListUserApiKeys => "user-api-keys",
     });
 
-    // 2b. Method. `POST /auth/cache/invalidate` must not be reachable by GET:
+    // 2b. Method. A write-shaped endpoint must not be reachable by GET:
     //     a method-agnostic handler would let a prefetching client, a
-    //     mis-configured health check or a browser address bar clear caches.
+    //     mis-configured health check or a browser address bar trigger writes.
     //     The method contract belongs to ROUTING, not to each handler, so it is
     //     checked once here.
     let expected = match route.endpoint {
@@ -409,7 +400,6 @@ pub async fn dispatch(
         | Endpoint::ListUserGroups
         | Endpoint::ListUsers
         | Endpoint::ListUserApiKeys => "GET",
-        Endpoint::InvalidateAuthCache => "POST",
     };
     if method != expected {
         return respond_error(
@@ -445,9 +435,6 @@ pub async fn dispatch(
         // Answered from the row the gate already resolved: no second lookup, so
         // there is nothing that could disagree with the authorisation.
         Endpoint::Whoami => handlers::whoami(session, ctx, &authenticated).await,
-        Endpoint::InvalidateAuthCache => {
-            handlers::invalidate(state, session, ctx, &authenticated).await
-        }
         Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
         // Read-only, snapshot-fed: no DB, no upstream — an edge serves them
         // exactly like `whoami`.

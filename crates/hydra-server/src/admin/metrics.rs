@@ -17,19 +17,15 @@
 //! | `hydra_tokens_total` | counter | tenant, provider, model, kind | proxy `logging` |
 //! | `hydra_auth_decisions_total` | counter | tenant, verdict, source | proxy `request_filter` |
 //! | `hydra_auth_upstream_error_total` | counter | tenant | proxy `request_filter` |
-//! | `hydra_auth_allow_ttl_capped_total` | counter | tenant | `http::AuthCache::set` |
 //! | `hydra_tenant_api_usage_query_total` | counter | source, group_by, result | `tenant_api::handlers::usage` |
 //! | `hydra_tenant_api_usage_query_seconds` | histogram | source | `tenant_api::handlers::usage` |
 //! | `hydra_tenant_api_requests_total` | counter | endpoint, status | `tenant_api` response writers |
 //! | `hydra_tenant_api_auth_failures_total` | counter | reason | `tenant_api::dispatch` gate |
 //! | `hydra_tenant_api_auth_latency_seconds` | histogram | — | `tenant_api::dispatch` gate |
 //! | `hydra_tenant_api_throttled_total` | counter | scope | `tenant_api::limit` |
-//! | `hydra_tenant_api_invalidate_pending_total` | counter | — | `tenant_api::handlers::invalidate` (202) |
-//! | `hydra_tenant_api_invalidate_converge_seconds` | histogram | result | `tenant_api::handlers::invalidate` |
 //! | `hydra_invalidation_consumer_applied_id` | gauge | node | `cluster::events` consumer |
 //! | `hydra_invalidation_consumer_lag_events` | gauge | node | `cluster::events` consumer |
 //! | `hydra_invalidation_consumer_stalled_seconds` | gauge | node | `cluster::events` consumer (**the alerting signal**) |
-//! | `hydra_auth_cache_size` | gauge | — | proxy `request_filter` |
 //! | `hydra_breaker_dead` | gauge | provider | breaker transitions |
 //! | `hydra_breaker_state_transitions_total` | counter | provider, to | breaker `on_failure`/`on_success` |
 //! | `hydra_limit_rejected_total` | counter | tenant, role, dim | proxy `request_filter` (429). **`dim` is `count` or `tokens`** (measured 2026-09-30: the plural is the real value, so a rule written on `dim="token"` would never fire) |
@@ -55,14 +51,13 @@
 //! | `hydra_upstream_first_byte_timeout_total` | counter | provider | proxy send path (upstream accepted, then sent no headers within the bound) |
 //! | `hydra_upstream_stream_idle_timeout_total` | counter | provider | proxy stream path (upstream sent headers, then no body byte within the idle bound) |
 //! | `hydra_invalidation_trimmed_total` | counter | — | invalidation stream trim task (entries dropped; whether or not a bump was needed) |
-//! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ every node clears its auth cache) |
+//! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ consumers must treat old cached state as unsafe) |
 //! | `hydra_replica_materialize_retries_total` | counter | outcome | replica materialization passes (attempt\|succeeded\|failed\|throttled) — `main.rs`'s convergence loop |
 //! | `hydra_arachne_this_node_leader` | gauge | — | raft `ArachneControl` leader watch (1 = this node is the writer) |
 //! | `hydra_arachne_leader_flips_total` | counter | — | raft `ArachneControl` leader watch (a change of answer) |
 //! | `hydra_arachne_publish_total` | counter | result | `ArachneConfigStore::publish` + `ConfigPublisher` (ok\|not_leader\|quorum_unavailable\|error\|refused) |
 //! | `hydra_arachne_config_bytes` | gauge | — | bytes in the tree the last publish committed (`ArachneConfigStore::publish`) |
 //! | `hydra_arachne_quorum_unavailable_total` | counter | op | raft operation that failed because no majority was reachable (publish\|read) |
-//! | `hydra_auth_cache_clear_total` | counter | layer,result | whole-cache clears (layer=l1|l2, result=ok|partial|error) |
 //! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
@@ -96,8 +91,6 @@ struct Metrics {
     tokens: IntCounterVec,
     auth_decisions: IntCounterVec,
     auth_upstream_error: IntCounterVec,
-    /// Allow writes whose TTL was clamped to `allow_ttl_max` (T7).
-    allow_ttl_capped: IntCounterVec,
     /// E3 usage reads, by store / grouping / outcome (`result` includes
     /// `decode_error`, which the tenant sees only as "unavailable").
     tenant_api_usage_query: IntCounterVec,
@@ -117,18 +110,12 @@ struct Metrics {
     tenant_api_auth_latency: Histogram,
     /// Requests the tenant-API limiters refused, by dimension.
     tenant_api_throttled: IntCounterVec,
-    /// E2 answers that were `202` — published but not confirmed everywhere.
-    /// Persistently non-zero means some node is not consuming the stream.
-    tenant_api_invalidate_pending: IntCounter,
-    /// How long the convergence barrier took, by outcome.
-    tenant_api_invalidate_converge: HistogramVec,
     /// Per-node consumer watermark (the barrier's data source), and how long it
     /// has been standing still.
     invalidation_consumer_applied_id: IntGaugeVec,
     invalidation_consumer_lag_events: IntGaugeVec,
     invalidation_consumer_stalled_seconds: IntGaugeVec,
     catalog_requests: IntCounterVec,
-    auth_cache_size: IntGauge,
     breaker_dead: IntGaugeVec,
     breaker_transitions: IntCounterVec,
     limit_rejected: IntCounterVec,
@@ -181,22 +168,17 @@ struct Metrics {
     /// Replica materialization retries by outcome. `failed` non-zero with
     /// `throttled` growing means a node that cannot materialize (and therefore
     /// cannot lead) — the state that used to be both permanent and invisible.
-    /// Whole-cache auth-cache clears, by layer and result. A `partial`/`error`
-    /// on the L2 is the state that leaves revoked keys served until their allow
-    /// TTL expires — previously only a `warn!` line, while
-    /// `hydra_auth_cache_size` was set to 0 and claimed the cache was empty.
     /// Failed admin-token attempts by outcome. Before this existed the admin
     /// gate had no counter at all and logged at `debug!` (filtered out at the
     /// shipped `RUST_LOG=info`), so a brute-force run against the single secret
     /// gating every provider key was completely invisible.
     admin_auth_failures: IntCounterVec,
-    auth_cache_clears: IntCounterVec,
     replica_materialize_retries: IntCounterVec,
     invalidation_trimmed: IntCounter,
     /// Trims that dropped an entry a LIVE consumer had not applied. Each one
-    /// makes every node clear its whole auth cache (L1+L2), so a non-zero rate
-    /// here means real convergence loss — or an event rate above
-    /// `maxlen / trim_interval` with a consumer that cannot keep up.
+    /// means consumers must treat cached state derived from the stream tail as
+    /// unsafe, so a non-zero rate here means real convergence loss — or an event
+    /// rate above `maxlen / trim_interval` with a consumer that cannot keep up.
     invalidation_generation_bumps: IntCounter,
     /// Session-affinity (T7b, plan §3.4 step 4) provider selections: a routed
     /// request whose provider choice was pinned by its session header instead
@@ -330,12 +312,6 @@ fn metrics() -> Option<&'static Metrics> {
                 &["tenant"]
             )
             .ok()?,
-            allow_ttl_capped: register_int_counter_vec!(
-                "hydra_auth_allow_ttl_capped_total",
-                "Allow verdicts whose TTL was clamped to the configured maximum",
-                &["tenant"]
-            )
-            .ok()?,
             tenant_api_usage_query: register_int_counter_vec!(
                 "hydra_tenant_api_usage_query_total",
                 "Tenant API usage reads, by store, grouping and outcome",
@@ -371,17 +347,6 @@ fn metrics() -> Option<&'static Metrics> {
                 &["scope"]
             )
             .ok()?,
-            tenant_api_invalidate_pending: register_int_counter!(
-                "hydra_tenant_api_invalidate_pending_total",
-                "Invalidations published but not confirmed by every live node (202)"
-            )
-            .ok()?,
-            tenant_api_invalidate_converge: register_histogram_vec!(
-                "hydra_tenant_api_invalidate_converge_seconds",
-                "Time to confirm an invalidation across the fleet, by outcome",
-                &["result"]
-            )
-            .ok()?,
             invalidation_consumer_applied_id: register_int_gauge_vec!(
                 "hydra_invalidation_consumer_applied_id",
                 "Per-node applied watermark (stream id, ms part)",
@@ -406,8 +371,6 @@ fn metrics() -> Option<&'static Metrics> {
                 &["tenant"]
             )
             .ok()?,
-            auth_cache_size: register_int_gauge!("hydra_auth_cache_size", "Auth cache entry count")
-                .ok()?,
             breaker_dead: register_int_gauge_vec!(
                 "hydra_breaker_dead",
                 "Dead-set indicator per provider (1=dead)",
@@ -527,12 +490,6 @@ fn metrics() -> Option<&'static Metrics> {
                 &["result"]
             )
             .ok()?,
-            auth_cache_clears: register_int_counter_vec!(
-                "hydra_auth_cache_clear_total",
-                "Whole-cache auth-cache clears (layer=l1|l2, result=ok|partial|error)",
-                &["layer", "result"]
-            )
-            .ok()?,
             replica_materialize_retries: register_int_counter_vec!(
                 "hydra_replica_materialize_retries_total",
                 "Replica materialization retries by outcome (attempt|succeeded|failed|throttled)",
@@ -546,7 +503,7 @@ fn metrics() -> Option<&'static Metrics> {
             .ok()?,
             invalidation_generation_bumps: register_int_counter!(
                 "hydra_invalidation_generation_bumps_total",
-                "Trims that dropped an entry a live consumer had not applied (whole-fleet cache clear)"
+                "Trims that dropped an entry a live consumer had not applied (consumer cached state must be treated as unsafe)"
             )
             .ok()?,
             sticky_hits: register_int_counter!(
@@ -707,23 +664,6 @@ pub fn record_catalog(tenant: &str) {
     }
 }
 
-/// Set the auth-cache-size gauge.
-#[allow(dead_code)]
-pub fn record_auth_cache_size(n: usize) {
-    if let Some(m) = metrics() {
-        m.auth_cache_size.set(n as i64);
-    }
-}
-
-/// Record an allow verdict whose TTL was clamped to `allow_ttl_max` (T7).
-/// Attributing this per tenant is the point: it tells an operator WHICH tenant
-/// is asking for long TTLs when they are deciding whether to raise the knob.
-pub fn record_allow_ttl_capped(tenant: &str) {
-    if let Some(m) = metrics() {
-        m.allow_ttl_capped.with_label_values(&[tenant]).inc();
-    }
-}
-
 /// Record one tenant-API response.
 pub fn record_tenant_api_request(endpoint: &str, status: u16) {
     if let Some(m) = metrics() {
@@ -735,9 +675,8 @@ pub fn record_tenant_api_request(endpoint: &str, status: u16) {
 
 /// Current value of `hydra_tenant_api_requests_total{endpoint,status}` (tests).
 ///
-/// `endpoint` is the low-cardinality route label (`whoami`, `invalidate`,
-/// `usage`, `sub-tenants`, `sub-tenant-routes`) or `unrouted` for a path under
-/// the reserved prefix that is not one of the five routes. A request refused by
+/// `endpoint` is the low-cardinality route label (`whoami`, `usage`,
+/// `sub-tenants`, `sub-tenant-routes`) or `unrouted` for a path under
 /// the token gate is still attributed to its ROUTE, on both the read and the
 /// write path.
 #[must_use]
@@ -769,26 +708,10 @@ pub fn record_tenant_api_auth_latency(elapsed: std::time::Duration) {
     }
 }
 
-/// Record a limiter refusal. `scope` is `ip` | `token` | `tenant` | `invalidate`.
+/// Record a limiter refusal. `scope` is `ip` | `token` | `tenant`.
 pub fn record_tenant_api_throttled(scope: &str) {
     if let Some(m) = metrics() {
         m.tenant_api_throttled.with_label_values(&[scope]).inc();
-    }
-}
-
-/// Record an invalidation that was published but not confirmed everywhere.
-pub fn record_tenant_api_invalidate_pending() {
-    if let Some(m) = metrics() {
-        m.tenant_api_invalidate_pending.inc();
-    }
-}
-
-/// Record how long the convergence barrier took, by outcome.
-pub fn record_tenant_api_invalidate_converge(result: &str, elapsed: std::time::Duration) {
-    if let Some(m) = metrics() {
-        m.tenant_api_invalidate_converge
-            .with_label_values(&[result])
-            .observe(elapsed.as_secs_f64());
     }
 }
 
@@ -839,15 +762,6 @@ pub fn tenant_api_auth_failures_total(reason: &str) -> f64 {
     }
 }
 
-/// Current value of `hydra_tenant_api_invalidate_pending_total` (tests).
-#[must_use]
-pub fn tenant_api_invalidate_pending_total() -> f64 {
-    match metrics() {
-        Some(m) => m.tenant_api_invalidate_pending.get() as f64,
-        None => 0.0,
-    }
-}
-
 /// Record one E3 usage read. `result` is `ok`, `store_unavailable`,
 /// `decode_error`, or `result_too_large`; the latter three are the same 503 to
 /// the tenant and are told apart here so an operator can distinguish a shape
@@ -881,16 +795,6 @@ pub fn tenant_api_usage_query_total(source: &str, group_by: &str, result: &str) 
             .tenant_api_usage_query
             .with_label_values(&[source, group_by, result])
             .get() as f64,
-        None => 0.0,
-    }
-}
-
-/// Current value of the allow-TTL-capped counter for a tenant (0.0 when
-/// metrics are unregistered, which mirrors a metric that was never recorded).
-#[must_use]
-pub fn allow_ttl_capped_total(tenant: &str) -> f64 {
-    match metrics() {
-        Some(m) => m.allow_ttl_capped.with_label_values(&[tenant]).get() as f64,
         None => 0.0,
     }
 }
@@ -1051,16 +955,6 @@ pub fn admin_auth_failures_total(result: &str) -> f64 {
     match metrics() {
         Some(m) => m.admin_auth_failures.with_label_values(&[result]).get() as f64,
         None => 0.0,
-    }
-}
-
-/// Count a whole-cache auth-cache clear by `layer` (`l1`/`l2`) and `result`
-/// (`ok`/`partial`/`error`).
-pub fn record_auth_cache_clear(layer: &str, result: &str) {
-    if let Some(m) = metrics() {
-        m.auth_cache_clears
-            .with_label_values(&[layer, result])
-            .inc();
     }
 }
 
@@ -1600,7 +1494,6 @@ mod tests {
         record_retry("t", "m", "connect");
         record_limit_rejected("t", "r", "count");
         record_route_error("t", "model_not_found");
-        record_auth_cache_size(3);
         record_upstream_duration("p", "m", 0.1);
         record_request_duration("t", "p", "m", 0.2);
         record_auth_upstream_error("t");

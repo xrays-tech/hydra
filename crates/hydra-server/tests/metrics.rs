@@ -25,7 +25,6 @@ use hydra_core::model::{
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -280,20 +279,12 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         .await
         .expect("ConfigStore::load");
 
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
 
     let proxy_state = AppState::for_tests(
         store.clone(),
-        auth.clone(),
         breaker.clone(),
         limiter,
         sink,
@@ -304,7 +295,6 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     let admin_state = Arc::new(AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
@@ -528,20 +518,12 @@ async fn all_candidates_failed_produces_empty_provider_sample() {
         .await
         .expect("ConfigStore::load");
 
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
 
     let proxy_state = AppState::for_tests(
         store.clone(),
-        auth.clone(),
         breaker.clone(),
         limiter,
         sink,
@@ -552,7 +534,6 @@ async fn all_candidates_failed_produces_empty_provider_sample() {
     let admin_state = Arc::new(AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),

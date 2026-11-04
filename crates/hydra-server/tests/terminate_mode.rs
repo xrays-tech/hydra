@@ -38,7 +38,6 @@ use hydra_core::model::{
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::{NonRouteStrategy, ProxyConfig};
 use hydra_server::proxy::limiter::RateLimiter;
@@ -222,19 +221,11 @@ async fn build_state_with_proxy_config(
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         sink,
@@ -599,18 +590,10 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
     let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
         .await
         .unwrap();
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .unwrap(),
-    );
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
-        auth,
         breaker.clone(),
         limiter,
         sink,
@@ -732,18 +715,10 @@ async fn usage_tokens_extracted_from_response() {
     let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
         .await
         .unwrap();
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .unwrap(),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         recording.clone(),
@@ -1168,19 +1143,11 @@ async fn rate_limit_429_even_when_routing_would_503() {
     let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
         .await
         .unwrap();
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .unwrap(),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         sink,
@@ -1400,18 +1367,10 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
     let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
         .await
         .unwrap();
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .unwrap(),
-    );
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
-        auth,
         breaker.clone(),
         limiter,
         sink,
@@ -1710,16 +1669,8 @@ async fn usage_record_never_invents_attribution_without_a_principal() {
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("store");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("checker"),
-    );
     let state = AppState::for_tests(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         recording.clone(),
@@ -3204,17 +3155,9 @@ async fn client_errors_do_not_trip_the_shared_breaker() {
     let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
         .await
         .unwrap();
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .unwrap(),
-    );
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store,
-        auth,
         breaker.clone(),
         Arc::new(RateLimiter::new()),
         sink,
@@ -4203,19 +4146,11 @@ async fn build_state_from_config(cfg: ConfigData, proxy: ProxyConfig) -> Arc<App
     let store = ConfigStore::from_data(common::setup_pool().await, cfg, key_provider)
         .await
         .expect("from_data");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         sink,

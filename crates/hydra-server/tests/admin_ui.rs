@@ -15,7 +15,6 @@ use std::time::Duration;
 use hydra_core::breaker::BreakerConfig;
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
@@ -36,18 +35,10 @@ async fn admin_state() -> Arc<AdminState> {
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     Arc::new(AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),

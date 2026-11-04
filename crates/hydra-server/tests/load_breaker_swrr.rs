@@ -254,7 +254,7 @@ fn swrr_exact_cycle_shape_3_to_1() {
 }
 
 // ---------------------------------------------------------------------------
-// T4.1c — auth-cache key never affects routing (privacy sanity): the breaker
+// T4.1c — a tenant's api-key never affects routing (privacy sanity): the breaker
 // view the router sees only knows `is_dead`, never api_keys.
 // ---------------------------------------------------------------------------
 

@@ -551,10 +551,7 @@ Propagation of any of those flips: **on your node the next request**; other node
 | `rate_limited` | 429 | 触发频率上限（见 §7.2），带 `Retry-After` | **是**（等 `Retry-After`） |
 | `payload_too_large` | 413 | 请求体超过 1 MiB | 否 |
 | `invalid_request` | 400 | 请求体不是合法 JSON，或读取失败 | 否 |
-| `too_many_keys` | 400 | 单次请求的 key 超过 1000 个 | 否（分批） |
 | `invalid_api_key` | 400 | 某个 key 超过 4096 字节 | 否 |
-| `invalid_wait` | 400 | `wait` 不是 `converged`/`none` | 否 |
-| `invalid_timeout_ms` | 400 | `timeout_ms` 不在 1..60000 | 否 |
 | `invalid_group_by` | 400 | `group_by` 不在白名单 | 否 |
 | `invalid_since` | 400 | `since` 缺失 / 写法非法 / 晚于 `until` | 否 |
 | `invalid_until` | 400 | `until` 写法非法 | 否 |

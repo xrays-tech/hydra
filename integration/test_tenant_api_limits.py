@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """The tenant API's documented rate limits, asserted.
 
-`dev-docs/ops.md` §5 documents three separate budgets and their exact semantics:
+`dev-docs/ops.md` §5 documents its budgets and their exact semantics:
   * `HYDRA_TENANT_API_RATE_LIMIT_PER_MIN` (60) — per-tenant cap on AUTHORISED requests,
     and it counts "every authenticated request the node accepts for the tenant,
     INCLUDING ones it then rejects" (the drill shows this with `/usage` calls that answer
     400: three of them consume a cap of 3, the fourth is 429);
-  * `HYDRA_TENANT_API_INVALIDATE_PER_MIN` (10) — per-tenant cap on
-    `auth/cache/invalidate`, which fans out to the whole fleet;
   * a `0`/garbage value must fall back to the default rather than refuse everything (a
     typo must not be a self-inflicted denial of service).
 Also pinned: the 429 carries `Retry-After`, and a VALID token is never refused by the
@@ -61,7 +59,7 @@ def call(method, url, token=None, body=None, timeout=5):
         return 0, {}, str(e)
 
 
-def start(label, admin, data, rate, invalidate):
+def start(label, admin, data, rate):
     env = dict(os.environ)
     env.update(usage_env("clickhouse", MOCK.url))
     env.update({
@@ -70,7 +68,6 @@ def start(label, admin, data, rate, invalidate):
         "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, label)}.db?mode=rwc",
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "HYDRA_TENANT_API_RATE_LIMIT_PER_MIN": str(rate),
-        "HYDRA_TENANT_API_INVALIDATE_PER_MIN": str(invalidate),
         "HYDRA_TENANT_API_AUTH_FAIL_LIMIT_PER_MIN": "10",
         "HYDRA_TENANT_API_LOCKOUT_SECS": "15",
         "RUST_LOG": "warn",
@@ -94,8 +91,8 @@ def wait_healthy(admin, budget=25.0):
 MOCK = MockClickHouse()
 
 
-def bring_up(label, admin, data, rate, invalidate):
-    proc = start(label, admin, data, rate, invalidate)
+def bring_up(label, admin, data, rate):
+    proc = start(label, admin, data, rate)
     if not wait_healthy(admin):
         raise SystemExit(f"[tenant-limits] CANNOT VERIFY: node {label} never became healthy")
     st, _, out = call("POST", f"http://127.0.0.1:{admin}/api/v1/tenants", token=ADMIN_TOKEN, body={
@@ -154,7 +151,7 @@ def main():
     procs = []
     try:
         # A: the authorised-request cap, and the documented "counts rejected requests" clause
-        p = bring_up("a-rate", 18490, 18491, 3, 10)
+        p = bring_up("a-rate", 18490, 18491, 3)
         procs.append(p)
         codes = [call("GET", f"http://127.0.0.1:18491/tenant/t1/api/v1/usage", token=TENANT_TOKEN)[0]
                  for _ in range(6)]
@@ -170,27 +167,17 @@ def main():
               'hydra_tenant_api_throttled_total{scope="tenant"}' in metrics)
         p.send_signal(signal.SIGKILL); p.wait(timeout=10)
 
-        # B: the invalidation cap (invalidation fans out to the fleet, so it is capped lower)
-        p = bring_up("b-invalidate", 18492, 18493, 60, 2)
-        procs.append(p)
-        inv = [call("POST", f"http://127.0.0.1:18493/tenant/t1/api/v1/auth/cache/invalidate",
-                    token=TENANT_TOKEN, body={})[0] for _ in range(5)]
-        check("INVALIDATE cap (2): the third and later invalidations are 429",
-              inv[:2] == [200, 200] and set(inv[2:]) == {429}, f"codes={inv}")
-        p.send_signal(signal.SIGKILL); p.wait(timeout=10)
-
         # D: a VALID token is never refused by the FAILURE lockout (B1)
-        p = bring_up("d-independent", 18494, 18495, 60, 10)
+        p = bring_up("d-independent", 18494, 18495, 60)
         procs.append(p)
         for i in range(12):
-            call("POST", f"http://127.0.0.1:18495/tenant/t1/api/v1/auth/cache/invalidate",
-                 token=f"sk-bad-{i}", body={})
+            call("GET", f"http://127.0.0.1:18495/tenant/t1/api/v1/whoami", token=f"sk-bad-{i}")
         st, _, _ = call("GET", "http://127.0.0.1:18495/tenant/t1/api/v1/whoami", token=TENANT_TOKEN)
         check("a VALID token still answers 200 after the failure budget is exhausted", st == 200, f"HTTP {st}")
         p.send_signal(signal.SIGKILL); p.wait(timeout=10)
 
         # E: 0 falls back to the default (a typo must not be a self-inflicted DoS)
-        p = bring_up("e-zeros", 18496, 18497, 0, 0)
+        p = bring_up("e-zeros", 18496, 18497, 0)
         procs.append(p)
         st, _, _ = call("GET", "http://127.0.0.1:18497/tenant/t1/api/v1/whoami", token=TENANT_TOKEN)
         check("a 0 cap falls back to the documented default (the request is served)", st == 200, f"HTTP {st}")
@@ -208,7 +195,7 @@ def main():
     if failures:
         print(f"TENANT-API LIMITS: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
-    print("TENANT-API LIMITS: PASSED (authorised cap, invalidate cap, Retry-After, failure-lockout isolation, 0-fallback)")
+    print("TENANT-API LIMITS: PASSED (authorised cap, Retry-After, failure-lockout isolation, 0-fallback)")
     return 0
 
 

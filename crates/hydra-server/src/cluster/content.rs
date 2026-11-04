@@ -27,7 +27,7 @@ use crate::crypto::KeyProvider;
 ///
 /// Carried so a replica can answer `has_access_token` and serve the tenant
 /// self-service endpoints on the DATA plane
-/// (`POST /tenant/{id}/api/v1/auth/cache/invalidate`) without a 401 — the
+/// (`GET /tenant/{id}/api/v1/whoami`) without a 401 — the
 /// snapshot, not the database, is what the tenant gate reads (design §3.4).
 pub type TenantTokenHashes = Vec<(String, String)>;
 

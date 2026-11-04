@@ -7,12 +7,8 @@ view, nothing covered the proxy/HTTP surface):
 
   §7.1 a tenant whose row is `enabled=false` is refused on its CLIENT requests but the whole
        tenant API keeps working — that is the documented SELF-SERVICE recovery path ("if you
-       cannot even get in, you cannot recover"). Steps 1 and 3 of the documented recovery
-       flow are executed here, and every read route plus the write routes are checked while
-       the tenant is suspended.
-  §7.3 `api_keys` cannot be a PREFIX: it is treated as one complete key, so it matches
-       nothing, `invalidated` is 0 and the client keeps being served — the document calls
-       this "silently ineffective", so the silence is what gets asserted.
+       cannot even get in, you cannot recover"). Every read route plus the write routes are
+       checked while the tenant is suspended.
   §7.5 the contract has NO `tenant_id` query parameter (it must be IGNORED, not honoured and
        not rejected — honouring it would be a cross-tenant read), and a window with no
        records answers `as_of: null` instead of an error.
@@ -264,9 +260,6 @@ def main():
             who = {}
         check("§7.1 step 1: `whoami` still works and SHOWS the suspension",
               st == 200 and who.get("enabled") is False, f"HTTP {st} enabled={who.get('enabled')}")
-        st, text = tenant("POST", "/auth/cache/invalidate", body={})
-        check("§7.1 step 3: the recovery `invalidate` still works while suspended",
-              st == 200, f"HTTP {st} {text[:70]}")
         for path in (f"/usage?since={SINCE}", "/sub-tenants", "/sub-tenant-routes"):
             st, text = tenant("GET", path)
             check(f"§7.1: the read route {path.split('?')[0]} still works while suspended",
@@ -288,38 +281,6 @@ def main():
         check("§7.1: re-enabling is visible on the next `whoami`",
               st == 200 and json.loads(text or "{}").get("enabled") is True,
               f"HTTP {st} enabled={json.loads(text or '{}').get('enabled')}")
-
-        # ---- §7.3 a PREFIX in `api_keys` is a silent no-op --------------------
-        Upstream.allowed = True
-        st_warm, _ = proxied()
-        Upstream.allowed = False
-        st_cached, _ = proxied()
-        st, text = tenant("POST", "/auth/cache/invalidate", body={"api_keys": [CLIENT_KEY[:6]]})
-        try:
-            inv_prefix = json.loads(text)["invalidated"]
-        except Exception:
-            inv_prefix = None
-        st_after_prefix, _ = proxied()
-        announce("§7.3 prefix invalidation",
-                 f"warm={st_warm} cached={st_cached} invalidated={inv_prefix} after={st_after_prefix}")
-        check("§7.3: the cache really held a verdict before this leg",
-              st_warm == 200 and st_cached == 200, f"{st_warm}/{st_cached}")
-        check("§7.3: a PREFIX is treated as one complete key -> `invalidated` is 0",
-              st == 200 and inv_prefix == 0, f"HTTP {st} invalidated={inv_prefix}")
-        check("§7.3: ...and the client keeps being served (the document calls this SILENTLY ineffective)",
-              st_after_prefix == 200, f"HTTP {st_after_prefix}")
-        st, text = tenant("POST", "/auth/cache/invalidate", body={"api_keys": [CLIENT_KEY]})
-        try:
-            inv_full = json.loads(text)["invalidated"]
-        except Exception:
-            inv_full = None
-        st_after_full, body_full = proxied()
-        announce("§7.3 full-key invalidation",
-                 f"invalidated={inv_full} after={st_after_full} {body_full[:40]}")
-        check("§7.3: the documented workaround (send the COMPLETE key) does clear it",
-              st == 200 and isinstance(inv_full, int) and inv_full >= 1 and st_after_full == 401,
-              f"invalidated={inv_full} after={st_after_full}")
-        Upstream.allowed = True
 
         # ---- §7.5 no `tenant_id` query parameter ------------------------------
         base = f"/usage?since={SINCE}"
@@ -354,9 +315,8 @@ def main():
     if failures:
         print(f"TENANT BOUNDARIES: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
-    print("TENANT BOUNDARIES: PASSED (suspended tenant keeps the self-service API, prefix "
-          "invalidation is a silent no-op as documented, no tenant_id query parameter, empty "
-          "window is as_of: null)")
+    print("TENANT BOUNDARIES: PASSED (suspended tenant keeps the self-service API, no "
+          "tenant_id query parameter, empty window is as_of: null)")
     return 0
 
 

@@ -28,7 +28,6 @@ use hydra_core::model::{
 };
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -304,18 +303,10 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         recording.clone(),
@@ -394,18 +385,10 @@ async fn v1_chat_completions_regression_generic_scanner() {
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         recording.clone(),
@@ -508,18 +491,10 @@ async fn v1_messages_upstream_gets_x_api_key_and_anthropic_version() {
     let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let state = AppState::for_tests(
         store,
-        auth,
         breaker,
         limiter,
         recording.clone(),

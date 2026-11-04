@@ -9,10 +9,10 @@
 //!
 //! ## Why a *separate* reqwest client
 //!
-//! The proxy shell already owns two other reqwest clients — the auth-upstream
-//! client ([`crate::http::HttpAuthChecker`]) and the breaker probe client
-//! ([`crate::proxy::breaker_wrap::probe_task`]). Those use **short** timeouts
-//! (sub-second to ~1.5 s) because they must fail fast. LLM chat-completion
+//! The proxy shell already owns another reqwest client — the breaker probe
+//! client ([`crate::proxy::breaker_wrap::probe_task`]). It uses a **short**
+//! timeout (sub-second to ~1.5 s) because it must fail fast. (The auth-upstream
+//! client retired with the external-auth surface, T10 Stage B.) LLM chat-completion
 //! requests — especially streaming SSE — can take **minutes** to first byte.
 //! Sharing a short-timeout client would abort legitimate long generations, so
 //! `ProviderClient` carries its own long-lived connection pool. It carries **no

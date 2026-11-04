@@ -20,7 +20,6 @@
 //!
 //! compare-and-renew so a renew can never clobber another holder's lease.
 
-pub mod auth_cache;
 pub mod breaker;
 pub mod rate_limit;
 
@@ -164,7 +163,7 @@ fn env_millis(key: &str, default: u64) -> u64 {
 /// argument (it is not part of `Config`), and this process passed `None`, so
 /// `ReconnectPolicy` — whose `max_attempts = 0` means "retry forever, every 1 s" — was never
 /// installed. `ops.md` §13.5 promises the opposite ("until Redis recovers"), and every
-/// fail-open path (cluster rate limits, auth-cache L2, breaker sync) silently
+/// fail-open path (cluster rate limits, breaker sync) silently
 /// became **permanent** instead of temporary.
 #[must_use]
 pub fn reconnect_policy() -> ReconnectPolicy {

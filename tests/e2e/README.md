@@ -15,8 +15,6 @@ End-to-end browser tests for the embedded `/admin/*` UI. Covers the AGENTS.md
 - **T2.3** `e2e_tenant_with_auth_url` — tenant with `auth_url` created via UI,
   then associated to a provider + model via the TenantAccess / TenantModels
   sections.
-- **T2.4** `e2e_invalidate_auth_cache` — UI triggers `DELETE
-  /api/v1/auth/cache`; the response count is shown.
 - **T2.5** `e2e_breaker_reset` — UI force-resets a provider id; toast confirms.
 - **T2.6** `e2e_reload` — UI triggers `POST /api/v1/reload`; new snapshot
   counts surface.

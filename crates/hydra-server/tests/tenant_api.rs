@@ -3,9 +3,11 @@
 //!
 //! T4 delivers the reserved-prefix interception, the token gate and an honest
 //! routing skeleton: no endpoint is wired yet, so every parsed route answers
-//! `404 unknown path` **locally**. E1 arrives in T5, E2 in T6, E3 in T8 — each
+//! `404 unknown path` **locally**. E1 arrived in T5 and E3 in T8 — each
 //! replacing exactly one 404 arm. That ordering is deliberate: if T4 wired E1,
-//! T5's RED step could never fail for the right reason.
+//! T5's RED step could never fail for the right reason. E2 (the auth-cache
+//! invalidate route) was retired together with the external-auth surface it
+//! served, so its tests are gone and the arm it occupied answers `404` again.
 
 #![cfg(all(feature = "db", feature = "http-client", feature = "proxy"))]
 
@@ -18,7 +20,6 @@ use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
 use hydra_server::crypto::StaticKeyProvider;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -84,25 +85,10 @@ async fn build_state(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppSt
     let store = ConfigStore::load(pool.clone(), kp)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn UsageSink> = Arc::new(NoopSink);
-    AppState::for_tests(
-        store,
-        auth,
-        breaker,
-        limiter,
-        sink,
-        ProxyConfig::default(),
-        cfg,
-    )
+    AppState::for_tests(store, breaker, limiter, sink, ProxyConfig::default(), cfg)
 }
 
 /// A usage reader that always answers a real zero.
@@ -155,16 +141,8 @@ async fn build_state_with_usage(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -
     let store = ConfigStore::load(pool.clone(), kp)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     AppState::for_tests_with_usage(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         Arc::new(NoopSink) as Arc<dyn UsageSink>,
@@ -478,16 +456,8 @@ async fn before_the_first_snapshot_the_gate_fails_closed_with_503() {
     )
     .await
     .expect("from_data");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("checker"),
-    );
     let state = AppState::for_tests(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         Arc::new(NoopSink) as Arc<dyn UsageSink>,
@@ -864,16 +834,8 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
         },
     });
 
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("checker"),
-    );
     let state = AppState::for_tests(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         Arc::new(NoopSink) as Arc<dyn UsageSink>,
@@ -887,258 +849,6 @@ async fn whoami_works_from_a_materialized_snapshot_alone() {
     assert_eq!(v["name"], "edge-tenant");
     // The snapshot's version, not a database's.
     assert_eq!(v["config_version"].as_u64(), Some(7));
-}
-
-// ---------------------------------------------------------------------------
-// T6 — E2 `POST /auth/cache/invalidate`
-// ---------------------------------------------------------------------------
-
-async fn post_invalidate(
-    root: &str,
-    tenant: &str,
-    token: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let c = client();
-    let url = format!("{root}/tenant/{tenant}/api/v1/auth/cache/invalidate");
-    for _ in 0..60 {
-        let mut req = c.post(&url).bearer_auth(token);
-        if let Some(b) = &body {
-            req = req.json(b);
-        }
-        if let Ok(r) = req.send().await {
-            return body_json(r).await;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-    panic!("proxy never became ready at {url}");
-}
-
-/// C3: a single-node build has no peers, so the local clear IS the whole answer
-/// and the report must say exactly that — not "applied" (which implies a fleet
-/// confirmed) and not "pending" (which implies someone is behind).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invalidate_reports_single_node_when_there_are_no_peers() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-    let (status, v) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
-    assert_eq!(status, 200, "got {v}");
-    assert_eq!(v["fleet"]["state"], "single_node", "got {v}");
-    assert_eq!(v["fleet"]["nodes_total"], 1);
-    assert_eq!(
-        v["scope"], "tenant",
-        "an absent body means the whole tenant: {v}"
-    );
-    assert_eq!(v["checked"], 0);
-}
-
-/// T13: the shape caps. A request that names absurd keys is rejected before any
-/// cache work happens.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invalidate_rejects_an_oversized_request() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-
-    let too_many: Vec<String> = (0..1_001).map(|i| format!("sk-{i}")).collect();
-    let (status, v) = post_invalidate(
-        &root,
-        "t1",
-        TENANT_TOKEN,
-        Some(serde_json::json!({ "api_keys": too_many })),
-    )
-    .await;
-    assert_eq!(status, 400, "got {v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("api_keys"),
-        "got {v}"
-    );
-
-    let (status2, v2) = post_invalidate(
-        &root,
-        "t1",
-        TENANT_TOKEN,
-        Some(serde_json::json!({ "api_keys": ["x".repeat(4_097)] })),
-    )
-    .await;
-    assert_eq!(status2, 400, "got {v2}");
-}
-
-/// T11: a precise key clears that key HERE and ONLY that key.
-///
-/// The cache is keyed `(tenant_id, sha256(key))`. Under the internal-auth model a
-/// data-plane client request no longer WRITES this cache (its verdict comes from
-/// `ConfigData.users_by_api_key_hash`), so the cached verdicts are seeded through
-/// the same seam `a_throttled_invalidate_does_not_clear_the_cache` uses. What is
-/// pinned is the CLEAR itself — E2 still performs it, and the second entry proves
-/// a named-key request does not sweep the tenant's whole L1.
-///
-/// The old leg that pointed the tenant at a mock `auth_url` and observed the
-/// upstream being asked again was EXTERNAL auth (T3 retires the check); it is
-/// removed rather than resurrected.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invalidate_clears_exactly_the_named_key() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state.clone());
-
-    // Two cached verdicts: the named one must go, the other must stay.
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-key-to-clear", true, Duration::from_secs(300))
-        .await;
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-key-to-keep", true, Duration::from_secs(300))
-        .await;
-
-    let before = state.auth.cache().len();
-    let (status, v) = post_invalidate(
-        &root,
-        "t1",
-        TENANT_TOKEN,
-        Some(serde_json::json!({ "api_keys": ["sk-key-to-clear"] })),
-    )
-    .await;
-    assert_eq!(status, 200, "got {v}");
-    assert_eq!(v["checked"], 1, "got {v}");
-    assert_eq!(v["scope"], "keys", "got {v}");
-    assert_eq!(
-        v["invalidated"], 1,
-        "the named key was cached, so exactly one entry must go: {v}",
-    );
-    assert_eq!(
-        state.auth.cache().len(),
-        before - 1,
-        "the named key was removed and nothing else",
-    );
-    assert_eq!(
-        state.auth.cache().check("t1", "sk-key-to-clear").await,
-        hydra_core::auth::Verdict::Miss,
-        "the cleared key must re-judge, not replay",
-    );
-    assert_eq!(
-        state.auth.cache().check("t1", "sk-key-to-keep").await,
-        hydra_core::auth::Verdict::Hit(true),
-        "a named-key request must not sweep the tenant's whole L1",
-    );
-}
-
-/// The per-tenant invalidate throttle is checked BEFORE the local cache clear,
-/// and that order is the security property: a throttled call must NOT clear the
-/// cache. If the clear were reordered ahead of the throttle check, a banned key
-/// would be re-served (cleared) by a request the tenant was not even allowed to
-/// make — the throttle would be a no-op. This pins the order end to end.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_throttled_invalidate_does_not_clear_the_cache() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let cfg = TenantApiConfig {
-        // A budget of one: the second invalidate in the window is refused.
-        invalidate_per_min: 1,
-        ..TenantApiConfig::default()
-    };
-    let state = build_state(&pool, cfg).await;
-    let root = start_proxy(state.clone());
-
-    // Seed a cached verdict so there is something real to clear. The direct
-    // seam is the same one `a_suspended_tenant_can_still_use_all_three_endpoints`
-    // uses: `state.auth.cache()`.
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-victim", true, Duration::from_secs(300))
-        .await;
-    assert_eq!(state.auth.cache().len(), 1, "the seeded verdict is cached");
-
-    // First invalidate: allowed (budget of one). It clears the entry.
-    let (s1, v1) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
-    assert_eq!(s1, 200, "the first invalidate must succeed: {v1}");
-    assert!(
-        state.auth.cache().is_empty(),
-        "the first invalidate cleared it"
-    );
-
-    // Re-seed the same verdict: it is back in the L1, and the second call is
-    // about to be judged against the (already spent) invalidate budget.
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-victim", true, Duration::from_secs(300))
-        .await;
-    assert_eq!(
-        state.auth.cache().check("t1", "sk-victim").await,
-        hydra_core::auth::Verdict::Hit(true),
-        "the re-seeded verdict is cached"
-    );
-
-    // Second invalidate, same tenant, same minute: throttled. The raw response
-    // is needed for the `Retry-After` header, so it is not sent through
-    // `post_invalidate` (which discards headers).
-    let c = client();
-    let url = format!("{root}/tenant/t1/api/v1/auth/cache/invalidate");
-    let resp = c
-        .post(&url)
-        .bearer_auth(TENANT_TOKEN)
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .expect("send");
-    let status = resp.status().as_u16();
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let text = resp.text().await.unwrap_or_default();
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-
-    assert_eq!(status, 429, "the second invalidate must be throttled: {v}");
-    assert_eq!(v["error"]["code"], "rate_limited", "got {v}");
-    assert!(
-        retry_after.as_deref().is_some_and(|r| !r.is_empty()),
-        "a 429 must carry a Retry-After header: {text}"
-    );
-
-    // THE ordering guard: the throttled call never reached the local clear, so the
-    // re-seeded verdict is still cached. A reorder (clear before the throttle
-    // check) would have dropped it.
-    assert_eq!(
-        state.auth.cache().check("t1", "sk-victim").await,
-        hydra_core::auth::Verdict::Hit(true),
-        "a throttled invalidate must NOT clear the cache (throttle check precedes the clear): {text}"
-    );
-}
-
-/// A GET on the invalidation route must not clear anything: a prefetching client
-/// or a browser address bar is not a tenant action.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invalidate_is_post_only() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-    let (status, v) = body_json(
-        send_until_ready(
-            &client(),
-            &format!("{root}/tenant/t1/api/v1/auth/cache/invalidate"),
-            Some(TENANT_TOKEN),
-            None,
-        )
-        .await,
-    )
-    .await;
-    assert_eq!(status, 405, "got {v}");
-    assert_eq!(v["error"]["code"], "method_not_allowed", "got {v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,163 +1237,15 @@ async fn a_wrong_tenant_in_the_url_does_not_spend_the_success_budget() {
     assert_eq!(s2, 200);
 }
 
-/// The two `read_body` failures used to hand back hand-written static JSON with
-/// no `trace_id` — the one field that ties a rejection to the log line that
-/// explains it, and which this API's envelope promises on EVERY response.
-///
-/// The body cap is the reason the cap exists at all: the gate runs before the
-/// body is read, so a caller that already holds a token can otherwise make the
-/// node buffer arbitrarily.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_oversized_body_is_413_in_the_documented_envelope() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-    let c = client();
-    let url = format!("{root}/tenant/t1/api/v1/auth/cache/invalidate");
-
-    // 2 MiB: one key far past the 1 MiB body cap.
-    let huge = "x".repeat(2 * 1024 * 1024);
-    let body = format!(r#"{{"api_keys":["{huge}"]}}"#);
-    let mut resp = None;
-    for _ in 0..60 {
-        match c
-            .post(&url)
-            .bearer_auth(TENANT_TOKEN)
-            .header("content-type", "application/json")
-            .body(body.clone())
-            .send()
-            .await
-        {
-            Ok(r) => {
-                resp = Some(r);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
-        }
-    }
-    let r = resp.expect("proxy never became ready");
-    let status = r.status().as_u16();
-    let header_trace = r
-        .headers()
-        .get("X-Hydra-Trace-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let text = r.text().await.unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-
-    assert_eq!(status, 413, "the body cap must fire: {text}");
-    assert_eq!(v["error"]["code"], "payload_too_large", "{text}");
-    assert!(
-        v["error"]["trace_id"].is_string(),
-        "the envelope must carry trace_id (this 413 body used to omit it): {text}"
-    );
-    assert_eq!(
-        header_trace.as_deref(),
-        v["error"]["trace_id"].as_str(),
-        "the header and the body must agree on the trace id: {text}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// E2's wait / timeout_ms parameters (design §4.2.2, Q10)
-// ---------------------------------------------------------------------------
-
-async fn post_invalidate_query(root: &str, tenant: &str, token: &str, query: &str) -> (u16, Value) {
-    let c = client();
-    let url = format!("{root}/tenant/{tenant}/api/v1/auth/cache/invalidate?{query}");
-    for _ in 0..60 {
-        if let Ok(r) = c
-            .post(&url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-        {
-            return body_json(r).await;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-    panic!("proxy never became ready at {url}");
-}
-
-/// `wait=none` is **accepted** on a non-cluster build: there is no convergence
-/// stream here, so the answer is `200` with `single_node` — the same answer the
-/// default `wait` produces in this build. What this test pins is that the
-/// parameter is PARSED (a misspelt value is refused, see below), not merely
-/// tolerated.
-///
-/// The real `202` "published, fleet still catching up" path is exercised at the
-/// `broadcast_and_confirm` level in `crates/hydra-server/tests/tenant_api_cluster.rs`,
-/// where an actual convergence stream exists.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wait_none_is_accepted_and_is_single_node_in_a_non_cluster_build() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-
-    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=none").await;
-    // No stream in this build ⇒ `single_node`; that is the same answer the
-    // default produces here, which is why this test also pins the 400s below
-    // (the parameters must be PARSED, not merely tolerated).
-    assert_eq!(status, 200, "got {v}");
-    assert_eq!(v["fleet"]["state"], "single_node", "got {v}");
-}
-
-/// A misspelt `wait` must be refused, not silently treated as the default: a
-/// caller that asked to skip the wait and got one (or vice versa) has been lied
-/// to about the only thing these parameters control.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unknown_wait_value_is_rejected_rather_than_defaulted() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-
-    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=eventually").await;
-    assert_eq!(status, 400, "got {v}");
-    assert_eq!(v["error"]["code"], "invalid_wait", "got {v}");
-
-    // The explicit default is accepted.
-    let (status, v) =
-        post_invalidate_query(&root, "t1", TENANT_TOKEN, "wait=converged&timeout_ms=1500").await;
-    assert_eq!(status, 200, "got {v}");
-}
-
-/// `timeout_ms` is clamped at both ends: `0` would mean "do not wait" while
-/// claiming to wait, and an unbounded value would let one caller hold a worker
-/// (and a share of the shared Redis) indefinitely.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_range_timeout_ms_is_rejected() {
-    let pool = common::setup_pool().await;
-    seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
-    let state = build_state(&pool, TenantApiConfig::default()).await;
-    let root = start_proxy(state);
-
-    for bad in ["0", "60001", "abc", "-5"] {
-        let (status, v) =
-            post_invalidate_query(&root, "t1", TENANT_TOKEN, &format!("timeout_ms={bad}")).await;
-        assert_eq!(status, 400, "timeout_ms={bad} got {v}");
-        assert_eq!(
-            v["error"]["code"], "invalid_timeout_ms",
-            "timeout_ms={bad}: {v}"
-        );
-    }
-
-    let (status, v) = post_invalidate_query(&root, "t1", TENANT_TOKEN, "timeout_ms=1").await;
-    assert_eq!(status, 200, "the boundary value 1 must be accepted: {v}");
-}
-
 /// A SUSPENDED tenant (欠费停机) must still be able to run its own recovery: read
-/// its state, force a re-authentication after a top-up, and check what it has
-/// used. The gate never consults `enabled` — suspension is the tenant's own
-/// policy, expressed through its `auth_url`, and a tenant that cannot reach the
-/// recovery path cannot recover.
+/// its state and check what it has used. The gate never consults `enabled` —
+/// suspension is the tenant's own policy, expressed through its `auth_url`, and a
+/// tenant that cannot reach the recovery path cannot recover.
 ///
-/// E1 alone was covered; this pins all three, because the contract document for
-/// tenants states all three and a document is only as good as its test.
+/// E1 alone was covered; this pins both surviving self-service endpoints (E2,
+/// the auth-cache invalidate route, was retired with the external-auth surface
+/// it served), because the contract document for tenants states them and a
+/// document is only as good as its test.
 /// The window a read asks for is computed from NOW: a hard-coded `since` ages out of the 31-day
 /// ceiling (`HYDRA_TENANT_API_USAGE_MAX_WINDOW_DAYS`) and turns the leg red on a date rather than on
 /// a change — measured 2026-10-07 on two drills that did exactly that.
@@ -1698,7 +1260,7 @@ fn window() -> (String, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
+async fn a_suspended_tenant_can_still_use_both_surviving_endpoints() {
     let (since, until) = window();
     let pool = common::setup_pool().await;
     seed_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
@@ -1709,13 +1271,7 @@ async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
     hydra_server::db::update_tenant(&pool, &t)
         .await
         .expect("disable");
-    // A cached allow, so E2 has something real to clear.
     let state = build_state_with_usage(&pool, TenantApiConfig::default()).await;
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-cached", true, Duration::from_secs(300))
-        .await;
     let root = start_proxy(state);
     let c = client();
 
@@ -1723,16 +1279,6 @@ async fn a_suspended_tenant_can_still_use_all_three_endpoints() {
     let (s1, v1) = get_tenant_json(&root, "t1", TENANT_TOKEN, "whoami").await;
     assert_eq!(s1, 200);
     assert_eq!(v1["enabled"], false, "suspended, and it can see that: {v1}");
-
-    let (s2, v2) = post_invalidate(&root, "t1", TENANT_TOKEN, None).await;
-    assert_eq!(
-        s2, 200,
-        "a suspended tenant must be able to force re-auth: {v2}"
-    );
-    assert!(
-        v2["invalidated"].as_u64().unwrap_or(0) >= 1,
-        "the cached allow must actually be gone: {v2}"
-    );
 
     let (s3, v3) = get_tenant_json(
         &root,
@@ -2111,16 +1657,8 @@ async fn the_read_only_endpoints_work_from_a_materialized_snapshot_alone() {
         },
     });
 
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("checker"),
-    );
     let state = AppState::for_tests(
         store,
-        auth,
         Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         Arc::new(RateLimiter::new()),
         Arc::new(NoopSink) as Arc<dyn UsageSink>,

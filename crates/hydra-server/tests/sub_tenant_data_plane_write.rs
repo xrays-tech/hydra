@@ -28,7 +28,6 @@ use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::admission::AdmissionControl;
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
@@ -157,23 +156,14 @@ async fn local_node_state(token: &str) -> Arc<AppState> {
         .await
         .expect("reload so the snapshot carries the token hash");
 
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     Arc::new(AppState {
         store,
-        auth,
         breaker: Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
         limiter: Arc::new(RateLimiter::new()),
         admission: AdmissionControl::new(),
         sink: Arc::new(NoopSink),
         proxy: ProxyConfig::default(),
         tenant_api: TenantApiConfig::default(),
-        tenant_api_throttle: Arc::new(hydra_server::tenant_api::throttle::Throttle::new()),
         tenant_api_limiter: Arc::new(hydra_server::tenant_api::limit::TenantApiLimiter::new()),
         invalidation: None,
         usage: None,

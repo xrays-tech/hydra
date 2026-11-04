@@ -3,7 +3,7 @@
 //! Exercises the REAL `AdminService` (a Pingora `ServeHttp` app) via real HTTP
 //! requests from `reqwest` against a real Pingora `Service` bound to
 //! `127.0.0.1:0`, backed by a real `:memory:` SQLite. No internal logic is
-//! mocked (dev-plan §1 铁律 2): `db::repo`, `ConfigStore`, `AuthCache` and
+//! mocked (dev-plan §1 铁律 2): `db::repo`, `ConfigStore` and
 //! `CircuitBreaker` are the production types.
 
 #![cfg(all(feature = "db", feature = "http-client", feature = "proxy"))]
@@ -18,7 +18,6 @@ use hydra_core::model::{BillingStatus, Tenant, User, UserApiKey, UserGroup};
 use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
@@ -56,18 +55,10 @@ async fn admin_state_with(auth_fail_per_min: u32) -> Arc<AdminState> {
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let mut state = AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
@@ -1785,215 +1776,6 @@ async fn a_normal_write_reports_a_fresh_snapshot() {
 }
 
 // ===========================================================================
-// §2.3 — auth cache invalidation (by keys, by tenant, unknown)
-// ===========================================================================
-
-#[tokio::test]
-async fn auth_cache_invalidate() {
-    let state = admin_state().await;
-    let port = start_admin(state.clone());
-
-    // Populate the cache directly: two keys for tenant t1, one for t2.
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-aaa", true, Duration::from_secs(300))
-        .await;
-    state
-        .auth
-        .cache()
-        .set("t1", "sk-bbb", true, Duration::from_secs(300))
-        .await;
-    state
-        .auth
-        .cache()
-        .set("t2", "sk-ccc", true, Duration::from_secs(300))
-        .await;
-    assert_eq!(state.auth.cache().len(), 3);
-
-    // By keys for t1 → invalidates 2.
-    let body = r#"{"tenant_id":"t1","api_keys":["sk-aaa","sk-bbb"]}"#;
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(body),
-    )
-    .await;
-    assert_eq!(r.status(), 200);
-    let v: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(v["invalidated"], 2);
-    assert_eq!(v["tenant_id"], "t1");
-    assert_eq!(state.auth.cache().len(), 1);
-
-    // Unknown key → 0, no error.
-    let body = r#"{"tenant_id":"t1","api_keys":["sk-nope"]}"#;
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(body),
-    )
-    .await;
-    assert_eq!(r.status(), 200);
-    assert_eq!(
-        r.json::<serde_json::Value>().await.unwrap()["invalidated"],
-        0
-    );
-
-    // By tenant (t2) → invalidates all for t2.
-    let body = r#"{"tenant_id":"t2"}"#;
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(body),
-    )
-    .await;
-    assert_eq!(r.status(), 200);
-    assert_eq!(
-        r.json::<serde_json::Value>().await.unwrap()["invalidated"],
-        1
-    );
-    assert_eq!(state.auth.cache().len(), 0);
-}
-
-// ===========================================================================
-// F-3 — empty-body DELETE invalidates the ENTIRE local cache (every tenant),
-// keeps the `invalidated` count truthful, and still publishes a whole-cache
-// stream event `(None, [])`.
-// ===========================================================================
-
-#[cfg(feature = "cluster-redis")]
-#[tokio::test]
-async fn empty_body_delete_invalidates_all_local() {
-    use hydra_core::config::ConfigData;
-    use hydra_core::model::Tenant;
-    use hydra_server::cluster::events::InvalidationStream;
-
-    // A REAL Redis (dev-plan 铁律 2): captures the published stream payload.
-    // Integration database 43.
-    let pool = common::real_redis_pool(43).await;
-    let reader_pool = pool.clone();
-
-    // Store with exactly 3 known tenants.
-    let kp: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
-    let mut data = ConfigData::default();
-    for (i, dom) in ["a.com", "b.com", "c.com"].iter().enumerate() {
-        data.tenants_by_domain.insert(
-            dom.to_string(),
-            Tenant {
-                id: format!("t{i}"),
-                name: format!("T{i}"),
-                domain: dom.to_string(),
-                auth_url: format!("https://auth.{dom}/v"),
-                cert_key: None,
-                cert_file: None,
-                enabled: true,
-                created_at: "".into(),
-                updated_at: "".into(),
-            },
-        );
-    }
-    // The store's OWN database is a migrated in-memory one: this test drives the snapshot it
-    // injected, not the tables, but a store no longer exists without a database behind it.
-    let db = common::setup_pool().await;
-    let store = ConfigStore::from_data(db.clone(), data, kp)
-        .await
-        .expect("from_data");
-
-    // Auth cache seeded with one entry per tenant.
-    let cache = AuthCache::new(Duration::from_secs(300), Duration::from_secs(30));
-    cache
-        .set("t0", "sk-0", true, Duration::from_secs(300))
-        .await;
-    cache
-        .set("t1", "sk-1", true, Duration::from_secs(300))
-        .await;
-    cache
-        .set("t2", "sk-2", true, Duration::from_secs(300))
-        .await;
-    assert_eq!(cache.len(), 3);
-    let auth = Arc::new(HttpAuthChecker::new(cache, AuthConfig::default()).expect("checker"));
-
-    let mut state = AdminState::new(
-        db,
-        store,
-        auth.clone(),
-        Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
-        Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
-        Some(TOKEN.to_string()),
-        hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
-    );
-    // Attach the invalidation stream publisher (cluster P4).
-    state.invalidation = Some(InvalidationStream::new(pool.clone()));
-    let state = Arc::new(state);
-    let port = start_admin(state.clone());
-
-    // Empty-body DELETE ⇒ invalidate everything (all tenants).
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        None,
-    )
-    .await;
-    // `DELETE /api/v1/auth/cache` is TRI-STATE, and documented as such
-    // (`admin-ui/api-docs.js:43-47`: `200 applied` / `202 pending` with the lagging nodes
-    // named / `503 unavailable`; `ops.md` §5.1 repeats it and warns that only 200 means
-    // "done"). These two assertions used to demand a flat 200 — the answer this endpoint
-    // gave BEFORE the convergence barrier replaced the `published: false` flag that could
-    // never be false without a stream. Against the shipped contract they were simply
-    // stale (tracked as decision item D-2; this is the resolution the documentation
-    // already implies).
-    //
-    // This test injects NO fleet view (`AdminState::live_nodes` stays `None` ⇒ the
-    // handler resolves `live = []`), so the barrier has nobody to confirm and the
-    // documented outcome is exactly `202 pending` with `nodes_total = 0`. What the test
-    // is really about — the LOCAL cache being cleared regardless of the fleet — is
-    // asserted right below, and it is what would break if the local clear were skipped.
-    let status = r.status();
-    let v: serde_json::Value = r.json().await.expect("json");
-    let fleet_state = v["fleet"]["state"].as_str().unwrap_or("<no fleet.state>");
-    println!(
-        "[D-2] DELETE /api/v1/auth/cache -> {status} fleet={}",
-        v["fleet"]
-    );
-    assert_eq!(
-        status.as_u16(),
-        202,
-        "with no fleet view injected the barrier cannot confirm anyone, so the documented \
-         answer is `202 pending`: {v}"
-    );
-    assert_eq!(fleet_state, "pending", "{v}");
-    assert_eq!(v["fleet"]["nodes_total"], 0, "{v}");
-    assert_eq!(v["fleet"]["lagging"], serde_json::json!([]), "{v}");
-    assert!(
-        v["fleet"]["event_id"].is_string(),
-        "an accepted invalidation carries the stream entry it published: {v}"
-    );
-    assert_eq!(v["invalidated"], 3, "all 3 tenants' entries cleared: {v}");
-    assert_eq!(state.auth.cache().len(), 0, "local L1 fully cleared");
-
-    // The stream payload is still a whole-cache clear: (None, []).
-    let reader = InvalidationStream::new(reader_pool);
-    let events = reader.read_since("0", 10).await.expect("read stream");
-    assert_eq!(events.len(), 1, "one stream event published");
-    let ev = &events[0].1;
-    assert_eq!(ev.tenant_id, None, "whole-cache event (None tenant)");
-    assert!(ev.keyhashes.is_empty(), "whole-cache event (no keyhashes)");
-    assert!(
-        ev.legacy_keys.is_empty(),
-        "whole-cache event (no legacy keys)"
-    );
-}
-
-// ===========================================================================
 // §2.4 — breaker inspect / reset
 // ===========================================================================
 
@@ -2084,13 +1866,6 @@ async fn concurrency_snapshot_reports_live_gates() {
     let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let admission = AdmissionControl::new();
 
@@ -2114,7 +1889,6 @@ async fn concurrency_snapshot_reports_live_gates() {
     let state = Arc::new(AdminState::new(
         pool,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
@@ -2760,18 +2534,10 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
     let store = ConfigStore::from_data(db.clone(), cfg, key_provider.clone())
         .await
         .expect("from_data");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
     let state = Arc::new(AdminState::new(
         db,
         store,
-        auth,
         breaker,
         key_provider,
         Some(TOKEN.to_string()),
@@ -3232,112 +2998,6 @@ async fn oversized_admin_body_is_rejected_with_413() {
     )
     .await;
     assert_eq!(ok.status(), 201, "the next request must still be served");
-}
-
-/// An invalidation naming more keys than the cap is refused, and NOTHING is
-/// published to the invalidation stream.
-#[cfg(feature = "cluster-redis")]
-#[tokio::test]
-async fn too_many_invalidation_keys_are_refused_and_publish_nothing() {
-    use fred::prelude::*;
-    use hydra_core::config::ConfigData;
-    use hydra_server::cluster::events::InvalidationStream;
-
-    // Integration-test database 41 (see tests/common/mod.rs for the partition).
-    let pool = common::real_redis_pool(41).await;
-
-    let db = common::setup_pool().await;
-    let mut state = AdminState::new(
-        db.clone(),
-        ConfigStore::from_data(
-            db,
-            ConfigData::default(),
-            Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
-        )
-        .await
-        .expect("from_data"),
-        Arc::new(
-            HttpAuthChecker::new(
-                AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-                AuthConfig::default(),
-            )
-            .expect("checker"),
-        ),
-        Arc::new(CircuitBreaker::new(BreakerConfig::new(2))),
-        Arc::new(StaticKeyProvider::new([1u8; 32], 1)),
-        Some(TOKEN.to_string()),
-        hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
-    );
-    state.invalidation = Some(InvalidationStream::new(pool.clone()));
-    let port = start_admin(Arc::new(state));
-
-    // One over the cap.
-    let keys: Vec<String> = (0..1001).map(|i| format!("sk-{i}")).collect();
-    let body = serde_json::json!({ "api_keys": keys }).to_string();
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(&body),
-    )
-    .await;
-    assert_eq!(r.status(), 400, "1001 keys must be refused");
-    let text = r.text().await.expect("body");
-    assert!(text.contains("too_many_keys"), "body: {text}");
-
-    // An absurdly long single key is refused too.
-    let body = serde_json::json!({ "api_keys": ["k".repeat(5000)] }).to_string();
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(&body),
-    )
-    .await;
-    assert_eq!(r.status(), 400, "an oversized api_key must be refused");
-    let text = r.text().await.expect("body");
-    assert!(text.contains("invalid_api_key"), "body: {text}");
-
-    // Nothing reached the stream (XLEN, only possible against a real Redis).
-    let len: i64 = pool.xlen("hydra:{ctl:events}").await.expect("xlen");
-    assert_eq!(len, 0, "a refused invalidation must publish nothing");
-
-    // At the cap it IS accepted: exactly one entry, ~65 KB.
-    let keys: Vec<String> = (0..1000).map(|i| format!("sk-{i}")).collect();
-    let body = serde_json::json!({ "api_keys": keys }).to_string();
-    let r = req(
-        port,
-        reqwest::Method::DELETE,
-        "/api/v1/auth/cache",
-        Some(TOKEN),
-        Some(&body),
-    )
-    .await;
-    // What this asserts is ACCEPTANCE at the cap: the request must not be refused. The
-    // status itself is the documented tri-state (`api-docs.js:47`): with no fleet view
-    // injected this node reports `202 pending` (see the note in
-    // `empty_body_delete_invalidates_all_local`), and `400`/`503` would be failures.
-    let status = r.status();
-    let v: serde_json::Value = r.json().await.expect("json");
-    println!(
-        "[D-2] DELETE /api/v1/auth/cache (1000 keys) -> {status} fleet={}",
-        v["fleet"]
-    );
-    assert!(
-        matches!(status.as_u16(), 200 | 202),
-        "1000 keys are within the cap, so the invalidation is accepted (200 applied / 202 \
-         pending): {status} {v}"
-    );
-    assert_ne!(
-        status.as_u16(),
-        400,
-        "1000 keys are exactly at the cap: {v}"
-    );
-    let len: i64 = pool.xlen("hydra:{ctl:events}").await.expect("xlen");
-    assert_eq!(len, 1, "exactly one stream entry");
 }
 
 /// The admin token is the single secret gating every tenant/provider/api-key

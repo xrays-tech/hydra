@@ -26,7 +26,6 @@ use hydra_core::config::CertMeta;
 use hydra_core::model::{Tenant, UsageRecord};
 use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
-use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
 use hydra_server::proxy::limiter::RateLimiter;
@@ -153,19 +152,11 @@ async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
     let store = ConfigStore::load(pool, key_provider)
         .await
         .expect("ConfigStore::load");
-    let auth = Arc::new(
-        HttpAuthChecker::new(
-            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
-            AuthConfig::default(),
-        )
-        .expect("HttpAuthChecker::new"),
-    );
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
     let limiter = Arc::new(RateLimiter::new());
     let sink: Arc<dyn hydra_server::usage::UsageSink> = Arc::new(NoopSink);
     let state = AppState::for_tests(
         store.clone(),
-        auth,
         breaker,
         limiter,
         sink,

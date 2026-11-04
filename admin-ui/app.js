@@ -53,7 +53,6 @@ const ICONS = {
   access:     '<path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/>',
   gate:       '<path d="M3 4h18l-7 8v6l-4 2v-8L3 4Z"/>',
   limits:     '<path d="M21 12a9 9 0 1 0-9 9"/><path d="M12 7v5l3 2"/>',
-  authcache:  '<path d="M12 2 4 5v7c0 5 3.5 8 8 10 4.5-2 8-5 8-10V5l-8-3Z"/><path d="m9 12 2 2 4-4"/>',
   breaker:    '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/>',
   health:     '<path d="M3 12h4l2-6 4 12 2-6h6"/>',
   plus:       '<path d="M12 5v14M5 12h14"/>',
@@ -449,8 +448,7 @@ const CRUD = {
       { name: "name", label: "field.name", required: true, placeholder: "Acme" },
       { name: "domain", label: "field.domain", required: true, placeholder: "acme.com", tip: "tip.domain" },
       { name: "auth_url", label: "field.authUrl", type: "url", required: true, placeholder: "https://auth.acme.com/v1/verify", full: true,
-        tip: "tip.authUrl",
-        action: { label: "common.action.test", action: (input) => testAuthUrl(input) } },
+        tip: "tip.authUrl" },
       { name: "access_token", label: "field.accessToken", type: "password", map: "opt", full: true,
         placeholder: "ph.blankKeepToken",
         tip: "tip.blankKeep",
@@ -563,7 +561,7 @@ function numOrDash(v) {
     : el("span", { class: "mono", text: String(v) });
 }
 
-/* ---- custom sections (auth-cache / breaker / health) ---- */
+/* ---- custom sections (breaker / health) ---- */
 const CUSTOM = {
   "global-roles": {
     title: "custom.globalroles.title", nav: "custom.globalroles.nav", icon: "roles",
@@ -575,11 +573,6 @@ const CUSTOM = {
     desc: "custom.accesstokens.pageDesc",
     render: renderAccessTokens,
     teardown: teardownAccessTokens,
-  },
-  "auth-cache": {
-    title: "custom.authcache.title", nav: "custom.authcache.title", icon: "authcache",
-    desc: "custom.authcache.pageDesc",
-    render: renderAuthCache,
   },
   breaker: {
     title: "custom.breaker.pageTitle", nav: "custom.breaker.nav", icon: "breaker",
@@ -608,7 +601,7 @@ const CUSTOM = {
 /* ordered nav with section dividers */
 const NAV = [
   { labelKey: "common.nav.configuration", items: ["providers", "provider-models", "provider-keys", "tenants", "global-roles", "access-tokens", "tenant-providers", "tenant-models", "limit-roles"] },
-  { labelKey: "common.nav.operations", items: ["auth-cache", "breaker", "health", "stats"] },
+  { labelKey: "common.nav.operations", items: ["breaker", "health", "stats"] },
   { labelKey: "common.nav.reference", items: ["api-docs"] },
 ];
 function sectionConfig(key) { return CRUD[key] || CUSTOM[key]; }
@@ -1005,28 +998,6 @@ function setLoading(btn, loading, label) {
   } else {
     btn.disabled = false;
     if (btn._prevHTML !== undefined) { btn.innerHTML = btn._prevHTML; }
-  }
-}
-
-/* ===========================================================================
- * Tenant auth-url probe ("Test" button on the Tenants form)
- * ======================================================================== */
-async function testAuthUrl(input) {
-  const url = (input.value || "").trim();
-  if (!url) { toast(t("common.auth.testEnter"), "err"); return; }
-  const wrap = input.closest(".input-wrap");
-  const btn = wrap ? wrap.querySelector("button") : null;
-  if (btn) setLoading(btn, true, t("common.auth.testing"));
-  try {
-    const r = await api("POST", "/tenants/auth/test", { body: { auth_url: url } });
-    const ms = typeof r.duration_ms === "number" ? " · " + r.duration_ms + "ms" : "";
-    const head = typeof r.status === "number" ? "HTTP " + r.status + ms : ms;
-    if (r.ok) toast(r.detail + " (" + head + ")", "ok", { title: t("common.auth.testTitle") });
-    else toast(r.detail + " (" + head + ")", "err", { title: t("common.auth.testFailTitle") });
-  } catch (e) {
-    toast(e.message, "err", { title: t("common.auth.testFailTitle") });
-  } finally {
-    if (btn) setLoading(btn, false);
   }
 }
 
@@ -1949,82 +1920,6 @@ async function revokeAccessToken(tenantId, token) {
     await renderAccessTokens();
   } catch (e) {
     toast(e.message, "err", { title: t("custom.accesstokens.revokeFailed") });
-  }
-}
-
-/* ===========================================================================
- * Custom: Auth Cache
- * ======================================================================== */
-function renderAuthCache() {
-  const content = $("#content");
-  clear(content);
-  const panel = el("div", { class: "panel" },
-    el("div", { class: "panel-head" },
-      el("h2", {}, el("span", { text: t("custom.authcache.title") })), el("div", { class: "spacer" })),
-    el("p", { class: "note" },
-      t("custom.authcache.desc"), " ",
-      el("code", { text: "tenant.auth_url" }), t("custom.authcache.desc2")),
-    el("div", { class: "field-row" },
-      el("div", { class: "input-group" },
-        el("label", { text: t("custom.authcache.tenantLabel") }),
-        el("input", { type: "text", id: "inv-tenant", placeholder: "e.g. t1" }),
-      ),
-      el("div", { class: "input-group" },
-        el("label", { text: t("custom.authcache.keysLabel") }),
-        el("input", { type: "text", id: "inv-keys", placeholder: "sk-aaa, sk-bbb" }),
-      ),
-    ),
-    el("div", { style: "margin-top:14px" },
-      el("button", { class: "btn primary", onClick: doInvalidate }, icon("trash", 15), " " + t("custom.authcache.invalidate")),
-    ),
-    el("div", { id: "inv-result", class: "hidden", style: "margin-top:14px" }),
-  );
-  content.appendChild(panel);
-}
-
-async function doInvalidate() {
-  const tenant = $("#inv-tenant").value.trim();
-  const keysRaw = $("#inv-keys").value.trim();
-  const keys = keysRaw ? keysRaw.split(",").map((s) => s.trim()).filter(Boolean) : null;
-  if (!tenant && !keys) { toast(t("common.token.provide"), "err"); return; }
-  const body = {};
-  if (tenant) body.tenant_id = tenant;
-  if (keys) body.api_keys = keys;
-  const box = $("#inv-result");
-  const invalidatedMsg = (n) => t("common.token.invalidated", { n, y: n === 1 ? "y" : "ies" });
-  try {
-    const r = await api("DELETE", "/auth/cache", { body });
-    // The response carries WHERE THE FLEET STANDS, not a boolean: `applied`
-    // (every live node confirmed), `pending` (published, the laggards are named)
-    // or `single_node`. Ignoring it was how an operator came to believe a
-    // banned key had been cleared everywhere when no node had been told.
-    const fleet = r.fleet || {};
-    const state = fleet.state || "unknown";
-    const lagging = (fleet.lagging || []).join(", ");
-    // An explicit map, not a template string: `scripts/check_i18n.js` can only
-    // verify keys it can see, and a key built at runtime is a key that can go
-    // missing from three of the four locales unnoticed.
-    const FLEET_KEYS = {
-      applied: "common.token.fleet.applied",
-      pending: "common.token.fleet.pending",
-      single_node: "common.token.fleet.single_node",
-      unavailable: "common.token.fleet.unavailable",
-    };
-    const fleetMsg = t(FLEET_KEYS[state] || "common.token.fleet.unknown", {
-      total: fleet.nodes_total ?? "?",
-      applied: fleet.nodes_applied ?? "?",
-      lagging: lagging || "-",
-    });
-    const ok = state === "applied" || state === "single_node";
-    box.className = ok ? "alert ok" : "alert err";
-    box.textContent = `${invalidatedMsg(r.invalidated)}. ${fleetMsg}`;
-    box.classList.remove("hidden");
-    toast(fleetMsg, ok ? "ok" : "err");
-  } catch (e) {
-    box.className = "alert err";
-    box.textContent = e.message;
-    box.classList.remove("hidden");
-    toast(e.message, "err");
   }
 }
 
