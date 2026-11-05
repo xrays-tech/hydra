@@ -951,6 +951,19 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(not(feature = "arachne"))]
     let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
+    #[cfg(feature = "arachne")]
+    let (cluster_peers, node_id, leader_name) = match arachne_control.as_ref() {
+        Some(ctl) => {
+            let leader_ctl = Arc::clone(ctl);
+            (
+                ctl.peers().cloned().map(Arc::new),
+                ctl.node_id().to_string(),
+                Some(Arc::new(move || leader_ctl.leader_name())
+                    as Arc<dyn Fn() -> Option<String> + Send + Sync>),
+            )
+        }
+        None => (None, String::new(), None),
+    };
     Ok(BootstrapComponents {
         pool,
         store,
@@ -959,6 +972,12 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         state,
         leader_ready,
         cert_store,
+        #[cfg(feature = "arachne")]
+        cluster_peers,
+        #[cfg(feature = "arachne")]
+        node_id,
+        #[cfg(feature = "arachne")]
+        leader_name,
         #[cfg(feature = "cluster-redis")]
         invalidation_stream,
         #[cfg(not(feature = "cluster-redis"))]
@@ -995,6 +1014,14 @@ struct BootstrapComponents {
     /// The convergence budget, same value for both entry points.
     #[cfg(feature = "cluster-redis")]
     converge_timeout: std::time::Duration,
+    /// Arachne fleet view for `/api/v1/cluster/status`: the configured member
+    /// list, this node's id, and the raft leader cache (all `None`/empty off-cluster).
+    #[cfg(feature = "arachne")]
+    cluster_peers: Option<Arc<hydra_server::cluster::arachne_node::ClusterPeers>>,
+    #[cfg(feature = "arachne")]
+    node_id: String,
+    #[cfg(feature = "arachne")]
+    leader_name: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     /// Resolved multi-tenant cert store (design §12.1 single source). Built in
     /// `bootstrap` — not in `run_server` — because it registers itself as a
     /// follower of the config snapshot, and a snapshot can be applied (by the
@@ -1238,6 +1265,16 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     #[cfg(feature = "cluster-redis")]
     {
         admin_state.invalidation = c.invalidation_stream;
+    }
+    // Arachne fleet view (/api/v1/cluster/status): the member list, this node's
+    // identity, and the raft leader cache are injected here. They used to stay at
+    // their `AdminState::new` defaults (`None`/empty), so a real 3-node raft
+    // cluster reported `cluster:false, mode:"single"` while serving traffic.
+    #[cfg(feature = "arachne")]
+    {
+        admin_state.cluster_peers = c.cluster_peers;
+        admin_state.node_id = c.node_id;
+        admin_state.leader_name = c.leader_name;
     }
     // The live-node view and convergence budget the admin service reports
     // against, so it can answer fleet questions honestly (and so the two

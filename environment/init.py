@@ -114,7 +114,6 @@ def main():
     post(f"tenant {t.get('id','default')}", "/tenants", {
         "id": t.get("id", "default"), "name": t.get("name", "Default"),
         "domain": t.get("domain", "localhost"),
-        "auth_url": t.get("auth_url", "http://mock-tenant:9091"),
         "enabled": True, "cert_key": None, "cert_file": None,
     })
     # associate tenant with all providers
@@ -130,9 +129,48 @@ def main():
             "model_key": mk,
         })
 
+    # ── tenant access token (multi-token; plaintext is shown once) ──
+    tenant_id = t.get("id", "default")
+    st, tok = req("POST", f"{base}/tenants/{tenant_id}/access-tokens", token, {"name": "local"})
+    if st not in (200, 201):
+        print(f"[init] FAIL: mint tenant token -> {st} {tok}")
+        sys.exit(1)
+    tenant_token = tok.get("token") if isinstance(tok, dict) else None
+    if not tenant_token:
+        print(f"[init] FAIL: token response had no plaintext: {tok}")
+        sys.exit(1)
+
+    # ── user hierarchy: group -> user -> client api-key ──
+    data = cfg.get("data_url", "http://localhost:8080").rstrip("/")
+    def t_req(method, path, body):
+        return req(method, f"{data}/tenant/{tenant_id}/api/v1{path}", tenant_token, body)
+    st, g = t_req("PUT", "/user-groups", {"name": "local"})
+    if st not in (200, 201):
+        print(f"[init] FAIL: create user-group -> {st} {g}")
+        sys.exit(1)
+    gid = g["user_group"]["id"]
+    st, u = t_req("PUT", "/users", {"user_group_id": gid, "name": "local-user"})
+    if st not in (200, 201):
+        print(f"[init] FAIL: create user -> {st} {u}")
+        sys.exit(1)
+    uid = u["user"]["id"]
+    st, k = t_req("POST", f"/users/{uid}/api-keys", {"name": "local"})
+    if st not in (200, 201):
+        print(f"[init] FAIL: create client key -> {st} {k}")
+        sys.exit(1)
+    client_key = k["key"]
+    try:
+        Path = __import__("pathlib").Path
+        (Path(ROOT) / "secure" / "local-client-key").write_text(client_key + "\n")
+    except Exception:
+        pass
+
     print(f"\n[init] done: {ok} ok, {fail} warnings (duplicates are fine).")
+    print(f"[init] tenant_id={tenant_id}")
+    print(f"[init] tenant_token={tenant_token}")
+    print(f"[init] client_key={client_key}")
     print("[init] test: curl http://localhost:8080/v1/chat/completions \\")
-    print("           -H 'Authorization: Bearer <your-client-key>' \\")
+    print(f"           -H 'Authorization: Bearer {client_key}' \\")
     print("           -H 'Content-Type: application/json' \\")
     print(f"           -d '{{\"model\":\"{all_model_keys[0] if all_model_keys else 'gpt-4o'}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'")
 

@@ -9,8 +9,9 @@
 #   * redis and clickhouse are the real services;
 #   * three real Hydra processes, ALL IDENTICAL raft members (ADR-0001: no leader/edge split)
 #     over a real Redis backbone, with ClickHouse usage metering.
-# The ONLY stand-in is the tenant authentication hop (Hydra mandates an external
-# auth_url); it is the always-allow contract of environment/mock_tenant/app.py.
+# Hydra authenticates client api-keys INTERNALLY (no auth_url hop). The local mock-llm
+# below is the upstream stand-in used by the stability drills; no external auth service
+# is needed.
 #
 # One small image is built from the repo Dockerfile (environment/Dockerfile),
 # which COPYs the staged ./bin/hydra and installs ca-certificates + tini. An
@@ -44,6 +45,9 @@ services:
   hydra-a:
     image: hydra-local:latest
     container_name: hydra-a
+    networks:
+      default:
+        ipv4_address: 172.28.0.11
     # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
     # shorter than this process needs: it drains in-flight requests for
     # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
@@ -58,9 +62,10 @@ services:
     environment:
       # ADR-0001: the member list IS the cluster, and its ORDER is the cluster's identity
       # (raft ids are positional). Same string on all three nodes.
-      HYDRA_CLUSTER_PEERS: "node-a=hydra-a:8091,node-b=hydra-b:8092,node-c=hydra-c:8093"
+      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-a"
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8091"
+      HYDRA_ARACHNE_LISTEN: "172.28.0.11:8091"
+      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
@@ -80,7 +85,7 @@ services:
     depends_on:
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
-      mock-tenant: { condition: service_healthy }
+      mock-llm: { condition: service_healthy }
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$HYDRA_ADMIN_TOKEN\" http://127.0.0.1:8081/api/v1/health"]
       interval: 10s
@@ -92,6 +97,9 @@ services:
   hydra-b:
     image: hydra-local:latest
     container_name: hydra-b
+    networks:
+      default:
+        ipv4_address: 172.28.0.12
     # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
     # shorter than this process needs: it drains in-flight requests for
     # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
@@ -104,9 +112,10 @@ services:
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
-      HYDRA_CLUSTER_PEERS: "node-a=hydra-a:8091,node-b=hydra-b:8092,node-c=hydra-c:8093"
+      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-b"
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8092"
+      HYDRA_ARACHNE_LISTEN: "172.28.0.12:8092"
+      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
@@ -124,7 +133,7 @@ services:
     depends_on:
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
-      mock-tenant: { condition: service_healthy }
+      mock-llm: { condition: service_healthy }
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$HYDRA_ADMIN_TOKEN\" http://127.0.0.1:8081/api/v1/health"]
       interval: 10s
@@ -136,6 +145,9 @@ services:
   hydra-c:
     image: hydra-local:latest
     container_name: hydra-c
+    networks:
+      default:
+        ipv4_address: 172.28.0.13
     # Docker's default stop grace is 10s (SIGTERM, then SIGKILL), which is far
     # shorter than this process needs: it drains in-flight requests for
     # HYDRA_SHUTDOWN_DRAIN_SECS (default 20) plus a 5s final runtime step.
@@ -148,9 +160,10 @@ services:
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
-      HYDRA_CLUSTER_PEERS: "node-a=hydra-a:8091,node-b=hydra-b:8092,node-c=hydra-c:8093"
+      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-c"
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8093"
+      HYDRA_ARACHNE_LISTEN: "172.28.0.13:8093"
+      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
@@ -172,7 +185,7 @@ services:
     depends_on:
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
-      mock-tenant: { condition: service_healthy }
+      mock-llm: { condition: service_healthy }
     healthcheck:
       # Every node serves the admin API (there is no edge role any more), and /api/v1/health
       # requires the Bearer token — same probe as the other two nodes.
@@ -288,46 +301,60 @@ services:
       clickhouse: { condition: service_healthy }
     restart: "no"
 
-  # ── Tenant authentication hop (the only stand-in) ──────────────────────────
-  # Reproduces environment/mock_tenant/app.py: POST / and POST /auth return
-  # {"allowed":true,"expires_in":300}; GET /health returns {"status":"ok"}.
-  # Inlined rather than bind-mounted because data files cannot be mounted here.
-  # Point a real service at it by editing auth_url in secure/config.json.
-  mock-tenant:
+  # ── Local OpenAI-compatible upstream for stability drills ──────────────────
+  # No external auth hop: Hydra now authenticates client api-keys internally.
+  # The mock returns deterministic chat completions + usage so destructive tests
+  # do not call a real provider (or spend real API credits).
+  mock-llm:
     image: python:3.12-slim
-    container_name: hydra-local-auth
+    container_name: hydra-local-mock-llm
     command:
       - python
       - -c
       - |
-        import json
+        import json, sys
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class H(BaseHTTPRequestHandler):
-            def _j(self, code, obj):
-                d = json.dumps(obj).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(d)))
-                self.end_headers()
-                self.wfile.write(d)
-            def do_GET(self):
-                self._j(200, {"status": "ok"} if self.path == "/health" else {"service": "mock-tenant"})
             def do_POST(self):
                 n = int(self.headers.get("Content-Length", 0))
-                if n:
-                    self.rfile.read(n)
-                self._j(200, {"allowed": True, "reason": "mock-tenant-always-allow", "expires_in": 300})
+                body = self.rfile.read(n) if n else b"{}"
+                try:
+                    req = json.loads(body)
+                    model = req.get("model", "echo")
+                    prompt = (req.get("messages") or [{}])[-1].get("content", "")
+                except Exception:
+                    model, prompt = "echo", ""
+                resp = {"id": "chatcmpl-mock", "object": "chat.completion", "model": model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                     "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": max(len(prompt)//4, 1), "completion_tokens": 1,
+                                  "total_tokens": max(len(prompt)//4, 1) + 1}}
+                data = json.dumps(resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers(); self.wfile.write(data)
+            def do_GET(self):
+                data = json.dumps({"object": "list", "data": [{"id": "echo", "object": "model"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers(); self.wfile.write(data)
             def log_message(self, *a):
                 pass
-        HTTPServer(("0.0.0.0", 9091), H).serve_forever()
-    ports:
-      - "127.0.0.1:9091:9091"
+        HTTPServer(("0.0.0.0", 9090), H).serve_forever()
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9091/health',timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9090/',timeout=2)"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   hydra-a-data:
