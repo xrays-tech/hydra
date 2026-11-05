@@ -429,6 +429,39 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             ));
             let store = store.with_publisher(publisher);
 
+            // The config tree is content-addressed and append-only. Without GC
+            // every publish leaves its old toc/entities in Arachne forever; at
+            // 4k entities that produced 447–511 MB snapshots, and the 64 MB
+            // snapshot threshold made the leader build a half-gigabyte snapshot
+            // every few hundred writes. Snapshot creation blocks apply, so the
+            // leader lost quorum and flapped. Keep only the CURRENT tree, in
+            // bounded batches, on whichever node currently leads.
+            #[cfg(feature = "arachne")]
+            if let Some(ctl) = arachne_control.as_ref() {
+                let gc_store = store.clone();
+                let ctl = Arc::clone(ctl);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(10));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        if !ctl.is_leader() {
+                            continue;
+                        }
+                        match gc_store.gc(200).await {
+                            Ok(Some(stats)) if stats.deleted() > 0 => info!(
+                                toc_deleted = stats.toc_deleted,
+                                entities_deleted = stats.entities_deleted,
+                                remaining = stats.remaining(),
+                                "arachne config GC: removed old content-addressed versions"
+                            ),
+                            Err(e) => warn!(error = %e, "arachne config GC failed; will retry"),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
             let target = Arc::new(ReplicaTarget::new(store.clone(), key_provider.clone()));
             let mut materializer = Materializer::new(ctl_store, target, key_provider.clone());
             tokio::spawn(async move {
@@ -891,6 +924,21 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // `503 usage_store_unavailable` in the tenant handler, not an accident.
     let usage = usage_backend.query.clone();
 
+    #[cfg(feature = "arachne")]
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = match &arachne_control {
+        Some(control) => {
+            let control = Arc::clone(control);
+            info!(
+                node_id = %control.node_id(),
+                "leadership is decided by the Arachne write probe (raft)"
+            );
+            Some(Arc::new(move || control.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "arachne"))]
+    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
+
     let state = Arc::new(AppState {
         store: store.clone(),
         breaker: breaker.clone(),
@@ -936,20 +984,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // The ONLY source of `leader_ready` now. When the control plane did not start — single-node
     // mode, i.e. no `HYDRA_CLUSTER_PEERS` — there is deliberately no leader notion at all and
     // `/healthz/leader` answers 404 rather than fabricating one (the documented single-node shape).
-    #[cfg(feature = "arachne")]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = match &arachne_control {
-        Some(control) => {
-            let control = Arc::clone(control);
-            info!(
-                node_id = %control.node_id(),
-                "leadership is decided by the Arachne write probe (raft)"
-            );
-            Some(Arc::new(move || control.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
-        }
-        None => None,
-    };
-    #[cfg(not(feature = "arachne"))]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
     #[cfg(feature = "arachne")]
     let (cluster_peers, node_id, leader_name) = match arachne_control.as_ref() {

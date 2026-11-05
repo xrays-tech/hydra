@@ -56,6 +56,9 @@ pub enum StoreError {
         "the config was committed to the local database but NOT PUBLISHED to the cluster: {reason}"
     )]
     NotPublished { reason: String },
+    /// Legacy config GC failed; the cluster keeps serving, and the next pass retries.
+    #[error("config GC failed: {0}")]
+    Gc(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +377,15 @@ pub struct ConfigStore {
     /// reload/publish semantics. Shared through `Arc` so `ConfigStore` clones (and
     /// therefore the whole store view) guard the same lock.
     publish_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Highest raft index this node has PUBLISHED locally. The materializer must
+    /// not apply a head below it: a stale `get_stale` read after a local write
+    /// used to let it rebuild the DB from an older tree and silently delete the
+    /// just-committed rows (measured: random role losses under 2000-role load).
+    local_write_index: Arc<std::sync::atomic::AtomicU64>,
+    /// The head hash this node last published locally. On a FOLLOWER the local
+    /// raft replica can lag; without this gate the materializer applies an older
+    /// head and wipes the committed-but-not-yet-materialized write.
+    pending_head: Arc<std::sync::Mutex<Option<String>>>,
     /// The Arachne publisher (ADR-0001), present only in a cluster node built with the `arachne`
     /// feature. `None` in single-node mode, where a local reload IS the whole truth.
     #[cfg(feature = "arachne")]
@@ -475,6 +487,8 @@ impl ConfigStore {
             replication: Arc::new(arc_swap::ArcSwap::from_pointee(content)),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
             publish_lock: Arc::new(tokio::sync::Mutex::new(())),
+            local_write_index: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_head: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "arachne")]
             publisher: None,
         })
@@ -537,6 +551,46 @@ impl ConfigStore {
     pub fn on_snapshot_change(&self, hook: SnapshotHook) {
         let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
         hooks.push(hook);
+    }
+
+    /// One bounded legacy-config GC pass, serialized with local writes/publish.
+    ///
+    /// `None` off-cluster (no publisher). The control plane keeps old content-addressed
+    /// entities/tocs forever otherwise; at scale their snapshots block the raft leader.
+    #[cfg(feature = "arachne")]
+    pub async fn gc(
+        &self,
+        max_deletes: usize,
+    ) -> Result<Option<crate::cluster::arachne_store::GcStats>, StoreError> {
+        let _guard = self.publish_guard().await;
+        match &self.publisher {
+            Some(p) => p.gc(max_deletes).await.map(Some).map_err(StoreError::Gc),
+            None => Ok(None),
+        }
+    }
+
+    /// The head this node published locally and has not yet observed applied.
+    #[must_use]
+    pub fn pending_head(&self) -> Option<String> {
+        self.pending_head
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Clear the pending marker once the materializer has applied that head.
+    pub fn clear_pending_head(&self, head: &str) {
+        let mut guard = self.pending_head.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_deref() == Some(head) {
+            *guard = None;
+        }
+    }
+
+    /// Highest raft index this node has published locally (0 before any write).
+    #[must_use]
+    pub fn local_write_index(&self) -> u64 {
+        self.local_write_index
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Acquire the publish coordination lock.
@@ -643,10 +697,17 @@ impl ConfigStore {
         #[cfg(feature = "arachne")]
         if let Some(publisher) = &self.publisher {
             let content = self.replication();
-            publisher
+            let published_head = publisher
                 .publish(&content.cfg, content.fidelity())
                 .await
                 .map_err(|reason| StoreError::NotPublished { reason })?;
+            *self.pending_head.lock().unwrap_or_else(|e| e.into_inner()) = Some(published_head);
+            // The local DB has committed the write; record the index we published
+            // so the materializer cannot rebuild from an older head that predates it.
+            if let Ok(Some((_, index))) = publisher.head_with_index().await {
+                self.local_write_index
+                    .store(index, std::sync::atomic::Ordering::Release);
+            }
         }
         Ok(true)
     }

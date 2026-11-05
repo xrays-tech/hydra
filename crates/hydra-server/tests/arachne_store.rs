@@ -11,10 +11,11 @@
 //!   in proportion to the size of the config;
 //! * an entity whose stored bytes do not match the toc is refused rather than
 //!   served;
-//! * since the `multi_put` conversion (plan 2026-10-10, A1–A4): one publish IS
-//!   one log entry, an over-cap batch is refused WHOLE before it enters the log,
-//!   concurrent publishes commit whole trees, and the toc the head names
-//!   describes a tree that is fully present.
+//! * since the `multi_put` conversion (plan 2026-10-10, A1–A4): missing entities are
+//!   uploaded in bounded content-addressed chunks and then toc + head commit in ONE log
+//!   entry, a bulk tree past the old single-batch cap commits via those chunks, concurrent
+//!   publishes commit whole trees, and the toc the head names describes a tree that is
+//!   fully present.
 //!
 //! The node is a one-member cluster assembled in-process. `Arachne::start`
 //! cannot be used here: it is a process-wide singleton, so a test binary cannot
@@ -31,9 +32,7 @@ use arachne_kv::{NodeId, Profile};
 use hydra_server::cluster::arachne_keys::{
     cfg_entity, cfg_toc, content_hash, ctl_head, hex_hash, EntityPath, Toc,
 };
-use hydra_server::cluster::arachne_store::{
-    ArachneConfigStore, ConfigTree, ReadOutcome, StoreError,
-};
+use hydra_server::cluster::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome};
 
 /// A raft member must be dialable at the address its peers were told about, so
 /// these cannot be OS-assigned — and cargo runs the tests in this file
@@ -112,11 +111,10 @@ fn expect_tree(outcome: ReadOutcome) -> BTreeMap<EntityPath, Vec<u8>> {
     }
 }
 
-/// A full round trip, and the commit-point property that replaced head-last
-/// ordering (2026-10-10, multi_put): the head MOVES WITH the entities and toc
-/// it names — one atomic batch, one log entry — so a reader sees either the old
-/// tree or the new one, never a mix, and once it has, the toc names exactly the
-/// tree that was published.
+/// A full round trip, and the commit-point property (2026-10-10, multi_put): missing
+/// entities are pre-uploaded under content-addressed keys, then the head MOVES WITH the toc
+/// it names — one atomic final batch, one log entry — so a reader sees either the old tree
+/// or the new one, never a mix, and once it has, the toc names exactly the tree published.
 ///
 /// Falsification: there is no window left to observe (the "move the head write
 /// before the toc write" falsification of the old head-last test no longer
@@ -147,9 +145,9 @@ async fn a_publish_round_trips_and_the_head_moves_with_its_tree() {
         "the tree must round trip byte for byte"
     );
 
-    // Entities, toc and head commit together, so there is no intermediate state
-    // for a reader to land in: after a second publish the head moved WITH its
-    // tree, and reading still yields one coherent config.
+    // The entity chunks are uploaded first and then toc + head commit together, so there is
+    // no intermediate state for a reader to land in: after a second publish the head moved
+    // WITH its tree, and reading still yields one coherent config.
     let mut second = first.clone();
     second.insert(
         EntityPath::Tenant("initech".into()),
@@ -387,39 +385,30 @@ async fn an_interleaved_publish_cannot_tear_the_tree_named_by_the_head() {
     node.thread.shutdown();
 }
 
-/// `hydra_arachne_publish_total{result="refused"}` — the capacity alarm. Read from the
-/// process-wide registry, so a test compares DELTAS, never absolutes.
-fn refused_publish_count() -> u64 {
-    hydra_server::admin::metrics::render()
-        .lines()
-        .find_map(|l| l.strip_prefix("hydra_arachne_publish_total{result=\"refused\"} "))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// ONE PUBLISH IS ONE LOG ENTRY (plan A1), and an unchanged entity is not resent.
+/// THE FINAL COMMIT IS ONE LOG ENTRY (plan A1), and an unchanged entity is not resent.
 ///
 /// The evidence is index arithmetic, not timing: `get_stale_with_index` reports the raft log
-/// index of the entry that wrote the key, so the head's index advancing by at least 1 per
-/// publish session, WITH the batch's contents pinned to that same session, is "one session =
-/// one entry". Before `multi_put` the same measurement gave `+N+2` (N entities + toc + head as
-/// separate proposes). The delta itself is `>= 1` rather than `== 1` (2026-10-10, oracle F4):
-/// a no-op entry from a leader handover may also advance the index, and that would false-red an
-/// exact-equality claim without meaning the batch split. What pins "same batch" is the index
-/// equality: the toc lands at the SAME index as the head, a newly written entity carries that
-/// index too, and an entity the new tree did not change keeps ITS origin index (it was skipped,
-/// not rewritten) — split the batch and the equality pins fail even when the delta would not.
+/// index of the entry that wrote the key. Missing entities are now uploaded in earlier,
+/// bounded chunks (content-addressed, unreferenced until the head moves), and the final batch
+/// writes toc + head together: the toc lands at the SAME index as the head. Before `multi_put`
+/// the same measurement gave `+N+2` (N entities + toc + head as separate proposes). The delta
+/// itself is `>= 1` rather than `== 1` (2026-10-10, oracle F4): a no-op entry from a leader
+/// handover may also advance the index, and that would false-red an exact-equality claim
+/// without meaning the commit split. What pins "same final batch" is the index equality
+/// between toc and head; an entity the new tree did not change keeps ITS origin index (it was
+/// skipped, not rewritten).
 ///
-/// Falsification: split the batch back into per-entity puts and the toc's index no longer equals
+/// Falsification: write toc and head as separate proposes and the toc's index no longer equals
 /// the head's (toc lands an entry earlier); always resend every entity and the frozen acme index
 /// advances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
+async fn the_final_commit_is_one_log_entry_and_unchanged_entities_stay_put() {
     let node = start_node("one-entry", PORTS[6]).await;
     wait_writable(&node).await;
     let store = ArachneConfigStore::new(node.handle.clone());
 
-    // First publish: everything is new, so the batch is 2 entities + toc + head.
+    // First publish: everything is new, so the two entities are uploaded in a chunk first,
+    // then toc + head commit in the final batch.
     let t = tree(&[("acme", b"one"), ("globex", b"two")]);
     let h1 = store.publish(&t).await.expect("first publish");
     let (_, i1) = store
@@ -454,8 +443,8 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
          index went {i1} → {i2}"
     );
 
-    // toc and head were written BY that entry: both carry its index, and the toc key under the
-    // committed hash is the one that entry wrote (toc/head are never skipped).
+    // toc and head were written BY the final commit entry: both carry its index, and the toc
+    // key under the committed hash is the one that entry wrote (toc/head are never skipped).
     let toc_key = cfg_toc(&h2);
     let (toc_bytes, toc_i) = node
         .handle
@@ -491,7 +480,8 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
         "the skipped entity's bytes must be intact"
     );
 
-    // A CHANGED tree is still one entry, and the entities it did not change stay untouched.
+    // A CHANGED tree still commits in one final entry, and the entities it did not change stay
+    // untouched.
     let mut t3 = t.clone();
     t3.insert(EntityPath::Tenant("initech".into()), b"three".to_vec());
     let h3 = store.publish(&t3).await.expect("third publish");
@@ -503,10 +493,10 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
     assert!(
         i3 - i2 >= 1,
         "a changed publish must advance the head by at least one log entry (same no-op caveat \
-         as above; the atomicity pins are the index equalities): head index went {i2} → {i3}"
+         as above; the atomicity pin is the toc/head index equality): head index went {i2} → {i3}"
     );
-    // Same-batch pins for THIS publish: the toc of the committed hash and the brand-new entity
-    // only this batch contains both carry the entry that moved the head.
+    // Same-entry pin for THIS publish: the toc of the committed hash carries the index of the
+    // entry that moved the head.
     let toc3_key = cfg_toc(&h3);
     let (toc3_bytes, toc3_i) = node
         .handle
@@ -516,8 +506,8 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
         .expect("every session rewrites the toc");
     assert_eq!(
         toc3_i, i3,
-        "the third toc must be written by the SAME log entry as the head (one atomic batch), got \
-         toc={toc3_i} head={i3}"
+        "the third toc must be written by the SAME log entry as the head (one atomic commit \
+         batch), got toc={toc3_i} head={i3}"
     );
     assert_eq!(
         hex_hash(&content_hash(&toc3_bytes)),
@@ -533,11 +523,11 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
         .get_stale_with_index(initech_key.as_bytes())
         .await
         .expect("initech read")
-        .expect("the third batch must have stored initech");
-    assert_eq!(
-        initech_i, i3,
-        "a NEWLY written entity must carry its publish session's index (same atomic batch), got \
-         entity={initech_i} head={i3}"
+        .expect("the third publish must have stored initech");
+    assert!(
+        initech_i < i3,
+        "a NEWLY written entity is uploaded in a chunk BEFORE the final toc/head commit, so its \
+         origin index must precede the head's: entity={initech_i} head={i3}"
     );
     let (_, acme_i3) = node
         .handle
@@ -555,90 +545,41 @@ async fn one_publish_is_one_log_entry_and_unchanged_entities_stay_put() {
     node.thread.shutdown();
 }
 
-/// AN OVER-CAP BATCH IS REFUSED WHOLE, BEFORE IT ENTERS THE LOG (plan A2).
+/// A BULK TREE PAST THE OLD SINGLE-BATCH CAP COMMITS VIA CHUNKS.
 ///
-/// Five entities of 900 KiB: every single value is UNDER the 1 MiB per-value cap, but the
-/// batch totals ~4.4 MiB — over the library's `MAX_MULTI_PUT_TOTAL_BYTES` (4 MiB). The
-/// library validates the batch before proposing (`validate_multi_put`), so the refusal is a
-/// fact about the config: the head keeps its value AND its origin index (a partially applied
-/// batch would have moved at least one of them), the previously committed tree still reads
-/// back intact, and `publish` counts the outcome as `result="refused"` — the capacity alarm —
-/// rather than an opaque error.
+/// 4200 entities of ~1 KiB: a single `multi_put` would exceed BOTH the library's 4096-entry
+/// and 4 MiB total-byte bounds and be refused whole. `publish_inner` uploads the missing
+/// entities in bounded chunks (<=2048 entries / <=2 MiB key+value) and only then commits
+/// toc + head in one final entry, so the bulk tree lands intact and the head still names a
+/// fully present tree.
 ///
-/// Falsification: split the batch to fit and the `StoreError::Refused` match fails (it would
-/// commit instead); drop the `InvalidArgument → Refused` arm in `map_err` and the variant
-/// match plus the counter both fail.
+/// Falsification: put every missing entity in one batch and this fails with
+/// `StoreError::Refused`; skip the final commit batch and the head never moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_over_cap_batch_is_refused_whole_before_it_enters_the_log() {
-    let node = start_node("overcap", PORTS[9]).await;
+async fn a_bulk_tree_past_the_old_single_batch_cap_commits_via_chunks() {
+    let node = start_node("bulk", PORTS[9]).await;
     wait_writable(&node).await;
     let store = ArachneConfigStore::new(node.handle.clone());
 
-    // A small committed tree, so "the log did not move" has a baseline to stay at.
-    let baseline = tree(&[("acme", b"baseline")]);
-    let h1 = store.publish(&baseline).await.expect("baseline publish");
-    let (_, i1) = store
-        .current_head_with_index()
-        .await
-        .expect("head read")
-        .expect("the baseline must publish a head");
-    let refused_before = refused_publish_count();
-
-    // ~1 MiB per value (under max_value_bytes), ~4.4 MiB in total (over the batch cap).
-    let payload = "x".repeat(900 * 1024);
-    let huge = tree(&[
-        ("h0", payload.as_bytes()),
-        ("h1", payload.as_bytes()),
-        ("h2", payload.as_bytes()),
-        ("h3", payload.as_bytes()),
-        ("h4", payload.as_bytes()),
-    ]);
-    let err = store
-        .publish(&huge)
-        .await
-        .expect_err("a batch over the total-byte cap must not commit");
-    match &err {
-        StoreError::Refused(msg) => assert!(
-            msg.contains("MAX_MULTI_PUT_TOTAL_BYTES"),
-            "the refusal must name the batch cap that tripped (that is the pre-propose \
-             InvalidArgument), got: {msg}"
-        ),
-        other => panic!(
-            "an over-cap batch must surface as StoreError::Refused before proposing, got {other:?}"
-        ),
+    let mut bulk = ConfigTree::new();
+    for i in 0..4200 {
+        bulk.insert(EntityPath::Tenant(format!("bulk-{i:04}")), vec![b'x'; 1024]);
     }
-
-    // Whole batch stayed OUT of the log: head value AND origin index unmoved, and the
-    // committed tree still reads as the baseline.
-    let (h2, i2) = store
-        .current_head_with_index()
+    let hash = store
+        .publish(&bulk)
         .await
-        .expect("head read")
-        .expect("the head must still be there");
+        .expect("a bulk tree past the old single-batch cap must commit via chunks");
+
     assert_eq!(
-        (h2.as_str(), i2),
-        (h1.as_str(), i1),
-        "the refused batch must not have entered the log: head value and origin index unmoved"
+        store.current_hash().await.expect("head read"),
+        Some(hash),
+        "the final commit must move the head to the bulk tree"
     );
     assert_eq!(
         expect_tree(store.read().await.expect("read")),
-        baseline,
-        "the cluster must still serve exactly the pre-refusal tree (no half-write)"
+        bulk,
+        "every entity of the chunked upload must be present and hash-verified under the head"
     );
-
-    // The capacity alarm fired.
-    let refused_after = refused_publish_count();
-    assert!(
-        refused_after > refused_before,
-        "publish must count a pre-propose refusal as result=\"refused\" (before \
-         {refused_before}, after {refused_after})"
-    );
-
-    // ...and the healthy path still works afterwards: the refusal did not poison the node.
-    store
-        .publish(&tree(&[("acme", b"after")]))
-        .await
-        .expect("a healthy publish must still succeed after a refusal");
 
     node.tonic.shutdown().await;
     node.thread.shutdown();
@@ -646,11 +587,11 @@ async fn an_over_cap_batch_is_refused_whole_before_it_enters_the_log() {
 
 /// CONCURRENT PUBLISHERS COMMIT WHOLE TREES, NEVER A MIX (plan A3).
 ///
-/// Two publishes racing on the same node: each is one atomic batch, so both must commit, and
-/// whichever head wins, a reader sees exactly one publisher's tree — complete, with every
-/// entity (including the loser's) still stored under its own content-addressed key. The
-/// deterministic interleave test above pins the key-non-conflict side of this; this one is the
-/// real race.
+/// Two publishes racing on the same node: each entity upload is content-addressed and the
+/// final toc/head commit is atomic, so both must commit, and whichever head wins, a reader
+/// sees exactly one publisher's tree — complete, with every entity (including the loser's)
+/// still stored under its own content-addressed key. The deterministic interleave test above
+/// pins the key-non-conflict side of this; this one is the real race.
 ///
 /// Falsification: revert to N+2 separate proposes per publish and the "reads exactly one
 /// publisher's tree" assertion is the one that fails — a reader can land between another

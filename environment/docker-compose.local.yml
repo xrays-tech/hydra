@@ -78,6 +78,10 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
+      # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
+      HYDRA_MAX_USERS_PER_TENANT: "5000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
+      HYDRA_MAX_HIERARCHY_ROWS: "20000"
       RUST_LOG: "info"
     volumes:
       - hydra-a-data:/app/data
@@ -128,6 +132,10 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
+      # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
+      HYDRA_MAX_USERS_PER_TENANT: "5000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
+      HYDRA_MAX_HIERARCHY_ROWS: "20000"
       RUST_LOG: "info"
     volumes:
       - hydra-b-data:/app/data
@@ -177,6 +185,10 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
+      # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
+      HYDRA_MAX_USERS_PER_TENANT: "5000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
+      HYDRA_MAX_HIERARCHY_ROWS: "20000"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here (any node can serve it)

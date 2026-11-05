@@ -475,6 +475,63 @@ struct UserUpsertBody {
     enabled: bool,
 }
 
+/// The body of `PUT .../users/bulk`: `{"users":[{id?,user_group_id,external_id?,name,enabled?}]}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsersBulkBody {
+    users: Vec<UserUpsertBody>,
+}
+
+/// The body of `PUT .../user-groups/bulk`: `{"user_groups":[{id?,name,enabled?}]}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserGroupsBulkBody {
+    user_groups: Vec<UserGroupUpsertBody>,
+}
+
+/// One key in `POST .../api-keys/bulk`. The target user is carried per entry
+/// (the bulk route has no `{uid}` path segment) and the key id stays
+/// server-generated.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeyBulkItem {
+    user_id: String,
+    name: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// The body of `POST .../api-keys/bulk`: `{"keys":[{user_id,name,expires_at?}]}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeysBulkBody {
+    keys: Vec<ApiKeyBulkItem>,
+}
+
+/// Upper bound on entries in ONE bulk request. Larger requests are a `400`,
+/// never a silent truncation: an operator reconciling 12k rows must know the
+/// call was refused and chunk it.
+const MAX_BULK_ENTRIES: usize = 5_000;
+
+/// The shared `400` for an oversized bulk body.
+async fn reject_oversized_bulk(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    count: usize,
+) -> pingora_core::Result<bool> {
+    super::respond_error(
+        session,
+        ctx,
+        400,
+        "bulk_limit_exceeded",
+        &format!(
+            "this request carries {count} entries; the maximum is {MAX_BULK_ENTRIES} per \
+             bulk request — split it into smaller chunks"
+        ),
+    )
+    .await
+}
+
 /// The hierarchy-row census behind `HYDRA_MAX_HIERARCHY_ROWS` (plan §3.5): the
 /// FIVE identity tables counted together, read off the PINNED snapshot the handler
 /// already holds.
@@ -995,6 +1052,696 @@ async fn user_upsert(
         ctx,
         200,
         &json!({"user": user, "config_version": version}),
+    )
+    .await
+}
+
+/// `PUT /tenant/{tenant_id}/api/v1/users/bulk`
+///
+/// The same row rules as [`user_upsert`], applied to a batch: every group must be
+/// this tenant's, every named id must not belong to another tenant, generated ids
+/// are minted for entries without one, and the whole batch lands in ONE DB
+/// transaction followed by ONE publish.
+async fn user_bulk_upsert(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+    trace_id: &str,
+) -> pingora_core::Result<bool> {
+    let tenant_id = &auth.tenant.id;
+    let content = state.store.replication();
+
+    let raw = match super::read_body(session, trace_id).await {
+        Ok(body) => body,
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
+    };
+    let req: UsersBulkBody = match parse_body(&raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                &format!(
+                    "request body is not a valid user bulk upsert \
+                     ({{users:[{{id?, user_group_id, external_id?, name, enabled?}}]}}): {e}"
+                ),
+            )
+            .await;
+        }
+    };
+    if req.users.len() > MAX_BULK_ENTRIES {
+        return reject_oversized_bulk(session, ctx, req.users.len()).await;
+    }
+    if req.users.is_empty() {
+        return respond_json(
+            session,
+            ctx,
+            200,
+            &json!({"users": [], "config_version": content.version}),
+        )
+        .await;
+    }
+
+    let stamped = crate::admin::handlers::now_ts();
+    let mut out: Vec<User> = Vec::with_capacity(req.users.len());
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(req.users.len());
+    let mut seen_external: HashSet<String> = HashSet::new();
+    let mut new_rows = 0usize;
+
+    for item in req.users {
+        let group_id = item.user_group_id.trim();
+        if group_id.is_empty() {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_group",
+                "`user_group_id` must not be empty",
+            )
+            .await;
+        }
+        let group_owned = content
+            .cfg
+            .user_groups
+            .iter()
+            .any(|group| group.id == group_id && group.tenant_id == *tenant_id);
+        if !group_owned {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_group",
+                &format!(
+                    "{group_id:?} is not a user-group of this tenant, so no user of this \
+                     tenant may belong to it"
+                ),
+            )
+            .await;
+        }
+
+        let name = item.name.trim();
+        if name.is_empty() {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                "`name` is required and must not be empty",
+            )
+            .await;
+        }
+
+        let id: String = match item.id {
+            None => crate::admin::handlers::gen_id(),
+            Some(raw_id) => {
+                let trimmed = raw_id.trim();
+                if trimmed.is_empty() {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_request",
+                        "`id` must not be empty — omit the field to have the server mint one",
+                    )
+                    .await;
+                }
+                trimmed.to_string()
+            }
+        };
+        if !seen_ids.insert(id.clone()) {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "duplicate_id",
+                &format!("id {id:?} appears more than once in this bulk request"),
+            )
+            .await;
+        }
+
+        let external_id: Option<String> = match item.external_id {
+            None => None,
+            Some(raw_id) => {
+                let trimmed = raw_id.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+        };
+        if let Some(external) = external_id.as_ref() {
+            if !seen_external.insert(external.clone()) {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    400,
+                    "duplicate_external_id",
+                    &format!(
+                        "external_id {external:?} appears more than once in this bulk request \
+                         (unique per tenant)"
+                    ),
+                )
+                .await;
+            }
+        }
+
+        let existing = content.cfg.users.get(&id);
+        if let Some(user) = existing {
+            if user.tenant_id != *tenant_id {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    404,
+                    "not_found",
+                    "no such user in this tenant",
+                )
+                .await;
+            }
+        } else {
+            new_rows += 1;
+        }
+        if let Some(external) = external_id.as_ref() {
+            let clash = content.cfg.users.values().any(|other| {
+                other.tenant_id == *tenant_id
+                    && other.id != id
+                    && other.external_id.as_deref() == Some(external.as_str())
+            });
+            if clash {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    409,
+                    "duplicate_external_id",
+                    &format!(
+                        "another user of this tenant already carries external_id {external:?} \
+                         (unique per tenant)"
+                    ),
+                )
+                .await;
+            }
+        }
+
+        let mut user: User = existing.cloned().unwrap_or(User {
+            id: id.clone(),
+            tenant_id: tenant_id.to_string(),
+            user_group_id: group_id.to_string(),
+            external_id: None,
+            name: name.to_string(),
+            enabled: item.enabled,
+            billing_status: BillingStatus::Active,
+            billing_reason: None,
+            billing_updated_at: None,
+            created_at: stamped.clone(),
+            updated_at: stamped.clone(),
+        });
+        user.user_group_id = group_id.to_string();
+        user.external_id = external_id;
+        user.name = name.to_string();
+        user.enabled = item.enabled;
+        user.updated_at = stamped.clone();
+        out.push(user);
+    }
+
+    let held = content
+        .cfg
+        .users
+        .values()
+        .filter(|u| u.tenant_id == *tenant_id)
+        .count();
+    let ceiling = state.tenant_api.max_users_per_tenant;
+    if held + new_rows > ceiling as usize {
+        return super::respond_error(
+            session,
+            ctx,
+            400,
+            "hierarchy_limit_exceeded",
+            &format!(
+                "this batch would grow the tenant from {held} to {} users, past its ceiling of \
+                 {ceiling}; HYDRA_MAX_USERS_PER_TENANT allows no more",
+                held + new_rows
+            ),
+        )
+        .await;
+    }
+    let rows = hierarchy_rows(&content.cfg);
+    let global = state.tenant_api.max_hierarchy_rows;
+    if rows + new_rows > global as usize {
+        return super::respond_error(
+            session,
+            ctx,
+            400,
+            "hierarchy_limit_exceeded",
+            &format!(
+                "this batch would grow the hierarchy from {rows} to {} rows, past its ceiling of \
+                 {global}; HYDRA_MAX_HIERARCHY_ROWS allows no more",
+                rows + new_rows
+            ),
+        )
+        .await;
+    }
+
+    let pool = state.store.pool();
+    if let Err(e) = crate::db::upsert_users_bulk(pool, &out).await {
+        let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
+        return super::respond_error(
+            session,
+            ctx,
+            status_code,
+            code,
+            "the users could not be stored (a uniqueness constraint or the group FK was rejected)",
+        )
+        .await;
+    }
+
+    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
+    let Some(version) = published else {
+        return Ok(true);
+    };
+
+    respond_json(
+        session,
+        ctx,
+        200,
+        &json!({"users": out, "config_version": version}),
+    )
+    .await
+}
+
+/// `PUT /tenant/{tenant_id}/api/v1/user-groups/bulk`
+///
+/// The bulk counterpart of [`user_group_upsert`]. The batch is validated
+/// tenant-locally, written in ONE transaction and published ONCE.
+async fn user_group_bulk_upsert(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+    trace_id: &str,
+) -> pingora_core::Result<bool> {
+    let tenant_id = &auth.tenant.id;
+    let content = state.store.replication();
+
+    let raw = match super::read_body(session, trace_id).await {
+        Ok(body) => body,
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
+    };
+    let req: UserGroupsBulkBody = match parse_body(&raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                &format!(
+                    "request body is not a valid user-group bulk upsert \
+                     ({{user_groups:[{{id?, name, enabled?}}]}}): {e}"
+                ),
+            )
+            .await;
+        }
+    };
+    if req.user_groups.len() > MAX_BULK_ENTRIES {
+        return reject_oversized_bulk(session, ctx, req.user_groups.len()).await;
+    }
+    if req.user_groups.is_empty() {
+        return respond_json(
+            session,
+            ctx,
+            200,
+            &json!({"user_groups": [], "config_version": content.version}),
+        )
+        .await;
+    }
+
+    let stamped = crate::admin::handlers::now_ts();
+    let mut out: Vec<UserGroup> = Vec::with_capacity(req.user_groups.len());
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(req.user_groups.len());
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut new_rows = 0usize;
+
+    for item in req.user_groups {
+        let name = item.name.trim();
+        if name.is_empty() {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                "`name` is required and must not be empty",
+            )
+            .await;
+        }
+        let id: String = match item.id {
+            None => crate::admin::handlers::gen_id(),
+            Some(raw_id) => {
+                let trimmed = raw_id.trim();
+                if trimmed.is_empty() {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_request",
+                        "`id` must not be empty — omit the field to have the server mint one",
+                    )
+                    .await;
+                }
+                trimmed.to_string()
+            }
+        };
+        if !seen_ids.insert(id.clone()) {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "duplicate_id",
+                &format!("id {id:?} appears more than once in this bulk request"),
+            )
+            .await;
+        }
+        if !seen_names.insert(name.to_string()) {
+            return super::respond_error(
+                session,
+                ctx,
+                409,
+                "duplicate_name",
+                &format!(
+                    "user-group name {name:?} appears more than once in this bulk request \
+                     (names are unique per tenant)"
+                ),
+            )
+            .await;
+        }
+
+        let existing = content.cfg.user_groups.iter().find(|group| group.id == id);
+        if let Some(group) = existing {
+            if group.tenant_id != *tenant_id {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    404,
+                    "not_found",
+                    "no such user-group in this tenant",
+                )
+                .await;
+            }
+        } else {
+            new_rows += 1;
+        }
+        let clash = content
+            .cfg
+            .user_groups
+            .iter()
+            .any(|other| other.tenant_id == *tenant_id && other.name == name && other.id != id);
+        if clash {
+            return super::respond_error(
+                session,
+                ctx,
+                409,
+                "duplicate_name",
+                &format!(
+                    "this tenant already has a user-group named {name:?} \
+                     (names are unique per tenant)"
+                ),
+            )
+            .await;
+        }
+
+        let mut group: UserGroup = existing.cloned().unwrap_or(UserGroup {
+            id: id.clone(),
+            tenant_id: tenant_id.to_string(),
+            name: name.to_string(),
+            enabled: item.enabled,
+            created_at: stamped.clone(),
+            updated_at: stamped.clone(),
+        });
+        group.name = name.to_string();
+        group.enabled = item.enabled;
+        group.updated_at = stamped.clone();
+        out.push(group);
+    }
+
+    let rows = hierarchy_rows(&content.cfg);
+    let ceiling = state.tenant_api.max_hierarchy_rows;
+    if rows + new_rows > ceiling as usize {
+        return super::respond_error(
+            session,
+            ctx,
+            400,
+            "hierarchy_limit_exceeded",
+            &format!(
+                "this batch would grow the hierarchy from {rows} to {} rows, past its ceiling \
+                 of {ceiling}; HYDRA_MAX_HIERARCHY_ROWS allows no more",
+                rows + new_rows
+            ),
+        )
+        .await;
+    }
+
+    let pool = state.store.pool();
+    if let Err(e) = crate::db::upsert_user_groups_bulk(pool, &out).await {
+        let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
+        return super::respond_error(
+            session,
+            ctx,
+            status_code,
+            code,
+            "the user-groups could not be stored (a uniqueness constraint was rejected)",
+        )
+        .await;
+    }
+
+    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
+    let Some(version) = published else {
+        return Ok(true);
+    };
+
+    respond_json(
+        session,
+        ctx,
+        200,
+        &json!({"user_groups": out, "config_version": version}),
+    )
+    .await
+}
+
+/// `POST /tenant/{tenant_id}/api/v1/api-keys/bulk`
+///
+/// Mints one key per entry, all in ONE DB transaction and ONE publish. Every
+/// target user must belong to this tenant; the key/user/hierarchy ceilings are
+/// checked for the WHOLE batch before anything is minted, so an over-limit caller
+/// never receives plaintext it cannot use. The plaintexts are shown exactly once,
+/// in the response body.
+async fn user_api_key_bulk_create(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    auth: &Authenticated,
+    trace_id: &str,
+) -> pingora_core::Result<bool> {
+    let tenant_id = &auth.tenant.id;
+    let content = state.store.replication();
+
+    let raw = match super::read_body(session, trace_id).await {
+        Ok(body) => body,
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
+    };
+    let req: ApiKeysBulkBody = match parse_body(&raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                &format!(
+                    "request body is not a valid api-key bulk mint \
+                     ({{keys:[{{user_id, name, expires_at?}}]}}): {e}"
+                ),
+            )
+            .await;
+        }
+    };
+    if req.keys.len() > MAX_BULK_ENTRIES {
+        return reject_oversized_bulk(session, ctx, req.keys.len()).await;
+    }
+    if req.keys.is_empty() {
+        return respond_json(
+            session,
+            ctx,
+            200,
+            &json!({"api_keys": [], "config_version": content.version}),
+        )
+        .await;
+    }
+
+    let own_users: HashSet<String> = content
+        .cfg
+        .users
+        .iter()
+        .filter(|(_, u)| u.tenant_id == *tenant_id)
+        .map(|(_, u)| u.id.clone())
+        .collect();
+
+    // Validate / normalize the whole batch BEFORE minting any credential.
+    let mut normalized: Vec<(String, String, Option<String>)> = Vec::with_capacity(req.keys.len());
+    for item in req.keys {
+        let user_id = item.user_id.trim();
+        if user_id.is_empty() {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                "`user_id` must not be empty",
+            )
+            .await;
+        }
+        if !own_users.contains(user_id) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "no such user in this tenant",
+            )
+            .await;
+        }
+        let name = item.name.trim();
+        if name.is_empty() {
+            return super::respond_error(
+                session,
+                ctx,
+                400,
+                "invalid_request",
+                "`name` must not be empty",
+            )
+            .await;
+        }
+        let expires_at = match item.expires_at {
+            None => None,
+            Some(raw_expiry) => match super::time_bound::parse_bound(&raw_expiry) {
+                None => {
+                    return super::respond_error(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_request",
+                        "`expires_at` must be RFC3339 (2026-09-16T00:00:00Z), epoch seconds \
+                         or epoch milliseconds",
+                    )
+                    .await;
+                }
+                Some(dt) => Some(super::time_bound::canonical(dt)),
+            },
+        };
+        normalized.push((user_id.to_string(), name.to_string(), expires_at));
+    }
+
+    let pool = state.store.pool();
+    let rows = match crate::db::list_user_api_keys(pool).await {
+        Err(e) => {
+            let (status, code) = crate::admin::handlers::classify_db_err(&e);
+            return super::respond_error(
+                session,
+                ctx,
+                status,
+                code,
+                "the api-key rows could not be read",
+            )
+            .await;
+        }
+        Ok(r) => r,
+    };
+    let held = rows
+        .iter()
+        .filter(|k| own_users.contains(&k.user_id))
+        .count();
+    let ceiling = state.tenant_api.max_user_api_keys_per_tenant;
+    if held + normalized.len() > ceiling as usize {
+        return super::respond_error(
+            session,
+            ctx,
+            400,
+            "hierarchy_limit_exceeded",
+            &format!(
+                "this batch would grow the tenant from {held} to {} api-keys, past its ceiling \
+                 of {ceiling}; HYDRA_MAX_USER_API_KEYS_PER_TENANT allows no more",
+                held + normalized.len()
+            ),
+        )
+        .await;
+    }
+    let hierarchy = hierarchy_rows(&content.cfg);
+    let global = state.tenant_api.max_hierarchy_rows;
+    if hierarchy + normalized.len() > global as usize {
+        return super::respond_error(
+            session,
+            ctx,
+            400,
+            "hierarchy_limit_exceeded",
+            &format!(
+                "this batch would grow the hierarchy from {hierarchy} to {} rows, past its \
+                 ceiling of {global}; HYDRA_MAX_HIERARCHY_ROWS allows no more",
+                hierarchy + normalized.len()
+            ),
+        )
+        .await;
+    }
+
+    let now = now_rfc3339();
+    let mut keys: Vec<UserApiKey> = Vec::with_capacity(normalized.len());
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(normalized.len());
+    for (user_id, name, expires_at) in normalized {
+        let plaintext = new_api_key_plaintext();
+        let key_hash = sha256_hex_string(plaintext.as_bytes());
+        let key = UserApiKey {
+            id: crate::admin::handlers::gen_id(),
+            user_id,
+            name,
+            key_hash,
+            key_prefix: head_chars(&plaintext, 8),
+            key_last4: tail_chars(&plaintext, 4),
+            enabled: true,
+            expires_at,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        out.push(json!({
+            "id": key.id,
+            "key": plaintext,
+            "key_prefix": key.key_prefix,
+            "key_last4": key.key_last4,
+        }));
+        keys.push(key);
+    }
+
+    if let Err(e) = crate::db::insert_user_api_keys_bulk(pool, &keys).await {
+        let (status, code) = crate::admin::handlers::classify_db_err(&e);
+        return super::respond_error(
+            session,
+            ctx,
+            status,
+            code,
+            "the api-keys could not be stored",
+        )
+        .await;
+    }
+
+    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
+    let Some(version) = published else {
+        return Ok(true);
+    };
+
+    respond_json(
+        session,
+        ctx,
+        200,
+        &json!({"api_keys": out, "config_version": version}),
     )
     .await
 }
@@ -1779,6 +2526,9 @@ pub async fn write(
         TenantWriteRoute::CreateUserApiKey { user_id, .. } => {
             return user_api_key_create(state, session, ctx, auth, user_id, &trace_id).await;
         }
+        TenantWriteRoute::CreateUserApiKeysBulk { .. } => {
+            return user_api_key_bulk_create(state, session, ctx, auth, &trace_id).await;
+        }
         TenantWriteRoute::DeleteUserApiKey {
             user_id, key_id, ..
         } => {
@@ -1796,11 +2546,17 @@ pub async fn write(
         TenantWriteRoute::UpsertUserGroup { .. } => {
             return user_group_upsert(state, session, ctx, auth, &trace_id).await;
         }
+        TenantWriteRoute::UpsertUserGroupsBulk { .. } => {
+            return user_group_bulk_upsert(state, session, ctx, auth, &trace_id).await;
+        }
         TenantWriteRoute::DeleteUserGroup { id, .. } => {
             return user_group_delete(state, session, ctx, auth, id, &trace_id).await;
         }
         TenantWriteRoute::UpsertUser { .. } => {
             return user_upsert(state, session, ctx, auth, &trace_id).await;
+        }
+        TenantWriteRoute::UpsertUsersBulk { .. } => {
+            return user_bulk_upsert(state, session, ctx, auth, &trace_id).await;
         }
         TenantWriteRoute::DeleteUser { id, .. } => {
             return user_delete(state, session, ctx, auth, id, &trace_id).await;

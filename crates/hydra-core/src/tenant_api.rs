@@ -288,12 +288,18 @@ pub enum TenantWriteRoute<'a> {
     /// optional `id` in the BODY (absent ⇒ create with a server-generated id),
     /// never a path segment (user hierarchy, T5).
     UpsertUserGroup { tenant_id: &'a str },
+    /// `PUT /tenant/{tenant_id}/api/v1/user-groups/bulk` — upsert many groups in
+    /// one request, one DB transaction and one publish.
+    UpsertUserGroupsBulk { tenant_id: &'a str },
     /// `DELETE /tenant/{tenant_id}/api/v1/user-groups/{id}` — delete by immutable
     /// id.
     DeleteUserGroup { tenant_id: &'a str, id: &'a str },
     /// `PUT /tenant/{tenant_id}/api/v1/users` — upsert; like the user-group upsert,
     /// the row id is the optional `id` in the BODY.
     UpsertUser { tenant_id: &'a str },
+    /// `PUT /tenant/{tenant_id}/api/v1/users/bulk` — upsert many users in one
+    /// request, one DB transaction and one publish.
+    UpsertUsersBulk { tenant_id: &'a str },
     /// `DELETE /tenant/{tenant_id}/api/v1/users/{id}` — delete by immutable id.
     DeleteUser { tenant_id: &'a str, id: &'a str },
     /// `POST /tenant/{tenant_id}/api/v1/users/{uid}/api-keys` — mint one api-key for
@@ -303,6 +309,10 @@ pub enum TenantWriteRoute<'a> {
         tenant_id: &'a str,
         user_id: &'a str,
     },
+    /// `POST /tenant/{tenant_id}/api/v1/api-keys/bulk` — mint many keys for users
+    /// of this tenant in one request, one DB transaction and one publish. Each key
+    /// names its `user_id` in the BODY (the bulk route has no `{uid}` segment).
+    CreateUserApiKeysBulk { tenant_id: &'a str },
     /// `DELETE /tenant/{tenant_id}/api/v1/users/{uid}/api-keys/{kid}` — revoke one
     /// key by immutable id; BOTH ids are path segments here, and a `kid` that
     /// belongs to another user is the caller's `404`, not a cross-user delete.
@@ -330,10 +340,13 @@ impl<'a> TenantWriteRoute<'a> {
     pub fn tenant_id(self) -> &'a str {
         match self {
             TenantWriteRoute::UpsertUserGroup { tenant_id, .. }
+            | TenantWriteRoute::UpsertUserGroupsBulk { tenant_id, .. }
             | TenantWriteRoute::DeleteUserGroup { tenant_id, .. }
             | TenantWriteRoute::UpsertUser { tenant_id, .. }
+            | TenantWriteRoute::UpsertUsersBulk { tenant_id, .. }
             | TenantWriteRoute::DeleteUser { tenant_id, .. }
             | TenantWriteRoute::CreateUserApiKey { tenant_id, .. }
+            | TenantWriteRoute::CreateUserApiKeysBulk { tenant_id, .. }
             | TenantWriteRoute::DeleteUserApiKey { tenant_id, .. }
             | TenantWriteRoute::SetUserBilling { tenant_id, .. } => tenant_id,
         }
@@ -346,10 +359,13 @@ impl TenantWriteRoute<'_> {
     pub fn label(self) -> &'static str {
         match self {
             TenantWriteRoute::UpsertUserGroup { .. } => "user-group-upsert",
+            TenantWriteRoute::UpsertUserGroupsBulk { .. } => "user-group-bulk-upsert",
             TenantWriteRoute::DeleteUserGroup { .. } => "user-group-delete",
             TenantWriteRoute::UpsertUser { .. } => "user-upsert",
+            TenantWriteRoute::UpsertUsersBulk { .. } => "user-bulk-upsert",
             TenantWriteRoute::DeleteUser { .. } => "user-delete",
             TenantWriteRoute::CreateUserApiKey { .. } => "user-api-key-create",
+            TenantWriteRoute::CreateUserApiKeysBulk { .. } => "user-api-key-bulk-create",
             TenantWriteRoute::DeleteUserApiKey { .. } => "user-api-key-delete",
             TenantWriteRoute::SetUserBilling { .. } => "user-billing-set",
         }
@@ -393,6 +409,15 @@ pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteR
             // BODY (`{id?, …}`), so there is no `{name}` / `{id}` segment to
             // confuse with the DELETE item routes below. A trailing segment
             // (`.../users/x`) is therefore a near miss, not an upsert of row `x`.
+            // The bulk upserts are FLAT collection-shaped paths too. Matched
+            // before the single-row shapes so `.../users/bulk` can never be
+            // mistaken for a per-row path.
+            if suffix == "api/v1/user-groups/bulk" {
+                return Some(TenantWriteRoute::UpsertUserGroupsBulk { tenant_id });
+            }
+            if suffix == "api/v1/users/bulk" {
+                return Some(TenantWriteRoute::UpsertUsersBulk { tenant_id });
+            }
             if suffix == "api/v1/user-groups" {
                 return Some(TenantWriteRoute::UpsertUserGroup { tenant_id });
             }
@@ -407,8 +432,15 @@ pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteR
             None
         }
         "POST" => {
-            // The api-key mint (T6) is the ONLY POST the tenant API accepts, and
-            // `POST api/v1/users` (no `{uid}/api-keys`) is a near miss — the
+            // The bulk mint is a collection POST with each key's `user_id` in
+            // the BODY. Matched before the per-user shape; `.../api-keys/bulk`
+            // is not a per-user path (`user_api_keys_uid` requires the
+            // `/api-keys` suffix, so it would not match either way).
+            if suffix == "api/v1/api-keys/bulk" {
+                return Some(TenantWriteRoute::CreateUserApiKeysBulk { tenant_id });
+            }
+            // The api-key mint (T6) is the ONLY other POST the tenant API accepts,
+            // and `POST api/v1/users` (no `{uid}/api-keys`) is a near miss — the
             // per-user key list is a GET.
             if let Some(user_id) = user_api_keys_uid(suffix) {
                 return Some(TenantWriteRoute::CreateUserApiKey { tenant_id, user_id });

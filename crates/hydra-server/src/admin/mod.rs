@@ -472,6 +472,16 @@ impl AdminService {
             return handlers::metrics_endpoint();
         }
 
+        // ONE admin mutation at a time, from BEFORE the handler's DB write
+        // through reload+publish. The materializer/GC use the same lock; without
+        // it a tick that applies the previous head can wipe a role/token/tenant
+        // that the handler already committed but has not published (measured:
+        // 2000 role creates left 1808 rows).
+        let _write_guard = if matches!(method, "POST" | "PUT" | "DELETE" | "PATCH") {
+            Some(self.state.store.publish_guard().await)
+        } else {
+            None
+        };
         let Some(rest) = path.strip_prefix("/api/v1/") else {
             return handlers::err_json(404, "not_found", "unknown path", trace_id);
         };
@@ -580,6 +590,11 @@ impl AdminService {
         // REST CRUD resources.
         let resource = parts.first().copied().unwrap_or("");
         let id = parts.get(1).copied();
+        // Bulk Global Role upsert: `/global-roles/bulk` would otherwise be read
+        // as the item id `bulk` by the generic match below.
+        if resource == "global-roles" && id == Some("bulk") && method == "PUT" {
+            return handlers::global_role_bulk(&self.state, session, trace_id).await;
+        }
         // Reject paths deeper than resource[/id].
         if parts.len() > 2 {
             return handlers::err_json(404, "not_found", "unknown path", trace_id);
@@ -758,11 +773,11 @@ impl ServeHttp for AdminService {
 
         // NO leader write gate any more (ADR-0001 T3.3). This node executes an admin mutation
         // LOCALLY and, once the write commits, publishes the resulting config to the control
-        // plane; the raft library forwards that publish — the whole batch (missing entities +
-        // toc + head) as ONE atomic `multi_put`, a single log entry — to the leader. The layer
-        // that relayed the whole HTTP request to the lease holder is retired along with the Redis
-        // lease it was built for (the write no longer needs a leader to LAND, only to be
-        // COMMITTED).
+        // plane; the raft library forwards those writes — missing entities in bounded chunks,
+        // then toc + head as ONE final atomic `multi_put` (the commit point) — to the leader.
+        // The layer that relayed the whole HTTP request to the lease holder is retired along
+        // with the Redis lease it was built for (the write no longer needs a leader to LAND,
+        // only to be COMMITTED).
         self.route(&method, &path, query.as_deref(), session, &trace_id)
             .await
     }

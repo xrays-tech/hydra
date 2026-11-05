@@ -97,6 +97,19 @@ pub trait MaterializeTarget: Send + Sync {
         None
     }
 
+    /// Highest raft index this node published locally. A head below it must not
+    /// replace the local database: doing so erases a committed, just-published
+    /// write (measured as random role losses under 2000-role load).
+    fn local_write_index(&self) -> u64 {
+        0
+    }
+
+    fn pending_head(&self) -> Option<String> {
+        None
+    }
+
+    fn clear_pending_head(&self, _head: &str) {}
+
     /// Install `cfg` (and the fidelity rows a replica needs to rebuild its own SQLite tables)
     /// as the state this node serves.
     ///
@@ -227,6 +240,17 @@ impl Materializer {
             Ok(None) => (None, None),
             Err(reason) => return Err(MaterializeError::Head { reason }),
         };
+        if let Some(idx) = head_index {
+            let local = self.target.local_write_index();
+            if idx < local {
+                tracing::debug!(
+                    head_index = idx,
+                    local_write_index = local,
+                    "head predates this node's last local publish; not applying"
+                );
+                return Ok(Converged::NoChange);
+            }
+        }
         if crate::cluster::arachne_materialize::is_stale_generation(head_index, self.applied_index)
         {
             // A stale read answered with an older tree. Keep serving what we have; the next tick reads
@@ -282,6 +306,7 @@ impl Materializer {
                                 });
                             }
                             self.gate.succeeded(&hash);
+                            self.target.clear_pending_head(&hash);
                             self.applied_index = head_index;
                             tracing::info!(hash = %hash, "config materialized");
                             Ok(Converged::Applied { hash })
@@ -369,6 +394,18 @@ impl ReplicaTarget {
 impl MaterializeTarget for ReplicaTarget {
     fn write_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         Some(self.store.write_lock())
+    }
+
+    fn local_write_index(&self) -> u64 {
+        self.store.local_write_index()
+    }
+
+    fn pending_head(&self) -> Option<String> {
+        self.store.pending_head()
+    }
+
+    fn clear_pending_head(&self, head: &str) {
+        self.store.clear_pending_head(head);
     }
 
     async fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
@@ -1209,21 +1246,20 @@ mod tests {
     /// AN OVER-CAP PUBLISH IS REFUSED WHOLE: nothing enters the log, the head does not move,
     /// the refusal is counted, and THIS node's local SQLite commit still stands.
     ///
-    /// The shape is the one a big-but-legal config produces (plan 2026-10-10 A2): five
-    /// providers whose names are 900 KiB each — every single value is UNDER the 1 MiB per-value
-    /// cap (so nothing here is the encoder's fault; compare `a_failed_publish_names_itself_…`
-    /// above, which trips that cap instead), but the missing batch totals ~4.4 MiB, over the
-    /// library's `MAX_MULTI_PUT_TOTAL_BYTES` (4 MiB). The library validates the batch BEFORE
-    /// proposing, so the whole batch stays out of the log: the head keeps its value and its
-    /// origin index, the cluster keeps serving the previous tree (no half-write), this node
-    /// keeps serving — and holding the row of — the providers its own transaction just
-    /// committed, and `publish` counts `result="refused"` instead of an opaque error. That is
-    /// exactly why the admin layer can answer "committed locally, NOT published" honestly.
+    /// The trigger is one provider whose name is 5 MiB: it exceeds the test node's 1 MiB
+    /// per-value cap (and, on its own, the library's 4 MiB `multi_put` total-byte cap), so no
+    /// chunk split can represent it — the entity forms a one-entry chunk and the library
+    /// refuses that chunk BEFORE propose. The four other providers make the local side a
+    /// realistic multi-row commit and let the test see all of them survive. The whole publish
+    /// stays out of the log: the head keeps its value and origin index, the cluster keeps
+    /// serving the previous tree (no half-write), this node keeps serving — and holding the
+    /// rows of — the providers its own transaction just committed, and `publish` counts
+    /// `result="refused"` instead of an opaque error. That is exactly why the admin layer can
+    /// answer "committed locally, NOT published" honestly.
     ///
-    /// Falsification: split the batch to fit the cap and the head-index assertion fails as soon
-    /// as any part of it commits; drop the `InvalidArgument → Refused` discrimination at the
-    /// `multi_put` call site and the reason no longer carries the Refused wording nor the
-    /// `refused` counter increment.
+    /// Falsification: make the oversized entity fit and the head advances instead of staying
+    /// put; drop the `InvalidArgument → Refused` discrimination at the `multi_put` call sites
+    /// and the reason no longer carries the Refused wording nor the `refused` counter increment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_over_cap_publish_is_refused_whole_and_the_local_commit_still_stands() {
         let raft = node("publish-over-cap", PORT_OVER_CAP).await;
@@ -1257,10 +1293,12 @@ mod tests {
         let tree_before = expect_tree(ctl.read().await.expect("baseline read"));
         let refused_before = refused_publish_count();
 
-        // Five providers × 900 KiB: each value fits, the batch does not.
+        // p1's value is 5 MiB: over the node's 1 MiB per-value cap, so no chunk split fits it.
         for i in 1..=5 {
             let mut p = provider(&format!("p{i}"));
-            p.name = "x".repeat(900 * 1024);
+            if i == 1 {
+                p.name = "x".repeat(5 * 1024 * 1024);
+            }
             crate::db::insert_provider(&pool, &p)
                 .await
                 .expect("insert oversized provider");
@@ -1271,9 +1309,9 @@ mod tests {
             // this module's `arachne_store::StoreError` — the publish step belongs to the former.
             Err(crate::store::StoreError::NotPublished { reason }) => {
                 assert!(
-                    reason.contains("MAX_MULTI_PUT_TOTAL_BYTES"),
-                    "the refusal must name the batch cap that tripped — that is the pre-propose \
-                     InvalidArgument, nothing entered the log — got: {reason}"
+                    reason.contains("max_value_bytes"),
+                    "the refusal must name the per-value cap that tripped — that is the \
+                     pre-propose InvalidArgument, nothing entered the log — got: {reason}"
                 );
                 assert!(
                     reason.contains("nothing entered the log"),

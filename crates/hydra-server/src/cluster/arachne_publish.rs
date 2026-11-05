@@ -5,12 +5,12 @@
 //!
 //! Under the homogeneous model (ADR-0001 D-2, and the user's ruling on where a management write
 //! lands) every node runs the same write path: the SQLite transaction commits LOCALLY, then this
-//! node encodes its own config into a tree and commits it: the entities it does not have yet, the
-//! toc and the head go into ONE `multi_put` — a single log entry, all or nothing, the head moving
-//! in the same entry as the tree it names (2026-10-10, plan `2026-10-10-multi-put-atomic-publish`).
-//! That batch is the one operation the library forwards to the raft leader (when this node is a
-//! follower), so "any node can accept a management write" does not mean "any node is a writer" at
-//! the storage level.
+//! node encodes its own config into a tree and commits it: missing entities are uploaded first in
+//! bounded content-addressed chunks, then the toc and head go into ONE final `multi_put` — a
+//! single log entry, all or nothing, the head moving in that same entry as the tree it names
+//! (2026-10-10, plan `2026-10-10-multi-put-atomic-publish`).
+//! Those writes are forwarded to the raft leader (when this node is a follower), so "any node can
+//! accept a management write" does not mean "any node is a writer" at the storage level.
 //!
 //! ## Why the local write is not rolled back when publishing fails
 //!
@@ -64,19 +64,35 @@ impl ConfigPublisher {
     ///
     /// # Errors
     /// A human-readable reason: the codec refused the config (an unkeyable id, a value over the
-    /// library's 1 MiB cap, a seal that failed); the `multi_put` batch overran a library bound
-    /// (>4096 entries / >4 MiB total — refused before propose, nothing enters the log); or the
-    /// commit did not go through (no leader, no quorum). All mean "the cluster does not have this
-    /// config"; the first two are also counted as `publish_total{result="refused"}`.
+    /// configured per-value cap, a seal that failed); an entity chunk or the final toc/head
+    /// batch overran a library bound (entry count / total bytes / per-value bytes — that
+    /// batch enters nothing, and the head never moves); or the commit did not go through (no
+    /// leader, no quorum). All mean "the cluster does not have this config"; the first two
+    /// are also counted as `publish_total{result="refused"}`.
+    /// The local replica's current head and its applied index (for the
+    /// ConfigStore's local-write watermark).
+    pub async fn head_with_index(&self) -> Result<Option<(String, u64)>, String> {
+        self.store
+            .current_head_with_index()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Run one bounded GC pass. Delegates to the control-plane store (the
+    /// publisher is the object the ConfigStore already owns).
+    pub async fn gc(&self, max_deletes: usize) -> Result<super::arachne_store::GcStats, String> {
+        self.store.gc(max_deletes).await.map_err(|e| e.to_string())
+    }
+
     pub async fn publish(
         &self,
         cfg: &ConfigData,
         fidelity: &FidelityRows,
     ) -> Result<String, String> {
         // A REFUSAL, not a transport failure: the config cannot be published as it
-        // stands (an over-sized value against the library's 1 MiB cap, an id that
-        // cannot be keyed, a failed seal), so retrying will not help and the fix is
-        // a configuration change. Counted separately from `error` for that reason —
+        // stands (a value over the configured per-value cap, an id that cannot be
+        // keyed, a failed seal), so retrying will not help and the fix is a
+        // configuration change. Counted separately from `error` for that reason —
         // it is the capacity alarm ADR-0001 risk R2 asks for, and it is a fact about
         // the CONFIG rather than about the cluster.
         let tree = encode_config(cfg, fidelity, self.key_provider.as_ref()).map_err(|e| {

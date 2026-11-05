@@ -243,10 +243,11 @@ struct Metrics {
     arachne_leader_flips_total: IntCounter,
     /// Publish outcomes: `ok` (the head moved), `not_leader` (the library refused
     /// the commit), `quorum_unavailable` (no majority), `error` (anything else,
-    /// including a malformed tree), `refused` (a PRE-propose rejection, so nothing
-    /// entered the log — either the encoder refused the config: the per-value size
-    /// limit, an unkeyable id, a failed seal; or the `multi_put` batch overran its
-    /// entry-count/total-byte bound. The capacity alarm ADR-0001 risk R2 asks for).
+    /// including a malformed tree), `refused` (a PRE-propose rejection of the
+    /// batch that tripped it — either the encoder refused the config: the per-value size
+    /// limit, an unkeyable id, a failed seal; or a `multi_put` entity chunk / the
+    /// final toc+head batch overran its entry-count/total-byte/per-value bound.
+    /// The capacity alarm ADR-0001 risk R2 asks for).
     arachne_publish_total: IntCounterVec,
     /// Bytes in the tree the last successful publish committed. The growth series
     /// for the capacity question R2 raises; the HARD signal is

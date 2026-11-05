@@ -7,15 +7,24 @@
 //! ```text
 //! publish(tree) =
 //!   1. collect the entities this node does not have (content-addressed keys)
-//!   2. multi_put([…those entities, new toc, head])   <- ONE log entry = the commit
+//!   2. multi_put(chunk of missing entities)  … one per bounded chunk, no head
+//!   3. multi_put([new toc, gc_retain, head]) <- ONE log entry = the commit
 //! ```
 //!
-//! The whole publish is one `multi_put`: one log entry, one session, one apply,
-//! all or nothing. A failed publish therefore leaves the previous tree current
-//! with nothing half-written — and a batch that overruns the library's bounds
-//! (entry count / total bytes) is refused BEFORE propose, so it never enters
-//! the log at all. Head remains the only commit point; it now moves in the same
-//! entry as the entities and toc it names rather than after them.
+//! A bulk config can have ~12k entities, far past the library's 4096-entry /
+//! 4 MiB single-batch bound, so the missing entities are uploaded first in
+//! bounded chunks and only then does a FINAL batch move the head. That final
+//! batch is one log entry, one session, one apply, all or nothing: a failed
+//! publish leaves the previous tree current, and a batch that overruns a
+//! library bound is refused BEFORE propose so it never enters the log. Head
+//! remains the only commit point; it moves in the same entry as the toc it
+//! names.
+//!
+//! Uploading entities before the head is safe because their keys are
+//! content-addressed: a value is stored under the hash of its own bytes, so it
+//! cannot overwrite another entity, and nothing names it until the head moves.
+//! A failed chunk therefore leaves only unreferenced (GC-able) orphans while
+//! the old head and tree stay exactly as they were.
 //!
 //! ## Reading
 //!
@@ -30,14 +39,14 @@
 //!   toc while every entity is checked against the hash that toc records. A
 //!   mismatch is a retry, not a repair.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arachne_kv::client::{ArachneError, Handle};
 
 use super::arachne_keys::{
-    cfg_entity, cfg_toc, content_hash, ctl_head, hex_hash, validate_entities, EntityPath,
-    KeysError, Toc, TocEntry, TOC_FORMAT,
+    cfg_entity, cfg_toc, content_hash, ctl_gc_retain, ctl_head, hex_hash, validate_entities,
+    EntityPath, KeysError, Toc, TocEntry, CFG_PREFIX, TOC_FORMAT,
 };
 
 /// The entities of one config tree: path → encoded bytes.
@@ -71,14 +80,17 @@ pub enum StoreError {
     /// what separates "the alert fires when the cluster is down" from "the alert
     /// fires whenever anything goes wrong".
     QuorumUnavailable,
-    /// The key space refused the write **before** it entered the log: a bound was
+    /// The key space refused a write **before** it entered the log: a bound was
     /// overrun (a value over `max_value_bytes`, or a `multi_put` batch over the
-    /// entry-count / total-byte caps). Nothing was committed; nothing partial exists.
+    /// entry-count / total-byte caps). The refused batch commits nothing, and the
+    /// head/tree are untouched; entities uploaded by an earlier chunk can remain as
+    /// unreferenced, GC-able orphans.
     ///
-    /// Produced at exactly one place — the `multi_put` call in [`Self::publish_inner`],
-    /// which discriminates `ArachneError::InvalidArgument` for the batch it assembled
-    /// (2026-10-10: the shared `map_err` that serves the read path deliberately does
-    /// NOT map `InvalidArgument` here — a bound refusal is a fact about a batch).
+    /// Produced at the `multi_put` call sites in [`Self::publish_inner`] (one per entity chunk,
+    /// plus the final toc/head batch), which discriminate `ArachneError::InvalidArgument` for
+    /// the batch they assembled (2026-10-10: the shared `map_err` that serves the read path
+    /// deliberately does NOT map `InvalidArgument` here — a bound refusal is a fact about a
+    /// batch).
     ///
     /// Its own variant rather than a string inside [`StoreError::Arachne`] because it
     /// is a fact about the CONFIG, not about the cluster — the fix is a smaller config,
@@ -121,6 +133,59 @@ impl From<KeysError> for StoreError {
     }
 }
 
+/// The first key strictly after every key carrying `prefix`, or `None` when
+/// the prefix is all `0xff` (unbounded).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(b) = out.pop() {
+        if b < 0xff {
+            out.push(b + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The most entities one pre-upload `multi_put` carries.
+///
+/// The library's hard limit is 4096 entries; half of it leaves ample headroom and keeps a
+/// single apply's lock hold bounded even for a ~12k-entity bulk config.
+const ENTITY_CHUNK_MAX_ENTRIES: usize = 2048;
+
+/// The most key+value bytes one pre-upload `multi_put` carries.
+///
+/// The library's hard limit is 4 MiB; 2 MiB leaves room for raft framing and means an
+/// over-sized entity is the ONLY thing that can push a chunk past the soft budget.
+const ENTITY_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Split missing `(key, value)` entities into `multi_put` chunks under both bounds.
+///
+/// A value that alone exceeds [`ENTITY_CHUNK_MAX_BYTES`] becomes a chunk of its own rather
+/// than being split (it cannot be): the library's per-value / total-byte validation then
+/// decides whether that entity is representable, and the caller maps its refusal to
+/// [`StoreError::Refused`]. Never emits an empty chunk.
+fn chunk_missing_entities<'a>(missing: &'a [(String, &'a [u8])]) -> Vec<Vec<(&'a [u8], &'a [u8])>> {
+    let mut chunks = Vec::new();
+    let mut current: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut bytes = 0usize;
+    for (key, value) in missing {
+        let entry_bytes = key.len() + value.len();
+        let full = current.len() >= ENTITY_CHUNK_MAX_ENTRIES;
+        // `!current.is_empty()` is what lets a lone oversized entity through as its own chunk.
+        let over_budget = !current.is_empty() && bytes + entry_bytes > ENTITY_CHUNK_MAX_BYTES;
+        if full || over_budget {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        current.push((key.as_bytes(), *value));
+        bytes += entry_bytes;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn map_err(e: ArachneError) -> StoreError {
     match e {
         ArachneError::NotLeader { .. } => StoreError::NotLeader,
@@ -129,8 +194,8 @@ fn map_err(e: ArachneError) -> StoreError {
         // (2026-10-10, oracle F2). `map_err` serves every call in this module — reads
         // (`read_inner`, `current_hash`, `current_head_with_index`) as well as the publish —
         // and a pre-propose bound refusal is a fact about a `multi_put` BATCH, not about a
-        // read. The `Refused` discrimination therefore lives at the `multi_put` call site in
-        // `publish_inner`, where the batch it judges was actually assembled.
+        // read. The `Refused` discrimination therefore lives at the `multi_put` call sites in
+        // `publish_inner`, where the batches it judges were actually assembled.
         other => StoreError::Arachne(format!("{other:?}")),
     }
 }
@@ -184,6 +249,44 @@ pub fn toc_for(tree: &ConfigTree) -> Result<Toc, KeysError> {
 #[derive(Clone)]
 pub struct ArachneConfigStore {
     handle: Handle,
+}
+
+/// One bounded garbage-collection pass over the control-plane keyspace.
+///
+/// The config tree is content-addressed and append-only: every publish writes a
+/// new toc and new entity versions, while the head names only the current tree.
+/// Nothing in the earlier design deleted the old ones, so a 2000-role run left
+/// 447–511 MB snapshots and the 64 MB snapshot threshold made Arachne build a
+/// half-gigabyte snapshot every few hundred writes. Snapshot creation blocks
+/// apply, the leader misses quorum, and leadership flaps. This pass keeps the
+/// CURRENT tree and deletes the rest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcStats {
+    /// Old toc values deleted in this pass.
+    pub toc_deleted: usize,
+    /// Unreferenced entity values deleted in this pass.
+    pub entities_deleted: usize,
+    /// Old toc values that existed when the pass started.
+    pub old_tocs: usize,
+    /// Unreferenced entity values that existed when the pass started.
+    pub unreferenced_entities: usize,
+}
+
+impl GcStats {
+    #[must_use]
+    pub fn deleted(&self) -> usize {
+        self.toc_deleted + self.entities_deleted
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.old_tocs
+            .saturating_sub(self.toc_deleted)
+            .saturating_add(
+                self.unreferenced_entities
+                    .saturating_sub(self.entities_deleted),
+            )
+    }
 }
 
 impl ArachneConfigStore {
@@ -319,13 +422,109 @@ impl ArachneConfigStore {
         }
     }
 
-    /// Publish `tree` as one atomic batch: entities + toc + head in a single `multi_put`.
+    /// Delete up to `max_deletes` keys that the CURRENT tree does not name.
+    ///
+    /// Scans `hydra/cfg/toc/` and `hydra/cfg/e/`, keeps the current toc and every
+    /// entity it references, and deletes the rest oldest-first (tocs before
+    /// entities). A bounded pass lets a caller hold the publish lock for a short
+    /// time; the next pass continues.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the head/current toc cannot be read or a delete is
+    /// refused. A refusal leaves the remaining keys for the next pass.
+    pub async fn gc(&self, max_deletes: usize) -> Result<GcStats, StoreError> {
+        let Some(head) = self.current_hash().await? else {
+            return Ok(GcStats::default());
+        };
+        let current_toc = cfg_toc(&head);
+        // The current toc must exist; if the head moved between these two reads,
+        // the next pass will see the newer one.
+        if !matches!(
+            self.handle.get_stale(current_toc.as_bytes()).await,
+            Ok(Some(_))
+        ) {
+            return Ok(GcStats::default());
+        }
+
+        let toc_prefix = format!("{CFG_PREFIX}toc/");
+        let retain_key = ctl_gc_retain();
+        let retain_raw = self
+            .handle
+            .get_stale(retain_key.as_bytes())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
+        let mut keep: HashSet<Vec<u8>> = retain_raw
+            .lines()
+            .filter(|h| !h.is_empty())
+            .map(|h| cfg_toc(h).into_bytes())
+            .collect();
+        keep.insert(current_toc.clone().into_bytes());
+        let mut old_tocs = self.scan_prefix(toc_prefix.as_bytes()).await?;
+        old_tocs.retain(|k| !keep.contains(k));
+
+        // A concurrent publish (from another node: this node's write lock does
+        // not cover the leader) may have moved the head after the scan. Abort
+        // this pass rather than delete a toc the new head now names.
+        if self.current_hash().await? != Some(head.clone()) {
+            return Ok(GcStats {
+                old_tocs: old_tocs.len(),
+                ..GcStats::default()
+            });
+        }
+
+        let mut stats = GcStats {
+            old_tocs: old_tocs.len(),
+            unreferenced_entities: 0,
+            ..GcStats::default()
+        };
+        for key in old_tocs.into_iter().take(max_deletes) {
+            self.handle.delete(&key).await.map_err(map_err)?;
+            stats.toc_deleted += 1;
+        }
+        Ok(stats)
+    }
+
+    /// All keys under `prefix`, paged because the server clamps one read to 10k.
+    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
+        let end = prefix_successor(prefix);
+        let mut start = prefix.to_vec();
+        let mut out = Vec::new();
+        loop {
+            let (rows, _, truncated) = self
+                .handle
+                .get_stale_range(&start, end.as_deref().unwrap_or(&[]), 10_000)
+                .await
+                .map_err(map_err)?;
+            for (key, _) in rows {
+                if key.starts_with(prefix) {
+                    out.push(key);
+                }
+            }
+            if !truncated {
+                break;
+            }
+            let Some(last) = out.last() else { break };
+            let mut next = last.clone();
+            next.push(0);
+            if !next.starts_with(prefix) {
+                break;
+            }
+            start = next;
+        }
+        Ok(out)
+    }
+
+    /// Publish `tree`: upload missing entities in bounded chunks, then commit toc + head in
+    /// one final atomic batch.
     ///
     /// # Errors
     /// [`StoreError::NotLeader`] when this node does not own the commit point,
-    /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Refused`] when the
-    /// batch overruns a library bound (nothing enters the log), [`StoreError::Arachne`]
-    /// for a transport or quorum failure.
+    /// [`StoreError::Keys`] for a malformed tree, [`StoreError::Refused`] when a chunk or the
+    /// final batch overruns a library bound (that batch enters nothing; the head never moves),
+    /// [`StoreError::Arachne`] for a transport or quorum failure.
     pub async fn publish(&self, tree: &ConfigTree) -> Result<String, StoreError> {
         let outcome = self.publish_inner(tree).await;
         // One record per publish, with the outcome the operator's rule is written
@@ -397,32 +596,67 @@ impl ArachneConfigStore {
             missing.push((key, bytes.as_slice()));
         }
 
-        // ONE atomic batch = one log entry: the entities this node was missing, then the toc,
-        // then the head. Head keeps its place (written last) inside the batch, but it no longer
-        // commits AFTER the payload — it commits WITH it, so no reader ever observes a window
-        // in which the head names a tree that is not fully written. The batch always carries
-        // toc + head (never empty — the library refuses empty batches), the head value is still
-        // the toc's content hash (the toc's bytes ARE the tree's name), and toc/head are
-        // rewritten every publish: only the entities get the local-existence skip.
         let toc_bytes = toc.encode();
         let toc_key = cfg_toc(&toc_hash);
         let head_key = ctl_head();
-        let mut batch: Vec<(&[u8], &[u8])> = missing
-            .iter()
-            .map(|(key, bytes)| (key.as_bytes(), *bytes))
-            .collect();
-        batch.push((toc_key.as_bytes(), toc_bytes.as_slice()));
-        batch.push((head_key.as_bytes(), toc_hash.as_bytes()));
+        // Keep a bounded HISTORY of toc hashes in the same commit batch. A
+        // materializer that read head H while H+1 publishes needs H's toc to
+        // exist long enough to apply; GC may delete only what is outside this
+        // window. 64 covers a follower catching up across ~1 minute of writes.
+        let retain_key = ctl_gc_retain();
+        let previous_retain = self
+            .handle
+            .get_stale(retain_key.as_bytes())
+            .await
+            .ok()
+            .flatten()
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default();
+        let mut retain: Vec<String> = vec![toc_hash.clone()];
+        for h in previous_retain.lines().filter(|h| !h.is_empty()) {
+            if h != toc_hash && retain.len() < 64 {
+                retain.push(h.to_string());
+            }
+        }
+        let retain_bytes = retain.join("\n").into_bytes();
 
-        // Capacity bound: the library validates the batch BEFORE propose (>4096 entries, >4MiB
-        // total key+value bytes, any value over `max_value_bytes`) and answers `InvalidArgument`
-        // with NOTHING in the log — fail-stop. This call site — and only this call site — turns
-        // that into `StoreError::Refused`, which `publish` counts as `result="refused"` (the
-        // capacity alarm) instead of `error`: a pre-propose refusal is a fact about THIS BATCH,
-        // not a cluster failure, and the shared `map_err` (which also serves the read path) must
-        // not claim that meaning. The batch is NEVER split to fit: splitting would trade away the
-        // atomicity this call exists for — an over-sized config fails whole, by design, until the
-        // config shrinks.
+        // PRE-UPLOAD the missing entities in bounded chunks, WITHOUT the head.
+        //
+        // This is safe because entity keys are CONTENT-ADDRESSED: a value is stored under the
+        // hash of its own bytes, so writing it cannot overwrite another entity, and the key is
+        // idempotent (re-uploading the same bytes writes the same key/value). Nothing names
+        // these entities until the final batch moves the head, so a failure here leaves the old
+        // head (and therefore the old tree) current; already-uploaded values are harmless
+        // orphans that GC collects. Two concurrent publishers writing different versions of one
+        // entity use different keys, so neither can corrupt the other's tree.
+        //
+        // Chunking exists because a ~12k-entity bulk config is far past the library's
+        // 4096-entry / 4 MiB `multi_put` bound. Both bounds are enforced per chunk; an entity
+        // that alone exceeds the byte budget gets a chunk to itself and is left to the
+        // library's own per-value/total caps to judge.
+        for chunk in chunk_missing_entities(&missing) {
+            // A pre-propose bound refusal is a fact about THIS CHUNK, not a cluster failure.
+            // Each call site turns `InvalidArgument` into `StoreError::Refused`, which
+            // `publish` counts as `result="refused"` (the capacity alarm) instead of `error`.
+            writer.multi_put(&chunk).await.map_err(|e| match e {
+                ArachneError::InvalidArgument(msg) => StoreError::Refused(msg),
+                other => map_err(other),
+            })?;
+        }
+
+        // FINAL BATCH = the commit point. toc + gc_retain + head land in ONE log entry (all or
+        // nothing), so a reader sees either the old tree or the new one: the head moves together
+        // with the toc it names, and every entity that toc references was already uploaded
+        // above. Never empty — the library refuses empty batches — and the head value is still
+        // the toc's content hash (the toc's bytes ARE the tree's name).
+        let batch: Vec<(&[u8], &[u8])> = vec![
+            (toc_key.as_bytes(), toc_bytes.as_slice()),
+            (retain_key.as_bytes(), retain_bytes.as_slice()),
+            (head_key.as_bytes(), toc_hash.as_bytes()),
+        ];
+        // Same `InvalidArgument` → `Refused` discrimination as the chunks above: the library
+        // validates this batch BEFORE propose, so a bound overrun (e.g. a toc over the per-value
+        // or total-byte cap) commits nothing and the previous head stays current.
         writer.multi_put(&batch).await.map_err(|e| match e {
             ArachneError::InvalidArgument(msg) => StoreError::Refused(msg),
             other => map_err(other),
@@ -434,6 +668,52 @@ impl ArachneConfigStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_successor_is_exclusive_and_handles_ff() {
+        assert_eq!(super::prefix_successor(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(super::prefix_successor(b"a\xff"), Some(b"b".to_vec()));
+        assert_eq!(super::prefix_successor(b"\xff\xff"), None);
+    }
+
+    /// Every chunk stays inside both `multi_put` bounds, and the helper never
+    /// emits an empty chunk (the library refuses those).
+    #[test]
+    fn entity_chunks_respect_entry_and_byte_bounds() {
+        assert!(super::chunk_missing_entities(&[]).is_empty());
+
+        // 600 KiB each: three fit in the 2 MiB soft budget, a fourth does not.
+        let value = vec![b'x'; 600 * 1024];
+        let missing: Vec<(String, &[u8])> = (0..5)
+            .map(|i| (format!("key-{i}"), value.as_slice()))
+            .collect();
+        let chunks = super::chunk_missing_entities(&missing);
+        let sizes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![3, 2]);
+        for chunk in &chunks {
+            let bytes: usize = chunk.iter().map(|(k, v)| k.len() + v.len()).sum();
+            assert!(bytes <= super::ENTITY_CHUNK_MAX_BYTES);
+        }
+
+        // Entry-count bound: 2049 tiny entities become 2048 + 1.
+        let tiny: Vec<(String, &[u8])> = (0..=super::ENTITY_CHUNK_MAX_ENTRIES)
+            .map(|i| (format!("k{i}"), b"v".as_slice()))
+            .collect();
+        let chunks = super::chunk_missing_entities(&tiny);
+        let sizes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![super::ENTITY_CHUNK_MAX_ENTRIES, 1]);
+    }
+
+    /// An entity bigger than the chunk budget still makes progress: it becomes
+    /// a one-entry chunk and the library's own caps decide whether it fits.
+    #[test]
+    fn an_entity_larger_than_the_byte_budget_gets_its_own_chunk() {
+        let value = vec![b'x'; super::ENTITY_CHUNK_MAX_BYTES + 1];
+        let missing = vec![("oversized".to_string(), value.as_slice())];
+        let chunks = super::chunk_missing_entities(&missing);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
     use super::*;
 
     fn tree(entries: &[(&str, &[u8])]) -> ConfigTree {

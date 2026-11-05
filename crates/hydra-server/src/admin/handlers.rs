@@ -2065,6 +2065,144 @@ async fn global_role_put(
     ok_json(if previous.is_some() { 200 } else { 201 }, &out)
 }
 
+/// What `PUT /api/v1/global-roles/bulk` accepts.
+#[derive(Debug, Deserialize)]
+struct GlobalRolesBulkBody {
+    roles: Vec<GlobalRoleWrite>,
+}
+
+/// Upper bound on entries in one admin bulk role request.
+const MAX_BULK_ROLES: usize = 5_000;
+
+/// `PUT /api/v1/global-roles/bulk`
+///
+/// Create-or-replace MANY Global Roles. Every rule is validated with the exact
+/// same [`global_role_write_error`] the single-row path uses, against ONE
+/// [`RoleDims`] snapshot; ids are de-duplicated; the whole batch lands in ONE DB
+/// transaction and is followed by ONE reload/publish.
+pub(super) async fn global_role_bulk(
+    state: &AdminState,
+    session: &mut ServerSession,
+    trace_id: &str,
+) -> Resp {
+    let body = match read_body(session, trace_id).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let req: GlobalRolesBulkBody = match parse_body(&body, trace_id) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if req.roles.len() > MAX_BULK_ROLES {
+        return err_json(
+            400,
+            "bulk_limit_exceeded",
+            &format!(
+                "this request carries {} roles; the maximum is {MAX_BULK_ROLES} per bulk \
+                 request — split it into smaller chunks",
+                req.roles.len()
+            ),
+            trace_id,
+        );
+    }
+    if req.roles.is_empty() {
+        return ok_json(200, &serde_json::json!({"roles": []}));
+    }
+
+    let existing: Vec<GlobalRole> = match crate::db::list_global_roles(state.db()).await {
+        Ok(rows) => rows,
+        Err(e) => return db_err_resp(e, trace_id),
+    };
+    let dims: RoleDims = match load_role_dims(state, trace_id).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+
+    let stamped = now_ts();
+    let mut seen: HashSet<String> = HashSet::with_capacity(req.roles.len());
+    let mut roles: Vec<(GlobalRole, Vec<String>)> = Vec::with_capacity(req.roles.len());
+
+    for item in req.roles {
+        let id = match item.id {
+            Some(v) => v,
+            None => gen_id(),
+        };
+        if !seen.insert(id.clone()) {
+            return err_json(
+                400,
+                "duplicate_id",
+                &format!("id {id:?} appears more than once in this bulk request"),
+                trace_id,
+            );
+        }
+        let previous = existing.iter().find(|r| r.id == id);
+
+        let role = GlobalRole {
+            id,
+            name: item.name.unwrap_or_default().trim().to_string(),
+            tenant_id: dim_or_any(item.tenant_id.as_deref()),
+            user_group_id: dim_or_any(item.user_group_id.as_deref()),
+            user_id: dim_or_any(item.user_id.as_deref()),
+            api_key_id: dim_or_any(item.api_key_id.as_deref()),
+            model_key: dim_or_any(item.model_key.as_deref()),
+            provider_ids: item.providers,
+            enabled: item.enabled.unwrap_or(true),
+            // PRESERVED on an UPDATE, exactly as in the single-row writer.
+            created_at: match previous {
+                Some(r) => r.created_at.clone(),
+                None => stamped.clone(),
+            },
+            updated_at: stamped.clone(),
+        };
+
+        if let Some(reason) = global_role_write_error(&role, &dims) {
+            return err_json(
+                400,
+                "invalid_role",
+                &format!("role {:?}: {reason}", role.id),
+                trace_id,
+            );
+        }
+        for warning in global_role_write_warnings(&role) {
+            tracing::warn!(
+                target: "hydra::admin",
+                trace_id,
+                role_id = %role.id,
+                "global_role bulk write: {warning}",
+            );
+        }
+        let providers = normalize_providers(&role.provider_ids);
+        roles.push((role, providers));
+    }
+
+    // Build the response BEFORE the batch is moved into the DB call.
+    let out_roles: Vec<serde_json::Value> = roles
+        .iter()
+        .map(|(role, providers)| {
+            let mut out = serde_json::to_value(role).unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Object(map) = &mut out {
+                map.insert("provider_ids".to_string(), serde_json::json!(providers));
+                map.insert(
+                    "warnings".to_string(),
+                    serde_json::json!(global_role_write_warnings(role)),
+                );
+            }
+            out
+        })
+        .collect();
+
+    match crate::db::upsert_global_roles_bulk(state.db(), &roles).await {
+        Ok(()) => {}
+        Err(e) => return db_err_resp(e, trace_id),
+    }
+
+    if let Some(r) = reload_best_effort(state, trace_id).await {
+        return r;
+    }
+
+    ok_json(200, &serde_json::json!({"roles": out_roles}))
+}
+
 /// `GET /api/v1/global-roles` + `PUT /api/v1/global-roles`.
 ///
 /// The list answers EVERY rule incl. `enabled = false` ones (an operator managing

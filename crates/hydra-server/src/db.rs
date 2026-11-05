@@ -1733,6 +1733,30 @@ fn billing_status_to_str(status: BillingStatus) -> &'static str {
     }
 }
 
+/// [`upsert_user_group`]'s SQL on a borrowed connection, so a bulk write can run
+/// every row inside ONE `begin_write` transaction.
+async fn upsert_user_group_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    group: &UserGroup,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           name = excluded.name, \
+           enabled = excluded.enabled, \
+           updated_at = datetime('now')",
+    )
+    .bind(&group.id)
+    .bind(&group.tenant_id)
+    .bind(&group.name)
+    .bind(group.enabled)
+    .bind(&group.created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(affected.rows_affected())
+}
+
 pub async fn upsert_user_group(pool: &SqlitePool, group: &UserGroup) -> Result<u64, sqlx::Error> {
     let affected = sqlx::query(
         "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) \
@@ -1752,11 +1776,64 @@ pub async fn upsert_user_group(pool: &SqlitePool, group: &UserGroup) -> Result<u
     Ok(affected.rows_affected())
 }
 
+/// Upsert MANY user groups in ONE `begin_write` transaction and commit once.
+///
+/// Same SQL as [`upsert_user_group`]; kept as a separate bulk primitive so a
+/// 100-group reconcile is one publish instead of a hundred.
+pub async fn upsert_user_groups_bulk(
+    pool: &SqlitePool,
+    groups: &[UserGroup],
+) -> Result<(), sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    for group in groups {
+        upsert_user_group_on_conn(&mut tx, group).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn delete_user_group(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
     let affected = sqlx::query("DELETE FROM user_group WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(affected.rows_affected())
+}
+
+/// [`upsert_user`]'s SQL on a borrowed connection, shared by the bulk writer so
+/// the two cannot drift.
+async fn upsert_user_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    user: &User,
+) -> Result<u64, sqlx::Error> {
+    let billing_status = billing_status_to_str(user.billing_status);
+    let affected = sqlx::query(
+        "INSERT INTO \"user\" (id, tenant_id, user_group_id, external_id, name, \
+         enabled, billing_status, billing_reason, billing_updated_at, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           tenant_id = excluded.tenant_id, \
+           user_group_id = excluded.user_group_id, \
+           external_id = excluded.external_id, \
+           name = excluded.name, \
+           enabled = excluded.enabled, \
+           billing_status = excluded.billing_status, \
+           billing_reason = excluded.billing_reason, \
+           billing_updated_at = excluded.billing_updated_at, \
+           updated_at = datetime('now')",
+    )
+    .bind(&user.id)
+    .bind(&user.tenant_id)
+    .bind(&user.user_group_id)
+    .bind(&user.external_id)
+    .bind(&user.name)
+    .bind(user.enabled)
+    .bind(billing_status)
+    .bind(&user.billing_reason)
+    .bind(&user.billing_updated_at)
+    .bind(&user.created_at)
+    .execute(&mut *conn)
+    .await?;
     Ok(affected.rows_affected())
 }
 
@@ -1792,10 +1869,44 @@ pub async fn upsert_user(pool: &SqlitePool, user: &User) -> Result<u64, sqlx::Er
     Ok(affected.rows_affected())
 }
 
+/// Upsert MANY users in ONE `begin_write` transaction and commit once.
+pub async fn upsert_users_bulk(pool: &SqlitePool, users: &[User]) -> Result<(), sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    for user in users {
+        upsert_user_on_conn(&mut tx, user).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn delete_user(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
     let affected = sqlx::query("DELETE FROM \"user\" WHERE id = ?")
         .bind(id)
         .execute(pool)
+        .await?;
+    Ok(affected.rows_affected())
+}
+
+/// [`insert_user_api_key`]'s SQL on a borrowed connection, shared by the bulk
+/// writer.
+async fn insert_user_api_key_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    api_key: &UserApiKey,
+) -> Result<u64, sqlx::Error> {
+    let affected = sqlx::query(
+        "INSERT INTO user_api_key (id, user_id, name, key_hash, key_prefix, key_last4, \
+         enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+    )
+        .bind(&api_key.id)
+        .bind(&api_key.user_id)
+        .bind(&api_key.name)
+        .bind(&api_key.key_hash)
+        .bind(&api_key.key_prefix)
+        .bind(&api_key.key_last4)
+        .bind(api_key.enabled)
+        .bind(&api_key.expires_at)
+        .bind(&api_key.created_at)
+        .execute(&mut *conn)
         .await?;
     Ok(affected.rows_affected())
 }
@@ -1820,6 +1931,19 @@ pub async fn insert_user_api_key(
         .execute(pool)
         .await?;
     Ok(affected.rows_affected())
+}
+
+/// Insert MANY user api-keys in ONE `begin_write` transaction and commit once.
+pub async fn insert_user_api_keys_bulk(
+    pool: &SqlitePool,
+    api_keys: &[UserApiKey],
+) -> Result<(), sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    for api_key in api_keys {
+        insert_user_api_key_on_conn(&mut tx, api_key).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn delete_user_api_key(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
@@ -1985,6 +2109,25 @@ pub async fn upsert_global_role_with_providers(
     let _inserted = replace_global_role_providers_on_conn(&mut tx, &role.id, providers).await?;
     tx.commit().await?;
     Ok(affected)
+}
+
+/// Create-or-replace MANY Global Roles AND their provider sets in ONE
+/// `begin_write` transaction, then commit once.
+///
+/// Reuses the two `_on_conn` primitives above, so the single-row and bulk write
+/// paths cannot drift in SQL or normalization (the provider set keeps its
+/// `UNIQUE(role_id, provider_id)` de-duplication and ascending storage order).
+pub async fn upsert_global_roles_bulk(
+    pool: &SqlitePool,
+    roles: &[(GlobalRole, Vec<String>)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = begin_write(pool).await?;
+    for (role, providers) in roles {
+        upsert_global_role_on_conn(&mut tx, role).await?;
+        replace_global_role_providers_on_conn(&mut tx, &role.id, providers).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn delete_global_role(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {

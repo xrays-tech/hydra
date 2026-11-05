@@ -114,6 +114,13 @@ pub fn ctl_format() -> String {
     format!("{CTL_PREFIX}format")
 }
 
+/// Newest-first hashes of the TOCs a lagging materializer may still need.
+/// Written in the SAME atomic publish batch as the head; GC keeps these TOCs.
+#[must_use]
+pub fn ctl_gc_retain() -> String {
+    format!("{CTL_PREFIX}gc_retain")
+}
+
 /// The table of contents of the tree identified by `toc_hash`.
 #[must_use]
 pub fn cfg_toc(toc_hash: &str) -> String {
