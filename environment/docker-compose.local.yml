@@ -76,6 +76,8 @@ services:
       # Bound every Redis command: a stalled Redis degrades instead of hanging
       # the data plane (crates/hydra-server/src/redis/mod.rs).
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
+      HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       RUST_LOG: "info"
     volumes:
       - hydra-a-data:/app/data
@@ -124,6 +126,8 @@ services:
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
+      HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       RUST_LOG: "info"
     volumes:
       - hydra-b-data:/app/data
@@ -171,6 +175,8 @@ services:
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
+      # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
+      HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here (any node can serve it)

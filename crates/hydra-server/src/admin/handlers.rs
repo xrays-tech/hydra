@@ -341,13 +341,22 @@ fn query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
 /// the module that used to own the internal endpoint, and this is the ONE id generator — a second
 /// copy is how two faces of the same write start minting different shapes of id.
 pub(crate) fn gen_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tid = format!("{:?}", std::thread::current().id());
-    format!("id-{nanos:x}-{}", tid.len())
+    // Nanoseconds alone are NOT unique: concurrent writers can read the same
+    // clock tick, and the old suffix (`thread id LENGTH`) was identical for every
+    // small ThreadId. Measured under 4-way user creation: 12 rows were silently
+    // overwritten by peers (4-user chunks), then key creation answered 404.
+    // Randomness makes the id unique ACROSS nodes too (ids are global keys);
+    // the atomic sequence keeps even same-tick, same-random calls distinct.
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let rand = rand::random::<u64>();
+    format!("id-{nanos:x}-{rand:016x}-{seq:x}")
 }
 
 /// Read the full request body into a vec (empty for bodyless requests).
@@ -2957,5 +2966,36 @@ mod tests {
                 "every documented field is present: {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod gen_id_tests {
+    use super::gen_id;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn gen_id_is_unique_under_concurrency() {
+        let n = 8usize;
+        let per = 500usize;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                (0..per).map(|_| gen_id()).collect::<Vec<_>>()
+            }));
+        }
+        let ids: HashSet<String> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            n * per,
+            "concurrent gen_id() produced duplicates"
+        );
     }
 }

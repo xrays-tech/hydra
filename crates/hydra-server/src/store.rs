@@ -544,6 +544,13 @@ impl ConfigStore {
         self.publish_lock.lock().await
     }
 
+    /// The same lock, as an owned handle for a consumer that must hold it across
+    /// an entire async loop (the materializer: head read -> plan -> apply).
+    #[must_use]
+    pub fn write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.publish_lock)
+    }
+
     /// Run every registered hook against the snapshot that was just published.
     fn notify(&self, cfg: &ConfigData) {
         // Cloned out of the lock before calling: a hook may (re)register.

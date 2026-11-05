@@ -1766,6 +1766,12 @@ pub async fn write(
     route: TenantWriteRoute<'_>,
 ) -> pingora_core::Result<bool> {
     let trace_id = ctx.trace_id.clone();
+    // ONE local write at a time, from BEFORE the DB mutation through the publish
+    // tail. The materializer takes the SAME lock around restore/swap; without
+    // this, a tick that applies the previous head can wipe a row this handler
+    // already committed but has not published yet (measured: 300 concurrent user
+    // creates left 291 rows, then key creation answered 404 `no such user`).
+    let _write_guard = state.store.publish_guard().await;
     match route {
         // T6 (D-7 + D-5): these write ROWS in the identity tables, not the config
         // tree, and the boundary they DO need (which user inside this tenant) is carried

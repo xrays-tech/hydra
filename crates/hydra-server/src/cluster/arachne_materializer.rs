@@ -88,6 +88,15 @@ impl std::error::Error for MaterializeError {}
 /// impls.
 #[async_trait::async_trait]
 pub trait MaterializeTarget: Send + Sync {
+    /// The local write lock this target must hold across the WHOLE converge
+    /// (head read -> plan -> apply), not only around the final restore. Reading
+    /// an old head and then waiting for the lock is still a lost update: after a
+    /// writer publishes, the materializer would apply the old tree it had already
+    /// decoded. `None` for recording/test targets.
+    fn write_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        None
+    }
+
     /// Install `cfg` (and the fidelity rows a replica needs to rebuild its own SQLite tables)
     /// as the state this node serves.
     ///
@@ -202,6 +211,14 @@ impl Materializer {
     /// failure is recorded in the gate (which starts a backoff) and does NOT move the
     /// watermark.
     pub async fn converge(&mut self) -> Result<Converged, MaterializeError> {
+        // Hold the local write lock across the ENTIRE pass. Taking it only in
+        // `apply` is too late: this loop can read head H_old, block on the lock
+        // while a writer publishes H_new, then acquire it and apply H_old — wiping
+        // the write that just committed. Measured under bulk tenant-API CRUD.
+        let _write_guard = match self.target.write_lock() {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
         // The head WITH its log index: the value may be arbitrarily stale (upstream: "arbitrary old,
         // N1"), but the index says how old, which is the ordering this node needs before it REPLACES
         // its own database and snapshot with the tree that value names.
@@ -350,6 +367,10 @@ impl ReplicaTarget {
 
 #[async_trait::async_trait]
 impl MaterializeTarget for ReplicaTarget {
+    fn write_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        Some(self.store.write_lock())
+    }
+
     async fn apply(&self, cfg: Arc<ConfigData>, fidelity: Arc<FidelityRows>) -> Result<(), String> {
         // Rebuilt INTO the node's own database, so a restart reproduces what it serves — the whole
         // point of materializing rather than applying in memory. There is no "this node has no
