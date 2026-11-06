@@ -171,8 +171,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arachne-kv"
-version = "0.5.1"
-source = "git+https://github.com/xrays-tech/arachne?rev=153fa76#153fa764d5fb5f906309a847713ed33b154bfac8"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b3621eb8d1e9e089d3f1a4b7362c381a1f9b7900803358957b54de2e65e0683"
 dependencies = [
  "arachne-kv-seam",
  "arachne-kv-transport-tonic",
@@ -188,13 +189,15 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv-seam"
-version = "0.5.1"
-source = "git+https://github.com/xrays-tech/arachne?rev=153fa76#153fa764d5fb5f906309a847713ed33b154bfac8"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd99348d7d9d1dc39d9612de1c58ec9c73539df5104c7f06389ff170aa5e7853"
 
 [[package]]
 name = "arachne-kv-testsupport"
-version = "0.5.1"
-source = "git+https://github.com/xrays-tech/arachne?rev=153fa76#153fa764d5fb5f906309a847713ed33b154bfac8"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "700bb1d9e76c317620c415fda3cdc7800bbc42abbf107928019969bad948be44"
 dependencies = [
  "arachne-kv-seam",
  "tokio",
@@ -202,8 +205,9 @@ dependencies = [
 
 [[package]]
 name = "arachne-kv-transport-tonic"
-version = "0.5.1"
-source = "git+https://github.com/xrays-tech/arachne?rev=153fa76#153fa764d5fb5f906309a847713ed33b154bfac8"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74bdb450f81b1df58034c6958210f63ca9ddbc8d8371caf26820ab04ebba60d1"
 dependencies = [
  "arachne-kv-seam",
  "http",

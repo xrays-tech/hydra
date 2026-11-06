@@ -1244,6 +1244,16 @@ impl ArachneConfigStore {
                 "published tree was superseded by a newer head"
             );
         }
+        // Feed the local watch cache immediately. The watch event may arrive a
+        // tick later, but a writer that just read back this head must make its
+        // own next materialization see it. Store the OBSERVED head: if a newer
+        // concurrent publish won, that is the authoritative generation.
+        *self
+            .watch_cache
+            .head
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((observed_head.into_bytes(), observed_index));
         Ok((head, final_index))
     }
 }
