@@ -49,6 +49,7 @@
 //! the format is self-describing in the toc values.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -184,6 +185,13 @@ const PUBLISH_READBACK_WAIT: Duration = Duration::from_secs(5);
 /// Entities per `multi_get` batch during materialization. 24k entities therefore cost ~94 read
 /// commands, inside the 0.5 integration target (~100) and below the 4096-key/4 MiB caps.
 const ENTITY_READ_BATCH: usize = 256;
+
+/// Prefix and snapshot bound for the materializer's watch cache. Arachne's
+/// `watch` returns a consistent snapshot plus ordered events; values are
+/// content-addressed, so a cached key is immutable even if the cache is older
+/// than the current head. Missing keys fall back to multi_get.
+const WATCH_PREFIX: &[u8] = b"hydra/cfg/";
+const WATCH_SNAPSHOT_LIMIT: usize = 100_000;
 
 /// Shard keys per `multi_get` batch. 32 buckets fit in two batches even before de-duplicating
 /// the shared empty shard; each batch also stays well below the 4 MiB returned-value cap at the
@@ -330,6 +338,24 @@ pub struct ArachneConfigStore {
     /// buckets are reused across trees; the map is pruned to the current
     /// manifest's digests after each read.
     shard_cache: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
+    /// Best-effort event-driven cache of `hydra/cfg/` values. The watch is
+    /// started lazily; read paths use a key when present and fall back to
+    /// multi_get when absent. Only content-addressed, immutable keys are stored.
+    watch_cache: Arc<WatchCache>,
+}
+
+struct WatchCache {
+    values: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    started: AtomicBool,
+}
+
+impl WatchCache {
+    fn new() -> Self {
+        Self {
+            values: Mutex::new(HashMap::new()),
+            started: AtomicBool::new(false),
+        }
+    }
 }
 
 /// One bounded garbage-collection pass over the control-plane keyspace.
@@ -383,7 +409,55 @@ impl ArachneConfigStore {
             handle,
             entity_cache: Arc::new(Mutex::new(HashMap::new())),
             shard_cache: Arc::new(Mutex::new(HashMap::new())),
+            watch_cache: Arc::new(WatchCache::new()),
         }
+    }
+
+    /// Start the prefix watch once. Failure is non-fatal: every read still has
+    /// the multi_get fallback, and a later read retries the subscription.
+    async fn ensure_watch(&self) {
+        if self.watch_cache.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let handle = self.handle.clone();
+        let cache = self.watch_cache.clone();
+        match handle.watch(WATCH_PREFIX, WATCH_SNAPSHOT_LIMIT).await {
+            Ok(sub) => {
+                {
+                    let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
+                    values.clear();
+                    values.extend(sub.snapshot);
+                }
+                let mut events = sub.events;
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
+                        match event.value {
+                            Some(value) => {
+                                values.insert(event.key, value);
+                            }
+                            None => {
+                                values.remove(&event.key);
+                            }
+                        }
+                    }
+                    cache.started.store(false, Ordering::Release);
+                });
+            }
+            Err(e) => {
+                cache.started.store(false, Ordering::Release);
+                tracing::warn!(error = %e, "config watch cache unavailable; using multi_get fallback");
+            }
+        }
+    }
+
+    fn cached_content(&self, key: &str) -> Option<Vec<u8>> {
+        self.watch_cache
+            .values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key.as_bytes())
+            .cloned()
     }
 
     /// The tree the head currently names, or [`ReadOutcome::Empty`].
@@ -402,6 +476,7 @@ impl ArachneConfigStore {
 
     /// [`Self::read`] without the instrumentation, so the counting happens once.
     async fn read_inner(&self) -> Result<ReadOutcome, StoreError> {
+        self.ensure_watch().await;
         // Read the head WITH its index, then wait for THIS node's state machine to apply that
         // index before reading anything it names. Every manifest/shard/entity write was committed
         // before the head entry, so "head applied locally" implies they are readable locally.
@@ -459,6 +534,9 @@ impl ArachneConfigStore {
     /// A one-key `multi_get(Stale)`, so manifest/toc reads use the same batch API as the rest of
     /// the 0.5 materialize path.
     async fn multi_get_one(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        if let Some(value) = self.cached_content(key) {
+            return Ok(Some(value));
+        }
         let result = self
             .handle
             .multi_get(&[key.as_bytes()], ReadConsistency::Stale)
@@ -488,6 +566,14 @@ impl ArachneConfigStore {
             let mut cache = self.entity_cache.lock().unwrap_or_else(|e| e.into_inner());
             for entry in entries {
                 let key = cfg_entity(&entry.path, &hex_hash(&entry.content_hash));
+                if let Some(bytes) = self.cached_content(&key) {
+                    if bytes.len() == entry.len as usize
+                        && content_hash(&bytes) == entry.content_hash
+                    {
+                        tree.insert(entry.path.clone(), bytes);
+                        continue;
+                    }
+                }
                 if let Some(bytes) = cache.get(&key) {
                     if bytes.len() == entry.len as usize
                         && content_hash(bytes) == entry.content_hash
@@ -561,6 +647,12 @@ impl ArachneConfigStore {
         {
             let mut cache = self.shard_cache.lock().unwrap_or_else(|e| e.into_inner());
             for (digest, key) in unique {
+                if let Some(bytes) = self.cached_content(&key) {
+                    if content_hash(&bytes) == digest {
+                        fetched.insert(digest, bytes);
+                        continue;
+                    }
+                }
                 if let Some(bytes) = cache.get(&digest) {
                     if content_hash(bytes) == digest {
                         fetched.insert(digest, bytes.clone());
