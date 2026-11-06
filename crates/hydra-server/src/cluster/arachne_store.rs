@@ -397,7 +397,7 @@ impl ArachneConfigStore {
         let Some((head, head_index)) = self.current_head_with_index().await? else {
             return Ok(ReadOutcome::Empty);
         };
-        tracing::info!(
+        tracing::debug!(
             target: "hydra::cluster",
             head = %head,
             head_index,
@@ -960,7 +960,7 @@ impl ArachneConfigStore {
                 other => map_err(other),
             })?;
 
-        tracing::info!(
+        tracing::debug!(
             target: "hydra::cluster",
             head = %head,
             final_index,

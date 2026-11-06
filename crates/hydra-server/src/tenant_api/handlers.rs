@@ -1732,7 +1732,7 @@ async fn user_api_key_bulk_create(
         .await;
     }
 
-    let published = commit_and_publish_with(state, session, ctx, tenant_id, trace_id, true).await?;
+    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
     let Some(version) = published else {
         return Ok(true);
     };
@@ -2384,37 +2384,16 @@ async fn commit_and_publish(
     tenant_id: &str,
     trace_id: &str,
 ) -> pingora_core::Result<Option<u64>> {
-    commit_and_publish_with(state, session, ctx, tenant_id, trace_id, false).await
-}
-
-/// The same tail, with an explicit `force` for bulk identity rows.
-///
-/// `reload_all` returns `Ok(false)` when the replicated content compares equal.
-/// A bulk insert is never a no-op in the database, but if the in-memory
-/// replication snapshot already contains those rows (for example after an
-/// earlier local reload that did not reach the cluster), the non-forced path
-/// would skip the publish and return 200 while the head still names the old
-/// tree. Forcing the publish is the safe direction for a committed bulk write.
-async fn commit_and_publish_with(
-    state: &AppState,
-    session: &mut Session,
-    ctx: &mut RequestContext,
-    tenant_id: &str,
-    trace_id: &str,
-    force: bool,
-) -> pingora_core::Result<Option<u64>> {
-    let reloaded = state.store.reload_all_with(force).await;
-    match &reloaded {
-        Ok(changed) => tracing::info!(
+    match state.store.reload_all().await {
+        Ok(changed) => tracing::debug!(
             target: "hydra::tenant_api",
             tenant = %tenant_id,
             trace_id = %trace_id,
-            force,
-            changed = *changed,
+            changed,
             "post-write reload/publish tail complete"
         ),
         Err(e) => {
-            if let crate::store::StoreError::NotPublished { reason } = e {
+            if let crate::store::StoreError::NotPublished { reason } = &e {
                 tracing::error!(
                     target: "hydra::tenant_api",
                     tenant = %tenant_id,
