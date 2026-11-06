@@ -192,6 +192,10 @@ const ENTITY_READ_BATCH: usize = 256;
 /// than the current head. Missing keys fall back to multi_get.
 const WATCH_PREFIX: &[u8] = b"hydra/cfg/";
 const WATCH_SNAPSHOT_LIMIT: usize = 100_000;
+/// Hard bound for the best-effort watch cache. The normal path prunes to the
+/// current tree; this bound covers bursts between materializations so a long
+/// running process cannot grow the cache without limit.
+const WATCH_CACHE_MAX_ENTRIES: usize = 200_000;
 
 /// Shard keys per `multi_get` batch. 32 buckets fit in two batches even before de-duplicating
 /// the shared empty shard; each batch also stays well below the 4 MiB returned-value cap at the
@@ -356,6 +360,12 @@ impl WatchCache {
             started: AtomicBool::new(false),
         }
     }
+
+    /// Keep only keys referenced by the tree this materializer just read.
+    fn prune_to(&self, keep: &HashSet<Vec<u8>>) {
+        let mut values = self.values.lock().unwrap_or_else(|e| e.into_inner());
+        values.retain(|key, _| keep.contains(key));
+    }
 }
 
 /// One bounded garbage-collection pass over the control-plane keyspace.
@@ -440,6 +450,12 @@ impl ArachneConfigStore {
                                 values.remove(&event.key);
                             }
                         }
+                        if values.len() > WATCH_CACHE_MAX_ENTRIES {
+                            values.clear();
+                            tracing::warn!(
+                                "config watch cache exceeded {WATCH_CACHE_MAX_ENTRIES} entries;                                  dropping it and falling back to multi_get"
+                            );
+                        }
                     }
                     cache.started.store(false, Ordering::Release);
                 });
@@ -498,7 +514,7 @@ impl ArachneConfigStore {
         // Head tokens are self-describing: `m:<manifest-hash>` is the sharded era, anything else
         // is a legacy bare toc hash. The format inside each value is checked as well, so a mixed
         // or forged key cannot make the decoder guess.
-        let toc = if let Some(manifest_hash) = head_manifest_hash(&head) {
+        let (toc, mut keep) = if let Some(manifest_hash) = head_manifest_hash(&head) {
             let manifest_bytes = self
                 .multi_get_one(&cfg_manifest(manifest_hash))
                 .await?
@@ -514,7 +530,13 @@ impl ArachneConfigStore {
                 )));
             }
             let manifest = Manifest::decode(&manifest_bytes)?;
-            self.read_shards(&head, &manifest).await?
+            let mut keep = HashSet::new();
+            keep.insert(cfg_manifest(manifest_hash).into_bytes());
+            for digest in &manifest.shards {
+                keep.insert(cfg_shard(&hex_hash(digest)).into_bytes());
+            }
+            let toc = self.read_shards(&head, &manifest).await?;
+            (toc, keep)
         } else {
             let toc_bytes = self
                 .multi_get_one(&cfg_toc(&head))
@@ -524,10 +546,16 @@ impl ArachneConfigStore {
                         "the legacy head names tree {head} but its table of contents is missing after wait_applied({head_index}); refusing to serve a mixed tree"
                     ))
                 })?;
-            Toc::decode(&toc_bytes)?
+            let mut keep = HashSet::new();
+            keep.insert(cfg_toc(&head).into_bytes());
+            (Toc::decode(&toc_bytes)?, keep)
         };
 
+        for entry in &toc.entities {
+            keep.insert(cfg_entity(&entry.path, &hex_hash(&entry.content_hash)).into_bytes());
+        }
         let tree = self.read_entities(&head, &toc.entities).await?;
+        self.watch_cache.prune_to(&keep);
         Ok(ReadOutcome::Tree(Arc::new(tree)))
     }
 
