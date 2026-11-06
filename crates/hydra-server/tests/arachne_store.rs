@@ -487,7 +487,7 @@ async fn an_interleaved_publish_cannot_tear_the_tree_named_by_the_head() {
         .expect("re-commit A's head");
 
     // The tree the head now names must be complete AND consistent — that is the property.
-    let read = expect_tree(store.read().await.expect(
+    let read = expect_tree(ArachneConfigStore::new(node.handle.clone()).read().await.expect(
         "the tree named by the head must be readable: an interleaved publish may not leave the \
          head naming bytes that are not there",
     ));
@@ -503,7 +503,12 @@ async fn an_interleaved_publish_cannot_tear_the_tree_named_by_the_head() {
         .await
         .expect("commit B's head");
     assert_eq!(
-        expect_tree(store.read().await.expect("B's tree must be readable too")),
+        expect_tree(
+            ArachneConfigStore::new(node.handle.clone())
+                .read()
+                .await
+                .expect("B's tree must be readable too")
+        ),
         b
     );
 
@@ -1023,7 +1028,7 @@ async fn manifest_and_shard_disagreements_are_refused() {
         .put(manifest_key.as_bytes(), &tampered)
         .await
         .expect("tamper manifest");
-    let err = store
+    let err = ArachneConfigStore::new(node.handle.clone())
         .read()
         .await
         .expect_err("tampered manifest must be refused");
@@ -1049,7 +1054,7 @@ async fn manifest_and_shard_disagreements_are_refused() {
         .put(shard_key.as_bytes(), b"not the shard")
         .await
         .expect("tamper shard");
-    let err = store
+    let err = ArachneConfigStore::new(node.handle.clone())
         .read()
         .await
         .expect_err("tampered shard must be refused");
@@ -1076,7 +1081,7 @@ async fn manifest_and_shard_disagreements_are_refused() {
     )
     .expect("manifest");
     install_sharded_chain(&node, &toc_one, &wrong_count).await;
-    let err = store
+    let err = ArachneConfigStore::new(node.handle.clone())
         .read()
         .await
         .expect_err("a wrong entry count must be refused");
@@ -1092,7 +1097,7 @@ async fn manifest_and_shard_disagreements_are_refused() {
     )
     .expect("manifest");
     install_sharded_chain(&node, &toc_one, &wrong_bytes).await;
-    let err = store
+    let err = ArachneConfigStore::new(node.handle.clone())
         .read()
         .await
         .expect_err("wrong entity bytes must be refused");
@@ -1110,7 +1115,7 @@ async fn manifest_and_shard_disagreements_are_refused() {
     .expect("toc");
     let (dup_manifest, _) = split_shards(&toc_dup).expect("split duplicate");
     install_sharded_chain(&node, &toc_dup, &dup_manifest).await;
-    let err = store
+    let err = ArachneConfigStore::new(node.handle.clone())
         .read()
         .await
         .expect_err("duplicate paths must be refused");

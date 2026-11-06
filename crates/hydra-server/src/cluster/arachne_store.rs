@@ -190,7 +190,7 @@ const ENTITY_READ_BATCH: usize = 256;
 /// `watch` returns a consistent snapshot plus ordered events; values are
 /// content-addressed, so a cached key is immutable even if the cache is older
 /// than the current head. Missing keys fall back to multi_get.
-const WATCH_PREFIX: &[u8] = b"hydra/cfg/";
+const WATCH_PREFIX: &[u8] = b"hydra/";
 const WATCH_SNAPSHOT_LIMIT: usize = 100_000;
 /// Hard bound for the best-effort watch cache. The normal path prunes to the
 /// current tree; this bound covers bursts between materializations so a long
@@ -350,6 +350,9 @@ pub struct ArachneConfigStore {
 
 struct WatchCache {
     values: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    /// Latest `ctl/head` value and the watch index that produced it. A snapshot
+    /// only carries the applied watermark, so it uses that conservative index.
+    head: Mutex<Option<(Vec<u8>, u64)>>,
     started: AtomicBool,
 }
 
@@ -357,6 +360,7 @@ impl WatchCache {
     fn new() -> Self {
         Self {
             values: Mutex::new(HashMap::new()),
+            head: Mutex::new(None),
             started: AtomicBool::new(false),
         }
     }
@@ -433,14 +437,30 @@ impl ArachneConfigStore {
         let cache = self.watch_cache.clone();
         match handle.watch(WATCH_PREFIX, WATCH_SNAPSHOT_LIMIT).await {
             Ok(sub) => {
+                crate::admin::metrics::record_arachne_watch("started");
+                let head_key = ctl_head();
+                let snapshot_head = sub
+                    .snapshot
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == head_key.as_bytes())
+                    .map(|(_, value)| (value.clone(), sub.applied_index));
                 {
                     let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
                     values.clear();
                     values.extend(sub.snapshot);
                 }
+                *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = snapshot_head;
                 let mut events = sub.events;
                 tokio::spawn(async move {
+                    let head_key = ctl_head();
                     while let Some(event) = events.recv().await {
+                        if event.key.as_slice() == head_key.as_bytes() {
+                            let mut head = cache.head.lock().unwrap_or_else(|e| e.into_inner());
+                            *head = event
+                                .value
+                                .as_ref()
+                                .map(|value| (value.clone(), event.index));
+                        }
                         let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
                         match event.value {
                             Some(value) => {
@@ -457,23 +477,43 @@ impl ArachneConfigStore {
                             );
                         }
                     }
+                    *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    crate::admin::metrics::record_arachne_watch("disconnected");
                     cache.started.store(false, Ordering::Release);
                 });
             }
             Err(e) => {
+                crate::admin::metrics::record_arachne_watch("failed");
+                *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 cache.started.store(false, Ordering::Release);
                 tracing::warn!(error = %e, "config watch cache unavailable; using multi_get fallback");
             }
         }
     }
 
-    fn cached_content(&self, key: &str) -> Option<Vec<u8>> {
+    fn watch_head(&self) -> Option<(String, u64)> {
         self.watch_cache
+            .head
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(value, index)| (String::from_utf8_lossy(value).into_owned(), *index))
+    }
+
+    fn cached_content(&self, key: &str) -> Option<Vec<u8>> {
+        let value = self
+            .watch_cache
             .values
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key.as_bytes())
-            .cloned()
+            .cloned();
+        crate::admin::metrics::record_arachne_watch_cache(if value.is_some() {
+            "hit"
+        } else {
+            "miss"
+        });
+        value
     }
 
     /// The tree the head currently names, or [`ReadOutcome::Empty`].
@@ -497,7 +537,19 @@ impl ArachneConfigStore {
         // index before reading anything it names. Every manifest/shard/entity write was committed
         // before the head entry, so "head applied locally" implies they are readable locally.
         // `wait_applied` is local (no quorum) and event-driven, not a poll.
-        let Some((head, head_index)) = self.current_head_with_index().await? else {
+        let head = if self.watch_cache.started.load(Ordering::Acquire) {
+            if let Some(head) = self.watch_head() {
+                crate::admin::metrics::record_arachne_watch("head_hit");
+                Some(head)
+            } else {
+                crate::admin::metrics::record_arachne_watch("head_fallback");
+                self.current_head_with_index().await?
+            }
+        } else {
+            crate::admin::metrics::record_arachne_watch("head_fallback");
+            self.current_head_with_index().await?
+        };
+        let Some((head, head_index)) = head else {
             return Ok(ReadOutcome::Empty);
         };
         tracing::debug!(

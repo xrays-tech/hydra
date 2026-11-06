@@ -253,6 +253,10 @@ struct Metrics {
     /// `conflict` (same index names a different tree), `superseded` (a newer
     /// concurrent head won).
     arachne_publish_readback_total: IntCounterVec,
+    /// Watch lifecycle / head-cache outcomes.
+    arachne_watch_total: IntCounterVec,
+    /// Per-key watch content-cache outcomes.
+    arachne_watch_cache_total: IntCounterVec,
     /// Bytes in the tree the last successful publish committed. The growth series
     /// for the capacity question R2 raises; the HARD signal is
     /// `publish_total{result="refused"}`, not a byte threshold invented here.
@@ -567,6 +571,18 @@ fn metrics() -> Option<&'static Metrics> {
             arachne_publish_readback_total: register_int_counter_vec!(
                 "hydra_arachne_publish_readback_total",
                 "Publish head read-back outcomes (result=stale|conflict|superseded)",
+                &["result"]
+            )
+            .ok()?,
+            arachne_watch_total: register_int_counter_vec!(
+                "hydra_arachne_watch_total",
+                "Arachne watch/head-cache outcomes (result=started|failed|disconnected|head_hit|head_fallback)",
+                &["result"]
+            )
+            .ok()?,
+            arachne_watch_cache_total: register_int_counter_vec!(
+                "hydra_arachne_watch_cache_total",
+                "Arachne watch content-cache lookups (result=hit|miss)",
                 &["result"]
             )
             .ok()?,
@@ -1083,6 +1099,22 @@ pub fn record_arachne_publish_readback(result: &str) {
     }
 }
 
+/// Count a watch lifecycle/head-cache outcome.
+pub fn record_arachne_watch(result: &str) {
+    if let Some(m) = metrics() {
+        m.arachne_watch_total.with_label_values(&[result]).inc();
+    }
+}
+
+/// Count a watch content-cache lookup.
+pub fn record_arachne_watch_cache(result: &str) {
+    if let Some(m) = metrics() {
+        m.arachne_watch_cache_total
+            .with_label_values(&[result])
+            .inc();
+    }
+}
+
 /// Publish the size of the tree the last publish committed.
 pub fn record_arachne_config_bytes(bytes: usize) {
     if let Some(m) = metrics() {
@@ -1479,6 +1511,10 @@ mod tests {
         record_arachne_publish("refused");
         record_arachne_publish_readback("stale");
         record_arachne_publish_readback("superseded");
+        record_arachne_watch("started");
+        record_arachne_watch("disconnected");
+        record_arachne_watch_cache("hit");
+        record_arachne_watch_cache("miss");
         record_arachne_config_bytes(4096);
         record_arachne_quorum_unavailable("read");
         let out = render();
@@ -1490,6 +1526,10 @@ mod tests {
             "hydra_arachne_publish_total{result=\"refused\"} 1",
             "hydra_arachne_publish_readback_total{result=\"stale\"} 1",
             "hydra_arachne_publish_readback_total{result=\"superseded\"} 1",
+            "hydra_arachne_watch_total{result=\"started\"} 1",
+            "hydra_arachne_watch_total{result=\"disconnected\"} 1",
+            "hydra_arachne_watch_cache_total{result=\"hit\"} 1",
+            "hydra_arachne_watch_cache_total{result=\"miss\"} 1",
             "hydra_arachne_config_bytes 4096",
             "hydra_arachne_quorum_unavailable_total{op=\"read\"} 1",
         ] {

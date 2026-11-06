@@ -993,6 +993,10 @@ name and label that really exists in this codebase (`/metrics`).
 | **No node is the raft writer** | `sum(hydra_arachne_this_node_leader) == 0` | Nobody answers the raft write probe, so no config change can be committed anywhere: management writes fail closed with `503 config_not_published` and the data plane keeps serving the **already materialized** config on every node. Sustained means the cluster has lost its majority (< ⌈n/2⌉+1 members reachable) — **the fix is to get a majority up**, not to restart the node answering 503. **The series exists only on a cluster node** (`IntGaugeVec` labelled by `node`): a single-node deployment has no raft node, so this rule is silent there instead of firing forever on a 0 that means "not applicable" (ADR-0001 T4.1 deleted the registry whose rows this replaces) |
 | Publishing a config change is failing | `increase(hydra_arachne_publish_total{result=~"quorum_unavailable|error"}[10m]) > 0` | A node tried to commit a config tree and the control plane refused it. `quorum_unavailable` = no majority (same outage as the row above, seen from the write side); `error` = a transport failure, a malformed tree or a bug — the node still holds the change **in its own SQLite** and keeps serving it, but no other node will ever see it (`StoreError::NotPublished`). Manage writes answered 503 while this happens; a later successful write re-publishes whatever the config is then |
 | A config change was REFUSED (capacity) | `increase(hydra_arachne_publish_total{result="refused"}[10m]) > 0` | The publish was rejected **before a byte was sent** — nothing enters the log, the whole batch fails whole — at either of two gates (2026-10-10 widened the definition): the **encoder** refused the config (a value over the library's 1 MiB cap, an id that cannot be keyed, a failed seal), or the **`multi_put` batch overran a library bound** (>4096 entries, >4 MiB total key+value bytes — `MAX_MULTI_PUT_TOTAL_BYTES`). Either way the admin write answers `503 config_not_published` with the bound named in the reason, and a later successful write re-publishes whatever the config is then. Retrying cannot help — this is a configuration change (shrink the entity, remove the offending id, or trim the config below the batch bound; the batch is **never split automatically**, atomicity is the point). It is the honest capacity alarm ADR-0001 risk R2 asks for; `hydra_arachne_config_bytes` shows the growth that leads to it. No threshold is invented in this rule: the bound is the library's own and is quoted verbatim in the refusal reason |
+| Publish head read-back rejected | `increase(hydra_arachne_publish_readback_total{result=~"stale|conflict"}[10m]) > 0` | The 0.5.1 publisher read `ctl/head` after its final batch and found a STALE index or a same-index conflict. The write was not reported as visible; management writes return `503 config_not_published`. This is the compensating guard for the Arachne P1 session-integrity gap; do not disable it until Arachne delivers the payload-hash/SessionConflict mechanism. Investigate the Arachne client/session and leader-change logs if it fires |
+| Publish superseded by a newer head | `increase(hydra_arachne_publish_readback_total{result="superseded"}[10m]) > 0` | A concurrent publish with a higher log index won. This is last-writer-wins, not a stale-session failure; it is a dashboard/watch signal, not a paging alert |
+| Control-plane watch cache disconnected | `increase(hydra_arachne_watch_total{result="disconnected"}[10m]) > 0` | The materializer's `hydra/` watch channel closed (consumer too slow or subscription ended). Reads fall back to `multi_get`; correctness is preserved, but materialization latency may rise. The next read re-subscribes. Alert only if sustained |
+| Watch cache unavailable at startup | `increase(hydra_arachne_watch_total{result="failed"}[10m]) > 0` | The lazy watch could not be opened (for example snapshot limit/Busy). Reads use `multi_get`; investigate the Arachne watch error if this is sustained |
 | Leadership is flapping | `increase(hydra_arachne_leader_flips_total[15m]) > 5` | The answer to "is this node the writer" changed more than five times in 15 minutes, on some node. A sampled gauge cannot show this (by the time a scrape lands the answer is true again), which is why the flips are counted separately. Flapping means an unstable quorum (a node restarting in a loop, a saturated link, a CPU-starved leader) and it moves the commit point under every writer |
 | Config snapshot stale | `hydra_config_snapshot_stale == 1` | A reload failed (post-write **or** the explicit `POST /api/v1/reload`); the in-memory snapshot is behind the DB. The state is nastier than it looks, and it was measured 2026-09-30 (`integration/test_snapshot_stale.py`) by putting a provider row the LOADER rejects directly into SQLite (the admin write boundary refuses such a row, so a hand-edited database or a restore is how this happens): the node **keeps serving** on the old snapshot, `POST /api/v1/reload` answers **400 `reload_failed`** ("old snapshot retained"), the gauge goes to 1, and — the trap the code documents in capitals — **every later admin write still answers 2xx while having no runtime effect**: a `PUT` that disables a tenant returned 200 and the tenant kept being served until a reload succeeded. Each tenant view carries `snapshot_stale: true` while this holds. **Recovery:** remove/fix the offending row and reload — the gauge returns to 0 and the pending write takes effect (measured: the disabled tenant then answered `403 tenant_disabled`). Until 2026-09-30 the explicit endpoint recorded **nothing**: a failing `/reload` left the gauge at 0 while a later successful `/reload` left an earlier 1 in place, so this alert could neither fire on the failure nor clear on the documented recovery |
 | Admission gate resized on hot-reload | `increase(hydra_admission_resizes_total[10m]) > 0` | A provider's admission limits were changed and a new gate generation was applied (decision D-14, 2026-10-09): the `PUT /api/v1/providers/{id}` row change took effect on the next request. In-flight requests finished under the old cap, so a brief spike around a resize is expected. `GET /api/v1/concurrency` shows both sides for the affected provider (`max_concurrency` vs `configured_max_concurrency`) plus `limits_stale: true` only in the window between a config write and the first request that applies it |
@@ -1065,6 +1069,27 @@ two names for one signal would mean two owners.
 > many answers your clients abandoned, that is still the open decision §7-1.
 
 ---
+
+### 9.2 Control-plane cache panels
+
+Suggested Grafana/PromQL panels for the materializer cache (the repository ships
+metrics, not dashboard JSON):
+
+```promql
+# cache hit ratio (per node)
+sum by (instance) (rate(hydra_arachne_watch_cache_total{result="hit"}[5m]))
+  /
+sum by (instance) (rate(hydra_arachne_watch_cache_total[5m]))
+
+# publish/read-back failures
+increase(hydra_arachne_publish_readback_total{result=~"stale|conflict"}[10m])
+
+# superseded publishes (expected under concurrent writers)
+increase(hydra_arachne_publish_readback_total{result="superseded"}[10m])
+
+# watch lifecycle
+sum by (result) (rate(hydra_arachne_watch_total[5m]))
+```
 
 ## 10. Troubleshooting
 
