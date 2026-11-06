@@ -249,6 +249,10 @@ struct Metrics {
     /// manifest+head batch overran its entry-count/total-byte/per-value bound.
     /// The capacity alarm ADR-0001 risk R2 asks for).
     arachne_publish_total: IntCounterVec,
+    /// Read-back guard outcomes: `stale` (head index regressed / absent),
+    /// `conflict` (same index names a different tree), `superseded` (a newer
+    /// concurrent head won).
+    arachne_publish_readback_total: IntCounterVec,
     /// Bytes in the tree the last successful publish committed. The growth series
     /// for the capacity question R2 raises; the HARD signal is
     /// `publish_total{result="refused"}`, not a byte threshold invented here.
@@ -557,6 +561,12 @@ fn metrics() -> Option<&'static Metrics> {
             arachne_publish_total: register_int_counter_vec!(
                 "hydra_arachne_publish_total",
                 "Config publish outcomes (result=ok|not_leader|quorum_unavailable|error|refused)",
+                &["result"]
+            )
+            .ok()?,
+            arachne_publish_readback_total: register_int_counter_vec!(
+                "hydra_arachne_publish_readback_total",
+                "Publish head read-back outcomes (result=stale|conflict|superseded)",
                 &["result"]
             )
             .ok()?,
@@ -1064,6 +1074,15 @@ pub fn record_arachne_publish(result: &str) {
     }
 }
 
+/// Count a publish read-back guard outcome (`stale`, `conflict`, `superseded`).
+pub fn record_arachne_publish_readback(result: &str) {
+    if let Some(m) = metrics() {
+        m.arachne_publish_readback_total
+            .with_label_values(&[result])
+            .inc();
+    }
+}
+
 /// Publish the size of the tree the last publish committed.
 pub fn record_arachne_config_bytes(bytes: usize) {
     if let Some(m) = metrics() {
@@ -1458,6 +1477,8 @@ mod tests {
         record_arachne_publish("ok");
         record_arachne_publish("quorum_unavailable");
         record_arachne_publish("refused");
+        record_arachne_publish_readback("stale");
+        record_arachne_publish_readback("superseded");
         record_arachne_config_bytes(4096);
         record_arachne_quorum_unavailable("read");
         let out = render();
@@ -1467,6 +1488,8 @@ mod tests {
             "hydra_arachne_publish_total{result=\"ok\"} 1",
             "hydra_arachne_publish_total{result=\"quorum_unavailable\"} 1",
             "hydra_arachne_publish_total{result=\"refused\"} 1",
+            "hydra_arachne_publish_readback_total{result=\"stale\"} 1",
+            "hydra_arachne_publish_readback_total{result=\"superseded\"} 1",
             "hydra_arachne_config_bytes 4096",
             "hydra_arachne_quorum_unavailable_total{op=\"read\"} 1",
         ] {

@@ -326,6 +326,10 @@ pub struct ArachneConfigStore {
     /// keys include their content hash, so a hit is immutable and can be reused
     /// across trees; the map is pruned to the current tree after each read.
     entity_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// Content-addressed TOC shard values. Shards are immutable, so unchanged
+    /// buckets are reused across trees; the map is pruned to the current
+    /// manifest's digests after each read.
+    shard_cache: Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>,
 }
 
 /// One bounded garbage-collection pass over the control-plane keyspace.
@@ -378,6 +382,7 @@ impl ArachneConfigStore {
         Self {
             handle,
             entity_cache: Arc::new(Mutex::new(HashMap::new())),
+            shard_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -552,7 +557,21 @@ impl ArachneConfigStore {
         }
 
         let mut fetched: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(unique.len());
-        for chunk in unique.chunks(SHARD_READ_BATCH) {
+        let mut pending: Vec<([u8; 32], String)> = Vec::new();
+        {
+            let mut cache = self.shard_cache.lock().unwrap_or_else(|e| e.into_inner());
+            for (digest, key) in unique {
+                if let Some(bytes) = cache.get(&digest) {
+                    if content_hash(bytes) == digest {
+                        fetched.insert(digest, bytes.clone());
+                        continue;
+                    }
+                    cache.remove(&digest);
+                }
+                pending.push((digest, key));
+            }
+        }
+        for chunk in pending.chunks(SHARD_READ_BATCH) {
             let keys: Vec<&[u8]> = chunk.iter().map(|(_, key)| key.as_bytes()).collect();
             let result = self
                 .handle
@@ -627,6 +646,13 @@ impl ArachneConfigStore {
                 )));
             }
         }
+
+        let mut shard_cache = self.shard_cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (digest, bytes) in &fetched {
+            shard_cache.insert(*digest, bytes.clone());
+        }
+        let keep: HashSet<[u8; 32]> = manifest.shards.iter().copied().collect();
+        shard_cache.retain(|digest, _| keep.contains(digest));
 
         Ok(Toc {
             format: TOC_FORMAT,
@@ -1009,12 +1035,16 @@ impl ArachneConfigStore {
             .await
             .map_err(map_err)?;
         let observed = self.current_head_with_index().await?;
+        if observed.is_none() {
+            crate::admin::metrics::record_arachne_publish_readback("stale");
+        }
         let (observed_head, observed_index) = observed.ok_or_else(|| {
             StoreError::Arachne(format!(
                 "published tree {head} at index {final_index}, but ctl/head is absent after read-back"
             ))
         })?;
         if observed_index < final_index {
+            crate::admin::metrics::record_arachne_publish_readback("stale");
             return Err(StoreError::Arachne(format!(
                 "published tree {head} at index {final_index}, but ctl/head reads as \
                  {observed_head} at index {observed_index}; refusing to report a head the \
@@ -1023,6 +1053,7 @@ impl ArachneConfigStore {
         }
         if observed_head != head {
             if observed_index == final_index {
+                crate::admin::metrics::record_arachne_publish_readback("conflict");
                 return Err(StoreError::Arachne(format!(
                     "published tree {head} at index {final_index}, but ctl/head names a different \
                      tree {observed_head} at the same index"
@@ -1031,6 +1062,7 @@ impl ArachneConfigStore {
             // A concurrent publish with a genuinely higher index won. Our final
             // batch did commit, but its tree is superseded by the newer head; that
             // is last-writer-wins, not a stale-session/read-back failure.
+            crate::admin::metrics::record_arachne_publish_readback("superseded");
             tracing::warn!(
                 target: "hydra::cluster",
                 published = %head,
