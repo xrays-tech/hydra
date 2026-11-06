@@ -5,10 +5,11 @@
 //!
 //! Under the homogeneous model (ADR-0001 D-2, and the user's ruling on where a management write
 //! lands) every node runs the same write path: the SQLite transaction commits LOCALLY, then this
-//! node encodes its own config into a tree and commits it: missing entities are uploaded first in
-//! bounded content-addressed chunks, then the toc and head go into ONE final `multi_put` — a
-//! single log entry, all or nothing, the head moving in that same entry as the tree it names
-//! (2026-10-10, plan `2026-10-10-multi-put-atomic-publish`).
+//! node encodes its own config into a tree and commits it: the toc is split into shards, missing
+//! entities and shards are pre-uploaded in bounded content-addressed chunks, then manifest +
+//! head token go into ONE final `multi_put` — a single log entry, all or nothing, the head
+//! moving in that same entry as the manifest it names (2026-10-10, plan
+//! `2026-10-10-multi-put-atomic-publish`; sharded V2 + Arachne 0.5 index returns).
 //! Those writes are forwarded to the raft leader (when this node is a follower), so "any node can
 //! accept a management write" does not mean "any node is a writer" at the storage level.
 //!
@@ -29,6 +30,7 @@
 
 use std::sync::Arc;
 
+use arachne_kv::Index;
 use hydra_core::config::ConfigData;
 
 use super::arachne_materializer::encode_config;
@@ -56,7 +58,8 @@ impl ConfigPublisher {
         }
     }
 
-    /// Encode `cfg` (+ the fidelity rows) and commit it. Returns the new head hash.
+    /// Encode `cfg` (+ the fidelity rows) and commit it. Returns the new head token
+    /// (`m:<manifest-hash>`).
     ///
     /// The two steps are separate on purpose: encoding is a pure function of the config (and
     /// testable without a cluster), committing is `ArachneConfigStore::publish`, which is the
@@ -64,10 +67,10 @@ impl ConfigPublisher {
     ///
     /// # Errors
     /// A human-readable reason: the codec refused the config (an unkeyable id, a value over the
-    /// configured per-value cap, a seal that failed); an entity chunk or the final toc/head
-    /// batch overran a library bound (entry count / total bytes / per-value bytes — that
-    /// batch enters nothing, and the head never moves); or the commit did not go through (no
-    /// leader, no quorum). All mean "the cluster does not have this config"; the first two
+    /// configured per-value cap, a seal that failed); a toc shard exceeded `SHARD_MAX_BYTES` at
+    /// plan time; an entity/shard chunk or the final manifest/head batch overran a library bound
+    /// (that batch enters nothing, and the head never moves); or the commit did not go through
+    /// (no leader, no quorum). All mean "the cluster does not have this config"; the first two
     /// are also counted as `publish_total{result="refused"}`.
     /// The local replica's current head and its applied index (for the
     /// ConfigStore's local-write watermark).
@@ -89,6 +92,19 @@ impl ConfigPublisher {
         cfg: &ConfigData,
         fidelity: &FidelityRows,
     ) -> Result<String, String> {
+        self.publish_with_index(cfg, fidelity)
+            .await
+            .map(|(head, _index)| head)
+    }
+
+    /// Encode, commit, and return both the new head token and the **final log index** that
+    /// committed the manifest+head. That index is the tree generation used by the local-write
+    /// watermark.
+    pub async fn publish_with_index(
+        &self,
+        cfg: &ConfigData,
+        fidelity: &FidelityRows,
+    ) -> Result<(String, Index), String> {
         // A REFUSAL, not a transport failure: the config cannot be published as it
         // stands (a value over the configured per-value cap, an id that cannot be
         // keyed, a failed seal), so retrying will not help and the fix is a
@@ -100,7 +116,7 @@ impl ConfigPublisher {
             format!("cannot encode the config tree: {e}")
         })?;
         self.store
-            .publish(&tree)
+            .publish_with_index(&tree)
             .await
             .map_err(|e| format!("the head could not be committed: {e}"))
     }

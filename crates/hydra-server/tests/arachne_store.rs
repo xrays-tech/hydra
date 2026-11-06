@@ -11,28 +11,31 @@
 //!   in proportion to the size of the config;
 //! * an entity whose stored bytes do not match the toc is refused rather than
 //!   served;
-//! * since the `multi_put` conversion (plan 2026-10-10, A1–A4): missing entities are
-//!   uploaded in bounded content-addressed chunks and then toc + head commit in ONE log
-//!   entry, a bulk tree past the old single-batch cap commits via those chunks, concurrent
-//!   publishes commit whole trees, and the toc the head names describes a tree that is
-//!   fully present.
+//! * since sharded V2: the toc is split into 32 fixed shards, missing entities/shards are
+//!   uploaded first, and then the manifest + head token commit in ONE log entry; a 24k tree
+//!   stays well under the per-value cap, format-6 heads still read, a bulk tree past the old
+//!   single-batch cap commits via chunks, and concurrent publishes commit whole trees.
 //!
 //! The node is a one-member cluster assembled in-process. `Arachne::start`
 //! cannot be used here: it is a process-wide singleton, so a test binary cannot
 //! host several nodes through it — but this file needs only one, and it drives
 //! the same production `ArachneConfigStore` the materializer will.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use arachne_kv::server::{assemble_cluster, ClusterConfig};
-use arachne_kv::{NodeId, Profile};
+use arachne_kv::{NodeId, Profile, ReadConsistency};
 use hydra_server::cluster::arachne_keys::{
-    cfg_entity, cfg_toc, content_hash, ctl_head, hex_hash, EntityPath, Toc,
+    cfg_entity, cfg_manifest, cfg_shard, cfg_toc, content_hash, ctl_gc_retain, ctl_head,
+    head_manifest_hash, hex_hash, manifest_head, EntityPath, Manifest, Toc, TocEntry,
+    LEGACY_TOC_FORMAT, SHARD_COUNT, SHARD_MAX_BYTES, TOC_FORMAT,
 };
-use hydra_server::cluster::arachne_store::{ArachneConfigStore, ConfigTree, ReadOutcome};
+use hydra_server::cluster::arachne_store::{
+    split_shards, ArachneConfigStore, ConfigTree, ReadOutcome,
+};
 
 /// A raft member must be dialable at the address its peers were told about, so
 /// these cannot be OS-assigned — and cargo runs the tests in this file
@@ -41,6 +44,10 @@ use hydra_server::cluster::arachne_store::{ArachneConfigStore, ConfigTree, ReadO
 const PORTS: [u16; 10] = [
     18211, 18212, 18213, 18214, 18215, 18216, 18217, 18218, 18219, 18220,
 ];
+const PORT_BULK_24K: u16 = 18221;
+const PORT_LEGACY: u16 = 18222;
+const PORT_GC: u16 = 18223;
+const PORT_MANIFEST_BAD: u16 = 18224;
 
 fn data_dir(tag: &str) -> PathBuf {
     let dir =
@@ -109,6 +116,125 @@ fn expect_tree(outcome: ReadOutcome) -> BTreeMap<EntityPath, Vec<u8>> {
         ReadOutcome::Tree(t) => (*t).clone(),
         ReadOutcome::Empty => panic!("expected a committed tree, found an empty config"),
     }
+}
+
+/// Follow a head token to its toc the way the reader does: manifest + shards for `m:`, a legacy
+/// whole toc for a bare hash. Used by the assertions that inspect storage directly.
+async fn toc_for_head(node: &arachne_kv::server::AssembledClusterNode, head: &str) -> Toc {
+    if let Some(manifest_hash) = head_manifest_hash(head) {
+        let manifest_bytes = node
+            .handle
+            .get_stale(cfg_manifest(manifest_hash).as_bytes())
+            .await
+            .expect("manifest read")
+            .expect("a sharded head must have a manifest");
+        assert_eq!(
+            hex_hash(&content_hash(&manifest_bytes)),
+            manifest_hash,
+            "the manifest must hash to the token the head names"
+        );
+        let manifest = Manifest::decode(&manifest_bytes).expect("manifest decodes");
+        let mut entries = Vec::new();
+        for digest in &manifest.shards {
+            let bytes = node
+                .handle
+                .get_stale(cfg_shard(&hex_hash(digest)).as_bytes())
+                .await
+                .expect("shard read")
+                .expect("every manifest shard must be stored");
+            assert_eq!(content_hash(&bytes), *digest);
+            let shard = Toc::decode_shard(&bytes).expect("shard decodes");
+            entries.extend(shard.entities);
+        }
+        assert_eq!(entries.len(), manifest.entry_count as usize);
+        Toc {
+            format: TOC_FORMAT,
+            entities: entries,
+        }
+    } else {
+        let bytes = node
+            .handle
+            .get_stale(cfg_toc(head).as_bytes())
+            .await
+            .expect("legacy toc read")
+            .expect("a bare head must have a legacy toc");
+        Toc::decode(&bytes).expect("legacy toc decodes")
+    }
+}
+
+fn toc_entry(path: EntityPath, bytes: &[u8]) -> TocEntry {
+    TocEntry {
+        path,
+        content_hash: content_hash(bytes),
+        len: bytes.len() as u32,
+    }
+}
+
+/// Write a self-consistent (or deliberately inconsistent) sharded chain directly, used by the
+/// GC and manifest-disagreement tests. The manifest is written under its own hash and the head is
+/// its `m:` token, so the reader follows exactly the production path.
+async fn install_sharded_chain(
+    node: &arachne_kv::server::AssembledClusterNode,
+    toc: &Toc,
+    manifest: &Manifest,
+) -> String {
+    let (_, shards) = split_shards(toc).expect("split chain");
+    let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen = HashSet::new();
+    for shard in &shards {
+        let digest = shard.digest();
+        if seen.insert(digest) {
+            writes.push((cfg_shard(&hex_hash(&digest)), shard.encode()));
+        }
+    }
+    let manifest_hash = manifest.hash();
+    writes.push((cfg_manifest(&manifest_hash), manifest.encode()));
+    let head = manifest_head(&manifest_hash);
+    writes.push((ctl_head(), head.clone().into_bytes()));
+
+    let refs: Vec<(&[u8], &[u8])> = writes
+        .iter()
+        .map(|(key, value)| (key.as_bytes(), value.as_slice()))
+        .collect();
+    node.handle
+        .multi_put(&refs)
+        .await
+        .expect("install sharded chain");
+    head
+}
+
+/// Write a legacy whole toc + entities + bare head, the shape an older build left behind.
+async fn install_legacy_chain(
+    node: &arachne_kv::server::AssembledClusterNode,
+    tree: &ConfigTree,
+) -> String {
+    let entries: Vec<TocEntry> = tree
+        .iter()
+        .map(|(path, bytes)| toc_entry(path.clone(), bytes))
+        .collect();
+    let toc = Toc::new(LEGACY_TOC_FORMAT, entries).expect("legacy toc");
+    let toc_hash = toc.hash();
+    let mut writes: Vec<(String, Vec<u8>)> = tree
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                cfg_entity(path, &hex_hash(&content_hash(bytes))),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    writes.push((cfg_toc(&toc_hash), toc.encode()));
+    writes.push((ctl_head(), toc_hash.clone().into_bytes()));
+
+    let refs: Vec<(&[u8], &[u8])> = writes
+        .iter()
+        .map(|(key, value)| (key.as_bytes(), value.as_slice()))
+        .collect();
+    node.handle
+        .multi_put(&refs)
+        .await
+        .expect("install legacy chain");
+    toc_hash
 }
 
 /// A full round trip, and the commit-point property (2026-10-10, multi_put): missing
@@ -388,19 +514,19 @@ async fn an_interleaved_publish_cannot_tear_the_tree_named_by_the_head() {
 /// THE FINAL COMMIT IS ONE LOG ENTRY (plan A1), and an unchanged entity is not resent.
 ///
 /// The evidence is index arithmetic, not timing: `get_stale_with_index` reports the raft log
-/// index of the entry that wrote the key. Missing entities are now uploaded in earlier,
+/// index of the entry that wrote the key. Missing entities and shards are uploaded in earlier,
 /// bounded chunks (content-addressed, unreferenced until the head moves), and the final batch
-/// writes toc + head together: the toc lands at the SAME index as the head. Before `multi_put`
-/// the same measurement gave `+N+2` (N entities + toc + head as separate proposes). The delta
-/// itself is `>= 1` rather than `== 1` (2026-10-10, oracle F4): a no-op entry from a leader
-/// handover may also advance the index, and that would false-red an exact-equality claim
+/// writes manifest + head together: the manifest lands at the SAME index as the head. Before
+/// `multi_put` the same measurement gave `+N+2` (N entities + toc + head as separate proposes).
+/// The delta itself is `>= 1` rather than `== 1` (2026-10-10, oracle F4): a no-op entry from a
+/// leader handover may also advance the index, and that would false-red an exact-equality claim
 /// without meaning the commit split. What pins "same final batch" is the index equality
-/// between toc and head; an entity the new tree did not change keeps ITS origin index (it was
-/// skipped, not rewritten).
+/// between manifest and head; an entity the new tree did not change keeps ITS origin index (it
+/// was skipped, not rewritten).
 ///
-/// Falsification: write toc and head as separate proposes and the toc's index no longer equals
-/// the head's (toc lands an entry earlier); always resend every entity and the frozen acme index
-/// advances.
+/// Falsification: write manifest and head as separate proposes and the manifest's index no
+/// longer equals the head's (manifest lands an entry earlier); always resend every entity and
+/// the frozen acme index advances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_final_commit_is_one_log_entry_and_unchanged_entities_stay_put() {
     let node = start_node("one-entry", PORTS[6]).await;
@@ -443,24 +569,33 @@ async fn the_final_commit_is_one_log_entry_and_unchanged_entities_stay_put() {
          index went {i1} → {i2}"
     );
 
-    // toc and head were written BY the final commit entry: both carry its index, and the toc
-    // key under the committed hash is the one that entry wrote (toc/head are never skipped).
-    let toc_key = cfg_toc(&h2);
-    let (toc_bytes, toc_i) = node
+    // manifest and head were written BY the final commit entry: both carry its index, and the
+    // manifest key under the committed hash is the one that entry wrote (manifest/head are never
+    // skipped).
+    let manifest_hash = head_manifest_hash(&h2).expect("a new head is a manifest token");
+    let (manifest_bytes, manifest_i) = node
         .handle
-        .get_stale_with_index(toc_key.as_bytes())
+        .get_stale_with_index(cfg_manifest(manifest_hash).as_bytes())
         .await
-        .expect("toc read")
-        .expect("every session rewrites the toc");
+        .expect("manifest read")
+        .expect("every session rewrites the manifest");
     assert_eq!(
-        toc_i, i2,
-        "the toc must be written by the SAME log entry as the head (one atomic batch), got \
-         toc={toc_i} head={i2}"
+        manifest_i, i2,
+        "the manifest must be written by the SAME log entry as the head (one atomic batch), got \
+         manifest={manifest_i} head={i2}"
     );
     assert_eq!(
-        hex_hash(&content_hash(&toc_bytes)),
-        h2,
-        "the stored toc must hash to the committed head"
+        hex_hash(&content_hash(&manifest_bytes)),
+        manifest_hash,
+        "the stored manifest must hash to the token the head names"
+    );
+    assert!(
+        node.handle
+            .get_stale(cfg_toc(&h2).as_bytes())
+            .await
+            .expect("legacy key read")
+            .is_none(),
+        "a new sharded publish must NOT write cfg_toc"
     );
 
     // The unchanged entity was NOT resent: its origin index is still the FIRST publish's.
@@ -495,24 +630,24 @@ async fn the_final_commit_is_one_log_entry_and_unchanged_entities_stay_put() {
         "a changed publish must advance the head by at least one log entry (same no-op caveat \
          as above; the atomicity pin is the toc/head index equality): head index went {i2} → {i3}"
     );
-    // Same-entry pin for THIS publish: the toc of the committed hash carries the index of the
-    // entry that moved the head.
-    let toc3_key = cfg_toc(&h3);
-    let (toc3_bytes, toc3_i) = node
+    // Same-entry pin for THIS publish: the manifest of the committed token carries the index of
+    // the entry that moved the head.
+    let manifest3_hash = head_manifest_hash(&h3).expect("a new head is a manifest token");
+    let (manifest3_bytes, manifest3_i) = node
         .handle
-        .get_stale_with_index(toc3_key.as_bytes())
+        .get_stale_with_index(cfg_manifest(manifest3_hash).as_bytes())
         .await
-        .expect("toc read")
-        .expect("every session rewrites the toc");
+        .expect("manifest read")
+        .expect("every session rewrites the manifest");
     assert_eq!(
-        toc3_i, i3,
-        "the third toc must be written by the SAME log entry as the head (one atomic commit \
-         batch), got toc={toc3_i} head={i3}"
+        manifest3_i, i3,
+        "the third manifest must be written by the SAME log entry as the head (one atomic commit \
+         batch), got manifest={manifest3_i} head={i3}"
     );
     assert_eq!(
-        hex_hash(&content_hash(&toc3_bytes)),
-        h3,
-        "the third stored toc must hash to the committed head"
+        hex_hash(&content_hash(&manifest3_bytes)),
+        manifest3_hash,
+        "the third stored manifest must hash to the token the head names"
     );
     let initech_key = cfg_entity(
         &EntityPath::Tenant("initech".into()),
@@ -616,16 +751,14 @@ async fn two_concurrent_publishes_each_commit_a_whole_tree() {
     let hb = rb.expect("publish B must commit");
     assert_ne!(ha, hb, "different content must name different trees");
 
-    // Both trees are COMPLETE in storage: every entity of both publishers, plus both tocs —
-    // so whichever head wins, flipping to it would be equally readable.
+    // Both trees are COMPLETE in storage: every entity of both publishers, plus both
+    // manifest+shard chains — so whichever head wins, flipping to it would be equally readable.
     for (head, expected) in [(&ha, &a), (&hb, &b)] {
-        assert!(
-            node.handle
-                .get_stale(cfg_toc(head).as_bytes())
-                .await
-                .expect("toc read")
-                .is_some(),
-            "the toc of {head} must be stored"
+        let toc = toc_for_head(&node, head).await;
+        assert_eq!(
+            toc.entities.len(),
+            expected.len(),
+            "the manifests/shards of {head} must describe every entity"
         );
         for (path, bytes) in expected.iter() {
             let key = cfg_entity(path, &hex_hash(&content_hash(bytes)));
@@ -665,19 +798,20 @@ async fn two_concurrent_publishes_each_commit_a_whole_tree() {
     node.thread.shutdown();
 }
 
-/// THE HEAD NAMES A TOC THAT DESCRIBES A FULLY PRESENT TREE (plan A4).
+/// THE HEAD NAMES A MANIFEST WHOSE SHARDS DESCRIBE A FULLY PRESENT TREE (plan A4/V2).
 ///
-/// Atomic publishing only pays off if the head — written inside the same batch as the toc and
-/// its entities — really does name a toc that covers every entity with matching hash and
-/// length, and every one of those entities is stored. This walks the chain the reader walks:
-/// head → toc → entries → entity bytes, including a binary value with NUL and 0xff bytes.
+/// Atomic publishing only pays off if the head — written inside the same batch as the manifest
+/// and its shards — really does name a manifest whose shards cover every entity with matching
+/// hash and length, and every one of those entities is stored. This walks the chain the reader
+/// walks: head token → manifest → shards → entries → entity bytes, including a binary value with
+/// NUL and 0xff bytes. The tiny tree also pins the shared-empty-shard property: most of the 32
+/// buckets are empty and therefore carry the SAME digest.
 ///
-/// Falsification: publish a toc with a missing/short entity entry and the per-entry
+/// Falsification: publish a shard with a missing/short entity entry and the per-entry
 /// presence/length assertion fails; write the head outside the batch and a reader could reach
-/// this chain at a moment when the toc it decodes does not describe the batch — caught here by
-/// the hash-join (head == hash(stored toc bytes)).
+/// this chain at a moment when the manifest it decodes does not describe the batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_head_names_a_toc_that_describes_a_fully_present_tree() {
+async fn the_head_names_a_manifest_that_describes_a_fully_present_tree() {
     let node = start_node("fulltree", PORTS[8]).await;
     wait_writable(&node).await;
     let store = ArachneConfigStore::new(node.handle.clone());
@@ -691,23 +825,38 @@ async fn the_head_names_a_toc_that_describes_a_fully_present_tree() {
     ]);
     let hash = store.publish(&t).await.expect("publish");
 
-    // The toc the committed head names.
-    let toc_bytes = node
+    // The manifest the committed head names.
+    let manifest_hash = head_manifest_hash(&hash).expect("a new publish names a manifest");
+    let manifest_bytes = node
         .handle
-        .get_stale(cfg_toc(&hash).as_bytes())
+        .get_stale(cfg_manifest(manifest_hash).as_bytes())
         .await
-        .expect("toc read")
-        .expect("a committed head must have a toc under its hash");
+        .expect("manifest read")
+        .expect("a committed head must have a manifest under its hash");
     assert_eq!(
-        hex_hash(&content_hash(&toc_bytes)),
-        hash,
-        "the head must BE the toc's content hash (A4: head naming = toc identity)"
+        hex_hash(&content_hash(&manifest_bytes)),
+        manifest_hash,
+        "the head token must carry the manifest's content hash"
     );
-    let toc = Toc::decode(&toc_bytes).expect("the committed toc must decode");
+    let manifest = Manifest::decode(&manifest_bytes).expect("the committed manifest must decode");
+    assert_eq!(manifest.shards.len(), SHARD_COUNT);
+    assert_eq!(manifest.entry_count as usize, t.len());
+    assert_eq!(
+        manifest.entity_bytes,
+        t.values().map(|bytes| bytes.len() as u64).sum::<u64>()
+    );
+    let unique_shards: HashSet<[u8; 32]> = manifest.shards.iter().copied().collect();
+    assert!(
+        unique_shards.len() < SHARD_COUNT,
+        "the empty buckets must share one identical shard digest; got {} unique",
+        unique_shards.len()
+    );
+
+    let toc = toc_for_head(&node, &hash).await;
     assert_eq!(
         toc.entities.len(),
         t.len(),
-        "the toc must contain one entry per entity of the tree"
+        "the merged shards must contain one entry per entity of the tree"
     );
 
     // Every entry describes bytes that are actually stored, under the exact key the entry
@@ -758,6 +907,414 @@ async fn the_head_names_a_toc_that_describes_a_fully_present_tree() {
         t,
         "the head must lead a reader to the tree that was published"
     );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// A 24k-entity tree is the size the sharded era exists for: the whole toc is past the old
+/// single-value budget, but the 32 shards are small and each is content-addressed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_24k_entity_tree_publishes_and_reads_via_32_shards() {
+    let node = start_node("bulk24k", PORT_BULK_24K).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    let mut t = ConfigTree::new();
+    for i in 0..24_000 {
+        t.insert(
+            EntityPath::User(format!("u{i:05}")),
+            format!("value-{i}").into_bytes(),
+        );
+    }
+    let head = store
+        .publish(&t)
+        .await
+        .expect("a 24k tree must publish through its shards");
+    assert!(head.starts_with("m:"), "a new head is a manifest token");
+
+    let manifest_hash = head_manifest_hash(&head).expect("manifest token");
+    let manifest_bytes = node
+        .handle
+        .get_stale(cfg_manifest(manifest_hash).as_bytes())
+        .await
+        .expect("manifest read")
+        .expect("manifest must be stored");
+    let manifest = Manifest::decode(&manifest_bytes).expect("manifest decodes");
+    assert_eq!(manifest.entry_count, 24_000);
+
+    let mut sizes = Vec::with_capacity(SHARD_COUNT);
+    for digest in &manifest.shards {
+        let bytes = node
+            .handle
+            .get_stale(cfg_shard(&hex_hash(digest)).as_bytes())
+            .await
+            .expect("shard read")
+            .expect("every shard must be stored");
+        assert!(
+            bytes.len() <= SHARD_MAX_BYTES,
+            "shard {} is {} bytes, over SHARD_MAX_BYTES",
+            sizes.len(),
+            bytes.len()
+        );
+        sizes.push(bytes.len());
+    }
+    eprintln!("24k shard sizes in bucket order: {sizes:?}");
+    eprintln!("24k shard total: {} bytes", sizes.iter().sum::<usize>());
+
+    assert_eq!(
+        expect_tree(store.read().await.expect("read the 24k tree")),
+        t,
+        "every one of the 24k entities must survive the manifest+shard round trip"
+    );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// A legacy format-6 tree under a bare head is still readable after the upgrade. This is the
+/// one-way bridge: new writes never produce it, old heads keep materializing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_format_6_tree_still_reads_through_a_bare_head() {
+    let node = start_node("legacy", PORT_LEGACY).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    let t = tree(&[("acme", b"legacy-one"), ("globex", b"legacy-two")]);
+    let head = install_legacy_chain(&node, &t).await;
+    assert_eq!(head.len(), 64, "a legacy head is the bare 64-hex toc hash");
+    assert_eq!(
+        store.current_hash().await.expect("head read"),
+        Some(head.clone())
+    );
+    assert_eq!(
+        expect_tree(store.read().await.expect("legacy read")),
+        t,
+        "format 6 must decode through the bare-token fallback"
+    );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// A manifest that disagrees with its shards (or a corrupted value) is refused, never served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_and_shard_disagreements_are_refused() {
+    let node = start_node("manifest-bad", PORT_MANIFEST_BAD).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    let t = tree(&[("acme", b"one")]);
+    let head = store.publish(&t).await.expect("publish");
+    let manifest_hash = head_manifest_hash(&head).expect("manifest token");
+    let manifest_key = cfg_manifest(manifest_hash);
+    let original_manifest = node
+        .handle
+        .get_stale(manifest_key.as_bytes())
+        .await
+        .expect("manifest read")
+        .expect("manifest");
+    let manifest = Manifest::decode(&original_manifest).expect("manifest decodes");
+
+    // 1) Corrupted manifest bytes no longer hash to the head token.
+    let mut tampered = original_manifest.clone();
+    tampered.push(0);
+    node.handle
+        .put(manifest_key.as_bytes(), &tampered)
+        .await
+        .expect("tamper manifest");
+    let err = store
+        .read()
+        .await
+        .expect_err("tampered manifest must be refused");
+    assert!(
+        err.to_string().contains("hash") || err.to_string().contains("manifest"),
+        "the error must identify the manifest mismatch, got: {err}"
+    );
+    node.handle
+        .put(manifest_key.as_bytes(), &original_manifest)
+        .await
+        .expect("restore manifest");
+
+    // 2) A shard whose bytes do not match its digest is refused before decode/merge.
+    let digest = manifest.shards[0];
+    let shard_key = cfg_shard(&hex_hash(&digest));
+    let original_shard = node
+        .handle
+        .get_stale(shard_key.as_bytes())
+        .await
+        .expect("shard read")
+        .expect("shard");
+    node.handle
+        .put(shard_key.as_bytes(), b"not the shard")
+        .await
+        .expect("tamper shard");
+    let err = store
+        .read()
+        .await
+        .expect_err("tampered shard must be refused");
+    assert!(
+        err.to_string().contains("digest") || err.to_string().contains("shard"),
+        "the error must identify the shard mismatch, got: {err}"
+    );
+    node.handle
+        .put(shard_key.as_bytes(), &original_shard)
+        .await
+        .expect("restore shard");
+
+    // 3) Manifest totals disagreeing with the shards are refused after the merge.
+    let toc_one = Toc::new(
+        TOC_FORMAT,
+        vec![toc_entry(EntityPath::Tenant("x".into()), b"v")],
+    )
+    .expect("toc");
+    let (derived, _) = split_shards(&toc_one).expect("split");
+    let wrong_count = Manifest::new(
+        derived.shards.clone(),
+        derived.entry_count + 1,
+        derived.entity_bytes,
+    )
+    .expect("manifest");
+    install_sharded_chain(&node, &toc_one, &wrong_count).await;
+    let err = store
+        .read()
+        .await
+        .expect_err("a wrong entry count must be refused");
+    assert!(
+        err.to_string().contains("entries"),
+        "the error must name the entry-count mismatch, got: {err}"
+    );
+
+    let wrong_bytes = Manifest::new(
+        derived.shards.clone(),
+        derived.entry_count,
+        derived.entity_bytes + 1,
+    )
+    .expect("manifest");
+    install_sharded_chain(&node, &toc_one, &wrong_bytes).await;
+    let err = store
+        .read()
+        .await
+        .expect_err("wrong entity bytes must be refused");
+    assert!(
+        err.to_string().contains("entity bytes"),
+        "the error must name the byte-count mismatch, got: {err}"
+    );
+
+    // 4) Duplicate paths across/inside the merged shards are refused.
+    let dup = EntityPath::Tenant("duplicate".into());
+    let toc_dup = Toc::new(
+        TOC_FORMAT,
+        vec![toc_entry(dup.clone(), b"one"), toc_entry(dup, b"two")],
+    )
+    .expect("toc");
+    let (dup_manifest, _) = split_shards(&toc_dup).expect("split duplicate");
+    install_sharded_chain(&node, &toc_dup, &dup_manifest).await;
+    let err = store
+        .read()
+        .await
+        .expect_err("duplicate paths must be refused");
+    assert!(
+        err.to_string().contains("more than once"),
+        "the error must name the duplicate path, got: {err}"
+    );
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// GC resolves mixed retain tokens, keeps current+retained manifests/tocs, and NEVER touches
+/// shards (deferred shard GC is a documented leak, not an accidental delete).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gc_keeps_current_and_retained_manifests_and_never_deletes_shards() {
+    let node = start_node("gc", PORT_GC).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    let h1 = store
+        .publish(&tree(&[("acme", b"first")]))
+        .await
+        .expect("first publish");
+    let h2 = store
+        .publish(&tree(&[("acme", b"second")]))
+        .await
+        .expect("second publish");
+    let mh1 = head_manifest_hash(&h1).expect("manifest token 1");
+    let mh2 = head_manifest_hash(&h2).expect("manifest token 2");
+
+    // A legacy format-6 toc value to mix into the retain history. It is not the current head; the
+    // point is that GC resolves a bare retain token to cfg_toc and keeps it.
+    let legacy = Toc::new(
+        LEGACY_TOC_FORMAT,
+        vec![toc_entry(EntityPath::Tenant("legacy".into()), b"v")],
+    )
+    .expect("legacy toc");
+    let legacy_hash = legacy.hash();
+    node.handle
+        .put(cfg_toc(&legacy_hash).as_bytes(), &legacy.encode())
+        .await
+        .expect("write legacy toc");
+
+    // Mixed history: current manifest, previous manifest, bare legacy toc — carried verbatim.
+    let retain = format!("{h2}\n{h1}\n{legacy_hash}");
+    node.handle
+        .put(ctl_gc_retain().as_bytes(), retain.as_bytes())
+        .await
+        .expect("mixed retain");
+
+    // Two old trampolines that are NOT retained: one manifest and one legacy toc.
+    node.handle
+        .put(cfg_manifest("deadbeef").as_bytes(), b"old manifest")
+        .await
+        .expect("old manifest");
+    node.handle
+        .put(cfg_toc("feedface").as_bytes(), b"old toc")
+        .await
+        .expect("old toc");
+
+    let manifest = Manifest::decode(
+        &node
+            .handle
+            .get_stale(cfg_manifest(mh2).as_bytes())
+            .await
+            .expect("manifest read")
+            .expect("current manifest"),
+    )
+    .expect("manifest decodes");
+    let shard_key = cfg_shard(&hex_hash(&manifest.shards[0]));
+
+    let stats = store.gc(100).await.expect("gc");
+    assert_eq!(stats.old_manifests, 1, "one unretained manifest");
+    assert_eq!(stats.manifest_deleted, 1);
+    assert_eq!(stats.old_tocs, 1, "one unretained legacy toc");
+    assert_eq!(stats.toc_deleted, 1);
+    assert_eq!(stats.deleted(), 2);
+    assert_eq!(stats.remaining(), 0);
+
+    for key in [
+        cfg_manifest(mh1),
+        cfg_manifest(mh2),
+        cfg_toc(&legacy_hash),
+        shard_key,
+    ] {
+        assert!(
+            node.handle
+                .get_stale(key.as_bytes())
+                .await
+                .expect("gc-check read")
+                .is_some(),
+            "{key} must survive GC (current/retained manifest or shard)"
+        );
+    }
+    for key in [cfg_manifest("deadbeef"), cfg_toc("feedface")] {
+        assert!(
+            node.handle
+                .get_stale(key.as_bytes())
+                .await
+                .expect("gc-check read")
+                .is_none(),
+            "{key} was unretained and must be deleted"
+        );
+    }
+
+    node.tonic.shutdown().await;
+    node.thread.shutdown();
+}
+
+/// The explicit 0.5 materialize recipe against a REAL multi-shard tree:
+/// head-with-index -> `wait_applied` -> batched `multi_get(Stale)` for manifest, shards, entities.
+///
+/// This is the path the store now uses internally; asserting it directly pins the API contract
+/// (single applied barrier, no missing-key retry loop) rather than only the store's return value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_05_head_wait_applied_multi_get_path_reads_a_multi_shard_tree() {
+    let node = start_node("materialize05", 18225).await;
+    wait_writable(&node).await;
+    let store = ArachneConfigStore::new(node.handle.clone());
+
+    let mut t = ConfigTree::new();
+    for i in 0..600 {
+        t.insert(
+            EntityPath::User(format!("u{i:04}")),
+            format!("value-{i}").into_bytes(),
+        );
+    }
+    let (head, head_index) = store
+        .publish_with_index(&t)
+        .await
+        .expect("publish with index");
+    assert!(head.starts_with("m:"));
+
+    node.handle
+        .wait_applied(head_index, Duration::from_secs(10))
+        .await
+        .expect("wait for the head index locally");
+
+    let manifest_hash = head_manifest_hash(&head).expect("manifest token");
+    let manifest = node
+        .handle
+        .multi_get(
+            &[cfg_manifest(manifest_hash).as_bytes()],
+            ReadConsistency::Stale,
+        )
+        .await
+        .expect("manifest multi_get")
+        .values
+        .remove(0)
+        .expect("manifest present after wait_applied");
+    assert_eq!(hex_hash(&content_hash(&manifest)), manifest_hash);
+    let manifest = Manifest::decode(&manifest).expect("manifest decodes");
+
+    let mut seen = HashSet::new();
+    let mut shard_keys = Vec::new();
+    for digest in &manifest.shards {
+        if seen.insert(*digest) {
+            shard_keys.push(cfg_shard(&hex_hash(digest)));
+        }
+    }
+    let mut shard_values = Vec::new();
+    for chunk in shard_keys.chunks(16) {
+        let refs: Vec<&[u8]> = chunk.iter().map(String::as_bytes).collect();
+        shard_values.extend(
+            node.handle
+                .multi_get(&refs, ReadConsistency::Stale)
+                .await
+                .expect("shard multi_get")
+                .values,
+        );
+    }
+
+    let mut toc_entries = Vec::new();
+    for value in shard_values {
+        let bytes = value.expect("every shard present after wait_applied");
+        let shard = Toc::decode_shard(&bytes).expect("shard decodes");
+        toc_entries.extend(shard.entities);
+    }
+    assert_eq!(toc_entries.len(), t.len());
+
+    let mut entity_keys = Vec::new();
+    for entry in &toc_entries {
+        entity_keys.push(cfg_entity(&entry.path, &hex_hash(&entry.content_hash)));
+    }
+    let mut values = Vec::new();
+    for chunk in entity_keys.chunks(256) {
+        let refs: Vec<&[u8]> = chunk.iter().map(String::as_bytes).collect();
+        values.extend(
+            node.handle
+                .multi_get(&refs, ReadConsistency::Stale)
+                .await
+                .expect("entity multi_get")
+                .values,
+        );
+    }
+    let mut rebuilt = ConfigTree::new();
+    for (entry, value) in toc_entries.iter().zip(values) {
+        let bytes = value.expect("every entity present after wait_applied");
+        assert_eq!(bytes.len(), entry.len as usize);
+        assert_eq!(content_hash(&bytes), entry.content_hash);
+        rebuilt.insert(entry.path.clone(), bytes);
+    }
+    assert_eq!(rebuilt, t, "the 0.5 batched path must reconstruct the tree");
 
     node.tonic.shutdown().await;
     node.thread.shutdown();

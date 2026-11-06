@@ -128,12 +128,50 @@ def wait_counts(expected_groups, expected_users, expected_keys, timeout=180):
     last = None
     while time.monotonic() < end:
         c = counts()
-        ok = all(c[n] == (expected_groups, expected_users, expected_keys) for n in "abc")
+        # Destructive churn creates and deletes groups; failed deletes legitimately
+        # leave extras. Only require the baseline, while users/keys stay exact.
+        ok = all(
+            c[n][0] >= expected_groups
+            and c[n][1] == expected_users
+            and c[n][2] == expected_keys
+            for n in "abc"
+        )
         line = " ".join(f"{n}:g{g}/u{u}/k{k}" for n,(g,u,k) in c.items())
         if line != last:
             print(f"   propagation {time.monotonic()-end+timeout:.0f}s: {line}", flush=True)
             last = line
         if ok: return True
+        time.sleep(1)
+    return False
+
+
+def wait_converged(timeout=300):
+    """Wait until all three nodes report the same (groups, users, keys) tuple.
+
+    The destructive phase deliberately kills and restarts nodes. A node can be
+    healthy (admin API up) while its materializer is still catching up; starting
+    the key bulk in that window makes the test look like a publish failure when
+    it is really post-quorum catch-up. Require a common baseline first.
+    """
+    end = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < end:
+        c = counts()
+        vals = list(c.values())
+        # Groups legitimately differ after churn; only require the same user
+        # revision and the same key revision on all nodes. A probe key may be
+        # present (k=1) before the bulk key phase.
+        ok = (
+            len(vals) == 3
+            and all(v[1] == USERS for v in vals)
+            and len({v[2] for v in vals}) == 1
+        )
+        line = " ".join(f"{n}:g{g}/u{u}/k{k}" for n, (g, u, k) in c.items())
+        if line != last:
+            print(f"   convergence {time.monotonic()-end+timeout:.0f}s: {line}", flush=True)
+            last = line
+        if ok:
+            return True
         time.sleep(1)
     return False
 
@@ -352,6 +390,8 @@ def main():
     docker("start","hydra-b"); docker("start","hydra-c")
     for c in ("hydra-b","hydra-c"): docker("update","--restart=unless-stopped",c)
     check("quorum recovery", healthy(180))
+    print("   -- post-destructive convergence")
+    check("post-destructive convergence", wait_converged(300))
 
     if USE_BULK:
         print(f"\n== keys {KEYS} (BULK, chunked)")
@@ -370,7 +410,9 @@ def main():
         print(f"   stopped at {made}/{KEYS} keys (capacity cliff recorded)")
     c=counts(); print("   final counts", c)
     if USE_BULK:
-        check("bulk propagation", wait_counts(GROUPS, USERS, made))
+        # The probe key is included in the tenant-wide key count; `made` only
+        # counts bulk-minted keys.
+        check("bulk propagation", wait_counts(GROUPS, USERS, made + 1))
 
     print("\n== failure-mode checks")
     check("data plane still serves last-known-good", all(proxy(n, probe_key)[0] == 200 for n in "abc"))

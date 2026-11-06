@@ -39,6 +39,11 @@
 #   seed:  python3 environment/init.py
 #   down:  docker compose -f environment/docker-compose.local.yml down -v
 # =============================================================================
+#
+# Explicit project name: the directory basename ("environment") is too generic
+# and would make `down --remove-orphans` able to touch any other stack that
+# reused it. Keep this stack isolated as `hydra-local`.
+name: hydra-local
 
 services:
   # ── Hydra node A - raft member (identical to node B and node C) ────────────
@@ -79,9 +84,9 @@ services:
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
-      HYDRA_MAX_USERS_PER_TENANT: "5000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
-      HYDRA_MAX_HIERARCHY_ROWS: "20000"
+      HYDRA_MAX_USERS_PER_TENANT: "10000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "40000"
+      HYDRA_MAX_HIERARCHY_ROWS: "50000"
       RUST_LOG: "info"
     volumes:
       - hydra-a-data:/app/data
@@ -133,9 +138,9 @@ services:
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
-      HYDRA_MAX_USERS_PER_TENANT: "5000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
-      HYDRA_MAX_HIERARCHY_ROWS: "20000"
+      HYDRA_MAX_USERS_PER_TENANT: "10000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "40000"
+      HYDRA_MAX_HIERARCHY_ROWS: "50000"
       RUST_LOG: "info"
     volumes:
       - hydra-b-data:/app/data
@@ -186,9 +191,9 @@ services:
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
       # Scale-test envelope (test env only): 2000 users + 8000 keys + 2000 roles.
-      HYDRA_MAX_USERS_PER_TENANT: "5000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "20000"
-      HYDRA_MAX_HIERARCHY_ROWS: "20000"
+      HYDRA_MAX_USERS_PER_TENANT: "10000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "40000"
+      HYDRA_MAX_HIERARCHY_ROWS: "50000"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here (any node can serve it)

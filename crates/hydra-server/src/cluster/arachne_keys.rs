@@ -4,9 +4,12 @@
 //! blob and not as a byte-sharded blob:
 //!
 //! ```text
-//! hydra/ctl/head                      -> the current tree's content hash
-//! hydra/cfg/toc/<toc-hash>            -> the table of contents of that tree
-//! hydra/cfg/e/<path>                  -> one entity, keyed by its entity path
+//! hydra/ctl/head                      -> head TOKEN: "m:<manifest-hash>" (sharded V2)
+//!                                            or a bare legacy toc hash (format 6)
+//! hydra/cfg/manifest/<manifest-hash>  -> Manifest: 32 shard digests + totals
+//! hydra/cfg/shard/<shard-hash>        -> one format-7 toc shard (content-addressed)
+//! hydra/cfg/toc/<toc-hash>            -> LEGACY format-6 whole toc (read-only)
+//! hydra/cfg/e/<path>/<content-hash>   -> one entity, content-addressed
 //! ```
 //!
 //! ## Why the entity key does NOT contain the tree hash
@@ -20,11 +23,19 @@
 //! key per entity content version, i.e. a garbage stream to collect, for files
 //! whose logical identity is the PATH.
 //!
-//! So the two are decoupled: the tree is named by the hash of its toc, the toc
-//! is stored under that hash, and entity keys are stable per path. A reader
-//! fetches an entity by path and verifies it against the hash the toc records,
-//! which is what makes the toc the authority and the entity key merely an
-//! address.
+//! So the two are decoupled: the tree is named by its transcript (a manifest of
+//! content-addressed shards, or a legacy whole toc), and entity keys are stable
+//! per path. A reader fetches an entity by path and verifies it against the hash
+//! its toc shard records, which is what makes the toc the authority and the
+//! entity key merely an address.
+//!
+//! ## One-way upgrade and `ctl_format`
+//!
+//! Format 7 is the sharded era; [`LEGACY_TOC_FORMAT`] (6) remains readable so an
+//! old head keeps materializing. A new publish never writes format 6 or
+//! `cfg/toc`, so the upgrade is one-way: older builds cannot read `m:` and must
+//! be upgraded before the first sharded publish. [`ctl_format`] is documented
+//! for operators but has NO writer; each toc value is self-describing.
 //!
 //! ## Why a tree keyed by entity path, and not byte shards
 //!
@@ -89,14 +100,41 @@ use std::hash::{Hash, Hasher};
 /// node would otherwise half-materialize a tree whose routing rows this one has dropped (or this node
 /// would meet an unknown discriminant and fail the whole read). Discriminants **6/7/8** stay reserved
 /// (never reused) so a stray 5-era byte still fails loudly rather than silently becoming another kind.
-pub const TOC_FORMAT: u32 = 6;
+///
+/// **7** — the sharded era. A new tree is no longer one `cfg/toc/<hash>` value: it is a
+/// [`Manifest`] at `cfg/manifest/<hash>` naming up to thirty-two format-7 [`Toc`] shards at
+/// `cfg/shard/<digest>`, and `ctl/head` carries the token `m:<manifest-hash>`. Format 6 remains
+/// READABLE through the bare-token fallback (`cfg/toc/<hash>`), but this build never writes a new
+/// format-6 toc. The upgrade is one-way: an older build that does not know `m:` cannot read a new
+/// tree, so all nodes must be upgraded before the first sharded publish.
+pub const TOC_FORMAT: u32 = 7;
+
+/// The previous (unsharded) toc format. Still accepted by [`Toc::decode`] so a head written
+/// before the sharded era keeps materializing; never written for a new tree.
+pub const LEGACY_TOC_FORMAT: u32 = 6;
+
+/// Fixed number of shard buckets. The count is part of the manifest format: changing it is a
+/// `MANIFEST_FORMAT` change, not a compatible tweak.
+pub const SHARD_COUNT: usize = 32;
+
+/// The largest encoded shard a publish will plan. Well under the library's 1 MiB per-value cap,
+/// leaving room for the manifest/head batch and for future per-entry growth.
+pub const SHARD_MAX_BYTES: usize = 900 * 1024;
+
+/// The manifest encoding version.
+pub const MANIFEST_FORMAT: u32 = 1;
+
+/// The head-token prefix for a manifest-named tree: `m:<manifest-hash>`.
+pub const HEAD_MANIFEST_PREFIX: &str = "m:";
 
 /// Prefix of the control-plane namespace (commit points, cluster identity).
 pub const CTL_PREFIX: &str = "hydra/ctl/";
 /// Prefix of the config-tree namespace.
 pub const CFG_PREFIX: &str = "hydra/cfg/";
 
-/// The key holding the current tree's hash — the **single commit point**.
+/// The key holding the current tree's **head token** — the **single commit point**.
+///
+/// A token is either `m:<manifest-hash>` (sharded tree) or a bare legacy toc hash.
 #[must_use]
 pub fn ctl_head() -> String {
     format!("{CTL_PREFIX}head")
@@ -121,10 +159,42 @@ pub fn ctl_gc_retain() -> String {
     format!("{CTL_PREFIX}gc_retain")
 }
 
-/// The table of contents of the tree identified by `toc_hash`.
+/// The table of contents of a legacy (format 6) tree identified by `toc_hash`.
+///
+/// New publishes do not write this key; it is kept for reading and collecting old trees.
 #[must_use]
 pub fn cfg_toc(toc_hash: &str) -> String {
     format!("{CFG_PREFIX}toc/{toc_hash}")
+}
+
+/// The manifest of the sharded tree identified by `manifest_hash`.
+#[must_use]
+pub fn cfg_manifest(manifest_hash: &str) -> String {
+    format!("{CFG_PREFIX}manifest/{manifest_hash}")
+}
+
+/// One content-addressed toc shard, identified by its content hash.
+#[must_use]
+pub fn cfg_shard(shard_hash: &str) -> String {
+    format!("{CFG_PREFIX}shard/{shard_hash}")
+}
+
+/// The head token naming a sharded tree.
+#[must_use]
+pub fn manifest_head(manifest_hash: &str) -> String {
+    format!("{HEAD_MANIFEST_PREFIX}{manifest_hash}")
+}
+
+/// The manifest hash carried by a sharded head token, or `None` for a legacy bare toc hash.
+#[must_use]
+pub fn head_manifest_hash(head: &str) -> Option<&str> {
+    head.strip_prefix(HEAD_MANIFEST_PREFIX)
+}
+
+/// Whether this head token names a sharded tree.
+#[must_use]
+pub fn head_is_manifest(head: &str) -> bool {
+    head_manifest_hash(head).is_some()
 }
 
 /// One entity, keyed by its PATH and its CONTENT HASH.
@@ -290,6 +360,10 @@ pub enum KeysError {
     Trailing { extra: usize },
     /// The toc names a format this build does not speak.
     UnsupportedFormat { found: u32 },
+    /// The manifest names a format this build does not speak.
+    UnsupportedManifestFormat { found: u32 },
+    /// The manifest does not carry exactly [`SHARD_COUNT`] shard digests.
+    BadShardCount { declared: u16, expected: usize },
     /// The toc declares an entity kind this build does not know.
     UnknownEntityKind { discriminant: u8 },
     /// The declared entity count exceeds what the remaining bytes can hold.
@@ -314,7 +388,16 @@ impl std::fmt::Display for KeysError {
             }
             Self::UnsupportedFormat { found } => write!(
                 f,
-                "the table of contents declares format {found}; this build speaks {TOC_FORMAT}"
+                "the table of contents declares format {found}; this build speaks {TOC_FORMAT} \
+                 (and reads legacy {LEGACY_TOC_FORMAT})"
+            ),
+            Self::UnsupportedManifestFormat { found } => write!(
+                f,
+                "the manifest declares format {found}; this build speaks {MANIFEST_FORMAT}"
+            ),
+            Self::BadShardCount { declared, expected } => write!(
+                f,
+                "the manifest carries {declared} shard digest(s); expected exactly {expected}"
             ),
             Self::UnknownEntityKind { discriminant } => {
                 write!(f, "unknown entity kind {discriminant}")
@@ -357,6 +440,126 @@ pub struct Toc {
     pub format: u32,
     /// The entities, in the publisher's order.
     pub entities: Vec<TocEntry>,
+}
+
+/// The shard index for an entity path.
+///
+/// **Explicit FNV-1a, not `DefaultHasher`.** `DefaultHasher`'s algorithm and seed are unspecified
+/// and may change between Rust releases; the bucket assignment is part of the on-disk contract
+/// (the reader asserts every entry landed in its manifest index), so it must be stable forever.
+#[must_use]
+pub fn shard_bucket(path: &EntityPath) -> usize {
+    let segment = path.to_key_segment();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in segment.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % SHARD_COUNT as u64) as usize
+}
+
+/// The manifest of a sharded config tree.
+///
+/// The manifest is a small, fixed-shape value committed atomically with the head. It names
+/// exactly [`SHARD_COUNT`] shard digests (an empty shard is a normal, content-addressed value and
+/// many buckets share it), plus the total entity count and entity-value byte sum a reader checks
+/// after merging the shards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifest {
+    /// The manifest encoding version.
+    pub format: u32,
+    /// One content digest per shard bucket, in bucket order.
+    pub shards: Vec<[u8; 32]>,
+    /// Total number of entities across all shards.
+    pub entry_count: u32,
+    /// Sum of `TocEntry::len` across all shards, in bytes.
+    pub entity_bytes: u64,
+}
+
+impl Manifest {
+    /// Build a manifest, requiring exactly [`SHARD_COUNT`] shard digests.
+    ///
+    /// # Errors
+    /// [`KeysError::BadShardCount`] when `shards` does not have exactly [`SHARD_COUNT`] entries.
+    pub fn new(
+        shards: Vec<[u8; 32]>,
+        entry_count: u32,
+        entity_bytes: u64,
+    ) -> Result<Self, KeysError> {
+        if shards.len() != SHARD_COUNT {
+            return Err(KeysError::BadShardCount {
+                declared: shards.len() as u16,
+                expected: SHARD_COUNT,
+            });
+        }
+        Ok(Self {
+            format: MANIFEST_FORMAT,
+            shards,
+            entry_count,
+            entity_bytes,
+        })
+    }
+
+    /// Encode for storage as the value of [`cfg_manifest`].
+    ///
+    /// Layout: `u32 format, u16 shard_count, u32 entry_count, u64 entity_bytes, 32*count bytes`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(18 + self.shards.len() * 32);
+        out.extend_from_slice(&self.format.to_le_bytes());
+        out.extend_from_slice(&(self.shards.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.entry_count.to_le_bytes());
+        out.extend_from_slice(&self.entity_bytes.to_le_bytes());
+        for shard in &self.shards {
+            out.extend_from_slice(shard);
+        }
+        out
+    }
+
+    /// Decode a stored manifest, refusing anything this build cannot interpret exactly.
+    ///
+    /// # Errors
+    /// [`KeysError`] for a truncated value, a wrong format, a shard count other than
+    /// [`SHARD_COUNT`], or trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self, KeysError> {
+        let mut cursor = Cursor { bytes, at: 0 };
+        let format = cursor.u32()?;
+        if format != MANIFEST_FORMAT {
+            return Err(KeysError::UnsupportedManifestFormat { found: format });
+        }
+        let count = cursor.u16()?;
+        if count as usize != SHARD_COUNT {
+            return Err(KeysError::BadShardCount {
+                declared: count,
+                expected: SHARD_COUNT,
+            });
+        }
+        let entry_count = cursor.u32()?;
+        let entity_bytes = cursor.u64()?;
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(cursor.take(32)?);
+            shards.push(digest);
+        }
+        if cursor.remaining() > 0 {
+            return Err(KeysError::Trailing {
+                extra: cursor.remaining(),
+            });
+        }
+        Ok(Self {
+            format,
+            shards,
+            entry_count,
+            entity_bytes,
+        })
+    }
+
+    /// The manifest's name: the hash of its encoded bytes, hex-encoded.
+    #[must_use]
+    pub fn hash(&self) -> String {
+        hex_hash(&content_hash(&self.encode()))
+    }
 }
 
 /// The maximum id length the encoding carries (a `u16` length prefix).
@@ -478,6 +681,13 @@ impl<'a> Cursor<'a> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+
+    fn u64(&mut self) -> Result<u64, KeysError> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
 }
 
 /// Validate every id in `entities`.
@@ -534,8 +744,12 @@ impl Toc {
         Ok(Self { format, entities })
     }
 
-    /// Decode a stored toc, refusing anything this build cannot interpret
-    /// exactly.
+    /// Decode a stored toc, accepting BOTH the sharded era ([`TOC_FORMAT`]) and the
+    /// legacy unsharded era ([`LEGACY_TOC_FORMAT`]).
+    ///
+    /// The format lives in every encoded value, so the reader can tell a shard from a legacy
+    /// whole toc without trusting the key it came from. A bare head still names a format-6
+    /// `cfg/toc/<hash>`; a sharded head names a manifest whose shards are format 7.
     ///
     /// # Errors
     /// [`KeysError`] for a truncated value, trailing bytes, another format, an
@@ -543,9 +757,25 @@ impl Toc {
     /// separator. Each is refused rather than repaired: a half-decoded tree
     /// would be served as if a publisher had written it.
     pub fn decode(bytes: &[u8]) -> Result<Self, KeysError> {
+        Self::decode_allowed(bytes, &[LEGACY_TOC_FORMAT, TOC_FORMAT])
+    }
+
+    /// Decode a stored SHARD, requiring the sharded era's format.
+    ///
+    /// A manifest may only point at format-7 shards; a legacy whole toc under a shard key is a
+    /// mixed/forged tree and is refused rather than merged.
+    ///
+    /// # Errors
+    /// The same decode errors as [`Toc::decode`], plus [`KeysError::UnsupportedFormat`] for a
+    /// format other than [`TOC_FORMAT`].
+    pub fn decode_shard(bytes: &[u8]) -> Result<Self, KeysError> {
+        Self::decode_allowed(bytes, &[TOC_FORMAT])
+    }
+
+    fn decode_allowed(bytes: &[u8], allowed: &[u32]) -> Result<Self, KeysError> {
         let mut cursor = Cursor { bytes, at: 0 };
         let format = cursor.u32()?;
-        if format != TOC_FORMAT {
+        if !allowed.contains(&format) {
             return Err(KeysError::UnsupportedFormat { found: format });
         }
         let count = cursor.u32()?;
@@ -642,14 +872,19 @@ impl Toc {
         Ok(Self { format, entities })
     }
 
-    /// The name of this tree: the hash of its encoded bytes.
+    /// The content digest of this toc's encoded bytes, as stored in a manifest's shard list.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        content_hash(&self.encode())
+    }
+
+    /// The name of this tree: the hex content hash of its encoded bytes.
     ///
-    /// This is the value written to [`ctl_head`], and therefore the commit point:
-    /// the tree is visible to the rest of the cluster exactly when the head
-    /// names it.
+    /// Kept for legacy trees and tests. A new publish names its tree with a manifest hash and
+    /// writes the token `m:<manifest-hash>` to [`ctl_head`].
     #[must_use]
     pub fn hash(&self) -> String {
-        hex_hash(&content_hash(&self.encode()))
+        hex_hash(&self.digest())
     }
 }
 
@@ -686,6 +921,13 @@ mod tests {
         assert_eq!(ctl_cluster_id(), "hydra/ctl/cluster_id");
         assert_eq!(ctl_format(), "hydra/ctl/format");
         assert_eq!(cfg_toc("abc123"), "hydra/cfg/toc/abc123");
+        assert_eq!(cfg_manifest("abc123"), "hydra/cfg/manifest/abc123");
+        assert_eq!(cfg_shard("abc123"), "hydra/cfg/shard/abc123");
+        assert_eq!(manifest_head("abc123"), "m:abc123");
+        assert_eq!(head_manifest_hash("m:abc123"), Some("abc123"));
+        assert_eq!(head_manifest_hash("abc123"), None);
+        assert!(head_is_manifest("m:abc123"));
+        assert!(!head_is_manifest("abc123"));
         // The entity key carries BOTH halves: the path (what an operator greps for) and the
         // content hash (what makes two concurrent publishers unable to collide).
         assert_eq!(
@@ -843,11 +1085,97 @@ mod tests {
     #[test]
     fn the_toc_format_is_pinned_with_its_reason() {
         assert_eq!(
-            TOC_FORMAT, 6,
-            "if you changed what an entity's bytes MEAN, bump this number AND add its entry to the \
-             doc above (the history is the reason the constant exists); if you did not, this test \
-             is the reminder that a bump happened and older builds now refuse this tree by name"
+            TOC_FORMAT, 7,
+            "if you changed what an entity's bytes MEAN or how a tree is stored, bump this number \
+             AND add its entry to the doc above (the history is the reason the constant exists)"
         );
+        assert_eq!(
+            LEGACY_TOC_FORMAT, 6,
+            "the legacy fallback must keep reading the era immediately before sharding"
+        );
+    }
+
+    /// Format 6 remains readable through the legacy whole-toc path; format 7 is accepted by
+    /// `decode` but only `decode_shard` may accept it under a manifest.
+    #[test]
+    fn legacy_format_6_is_readable_but_never_written_as_a_shard() {
+        let legacy = Toc {
+            format: LEGACY_TOC_FORMAT,
+            entities: vec![entry("a", b"one")],
+        };
+        let bytes = legacy.encode();
+        assert_eq!(Toc::decode(&bytes).expect("legacy toc decodes"), legacy);
+        assert!(
+            matches!(
+                Toc::decode_shard(&bytes),
+                Err(KeysError::UnsupportedFormat {
+                    found: LEGACY_TOC_FORMAT
+                })
+            ),
+            "a legacy whole toc must not be accepted as a shard"
+        );
+    }
+
+    /// The bucket assignment is stable and explicit: a known path lands in a pinned bucket,
+    /// so a future `DefaultHasher` change cannot silently re-shard every tree.
+    #[test]
+    fn shard_bucket_is_deterministic_and_on_a_fixed_grid() {
+        let path = EntityPath::Tenant("acme".into());
+        let first = shard_bucket(&path);
+        assert_eq!(first, shard_bucket(&path));
+        assert!(first < SHARD_COUNT);
+        assert_eq!(
+            first, 0,
+            "the explicit FNV-1a bucket for tenant/acme is pinned; changing it is a manifest \
+             format change"
+        );
+        assert_eq!(
+            shard_bucket(&EntityPath::Provider("acme".into())),
+            shard_bucket(&EntityPath::Provider("acme".into()))
+        );
+    }
+
+    /// Manifest round trip and every rejection the reader relies on.
+    #[test]
+    fn manifest_round_trips_and_refuses_malformed_values() {
+        let shards: Vec<[u8; 32]> = (0..SHARD_COUNT).map(|i| [i as u8; 32]).collect();
+        let manifest = Manifest::new(shards.clone(), 12_345, 678_901).expect("manifest");
+        let bytes = manifest.encode();
+        assert_eq!(Manifest::decode(&bytes).expect("round trip"), manifest);
+        assert_eq!(manifest.hash().len(), 64);
+
+        let mut wrong_format = bytes.clone();
+        wrong_format[0] = MANIFEST_FORMAT.wrapping_add(1) as u8;
+        assert!(matches!(
+            Manifest::decode(&wrong_format),
+            Err(KeysError::UnsupportedManifestFormat { .. })
+        ));
+
+        let mut wrong_count = bytes.clone();
+        wrong_count[4..6].copy_from_slice(&(SHARD_COUNT as u16 + 1).to_le_bytes());
+        assert!(matches!(
+            Manifest::decode(&wrong_count),
+            Err(KeysError::BadShardCount { .. })
+        ));
+
+        for cut in 0..bytes.len() {
+            assert!(
+                Manifest::decode(&bytes[..cut]).is_err(),
+                "a manifest truncated to {cut} byte(s) must be refused"
+            );
+        }
+
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(matches!(
+            Manifest::decode(&extended),
+            Err(KeysError::Trailing { .. })
+        ));
+
+        assert!(matches!(
+            Manifest::new(vec![[0u8; 32]; SHARD_COUNT - 1], 0, 0),
+            Err(KeysError::BadShardCount { .. })
+        ));
     }
 
     /// A changed entity changes the tree's name — the property that makes the

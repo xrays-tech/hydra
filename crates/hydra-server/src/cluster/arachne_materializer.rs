@@ -1123,7 +1123,10 @@ mod tests {
             .await
             .expect("read head")
             .expect("the reload must have PUBLISHED a head");
-        assert_eq!(head.len(), 64, "the head is a content hash");
+        assert!(
+            head.starts_with("m:") && head.len() == 66,
+            "a new publish names a manifest token (m:<64 hex>), got {head:?}"
+        );
 
         // Republishing an unchanged config must not move the head: `changed` is false, so publish
         // is not even reached — and if it were, the tree name would be identical anyway.

@@ -382,7 +382,10 @@ async fn an_isolated_but_alive_node_keeps_serving_its_last_materialized_config()
 
     // ---- h1: written, published, and materialized by ALL THREE --------------------------------
     let h1 = write_and_publish(&mut nodes, 0, "p1", "before-the-partition").await;
-    assert_eq!(h1.len(), 64, "a toc hash is 64 hex characters");
+    assert!(
+        h1.starts_with("m:") && h1.len() == 66,
+        "a new head is a manifest token (m:<64 hex>), got {h1:?}"
+    );
     for (i, node) in nodes.iter_mut().enumerate() {
         converge_until(node, &h1, &format!("node {i} (pre-partition)")).await;
     }

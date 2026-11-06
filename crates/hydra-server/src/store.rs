@@ -697,17 +697,16 @@ impl ConfigStore {
         #[cfg(feature = "arachne")]
         if let Some(publisher) = &self.publisher {
             let content = self.replication();
-            let published_head = publisher
-                .publish(&content.cfg, content.fidelity())
+            let (published_head, final_index) = publisher
+                .publish_with_index(&content.cfg, content.fidelity())
                 .await
                 .map_err(|reason| StoreError::NotPublished { reason })?;
             *self.pending_head.lock().unwrap_or_else(|e| e.into_inner()) = Some(published_head);
-            // The local DB has committed the write; record the index we published
-            // so the materializer cannot rebuild from an older head that predates it.
-            if let Ok(Some((_, index))) = publisher.head_with_index().await {
-                self.local_write_index
-                    .store(index, std::sync::atomic::Ordering::Release);
-            }
+            // The final manifest/head batch's index IS the tree generation. Record it directly:
+            // a follow-up head read could race a newer publish and watermark this node with the
+            // wrong generation.
+            self.local_write_index
+                .store(final_index, std::sync::atomic::Ordering::Release);
         }
         Ok(true)
     }

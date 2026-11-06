@@ -1732,7 +1732,7 @@ async fn user_api_key_bulk_create(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
+    let published = commit_and_publish_with(state, session, ctx, tenant_id, trace_id, true).await?;
     let Some(version) = published else {
         return Ok(true);
     };
@@ -2384,47 +2384,72 @@ async fn commit_and_publish(
     tenant_id: &str,
     trace_id: &str,
 ) -> pingora_core::Result<Option<u64>> {
-    if let Err(e) = state.store.reload_all().await {
-        if let crate::store::StoreError::NotPublished { reason } = &e {
+    commit_and_publish_with(state, session, ctx, tenant_id, trace_id, false).await
+}
+
+/// The same tail, with an explicit `force` for bulk identity rows.
+///
+/// `reload_all` returns `Ok(false)` when the replicated content compares equal.
+/// A bulk insert is never a no-op in the database, but if the in-memory
+/// replication snapshot already contains those rows (for example after an
+/// earlier local reload that did not reach the cluster), the non-forced path
+/// would skip the publish and return 200 while the head still names the old
+/// tree. Forcing the publish is the safe direction for a committed bulk write.
+async fn commit_and_publish_with(
+    state: &AppState,
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    tenant_id: &str,
+    trace_id: &str,
+    force: bool,
+) -> pingora_core::Result<Option<u64>> {
+    let reloaded = state.store.reload_all_with(force).await;
+    match &reloaded {
+        Ok(changed) => tracing::info!(
+            target: "hydra::tenant_api",
+            tenant = %tenant_id,
+            trace_id = %trace_id,
+            force,
+            changed = *changed,
+            "post-write reload/publish tail complete"
+        ),
+        Err(e) => {
+            if let crate::store::StoreError::NotPublished { reason } = e {
+                tracing::error!(
+                    target: "hydra::tenant_api",
+                    tenant = %tenant_id,
+                    trace_id = %trace_id,
+                    %reason,
+                    "post-write PUBLISH FAILED: the local SQLite transaction committed and this \
+                     node serves the new config, but the cluster does not have it"
+                );
+                let answered = super::respond_error(
+                    session,
+                    ctx,
+                    503,
+                    "config_not_published",
+                    &format!(
+                        "the change was committed to this node's database but could NOT be \
+                         published to the cluster, so no other node will see it: {reason} — \
+                         retry the same request once the cluster has a majority; the write is \
+                         idempotent and the retry is what publishes it"
+                    ),
+                )
+                .await;
+                return match answered {
+                    Err(e) => Err(e),
+                    Ok(_) => Ok(None),
+                };
+            }
             tracing::error!(
                 target: "hydra::tenant_api",
                 tenant = %tenant_id,
                 trace_id = %trace_id,
-                %reason,
-                "post-write PUBLISH FAILED: the local SQLite transaction committed and this \
-                 node serves the new config, but the cluster does not have it"
+                error = %e,
+                "post-write reload_all FAILED: the in-memory config snapshot is now STALE (the \
+                 write committed locally with no runtime effect until a reload succeeds)"
             );
-            let answered = super::respond_error(
-                session,
-                ctx,
-                503,
-                "config_not_published",
-                &format!(
-                    "the change was committed to this node's database but could NOT be \
-                     published to the cluster, so no other node will see it: {reason} — \
-                     retry the same request once the cluster has a majority; the write is \
-                     idempotent and the retry is what publishes it"
-                ),
-            )
-            .await;
-            return match answered {
-                Err(e) => Err(e),
-                Ok(_) => Ok(None),
-            };
         }
-        // Any OTHER reload failure: the write DID commit, this node keeps serving
-        // the PREVIOUS snapshot, and every later write will also lack runtime
-        // effect — the `hydra_config_snapshot_stale` case. Its gauge is owned by
-        // `AdminState`, so this path only logs at the same severity, exactly as
-        // `local_write` does.
-        tracing::error!(
-            target: "hydra::tenant_api",
-            tenant = %tenant_id,
-            trace_id = %trace_id,
-            error = %e,
-            "post-write reload_all FAILED: the in-memory config snapshot is now STALE (the \
-             write committed locally with no runtime effect until a reload succeeds)"
-        );
     }
     Ok(Some(state.store.version()))
 }

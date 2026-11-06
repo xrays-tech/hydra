@@ -283,7 +283,10 @@ async fn three_nodes_converge_on_the_same_head_and_each_can_rebuild_itself() {
     // immediately (ADR-0001 F-5, measured lag ~7 ms). Waiting is not weakening the assertion: the
     // head must appear, and it must be the one every node converges on.
     let head = wait_for_head(&nodes[0]).await;
-    assert_eq!(head.len(), 64);
+    assert!(
+        head.starts_with("m:") && head.len() == 66,
+        "a new publish names a manifest token (m:<64 hex>), got {head:?}"
+    );
 
     let passes = converge_all(&mut nodes, &head).await;
 

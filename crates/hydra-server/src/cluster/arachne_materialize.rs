@@ -77,15 +77,20 @@ impl std::error::Error for GateError {}
 /// The length of a tree name: the hex encoding of a 32-byte content hash.
 const TREE_HASH_LEN: usize = 64;
 
-/// Whether `raw` looks like a tree name this build could have written.
+/// The prefix a sharded head token carries in front of its manifest hash.
+const SHARDED_HEAD_PREFIX: &str = "m:";
+
+/// Whether `raw` looks like a head token this build could have written.
 ///
-/// Refused rather than repaired: a head that is not a 64-character lowercase hex
-/// string means something else is writing this key, and materializing "the best
+/// Two eras are accepted: a bare 64-character lowercase hex toc hash (legacy format 6) and
+/// `m:<64 lowercase hex>` naming a manifest (the sharded era). Refused rather than repaired: a
+/// head that is neither means something else is writing this key, and materializing "the best
 /// guess" would build a config out of a foreign value.
 #[must_use]
 fn is_tree_name(raw: &str) -> bool {
-    raw.len() == TREE_HASH_LEN
-        && raw
+    let hash = raw.strip_prefix(SHARDED_HEAD_PREFIX).unwrap_or(raw);
+    hash.len() == TREE_HASH_LEN
+        && hash
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -307,6 +312,8 @@ mod tests {
         for raw in [
             "",
             "nope",
+            "m:",
+            &format!("m:{}", "Z".repeat(64)),
             &"Z".repeat(64),
             &"a".repeat(63),
             &"a".repeat(65),
@@ -317,9 +324,14 @@ mod tests {
                 "{raw:?} must be refused, got {got:?}"
             );
         }
-        // And a well-formed one is accepted, so the check is not vacuous.
+        // And well-formed tokens from BOTH eras are accepted, so the check is not vacuous.
         let good = "0123456789abcdef".repeat(4);
         assert!(gate.plan(Some(good.as_bytes()), now()).is_ok());
+        assert!(
+            gate.plan(Some(format!("m:{good}").as_bytes()), now())
+                .is_ok(),
+            "a sharded manifest token must be accepted"
+        );
     }
 
     /// A failed attempt must NOT move the watermark — the property that keeps a
