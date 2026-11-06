@@ -49,7 +49,7 @@
 //! the format is self-describing in the toc values.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arachne_kv::client::{ArachneError, Handle};
@@ -322,6 +322,10 @@ pub fn split_shards(toc: &Toc) -> Result<(Manifest, Vec<Toc>), StoreError> {
 #[derive(Clone)]
 pub struct ArachneConfigStore {
     handle: Handle,
+    /// Content-addressed entity values seen by this store's materializer. Entity
+    /// keys include their content hash, so a hit is immutable and can be reused
+    /// across trees; the map is pruned to the current tree after each read.
+    entity_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 /// One bounded garbage-collection pass over the control-plane keyspace.
@@ -371,7 +375,10 @@ impl ArachneConfigStore {
     /// Wrap a running node's handle.
     #[must_use]
     pub fn new(handle: Handle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            entity_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The tree the head currently names, or [`ReadOutcome::Empty`].
@@ -466,27 +473,45 @@ impl ArachneConfigStore {
         entries: &[TocEntry],
     ) -> Result<ConfigTree, StoreError> {
         let mut tree = ConfigTree::new();
-        for chunk in entries.chunks(ENTITY_READ_BATCH) {
-            let keys: Vec<String> = chunk
-                .iter()
-                .map(|entry| cfg_entity(&entry.path, &hex_hash(&entry.content_hash)))
-                .collect();
+        let mut missing: Vec<(String, TocEntry)> = Vec::new();
+        let current_keys: HashSet<String> = entries
+            .iter()
+            .map(|entry| cfg_entity(&entry.path, &hex_hash(&entry.content_hash)))
+            .collect();
+
+        {
+            let mut cache = self.entity_cache.lock().unwrap_or_else(|e| e.into_inner());
+            for entry in entries {
+                let key = cfg_entity(&entry.path, &hex_hash(&entry.content_hash));
+                if let Some(bytes) = cache.get(&key) {
+                    if bytes.len() == entry.len as usize
+                        && content_hash(bytes) == entry.content_hash
+                    {
+                        tree.insert(entry.path.clone(), bytes.clone());
+                        continue;
+                    }
+                    cache.remove(&key);
+                }
+                missing.push((key, entry.clone()));
+            }
+        }
+
+        let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
+        for chunk in missing.chunks(ENTITY_READ_BATCH) {
+            let keys: Vec<String> = chunk.iter().map(|(key, _)| key.clone()).collect();
             let key_refs: Vec<&[u8]> = keys.iter().map(String::as_bytes).collect();
             let result = self
                 .handle
                 .multi_get(&key_refs, ReadConsistency::Stale)
                 .await
                 .map_err(map_err)?;
-            for (entry, value) in chunk.iter().zip(result.values) {
+            for ((key, entry), value) in chunk.iter().zip(result.values) {
                 let Some(bytes) = value else {
                     return Err(StoreError::Arachne(format!(
                         "tree {head} is missing entity {} after wait_applied; refusing to serve a mixed tree",
                         entry.path.to_key_segment()
                     )));
                 };
-                // Still verified, although the key already commits to the hash: this catches a
-                // store that returned the wrong value (or bytes that rotted), and it is what makes
-                // a torn read impossible to SERVE.
                 if bytes.len() != entry.len as usize || content_hash(&bytes) != entry.content_hash {
                     return Err(StoreError::Arachne(format!(
                         "entity {} in tree {head} does not match the hash its table of contents \
@@ -494,9 +519,16 @@ impl ArachneConfigStore {
                         entry.path.to_key_segment()
                     )));
                 }
-                tree.insert(entry.path.clone(), bytes);
+                tree.insert(entry.path.clone(), bytes.clone());
+                fetched.push((key.clone(), bytes));
             }
         }
+
+        let mut cache = self.entity_cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, bytes) in fetched {
+            cache.insert(key, bytes);
+        }
+        cache.retain(|key, _| current_keys.contains(key));
         Ok(tree)
     }
 
