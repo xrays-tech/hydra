@@ -1,5 +1,11 @@
 # Upstream request: expose `ProfileConfig` / `snapshot_threshold_bytes` on `ClusterConfig`
 
+> **Resolved in `arachne-kv 0.7.0`.** `ClusterConfig` now exposes
+> `with_snapshot_threshold_bytes(...)` and `with_wal_trailing_keep_bytes(...)`.
+> Hydra pins 0.7.0 and exposes `HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB`; the 150k
+> drill sets 256 MiB. 64 MiB remains the production default. This document is
+> kept as the measured justification for the non-default value.
+
 ## Summary
 
 `arachne-kv 0.6.0` exposes only the `Profile::Lan` / `Profile::Wan` presets on

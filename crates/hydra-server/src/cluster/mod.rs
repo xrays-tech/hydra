@@ -189,13 +189,14 @@ pub fn node_id_from(node_id_env: Option<&str>, hostname_env: Option<&str>) -> St
 /// (`cluster/arachne_node.rs`, through named constants rather than literals) and by
 /// `main.rs`; `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` / `HYDRA_CLUSTER_TOKEN` are still read
 /// by the Redis backbone, which stays for the data-plane hot path (ADR-0001 D-1).
-const CLUSTER_ONLY_ENV: [&str; 6] = [
-    "HYDRA_CLUSTER_PEERS",  // the member list — the decision itself
-    "HYDRA_CLUSTER_ID",     // optional cluster name: refuses a data directory from another cluster
-    "HYDRA_REDIS_URL",      // the data-plane backbone (still required in a cluster)
-    "HYDRA_REDIS_MODE",     // ...and its topology
-    "HYDRA_NODE_ID",        // this node's identity (registry today, raft id after T1.3)
+const CLUSTER_ONLY_ENV: [&str; 7] = [
+    "HYDRA_CLUSTER_PEERS",                 // the member list — the decision itself
+    "HYDRA_CLUSTER_ID", // optional cluster name: refuses a data directory from another cluster
+    "HYDRA_REDIS_URL",  // the data-plane backbone (still required in a cluster)
+    "HYDRA_REDIS_MODE", // ...and its topology
+    "HYDRA_NODE_ID",    // this node's identity (registry today, raft id after T1.3)
     "HYDRA_ARACHNE_LISTEN", // where this node's raft transport binds
+    "HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB", // optional snapshot/WAL threshold override
 ];
 
 /// Variables the Arachne control plane RETIRES, once their readers are gone.
@@ -523,6 +524,7 @@ mod tests {
                 "HYDRA_REDIS_MODE",
                 "HYDRA_NODE_ID",
                 "HYDRA_ARACHNE_LISTEN",
+                "HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB",
             ],
             "the cluster-only table is what the fallback diagnostic names — changing it is a \
              user-visible change"

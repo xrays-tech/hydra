@@ -741,6 +741,18 @@ pub fn arachne_config(
         peers.addresses().clone(),
     );
     cfg.profile = Profile::Lan;
+    // Deployment knob for the Arachne snapshot trigger. Unset keeps the LAN
+    // preset (64 MiB). Setting it also bounds the WAL retained for slow
+    // followers; the 150k drill uses 256 MiB because the current tree is ~78 MiB
+    // and the 64 MiB trigger caused repeated snapshots / leader flaps.
+    if let Ok(raw) = std::env::var("HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB") {
+        if let Ok(mb) = raw.trim().parse::<u64>() {
+            let bytes = mb.saturating_mul(1024 * 1024);
+            cfg = cfg
+                .with_snapshot_threshold_bytes(bytes)
+                .with_wal_trailing_keep_bytes(bytes);
+        }
+    }
     cfg
 }
 

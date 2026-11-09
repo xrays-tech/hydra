@@ -50,6 +50,7 @@
 | `HYDRA_NODE_ID` | **是** | 本节点在表里的名字。**集群下不要依赖 `HOSTNAME` 回退**：普通 Deployment 每次重启换 Pod 名，身份跟着漂 |
 | `HYDRA_ARACHNE_LISTEN` | **是** | 本节点 raft 传输绑定的地址，**必须等于表里自己那一项** |
 | `HYDRA_ARACHNE_DATA_DIR` | 否 | raft 数据目录。默认 = SQLite 路径所在目录下的 `arachne/`（`sqlite:/app/data/hydra.db` ⇒ `/app/data/arachne`） |
+| `HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB` | 否 | 覆盖 Arachne LAN preset 的 snapshot 阈值（默认 **64** MiB），并把 `wal_trailing_keep_bytes` 设为同一值；`0` 关闭本地 snapshot 触发。150k 压测用 **256**：当前树 ~78 MiB，64 MiB 会频繁 snapshot / leader flap。调大后 snapshot 更少，但 WAL/磁盘保留更多 |
 | `HYDRA_CLUSTER_ID` | **建议显式** | 集群身份。默认 = **成员表内容的哈希** ⇒ **改成员表就会改身份**，而每个节点的数据目录记录着旧身份，于是全部拒绝启动。**要在将来做成员变更，就从第一天起显式设一个人类可读的名字**（见 §6.3，含实测报错） |
 | `HYDRA_REDIS_URL` | **是** | 数据面骨干（fail-closed，集群模式缺它就拒绝启动） |
 | `HYDRA_REDIS_MODE` | 否（默认 `single`） | 只接受 `single`；其它任何值**快速失败**。**限定**：这个开关**只在集群模式下被读取**，单节点默认下既不校验也不提及（由 `integration/test_startup_knobs.py` 的 K12 钉住） |
