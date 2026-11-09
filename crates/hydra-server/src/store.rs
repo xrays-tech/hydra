@@ -21,10 +21,13 @@ use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
 use hydra_core::identity::TenantTokenIdentity;
-use hydra_core::model::{GlobalRole, LimitRole, User, UserApiKey, UserGroup};
+use hydra_core::model::{
+    GlobalRole, LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantAccessToken,
+    TenantModel, TenantProvider, User, UserApiKey, UserGroup,
+};
 use hydra_core::swrr::SwrrState;
 
-use crate::cluster::content::ReplicationContent;
+use crate::cluster::content::{FidelityRows, ReplicationContent};
 use crate::cluster::snapshot::HydratedWire;
 use crate::crypto::KeyProvider;
 use crate::db;
@@ -75,104 +78,54 @@ pub async fn build_config(
     pool: &SqlitePool,
     kp: &dyn KeyProvider,
 ) -> Result<ConfigData, StoreError> {
-    // providers
-    let mut providers: HashMap<String, _> = HashMap::new();
-    for p in db::list_providers(pool).await? {
-        providers.insert(p.id.clone(), p);
-    }
+    let rows = load_config_rows(pool, kp).await?;
+    config_from_rows(&rows)
+}
 
-    // models: only status == 1 (online) enter models_by_key (design §4.2).
-    let mut models_by_key: HashMap<String, Vec<ModelProvider>> = HashMap::new();
-    for m in db::list_provider_models(pool).await? {
-        if m.status != 1 {
-            continue;
-        }
-        let weight = providers.get(&m.provider_id).map(|p| p.weight).unwrap_or(0);
-        models_by_key
-            .entry(m.key.clone())
-            .or_default()
-            .push(ModelProvider {
-                provider_id: m.provider_id.clone(),
-                weight,
-            });
-    }
+/// Load the DB rows ONCE and build both the served config and the fidelity rows
+/// the control plane carries.
+///
+/// `reload_all_with` used to call [`build_config`] and then
+/// [`ReplicationContent::load`], which each read the full hierarchy tables
+/// (48k rows in the scale drill) — ~600 ms of duplicated SQLite work on every
+/// management write. This helper reads everything in ONE read transaction, then
+/// derives both views from those rows.
+pub(crate) async fn build_config_with_fidelity(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<(ConfigData, FidelityRows), StoreError> {
+    let rows = load_config_rows(pool, kp).await?;
+    let cfg = config_from_rows(&rows)?;
+    Ok((cfg, fidelity_from_rows(rows)))
+}
 
-    // provider keys (decrypted at the DB boundary; plaintext lives in-memory only)
-    let mut provider_keys: HashMap<String, Vec<String>> = HashMap::new();
-    for k in db::list_provider_keys(pool, kp).await? {
-        provider_keys
-            .entry(k.provider_id.clone())
-            .or_default()
-            .push(k.api_key);
-    }
+/// Every raw row set the loader needs, read at ONE applied SQLite snapshot.
+struct ConfigRows {
+    providers: Vec<Provider>,
+    provider_models: Vec<ProviderModel>,
+    provider_keys: Vec<ProviderKey>,
+    tenants: Vec<Tenant>,
+    tenant_certs: Vec<db::TenantCert>,
+    tenant_providers: Vec<TenantProvider>,
+    tenant_models: Vec<TenantModel>,
+    limit_roles: Vec<LimitRole>,
+    user_groups: Vec<UserGroup>,
+    users: Vec<User>,
+    user_api_keys: Vec<UserApiKey>,
+    tenant_access_tokens: Vec<TenantAccessToken>,
+    global_roles: Vec<GlobalRole>,
+}
 
-    // tenants (+ certs meta). domain is lowercased, incl. the `localhost`
-    // special case (design §5.2). Certs resolve content-first (migration
-    // 0007); legacy path rows are carried too so the TLS layer can fall back.
-    let mut tenants_by_domain: HashMap<String, hydra_core::model::Tenant> = HashMap::new();
-    let mut tenant_domains: HashMap<String, String> = HashMap::new();
-    let mut certs: HashMap<String, CertMeta> = HashMap::new();
-    for t in db::list_tenants(pool).await? {
-        let domain = t.domain.to_lowercase();
-        if t.cert_file.is_some() || t.cert_key.is_some() {
-            certs.insert(
-                domain.clone(),
-                CertMeta {
-                    domain: domain.clone(),
-                    cert_file: t.cert_file.clone(),
-                    cert_key: t.cert_key.clone(),
-                    cert_pem: None,
-                    cert_key_pem: None,
-                },
-            );
-        }
-        tenant_domains.insert(t.id.clone(), domain.clone());
-        tenants_by_domain.insert(domain, t);
-    }
-
-    // Overlay stored cert content (migration 0007): a tenant with content in
-    // the DB wins over its (possibly stale) legacy path fields. The loader
-    // decrypts the sealed key at this boundary; plaintext lives in the
-    // snapshot in-memory only.
-    for tc in db::list_tenant_certs(pool, kp).await? {
-        if tc.cert_pem.is_none() {
-            continue;
-        }
-        let Some(domain) = tenant_domains.get(&tc.tenant_id) else {
-            continue;
-        };
-        certs.insert(
-            domain.clone(),
-            CertMeta {
-                domain: domain.clone(),
-                cert_file: None,
-                cert_key: None,
-                cert_pem: tc.cert_pem,
-                cert_key_pem: tc.cert_key_pem,
-            },
-        );
-    }
-
-    // tenant_providers
-    let mut tenant_providers: HashMap<String, HashSet<String>> = HashMap::new();
-    for tp in db::list_tenant_providers(pool).await? {
-        tenant_providers
-            .entry(tp.tenant_id.clone())
-            .or_default()
-            .insert(tp.provider_id);
-    }
-
-    // tenant_models
-    let mut tenant_models: HashMap<String, HashSet<String>> = HashMap::new();
-    for tm in db::list_tenant_models(pool).await? {
-        tenant_models
-            .entry(tm.tenant_id.clone())
-            .or_default()
-            .insert(tm.model_key);
-    }
-
-    // limit_roles: only enabled roles (design §5.2 "启用的限流角色").
-    //
+/// Read every config row in one read-only SQLite transaction.
+///
+/// One transaction is load-bearing: the served config and the fidelity rows must
+/// describe the same revision, or a replica can be rebuilt with a user whose key,
+/// group or role came from a different commit. `seal_legacy_limit_keys` is a
+/// WRITE, so it runs before the transaction (the same order `build_config` used).
+async fn load_config_rows(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<ConfigRows, StoreError> {
     // `seal_legacy_limit_keys` runs BEFORE the read, and it is the whole of the D-16 migration: a
     // `matching_key` written before 2026-10-08 is plaintext in the column, and this is the pass that
     // rewrites it (the loader runs at boot and on every reload, so an upgrade needs no operator
@@ -188,34 +141,167 @@ pub async fn build_config(
             resealed
         );
     }
-    let limit_roles: Vec<LimitRole> = db::list_limit_roles(pool, kp)
-        .await?
-        .into_iter()
-        .filter(|r| r.enabled)
+
+    let mut tx = pool.begin().await?;
+    let providers = db::list_providers_on(&mut *tx).await?;
+    let provider_models = db::list_provider_models_on(&mut *tx).await?;
+    let provider_keys = db::list_provider_keys_on(&mut *tx, kp).await?;
+    let tenants = db::list_tenants_on(&mut *tx).await?;
+    let tenant_certs = db::list_tenant_certs_on(&mut *tx, kp).await?;
+    let tenant_providers = db::list_tenant_providers_on(&mut *tx).await?;
+    let tenant_models = db::list_tenant_models_on(&mut *tx).await?;
+    let limit_roles = db::list_limit_roles_on(&mut *tx, kp).await?;
+    let user_groups = db::list_user_groups_on(&mut *tx).await?;
+    let users = db::list_users_on(&mut *tx).await?;
+    let user_api_keys = db::list_user_api_keys_on(&mut *tx).await?;
+    let tenant_access_tokens = db::list_tenant_access_tokens_on(&mut *tx).await?;
+    let global_roles = db::list_global_roles_on_conn(&mut tx).await?;
+    tx.commit().await?;
+
+    Ok(ConfigRows {
+        providers,
+        provider_models,
+        provider_keys,
+        tenants,
+        tenant_certs,
+        tenant_providers,
+        tenant_models,
+        limit_roles,
+        user_groups,
+        users,
+        user_api_keys,
+        tenant_access_tokens,
+        global_roles,
+    })
+}
+
+/// Derive the served [`ConfigData`] from one consistent row set.
+///
+/// The filtering asymmetry is load-bearing (plan §3.2):
+///   * identity rows (groups/users/keys) load FULL — disabled/expired/delinquent
+///     entities must stay KNOWN (401/402/403 by status, never "unknown" 401-
+///     equivalent that lets a replica enumerate live keys);
+///   * tenant_tokens load ENABLED-ONLY — a revoked tenant token is simply
+///     GONE (the token index is not an enumeration surface);
+///   * global_roles load ENABLED-ONLY — a disabled rule must match NOTHING,
+///     not even as a failover candidate.
+fn config_from_rows(rows: &ConfigRows) -> Result<ConfigData, StoreError> {
+    // providers
+    let providers: HashMap<String, _> = rows
+        .providers
+        .iter()
+        .map(|p| (p.id.clone(), p.clone()))
         .collect();
 
-    // --- User hierarchy / tenant tokens / Global Roles (plan §3.2 loader) -----
-    //
-    // The filtering asymmetry is load-bearing (plan §3.2):
-    //   * identity rows (groups/users/keys) load FULL — disabled/expired/delinquent
-    //     entities must stay KNOWN (401/402/403 by status, never "unknown" 401-
-    //     equivalent that lets a replica enumerate live keys);
-    //   * tenant_tokens load ENABLED-ONLY — a revoked tenant token is simply
-    //     GONE (the token index is not an enumeration surface);
-    //   * global_roles load ENABLED-ONLY — a disabled rule must match NOTHING,
-    //     not even as a failover candidate.
+    // models: only status == 1 (online) enter models_by_key (design §4.2).
+    let mut models_by_key: HashMap<String, Vec<ModelProvider>> = HashMap::new();
+    for m in &rows.provider_models {
+        if m.status != 1 {
+            continue;
+        }
+        let weight = providers.get(&m.provider_id).map(|p| p.weight).unwrap_or(0);
+        models_by_key
+            .entry(m.key.clone())
+            .or_default()
+            .push(ModelProvider {
+                provider_id: m.provider_id.clone(),
+                weight,
+            });
+    }
 
-    let user_groups: Vec<UserGroup> = db::list_user_groups(pool).await?;
-    let users_map: HashMap<String, User> = db::list_users(pool)
-        .await?
-        .into_iter()
-        .map(|u| (u.id.clone(), u))
+    // provider keys (decrypted at the DB boundary; plaintext lives in-memory only)
+    let mut provider_keys: HashMap<String, Vec<String>> = HashMap::new();
+    for k in &rows.provider_keys {
+        provider_keys
+            .entry(k.provider_id.clone())
+            .or_default()
+            .push(k.api_key.clone());
+    }
+
+    // tenants (+ certs meta). domain is lowercased, incl. the `localhost`
+    // special case (design §5.2). Certs resolve content-first (migration
+    // 0007); legacy path rows are carried too so the TLS layer can fall back.
+    let mut tenants_by_domain: HashMap<String, Tenant> = HashMap::new();
+    let mut tenant_domains: HashMap<String, String> = HashMap::new();
+    let mut certs: HashMap<String, CertMeta> = HashMap::new();
+    for t in &rows.tenants {
+        let domain = t.domain.to_lowercase();
+        if t.cert_file.is_some() || t.cert_key.is_some() {
+            certs.insert(
+                domain.clone(),
+                CertMeta {
+                    domain: domain.clone(),
+                    cert_file: t.cert_file.clone(),
+                    cert_key: t.cert_key.clone(),
+                    cert_pem: None,
+                    cert_key_pem: None,
+                },
+            );
+        }
+        tenant_domains.insert(t.id.clone(), domain.clone());
+        tenants_by_domain.insert(domain, t.clone());
+    }
+
+    // Overlay stored cert content (migration 0007): a tenant with content in
+    // the DB wins over its (possibly stale) legacy path fields. The loader
+    // decrypts the sealed key at this boundary; plaintext lives in the
+    // snapshot in-memory only.
+    for tc in &rows.tenant_certs {
+        if tc.cert_pem.is_none() {
+            continue;
+        }
+        let Some(domain) = tenant_domains.get(&tc.tenant_id) else {
+            continue;
+        };
+        certs.insert(
+            domain.clone(),
+            CertMeta {
+                domain: domain.clone(),
+                cert_file: None,
+                cert_key: None,
+                cert_pem: tc.cert_pem.clone(),
+                cert_key_pem: tc.cert_key_pem.clone(),
+            },
+        );
+    }
+
+    // tenant_providers
+    let mut tenant_providers: HashMap<String, HashSet<String>> = HashMap::new();
+    for tp in &rows.tenant_providers {
+        tenant_providers
+            .entry(tp.tenant_id.clone())
+            .or_default()
+            .insert(tp.provider_id.clone());
+    }
+
+    // tenant_models
+    let mut tenant_models: HashMap<String, HashSet<String>> = HashMap::new();
+    for tm in &rows.tenant_models {
+        tenant_models
+            .entry(tm.tenant_id.clone())
+            .or_default()
+            .insert(tm.model_key.clone());
+    }
+
+    // limit_roles: only enabled roles (design §5.2 "启用的限流角色").
+    let limit_roles: Vec<LimitRole> = rows
+        .limit_roles
+        .iter()
+        .filter(|r| r.enabled)
+        .cloned()
+        .collect();
+
+    let user_groups: Vec<UserGroup> = rows.user_groups.clone();
+    let users_map: HashMap<String, User> = rows
+        .users
+        .iter()
+        .map(|u| (u.id.clone(), u.clone()))
         .collect();
     // FULL key set: reindex_identity derives the identity index from it; the
     // vector itself is NOT stored in ConfigData (the index is the carrier).
-    let user_api_keys: Vec<UserApiKey> = db::list_user_api_keys(pool).await?;
+    let user_api_keys = &rows.user_api_keys;
     let mut tenant_tokens: HashMap<String, TenantTokenIdentity> = HashMap::new();
-    for tok in db::list_tenant_access_tokens(pool).await? {
+    for tok in &rows.tenant_access_tokens {
         if !tok.enabled {
             continue;
         }
@@ -228,10 +314,11 @@ pub async fn build_config(
             },
         );
     }
-    let global_roles: Vec<GlobalRole> = db::list_global_roles(pool)
-        .await?
-        .into_iter()
+    let global_roles: Vec<GlobalRole> = rows
+        .global_roles
+        .iter()
         .filter(|r| r.enabled)
+        .cloned()
         .collect();
 
     let mut cfg = ConfigData {
@@ -263,11 +350,31 @@ pub async fn build_config(
     cfg.reindex_tenants();
     // Identity index + Global Role indexes (plan §3.2/§3.5): same single-entry-point
     // rule; the replica hydrate path calls the same two functions (plan §3.5).
-    cfg.reindex_identity(&user_api_keys);
+    cfg.reindex_identity(user_api_keys);
     cfg.reindex_global_roles();
 
     validate_and_log(&cfg)?;
     Ok(cfg)
+}
+
+/// Derive the FULL row sets the control plane carries from the same rows.
+///
+/// Unlike [`ConfigData`], fidelity rows keep disabled/expired rows: a replica must
+/// rebuild the leader's tables byte-faithfully, including rows that no request
+/// currently matches.
+fn fidelity_from_rows(rows: ConfigRows) -> FidelityRows {
+    FidelityRows {
+        limit_roles: rows.limit_roles,
+        provider_keys: rows.provider_keys,
+        provider_models: rows.provider_models,
+        tenant_providers: rows.tenant_providers,
+        tenant_models: rows.tenant_models,
+        user_groups: rows.user_groups,
+        users: rows.users,
+        user_api_keys: rows.user_api_keys,
+        tenant_access_tokens: rows.tenant_access_tokens,
+        global_roles: rows.global_roles,
+    }
 }
 
 /// Run the pure [`validate`] plus the loader-side fatal checks.
@@ -403,8 +510,8 @@ impl ConfigStore {
         pool: SqlitePool,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
-        let cfg = build_config(&pool, key_provider.as_ref()).await?;
-        Self::assemble(pool, cfg, key_provider).await
+        let (cfg, fidelity) = build_config_with_fidelity(&pool, key_provider.as_ref()).await?;
+        Self::assemble(pool, cfg, Some(fidelity), key_provider).await
     }
 
     /// A store serving a config built IN MEMORY, materialized into `pool` — the seam the tests use
@@ -422,14 +529,19 @@ impl ConfigStore {
         cfg: ConfigData,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
-        Self::assemble(pool, cfg, key_provider).await
+        Self::assemble(pool, cfg, None, key_provider).await
     }
 
     /// The ONE construction path: an already-built config, plus the pool it is (or is about to be)
     /// materialized into.
+    ///
+    /// `preloaded_fidelity` is `Some` only from [`Self::load`], which already read every row in one
+    /// transaction. Passing it through avoids a second full hierarchy read at boot; `from_data`
+    /// passes `None` and falls back to [`ReplicationContent::load`].
     async fn assemble(
         pool: SqlitePool,
         cfg: ConfigData,
+        preloaded_fidelity: Option<FidelityRows>,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
         // Resume the config version from the DB instead of restarting at 1:
@@ -477,8 +589,14 @@ impl ConfigStore {
         // The replication content is built at construction (not lazily): a
         // leader that served a wire with EMPTY fidelity rows would instruct
         // every replica to wipe its fidelity tables and insert nothing.
-        let content =
-            ReplicationContent::load(&pool, key_provider.as_ref(), cfg.clone(), version).await?;
+        let content = match preloaded_fidelity {
+            // `ConfigStore::load` read the rows in one transaction; reuse them
+            // instead of issuing a second full hierarchy read at boot.
+            Some(fidelity) => ReplicationContent::from_loaded(cfg.clone(), fidelity, version),
+            None => {
+                ReplicationContent::load(&pool, key_provider.as_ref(), cfg.clone(), version).await?
+            }
+        };
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
             pool,
@@ -654,7 +772,7 @@ impl ConfigStore {
     pub async fn reload_all_with(&self, force: bool) -> Result<bool, StoreError> {
         let pool = self.pool.clone();
         let kp = self.key_provider.clone();
-        let new_cfg = build_config(&pool, kp.as_ref()).await?;
+        let (new_cfg, fidelity) = build_config_with_fidelity(&pool, kp.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
         // so the previous snapshot is preserved.
         //
@@ -665,7 +783,7 @@ impl ConfigStore {
         // would still advance on every reload (the defect this predicate
         // exists to remove).
         let prev_version = self.version();
-        let candidate = ReplicationContent::load(&pool, kp.as_ref(), new_cfg, prev_version).await?;
+        let candidate = ReplicationContent::from_loaded(new_cfg, fidelity, prev_version);
         let changed = force || self.replication.load().as_ref() != &candidate;
 
         if !changed {
@@ -957,4 +1075,205 @@ mod tests {
     // `StoreError::NoDatabase`. Both the constructor and the variant are gone — a store without a
     // database is not a state this process can be in — so the test went with them rather than
     // being rewritten to assert something else under the same name.
+
+    /// The combined reload path must derive the SAME config and fidelity rows as
+    /// the two separate loaders it replaced.
+    ///
+    /// `reload_all_with` used to call `build_config` and then
+    /// `ReplicationContent::load`, reading the hierarchy twice. The one-read
+    /// version is only a win if it is not a silent divergence. The fixture
+    /// carries enabled AND disabled hierarchy rows plus an offline provider
+    /// model, so the load-bearing filtering asymmetry (full fidelity rows vs
+    /// enabled-only served config) participates in the comparison.
+    #[tokio::test]
+    async fn combined_loader_matches_the_separate_loaders() {
+        use hydra_core::model::{
+            BillingStatus, GlobalRole, LimitRole, ProviderKey, ProviderModel, Tenant,
+            TenantAccessToken, UserApiKey,
+        };
+
+        let pool = crate::db::init_pool("sqlite::memory:")
+            .await
+            .expect("init_pool");
+        crate::db::run_migrate(&pool).await.expect("migrate");
+
+        crate::db::insert_tenant(
+            &pool,
+            &Tenant {
+                id: "t1".into(),
+                name: "T".into(),
+                domain: "acme.com".into(),
+                cert_key: None,
+                cert_file: None,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .await
+        .expect("tenant");
+        crate::db::upsert_user_group(
+            &pool,
+            &hydra_core::model::UserGroup {
+                id: "g1".into(),
+                tenant_id: "t1".into(),
+                name: "g".into(),
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .await
+        .expect("group");
+        crate::db::upsert_user(
+            &pool,
+            &User {
+                id: "u1".into(),
+                tenant_id: "t1".into(),
+                user_group_id: "g1".into(),
+                external_id: None,
+                name: "u".into(),
+                enabled: true,
+                billing_status: BillingStatus::Active,
+                billing_reason: None,
+                billing_updated_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .await
+        .expect("user");
+        crate::db::insert_user_api_key(
+            &pool,
+            &UserApiKey {
+                id: "k1".into(),
+                user_id: "u1".into(),
+                name: "k".into(),
+                key_hash: "hash-k1".into(),
+                key_prefix: "hk_".into(),
+                key_last4: "k1".into(),
+                enabled: true,
+                expires_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .await
+        .expect("key");
+
+        // Provider row + two keys sharing a second-granularity `created_at`:
+        // the loader's total order (`, id` tie-breaker) must be identical in
+        // both paths.
+        seed_change(&pool, "p-combined").await;
+        for (id, api_key) in [("pk1", "sk-one"), ("pk2", "sk-two")] {
+            crate::db::insert_provider_key(
+                &pool,
+                kp().as_ref(),
+                &ProviderKey {
+                    id: id.into(),
+                    provider_id: "p-combined".into(),
+                    api_key: api_key.into(),
+                    created_at: "2026-01-01 00:00:00".into(),
+                },
+            )
+            .await
+            .expect("provider key");
+        }
+        // One online model enters `models_by_key`; the offline row is dropped
+        // from the served config but MUST stay in the fidelity rows.
+        for (id, key, status) in [("pm-online", "m-online", 1), ("pm-offline", "m-offline", 0)] {
+            crate::db::insert_provider_model(
+                &pool,
+                &ProviderModel {
+                    id: id.into(),
+                    key: key.into(),
+                    name: key.into(),
+                    provider_id: "p-combined".into(),
+                    status,
+                },
+            )
+            .await
+            .expect("provider model");
+        }
+        // Enabled + disabled limit roles / tokens / global roles: the served
+        // config keeps only the enabled ones; fidelity keeps BOTH.
+        for (id, enabled) in [("lr-on", true), ("lr-off", false)] {
+            crate::db::insert_limit_role(
+                &pool,
+                kp().as_ref(),
+                &LimitRole {
+                    id: id.into(),
+                    name: id.into(),
+                    matching_key: None,
+                    matching_model: None,
+                    matching_tenant: None,
+                    matching_provider: None,
+                    limit_count: Some(1),
+                    limit_token: None,
+                    window: "m".into(),
+                    enabled,
+                    created_at: String::new(),
+                },
+            )
+            .await
+            .expect("limit role");
+        }
+        for (id, enabled) in [("tok-on", true), ("tok-off", false)] {
+            crate::db::insert_tenant_access_token(
+                &pool,
+                &TenantAccessToken {
+                    id: id.into(),
+                    tenant_id: "t1".into(),
+                    name: id.into(),
+                    token_hash: format!("hash-{id}"),
+                    token_prefix: "ht_".into(),
+                    token_last4: "abcd".into(),
+                    enabled,
+                    expires_at: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+            )
+            .await
+            .expect("tenant token");
+        }
+        for (id, enabled) in [("role-on", true), ("role-off", false)] {
+            crate::db::upsert_global_role_with_providers(
+                &pool,
+                &GlobalRole {
+                    id: id.into(),
+                    name: id.into(),
+                    tenant_id: "t1".into(),
+                    user_group_id: "*".into(),
+                    user_id: "*".into(),
+                    api_key_id: "*".into(),
+                    model_key: "*".into(),
+                    provider_ids: Vec::new(),
+                    enabled,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+                &[],
+            )
+            .await
+            .expect("global role");
+        }
+
+        let cfg_only = build_config(&pool, kp().as_ref())
+            .await
+            .expect("build_config");
+        let expected = ReplicationContent::load(&pool, kp().as_ref(), cfg_only.clone(), 7)
+            .await
+            .expect("separate load");
+
+        let (cfg, fidelity) = build_config_with_fidelity(&pool, kp().as_ref())
+            .await
+            .expect("combined load");
+        assert_eq!(cfg, cfg_only, "the served config view must not change");
+        assert_eq!(
+            ReplicationContent::from_loaded(cfg, fidelity, 7),
+            expected,
+            "the combined loader must produce the same config + fidelity rows"
+        );
+    }
 }

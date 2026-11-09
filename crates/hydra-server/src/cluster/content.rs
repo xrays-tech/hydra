@@ -129,6 +129,21 @@ impl ReplicationContent {
         }
     }
 
+    /// Build from rows this node just loaded in ONE read transaction.
+    ///
+    /// The leader write path (`store::build_config_with_fidelity`) uses this so a
+    /// management write reads the full hierarchy once, not twice. The caller MUST
+    /// pass a `cfg` and `fidelity` derived from the same snapshot; the combined
+    /// loader constructs both from one `ConfigRows`.
+    #[must_use]
+    pub(crate) fn from_loaded(cfg: ConfigData, fidelity: FidelityRows, version: u64) -> Self {
+        Self {
+            version,
+            cfg: Arc::new(cfg),
+            fidelity,
+        }
+    }
+
     /// Load the FULL replication content for `cfg` from the local DB.
     ///
     /// TWO properties make `PartialEq` on this struct a valid change predicate:

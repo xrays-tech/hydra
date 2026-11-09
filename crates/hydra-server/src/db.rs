@@ -360,13 +360,21 @@ pub async fn get_provider(pool: &SqlitePool, id: &str) -> Result<Provider, sqlx:
 
 /// All providers, ordered by `created_at`.
 pub async fn list_providers(pool: &SqlitePool) -> Result<Vec<Provider>, sqlx::Error> {
+    list_providers_on(pool).await
+}
+
+/// [`list_providers`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_providers_on<'e, E>(exec: E) -> Result<Vec<Provider>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         ProviderRow,
         r#"SELECT id as "id!", key, name, endpoint, weight, created_at, updated_at,
                   max_concurrency, max_queue_depth, queue_wait_timeout_ms
            FROM provider ORDER BY created_at"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -681,13 +689,21 @@ pub async fn get_tenant(pool: &SqlitePool, id: &str) -> Result<Tenant, sqlx::Err
 }
 
 pub async fn list_tenants(pool: &SqlitePool) -> Result<Vec<Tenant>, sqlx::Error> {
+    list_tenants_on(pool).await
+}
+
+/// [`list_tenants`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_tenants_on<'e, E>(exec: E) -> Result<Vec<Tenant>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         TenantRow,
         r#"SELECT id as "id!", name, domain, cert_key, cert_file, enabled,
                   created_at, updated_at
            FROM tenant ORDER BY created_at"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
@@ -905,13 +921,24 @@ pub async fn list_tenant_certs(
     pool: &SqlitePool,
     kp: &dyn KeyProvider,
 ) -> Result<Vec<TenantCert>, sqlx::Error> {
+    list_tenant_certs_on(pool, kp).await
+}
+
+/// [`list_tenant_certs`] on an arbitrary executor (one-transaction read).
+pub(crate) async fn list_tenant_certs_on<'e, E>(
+    exec: E,
+    kp: &dyn KeyProvider,
+) -> Result<Vec<TenantCert>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let rows = sqlx::query_as!(
         TenantCertRow,
         r#"SELECT id as "tenant_id!", cert_pem, cert_key_ciphertext, cert_key_nonce,
                   cert_key_version
            FROM tenant ORDER BY id"#
     )
-    .fetch_all(pool)
+    .fetch_all(exec)
     .await?;
     rows.iter().map(|r| r.to_model(kp)).collect()
 }

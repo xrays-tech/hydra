@@ -6,7 +6,7 @@
 //! land. `crypto_to_sqlx` stays in the parent and is reached as a child module
 //! may reach an ancestor's private item.
 
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, SqlitePool};
 
 use crate::crypto::KeyProvider;
 use hydra_core::model::BillingStatus;
@@ -271,97 +271,106 @@ pub async fn restore_config(
     //   key        -> user
     //   tenant token -> tenant
     //   global_role provider -> provider + global_role
-    for g in &fidelity.user_groups {
-        sqlx::query(
-            "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&g.id)
-        .bind(&g.tenant_id)
-        .bind(&g.name)
-        .bind(g.enabled)
-        .bind(&g.created_at)
-        .bind(&g.updated_at)
-        .execute(&mut *tx)
-        .await?;
+    // 6 columns/row; 150 rows = 900 binds.
+    for chunk in fidelity.user_groups.chunks(150) {
+        let mut qb = QueryBuilder::new(
+            "INSERT INTO user_group (id, tenant_id, name, enabled, created_at, updated_at) ",
+        );
+        qb.push_values(chunk, |mut b, g| {
+            b.push_bind(&g.id)
+                .push_bind(&g.tenant_id)
+                .push_bind(&g.name)
+                .push_bind(g.enabled)
+                .push_bind(&g.created_at)
+                .push_bind(&g.updated_at);
+        });
+        qb.build().execute(&mut *tx).await?;
     }
-    for u in &fidelity.users {
-        let billing_status: &'static str = match u.billing_status {
-            BillingStatus::Active => "active",
-            BillingStatus::Delinquent => "delinquent",
-        };
-        sqlx::query(
+    // 11 columns/row; 80 rows = 880 binds.
+    for chunk in fidelity.users.chunks(80) {
+        let mut qb = QueryBuilder::new(
             "INSERT INTO \"user\" (id, tenant_id, user_group_id, external_id, name, \
              enabled, billing_status, billing_reason, billing_updated_at, created_at, \
-             updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&u.id)
-        .bind(&u.tenant_id)
-        .bind(&u.user_group_id)
-        .bind(&u.external_id)
-        .bind(&u.name)
-        .bind(u.enabled)
-        .bind(billing_status)
-        .bind(&u.billing_reason)
-        .bind(&u.billing_updated_at)
-        .bind(&u.created_at)
-        .bind(&u.updated_at)
-        .execute(&mut *tx)
-        .await?;
+             updated_at) ",
+        );
+        qb.push_values(chunk, |mut b, u| {
+            let billing_status: &'static str = match u.billing_status {
+                BillingStatus::Active => "active",
+                BillingStatus::Delinquent => "delinquent",
+            };
+            b.push_bind(&u.id)
+                .push_bind(&u.tenant_id)
+                .push_bind(&u.user_group_id)
+                .push_bind(&u.external_id)
+                .push_bind(&u.name)
+                .push_bind(u.enabled)
+                .push_bind(billing_status)
+                .push_bind(&u.billing_reason)
+                .push_bind(&u.billing_updated_at)
+                .push_bind(&u.created_at)
+                .push_bind(&u.updated_at);
+        });
+        qb.build().execute(&mut *tx).await?;
     }
-    for k in &fidelity.user_api_keys {
-        sqlx::query(
+    // 10 columns/row; 90 rows = 900 binds, under SQLite's default 999-variable cap.
+    for chunk in fidelity.user_api_keys.chunks(90) {
+        let mut qb = QueryBuilder::new(
             "INSERT INTO user_api_key (id, user_id, name, key_hash, key_prefix, key_last4, \
-             enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&k.id)
-        .bind(&k.user_id)
-        .bind(&k.name)
-        .bind(&k.key_hash)
-        .bind(&k.key_prefix)
-        .bind(&k.key_last4)
-        .bind(k.enabled)
-        .bind(&k.expires_at)
-        .bind(&k.created_at)
-        .bind(&k.updated_at)
-        .execute(&mut *tx)
-        .await?;
+             enabled, expires_at, created_at, updated_at) ",
+        );
+        qb.push_values(chunk, |mut b, k| {
+            b.push_bind(&k.id)
+                .push_bind(&k.user_id)
+                .push_bind(&k.name)
+                .push_bind(&k.key_hash)
+                .push_bind(&k.key_prefix)
+                .push_bind(&k.key_last4)
+                .push_bind(k.enabled)
+                .push_bind(&k.expires_at)
+                .push_bind(&k.created_at)
+                .push_bind(&k.updated_at);
+        });
+        qb.build().execute(&mut *tx).await?;
     }
-    for tok in &fidelity.tenant_access_tokens {
-        sqlx::query(
+    // 10 columns/row; 90 rows = 900 binds.
+    for chunk in fidelity.tenant_access_tokens.chunks(90) {
+        let mut qb = QueryBuilder::new(
             "INSERT INTO tenant_access_token (id, tenant_id, name, token_hash, token_prefix, \
-             token_last4, enabled, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-            .bind(&tok.id)
-            .bind(&tok.tenant_id)
-            .bind(&tok.name)
-            .bind(&tok.token_hash)
-            .bind(&tok.token_prefix)
-            .bind(&tok.token_last4)
-            .bind(tok.enabled)
-            .bind(&tok.expires_at)
-            .bind(&tok.created_at)
-            .bind(&tok.updated_at)
-            .execute(&mut *tx)
-            .await?;
+             token_last4, enabled, expires_at, created_at, updated_at) ",
+        );
+        qb.push_values(chunk, |mut b, tok| {
+            b.push_bind(&tok.id)
+                .push_bind(&tok.tenant_id)
+                .push_bind(&tok.name)
+                .push_bind(&tok.token_hash)
+                .push_bind(&tok.token_prefix)
+                .push_bind(&tok.token_last4)
+                .push_bind(tok.enabled)
+                .push_bind(&tok.expires_at)
+                .push_bind(&tok.created_at)
+                .push_bind(&tok.updated_at);
+        });
+        qb.build().execute(&mut *tx).await?;
     }
-    for role in &fidelity.global_roles {
-        sqlx::query(
+    // 10 columns/row; 90 rows = 900 binds.
+    for chunk in fidelity.global_roles.chunks(90) {
+        let mut qb = QueryBuilder::new(
             "INSERT INTO global_role (id, name, tenant_id, user_group_id, user_id, api_key_id, \
-             model_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&role.id)
-        .bind(&role.name)
-        .bind(&role.tenant_id)
-        .bind(&role.user_group_id)
-        .bind(&role.user_id)
-        .bind(&role.api_key_id)
-        .bind(&role.model_key)
-        .bind(role.enabled)
-        .bind(&role.created_at)
-        .bind(&role.updated_at)
-        .execute(&mut *tx)
-        .await?;
+             model_key, enabled, created_at, updated_at) ",
+        );
+        qb.push_values(chunk, |mut b, role| {
+            b.push_bind(&role.id)
+                .push_bind(&role.name)
+                .push_bind(&role.tenant_id)
+                .push_bind(&role.user_group_id)
+                .push_bind(&role.user_id)
+                .push_bind(&role.api_key_id)
+                .push_bind(&role.model_key)
+                .push_bind(role.enabled)
+                .push_bind(&role.created_at)
+                .push_bind(&role.updated_at);
+        });
+        qb.build().execute(&mut *tx).await?;
     }
     // The provider set is normalized in its own table. `GlobalRole.provider_ids` does not carry
     // the child row's PRIMARY KEY, so the row id is re-derived deterministically from the (role,
