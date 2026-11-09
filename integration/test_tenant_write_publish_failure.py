@@ -19,7 +19,9 @@ Gates:
      `503` later is about the quorum, not about the request)
   B  no quorum (2 of 3 killed): the SAME kind of write answers **503 `config_not_published`**
   C  ...and the error body says the change is local-only (it must not read as "your request was
-     bad"), which is what tells an integrator to retry rather than to fix the payload
+     bad"), which is what tells an integrator to retry rather than to fix the payload. It must also
+     name the non-idempotent recovery: `POST /api/v1/reload?force=1` (a plain reload sees no change
+     after the failed write already swapped the in-memory snapshot, and would skip the publish)
   D  the survivor is still healthy and still serving its materialized config (`/api/v1/health` 200):
      a refused publish must not take the node down
   E  quorum restored: retrying the SAME request answers 200 (the write is idempotent — a user-group
@@ -197,7 +199,8 @@ def seed(node, upstream):
         ("/provider-keys", {"id": "pk-pf", "provider_id": "p-pf", "api_key": "sk-up",
                             "created_at": ""}),
         ("/tenants", {"id": "t1", "name": "T", "domain": "pubfail.local",
-                      "cert_file": None,                       "created_at": "", "updated_at": ""}),
+                      "cert_key": None, "cert_file": None, "enabled": True,
+                      "created_at": "", "updated_at": ""}),
         ("/tenant-providers", {"id": "tp-pf", "tenant_id": "t1", "provider_id": "p-pf",
                                "created_at": "", "updated_at": ""}),
         ("/tenant-models", {"id": "tm-pf", "tenant_id": "t1", "model_key": "echo",
@@ -332,10 +335,11 @@ def main():
               status == 503 and code == "config_not_published",
               f"HTTP {status} code={code!r} {str(body)[:160]}")
         message = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
-        check("C: the refusal says the change is LOCAL-ONLY (an integrator must retry, not fix the "
-              "payload)",
-              "could NOT be published" in message and "retry" in message.lower(),
-              f"message={message[:200]!r}")
+        check("C: the refusal says the change is LOCAL-ONLY and names the non-idempotent recovery "
+              "(retry an idempotent write; /reload?force=1 publishes a non-idempotent one)",
+              "could NOT be published" in message and "retry" in message.lower()
+              and "/reload?force=1" in message and "NOT idempotent" in message,
+              f"message={message[:240]!r}")
         check("D: the survivor is still healthy and still serving its materialized config",
               entry.serving() and tenant_list(entry)[0] == 200,
               f"health={entry.serving()} tenant_api={tenant_list(entry)[0]}")
@@ -376,7 +380,8 @@ def main():
         print(f"TENANT WRITE PUBLISH FAILURE: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print("TENANT WRITE PUBLISH FAILURE: PASSED (503 config_not_published without a quorum, "
-          "idempotent user-group retry republishes it)")
+          "idempotent user-group retry republishes it; the body names /reload?force=1 for "
+          "non-idempotent writes)")
     return 0
 
 

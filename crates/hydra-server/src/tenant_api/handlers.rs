@@ -2410,8 +2410,11 @@ async fn commit_and_publish(
                     &format!(
                         "the change was committed to this node's database but could NOT be \
                          published to the cluster, so no other node will see it: {reason} — \
-                         retry the same request once the cluster has a majority; the write is \
-                         idempotent and the retry is what publishes it"
+                         retry the same request once the cluster has a majority; an idempotent \
+                         write is published by that retry. If the write is NOT idempotent (for \
+                         example POST /api-keys/bulk), do NOT re-send it: POST \
+                         /api/v1/reload?force=1 publishes the locally committed config (a plain \
+                         reload sees no change and skips the publish)"
                     ),
                 )
                 .await;
