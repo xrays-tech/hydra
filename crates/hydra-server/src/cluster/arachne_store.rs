@@ -186,21 +186,48 @@ const PUBLISH_READBACK_WAIT: Duration = Duration::from_secs(5);
 /// commands, inside the 0.5 integration target (~100) and below the 4096-key/4 MiB caps.
 const ENTITY_READ_BATCH: usize = 256;
 
-/// Prefix and snapshot bound for the materializer's watch cache. Arachne's
-/// `watch` returns a consistent snapshot plus ordered events; values are
-/// content-addressed, so a cached key is immutable even if the cache is older
-/// than the current head. Missing keys fall back to multi_get.
-const WATCH_PREFIX: &[u8] = b"hydra/";
-const WATCH_SNAPSHOT_LIMIT: usize = 100_000;
-/// Hard bound for the best-effort watch cache. The normal path prunes to the
+/// Value bytes per entity `multi_get`. The library rejects a reply whose VALUES exceed 4 MiB
+/// (`MAX_MULTI_GET_RESULT_BYTES`); half of it leaves framing headroom. At 120k entities a
+/// count-only batch is not enough: one large value (or a run of them) must be able to split the
+/// batch before the library refuses it.
+const ENTITY_READ_BYTES: usize = 2 * 1024 * 1024;
+
+/// Entities per exact-key existence probe during publish.
+///
+/// The pre-upload skip used to issue one `get_stale` per entity, so a 48k-entity tree cost 48k
+/// sequential commands. The library's `multi_get` accepts 4096 keys; the byte budget below is
+/// the tighter bound for normal-sized rows, so a 48k tree costs ~12 probes instead of 48k
+/// (measured: the probe phase dropped to ~60 ms at 48k entities).
+const PUBLISH_PROBE_ENTRIES: usize = 4096;
+
+/// Key+value bytes one publish existence probe may carry. `multi_get` caps the RETURNED values
+/// at 4 MiB (`MAX_MULTI_GET_RESULT_BYTES`); half of that leaves framing headroom and matches
+/// the pre-upload `multi_put` budget, so one oversized value cannot make the probe fail.
+const PUBLISH_PROBE_BYTES: usize = ENTITY_CHUNK_MAX_BYTES;
+
+/// The control-plane head watch is tiny (4 ctl keys), so it can always start.
+const WATCH_HEAD_PREFIX: &[u8] = b"hydra/ctl/";
+const WATCH_HEAD_SNAPSHOT_LIMIT: usize = 64;
+
+/// Content watch prefix and snapshot bound.
+///
+/// `hydra/cfg/` holds one key per entity plus the manifest/shard values. Arachne's server clamps
+/// every `get_range` snapshot to `MAX_STALE_RANGE_ENTRIES = 10_000` and rejects a truncated watch
+/// snapshot with `Busy` (a truncated snapshot would silently miss older keys). We ask for exactly
+/// that cap; when the config outgrows it, [`WatchCache::content_too_large`] disables only the
+/// content prewarm — the head watch and the materializer's own `entity_cache`/`shard_cache` stay.
+const WATCH_CONTENT_PREFIX: &[u8] = b"hydra/cfg/";
+const WATCH_CONTENT_SNAPSHOT_LIMIT: usize = 10_000;
+
+/// Hard bound for the best-effort content watch cache. The normal path prunes to the
 /// current tree; this bound covers bursts between materializations so a long
 /// running process cannot grow the cache without limit.
 const WATCH_CACHE_MAX_ENTRIES: usize = 200_000;
 
-/// Shard keys per `multi_get` batch. 32 buckets fit in two batches even before de-duplicating
-/// the shared empty shard; each batch also stays well below the 4 MiB returned-value cap at the
-/// 24k target (~34 KiB per shard).
-const SHARD_READ_BATCH: usize = 16;
+/// Shard keys per `multi_get` batch. At most four, because a shard may be up to
+/// [`SHARD_MAX_BYTES`] (900 KiB): 4 × 900 KiB stays under the library's 4 MiB returned-value cap.
+/// 32 buckets therefore cost eight read commands, which is still negligible.
+const SHARD_READ_BATCH: usize = 4;
 
 /// Split missing `(key, value)` entities into `multi_put` chunks under both bounds.
 ///
@@ -353,7 +380,15 @@ struct WatchCache {
     /// Latest `ctl/head` value and the watch index that produced it. A snapshot
     /// only carries the applied watermark, so it uses that conservative index.
     head: Mutex<Option<(Vec<u8>, u64)>>,
-    started: AtomicBool,
+    /// The two watches are independent: the head watch always fits; the content
+    /// watch may be disabled when `hydra/cfg/` outgrows Arachne's snapshot cap.
+    head_started: AtomicBool,
+    content_started: AtomicBool,
+    /// Set after `watch(hydra/cfg/)` answers `Busy` because the prefix snapshot
+    /// exceeds the library's 10k cap. Retrying every materialization would emit a
+    /// command and a warning per second for an immutable fact about the config's
+    /// size; the content prewarm stays off until a restart.
+    content_too_large: AtomicBool,
 }
 
 impl WatchCache {
@@ -361,7 +396,9 @@ impl WatchCache {
         Self {
             values: Mutex::new(HashMap::new()),
             head: Mutex::new(None),
-            started: AtomicBool::new(false),
+            head_started: AtomicBool::new(false),
+            content_started: AtomicBool::new(false),
+            content_too_large: AtomicBool::new(false),
         }
     }
 
@@ -427,15 +464,24 @@ impl ArachneConfigStore {
         }
     }
 
-    /// Start the prefix watch once. Failure is non-fatal: every read still has
-    /// the multi_get fallback, and a later read retries the subscription.
+    /// Start both watches once. Failure is non-fatal: every read still has a
+    /// fallback, and a later read retries the failed one.
     async fn ensure_watch(&self) {
-        if self.watch_cache.started.swap(true, Ordering::AcqRel) {
+        self.ensure_head_watch().await;
+        self.ensure_content_watch().await;
+    }
+
+    /// The head watch: a 4-key snapshot, so it always fits.
+    async fn ensure_head_watch(&self) {
+        if self.watch_cache.head_started.swap(true, Ordering::AcqRel) {
             return;
         }
         let handle = self.handle.clone();
         let cache = self.watch_cache.clone();
-        match handle.watch(WATCH_PREFIX, WATCH_SNAPSHOT_LIMIT).await {
+        match handle
+            .watch(WATCH_HEAD_PREFIX, WATCH_HEAD_SNAPSHOT_LIMIT)
+            .await
+        {
             Ok(sub) => {
                 crate::admin::metrics::record_arachne_watch("started");
                 let head_key = ctl_head();
@@ -444,11 +490,6 @@ impl ArachneConfigStore {
                     .iter()
                     .find(|(key, _)| key.as_slice() == head_key.as_bytes())
                     .map(|(_, value)| (value.clone(), sub.applied_index));
-                {
-                    let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
-                    values.clear();
-                    values.extend(sub.snapshot);
-                }
                 *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = snapshot_head;
                 let mut events = sub.events;
                 tokio::spawn(async move {
@@ -461,6 +502,56 @@ impl ArachneConfigStore {
                                 .as_ref()
                                 .map(|value| (value.clone(), event.index));
                         }
+                    }
+                    *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    crate::admin::metrics::record_arachne_watch("disconnected");
+                    cache.head_started.store(false, Ordering::Release);
+                });
+            }
+            Err(e) => {
+                crate::admin::metrics::record_arachne_watch("failed");
+                *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                cache.head_started.store(false, Ordering::Release);
+                tracing::warn!(
+                    error = %e,
+                    "control-plane head watch unavailable; using current_head_with_index fallback"
+                );
+            }
+        }
+    }
+
+    /// The content watch: `hydra/cfg/` may exceed Arachne's 10k snapshot cap.
+    ///
+    /// When it does, `watch` answers `Busy` (a truncated snapshot is rejected, not
+    /// returned) and this method disables the content prewarm for the life of the
+    /// process. The head watch and the materializer's local caches are unaffected.
+    async fn ensure_content_watch(&self) {
+        if self.watch_cache.content_too_large.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .watch_cache
+            .content_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let handle = self.handle.clone();
+        let cache = self.watch_cache.clone();
+        match handle
+            .watch(WATCH_CONTENT_PREFIX, WATCH_CONTENT_SNAPSHOT_LIMIT)
+            .await
+        {
+            Ok(sub) => {
+                crate::admin::metrics::record_arachne_watch("started");
+                {
+                    let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
+                    values.clear();
+                    values.extend(sub.snapshot);
+                }
+                let mut events = sub.events;
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
                         let mut values = cache.values.lock().unwrap_or_else(|e| e.into_inner());
                         match event.value {
                             Some(value) => {
@@ -473,20 +564,31 @@ impl ArachneConfigStore {
                         if values.len() > WATCH_CACHE_MAX_ENTRIES {
                             values.clear();
                             tracing::warn!(
-                                "config watch cache exceeded {WATCH_CACHE_MAX_ENTRIES} entries;                                  dropping it and falling back to multi_get"
+                                "config watch cache exceeded {WATCH_CACHE_MAX_ENTRIES} entries; \
+                                 dropping it and falling back to multi_get"
                             );
                         }
                     }
-                    *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     crate::admin::metrics::record_arachne_watch("disconnected");
-                    cache.started.store(false, Ordering::Release);
+                    cache.content_started.store(false, Ordering::Release);
                 });
+            }
+            Err(ArachneError::Busy) => {
+                crate::admin::metrics::record_arachne_watch("content_capped");
+                cache.content_too_large.store(true, Ordering::Release);
+                cache.content_started.store(false, Ordering::Release);
+                tracing::warn!(
+                    "config content watch disabled: hydra/cfg/ exceeds Arachne's 10k snapshot \
+                     cap; the materializer uses its local entity/shard caches and multi_get"
+                );
             }
             Err(e) => {
                 crate::admin::metrics::record_arachne_watch("failed");
-                *cache.head.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                cache.started.store(false, Ordering::Release);
-                tracing::warn!(error = %e, "config watch cache unavailable; using multi_get fallback");
+                cache.content_started.store(false, Ordering::Release);
+                tracing::warn!(
+                    error = %e,
+                    "config content watch unavailable; using multi_get fallback"
+                );
             }
         }
     }
@@ -501,6 +603,13 @@ impl ArachneConfigStore {
     }
 
     fn cached_content(&self, key: &str) -> Option<Vec<u8>> {
+        // The content watch is the only producer of `values`. If it is disabled
+        // (prefix over the 10k cap) or between reconnects, the entity/shard
+        // caches and multi_get are the path; do not record a miss that the
+        // content watch never had a chance to serve.
+        if !self.watch_cache.content_started.load(Ordering::Acquire) {
+            return None;
+        }
         let value = self
             .watch_cache
             .values
@@ -523,21 +632,32 @@ impl ArachneConfigStore {
     /// [`MATERIALIZE_WAIT`], or what it returned does not match what the toc describes. After
     /// `wait_applied` a mismatch/missing key is real inconsistency, not a lag to retry.
     pub async fn read(&self) -> Result<ReadOutcome, StoreError> {
-        let outcome = self.read_inner().await;
+        let outcome = self.read_inner(None).await;
         if let Err(e) = &outcome {
             note_quorum_failure("read", e);
         }
         outcome
     }
 
-    /// [`Self::read`] without the instrumentation, so the counting happens once.
-    async fn read_inner(&self) -> Result<ReadOutcome, StoreError> {
+    /// Read the tree named by an ALREADY-CHOSEN head.
+    ///
+    /// The materializer reads the head once, decides to apply it, and must then read EXACTLY that
+    /// tree. Re-reading the head inside the tree read can pick a different (stale watch) value and
+    /// apply a mixed tree under the token the gate just recorded — measured at 120k rows: followers
+    /// stayed at 76k while the gate believed 80k was applied.
+    pub async fn read_at(&self, head: &str, head_index: Index) -> Result<ReadOutcome, StoreError> {
+        let outcome = self.read_inner(Some((head.to_string(), head_index))).await;
+        if let Err(e) = &outcome {
+            note_quorum_failure("read", e);
+        }
+        outcome
+    }
+
+    /// The head the materializer should act on: the watch value when available, else a direct
+    /// read. This is the ONE head the materializer both plans with and pins its tree read to.
+    pub(crate) async fn materializer_head(&self) -> Result<Option<(String, Index)>, StoreError> {
         self.ensure_watch().await;
-        // Read the head WITH its index, then wait for THIS node's state machine to apply that
-        // index before reading anything it names. Every manifest/shard/entity write was committed
-        // before the head entry, so "head applied locally" implies they are readable locally.
-        // `wait_applied` is local (no quorum) and event-driven, not a poll.
-        let head = if self.watch_cache.started.load(Ordering::Acquire) {
+        let head = if self.watch_cache.head_started.load(Ordering::Acquire) {
             if let Some(head) = self.watch_head() {
                 crate::admin::metrics::record_arachne_watch("head_hit");
                 Some(head)
@@ -548,6 +668,21 @@ impl ArachneConfigStore {
         } else {
             crate::admin::metrics::record_arachne_watch("head_fallback");
             self.current_head_with_index().await?
+        };
+        Ok(head)
+    }
+
+    /// [`Self::read`] without the instrumentation, so the counting happens once.
+    async fn read_inner(
+        &self,
+        expected_head: Option<(String, Index)>,
+    ) -> Result<ReadOutcome, StoreError> {
+        self.ensure_watch().await;
+        // A caller that already decided on a head pins the read to it. Otherwise use the watch
+        // head / a direct read, exactly as before.
+        let head = match expected_head {
+            Some(head) => Some(head),
+            None => self.materializer_head().await?,
         };
         let Some((head, head_index)) = head else {
             return Ok(ReadOutcome::Empty);
@@ -668,31 +803,26 @@ impl ArachneConfigStore {
         }
 
         let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
-        for chunk in missing.chunks(ENTITY_READ_BATCH) {
-            let keys: Vec<String> = chunk.iter().map(|(key, _)| key.clone()).collect();
-            let key_refs: Vec<&[u8]> = keys.iter().map(String::as_bytes).collect();
-            let result = self
-                .handle
-                .multi_get(&key_refs, ReadConsistency::Stale)
-                .await
-                .map_err(map_err)?;
-            for ((key, entry), value) in chunk.iter().zip(result.values) {
-                let Some(bytes) = value else {
-                    return Err(StoreError::Arachne(format!(
-                        "tree {head} is missing entity {} after wait_applied; refusing to serve a mixed tree",
-                        entry.path.to_key_segment()
-                    )));
-                };
-                if bytes.len() != entry.len as usize || content_hash(&bytes) != entry.content_hash {
-                    return Err(StoreError::Arachne(format!(
-                        "entity {} in tree {head} does not match the hash its table of contents \
-                         records; refusing to serve a mixed tree",
-                        entry.path.to_key_segment()
-                    )));
-                }
-                tree.insert(entry.path.clone(), bytes.clone());
-                fetched.push((key.clone(), bytes));
+        // Bound BOTH the command count and the returned byte count. The library rejects a
+        // `multi_get` whose values exceed 4 MiB; a count-only batch of 256 is fine for ~500-byte
+        // rows but not for a run of large entities, which is what the 120k drill hit.
+        let mut start = 0usize;
+        let mut batch_bytes = 0usize;
+        for index in 0..missing.len() {
+            let entry_bytes = missing[index].0.len() + missing[index].1.len as usize;
+            let full = index - start >= ENTITY_READ_BATCH;
+            let over_budget = index > start && batch_bytes + entry_bytes > ENTITY_READ_BYTES;
+            if full || over_budget {
+                self.read_entity_batch(head, &missing[start..index], &mut tree, &mut fetched)
+                    .await?;
+                start = index;
+                batch_bytes = 0;
             }
+            batch_bytes += entry_bytes;
+        }
+        if start < missing.len() {
+            self.read_entity_batch(head, &missing[start..], &mut tree, &mut fetched)
+                .await?;
         }
 
         let mut cache = self.entity_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -701,6 +831,45 @@ impl ArachneConfigStore {
         }
         cache.retain(|key, _| current_keys.contains(key));
         Ok(tree)
+    }
+
+    /// One bounded entity `multi_get` batch, verified against the toc entries.
+    ///
+    /// `multi_get` returns one `Option` per key in input order; a missing value is a real
+    /// inconsistency after `wait_applied`, not a race to retry. The caller has already bounded
+    /// the batch by both entry count and value bytes.
+    async fn read_entity_batch(
+        &self,
+        head: &str,
+        batch: &[(String, TocEntry)],
+        tree: &mut ConfigTree,
+        fetched: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<(), StoreError> {
+        let keys: Vec<String> = batch.iter().map(|(key, _)| key.clone()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(String::as_bytes).collect();
+        let result = self
+            .handle
+            .multi_get(&key_refs, ReadConsistency::Stale)
+            .await
+            .map_err(map_err)?;
+        for ((key, entry), value) in batch.iter().zip(result.values) {
+            let Some(bytes) = value else {
+                return Err(StoreError::Arachne(format!(
+                    "tree {head} is missing entity {} after wait_applied; refusing to serve a mixed tree",
+                    entry.path.to_key_segment()
+                )));
+            };
+            if bytes.len() != entry.len as usize || content_hash(&bytes) != entry.content_hash {
+                return Err(StoreError::Arachne(format!(
+                    "entity {} in tree {head} does not match the hash its table of contents \
+                     records; refusing to serve a mixed tree",
+                    entry.path.to_key_segment()
+                )));
+            }
+            tree.insert(entry.path.clone(), bytes.clone());
+            fetched.push((key.clone(), bytes));
+        }
+        Ok(())
     }
 
     /// Fetch, verify, and merge the shards a manifest names.
@@ -1071,6 +1240,32 @@ impl ArachneConfigStore {
         outcome
     }
 
+    /// Probe one bounded batch of content-addressed entity keys and append the ones this
+    /// replica does not hold to `missing`.
+    ///
+    /// `multi_get(Stale)` returns one `Option` per input key in input order, so the mapping
+    /// back to `(key, value)` is positional. The caller bounds both the entry count and the
+    /// key+value bytes; `multi_get` would otherwise reject an oversized reply with
+    /// `ResultTooLarge` instead of returning a partial batch.
+    async fn probe_publish_entities<'a>(
+        &self,
+        batch: &[(String, &'a [u8])],
+        missing: &mut Vec<(String, &'a [u8])>,
+    ) -> Result<(), StoreError> {
+        let keys: Vec<&[u8]> = batch.iter().map(|(key, _)| key.as_bytes()).collect();
+        let result = self
+            .handle
+            .multi_get(&keys, ReadConsistency::Stale)
+            .await
+            .map_err(map_err)?;
+        for ((key, bytes), value) in batch.iter().zip(result.values) {
+            if value.is_none() {
+                missing.push((key.clone(), *bytes));
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::publish_with_index`] without the instrumentation, so counting happens once.
     async fn publish_inner(&self, tree: &ConfigTree) -> Result<(String, Index), StoreError> {
         // The toc first: it validates every id, so an unkeyable entity is refused before a single
@@ -1101,16 +1296,48 @@ impl ArachneConfigStore {
         // cannot overwrite another tree's value; nothing here is visible to a reader until the
         // final batch moves the head. A failure leaves only unreferenced, GC-able orphans.
         //
-        // Entity skip: `get_stale` against this node's own replica. A "missing" answer only costs
-        // a redundant idempotent write; a "present" answer cannot be wrong about CONTENT because
-        // the key carries the hash. Hydra never deletes entities, so a skip cannot go stale.
+        // Entity skip: exact-key existence against this node's own replica. A "missing" answer
+        // only costs a redundant idempotent write; a "present" answer cannot be wrong about
+        // CONTENT because the key carries the hash. Hydra never deletes referenced entities, so
+        // a skip cannot go stale.
+        //
+        // BATCHED on purpose. This used to be one `get_stale` per entity, i.e. 48k sequential
+        // commands for a 48k-entity tree. `multi_get` is exact-key, stale, and returns one answer
+        // per input key in order; the byte budget below keeps each reply under the library's
+        // 4 MiB result cap. We do NOT consult the materializer's entity cache here: that cache
+        // may hold a value whose unreferenced key was already GC'd, and skipping an upload on
+        // that evidence would commit a head that names a missing entity for every other node.
+        // `toc_for` is built from this same tree and preserves its order, so reuse its
+        // content hash instead of hashing every entity a second time.
+        debug_assert_eq!(toc.entities.len(), tree.len());
+        let entries: Vec<(String, &[u8])> = tree
+            .iter()
+            .zip(toc.entities.iter())
+            .map(|((_, bytes), entry)| {
+                (
+                    cfg_entity(&entry.path, &hex_hash(&entry.content_hash)),
+                    bytes.as_slice(),
+                )
+            })
+            .collect();
         let mut missing: Vec<(String, &[u8])> = Vec::new();
-        for (path, bytes) in tree.iter() {
-            let key = cfg_entity(path, &hex_hash(&content_hash(bytes)));
-            if matches!(self.handle.get_stale(key.as_bytes()).await, Ok(Some(_))) {
-                continue;
+        let mut start = 0usize;
+        let mut batch_bytes = 0usize;
+        for index in 0..entries.len() {
+            let entry_bytes = entries[index].0.len() + entries[index].1.len();
+            let full = index - start >= PUBLISH_PROBE_ENTRIES;
+            let over_budget = index > start && batch_bytes + entry_bytes > PUBLISH_PROBE_BYTES;
+            if full || over_budget {
+                self.probe_publish_entities(&entries[start..index], &mut missing)
+                    .await?;
+                start = index;
+                batch_bytes = 0;
             }
-            missing.push((key, bytes.as_slice()));
+            batch_bytes += entry_bytes;
+        }
+        if start < entries.len() {
+            self.probe_publish_entities(&entries[start..], &mut missing)
+                .await?;
         }
 
         // Shards are content-addressed too, and committed BEFORE the head. A shard that is not

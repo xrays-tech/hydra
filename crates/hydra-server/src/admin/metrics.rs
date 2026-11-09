@@ -576,7 +576,7 @@ fn metrics() -> Option<&'static Metrics> {
             .ok()?,
             arachne_watch_total: register_int_counter_vec!(
                 "hydra_arachne_watch_total",
-                "Arachne watch/head-cache outcomes (result=started|failed|disconnected|head_hit|head_fallback)",
+                "Arachne watch/head-cache outcomes (result=started|failed|disconnected|head_hit|head_fallback|content_capped)",
                 &["result"]
             )
             .ok()?,

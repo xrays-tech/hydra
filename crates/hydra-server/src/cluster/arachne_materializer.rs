@@ -20,14 +20,13 @@
 //!    because a replica that receives only `ConfigData` cannot rebuild its SQLite tables
 //!    byte-faithfully (disabled rows, provider-key identity, offline models, tenant access tokens).
 //!
-//! ## What this layer deliberately does NOT do yet
+//! ## Wiring
 //!
-//! Wire itself into `main.rs`. [`ReplicaTarget`] is the real target (it rebuilds the node's
-//! SQLite replica and swaps the in-memory config), and the loop is proven against a live raft node
-//! and a live store — but nothing spawns the loop on startup yet, and publishing still goes
-//! through `SnapshotWire`, so today no node serves config from Arachne. Both halves belong to the
-//! publish cutover (T3.2), and doing one without the other would leave a node that reports itself
-//! materialized against a head nobody writes.
+//! `main.rs` spawns one [`Materializer`] per node on a one-second tick, and [`ReplicaTarget`] is the
+//! real target: it rebuilds the node's SQLite replica and swaps the in-memory config. Publishing
+//! and materialization are both live in the Arachne control plane. That is why the loop must skip a
+//! tree the write path just installed locally — re-applying it would rewrite every row under the
+//! same write lock that the next management write needs.
 
 #![cfg(feature = "arachne")]
 
@@ -140,9 +139,10 @@ pub trait HeadSource: Send + Sync {
 #[async_trait::async_trait]
 impl HeadSource for ArachneConfigStore {
     async fn head_with_index(&self) -> Result<Option<(String, u64)>, String> {
-        self.current_head_with_index()
-            .await
-            .map_err(|e| e.to_string())
+        // The materializer must act on ONE head: this is the one it will pass
+        // back to `read_at`. Using the watch head here (not a second direct
+        // read in the tree read) is what keeps the two from disagreeing.
+        self.materializer_head().await.map_err(|e| e.to_string())
     }
 }
 
@@ -264,6 +264,37 @@ impl Materializer {
             return Ok(Converged::NoChange);
         }
 
+        // A tree THIS node published was already committed to its own SQLite and
+        // swapped into its in-memory snapshot by the write path, under the same
+        // write lock this pass holds. Re-running `restore_config` would rewrite
+        // every row (48k in the scale drill) and block the next write; mark the
+        // tree applied without touching the target.
+        //
+        // Stale-pending case, documented on purpose: if a LATER local write
+        // swapped a newer config and its publish failed, `(pending_head,
+        // local_write_index)` still names this older successful head. Skipping is
+        // the right answer there too: the `NotPublished` contract says the node
+        // KEEPS SERVING its locally committed config until some other head moves.
+        // The gate token therefore names the head this node has accounted for,
+        // not necessarily the exact bytes it serves; leader eligibility only
+        // requires that a config was installed. A genuinely newer head has a
+        // higher index, so the `==` check below never hides it.
+        if let (Some(hash), Some(index)) = (head.as_deref(), head_index) {
+            if index == self.target.local_write_index()
+                && self.target.pending_head().as_deref() == Some(hash)
+            {
+                self.gate.succeeded(hash);
+                self.target.clear_pending_head(hash);
+                self.applied_index = head_index;
+                tracing::debug!(
+                    head = %hash,
+                    index,
+                    "head is this node's own publish; local database already has it"
+                );
+                return Ok(Converged::NoChange);
+            }
+        }
+
         let plan = self
             .gate
             .plan(
@@ -290,56 +321,65 @@ impl Materializer {
                 Ok(Converged::NoChange)
             }
             Plan::Hold { hash, .. } => Ok(Converged::Deferred { hash }),
-            Plan::Materialize { hash } => match self.store.read().await {
-                Ok(ReadOutcome::Tree(tree)) => {
-                    match build_config_with_fidelity(&tree, self.key_provider.as_ref()) {
-                        Ok((cfg, fidelity)) => {
-                            // Apply FIRST, then move the watermark: the other order is the bug
-                            // this test file exists for.
-                            if let Err(reason) =
-                                self.target.apply(Arc::new(cfg), Arc::new(fidelity)).await
-                            {
-                                let wait = self.gate.failed(&hash);
-                                return Err(MaterializeError::Unavailable {
-                                    hash,
-                                    reason: format!("{reason} (retry in {wait:?})"),
-                                });
+            Plan::Materialize { hash } => {
+                let Some(index) = head_index else {
+                    return Err(MaterializeError::Head {
+                        reason: "materialize plan without a head index".into(),
+                    });
+                };
+                // Pin the tree read to the SAME head the gate just decided on. Re-reading the
+                // head here is how a stale watch value applied a mixed tree at 120k rows.
+                match self.store.read_at(&hash, index).await {
+                    Ok(ReadOutcome::Tree(tree)) => {
+                        match build_config_with_fidelity(&tree, self.key_provider.as_ref()) {
+                            Ok((cfg, fidelity)) => {
+                                // Apply FIRST, then move the watermark: the other order is the bug
+                                // this test file exists for.
+                                if let Err(reason) =
+                                    self.target.apply(Arc::new(cfg), Arc::new(fidelity)).await
+                                {
+                                    let wait = self.gate.failed(&hash);
+                                    return Err(MaterializeError::Unavailable {
+                                        hash,
+                                        reason: format!("{reason} (retry in {wait:?})"),
+                                    });
+                                }
+                                self.gate.succeeded(&hash);
+                                self.target.clear_pending_head(&hash);
+                                self.applied_index = head_index;
+                                tracing::info!(hash = %hash, "config materialized");
+                                Ok(Converged::Applied { hash })
                             }
-                            self.gate.succeeded(&hash);
-                            self.target.clear_pending_head(&hash);
-                            self.applied_index = head_index;
-                            tracing::info!(hash = %hash, "config materialized");
-                            Ok(Converged::Applied { hash })
-                        }
-                        Err(e) => {
-                            let wait = self.gate.failed(&hash);
-                            Err(MaterializeError::Unavailable {
-                                hash,
-                                reason: format!("{e} (retry in {wait:?})"),
-                            })
+                            Err(e) => {
+                                let wait = self.gate.failed(&hash);
+                                Err(MaterializeError::Unavailable {
+                                    hash,
+                                    reason: format!("{e} (retry in {wait:?})"),
+                                })
+                            }
                         }
                     }
-                }
-                Ok(ReadOutcome::Empty) => {
-                    // The head named a tree, then vanished. Holding the previous config is the
-                    // safe answer; wiping it is not.
-                    let wait = self.gate.failed(&hash);
-                    Err(MaterializeError::Unavailable {
-                        hash,
-                        reason: format!(
-                            "the head names a tree that is no longer readable; keeping the \
+                    Ok(ReadOutcome::Empty) => {
+                        // The head named a tree, then vanished. Holding the previous config is the
+                        // safe answer; wiping it is not.
+                        let wait = self.gate.failed(&hash);
+                        Err(MaterializeError::Unavailable {
+                            hash,
+                            reason: format!(
+                                "the head names a tree that is no longer readable; keeping the \
                              last-known-good config (retry in {wait:?})"
-                        ),
-                    })
+                            ),
+                        })
+                    }
+                    Err(e) => {
+                        let wait = self.gate.failed(&hash);
+                        Err(MaterializeError::Unavailable {
+                            hash,
+                            reason: format!("{e} (retry in {wait:?})"),
+                        })
+                    }
                 }
-                Err(e) => {
-                    let wait = self.gate.failed(&hash);
-                    Err(MaterializeError::Unavailable {
-                        hash,
-                        reason: format!("{e} (retry in {wait:?})"),
-                    })
-                }
-            },
+            }
         }
     }
 }
@@ -465,6 +505,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -494,6 +535,10 @@ mod tests {
         /// How many limit roles the last apply carried — the fidelity rows must travel WITH the
         /// config, or a replica cannot rebuild its tables.
         fidelity_rows: Mutex<usize>,
+        /// What a real `ConfigStore` reports after a LOCAL publish: the final log index
+        /// and the head token awaiting materialization.
+        local_write_index: AtomicU64,
+        pending: Mutex<Option<String>>,
     }
 
     impl RecordingTarget {
@@ -509,10 +554,32 @@ mod tests {
         fn fidelity_rows(&self) -> usize {
             *self.fidelity_rows.lock().expect("lock")
         }
+        fn mark_local_publish(&self, head: &str, index: u64) {
+            self.local_write_index.store(index, Ordering::Release);
+            *self.pending.lock().expect("lock") = Some(head.to_string());
+        }
+        fn pending(&self) -> Option<String> {
+            self.pending.lock().expect("lock").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl MaterializeTarget for RecordingTarget {
+        fn local_write_index(&self) -> u64 {
+            self.local_write_index.load(Ordering::Acquire)
+        }
+
+        fn pending_head(&self) -> Option<String> {
+            self.pending.lock().expect("lock").clone()
+        }
+
+        fn clear_pending_head(&self, head: &str) {
+            let mut pending = self.pending.lock().expect("lock");
+            if pending.as_deref() == Some(head) {
+                *pending = None;
+            }
+        }
+
         async fn apply(
             &self,
             cfg: Arc<ConfigData>,
@@ -543,6 +610,10 @@ mod tests {
     /// needs its own node because its assertions read the head's origin index, which a shared
     /// node could move under it.
     const PORT_OVER_CAP: u16 = 18409;
+    /// Disjoint from every other test node: the own-publish skip test needs a stable head.
+    const PORT_OWN_PUBLISH: u16 = 18433;
+    /// Disjoint from the own-publish test: this one publishes a SECOND head over the first.
+    const PORT_OWN_PUBLISH_NEWER: u16 = 18434;
 
     fn data_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hydra-mat-{tag}-{}", std::process::id()));
@@ -708,6 +779,103 @@ mod tests {
             1,
             "no second apply for an unchanged head"
         );
+    }
+
+    /// A tree THIS node published must not be re-applied: the write path already
+    /// committed it to the local SQLite and swapped the in-memory snapshot under
+    /// the same write lock. Re-running `restore_config` rewrites every row and
+    /// blocks the next write (measured as back-to-back writes waiting ~1.4 s
+    /// instead of ~0.5 s on a 48k-entity config).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tree_this_node_just_published_is_not_reapplied() {
+        let node = node("own-publish", PORT_OWN_PUBLISH).await;
+        wait_writable(&node).await;
+        let store = ArachneConfigStore::new(node.handle.clone());
+
+        let cfg = config(&[("t1", "acme.example")]);
+        let hash = publish(&store, &cfg).await;
+        let (head, index) = store
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("a head after publish");
+        assert_eq!(head, hash, "the head names the tree just published");
+
+        let target = Arc::new(RecordingTarget::default());
+        target.mark_local_publish(&hash, index);
+        let mut mat = Materializer::new(store, target.clone(), Arc::new(kp()));
+
+        assert_eq!(
+            mat.converge().await.expect("own publish"),
+            Converged::NoChange,
+            "a node's own publish is already installed locally"
+        );
+        assert_eq!(
+            target.applied_count(),
+            0,
+            "the materializer must NOT rewrite the tree the write path just installed"
+        );
+        assert_eq!(
+            target.pending(),
+            None,
+            "the pending-head marker is cleared once the tree is accounted for"
+        );
+        assert_eq!(mat.materialized(), Some(hash.as_str()));
+        assert!(
+            mat.may_be_leader(),
+            "the tree is applied, so this node is current"
+        );
+
+        // And the gate now treats the same head as steady state.
+        assert_eq!(mat.converge().await.expect("steady"), Converged::NoChange);
+        assert_eq!(target.applied_count(), 0);
+    }
+
+    /// The skip must be exact, not "a local write happened": a NEWER head,
+    /// while an older `(pending_head, local_write_index)` pair is still marked,
+    /// must be materialized. This is the guard for both the superseded-head and
+    /// the stale-pending (`NotPublished`) cases.
+    ///
+    /// Falsification: change the `==` to `>=`, or drop the
+    /// `pending_head == head` conjunct, and `applied_count` stays 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newer_head_is_applied_even_when_an_older_pending_is_marked() {
+        let node = node("newer-head", PORT_OWN_PUBLISH_NEWER).await;
+        wait_writable(&node).await;
+        let store = ArachneConfigStore::new(node.handle.clone());
+
+        let first = config(&[("t1", "acme.example")]);
+        let first_hash = publish(&store, &first).await;
+        let (_, first_index) = store
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("a head after the first publish");
+        let target = Arc::new(RecordingTarget::default());
+        target.mark_local_publish(&first_hash, first_index);
+
+        // A second publish moves the head forward; the stale pair must not skip it.
+        let second = config(&[("t2", "globex.example")]);
+        let second_hash = publish(&store, &second).await;
+        let mut mat = Materializer::new(store, target.clone(), Arc::new(kp()));
+
+        assert_eq!(
+            mat.converge().await.expect("newer head"),
+            Converged::Applied {
+                hash: second_hash.clone()
+            },
+            "a newer head must be materialized, never hidden by an older pending marker"
+        );
+        assert_eq!(
+            target.applied_count(),
+            1,
+            "a newer head must reach the target"
+        );
+        assert_eq!(mat.materialized(), Some(second_hash.as_str()));
+
+        // The gate makes the next pass steady; the stale marker itself is irrelevant.
+        assert_eq!(mat.converge().await.expect("steady"), Converged::NoChange);
+        assert_eq!(target.applied_count(), 1);
     }
 
     /// A failed apply must NOT move the watermark, and the next pass must try again — after
@@ -1417,16 +1585,33 @@ mod tests {
         wait_writable(&node).await;
         let store = ArachneConfigStore::new(node.handle.clone());
 
-        // Two REAL trees, published the normal way.
+        // Two REAL trees, published the normal way. Their REAL indices are used in the
+        // script: `read_at` pins `wait_applied` to the head it was given, so a
+        // fabricated index would time out instead of testing the ordering.
         let first = publish(&store, &config(&[("t1", "d1")])).await;
+        let (_, first_index) = store
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("a head after the first publish");
         let second = publish(&store, &config(&[("t1", "d1"), ("t2", "d2")])).await;
+        let (_, second_index) = store
+            .current_head_with_index()
+            .await
+            .expect("head read")
+            .expect("a head after the second publish");
         assert_ne!(first, second, "fixture: two different trees");
+        assert!(
+            first_index < second_index,
+            "fixture: the second publish must be at a higher log index"
+        );
 
-        // The script: apply `second` at index 10, then read `first` at index 5 — a stale replica answering
-        // the head read with an older tree.
+        // The script: apply `second` at its real index, then read `first` at its
+        // real (lower) index — a stale replica answering the head read with an
+        // older tree. The cluster cannot itself return that pair; the seam does.
         let head = Arc::new(ScriptedHead::new(vec![
-            (second.clone(), 10),
-            (first.clone(), 5),
+            (second.clone(), second_index),
+            (first.clone(), first_index),
         ]));
         let target = Arc::new(RecordingTarget::default());
         let mut mat =
