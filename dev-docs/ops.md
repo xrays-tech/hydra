@@ -693,8 +693,12 @@ curl -s -X DELETE http://<data-plane-addr>/tenant/t-acme/api/v1/users/$UID/api-k
 
 > There are **no `wait=` / `timeout_ms` parameters any more** (they belonged to the retired
 > invalidate endpoint). A write that lands locally but cannot be committed cluster-wide answers
-> **`503 config_not_published`** — re-read on the same node and re-send the identical request once
-> the cluster has a majority (§5.5 write semantics).
+> **`503 config_not_published`** — for an **idempotent** write, re-read on the same node and
+> re-send the identical request once the cluster has a majority (§5.5 write semantics). For a
+> **non-idempotent** write (for example `POST .../api-keys/bulk`, which mints a new key every
+> retry), do NOT re-send: use `POST /api/v1/reload?force=1` to publish the locally committed
+> config. A plain reload sees `changed=false` after the failed write already swapped the in-memory
+> snapshot and skips the publish.
 
 > 租户侧的完整对接说明（字段表、错误码、边界、排障）在
 > [`tenant-api-integration.md`](tenant-api-integration.md) —— 给租户看，不是给你看的.
@@ -788,9 +792,12 @@ tenant self-service API (§5.1). Admin is the **read** half:
 local SQLite transaction -> publish to the cluster -> every node re-materialises its snapshot
 within **≤5 s**. Consequences:
 
-- `503 config_not_published` = committed **locally**, not cluster-wide. Re-read via `whoami`
-  on the same node, then re-send the identical request; hierarchy writes are upsert/idempotent
-  (except `POST .../api-keys`, which mints a NEW key on every retry — §5.7.5 of the tenant doc).
+- `503 config_not_published` = committed **locally**, not cluster-wide. For an idempotent write,
+  re-read via `whoami` on the same node, then re-send the identical request; hierarchy writes are
+  upsert/idempotent. `POST .../api-keys` is the exception: it mints a NEW key on every retry
+  (§5.7.5 of the tenant doc), so use `POST /api/v1/reload?force=1` instead — a plain reload sees
+  `changed=false` after the failed write already swapped the in-memory snapshot and skips the
+  publish.
 - The `config_version` in a 200 body is the reconciliation baseline; a node whose snapshot
   lags answers from the previous version until the ≤5 s deadline, then fails loud.
 - Failed publishes log at `error` level, `target: "hydra::tenant_api"` with
@@ -995,8 +1002,9 @@ name and label that really exists in this codebase (`/metrics`).
 | A config change was REFUSED (capacity) | `increase(hydra_arachne_publish_total{result="refused"}[10m]) > 0` | The publish was rejected **before a byte was sent** — nothing enters the log, the whole batch fails whole — at either of two gates (2026-10-10 widened the definition): the **encoder** refused the config (a value over the library's 1 MiB cap, an id that cannot be keyed, a failed seal), or the **`multi_put` batch overran a library bound** (>4096 entries, >4 MiB total key+value bytes — `MAX_MULTI_PUT_TOTAL_BYTES`). Either way the admin write answers `503 config_not_published` with the bound named in the reason, and a later successful write re-publishes whatever the config is then. Retrying cannot help — this is a configuration change (shrink the entity, remove the offending id, or trim the config below the batch bound; the batch is **never split automatically**, atomicity is the point). It is the honest capacity alarm ADR-0001 risk R2 asks for; `hydra_arachne_config_bytes` shows the growth that leads to it. No threshold is invented in this rule: the bound is the library's own and is quoted verbatim in the refusal reason |
 | Publish head read-back rejected | `increase(hydra_arachne_publish_readback_total{result=~"stale|conflict"}[10m]) > 0` | The 0.5.1 publisher read `ctl/head` after its final batch and found a STALE index or a same-index conflict. The write was not reported as visible; management writes return `503 config_not_published`. This is the compensating guard for the Arachne P1 session-integrity gap; do not disable it until Arachne delivers the payload-hash/SessionConflict mechanism. Investigate the Arachne client/session and leader-change logs if it fires |
 | Publish superseded by a newer head | `increase(hydra_arachne_publish_readback_total{result="superseded"}[10m]) > 0` | A concurrent publish with a higher log index won. This is last-writer-wins, not a stale-session failure; it is a dashboard/watch signal, not a paging alert |
-| Control-plane watch cache disconnected | `increase(hydra_arachne_watch_total{result="disconnected"}[10m]) > 0` | The materializer's `hydra/` watch channel closed (consumer too slow or subscription ended). Reads fall back to `multi_get`; correctness is preserved, but materialization latency may rise. The next read re-subscribes. Alert only if sustained |
-| Watch cache unavailable at startup | `increase(hydra_arachne_watch_total{result="failed"}[10m]) > 0` | The lazy watch could not be opened (for example snapshot limit/Busy). Reads use `multi_get`; investigate the Arachne watch error if this is sustained |
+| Control-plane watch cache disconnected | `increase(hydra_arachne_watch_total{result="disconnected"}[10m]) > 0` | The materializer's head or content watch channel closed (consumer too slow or subscription ended). Reads fall back to `current_head_with_index` / `multi_get`; correctness is preserved, but materialization latency may rise. The next read re-subscribes. Alert only if sustained |
+| Watch cache unavailable at startup | `increase(hydra_arachne_watch_total{result="failed"}[10m]) > 0` | A watch could not be opened for a reason **other than** the content snapshot cap (transport, permission, client shutdown). Reads use the fallbacks; investigate the Arachne watch error if this is sustained. A config whose `hydra/cfg/` prefix exceeds 10k keys does **not** emit `failed`; see `content_capped` below |
+| Content watch capped (expected at scale) | `increase(hydra_arachne_watch_total{result="content_capped"}[10m]) > 0` | One-time per process: `hydra/cfg/` outgrew Arachne's `MAX_STALE_RANGE_ENTRIES = 10_000`, so the content **prewarm** is off. The head watch still runs, and the materializer uses its local content-addressed `entity_cache`/`shard_cache` + `multi_get`; this is not an error. The content cache stays disabled until restart (retrying would emit a command and a warning every second for a stable fact about config size) |
 | Leadership is flapping | `increase(hydra_arachne_leader_flips_total[15m]) > 5` | The answer to "is this node the writer" changed more than five times in 15 minutes, on some node. A sampled gauge cannot show this (by the time a scrape lands the answer is true again), which is why the flips are counted separately. Flapping means an unstable quorum (a node restarting in a loop, a saturated link, a CPU-starved leader) and it moves the commit point under every writer |
 | Config snapshot stale | `hydra_config_snapshot_stale == 1` | A reload failed (post-write **or** the explicit `POST /api/v1/reload`); the in-memory snapshot is behind the DB. The state is nastier than it looks, and it was measured 2026-09-30 (`integration/test_snapshot_stale.py`) by putting a provider row the LOADER rejects directly into SQLite (the admin write boundary refuses such a row, so a hand-edited database or a restore is how this happens): the node **keeps serving** on the old snapshot, `POST /api/v1/reload` answers **400 `reload_failed`** ("old snapshot retained"), the gauge goes to 1, and — the trap the code documents in capitals — **every later admin write still answers 2xx while having no runtime effect**: a `PUT` that disables a tenant returned 200 and the tenant kept being served until a reload succeeded. Each tenant view carries `snapshot_stale: true` while this holds. **Recovery:** remove/fix the offending row and reload — the gauge returns to 0 and the pending write takes effect (measured: the disabled tenant then answered `403 tenant_disabled`). Until 2026-09-30 the explicit endpoint recorded **nothing**: a failing `/reload` left the gauge at 0 while a later successful `/reload` left an earlier 1 in place, so this alert could neither fire on the failure nor clear on the documented recovery |
 | Admission gate resized on hot-reload | `increase(hydra_admission_resizes_total[10m]) > 0` | A provider's admission limits were changed and a new gate generation was applied (decision D-14, 2026-10-09): the `PUT /api/v1/providers/{id}` row change took effect on the next request. In-flight requests finished under the old cap, so a brief spike around a resize is expected. `GET /api/v1/concurrency` shows both sides for the affected provider (`max_concurrency` vs `configured_max_concurrency`) plus `limits_stale: true` only in the window between a config write and the first request that applies it |
@@ -1090,6 +1098,12 @@ increase(hydra_arachne_publish_readback_total{result="superseded"}[10m])
 # watch lifecycle
 sum by (result) (rate(hydra_arachne_watch_total[5m]))
 ```
+
+> When `hydra_arachne_watch_total{result="content_capped"}` is present, the
+> `hydra/cfg/` prefix exceeds Arachne's 10k snapshot cap and the content **prewarm**
+> is intentionally disabled. The hit-ratio panel then has no data — that is not a
+> regression: the materializer still serves from its local `entity_cache` /
+> `shard_cache` and falls back to `multi_get`. Only the head watch runs.
 
 ## 10. Troubleshooting
 
