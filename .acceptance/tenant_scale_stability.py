@@ -87,6 +87,19 @@ def docker(*a, timeout=120):
     return subprocess.run(["docker", *a], capture_output=True, text=True, timeout=timeout)
 
 
+def docker_network(node="hydra-a"):
+    """Derive this stack's network name instead of assuming the project name.
+
+    The compose file sets `name: hydra-local`, so the network is
+    `hydra-local_default`; an older stack created from the `environment/`
+    directory was `environment_default`. A hardcoded name silently turns the
+    partition drill into a no-op on the other layout.
+    """
+    out = docker("inspect", node, "--format",
+                 "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}", timeout=15)
+    return out.stdout.strip() or "hydra-local_default"
+
+
 def healthy(timeout=150):
     end = time.monotonic()+timeout
     while time.monotonic() < end:
@@ -176,6 +189,25 @@ def wait_converged(timeout=300):
     return False
 
 
+def reload_publish(tries=15):
+    """Re-publish this node's already-committed config (IDEMPOTENT).
+
+    A bulk API-key mint is NOT idempotent: retrying the same body would mint a
+    second set of keys. A `503 config_not_published` means the local transaction
+    DID commit, so the correct recovery is `POST /api/v1/reload?force=1`, which
+    re-publishes even when the in-memory snapshot already equals the DB (the
+    failed write path swapped it before the publish failed; a plain reload would
+    see `changed=false` and skip the publish entirely).
+    """
+    last = (0, "", 0)
+    for _ in range(tries):
+        last = admin("POST", "/reload?force=1")
+        if last[0] in (200, 201):
+            return last
+        time.sleep(1)
+    return last
+
+
 def bulk_mint_keys(token, users, count, label):
     """Mint `count` keys through POST .../api-keys/bulk, chunked under the caps."""
     global capacity_cliff
@@ -188,6 +220,18 @@ def bulk_mint_keys(token, users, count, label):
         st, out, ms = with_progress(
             f"{label} keys {start+n}/{count}",
             lambda entries=entries: tenant("POST", "/api-keys/bulk", token, {"keys": entries}))
+        if st == 503 and "config_not_published" in out:
+            # The local transaction committed; do NOT mint again. Publish the
+            # config this node already holds and count the chunk as made.
+            rst, rout, rms = reload_publish()
+            if rst not in (200, 201):
+                check(f"{label} key bulk publish recovery", False,
+                      f"at {start}: reload HTTP {rst} {rout[:160]}")
+                break
+            lat["key"].append(ms); made += n
+            print(f"   {label} keys {made}/{count} — local commit, published via reload "
+                  f"(HTTP {rst} in {rms:.0f}ms, chunk {n})", flush=True)
+            continue
         if st not in (200, 201):
             capacity_cliff = ("key", start, st, out[:300])
             print(f"   key bulk cliff at {start}: HTTP {st} {out[:300]}", flush=True)
@@ -218,9 +262,42 @@ def leader():
     return None
 
 
+def ensure_mock_provider():
+    """Make the drill self-contained after `down -v` + `up -d`.
+
+    The scale tenant needs one serving provider/model pair; a fresh data volume
+    has none, and the data-plane checks would then fail with `no_available_provider`
+    (the router filters providers without an api-key) even though every write
+    succeeded. Seeding it here keeps a reset run from needing a separate step.
+    """
+    st, out, _ = admin("GET", "/providers")
+    have = {p["id"] for p in json.loads(out)} if st == 200 else set()
+    if "mock" not in have:
+        st, out, _ = admin("POST", "/providers", {
+            "id": "mock", "key": "mock", "name": "Mock LLM",
+            "endpoint": "http://mock-llm:9090", "weight": 1,
+            "created_at": "", "updated_at": ""})
+        check("seed provider mock", st in (200, 201), f"HTTP {st} {out[:100]}")
+    st, out, _ = admin("GET", "/provider-models")
+    have = {m["id"] for m in json.loads(out)} if st == 200 else set()
+    if "mock-echo" not in have:
+        st, out, _ = admin("POST", "/provider-models", {
+            "id": "mock-echo", "key": "echo", "name": "echo",
+            "provider_id": "mock", "status": 1,
+            "created_at": "", "updated_at": ""})
+        check("seed model mock-echo", st in (200, 201), f"HTTP {st} {out[:100]}")
+    st, out, _ = admin("GET", "/provider-keys?provider_id=mock")
+    if st == 200 and not json.loads(out):
+        st, out, _ = admin("POST", "/provider-keys", {
+            "id": "mock-key0", "provider_id": "mock", "api_key": "mock",
+            "created_at": ""})
+        check("seed provider key", st in (200, 201), f"HTTP {st} {out[:100]}")
+
+
 def main():
     global capacity_cliff
     print(f"== setup {TENANT}")
+    ensure_mock_provider()
     st, out, _ = admin("POST", "/tenants", {"id":TENANT,"name":TENANT,"domain":DOMAIN,"enabled":True,
                                              "cert_key":None,"cert_file":None,"created_at":"","updated_at":""})
     check("tenant", st in (200,201), f"HTTP {st}")
@@ -244,16 +321,23 @@ def main():
     check("groups", True, f"{GROUPS}")
 
     if USE_BULK:
-        print(f"\n== users {USERS} (BULK, one request)")
-        entries=[{"id":f"user-{STAMP}-{i}","user_group_id":groups[i%len(groups)],
-                  "name":f"u{i}"} for i in range(USERS)]
-        st,out,ms=with_progress(f"bulk users {USERS}",
-                                lambda: tenant("PUT","/users/bulk",token,{"users":entries}))
-        if st not in (200,201):
-            check("users",False,f"HTTP {st} {out[:160]}"); return 1
-        users=[u["id"] for u in json.loads(out)["users"]]
-        lat["user"].append(ms)
-        print(f"   users bulk: {len(users)} in {ms:.0f}ms (HTTP {st})", flush=True)
+        print(f"\n== users {USERS} (BULK, chunked)")
+        # `MAX_BULK_ENTRIES` is 5000 per request; 4000 also keeps the 1 MiB
+        # body cap comfortable. The previous ladder stopped at 4000 users, so
+        # the one-request path never needed chunking; larger rungs do.
+        users=[]; chunk=4000
+        for start in range(0, USERS, chunk):
+            n=min(chunk, USERS-start)
+            entries=[{"id":f"user-{STAMP}-{start+i}","user_group_id":groups[(start+i)%len(groups)],
+                      "name":f"u{start+i}"} for i in range(n)]
+            st,out,ms=with_progress(
+                f"bulk users {start+n}/{USERS}",
+                lambda entries=entries: tenant("PUT","/users/bulk",token,{"users":entries}))
+            if st not in (200,201):
+                check("users",False,f"HTTP {st} {out[:160]}"); return 1
+            got=[u["id"] for u in json.loads(out)["users"]]
+            users.extend(got); lat["user"].append(ms)
+            print(f"   users {len(users)}/{USERS} — HTTP {st} in {ms:.0f}ms (chunk {n})", flush=True)
     else:
         print(f"\n== users {USERS} (concurrency {CONC})")
         def mk_user(i):
@@ -375,10 +459,13 @@ def main():
     docker("start","hydra-local-clickhouse",timeout=60); time.sleep(3)
 
     print("   -- network partition node-b")
-    docker("network","disconnect","environment_default","hydra-b")
+    net = docker_network()
+    r = docker("network","disconnect",net,"hydra-b")
+    check("node-b actually detached", r.returncode == 0, (net + " " + r.stderr.strip())[:120])
     time.sleep(3)
     check("remaining nodes serve data plane", all(proxy(n, probe_key)[0] == 200 for n in "ac"))
-    docker("network","connect","environment_default","hydra-b","--ip","172.28.0.12")
+    r = docker("network","connect",net,"hydra-b","--ip","172.28.0.12")
+    check("node-b reattached", r.returncode == 0, r.stderr.strip()[:120])
     check("node-b reconnects", healthy(180))
 
     print("   -- quorum loss")
