@@ -1072,6 +1072,10 @@ increase(hydra_config_notify_total{result="error"}[10m])
 # is this node serving the latest revision?
 hydra_config_version
 hydra_config_snapshot_stale
+
+# full-reload cost: the duration histogram is hydra_config_reload_duration_seconds
+# (use its _sum/_count in PromQL); this gauge is the last swapped snapshot size.
+hydra_config_rows_loaded
 ```
 
 ## 10. Troubleshooting

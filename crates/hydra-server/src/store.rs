@@ -518,6 +518,44 @@ pub struct ReloadGuard<'a>(
 /// [`ConfigStore::on_snapshot_change`]).
 pub type SnapshotHook = Arc<dyn Fn(&ConfigData) + Send + Sync>;
 
+/// Entity count of one served snapshot, for the full-reload cost gauge.
+///
+/// The count is deliberately taken from `ConfigData`, not from the raw rows:
+/// it measures what the reload had to rebuild and swap. Nested collections
+/// contribute their VALUES (one entry per provider model / key / grant), and
+/// `tenants_by_domain` is counted once rather than also adding its derived
+/// `tenants_by_id` twin. Only ONLINE provider models are in `models_by_key`;
+/// that is the runtime snapshot the 150k-row trade-off is about.
+#[cfg(feature = "proxy")]
+fn config_row_count(cfg: &ConfigData) -> u64 {
+    let provider_models = cfg.models_by_key.values().map(Vec::len).sum::<usize>();
+    let provider_keys = cfg.provider_keys.values().map(Vec::len).sum::<usize>();
+    let tenant_providers = cfg
+        .tenant_providers
+        .values()
+        .map(std::collections::HashSet::len)
+        .sum::<usize>();
+    let tenant_models = cfg
+        .tenant_models
+        .values()
+        .map(std::collections::HashSet::len)
+        .sum::<usize>();
+    let total = cfg.providers.len()
+        + provider_models
+        + provider_keys
+        + cfg.tenants_by_domain.len()
+        + cfg.certs.len()
+        + tenant_providers
+        + tenant_models
+        + cfg.limit_roles.len()
+        + cfg.user_groups.len()
+        + cfg.users.len()
+        + cfg.users_by_api_key_hash.len()
+        + cfg.tenant_tokens.len()
+        + cfg.global_roles.len();
+    u64::try_from(total).unwrap_or(u64::MAX)
+}
+
 impl ConfigStore {
     /// Build the initial snapshot from the DB and wrap it in `ArcSwap`.
     pub async fn load(pool: Pool, key_provider: Arc<dyn KeyProvider>) -> Result<Self, StoreError> {
@@ -756,6 +794,11 @@ impl ConfigStore {
         force: bool,
         source: ReloadSource,
     ) -> Result<bool, StoreError> {
+        // Starts AFTER the reload guard is held: lock contention is reported as
+        // `storage_busy`, not charged to the reload body. Stops as soon as
+        // `reload_impl` returns, so no-op and failed reloads are included.
+        let started = std::time::Instant::now();
+
         #[cfg(test)]
         {
             let active = self.reload_probe.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -772,6 +815,9 @@ impl ConfigStore {
 
         #[cfg(test)]
         self.reload_probe.active.fetch_sub(1, Ordering::SeqCst);
+
+        #[cfg(feature = "proxy")]
+        crate::admin::metrics::record_config_reload_duration(started.elapsed().as_secs_f64());
 
         match &result {
             // Only a successful rebuild + swap proves the runtime caught up.
@@ -820,6 +866,8 @@ impl ConfigStore {
         }
 
         let new_cfg = config_from_rows(&rows)?;
+        #[cfg(feature = "proxy")]
+        let rows_loaded = config_row_count(&new_cfg);
         let new_version = db_version.max(local + 1);
 
         self.inner.store(Arc::new(new_cfg));
@@ -829,6 +877,10 @@ impl ConfigStore {
         }
         self.version.store(new_version, Ordering::Release);
         self.swrr.clear();
+        // Only a real swap reached this point; no-op and failure leave the
+        // previous gauge value untouched.
+        #[cfg(feature = "proxy")]
+        crate::admin::metrics::record_config_rows(rows_loaded);
         // Followers of the snapshot (the TLS cert store) re-resolve here, so a
         // cert written through the admin API is live on the very next
         // handshake.

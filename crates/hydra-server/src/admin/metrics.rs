@@ -43,6 +43,8 @@
 //! | `hydra_admission_resizes_total` | counter | provider | admission module (hot-reload generations swapped, decision item D-14 — implemented 2026-10-09) |
 //! | `hydra_config_snapshot_stale` | gauge | — | `ConfigStore` reload outcome (1 = last reload failed, snapshot stale; mirrored to `/metrics` from `store.snapshot_stale()`) |
 //! | `hydra_config_reload_total` | counter | source, changed | `ConfigStore` reload (source=local\|pubsub\|poll, changed=true\|false) |
+//! | `hydra_config_reload_duration_seconds` | histogram | — | `ConfigStore` reload wall-clock duration (no-op and failed reloads included; lock wait excluded) |
+//! | `hydra_config_rows_loaded` | gauge | — | entities in the last successfully swapped `ConfigData` snapshot (unchanged on no-op/failure) |
 //! | `hydra_config_notify_total` | counter | result | `ConfigStore` local-change fanout (result=ok\|error) |
 //! | `hydra_config_version` | gauge | — | `ConfigStore` (local last-applied revision) |
 //! | `hydra_config_watch_last_ok_unixtime` | gauge | — | `cluster::config_bus` watcher (unix seconds of the last completed poll tick / handled pub/sub message; alert when `time() - gauge > 3× poll interval`) |
@@ -78,6 +80,12 @@ use serde::Serialize;
 /// Histogram buckets for latency: 5 ms → 120 s (LLM requests are slow).
 const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
+/// Full-config reload cost buckets: 1 ms → 10 s. The upper half is the
+/// 150k-row full-reload trade-off; the lower half is the ordinary no-op/gate.
+const CONFIG_RELOAD_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
 /// All `hydra_*` metric handles (minus the tls-owned SNI counter). Registered
@@ -154,6 +162,13 @@ struct Metrics {
     /// and whether the served snapshot actually changed. A steady stream of
     /// `changed="false"` polls is the cheap-probe steady state, not an error.
     config_reload: IntCounterVec,
+    /// Wall-clock time of every reload attempt (no-op and failed included).
+    /// The timer starts inside `reload_with_source`, after the reload guard is
+    /// acquired: lock contention is measured by `storage_busy`, not here.
+    config_reload_duration: Histogram,
+    /// Entities in the last successfully swapped snapshot. Leaves the previous
+    /// value on a no-op or failed reload because no new snapshot was applied.
+    config_rows_loaded: IntGauge,
     /// Cross-node notification outcomes (`result=ok|error`). An error here is
     /// logged but never fails the write/reload; the poller is the backstop.
     config_notify: IntCounterVec,
@@ -455,6 +470,17 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_config_reload_total",
                 "Config reload attempts by trigger source and whether the served snapshot changed",
                 &["source", "changed"]
+            )
+            .ok()?,
+            config_reload_duration: register_histogram!(
+                "hydra_config_reload_duration_seconds",
+                "Wall-clock duration of a config reload attempt (no-op and failed included; lock wait excluded)",
+                CONFIG_RELOAD_BUCKETS.to_vec()
+            )
+            .ok()?,
+            config_rows_loaded: register_int_gauge!(
+                "hydra_config_rows_loaded",
+                "Entities in the last successfully swapped ConfigData snapshot"
             )
             .ok()?,
             config_notify: register_int_counter_vec!(
@@ -841,6 +867,37 @@ pub fn record_config_reload(source: &str, changed: bool) {
     if let Some(m) = metrics() {
         let changed = if changed { "true" } else { "false" };
         m.config_reload.with_label_values(&[source, changed]).inc();
+    }
+}
+
+/// Record the wall-clock duration of one reload attempt.
+///
+/// The caller starts the timer inside `reload_with_source`, i.e. after the
+/// reload guard is held. Lock contention is therefore NOT included: it is
+/// reported separately as `storage_busy`, and counting it here would make the
+/// full-reload cost indistinguishable from queueing.
+pub fn record_config_reload_duration(seconds: f64) {
+    if let Some(m) = metrics() {
+        m.config_reload_duration.observe(seconds);
+    }
+}
+
+/// Set `hydra_config_rows_loaded` to the entity count in the snapshot that was
+/// just swapped in. Only successful swaps call this; a no-op or failure leaves
+/// the previous value intact because the served snapshot did not change.
+pub fn record_config_rows(rows: u64) {
+    if let Some(m) = metrics() {
+        m.config_rows_loaded
+            .set(i64::try_from(rows).unwrap_or(i64::MAX));
+    }
+}
+
+/// Current value of `hydra_config_rows_loaded` (tests).
+#[must_use]
+pub fn config_rows_loaded() -> f64 {
+    match metrics() {
+        Some(m) => m.config_rows_loaded.get() as f64,
+        None => 0.0,
     }
 }
 
@@ -1465,6 +1522,10 @@ mod tests {
         record_config_reload("local", true);
         record_config_reload("pubsub", false);
         record_config_reload("poll", false);
+        record_config_reload_duration(0.0);
+        record_config_reload_duration(0.125);
+        record_config_rows(0);
+        record_config_rows(42);
         record_config_notify(true);
         record_config_notify(false);
         record_config_version(42);
@@ -1489,6 +1550,24 @@ mod tests {
         assert!(
             render().contains("hydra_config_watch_last_ok_unixtime"),
             "the watcher-liveness gauge must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn config_reload_cost_metrics_are_registered() {
+        record_config_reload_duration(0.042);
+        assert!(
+            render().contains("hydra_config_reload_duration_seconds_bucket"),
+            "the reload-duration histogram must appear on /metrics"
+        );
+        record_config_rows(123);
+        assert!(
+            config_rows_loaded() >= 0.0,
+            "the rows-loaded helper must read the registered gauge"
+        );
+        assert!(
+            render().contains("hydra_config_rows_loaded"),
+            "the rows-loaded gauge must appear on /metrics"
         );
     }
 

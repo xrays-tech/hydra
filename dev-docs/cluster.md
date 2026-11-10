@@ -183,6 +183,8 @@ Deployment/StatefulSet 指向**托管数据库**即可（StatefulSet 仍可用�
 | 指标 | 含义 |
 |---|---|
 | `hydra_config_reload_total{source="local\|pubsub\|poll", changed="true\|false"}` | reload 次数；`changed` 区分真实换快照与 no-op |
+| `hydra_config_reload_duration_seconds` | 每次 reload 的墙钟耗时（含 no-op/失败；不含等待 reload 锁的时间）；用于衡量 15 万行全量 reload 的代价 |
+| `hydra_config_rows_loaded` | 最近一次成功换入快照的实体数；no-op/失败不改变该值 |
 | `hydra_config_notify_total{result="ok\|error"}` | 本地变更扇出成功/失败。失败只告警，不失败写；轮询会兜底 |
 | `hydra_config_version` | 本节点最后应用的 revision |
 | `hydra_config_snapshot_stale` | 1 = 上次 reload 失败，内存快照落后于数据库 |

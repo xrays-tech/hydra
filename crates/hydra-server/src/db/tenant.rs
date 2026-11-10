@@ -205,23 +205,25 @@ pub async fn delete_tenant(pool: &Pool, id: &str) -> Result<(), sqlx::Error> {
     let mut tx = begin_write(pool).await?;
     #[cfg(feature = "db-mysql")]
     let affected = {
-        // MySQL 8.0 answers a server-side prepared `DELETE FROM tenant` with
+        // MySQL 8.0 can answer a server-side prepared `DELETE FROM tenant` with
         // `ER_NEED_REPREPARE` (1615) once the cascading child foreign keys are
-        // in the way — even a freshly prepared statement fails. Execute it
-        // through the text protocol (no bound arguments ⇒ sqlx sends
-        // `COM_QUERY`) and inline the id as a hex literal, which needs no
-        // quoting/escaping under any `sql_mode`. The columns are unquoted, so
-        // the statement needs no session-mode override.
-        //
-        // `X'...'` is a BINARY literal, so `id = X'...'` compares bytes rather
-        // than applying the column's utf8mb4 collation. That is correct because
-        // ids are application-generated ASCII and are written through the same
-        // utf8mb4 connections, so the stored bytes equal the runtime UTF-8
-        // bytes. Do NOT reuse this pattern for a column whose encoding or
-        // collation may differ from the runtime string.
-        let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let sql = format!("DELETE FROM tenant WHERE id = X'{hex}'");
-        sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(&sql)).await?
+        // in the way. Try the normal BOUND statement first; `.persistent(false)`
+        // closes the server-side statement after execution, so the next delete
+        // cannot reuse stale metadata. A 1615 is raised before execution, so a
+        // fallback retry has no double-delete hazard.
+        let result = sqlx::query(&dialect::sql("DELETE FROM tenant WHERE id = ?"))
+            .bind(id)
+            .persistent(false)
+            .execute(&mut *tx)
+            .await;
+        match result {
+            Ok(affected) => affected,
+            // ONLY 1615 takes the text-protocol fallback. Its id literal is
+            // built from the runtime bytes (injection-safe); CONVERT plus the
+            // schema collation keep the comparison textual, not raw binary.
+            Err(e) if is_mysql_need_reprepare(&e) => delete_tenant_fallback(&mut tx, id).await?,
+            Err(e) => return Err(e),
+        }
     };
     #[cfg(feature = "db-postgres")]
     let affected = sqlx::query(&dialect::sql("DELETE FROM tenant WHERE id = ?"))
@@ -229,6 +231,55 @@ pub async fn delete_tenant(pool: &Pool, id: &str) -> Result<(), sqlx::Error> {
         .execute(&mut *tx)
         .await?;
     commit_write(tx, affected.rows_affected() > 0).await
+}
+
+/// MySQL `ER_NEED_REPREPARE` (error number 1615).
+///
+/// SQLx exposes MySQL's SQLSTATE through `DatabaseError::code()`, but 1615's
+/// SQLSTATE is the generic `HY000`, so the numeric error is the precise
+/// discriminator. Consult the SQLSTATE only when the driver cannot surface a
+/// number.
+#[cfg(any(feature = "db-mysql", test))]
+fn mysql_need_reprepare(code: Option<&str>, number: Option<u16>) -> bool {
+    match number {
+        Some(n) => n == 1615,
+        None => code == Some("HY000"),
+    }
+}
+
+/// True only for MySQL 1615 (`ER_NEED_REPREPARE`).
+#[cfg(feature = "db-mysql")]
+fn is_mysql_need_reprepare(err: &sqlx::Error) -> bool {
+    let Some(db) = err.as_database_error() else {
+        return false;
+    };
+    let code = db.code();
+    let number = db
+        .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        .map(sqlx::mysql::MySqlDatabaseError::number);
+    mysql_need_reprepare(code.as_deref(), number)
+}
+
+/// Text-protocol retry used only when a bound `DELETE FROM tenant` hits 1615.
+///
+/// The id is rendered as a hex literal from its bytes, so it needs no quoting
+/// and cannot break out of the SQL. `CONVERT(... USING utf8mb4)` turns the
+/// BINARY literal into utf8mb4 text; `COLLATE utf8mb4_unicode_ci` names the
+/// collation the MySQL migrations declare for these columns. Without the
+/// explicit collation, `CONVERT`'s result is IMPLICIT with the server default
+/// (often `utf8mb4_0900_ai_ci`) and MySQL raises 1267 against the
+/// `utf8mb4_unicode_ci` column.
+#[cfg(feature = "db-mysql")]
+async fn delete_tenant_fallback(
+    tx: &mut super::Tx<'static>,
+    id: &str,
+) -> Result<sqlx::mysql::MySqlQueryResult, sqlx::Error> {
+    let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let sql = format!(
+        "DELETE FROM tenant WHERE id = CONVERT(X'{hex}' USING utf8mb4) \
+         COLLATE utf8mb4_unicode_ci"
+    );
+    sqlx::Executor::execute(&mut **tx, sqlx::raw_sql(&sql)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -445,4 +496,24 @@ pub async fn delete_tenant_model(pool: &Pool, id: &str) -> Result<(), sqlx::Erro
         .execute(&mut *tx)
         .await?;
     commit_write(tx, affected.rows_affected() > 0).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mysql_need_reprepare;
+
+    #[test]
+    fn need_reprepare_matches_mysql_error_number() {
+        assert!(mysql_need_reprepare(Some("HY000"), Some(1615)));
+        assert!(mysql_need_reprepare(None, Some(1615)));
+        assert!(!mysql_need_reprepare(Some("HY000"), Some(1062)));
+        assert!(!mysql_need_reprepare(Some("HY000"), Some(1451)));
+    }
+
+    #[test]
+    fn need_reprepare_code_fallback_is_limited_to_hy000() {
+        assert!(mysql_need_reprepare(Some("HY000"), None));
+        assert!(!mysql_need_reprepare(Some("42S02"), None));
+        assert!(!mysql_need_reprepare(None, None));
+    }
 }
