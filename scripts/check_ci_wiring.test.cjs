@@ -1700,6 +1700,30 @@ const BLOCK_WITH_DASH = (realCommand) => [
     "status=" + r47c.status + " out=" + r47c.out.trim().slice(0, 220),
   );
 
+  /* 50: the shared-DB random fanout drill has a real runner. It is a plain new integration
+   * artifact, so this also pins the shape that matters for the Phase-4 drill: an unwired
+   * `integration/test_shared_db_random_fanout.py` must fail, and naming it in a CI step must
+   * pass. (The drill itself is a real three-node test; the skeleton only tests the guard.) */
+  const fanoutFile = { "integration/test_shared_db_random_fanout.py": "#!/usr/bin/env python3\n" };
+  const fanoutPlaywright = "module.exports = { testDir: './tests/e2e' };\n";
+  const r50a = run(skeleton({ ci: baseCi(), extraFiles: fanoutFile,
+                             playwright: fanoutPlaywright }));
+  assert(
+    "50a: an unwired shared-DB random-fanout drill is reported",
+    r50a.status === 1 && /test_shared_db_random_fanout\.py is never executed/.test(r50a.out),
+    "status=" + r50a.status + " out=" + r50a.out.trim().slice(0, 240),
+  );
+  const r50b = run(skeleton({
+    ci: baseCi("      - run: python3 integration/test_shared_db_random_fanout.py"),
+    extraFiles: fanoutFile,
+    playwright: fanoutPlaywright,
+  }));
+  assert(
+    "50b: naming it in a CI step wires it",
+    r50b.status === 0 && !/test_shared_db_random_fanout\.py is never executed/.test(r50b.out),
+    "status=" + r50b.status + " out=" + r50b.out.trim().slice(0, 240),
+  );
+
   // 49: the floor, with its own explicit value.
   const r49 = run(skel({ "orphan.sh": "#!/bin/sh\n" }), { CI_WIRING_MIN_SHELL_SCRIPTS: "9" });
   assert(

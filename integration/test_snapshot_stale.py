@@ -11,7 +11,7 @@ the database — a hand-edited database, a restore, or a config written by an ol
 
 Cases:
   S0  a healthy node: the gauge is 0 and `/reload` answers 200
-  S1  a bad provider row is written DIRECTLY into SQLite (bypassing the write boundary, exactly what
+  S1  a bad provider row is written DIRECTLY into the database (bypassing the write boundary, exactly what
       a restore can produce), then `POST /api/v1/reload`:
       - the gauge flips to **1** and the ERROR is logged with the documented wording
       - the node KEEPS SERVING on the old snapshot (traffic is not what breaks)

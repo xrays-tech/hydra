@@ -33,7 +33,7 @@ fn ephemeral_port() -> u16 {
     common::ephemeral_port()
 }
 
-/// Build a fresh admin state on a fresh `:memory:` DB.
+/// Build a fresh admin state on a fresh isolated real database.
 async fn admin_state() -> Arc<AdminState> {
     admin_state_with_fail_limit(10).await
 }

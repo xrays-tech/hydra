@@ -11,7 +11,16 @@ Run:
 
 Exit 0 = all requested scale reached; 3 = expected capacity cliff found and
 failure mode safe; 1 = unexpected failure; 2 = cannot verify.
+
+RETIRED 2026-11-10: this measured the Arachne/raft control plane (TOC/multi_put
+capacity), which was removed by commit d5c73f2. Do not run it against the
+shared-DB architecture. Use integration/test_shared_db_cluster.py and
+integration/test_shared_db_random_fanout.py instead.
 """
+raise SystemExit(
+    "RETIRED: the Arachne/raft control plane was removed (d5c73f2); "
+    "use integration/test_shared_db_cluster.py + test_shared_db_random_fanout.py"
+)
 import json, os, subprocess, sys, threading, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -189,7 +198,7 @@ def wait_converged(timeout=300):
     return False
 
 
-def reload_publish(tries=15):
+def reload_publish(tries=60):
     """Re-publish this node's already-committed config (IDEMPOTENT).
 
     A bulk API-key mint is NOT idempotent: retrying the same body would mint a
@@ -198,13 +207,16 @@ def reload_publish(tries=15):
     re-publishes even when the in-memory snapshot already equals the DB (the
     failed write path swapped it before the publish failed; a plain reload would
     see `changed=false` and skip the publish entirely).
+
+    A 400 `reload_failed` means the reload's own publish still failed; that is
+    transient while the cluster is electing/snapshotting, so keep retrying.
     """
     last = (0, "", 0)
     for _ in range(tries):
         last = admin("POST", "/reload?force=1")
         if last[0] in (200, 201):
             return last
-        time.sleep(1)
+        time.sleep(2)
     return last
 
 
@@ -369,14 +381,17 @@ def main():
             chunk=[{"id":f"role-{STAMP}-{start+i}","name":f"r{start+i}","tenant_id":TENANT,
                     "user_group_id":"*","user_id":"*","api_key_id":"*","model_key":"*",
                     "providers":["mock"],"enabled":True} for i in range(n)]
-            st,out,ms=with_progress(f"bulk roles {start+n}/{ROLES}",
-                                    lambda chunk=chunk: admin("PUT","/global-roles/bulk",{"roles":chunk}))
+            st,out,ms,tries=with_progress(
+                f"bulk roles {start+n}/{ROLES}",
+                lambda chunk=chunk: retry_write(
+                    lambda: admin("PUT","/global-roles/bulk",{"roles":chunk}),
+                    max_tries=20))
             if st not in (200,201):
                 capacity_cliff=("role",start,st,out[:200])
                 print(f"   role bulk cliff at {start}: HTTP {st} {out[:200]}", flush=True); break
             got=len(json.loads(out).get("roles", []))
             lat["role"].append(ms); roles+=got
-            print(f"   roles {roles}/{ROLES} — HTTP {st} in {ms:.0f}ms (chunk {n})", flush=True)
+            print(f"   roles {roles}/{ROLES} — HTTP {st} in {ms:.0f}ms (chunk {n}, tries {tries})", flush=True)
     else:
         print(f"\n== roles {ROLES} (admin, sequential)")
         roles=0

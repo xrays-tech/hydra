@@ -35,7 +35,7 @@ Plus edge cases and non-CRUD endpoints:
 - FK / CHECK constraint violations → 400 (3 cases)
 - 401 without token / with wrong token
 - 404 unknown path with `error.code == "not_found"`
-- `GET /health`, `POST /reload`, `DELETE /auth/cache` (×2), `GET /breaker`
+- `GET /health`, `POST /reload`, `GET /breaker`
 
 ## Prerequisites
 
@@ -119,6 +119,42 @@ stop the Redis server or touch the `hydra-local` compose stack.
 The load drill `integration/test_data_plane_failover_load.py` uses the same
 topology: 20 rps at a survivor across a SIGKILL of another node, asserting zero
 non-200 responses.
+
+### Concurrent random-write fanout drill
+
+`integration/test_shared_db_random_fanout.py` is the stress complement: three
+nodes write different entity kinds **concurrently**, and every node must end up
+with the same config. It creates providers, tenants (with provider/model/grants),
+standalone tenant grants, limit roles, global roles, and tenant-API identity rows
+(user-group/user/api-key) through each node's own admin/tenant API.
+
+Every node is started with `HYDRA_CONFIG_POLL_MS=60000`, so convergence inside the
+drill's short window can only come from Redis pub/sub — the poll fallback cannot
+explain it. The drill prints the seed and every operation.
+
+```sh
+export HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra
+export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380
+# optional: HYDRA_FANOUT_SEED=<int> (default 20261110)
+# optional: HYDRA_FANOUT_ROUNDS=<n> (default 10)
+python3 integration/test_shared_db_random_fanout.py
+```
+
+What it proves:
+
+- every concurrent CREATE/UPDATE/DELETE answers 2xx (no 5xx / `config_not_published`);
+- all three nodes converge to one `config_version` after every phase;
+- every created row is visible on every node, each linked tenant's
+  snapshot-backed `/api/v1/tenants/{id}/models` contains its model, and a
+  representative data-plane request works on all nodes;
+- each node's `hydra_config_reload_total{source="pubsub"}` increases while the
+  `poll` counter does not;
+- updates (including disabling a user: 403 `user_disabled` everywhere) and
+  deletions (tenant catalog 404, revoked keys 401, grants gone from the catalog)
+  fan out as completely as creates.
+
+The shared process/request/seed helpers live in `integration/_cluster_harness.py`
+and are used by both this drill and `test_shared_db_cluster.py`.
 
 ## Configuration (env vars)
 

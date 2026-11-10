@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# RETIRED 2026-11-10: this measured Arachne/raft index ordering under CPU load.
+# That control plane was removed by commit d5c73f2. Use
+# integration/test_shared_db_random_fanout.py for the shared-DB fanout ordering
+# check (run it under CPU load if you need the same discrimination).
+echo "RETIRED: the Arachne/raft control plane was removed (d5c73f2); use integration/test_shared_db_random_fanout.py" >&2
+exit 2
 # Discriminating evidence for the index-ordering fix, at the strength the idle run cannot give.
 #
 # The idle acceptance drill passed 5/5 BOTH before and after the fix, so it is a regression check. The

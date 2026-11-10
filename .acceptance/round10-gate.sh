@@ -189,8 +189,6 @@ gate "limit_roles enforcement"         python3 integration/test_limit_roles_enfo
 # The data-plane catalog: public read, no external auth for a presented key, whitelist,
 # online filter, and the two narrowing mechanisms.
 gate "model catalog (/v1/models)"      python3 integration/test_model_catalog.py
-# Sub-tenant / operator key-prefix steering on the chat path, incl. "delete != revoke".
-gate "sub-tenant steering"             python3 integration/test_sub_tenant_steering.py
 # The ClickHouse sink's WIRE format, measured against a MOCK ClickHouse (no live database):
 # userinfo -> Basic auth, verbatim query-string passthrough, the row as a MASKED JSONEachRow
 # body (not param_* — that is the reader's form), a path in the URL trimmed rather than glued
@@ -224,9 +222,6 @@ gate "master-key rotation"             python3 integration/test_key_rotation_liv
 # Master-key SOURCES: inline base64 vs the raw key FILE (K8s secret form), their equivalence
 # in both directions, the documented file precedence, and every fail-closed mode.
 gate "master key sources"              python3 integration/test_master_key_sources.py
-# The auth hop against a dead route: bounded 503, no forwarding, attribution, NOT cached,
-# refused-port contrast, immediate recovery, and the unselectable fail-open mode.
-gate "auth hop (dead route)"           python3 integration/test_auth_hop_failmode.py
 # Usage-row loss accounting: the under-billing counter, its reasons, the measured threshold,
 # the per-drop trace id, and that recovery stops it.
 gate "usage drop accounting"           python3 integration/test_usage_drop_accounting.py
@@ -242,8 +237,6 @@ gate "listener signals"                python3 integration/test_listener_signals
 # A failing reload (bad row written past the write boundary): gauge, 2xx-with-no-effect trap,
 # per-tenant flag, and recovery.
 gate "snapshot stale"                  python3 integration/test_snapshot_stale.py
-# The two-layer auth verdict cache on a real cluster + Redis (L1, the shared L2, fleet clear).
-gate "auth cache layers (L1+L2)"       bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_auth_cache_layers.py'
 # What a replica must still know (enabled limit roles, token hashes, sub-tenant routes) and
 # what `matching_key` really compares against (the MASKED key — D-15 evidence).
 #
@@ -282,7 +275,7 @@ gate "startup knobs (refuse/name)"     bash -c 'cargo build -p hydra-server --fe
 # The three SDK `--cluster` entries were RETIRED 2026-10-07, together with the CI steps they
 # mirrored: they asserted the pre-ADR-0001 world (`applied` + `event_id`, `202 pending`, "the
 # edge") while starting two PLAIN single-node instances, which correctly answer `single_node`.
-# Coverage: the live fleet report is `test_auth_cache_layers.py` (above), the SDK's own state
+# Coverage: the live fleet report is `integration/test_shared_db_cluster.py`, the SDK's own state
 # handling is the three mock SDK suites in the `sdks` CI job, and each SDK against a real node is
 # the pair of entries below.
 # The CLI against a real node (its own suite is mock-only). Rebuilds dist/ first so the

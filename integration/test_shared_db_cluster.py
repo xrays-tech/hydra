@@ -46,16 +46,19 @@ Exit 0 pass · 1 an assertion failed · 2 could not verify (missing env/binary/s
 import json
 import os
 import shutil
-import signal
-import socket
-import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 
+from _cluster_harness import (
+    Node,
+    Upstream,
+    free_port,
+    rename_tenant,
+    seed_base,
+    wait_for,
+)
 from _redis_harness import (
     RedisRelay,
     RedisSetupError,
@@ -65,7 +68,6 @@ from _redis_harness import (
     require_url as require_redis_url,
 )
 from _shared_db import SetupError, isolated
-from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
@@ -100,312 +102,12 @@ def announce(label, detail=""):
     print(f"   ....  {label}{'  — ' + detail if detail else ''}")
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def call(method, url, token=None, body=None, timeout=20, host=None):
-    data = None if body is None else json.dumps(body).encode()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if host:
-        headers["Host"] = host
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, dict(r.headers), r.read().decode(errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read().decode(errors="replace")
-    except Exception as e:  # refused / reset / timeout
-        return 0, {}, str(e)
-
-
-class Upstream(BaseHTTPRequestHandler):
-    """The provider endpoint: a chat completion the data plane could proxy if needed."""
-
-    def do_GET(self):
-        body = b'{"object":"list","data":[]}'
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if length:
-            self.rfile.read(length)
-        body = json.dumps(
-            {
-                "id": "chatcmpl-shared-db",
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
-            }
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):  # noqa: A002 - matches BaseHTTPRequestHandler
-        pass
-
-
-class Node:
-    def __init__(self, name, db_url_value, redis_url_value, log_path):
-        self.name = name
-        self.admin_port = free_port()
-        self.data_port = free_port()
-        self.db_url = db_url_value
-        self.redis_url = redis_url_value
-        self.log_path = log_path
-        self.proc = None
-
-    def env(self):
-        # Drop every inherited HYDRA_*: a developer shell with a stale value would otherwise
-        # silently rewrite the drill (the startup-knobs drill learned the same lesson).
-        env = {k: v for k, v in os.environ.items() if not k.startswith("HYDRA_")}
-        env.update(usage_env())
-        env.update(
-            {
-                "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
-                "HYDRA_ENCRYPTION_KEY": ENCRYPTION_KEY,
-                "HYDRA_NODE_ID": self.name,
-                "HYDRA_ADMIN_ADDR": f"127.0.0.1:{self.admin_port}",
-                "HYDRA_LISTEN": f"127.0.0.1:{self.data_port}",
-                "HYDRA_DB_URL": self.db_url,
-                "HYDRA_REDIS_URL": self.redis_url,
-                "HYDRA_REDIS_MODE": "single",
-                "HYDRA_CONFIG_POLL_MS": str(POLL_MS),
-                "RUST_LOG": "warn",
-            }
-        )
-        return env
-
-    def start(self):
-        with open(self.log_path, "w") as log:
-            self.proc = subprocess.Popen(
-                [BIN], env=self.env(), stdout=log, stderr=subprocess.STDOUT
-            )
-        return self
-
-    def alive(self):
-        return self.proc is not None and self.proc.poll() is None
-
-    def kill(self):
-        proc = self.proc
-        if proc is not None and proc.poll() is None:
-            os.kill(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=10)
-
-    def admin(self, method, path, body=None, timeout=20):
-        return call(
-            method,
-            f"http://127.0.0.1:{self.admin_port}/api/v1{path}",
-            token=ADMIN_TOKEN,
-            body=body,
-            timeout=timeout,
-        )
-
-    def healthy(self):
-        return self.admin("GET", "/health", timeout=3)[0] == 200
-
-    def leader_probe(self):
-        # The admin gate runs before routing, so an unauthenticated unknown path is 401. Send the
-        # admin token so the assertion observes the ROUTE's absence (404), not the gate.
-        return call(
-            "GET",
-            f"http://127.0.0.1:{self.admin_port}/healthz/leader",
-            token=ADMIN_TOKEN,
-            timeout=3,
-        )[0]
-
-    def catalog(self):
-        st, _, out = call(
-            "GET",
-            f"http://127.0.0.1:{self.data_port}/v1/models",
-            timeout=10,
-            host=TENANT_DOMAIN,
-        )
-        try:
-            ids = sorted(m["id"] for m in json.loads(out).get("data", []))
-        except Exception:
-            ids = None
-        return st, ids, out
-
-    def status(self):
-        st, _, out = self.admin("GET", "/cluster/status", timeout=5)
-        try:
-            return st, json.loads(out)
-        except Exception:
-            return st, {}
-
-    def version(self):
-        st, body = self.status()
-        return int(body.get("config_version", -1)) if st == 200 else -1
-
-    def tenants(self):
-        st, _, out = self.admin("GET", "/tenants", timeout=10)
-        try:
-            return st, json.loads(out)
-        except Exception:
-            return st, out
-
-    def tenant_name(self, tenant_id=TENANT_ID):
-        st, body = self.tenants()
-        if st != 200 or not isinstance(body, list):
-            return None
-        for t in body:
-            if t.get("id") == tenant_id:
-                return t.get("name")
-        return None
-
-    def metric_values(self, name, needle=None):
-        st, _, out = call(
-            "GET", f"http://127.0.0.1:{self.admin_port}/metrics", token=ADMIN_TOKEN
-        )
-        if st != 200:
-            return []
-        values = []
-        for line in out.splitlines():
-            if not line.startswith(name) or line.startswith("#"):
-                continue
-            if needle and needle not in line:
-                continue
-            try:
-                values.append(float(line.rsplit(" ", 1)[1]))
-            except (ValueError, IndexError):
-                pass
-        return values
-
-    def reload_source(self, source):
-        return sum(self.metric_values("hydra_config_reload_total", f'source="{source}"'))
-
-    def log_tail(self, n=1200):
-        try:
-            with open(self.log_path, errors="replace") as fh:
-                return fh.read()[-n:]
-        except OSError:
-            return "<no log>"
-
-
-def wait_for(cond, budget, what):
-    deadline = time.time() + budget
-    while time.time() < deadline:
-        try:
-            if cond():
-                return True
-        except Exception:
-            pass
-        time.sleep(0.05)
-    print(f"   !!  timed out waiting for {what}", file=sys.stderr)
-    return False
-
-
-def seed(node):
-    """Tenant + provider + model through node A's ADMIN API."""
-    for path, payload in (
-        (
-            "/providers",
-            {
-                "id": "p-drill",
-                "key": "p-drill",
-                "name": "Drill upstream",
-                "endpoint": f"http://127.0.0.1:{UPSTREAM_PORT}",
-                "weight": 1,
-                "created_at": "",
-                "updated_at": "",
-            },
-        ),
-        (
-            "/provider-models",
-            {
-                "id": "pm-drill",
-                "key": MODEL,
-                "name": "Echo",
-                "provider_id": "p-drill",
-                "status": 1,
-                "created_at": "",
-                "updated_at": "",
-            },
-        ),
-        (
-            "/provider-keys",
-            {
-                "id": "pk-drill",
-                "provider_id": "p-drill",
-                "api_key": "sk-upstream",
-                "created_at": "",
-            },
-        ),
-        (
-            "/tenants",
-            {
-                "id": TENANT_ID,
-                "name": "Shared DB Drill",
-                "domain": TENANT_DOMAIN,
-                "cert_key": None,
-                "cert_file": None,
-                "enabled": True,
-                "created_at": "",
-                "updated_at": "",
-            },
-        ),
-        (
-            "/tenant-providers",
-            {
-                "id": "tp-drill",
-                "tenant_id": TENANT_ID,
-                "provider_id": "p-drill",
-                "created_at": "",
-                "updated_at": "",
-            },
-        ),
-        (
-            "/tenant-models",
-            {
-                "id": "tm-drill",
-                "tenant_id": TENANT_ID,
-                "model_key": MODEL,
-                "created_at": "",
-                "updated_at": "",
-            },
-        ),
-    ):
-        st, _, out = node.admin("POST", path, payload, timeout=25)
-        if st not in (200, 201):
-            raise RuntimeError(f"seeding {path} -> HTTP {st} {out[:200]}")
-
-
-def rename_tenant(node, new_name):
-    """A management write on `node`: read the tenant, change its name, PUT it back."""
-    st, _, out = node.admin("GET", f"/tenants/{TENANT_ID}", timeout=10)
-    if st != 200:
-        return st, out
-    body = json.loads(out)
-    body.pop("snapshot_stale", None)
-    body["name"] = new_name
-    st, _, out = node.admin("PUT", f"/tenants/{TENANT_ID}", body, timeout=25)
-    return st, out
-
-
 def converge(nodes, version, name, budget=CONVERGE_BUDGET):
     def reached():
         for n in nodes:
             if n.version() < version:
                 return False
-            if n.tenant_name() != name:
+            if n.tenant_name(TENANT_ID) != name:
                 return False
         return True
 
@@ -467,6 +169,9 @@ def main():
             test_db.url,
             node_redis,
             os.path.join(DIR, f"{label}.log"),
+            admin_token=ADMIN_TOKEN,
+            encryption_key=ENCRYPTION_KEY,
+            poll_ms=POLL_MS,
         )
         for label in ("a", "b", "c")
     ]
@@ -518,15 +223,23 @@ def main():
         )
 
         # ------------------------------------------------------------------ seed + A2
-        seed(A)
+        seed_base(
+            A,
+            tenant_id=TENANT_ID,
+            domain=TENANT_DOMAIN,
+            model=MODEL,
+            upstream_port=UPSTREAM_PORT,
+            prefix="drill",
+            tenant_name="Shared DB Drill",
+        )
         announce("seeded tenant/provider/model through", A.name)
         expected = [MODEL]
         served = wait_for(
-            lambda: all(n.catalog()[:2] == (200, expected) for n in nodes),
+            lambda: all(n.catalog(TENANT_DOMAIN)[:2] == (200, expected) for n in nodes),
             CONVERGE_BUDGET,
             "the model catalog on A, B and C",
         )
-        catalogs = [n.catalog()[:2] for n in nodes]
+        catalogs = [n.catalog(TENANT_DOMAIN)[:2] for n in nodes]
         check(
             "A2: the seeded model is served by the data plane on A, B and C",
             served,
@@ -537,7 +250,7 @@ def main():
         # ------------------------------------------------------------------ A3: write on B
         pubsub_a0, pubsub_c0 = A.reload_source("pubsub"), C.reload_source("pubsub")
         name_b = "Drill renamed by B"
-        st_b, out_b = rename_tenant(B, name_b)
+        st_b, out_b = rename_tenant(B, TENANT_ID, name_b)
         version_b = B.version()
         check(
             "A3: a management write on B succeeds (no leader is needed)",
@@ -549,7 +262,16 @@ def main():
             "A3: A and C converge to B's config_version and see the renamed tenant",
             converged_b,
             f"versions a={A.version()} b={B.version()} c={C.version()} names="
-            f"{[n.tenant_name() for n in nodes]}",
+            f"{[n.tenant_name(TENANT_ID) for n in nodes]}",
+        )
+        # Convergence may be satisfied by the short poll before the pubsub message is
+        # handled. Wait for the pubsub counters too, so this assertion still proves the
+        # fanout path instead of racing it.
+        wait_for(
+            lambda: A.reload_source("pubsub") > pubsub_a0
+            and C.reload_source("pubsub") > pubsub_c0,
+            CONVERGE_BUDGET,
+            "A3 pubsub reload counters",
         )
         changed_a, changed_c = A.reload_source("pubsub") - pubsub_a0, C.reload_source("pubsub") - pubsub_c0
         check(
@@ -562,7 +284,7 @@ def main():
         # ------------------------------------------------------------------ A4: write on C
         pubsub_a0, pubsub_b0 = A.reload_source("pubsub"), B.reload_source("pubsub")
         name_c = "Drill renamed by C"
-        st_c, out_c = rename_tenant(C, name_c)
+        st_c, out_c = rename_tenant(C, TENANT_ID, name_c)
         version_c = C.version()
         check(
             "A4: a management write on C succeeds",
@@ -574,7 +296,13 @@ def main():
             "A4: A and B converge to C's config_version and see the renamed tenant",
             converged_c,
             f"versions a={A.version()} b={B.version()} c={C.version()} names="
-            f"{[n.tenant_name() for n in nodes]}",
+            f"{[n.tenant_name(TENANT_ID) for n in nodes]}",
+        )
+        wait_for(
+            lambda: A.reload_source("pubsub") > pubsub_a0
+            and B.reload_source("pubsub") > pubsub_b0,
+            CONVERGE_BUDGET,
+            "A4 pubsub reload counters",
         )
         check(
             "A4: ...again via pub/sub on both peers",
@@ -587,7 +315,7 @@ def main():
         announce("SIGKILL", f"{B.name} (the data plane and the shared DB keep going)")
         B.kill()
         name_kill = "Drill after B was killed"
-        st_a, out_a = rename_tenant(A, name_kill)
+        st_a, out_a = rename_tenant(A, TENANT_ID, name_kill)
         version_kill = A.version()
         check(
             "A5: a write on A still succeeds while B is dead",
@@ -597,14 +325,14 @@ def main():
         converged_kill = converge([A, C], version_kill, name_kill)
         check(
             "A5: C converges and still serves a data-plane request after the kill",
-            converged_kill and C.catalog()[:2] == (200, expected),
-            f"versions a={A.version()} c={C.version()} c-catalog={C.catalog()[:2]}",
+            converged_kill and C.catalog(TENANT_DOMAIN)[:2] == (200, expected),
+            f"versions a={A.version()} c={C.version()} c-catalog={C.catalog(TENANT_DOMAIN)[:2]}",
         )
         # Optional in the spec, asserted because a restarted node must load the committed DB state.
         B.start()
         restarted = wait_for(B.healthy, STARTUP_BUDGET, "B to restart")
         caught_up = restarted and wait_for(
-            lambda: B.version() >= version_kill and B.tenant_name() == name_kill,
+            lambda: B.version() >= version_kill and B.tenant_name(TENANT_ID) == name_kill,
             CONVERGE_BUDGET,
             "B to catch up from the shared DB",
         )
@@ -612,7 +340,7 @@ def main():
             "A5: B restarts against the shared DB and catches up without replay/peer repair",
             caught_up,
             f"healthy={restarted} version={B.version()} expected>={version_kill} "
-            f"name={B.tenant_name()!r}",
+            f"name={B.tenant_name(TENANT_ID)!r}",
         )
 
         # ------------------------------------------------------------------ A6: Redis outage
@@ -621,7 +349,7 @@ def main():
         relay.set_blocked(True)
         time.sleep(0.3)
         name_poll = "Drill converged by the poll fallback"
-        st_p, out_p = rename_tenant(A, name_poll)
+        st_p, out_p = rename_tenant(A, TENANT_ID, name_poll)
         code_p = None
         if isinstance(out_p, str):
             try:
@@ -641,14 +369,14 @@ def main():
             "A6: C converges through the POLL fallback while Redis is unreachable",
             converged_poll and poll_delta > 0,
             f"versions a={A.version()} c={C.version()} poll-reloads-on-c={poll_delta:g} "
-            f"name={C.tenant_name()!r}",
+            f"name={C.tenant_name(TENANT_ID)!r}",
         )
         relay.set_blocked(False)
         time.sleep(0.5)
         check(
             "A6: C still serves the converged config after Redis is restored",
-            C.catalog()[:2] == (200, expected) and C.tenant_name() == name_poll,
-            f"catalog={C.catalog()[:2]} name={C.tenant_name()!r}",
+            C.catalog(TENANT_DOMAIN)[:2] == (200, expected) and C.tenant_name(TENANT_ID) == name_poll,
+            f"catalog={C.catalog(TENANT_DOMAIN)[:2]} name={C.tenant_name(TENANT_ID)!r}",
         )
 
         # ------------------------------------------------------------------ A7: write anywhere
@@ -671,7 +399,7 @@ def main():
         check(
             "A7: ...and all three converge to the same config_version and tenant name",
             converge(nodes, final_version, name_poll),
-            f"versions={[n.version() for n in nodes]} names={[n.tenant_name() for n in nodes]}",
+            f"versions={[n.version() for n in nodes]} names={[n.tenant_name(TENANT_ID) for n in nodes]}",
         )
 
         # ------------------------------------------------------------------ A8: cleanup check

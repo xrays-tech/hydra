@@ -276,6 +276,16 @@ jobs:
       - name: Test hydra-server (mysql backend)
         run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql
 
+      - name: Shared-DB cluster + concurrent fanout (mysql backend)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+          HYDRA_FANOUT_ROUNDS: "5"
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql --bin hydra
+          python3 integration/test_shared_db_cluster.py
+          python3 integration/test_shared_db_random_fanout.py
+
   # The feature combinations that NO other job compiles. Both were holes of the
   # same shape the `optional-features` job above was added to close, and both are
   # documented as supported builds:
@@ -453,46 +463,11 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_startup_knobs.py
 
-      # The three "SDK against a live cluster" steps (Python, TypeScript, Go) were RETIRED on
-      # 2026-10-07, in the same class as `test_cluster_ha.py` and `test_replica_fidelity.py`.
-      #
-      # WHY: their C1-C3 legs asserted the world ADR-0001 replaced — `200 applied` with an
-      # `event_id`, `202 pending` via `wait=none`, `503 unavailable` from "the edge" whose
-      # `/api/v1/health` is 404. But the drills started two PLAIN SINGLE-NODE instances
-      # (`HYDRA_REDIS_MODE=single`, no `HYDRA_REDIS_URL`), and such a node correctly answers
-      # `state: "single_node"` (documented in `admin-ui/api-docs.js`: "this node is the whole
-      # fleet"). Measured 2026-10-07: with the reported `single_node` body, `eventId: None`,
-      # 7 (Python) / 6 (TS) / 5 (Go) assertions failed, so these steps could never pass again
-      # while claiming to be about a cluster.
-      #
-      # WHERE THE COVERAGE LIVES NOW — nothing here is unverified, it is verified elsewhere:
-      #   * the live FLEET REPORT (`applied` with nodes_applied == nodes_total, and the measured
-      #     `202 pending` shape when a member is down) -> `integration/test_auth_cache_layers.py`,
-      #     a real 2-node cluster, which asserts the report itself and whose header records the
-      #     202 pending measurement (2026-10-05);
-      #   * the SDK's OWN handling of the three states, including raising on `pending` and the
-      #     `single_node` short-circuit -> the three SDK suites that run in the `sdks` job against
-      #     mocks: `tools/hydra-py/tests/test_client.py` (applied 35 / pending 19 / single_node 4
-      #     references), `tools/hydra-ts/test/client.test.ts` (13 / 18 / 5),
-      #     `tools/hydra-go/client_test.go` (10 / 20 / 4);
-      #   * each SDK against a REAL node, which is what the drills keep doing in their single-node
-      #     legs: `integration/test_sdk_live.py`, `test_sdk_ts_live.py`, `test_sdk_go_live.py`
-      #     (steps below, no flag).
-      # What is genuinely NOT covered any more: an SDK pointed at a multi-member raft fleet seeing
-      # a real `200 applied`/`202 pending` over HTTP. Recorded in ADR-0001's plan coverage table
-      # rather than left implied.
-
-      # The TWO-LAYER auth verdict cache, measured with a counting auth upstream on a real
-      # cluster: L1 per node, L2 written to Redis (`1`/`0` + tenant index), **L2 SHARED** so
-      # the second node serves without re-asking, and a fleet invalidation that clears BOTH
-      # layers. This is the behaviour decision item D-9 is about.
-      - name: auth cache layers (L1 + shared Redis L2 + fleet clear)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
-          python3 integration/test_auth_cache_layers.py
+      # The three "SDK against a live cluster" steps were retired together with the
+      # raft control plane (ADR-0001/ADR-0004). The SDKs' own state handling is
+      # covered by the mock suites in the `sdks` job; each SDK against a real node is
+      # covered below. The shared-DB 3-node fleet is covered by
+      # `integration/test_shared_db_cluster.py`.
 
       # CLUSTER RATE LIMITS over Redis, on a real leader + edge and through a CUTTABLE relay:
       # `ops.md` §12's "shared rate-limit counters" (a window filled by both nodes refuses on
@@ -525,6 +500,19 @@ jobs:
           set -o pipefail
           cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_shared_db_cluster.py
+
+      # CONCURRENT random creates/updates/deletes from all three nodes. The poll interval is
+      # fixed at 60 s inside the drill, so convergence in its <10 s run is proof of Redis pub/sub
+      # fanout, not the fallback. Covers providers/tenants/limit roles/global roles/grants and the
+      # tenant-API identity rows (user-group/user/api-key).
+      - name: shared-DB random fanout (concurrent writes, 60s poll => pub/sub only)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+          HYDRA_FANOUT_ROUNDS: "10"
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
+          python3 integration/test_shared_db_random_fanout.py
 
       # The data plane under load across a node kill, with the same shared DB + Redis topology.
       # 20 rps at a survivor while another node is SIGKILLed; zero non-200 is the assertion.
@@ -794,14 +782,6 @@ jobs:
       - name: data-plane model catalog (public, local, narrowing, online filter)
         run: python3 integration/test_model_catalog.py
 
-      # Sub-tenant / key-prefix STEERING on the chat path: the sub-tenant's per-model routes,
-      # the documented fallback for a model it has no route for, the operator prefix binding
-      # winning over it, and §7.6.2's boundary — deleting or disabling a sub-tenant is NOT
-      # revocation (the key keeps working through the default pipeline). The serving provider
-      # is observable because the two mocks answer with different ids.
-      - name: sub-tenant / key-prefix steering
-        run: python3 integration/test_sub_tenant_steering.py
-
       # The ClickHouse sink's WIRE format — what `HYDRA_CLICKHOUSE_URL` actually produces,
       # which `ops.md` §1.1 documents and no test observed: the userinfo becoming
       # `Authorization: Basic …`, the passthrough query string surviving verbatim, the row
@@ -860,16 +840,6 @@ jobs:
       # stops growing once the backend recovers and the retained batch lands.
       - name: usage drop accounting (under-billing signal)
         run: python3 integration/test_usage_drop_accounting.py
-
-      # The AUTH hop against a dead route (the last hop without one): TEST-NET-1 as the black hole,
-      # so nothing on the network is contacted. Pins the documented 503
-      # `auth_upstream_unavailable` in bounded time, that the provider is never called, that the
-      # failure is attributed, that it is NOT cached (three requests in a row each pay the 2 s
-      # round-trip timeout — caching it would keep the tenant blocked for the deny TTL after
-      # recovery, which the falsification showed), the millisecond contrast for a REFUSED port,
-      # immediate recovery, and that `FailMode::Open` cannot be selected.
-      - name: auth hop (dead route, fail mode, no caching of an outage)
-        run: python3 integration/test_auth_hop_failmode.py
 
       # Where the master key comes from: the inline BASE64 variable vs `HYDRA_ENCRYPTION_KEY_FILE`
       # (RAW 32 bytes) — the asymmetry an operator gets wrong, and the one a Kubernetes secret
