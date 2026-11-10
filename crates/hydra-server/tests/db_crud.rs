@@ -1089,3 +1089,76 @@ async fn every_successful_write_bumps_revision_and_noop_does_not() {
 
     test_db.cleanup().await;
 }
+
+/// The config loader's paired read must be one snapshot on PostgreSQL too.
+#[tokio::test]
+async fn read_snapshot_is_repeatable_read() {
+    let pool = common::setup_pool().await;
+    let mut tx = db::begin_read_snapshot(&pool)
+        .await
+        .expect("begin read snapshot");
+
+    #[cfg(feature = "db-postgres")]
+    let isolation: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("transaction isolation");
+    #[cfg(feature = "db-mysql")]
+    let isolation: String = sqlx::query_scalar("SELECT @@transaction_isolation")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("transaction isolation");
+
+    tx.commit().await.expect("commit read snapshot");
+    assert_eq!(
+        isolation.to_ascii_lowercase().replace('-', " "),
+        "repeatable read",
+        "the loader must not run under READ COMMITTED; got {isolation:?}"
+    );
+}
+
+/// A partitioned node must not hold the write lock forever: the session
+/// guardrails are installed by `init_pool`'s `after_connect`.
+#[tokio::test]
+async fn session_guardrails_are_set() {
+    let pool = common::setup_pool().await;
+
+    #[cfg(feature = "db-postgres")]
+    {
+        let statement_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+                .fetch_one(&pool)
+                .await
+                .expect("statement_timeout");
+        let idle_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('idle_in_transaction_session_timeout')")
+                .fetch_one(&pool)
+                .await
+                .expect("idle_in_transaction_session_timeout");
+        assert_ne!(statement_timeout, "0", "statement_timeout must be bounded");
+        assert_ne!(idle_timeout, "0", "idle transaction must be bounded");
+    }
+
+    #[cfg(feature = "db-mysql")]
+    {
+        let lock_wait: u64 = sqlx::query_scalar("SELECT @@innodb_lock_wait_timeout")
+            .fetch_one(&pool)
+            .await
+            .expect("innodb_lock_wait_timeout");
+        assert_eq!(lock_wait, 10, "the cluster write lock must time out");
+    }
+}
+
+/// The write transaction bounds its own lock wait without touching migrations.
+#[cfg(feature = "db-postgres")]
+#[tokio::test]
+async fn write_lock_wait_is_bounded() {
+    let pool = common::setup_pool().await;
+    let mut tx = db::begin_write(&pool).await.expect("begin write");
+    let lock_timeout: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("lock_timeout inside a write transaction");
+    tx.rollback().await.expect("rollback");
+    assert_eq!(lock_timeout, "5s");
+}

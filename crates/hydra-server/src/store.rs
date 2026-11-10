@@ -152,7 +152,11 @@ async fn load_config_rows(
     pool: &Pool,
     kp: &dyn KeyProvider,
 ) -> Result<(ConfigRows, u64), StoreError> {
-    let mut tx = pool.begin().await?;
+    // PostgreSQL READ COMMITTED would give each of the 14 statements a fresh
+    // snapshot; the helper pins them to one REPEATABLE READ snapshot (MySQL's
+    // default already is). Without this, a concurrent writer can yield a
+    // revision tag and rows from different config states.
+    let mut tx = db::begin_read_snapshot(pool).await?;
     let version = db::read_revision_on(&mut *tx).await?;
 
     let providers = db::list_providers_on(&mut *tx).await?;

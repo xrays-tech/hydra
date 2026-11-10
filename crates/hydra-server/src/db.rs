@@ -87,8 +87,20 @@ pub async fn init_pool(url: &str) -> Result<Pool, sqlx::Error> {
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     sqlx::query(&dialect::sql("SET TIME ZONE 'UTC'"))
-                        .execute(conn)
+                        .execute(&mut *conn)
                         .await?;
+                    // A node that loses the DB mid-transaction must not hold
+                    // `hydra_lock` until TCP keepalive notices; bound the waits
+                    // and the idle-in-transaction window. 60s is far above any
+                    // healthy config read/write and still finite on a partition.
+                    sqlx::query(&dialect::sql("SET statement_timeout = '60s'"))
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query(&dialect::sql(
+                        "SET idle_in_transaction_session_timeout = '60s'",
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
                     Ok(())
                 })
             })
@@ -107,6 +119,12 @@ pub async fn init_pool(url: &str) -> Result<Pool, sqlx::Error> {
                     sqlx::query(&dialect::sql("SET SESSION time_zone = '+00:00'"))
                         .execute(&mut *conn)
                         .await?;
+                    // Same partition guard as PostgreSQL: a lost connection
+                    // must not wait forever on a row lock. MySQL's default is
+                    // 50s; 10s keeps the cluster-level write stall bounded.
+                    sqlx::query(&dialect::sql("SET SESSION innodb_lock_wait_timeout = 10"))
+                        .execute(&mut *conn)
+                        .await?;
                     Ok(())
                 })
             })
@@ -122,6 +140,24 @@ pub async fn init_pool(url: &str) -> Result<Pool, sqlx::Error> {
             "no database backend selected (enable db-postgres or db-mysql)".into(),
         ))
     }
+}
+
+/// Begin a read-only snapshot transaction for the config loader.
+///
+/// PostgreSQL's default READ COMMITTED gives every statement a fresh snapshot,
+/// so the revision and the 13 table reads would not describe one config state.
+/// REPEATABLE READ pins them together; it is read-only, so it cannot raise a
+/// serialization failure. MySQL's default is already REPEATABLE READ.
+#[allow(unused_mut)] // `mut` is only needed by the PostgreSQL branch
+pub async fn begin_read_snapshot(pool: &Pool) -> Result<Tx<'static>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    #[cfg(feature = "db-postgres")]
+    sqlx::query(&dialect::sql(
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    ))
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
 }
 
 /// Run the embedded migrations for the selected backend.
@@ -146,6 +182,15 @@ pub async fn run_migrate(pool: &Pool) -> Result<(), MigrateError> {
 /// this primitive so writers serialize on the same row across nodes.
 pub async fn begin_write(pool: &Pool) -> Result<Tx<'static>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+
+    // Bound the wait for `hydra_lock`/row locks, but ONLY in write
+    // transactions: a session-wide lock_timeout also applies to sqlx's
+    // migration advisory lock and makes concurrent schema provisioning fail
+    // with 55P03. `SET LOCAL` is transaction-scoped and leaves migrations alone.
+    #[cfg(feature = "db-postgres")]
+    sqlx::query(&dialect::sql("SET LOCAL lock_timeout = '5s'"))
+        .execute(&mut *tx)
+        .await?;
 
     #[cfg(feature = "db-postgres")]
     sqlx::query(&dialect::sql(

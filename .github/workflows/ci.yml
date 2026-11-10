@@ -1015,6 +1015,16 @@ jobs:
       - name: purity checker tests
         run: node --test scripts/check_source_purity.test.cjs
 
+      # Every production SQL call in db.rs must pass through `dialect::sql()`.
+      # A raw `?` query compiles and runs on MySQL, and only fails on PostgreSQL
+      # at runtime; the one allowlisted exception is delete_tenant's MySQL
+      # text-protocol escape hatch (1615).
+      - name: SQL dialect guard (every query goes through dialect::sql)
+        run: node scripts/check_dialect_sql.cjs
+
+      - name: SQL dialect guard tests
+        run: node --test scripts/check_dialect_sql.test.cjs
+
       # The operator runbook's config table is a promise: every variable it lists
       # must be read by something. It listed a `HYDRA_LOG` alias that no code has
       # ever read (verified at runtime: HYDRA_LOG=debug logs 0 lines).
