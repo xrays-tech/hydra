@@ -79,11 +79,9 @@ TENANT_ID = "t-drill"
 TENANT_DOMAIN = "drill.local"
 MODEL = "echo"
 
-# Short poll so the missed-message leg finishes quickly while still proving the fallback. The
-# pub/sub legs assert the pubsub counter, so a fast poll cannot make them green for the wrong reason.
-# The drill sets the node's HYDRA_CONFIG_POLL_MS explicitly. 200 ms makes the missed-message
-# leg quick; the pub/sub legs assert the pubsub counter, so a fast poll cannot make them green
-# for the wrong reason. Override with HYDRA_CONFIG_POLL_MS when investigating convergence.
+# Short poll so the missed-message leg finishes quickly, while the pub/sub legs assert the
+# pubsub counter (not just convergence), so a fast poll cannot make them green for the wrong
+# reason. Override with HYDRA_CONFIG_POLL_MS when investigating convergence.
 POLL_MS = int(os.environ.get("HYDRA_CONFIG_POLL_MS", "200"))
 STARTUP_BUDGET = float(os.environ.get("HYDRA_SHARED_DB_STARTUP_BUDGET", "60"))
 CONVERGE_BUDGET = float(os.environ.get("HYDRA_SHARED_DB_CONVERGE_BUDGET", "10"))

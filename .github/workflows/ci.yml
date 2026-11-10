@@ -670,13 +670,14 @@ jobs:
       - name: admission queue (per-provider concurrency)
         run: python3 integration/test_admission_queue.py
 
-      # The ops.md §1.4 backup/restore runbook, executed: the naive `cp` of a live WAL
-      # database silently loses rows, `VACUUM INTO` is complete and its snapshot serves
-      # traffic, a stale -wal left beside a REPLACED database makes the node refuse to
-      # start (`database disk image is malformed`) while deleting it fixes that, and a
-      # different master key is refused. Needs no Redis; uses in-process mock upstreams.
+      # The ops.md §1.4 backup/restore runbook on the shared DB: a logical copy into a
+      # freshly migrated schema/database, the restored node serves the same config, and a
+      # different master key is refused. Builds the binary it runs.
       - name: backup / restore runbook
-        run: python3 integration/test_backup_restore.py
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
+          python3 integration/test_backup_restore.py
 
       # The tenant Python SDK against a real node (its own suite is mock-only): the
       # documented usage, `single_node`, the auth cache ACTUALLY being cleared, another

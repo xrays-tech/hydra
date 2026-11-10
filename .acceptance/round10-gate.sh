@@ -254,10 +254,10 @@ gate "snapshot stale"                  python3 integration/test_snapshot_stale.p
 # returns — the leg that caught the missing fred reconnect policy (P1, 2026-09-30).
 gate "cluster rate limits (shared+FO)"  bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_cluster_limits.py'
 gate "admission queue"                python3 integration/test_admission_queue.py
-# ops.md §1.4 (backup & restore): the naive `cp` of a live WAL database loses rows,
-# `VACUUM INTO` is complete, a stale -wal beside a REPLACED db refuses to boot, and a
-# different master key is rejected. Never ran before round 79.
-gate "backup / restore runbook"        python3 integration/test_backup_restore.py
+# ops.md §1.4 (backup & restore) on the shared DB: logical copy into a fresh
+# schema/database, the restored node serves the same config, a different master key is
+# rejected. Builds the binary it runs.
+gate "backup / restore runbook"        bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_backup_restore.py'
 gate "tenant SDK vs live node"        python3 integration/test_sdk_live.py
 gate "integration proxy e2e"           bash -c 'MOCK_LLM_PORT=19190 MOCK_AUTH_PORT=19191 HYDRA_PROXY_PORT=18092 HYDRA_ADMIN_PORT=18093 python3 integration/e2e_proxy_test.py'
 # The documented zero-downtime upgrade (ops.md §2): the handover must keep the data

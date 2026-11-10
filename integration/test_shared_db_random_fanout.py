@@ -5,7 +5,7 @@ This is the stress complement to `test_shared_db_cluster.py`: that drill proves 
 time; this one proves that three processes writing DIFFERENT entity kinds at the same time all
 converge to the same config, and that the convergence is carried by Redis pub/sub.
 
-The poll fallback is deliberately 60 s (`HYDRA_CONFIG_POLL_MS=60000`) on every node. The whole
+The poll fallback is deliberately 120 s (`HYDRA_CONFIG_POLL_MS=120000`) on every node. The whole
 drill runs well below that, so a converged node inside the window can only have got there from a
 pub/sub notification. That condition is not weakened: it is what makes this a fanout test rather
 than a polling test.
@@ -74,8 +74,9 @@ BASE_TENANT = "t-fanout-base"
 BASE_DOMAIN = "fanout.local"
 MODEL = "echo"
 
-# MUST stay 60000: convergence inside the test window has to come from pub/sub, never polling.
-POLL_MS = 60000
+# MUST stay far above the test duration: in-window convergence has to come from
+# pub/sub, never polling. 120 s leaves margin on a slow/contended CI runner.
+POLL_MS = 120000
 REDIS_DB = int(os.environ.get("HYDRA_FANOUT_REDIS_DB", "57"))
 ROUNDS = int(os.environ.get("HYDRA_FANOUT_ROUNDS", "10"))
 SEED = int(os.environ.get("HYDRA_FANOUT_SEED", "20261110"))
@@ -670,10 +671,6 @@ def main():
 
         # ---------------------------------------------------------------- Phase A
         print("\n== Phase A: concurrent creates")
-        for w in writers:
-            kinds = list(OP_KINDS)
-            w.rng.shuffle(kinds)
-
         # `kinds` is per writer; build that inside the thread instead of sharing the last one.
         def create_worker(w):
             kinds = list(OP_KINDS)
@@ -706,9 +703,9 @@ def main():
 
         pubsub_delta = {n.name: n.reload_source("pubsub") - pubsub_before[n.name] for n in nodes}
         poll_delta = {n.name: n.reload_source("poll") - poll_before[n.name] for n in nodes}
-        check("A8: every node's pub/sub reload counter moved (60s poll cannot explain it)",
+        check("A8: every node's pub/sub reload counter moved (120s poll cannot explain it)",
               all(v > 0 for v in pubsub_delta.values()), f"pubsub delta={pubsub_delta}")
-        check("A9: ...and the poll fallback did NOT run during the phase (poll interval is 60s)",
+        check("A9: ...and the poll fallback did NOT run during the phase (poll interval is 120s)",
               all(v == 0 for v in poll_delta.values()), f"poll delta={poll_delta}")
 
         # ---------------------------------------------------------------- Phase B
@@ -855,7 +852,7 @@ def main():
     print(
         "RANDOM FANOUT: PASSED (3 nodes x concurrent random creates/updates/deletes; equal "
         "config versions, every row visible on every node, pub/sub-only convergence with a "
-        "60s poll, snapshot catalog/identity probes, clean deletion fanout)"
+        "120s poll, snapshot catalog/identity probes, clean deletion fanout)"
     )
     return 0
 
