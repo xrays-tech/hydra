@@ -12,6 +12,7 @@ Prerequisites: python3 (stdlib only). The Hydra binary is started via cargo run.
 """
 import base64, json, os, signal, subprocess, sys, time, urllib.request, urllib.error
 
+from _shared_db import env_db_url
 from _usage_env import usage_env  # the ONE owner of "which usage sink a drill's node starts with"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,7 +121,7 @@ def main():
         env = {**os.environ, **usage_env(),
                "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
                "HYDRA_ENCRYPTION_KEY": _master_key(),
-               "HYDRA_DB_URL": f"sqlite:{DB_FILE}?mode=rwc",
+               "HYDRA_DB_URL": env_db_url("e2e_proxy"),
                "HYDRA_LISTEN": f"0.0.0.0:{HYDRA_PROXY_PORT}",
                "HYDRA_ADMIN_ADDR": f"0.0.0.0:{HYDRA_ADMIN_PORT}",
                "RUST_LOG": "info"}

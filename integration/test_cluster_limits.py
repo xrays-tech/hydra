@@ -2,35 +2,22 @@
 """Cluster rate limits over Redis: SHARED across nodes, and FAIL-OPEN when Redis dies.
 
 `ops.md` §12 states cluster mode gives you "multi-instance with **shared rate-limit
-counters**", §13.5 says the data plane keeps serving through a Redis outage while election is
-fail-closed, and §13.4/`redis/rate_limit.rs` document the deliberate opposite for limits: the
-Redis rate-limit path is **hard-coded fail-open** ("there is NO env override"). `redis/mod.rs`
-adds why the fail-open branch can fire at all — a 500 ms per-command timeout
-(`HYDRA_REDIS_COMMAND_TIMEOUT_MS`) turns a black-holed socket into an ordinary error, because
-"a hang never produces an `Err`, so the documented fail-open branch cannot fire either".
+counters**", and §13.4/`redis/rate_limit.rs` documents the deliberate fail-open direction for
+limits. `redis/mod.rs` adds why the fail-open branch can fire at all — a bounded per-command
+timeout (`HYDRA_REDIS_COMMAND_TIMEOUT_MS`) turns a black-holed socket into an ordinary error,
+because "a hang never produces an `Err`, so the documented fail-open branch cannot fire either".
 
-None of that had ever been observed on a real cluster: `limit_roles` enforcement was measured
-single-node (in-process windows), and the Redis limiter only in-process unit tests. This drill runs
-TWO members of a three-member raft cluster against the test Redis THROUGH a cuttable relay, so the
-same tenant's quota can be spent on both nodes and the bus can be killed under them.
+This drill runs TWO real nodes sharing ONE PostgreSQL/MySQL database and ONE Redis (through a
+cuttable relay), so the same tenant's quota can be spent on both nodes and the bus can be killed
+under them. Cluster mode is exactly "a non-empty `HYDRA_REDIS_URL`" — there is no member list, no
+raft writer and no leader probe. The shared DB is provisioned per run; SQLite is not used. The
+user's `hydra-local` stack is untouched (dedicated schema/database, Redis DB and ports).
 
-Ported to the member-list topology (ADR-0001, 2026-10-05). What changed and why:
-  * `HYDRA_ROLE=leader|edge` became "two members of `HYDRA_CLUSTER_PEERS`". The roles are gone, and
-    the drill never actually depended on them — it needs two nodes whose rate-limit windows share
-    one Redis, which is exactly what the member topology gives;
-  * the bring-up had to change ORDER, and that is a real property of the new model: a data directory
-    that has never been claimed needs a MAJORITY up at the same time, so "start the leader, wait for
-    it, then start the edge" CANNOT work any more (one node of three can never claim its directory —
-    measured). Both members now start together, and the drill waits for both to be healthy plus
-    exactly one raft writer;
-  * the leg that compared the other node's applied SNAPSHOT VERSION to the version a write produced
-    is GONE: it read `hydra_control_snapshot_version`, which was retired with the polling client (and
-    was one of three series whose alert rows could never fire — see `ops.md` §9.1). Nothing replaced
-    it as a per-node number: the control plane tracks the head's content HASH, and no metric exposes
-    "which head am I serving". The claim it corroborated ("that node holds the whole version") is
-    still proved by the leg above it, which uses an unconditional-deny role as the probe.
+The bring-up is simpler than the raft era: both nodes start together against the shared database,
+wait for their admin health, and then the drill seeds one tenant identity per tenant so the data
+plane has a real client api-key (the internal identity index, not an external auth hop).
 
-Cases (real cluster, real Redis, mock upstream; the user's dev stack is untouched):
+Cases (real nodes, real DB + Redis, mock upstream):
   C0  control: both members serve the tenant before any role exists
   C1  config convergence is proven with a ZERO-side-effect probe: a `limit_count = 0` role
       (unconditional deny, decided BEFORE any Redis call) is created in the same snapshot as
@@ -65,26 +52,25 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from _redis_harness import RedisSetupError, endpoint as redis_endpoint, require_url as require_redis_url
+from _shared_db import SetupError, isolated
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR = os.path.join(ROOT, ".acceptance", "cluster-limits-test")
 BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra"))
-# Two members are STARTED; the third exists only in the member list, because a three-member table is
-# the minimum the parser accepts and two live members are a majority (enough to elect and to claim
-# their data directories). `PHANTOM_RAFT` is never bound by anything.
-A_ADMIN, A_DATA, A_RAFT = 18860, 18861, 18862
-B_ADMIN, B_DATA, B_RAFT = 18870, 18871, 18872
-PHANTOM_RAFT = 18873
+# Two nodes, one shared DB, one Redis. No member list, no raft port, no leader.
+A_ADMIN, A_DATA = 18860, 18861
+B_ADMIN, B_DATA = 18870, 18871
 UPSTREAM = 18879
 REDIS_DB = 3
 ADMIN_TOKEN = "hydra-cluster-limits-admin-2026"
-MEMBERS = f"cl-a=127.0.0.1:{A_RAFT},cl-b=127.0.0.1:{B_RAFT},cl-c=127.0.0.1:{PHANTOM_RAFT}"
 TOKENS = 13                      # 5 in + 8 out, the mock upstream's usage
-DEAD_CH = "http://127.0.0.1:18898"
+TEST_DB = None
+CLIENT_KEYS = {}                 # tenant id -> plaintext data-plane api-key
 
 # How long the token charge may take to become visible in the shared window before the drill says
 # so out loud. The charge is ONE Redis round trip in the `logging` phase, so ~0.4 ms is the honest
@@ -109,14 +95,6 @@ def announce(label, detail):
 # ---------------------------------------------------------------------------
 # Redis: raw RESP (there is no redis-cli on this host) + a cuttable relay
 # ---------------------------------------------------------------------------
-
-def redis_url_parts():
-    raw = os.environ.get("HYDRA_TEST_REDIS_URL", "redis://127.0.0.1:6380").rstrip("/")
-    parsed = urllib.parse.urlparse(raw)
-    if not parsed.hostname or not parsed.port:
-        return None, f"cannot parse {raw!r} as redis://host:port"
-    return (parsed.hostname, parsed.port), ""
-
 
 def redis_cmd(sock, *args):
     """Send one RESP command on `sock`.
@@ -314,6 +292,16 @@ class RedisRelay:
                 except OSError:
                     pass
 
+    def stop(self):
+        self.set_blocked(True)
+        self.set_blackhole(False)
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # nodes and the mock upstream
@@ -383,18 +371,17 @@ def proxied(data_port, host, key):
     return st, headers, body, time.time() - started
 
 
-def start_node(redis_url, label, admin_port, data_port, raft_port):
-    env = dict(os.environ)
+def start_node(redis_url, label, admin_port, data_port):
+    assert TEST_DB is not None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HYDRA_")}
     env.update(usage_env())
     env.update({
         "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
-        "HYDRA_CLUSTER_PEERS": MEMBERS, "HYDRA_CLUSTER_ID": "cluster-limits-drill",
-        "HYDRA_NODE_ID": label, "HYDRA_ARACHNE_LISTEN": f"127.0.0.1:{raft_port}",
-        "HYDRA_ARACHNE_DATA_DIR": os.path.join(DIR, f"raft-{label}"),
+        "HYDRA_NODE_ID": label,
         "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin_port}", "HYDRA_LISTEN": f"127.0.0.1:{data_port}",
         "HYDRA_REDIS_URL": redis_url, "HYDRA_REDIS_MODE": "single",
-        "HYDRA_USAGE_SINK": "clickhouse", "HYDRA_CLICKHOUSE_URL": DEAD_CH,
-        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, label)}.db?mode=rwc",
+        "HYDRA_CONFIG_POLL_MS": "500",
+        "HYDRA_DB_URL": TEST_DB.url,
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "RUST_LOG": "warn",
     })
@@ -415,10 +402,6 @@ def healthy(admin_port):
     """A member's own admin health. `/api/v1/health` needs the admin token; `/healthz` and
     `/readyz` were the retired edge role's token-free probes and answer 404 now."""
     return call("GET", f"http://127.0.0.1:{admin_port}/api/v1/health", token=ADMIN_TOKEN)[0] == 200
-
-
-def leader_probe(admin_port):
-    return call("GET", f"http://127.0.0.1:{admin_port}/healthz/leader")[0]
 
 
 def metric(port, name):
@@ -488,11 +471,11 @@ def seed():
         ("provider-models", {"id": "pm1", "key": "echo", "name": "E", "provider_id": "p1",
                              "status": 1, "created_at": "", "updated_at": ""}),
         ("provider-keys", {"id": "pk1", "provider_id": "p1", "api_key": "sk-up", "created_at": ""}),
-        ("tenants", {"id": "t1", "name": "T1", "domain": "count.local",
+        ("tenants", {"id": "t1", "name": "T1", "enabled": True, "domain": "count.local",
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
-        ("tenants", {"id": "t2", "name": "T2", "domain": "token.local",
+        ("tenants", {"id": "t2", "name": "T2", "enabled": True, "domain": "token.local",
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
-        ("tenants", {"id": "t3", "name": "T3", "domain": "probe.local",
+        ("tenants", {"id": "t3", "name": "T3", "enabled": True, "domain": "probe.local",
                      "cert_key": None, "cert_file": None, "created_at": "", "updated_at": ""}),
     ]
     for tid in ("t1", "t2", "t3"):
@@ -508,20 +491,50 @@ def seed():
         if st not in (200, 201):
             raise SystemExit(f"[cluster-limits] CANNOT VERIFY: seeding {path} -> {st} {out[:140]}")
 
+    # A data-plane chat needs a real client api-key: since the internal identity index landed,
+    # `enforce_auth` rejects an unknown key instead of trusting the header. Mint one per tenant
+    # through the tenant self-service API (the WRITE half of the hierarchy lives there).
+    for tid, domain in (("t1", "count.local"), ("t2", "token.local"), ("t3", "probe.local")):
+        st, out = admin("POST", f"/tenants/{tid}/access-tokens", {"name": "limits"})
+        if st not in (200, 201):
+            raise SystemExit(f"[cluster-limits] CANNOT VERIFY: minting token for {tid} -> {st} {out[:140]}")
+        tenant_token = json.loads(out)["token"]
+        base = f"http://127.0.0.1:{A_DATA}/tenant/{tid}/api/v1"
+        for path, body in (
+            ("/user-groups", {"id": f"g-{tid}", "name": f"group-{tid}"}),
+            ("/users", {"id": f"u-{tid}", "user_group_id": f"g-{tid}", "name": f"user-{tid}"}),
+        ):
+            st, _, out = call("PUT", f"{base}{path}", token=tenant_token, body=body)
+            if st not in (200, 201):
+                raise SystemExit(f"[cluster-limits] CANNOT VERIFY: seeding {path} {tid} -> {st} {out[:160]}")
+        st, _, out = call("POST", f"{base}/users/u-{tid}/api-keys", token=tenant_token,
+                          body={"name": "limits"})
+        if st not in (200, 201):
+            raise SystemExit(f"[cluster-limits] CANNOT VERIFY: minting data key {tid} -> {st} {out[:160]}")
+        CLIENT_KEYS[tid] = json.loads(out)["key"]
+
 
 def main():
+    global TEST_DB
     if not os.path.exists(BIN):
         print(f"[cluster-limits] CANNOT VERIFY: {BIN} is not built", file=sys.stderr)
         return 2
-    (host, port), err = redis_url_parts()
-    if err:
-        print(f"[cluster-limits] CANNOT VERIFY: {err}", file=sys.stderr)
+    try:
+        (host, port) = redis_endpoint(require_redis_url())
+        ok, note = flush_db(host, port)
+    except RedisSetupError as e:
+        print(f"[cluster-limits] CANNOT VERIFY: {e}", file=sys.stderr)
         return 2
-    ok, note = flush_db(host, port)
     if not ok:
         print(f"[cluster-limits] CANNOT VERIFY: {note}", file=sys.stderr)
         return 2
+    try:
+        TEST_DB = isolated("cluster_limits")
+    except SetupError as e:
+        print(f"[cluster-limits] CANNOT VERIFY: {e}", file=sys.stderr)
+        return 2
     print(f"== redis: {note}")
+    print(f"== database: {TEST_DB}")
     shutil.rmtree(DIR, ignore_errors=True)
     os.makedirs(DIR, exist_ok=True)
     killed = kill_our_instances()
@@ -538,107 +551,52 @@ def main():
     redis_sock = socket.create_connection((host, port), timeout=5)
     proc_a = proc_b = None
     try:
-        # BOTH members at once: one node of a three-member table can never claim its data directory
-        # (the claim is a raft write and needs a majority), so a sequential bring-up would time out
-        # with "no member adopted this node's Arachne data directory" — measured 2026-10-05.
-        proc_a = start_node(redis_url, "cl-a", A_ADMIN, A_DATA, A_RAFT)
-        proc_b = start_node(redis_url, "cl-b", B_ADMIN, B_DATA, B_RAFT)
+        # Both nodes start together against the SAME database and Redis. No roster, no quorum,
+        # no leader: cluster mode is exactly the Redis URL.
+        proc_a = start_node(redis_url, "cl-a", A_ADMIN, A_DATA)
+        proc_b = start_node(redis_url, "cl-b", B_ADMIN, B_DATA)
         if not wait_for(lambda: healthy(A_ADMIN) and healthy(B_ADMIN), budget=40):
             for label in ("cl-a", "cl-b"):
                 log = open(os.path.join(DIR, f"{label}.log"), errors="replace").read()
                 if "cluster-redis' cargo feature" in log:
                     print("[cluster-limits] CANNOT VERIFY: the binary lacks the cluster features; "
-                          "rebuild with --features server,cluster-redis,arachne,usage-clickhouse",
+                          "rebuild with --features server,cluster-redis,usage-clickhouse",
                           file=sys.stderr)
                     return 2
                 print(f"--- {label} ---\n{log[-700:]}", file=sys.stderr)
-            print("[cluster-limits] CANNOT VERIFY: the two members never became healthy",
+            print("[cluster-limits] CANNOT VERIFY: the two nodes never became healthy",
                   file=sys.stderr)
-            return 2
-        # Exactly one of them must be the raft writer, or the cluster never committed anything.
-        if not wait_for(lambda: sum(1 for p in (A_ADMIN, B_ADMIN) if leader_probe(p) == 200) == 1,
-                        budget=25):
-            print("[cluster-limits] CANNOT VERIFY: no single raft writer", file=sys.stderr)
             return 2
         seed()
-        # Both members must serve the seeded config before anything is measured.
-        #
-        # The failure path reports EVIDENCE, not only a verdict. Measured 2026-10-07: this drill
-        # passes locally (also against a Redis shaped exactly like CI's: `redis:7-alpine --save ""
-        # --appendonly no --databases 64` on 6379) and timed out on a runner — and all it said was "a
-        # member never routed the tenant", with the seed's own responses discarded (they had
-        # SUCCEEDED, or `seed()` would have raised) and neither node's log printed. A CANNOT VERIFY
-        # that hides every observable turns the next investigation into a guess, so each member's
-        # answer and both log tails are printed here.
-        if not wait_for(lambda: all(proxied(p, "count.local", "sk-t1")[0] == 200
+        # Both nodes must serve the seeded identity before anything is measured. The failure
+        # path prints the observable state (version, seed answers, what each admin API serves,
+        # both log tails) instead of only a verdict — a CANNOT VERIFY that hides the evidence
+        # turns the next investigation into a guess.
+        if not wait_for(lambda: all(proxied(p, "count.local", CLIENT_KEYS["t1"])[0] == 200
                                     for p in (A_DATA, B_DATA)), budget=30):
-            # The four questions that decide WHICH side is broken, answered from the runner itself:
-            # who held the writer, what the seed's writes were answered with, what the WRITER's admin
-            # API serves back, and whether the materialization loop actually ran.
-            # (`hydra_replica_materialize_retries_total` is labelled `outcome`
-            # ∈ {attempt, succeeded, failed, throttled} — a loop stuck retrying shows up as
-            # failed/throttled with no `succeeded`, and a loop that never ran shows no series.)
-            print("--- which member held the raft writer ---", file=sys.stderr)
-            print(f"    /healthz/leader   A:{leader_probe(A_ADMIN)}   B:{leader_probe(B_ADMIN)}",
-                  file=sys.stderr)
             print(f"--- seed POST statuses ({len(SEED_LOG)} writes) ---", file=sys.stderr)
             print("    " + ", ".join(f"{p}:{st}" for p, st in SEED_LOG), file=sys.stderr)
-            # BOTH nodes' databases, and each labelled with its role. The first version queried
-            # `A_ADMIN` only and CALLED it "the writer" — which was wrong twice over on the run that
-            # caught this: the writer was B, and the node holding the seed's writes was A. A dump that
-            # mislabels which database it read is worse than no dump: the fact it produced ("the row
-            # is missing") has to be attributed to the right node to mean anything.
-            #
-            # The variable is `node_role`, NOT `role`: this file has a module-level helper called
-            # `role(...)`, and assigning to that name anywhere inside `main()` makes it a LOCAL for
-            # the whole function — so the normal path died with
-            # `UnboundLocalError: cannot access local variable 'role'` at its first `role(...)` call,
-            # ~60 lines later. Caught by CI, not locally, because the only local check of this block
-            # was the forced-failure path, which returns before reaching that call: a diagnostic's own
-            # path is not the drill's normal path, and both have to be run.
-            for who, port in (("A", A_ADMIN), ("B", B_ADMIN)):
-                node_role = "writer" if leader_probe(port) == 200 else "follower"
-                print(f"--- what {who}'s admin API serves back (its own database; {node_role}) ---",
-                      file=sys.stderr)
+            for who, admin_port in (("A", A_ADMIN), ("B", B_ADMIN)):
+                st, out = admin("GET", "/cluster/status", port=admin_port)
+                print(f"--- {who} cluster/status -> HTTP {st} :: {out[:220]}", file=sys.stderr)
                 for path in ("providers", "provider-models", "provider-keys", "tenants",
                              "tenant-providers", "tenant-models"):
-                    st, out = admin("GET", f"/{path}", port=port)
-                    print(f"    {who} GET /{path} -> HTTP {st} :: {str(out)[:200]}", file=sys.stderr)
-            print("--- materialization on both nodes ---", file=sys.stderr)
-            for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
-                series = metric(port, "hydra_replica_materialize_retries_total")
-                print(f"    {label}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
-            # The publish counters say WHY a publish failed, by label:
-            # `hydra_arachne_publish_total{result}` ∈ {ok, not_leader, quorum_unavailable, error,
-            # refused} and `hydra_arachne_quorum_unavailable_total{op}` (label verified in a
-            # live dump: `hydra_arachne_publish_total{result="ok"} 6`). A drill that only prints the
-            # materialization counter knows the loop ran but not whether the write ever reached the
-            # tree — and "the write never reached the tree" is the symptom under investigation.
-            print("--- publish on both nodes ---", file=sys.stderr)
-            for label, port in (("cl-a", A_ADMIN), ("cl-b", B_ADMIN)):
-                for name in ("hydra_arachne_publish_total", "hydra_arachne_quorum_unavailable_total"):
-                    series = metric(port, name)
-                    print(f"    {label} {name}: {series or 'NO SERIES AT ALL'}", file=sys.stderr)
+                    st, out = admin("GET", f"/{path}", port=admin_port)
+                    print(f"    {who} GET /{path} -> HTTP {st} :: {str(out)[:180]}", file=sys.stderr)
             for p in (A_DATA, B_DATA):
-                st, _headers, body, took = proxied(p, "count.local", "sk-t1")
+                st, _headers, body, took = proxied(p, "count.local", CLIENT_KEYS["t1"])
                 print(f"--- data plane :{p} -> HTTP {st} after {took:.2f}s :: {body[:300]}",
                       file=sys.stderr)
             for label in ("cl-a", "cl-b"):
                 log = open(os.path.join(DIR, f"{label}.log"), errors="replace").read()
-                # The whole file is scanned for the publish failure's own line — the tail may be
-                # long past it by the time this dump runs, and that line carries the reason.
-                publish_lines = [l for l in log.splitlines() if "PUBLISH FAILED" in l or "not_leader" in l]
-                print(f"--- {label}.log: publish failures ({len(publish_lines)}) ---", file=sys.stderr)
-                for line in publish_lines[:3]:
-                    print(f"    {line[:400]}", file=sys.stderr)
-                print(f"--- {label}.log (last 1200) ---\n{log[-1200:]}", file=sys.stderr)
-            print("[cluster-limits] CANNOT VERIFY: a member never routed the tenant",
+                print(f"--- {label}.log (last 1400) ---\n{log[-1400:]}", file=sys.stderr)
+            print("[cluster-limits] CANNOT VERIFY: a node never routed the seeded tenant",
                   file=sys.stderr)
             return 2
 
         # ---- C0: control, before any role exists ------------------------------
-        st_l = proxied(A_DATA, "count.local", "sk-t1")[0]
-        st_e = proxied(B_DATA, "count.local", "sk-t1")[0]
+        st_l = proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])[0]
+        st_e = proxied(B_DATA, "count.local", CLIENT_KEYS["t1"])[0]
         check("C0: with no limit role, BOTH members serve the tenant (200)",
               st_l == 200 and st_e == 200, f"a={st_l} b={st_e}")
 
@@ -659,8 +617,8 @@ def main():
         st, out = admin("POST", "/reload", {})
         check("C1: the three roles were accepted (any member applies a management write now; the probe role written LAST)",
               st == 200, f"HTTP {st} {out[:80]}")
-        converged = wait_for(lambda: proxied(B_DATA, "probe.local", "sk-t3")[0] == 429, budget=20)
-        st_l3 = proxied(A_DATA, "probe.local", "sk-t3")[0]
+        converged = wait_for(lambda: proxied(B_DATA, "probe.local", CLIENT_KEYS["t3"])[0] == 429, budget=20)
+        st_l3 = proxied(A_DATA, "probe.local", CLIENT_KEYS["t3"])[0]
         check("C1: `limit_count = 0` denies UNCONDITIONALLY on both members (an unconditional "
               "deny needs no window — it is the convergence probe)",
               converged and st_l3 == 429, f"a={st_l3} b-429={converged}")
@@ -678,8 +636,8 @@ def main():
               deny_keys == [], f"keys={deny_keys}")
 
         # ---- C2: the SHARED count window --------------------------------------
-        codes_l = [proxied(A_DATA, "count.local", "sk-t1")[0] for _ in range(2)]
-        st_e1, _, body_e1, _ = proxied(B_DATA, "count.local", "sk-t1")
+        codes_l = [proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])[0] for _ in range(2)]
+        st_e1, _, body_e1, _ = proxied(B_DATA, "count.local", CLIENT_KEYS["t1"])
         announce("C2 the three admits", f"a={codes_l} b={st_e1}")
         check("C2: the two members' admits land in ONE window: 2 on A + 1 on B fill `limit_count = 3`",
               codes_l == [200, 200] and st_e1 == 200,
@@ -694,8 +652,8 @@ def main():
               f"members={len(members)} distinct instance prefixes={len(prefixes)}")
         announce("C2 the window in Redis right after the fill",
                  zinfo(redis_sock, count_keys[0]) if count_keys else "key absent")
-        st_l4, headers_l4, _, _ = proxied(A_DATA, "count.local", "sk-t1")
-        st_e2, _, _, _ = proxied(B_DATA, "count.local", "sk-t1")
+        st_l4, headers_l4, _, _ = proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])
+        st_e2, _, _, _ = proxied(B_DATA, "count.local", CLIENT_KEYS["t1"])
         ra = headers_l4.get("Retry-After") or headers_l4.get("retry-after")
         check("C2: ...and once the SHARED window is full, BOTH members refuse (429)",
               st_l4 == 429 and st_e2 == 429, f"a={st_l4} b={st_e2}")
@@ -732,7 +690,7 @@ def main():
         # waits (bounded) for the sample and reports how long that took; a sample that never appears
         # fails on its OWN assertion instead of masquerading as "B admitted the request". The poll
         # uses `keys_matching_fast` — the 100 ms helper cannot resolve a ~100 ms gap.
-        st_t1 = proxied(A_DATA, "token.local", "sk-t2")[0]
+        st_t1 = proxied(A_DATA, "token.local", CLIENT_KEYS["t2"])[0]
         visible_at = time.monotonic()
         token_keys = []
         while time.monotonic() - visible_at < 5.0:
@@ -754,7 +712,7 @@ def main():
               len(token_keys) == 1,
               f"keys={token_keys} after waiting {lag * 1000:.1f} ms (no sample = A never recorded it: "
               f"look for `token-usage record failed` in the node log, and check the member prefixes)")
-        st_t2, _, _, _ = proxied(B_DATA, "token.local", "sk-t2")
+        st_t2, _, _, _ = proxied(B_DATA, "token.local", CLIENT_KEYS["t2"])
         check("C3: the token ceiling is crossed by usage recorded on the OTHER node "
               "(B refuses on the sample A wrote, measured across processes)",
               st_t1 == 200 and st_t2 == 429, f"first(a)={st_t1} second(b)={st_t2} (sample seen after "
@@ -769,12 +727,12 @@ def main():
         errs_before = metric_sum(A_ADMIN, "hydra_control_poll_total", 'result="rate_limit_error"')
         relay.set_blocked(True)
         time.sleep(0.5)
-        st_cut, _, _, elapsed_cut = proxied(A_DATA, "count.local", "sk-t1")
+        st_cut, _, _, elapsed_cut = proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])
         announce("C4 request 1 (a, cut)",
                  f"HTTP {st_cut} in {elapsed_cut:.2f}s window={zinfo(redis_sock, count_keys[0])}")
         cut_codes = [st_cut]
         for i in (2, 3):
-            st_i, _, _, el_i = proxied(B_DATA, "count.local", "sk-t1")
+            st_i, _, _, el_i = proxied(B_DATA, "count.local", CLIENT_KEYS["t1"])
             cut_codes.append(st_i)
             announce(f"C4 request {i} (b, cut)",
                      f"HTTP {st_i} in {el_i:.2f}s window={zinfo(redis_sock, count_keys[0])}")
@@ -805,7 +763,7 @@ def main():
         relay.set_blocked(False)
         relay.set_blackhole(True)
         time.sleep(0.5)
-        st_bh, _, _, elapsed_bh = proxied(A_DATA, "count.local", "sk-t1")
+        st_bh, _, _, elapsed_bh = proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])
         relay.set_blackhole(False)
         announce("C4b request against a black-holed bus", f"HTTP {st_bh} in {elapsed_bh:.2f}s")
         check("C4b: a black-holed Redis still yields a response (fail-open, not a hang)",
@@ -840,7 +798,7 @@ def main():
         first_after = None          # round 166: the FIRST reply after the bus is back
         t0 = time.time()
         for attempt in range(1, 46):
-            st_r, _, _, el_r = proxied(A_DATA, "count.local", "sk-t1")
+            st_r, _, _, el_r = proxied(A_DATA, "count.local", CLIENT_KEYS["t1"])
             if first_after is None:
                 first_after = st_r
             took = time.time() - t0
@@ -871,14 +829,14 @@ def main():
     finally:
         stop(proc_a)
         stop(proc_b)
-        relay.set_blocked(True)
+        relay.stop()
         try:
-            relay.server.shutdown()
-            relay.server.server_close()
-        except Exception:
+            redis_sock.close()
+        except OSError:
             pass
-        redis_sock.close()
         upstream.shutdown()
+        if TEST_DB is not None:
+            TEST_DB.cleanup()
 
     print()
     if failures:

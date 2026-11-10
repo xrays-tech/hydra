@@ -42,7 +42,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model (`model_key`) + one key. The
 /// provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_routed(pool: &sqlx::SqlitePool, upstream_endpoint: &str, model_key: &str) {
+async fn seed_routed(pool: &hydra_server::db::Pool, upstream_endpoint: &str, model_key: &str) {
     repo::insert_provider(
         pool,
         &Provider {

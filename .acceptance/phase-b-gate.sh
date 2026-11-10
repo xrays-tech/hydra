@@ -23,7 +23,8 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 export CARGO_HOME="$REPO/.cargo-cache/home"; export PATH="$CARGO_HOME/bin:$PATH"
-export RUSTFLAGS="-D warnings" SQLX_OFFLINE=true
+export RUSTFLAGS="-D warnings"
+export HYDRA_TEST_DATABASE_URL="${HYDRA_TEST_DATABASE_URL:-postgres://hydra:hydra@127.0.0.1:5432/hydra}"
 export HYDRA_SHUTDOWN_DRAIN_SECS=20
 export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380
 export npm_config_cache="$REPO/.acceptance/npm-cache"
@@ -59,8 +60,8 @@ run() {
 
 run "1a. lockfile fresh"         cargo update --workspace --locked --dry-run
 run "1b. fmt"                    cargo fmt --check
-run "1c. clippy (server)"        cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
-run "1d. release build (server)" cargo build --release --workspace --features hydra-server/server
+run "1c. clippy (server)"        cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/db-postgres -- -D warnings
+run "1d. release build (server)" cargo build --release --workspace --features hydra-server/server,hydra-server/db-postgres
 
 run "2a. hydra-core tests"       cargo test -p hydra-core
 
@@ -73,15 +74,15 @@ else
   echo "dependency firewall OK"; RESULTS+=("PASS  2b. dependency firewall")
 fi
 
-run "3a. hydra-server tests (server)" cargo test -p hydra-server --features server
+run "3a. hydra-server tests (server)" cargo test -p hydra-server --features server,db-postgres
 echo "server suites ok: $(grep -cE '^test result: ok\.' "$LAST_LOG")"
 
 run "3b. clippy (server+cluster-redis+usage-clickhouse)" \
-  cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse -- -D warnings
+  cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres -- -D warnings
 run "3c. release build (all optional features)" \
-  cargo build --release --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
+  cargo build --release --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres
 run "3d. hydra-server tests (all optional features)" \
-  cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse
+  cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres
 
 step "3e. all-features suite totals (from step 3d's own run)"
 allfeat_passed=$(grep -E '^test result: ok\.' "$LAST_LOG" | awk '{s+=$4} END {print s+0}')
@@ -109,12 +110,11 @@ if [ -f "$RUN/hydra.pid" ]; then kill "$(cat "$RUN/hydra.pid")" 2>/dev/null || t
 # process still holds the port, the new instance exits and the readiness guard
 # below fails loudly instead of silently validating a stale binary.
 sleep 1
-rm -f "$RUN/e2e.db" "$RUN/e2e.db-shm" "$RUN/e2e.db-wal"
 (
   cd "$RUN"
   nohup env HYDRA_ADMIN_TOKEN=dev-admin-token-2026 HYDRA_ADMIN_ADDR=127.0.0.1:18081 \
     HYDRA_LISTEN=127.0.0.1:18080 \
-    HYDRA_DB_URL="sqlite://$RUN/e2e.db?mode=rwc" \
+    HYDRA_DB_URL="${HYDRA_TEST_DATABASE_URL:-postgres://hydra:hydra@127.0.0.1:5432/hydra}" \
     HYDRA_ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
     "$REPO/target/release/hydra" >"$RUN/hydra.log" 2>&1 &
   echo $! > "$RUN/hydra.pid"

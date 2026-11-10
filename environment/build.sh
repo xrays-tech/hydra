@@ -13,38 +13,57 @@
 # target (which has `required-features = ["server"]`) for the cross target, so the binary is
 # silently skipped. This script does that for you.
 #
-# The image bundles ALL optional features (server + cluster-redis + arachne + usage-clickhouse)
-# so a SINGLE `hydra:latest` image serves both single-node (no HYDRA_CLUSTER_PEERS → zero external
-# deps, unchanged behavior) and cluster mode (HYDRA_CLUSTER_PEERS set → Arachne raft membership +
-# Redis for the data-plane state). ADR-0001 retired HYDRA_ROLE: the member list IS the decision.
+# The image bundles the server + one relational backend + Redis data-plane + ClickHouse usage
+# features so a SINGLE build serves both single-node (no `HYDRA_REDIS_URL` -> zero external deps)
+# and cluster mode (`HYDRA_REDIS_URL` set -> shared Redis rate/breaker state). Config authority is
+# the relational database; there is no raft control plane/leader.
 #
-# `arachne` is NOT optional for a cluster deployment: without it the binary refuses to BOOT when
-# `HYDRA_CLUSTER_PEERS` is set (main.rs: "this build has no control plane"), so an image built
-# from this recipe without the feature could not run `docker-compose.cluster.yml` at all. Measured
-# 2026-10-05: the recipe listed three features while every compose manifest in this directory
-# requires raft, and CI stayed green because CI's own builds pass `arachne` separately.
-# `scripts/check_image_features.cjs` now derives the required set from the manifests so this
+# DB_BACKEND selects the compiled relational backend (default `postgres`):
+#   postgres -> `db-postgres` -> images `hydra:postgres` and `hydra:latest`
+#   mysql    -> `db-mysql`    -> image  `hydra:mysql`
+# The default backend also owns the legacy `hydra:latest` tag.
+#
+# `scripts/check_compose_env.cjs` derives the required backend feature from the manifests so this
 # cannot drift again.
 #
 # Usage:
-#   ./environment/build.sh              # full: cross-compile + stage + docker build
-#   ./environment/build.sh --no-build   # cross-compile + stage only (skip docker build)
+#   ./environment/build.sh                       # postgres (default): cross-compile + stage + docker build
+#   DB_BACKEND=mysql ./environment/build.sh      # mysql variant
+#   ./environment/build.sh --no-build            # cross-compile + stage only (skip docker build)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+DB_BACKEND="${DB_BACKEND:-postgres}"
+case "$DB_BACKEND" in
+    postgres) : ;;
+    mysql) : ;;
+    *)
+        echo "!! DB_BACKEND must be 'postgres' or 'mysql' (got '$DB_BACKEND')" >&2
+        exit 2
+        ;;
+esac
+
+# Both variants are written as LITERAL feature lists so `scripts/check_compose_env.cjs` can read
+# them without evaluating shell. Exactly one backend feature is active per build.
+if [[ "$DB_BACKEND" == "postgres" ]]; then
+    FEATURES="server,cluster-redis,usage-clickhouse,db-postgres"
+else
+    FEATURES="server,cluster-redis,usage-clickhouse,db-mysql"
+fi
 
 TARGET="x86_64-unknown-linux-gnu"
 GLOBAL_TARGET_BIN="$HOME/.cargo/global-target/$TARGET/release/hydra"
 DO_DOCKER=1
 [[ "${1:-}" == "--no-build" ]] && DO_DOCKER=0
 
-echo ">> [1/3] cross-compiling hydra for $TARGET (release) via rust_build_linux..."
+echo ">> [1/3] cross-compiling hydra for $TARGET (release, $DB_BACKEND) via rust_build_linux..."
 # Run from the package dir so `--features … --bin hydra` resolves correctly for the cross target
-# (the `[[bin]] hydra` target has `required-features = ["server"]`). usage-clickhouse compiles
-# BOTH sinks (sqlite + clickhouse) into one binary; cluster-redis is the data-plane backbone;
-# arachne is the control plane (raft). HYDRA_CLUSTER_PEERS / HYDRA_USAGE_SINK select at runtime.
-( cd crates/hydra-server && rust_build_linux --features server,cluster-redis,arachne,usage-clickhouse --bin hydra )
+# (the `[[bin]] hydra` target has `required-features = ["server"]`). usage-clickhouse compiles the
+# usage sink; cluster-redis is the data-plane backbone; db-postgres/db-mysql selects the relational
+# backend (exactly one is required — `db/backend.rs` refuses to compile without one).
+( cd crates/hydra-server && rust_build_linux --features "$FEATURES" --bin hydra )
 
 if [[ ! -f "$GLOBAL_TARGET_BIN" ]]; then
     echo "!! expected binary not found at $GLOBAL_TARGET_BIN" >&2
@@ -58,10 +77,20 @@ chmod +x bin/hydra
 echo "    $(file bin/hydra | cut -d, -f1-2)"
 
 if [[ "$DO_DOCKER" -eq 1 ]]; then
-    echo ">> [3/3] building docker image hydra:latest..."
-    docker build -t hydra:latest -f environment/Dockerfile .
-    echo ">> done."
-    echo "   run: docker run --rm -p 443:443 -p 8081:8081 -v \"$PWD/data\":/app/data -e HYDRA_ADMIN_TOKEN=<token> hydra:latest"
+    echo ">> [3/3] building docker image hydra:$DB_BACKEND..."
+    docker build -t "hydra:$DB_BACKEND" -f environment/Dockerfile .
+    # `hydra:latest` follows the DEFAULT backend only; a mysql build must not silently become the
+    # image a `docker run hydra:latest` picks up.
+    if [[ "$DB_BACKEND" == "postgres" ]]; then
+        docker tag "hydra:$DB_BACKEND" hydra:latest
+        echo ">> done. images: hydra:postgres (default) + hydra:latest"
+    else
+        echo ">> done. image: hydra:mysql (hydra:latest left untouched)"
+    fi
+    echo "   run: docker run --rm -p 8080:8080 -p 8081:8081 \\"
+    echo "          -e HYDRA_ADMIN_TOKEN=<token> \\"
+    echo "          -e HYDRA_DB_URL='postgres://hydra:hydra@HOST:5432/hydra' \\"
+    echo "          hydra:$DB_BACKEND"
 else
     echo ">> staged bin/hydra (docker build skipped)."
 fi

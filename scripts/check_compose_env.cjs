@@ -14,16 +14,12 @@
  *    becomes a rule for this guard in the same commit, with no second list to keep in sync.
  *
  * 2. THE FEATURE SET THAT BUILDS THE BINARY MUST COVER WHAT THE MANIFEST ASKS THE BINARY TO DO.
- *    `HYDRA_CLUSTER_PEERS` set on a binary built without the `arachne` feature is a REFUSAL TO
- *    BOOT (`main.rs`: "this build has no control plane"), and `HYDRA_REDIS_URL` /
- *    `HYDRA_REDIS_MODE` on a binary without `cluster-redis` are SILENTLY IGNORED
+ *    A manifest that sets `HYDRA_REDIS_URL` / `HYDRA_REDIS_MODE` asks the binary to use the shared
+ *    Redis data plane; built without `cluster-redis` those settings are SILENTLY IGNORED
  *    (`redis_backend` is `None` under `#[cfg(not(feature = "cluster-redis"))]`), so every node
  *    would keep its own rate limits and its own auth L2 while the manifest claims a shared
- *    backbone. Measured 2026-10-05: `environment/build.sh` — the recipe that produces the image
- *    EVERY manifest in this directory runs — listed three features and not `arachne`, while CI
- *    stayed green because CI's own builds pass `arachne` in a separate step. The requirement is
- *    DERIVED from the manifests below, so a manifest that starts using raft drags the recipe with
- *    it.
+ *    backbone. Cluster mode itself is `HYDRA_REDIS_URL` presence; the raft/Arachne feature is
+ *    retired. The requirement is DERIVED from the manifests below.
  *
  * The manifests are read with `compose_static.cjs` — the text reader the other compose guards fall
  * back to when `docker compose config` cannot render a file. In CI that is ALWAYS the case for the
@@ -44,6 +40,7 @@ const {
   collectAnchors,
   mergeRefs,
   subBlock,
+  envValue,
   unjudgeableServices,
 } = require('./compose_static.cjs');
 
@@ -69,6 +66,21 @@ const RECIPES = ['environment/build.sh', 'environment/release.sh'];
 
 /** The `[[bin]] hydra` target is gated on this feature; a recipe without it produces no binary. */
 const BIN_FEATURE = 'server';
+
+/** The relational backends: exactly ONE is required per build (`db/backend.rs` compile_error!). */
+const DB_BACKENDS = ['db-postgres', 'db-mysql'];
+
+/**
+ * The backend a compose `HYDRA_DB_URL` asks the binary for, derived from its scheme.
+ *
+ * `null` means "not a database URL this tree supports" — SQLite is reported separately, and an
+ * unknown scheme is a manifest the guard cannot judge.
+ */
+function backendFeature(url) {
+  if (/^postgres(?:ql)?:\/\//i.test(url) || /^postgres(?:ql)?:/i.test(url)) return 'db-postgres';
+  if (/^mysql:\/\//i.test(url) || /^mysql:/i.test(url)) return 'db-mysql';
+  return null;
+}
 
 /**
  * `NAME: value` per line, from `subBlock(…, 'environment')` and from any anchor it merges.
@@ -164,9 +176,16 @@ function readManifest(label, file, clusterOnly, retired) {
   }
   const anchors = collectAnchors(text);
   const names = new Set();
+  const dbUrls = new Map();
+  const sqliteUrls = [];
   const notes = [];
   for (const { name, block } of services) {
     for (const n of envNames(block, anchors)) names.add(n);
+    const url = envValue(block, 'HYDRA_DB_URL', anchors);
+    if (url) {
+      dbUrls.set(name, url);
+      if (/^sqlite:/i.test(url)) sqliteUrls.push(`${name}: ${url}`);
+    }
     for (const ref of envFileRefs(block)) {
       const resolved = envFileNames(path.resolve(path.dirname(file), ref));
       if (resolved === null) {
@@ -182,17 +201,28 @@ function readManifest(label, file, clusterOnly, retired) {
   const retiredSet = [...names].filter((n) => retired.set.has(n));
 
   // 2. Feature requirement, derived from what the manifest sets (not from a list here).
+  //    Cluster mode is `HYDRA_REDIS_URL` presence; there is no raft/Arachne feature any more.
   const features = new Set([BIN_FEATURE]);
-  if (set('HYDRA_CLUSTER_PEERS')) features.add('arachne');
   if (set('HYDRA_REDIS_URL') || set('HYDRA_REDIS_MODE')) features.add('cluster-redis');
 
-  // A manifest that sets cluster WIRING but not the member list is the "standalone node that
-  // silently drops its configuration" case `cluster_decision` reports as `WiringWithoutMembers`:
-  // the manifests must not ship that shape at all.
-  const wiringWithoutMembers = !set('HYDRA_CLUSTER_PEERS')
-    && clusterOnly.names.filter((n) => n !== 'HYDRA_CLUSTER_PEERS').filter(set);
+  // The relational backend is derived from each node's HYDRA_DB_URL scheme. A manifest may set
+  // it explicitly on every node (shared DB) or not at all (fixtures); when it is set, the recipe
+  // that builds the binary MUST compile the matching feature.
+  const backends = new Set();
+  const unknownDbUrls = [];
+  for (const [name, url] of dbUrls) {
+    const feature = backendFeature(url);
+    if (feature) backends.add(feature);
+    else if (!/^sqlite:/i.test(url)) unknownDbUrls.push(`${name}: ${url}`);
+  }
 
-  return { label, file, services: services.length, names, unlisted, retired: retiredSet, features, wiringWithoutMembers, notes };
+  // A manifest that sets cluster wiring but not `HYDRA_REDIS_URL` is the "standalone node that
+  // silently drops its configuration" case `cluster_decision` reports as `Dropped`: the manifests
+  // must not ship that shape at all.
+  const wiringWithoutRedis = !set('HYDRA_REDIS_URL')
+    && clusterOnly.names.filter((n) => n !== 'HYDRA_REDIS_URL').filter(set);
+
+  return { label, file, services: services.length, names, unlisted, retired: retiredSet, features, backends, dbUrls, sqliteUrls, unknownDbUrls, wiringWithoutRedis, notes };
 }
 
 /** `--features a,b,c` lists in one recipe, one per build invocation. */
@@ -201,13 +231,26 @@ function readRecipe(label, file) {
   const lists = [];
   for (const line of text.split('\n')) {
     if (/^\s*#/.test(line)) continue;
+    // A literal feature list on the command line.
     const m = /--features\s+([^\s"'\\]+)/.exec(line);
-    if (m) lists.push({ line: line.trim(), features: new Set(m[1].split(',').map((f) => f.trim()).filter(Boolean)) });
+    if (m) {
+      lists.push({ line: line.trim(), features: new Set(m[1].split(',').map((f) => f.trim()).filter(Boolean)) });
+      continue;
+    }
+    // A literal `FEATURES="…"` assignment (the backend-variant recipes write one per backend so
+    // `--features "$FEATURES"` can switch without evaluating the shell).
+    const f = /^\s*(?:export\s+)?FEATURES=(?:"([^"]+)"|'([^']+)'|([^\s#]+))/.exec(line);
+    if (f) {
+      const value = f[1] ?? f[2] ?? f[3];
+      if (value) {
+        lists.push({ line: line.trim(), features: new Set(value.split(',').map((x) => x.trim()).filter(Boolean)) });
+      }
+    }
   }
   if (lists.length === 0) {
     throw new Error(
-      `found no \`--features …\` in ${label}; refusing to judge a recipe whose feature set this ` +
-        'reader cannot read (if the build moved elsewhere, point RECIPES at its new home)',
+      `found no \`--features …\` or \`FEATURES="…"\` in ${label}; refusing to judge a recipe whose ` +
+        'feature set this reader cannot read (if the build moved elsewhere, point RECIPES at its new home)',
     );
   }
   return { label, file, lists };
@@ -257,10 +300,21 @@ function main() {
           'ignored, so the manifest is telling the reader the opposite of what happens',
       );
     }
-    if (m.wiringWithoutMembers.length > 0) {
+    if (m.wiringWithoutRedis.length > 0) {
       problems.push(
-        `${m.label}: sets cluster wiring (${m.wiringWithoutMembers.join(', ')}) but no ` +
-          'HYDRA_CLUSTER_PEERS — that node boots standalone and drops every one of those settings',
+        `${m.label}: sets cluster wiring (${m.wiringWithoutRedis.join(', ')}) but no ` +
+          'HYDRA_REDIS_URL — that node boots standalone and drops every one of those settings',
+      );
+    }
+    for (const url of m.sqliteUrls) {
+      problems.push(
+        `${m.label}: uses SQLite (${url}) — the SQLite backend was removed in Phase 2; set ` +
+          'HYDRA_DB_URL to postgres://… or mysql://… (credentials hydra/hydra, database hydra)',
+      );
+    }
+    for (const url of m.unknownDbUrls) {
+      problems.push(
+        `${m.label}: HYDRA_DB_URL has no recognised scheme (${url}) — expected postgres:// or mysql://`,
       );
     }
     for (const n of m.unlisted) {
@@ -274,6 +328,11 @@ function main() {
   // Rule 2 is a cross-product: EVERY recipe must cover EVERY manifest's requirement, because both
   // recipes stage a binary that a manifest in this directory runs.
   for (const r of recipes) {
+    // The backend features this recipe builds (across its backend variants).
+    const builtBackends = new Set();
+    for (const list of r.lists) {
+      for (const b of DB_BACKENDS) if (list.features.has(b)) builtBackends.add(b);
+    }
     for (const m of manifests) {
       for (const list of r.lists) {
         const missing = [...m.features].filter((f) => !list.features.has(f));
@@ -285,6 +344,30 @@ function main() {
               `built that way the binary refuses to boot / silently ignores the setting`,
           );
         }
+      }
+      // Each backend a manifest asks for must be built by a variant of this recipe.
+      for (const backend of m.backends) {
+        if (!builtBackends.has(backend)) {
+          problems.push(
+            `${r.label}: no build variant carries \`${backend}\`, which ${m.label} requires via its ` +
+              `HYDRA_DB_URL; the recipe would produce a binary that cannot open that database`,
+          );
+        }
+      }
+    }
+    // Exactly ONE backend per build: `db/backend.rs` emits compile_error! for neither AND for both.
+    for (const list of r.lists) {
+      const backends = DB_BACKENDS.filter((b) => list.features.has(b));
+      if (backends.length === 0) {
+        problems.push(
+          `${r.label}: \`${list.line}\` selects NO database backend — enable exactly one of ` +
+            `${DB_BACKENDS.join(' / ')} (db/backend.rs refuses to compile without one)`,
+        );
+      } else if (backends.length > 1) {
+        problems.push(
+          `${r.label}: \`${list.line}\` selects ${backends.join(' AND ')} — the backends are ` +
+            'mutually exclusive (db/backend.rs emits compile_error!)',
+        );
       }
     }
   }
@@ -298,7 +381,8 @@ function main() {
   console.log(
     `[compose-env] OK: ${manifests.length} manifest(s) judged (${judged}); none sets any of the ` +
       `${retired.names.length} variable(s) RETIRED_CLUSTER_ENV retires, every cluster node carries ` +
-      'the member list, and every recipe that stages a binary carries the features the manifests need',
+      'the Redis data-plane wiring, every recipe that stages a binary carries the features the ' +
+      'manifests need, and every build selects exactly one relational backend (db-postgres / db-mysql)',
   );
   console.log(
     `[compose-env] OK: recipes judged: ${recipes.map((r) => `${r.label}=${r.lists.length} build(s)`).join(', ')}`,

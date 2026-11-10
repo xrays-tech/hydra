@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -154,7 +155,8 @@ def proxied():
 
 
 def db_file(label):
-    return os.path.join(DIR, f"{label}.db")
+    # A per-label isolated real DB (the label is the cache key across restarts).
+    return env_db_url(f"mks_{label}")
 
 
 def base_env():
@@ -175,7 +177,7 @@ def start(label, key_file_bytes=None, inline=None, db=None, extra=None):
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
-        "HYDRA_DB_URL": f"sqlite://{db or db_file('shared')}?mode=rwc",
+        "HYDRA_DB_URL": db or db_file("shared"),
         "RUST_LOG": "info",
     })
     env.pop("HYDRA_ENCRYPTION_KEY_FILE", None)
@@ -335,7 +337,7 @@ def main():
     proc7 = subprocess.run(
         [BIN], capture_output=True, text=True, timeout=40,
         env={**env7, "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
-             "HYDRA_LISTEN": f"127.0.0.1:{DATA}", "HYDRA_DB_URL": f"sqlite://{db_a}?mode=rwc",
+             "HYDRA_LISTEN": f"127.0.0.1:{DATA}", "HYDRA_DB_URL": db_a,
              "RUST_LOG": "info",
              "HYDRA_ENCRYPTION_KEY_FILE": os.path.join(DIR, "does-not-exist.key")})
     out7 = (proc7.stdout or "") + (proc7.stderr or "")

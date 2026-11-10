@@ -133,8 +133,8 @@ pub struct AppState {
     pub tenant_api_limiter: Arc<crate::tenant_api::limit::TenantApiLimiter>,
 
     /// Cache-clearing fan-out and its convergence barrier (T6). `None` in a build
-    /// without `cluster-redis`, where the local clear IS the complete answer:
-    /// `HYDRA_ROLE=leader|edge` is refused at startup without that feature, so a
+    /// without `cluster-redis`, where the local clear IS the complete answer: a
+    /// Redis-backed cluster is refused at startup without that feature, so a
     /// feature-less build cannot be a cluster. Mirrors `AdminState`'s shape.
     #[cfg(feature = "cluster-redis")]
     pub invalidation: Option<crate::cluster::events::InvalidationStream>,

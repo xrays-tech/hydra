@@ -1,7 +1,7 @@
 //! Domain entities — pure data structures (no logic).
 //!
-//! These mirror the SQLite schema in `dev-docs/design.md` §4.1. Timestamps are
-//! stored as ISO-8601 `String` (the core has no `chrono` dependency by design;
+//! These mirror the relational schema in `dev-docs/design.md` §4.1 (the PostgreSQL
+//! and MySQL migrations are authoritative). Timestamps are stored as ISO-8601 `String` (the core has no `chrono` dependency by design;
 //! the server translates to/from `DateTime` at the I/O boundary). `enabled`
 //! and `status` use idiomatic Rust types (`bool`/`i32`); the DB-layer
 //! mapping (INTEGER 0/1) lives in `hydra-server`.
@@ -136,8 +136,8 @@ pub struct TenantModel {
 // ---------------------------------------------------------------------------
 
 /// A user's billing state (plan §3.2 / acceptance B4). The wire form is
-/// snake_case, matching the SQLite `CHECK (billing_status IN
-/// ('active','delinquent'))` domain. `Delinquent` ⇒ API-key auth answers 402
+/// snake_case, matching the database `CHECK (billing_status IN
+/// ('active','delinquent'))` domain in both migrations. `Delinquent` ⇒ API-key auth answers 402
 /// `user_delinquent` (never 401: the key exists and is valid, the account cannot
 /// pay).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ pub enum BillingStatus {
 }
 
 /// A user group: a tenant-scoped grouping of users (plan §3.1, acceptance A1).
-/// `UNIQUE (tenant_id, name)` is enforced by SQLite; the loader keeps ALL rows
+/// `UNIQUE (tenant_id, name)` is enforced by the database; the loader keeps ALL rows
 /// (incl. `enabled == false`) in `ConfigData::user_groups` so a disabled group
 /// answers 403 `group_disabled` (known but disabled) rather than 401.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,8 +168,9 @@ pub struct UserGroup {
 /// `billing_status` is the欠费 dimension (plan §3.2 / D-5): the identity index
 /// deliberately carries it for disabled AND delinquent rows so replicas decide
 /// 402/403 consistently. `external_id` is an optional operator-supplied id,
-/// `UNIQUE (tenant_id, external_id)` in SQLite (NULL allowed, not deduplicated
-/// there — SQLite treats NULLs as distinct, which matches "no external id").
+/// `UNIQUE (tenant_id, external_id)` in the database (NULL allowed, not
+/// deduplicated there — PostgreSQL and MySQL treat NULLs as distinct, which
+/// matches "no external id").
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     pub id: String,

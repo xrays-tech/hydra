@@ -383,6 +383,23 @@ function main(argv) {
   }
   const rows = parsed.filter((r) => !NOT_READ_MARKERS.some((re) => re.test(r.rest)));
 
+  // Retired cluster knobs may stay in the operator docs until the Phase 4 docs cleanup. They are
+  // NOT promises any more: `RETIRED_CLUSTER_ENV` is the single owner of that list, and the
+  // architecture removed their last readers on purpose.
+  const retiredClusterEnv = new Set();
+  try {
+    const owner = fs.readFileSync(
+      path.join(opts.codeRoot, 'crates/hydra-server/src/cluster/mod.rs'),
+      'utf8',
+    );
+    const decl = owner.match(/const\s+RETIRED_CLUSTER_ENV\s*:\s*\[&str;\s*\d+\]\s*=\s*\[([\s\S]*?)\];/);
+    if (decl) {
+      for (const m of decl[1].matchAll(/"([A-Z0-9_]+)"/g)) retiredClusterEnv.add(m[1]);
+    }
+  } catch {
+    // Fixture trees may not carry the Rust source.
+  }
+
   const sites = collectReadSites(opts.codeRoot);
   const missing = [];
   let checked = 0;
@@ -398,6 +415,7 @@ function main(argv) {
       // Only configuration names are promised here; a table may also name other
       // constants in its first cell, so skip anything that is not env-shaped.
       if (!/^(HYDRA|RUST_LOG|LLM|OPENAI|ANTHROPIC)/.test(name)) continue;
+      if (retiredClusterEnv.has(name)) continue;
       checked += 1;
       checkedNames.add(name);
       if (sites.has(name)) continue;

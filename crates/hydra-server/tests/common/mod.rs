@@ -1,12 +1,13 @@
 //! Shared integration-test helpers.
 //!
-//! Every persistence test gets its own fresh `:memory:` SQLite database
-//! (design wave-2 §3: real engine, never a mock). The pool is pinned to a
-//! single connection (see [`db::init_pool`]) so migrations are visible to all
-//! queries within the test.
+//! Every persistence test gets its own migrated PostgreSQL schema / MySQL
+//! database (design wave-2 §3: real engine, never a mock). Provisioning lives in
+//! [`hydra_server::db::testing`]; tests that need the URL for a spawned binary
+//! must keep the [`TestDb`] alive for the process's lifetime.
 
 use hydra_server::db;
-use sqlx::SqlitePool;
+
+pub use hydra_server::db::testing::TestDb;
 
 // ---------------------------------------------------------------------------
 // Identity seeding helpers (multi-token / internal-auth model)
@@ -42,7 +43,7 @@ fn display_atoms(plaintext: &str) -> (String, String) {
 /// rotates the token deletes the old row by this id.
 #[allow(dead_code)]
 pub async fn seed_tenant_access_token(
-    pool: &SqlitePool,
+    pool: &db::Pool,
     tenant_id: &str,
     name: &str,
     plaintext: &str,
@@ -78,7 +79,7 @@ pub async fn seed_tenant_access_token(
 /// Returns `(group_id, user_id, key_id)`.
 #[allow(dead_code)]
 pub async fn seed_api_identity(
-    pool: &SqlitePool,
+    pool: &db::Pool,
     tenant_id: &str,
     api_key_plaintext: &str,
 ) -> (String, String, String) {
@@ -123,6 +124,7 @@ pub async fn seed_api_identity(
     let (prefix, last4) = display_atoms(api_key_plaintext);
     db::insert_user_api_key(
         pool,
+        tenant_id,
         &hydra_core::model::UserApiKey {
             id: key_id.clone(),
             user_id: user_id.clone(),
@@ -142,18 +144,22 @@ pub async fn seed_api_identity(
     (group_id, user_id, key_id)
 }
 
-/// A migrated, PRAGMA-configured in-memory pool. One per test.
+/// A migrated isolated database. One per test.
+///
+/// The backing schema/database is leaked on purpose (the pool is all the caller
+/// needs); CI database containers are disposable. A test that spawns the real
+/// binary should use [`setup_db`] instead and pass its URL.
 // Each test target compiles this module on its own, so a helper used by one
 // target is "dead code" in all the others (same as [`ephemeral_port`]).
 #[allow(dead_code)]
-pub async fn setup_pool() -> SqlitePool {
-    let pool = db::init_pool("sqlite::memory:")
-        .await
-        .expect("init_pool should connect to :memory:");
-    db::run_migrate(&pool)
-        .await
-        .expect("run_migrate should create the schema");
-    pool
+pub async fn setup_pool() -> db::Pool {
+    db::testing::setup_pool().await
+}
+
+/// A migrated isolated database plus its URL, for tests that spawn the binary.
+#[allow(dead_code)]
+pub async fn setup_db() -> TestDb {
+    db::testing::isolated().await
 }
 
 /// A REAL Redis for integration tests (dev-plan 铁律 2: Redis is an external
@@ -265,31 +271,4 @@ pub fn ephemeral_port() -> u16 {
         }
     }
     panic!("no free test port in the allocated block");
-}
-
-/// A hydrated wire with NO fidelity rows, for tests that only exercise the
-/// config swap / version adoption. Production never builds one this way: the
-/// leader uses `ReplicationContent::load` and a replica uses `hydrate` on a real
-/// wire (which supplies both).
-#[allow(dead_code)]
-pub fn hydrated(
-    version: u64,
-    cfg: hydra_core::config::ConfigData,
-) -> hydra_server::cluster::snapshot::HydratedWire {
-    hydra_server::cluster::snapshot::HydratedWire {
-        version,
-        cfg,
-        fidelity: hydra_server::cluster::content::FidelityRows {
-            limit_roles: Vec::new(),
-            provider_keys: Vec::new(),
-            provider_models: Vec::new(),
-            tenant_providers: Vec::new(),
-            tenant_models: Vec::new(),
-            user_groups: Vec::new(),
-            users: Vec::new(),
-            user_api_keys: Vec::new(),
-            tenant_access_tokens: Vec::new(),
-            global_roles: Vec::new(),
-        },
-    }
 }

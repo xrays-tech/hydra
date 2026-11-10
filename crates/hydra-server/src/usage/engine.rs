@@ -37,7 +37,8 @@ use tokio::sync::mpsc;
 // ===========================================================================
 
 /// Pluggable usage-record sink. Implementations write [`UsageRecord`]s to a
-/// backend (SQLite by default, ClickHouse optionally).
+/// backend (ClickHouse is the shipped shared store; the explicit `none` sink
+/// records nothing).
 ///
 /// `record` is **fire-and-forget**: it MUST return immediately —
 /// implementations buffer internally and flush asynchronously. A bounded
@@ -346,8 +347,8 @@ pub(crate) const DEFAULT_BATCH_SIZE: usize = 256;
 /// Seconds between time-driven flushes when a batch never fills.
 pub(crate) const DEFAULT_FLUSH_SECS: u64 = 5;
 
-/// Maximum time [`SqliteSink`] / [`ClickHouseSink`] `Drop` will wait for the
-/// background task to finish its final flush. Bounds graceful shutdown so a
+/// Maximum time a backend sink's `Drop` will wait for the background task to
+/// finish its final flush. Bounds graceful shutdown so a
 /// permanently-broken backend cannot hang shutdown indefinitely; if the wait
 /// elapses the task is detached (it may still complete the flush if the backend
 /// recovers, and is aborted when the runtime shuts down).
@@ -705,9 +706,10 @@ mod tests {
     // =====================================================================
     //
     // These seven cases were `tests/sqlite_sink.rs` until 2026-10-07. They were written against
-    // `SqliteSink` because that was the only sink a test could point at a real store; when ADR-0002
-    // retires SQLite, testing the engine through "whatever backend exists" would make the engine's
-    // coverage depend on that backend. They now drive `usage::testing::RecordingSink`, which is
+    // the retired `SqliteSink` because that was the only sink a test could point at a real store;
+    // when ADR-0002 retired SQLite, testing the engine through "whatever backend exists" would have
+    // made the engine's coverage depend on that backend. They now drive
+    // `usage::testing::RecordingSink`, which is
     // wired exactly like the real backends (same `run_channel_sink`, same `drain_on_drop`) and
     // records instead of writing.
     //

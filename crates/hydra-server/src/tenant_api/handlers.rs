@@ -60,9 +60,8 @@ struct Whoami<'a> {
 /// `GET /tenant/{tenant_id}/api/v1/whoami`
 ///
 /// Answers entirely from the configuration snapshot: no database, no upstream,
-/// no external auth. That is what makes it work identically on a leader, a
-/// standby and an edge node, and it is why it costs nothing to serve — an edge
-/// with no local DB answers it, which no other endpoint can.
+/// no external auth. That is why it costs nothing to serve and works identically
+/// on every node.
 pub async fn whoami(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -126,8 +125,8 @@ pub async fn usage(
     ctx: &mut RequestContext,
     auth: &Authenticated,
 ) -> pingora_core::Result<bool> {
-    // The capability, not a probe for a pool: in a cluster the leader also has a
-    // local SQLite file, and it contains no usage rows at all.
+    // The capability, not a probe for a pool: a node can have a local database
+    // handle while the configured usage backend holds no readable rows.
     #[cfg(feature = "db")]
     {
         let Some(reader) = state.usage.as_ref() else {
@@ -247,10 +246,11 @@ pub async fn usage(
             }
         }
     }
-    // A build without `db` has no `usage` field at all: the sink kind cannot be
-    // `sqlite` and `main` refuses to start without a database, so the endpoint is
-    // unreachable. Answering `not_ready` keeps the shape honest rather than
-    // pretending to know the tenant id.
+    // A build without `db` has no `usage` field at all, and `main` refuses to
+    // start without a database, so the endpoint is unreachable. (The legacy
+    // `sqlite` sink value is a retired-value error, not a selectable backend.)
+    // Answering `not_ready` keeps the shape honest rather than pretending to
+    // know the tenant id.
     #[cfg(not(feature = "db"))]
     {
         let _ = (state, auth);
@@ -275,17 +275,17 @@ pub async fn usage(
 //
 // Same face as T6, and for the same reason: these rows are NOT part of the config
 // tree, so they do NOT go through a shared config-write core. Each handler runs ONE
-// statement against this node's own SQLite and
-// then the SAME reload/publish tail [`local_write`] runs, via [`commit_and_publish`].
+// statement against the shared database and then the SAME best-effort reload tail
+// [`commit_and_publish`] runs.
 //
 // Read/WRITE asymmetry, unchanged from T6:
 //
 //   * WHICH rows exist, which tenant owns them, and the version they are
-//     attributed to: the replication SNAPSHOT (`store.replication()`), exactly
-//     what the read-only views do. The WRITE boundary ("does this id exist,
-//     and is it MINE?") is therefore decided the SAME way the read face reports
-//     it — a replica that has not yet materialized a row refuses a write to it
-//     as `404`, the same status it would answer for reading it.
+//     attributed to: the config SNAPSHOT (`store.snapshot()`/`store.version()`),
+//     exactly what the read-only views do. The WRITE boundary ("does this id
+//     exist, and is it MINE?") is therefore decided the SAME way the read face
+//     reports it — a node whose snapshot has not yet reloaded refuses a write to
+//     it as `404`, the same status it would answer for reading it.
 //   * What the row contains after a write: what the handler just built, echoed
 //     back so the caller can confirm its own statement without a round-trip.
 //
@@ -320,10 +320,11 @@ pub async fn usage(
 //     that is NOT leaf-only.
 //
 // Timestamps use [`crate::admin::handlers::now_ts`] (`%Y-%m-%d %H:%M:%S`), NOT
-// this module's [`now_rfc3339`]: the columns' own DDL default is SQLite
-// `datetime('now')`, and every upsert stamps `updated_at` with it, so a
-// `T`-separated `created_at` in the same column would be two formats for one
-// field. [`now_rfc3339`] stays right for IDENTITY expiry, which is compared
+// this module's [`now_rfc3339`]: the columns' own DDL default is
+// `CURRENT_TIMESTAMP` (the same `%Y-%m-%d %H:%M:%S` shape on PostgreSQL and
+// MySQL), and every upsert stamps `updated_at` with it, so a `T`-separated
+// `created_at` in the same column would be two formats for one field.
+// [`now_rfc3339`] stays right for IDENTITY expiry, which is compared
 // lexicographically by `time_bound`.
 
 /// The body of `GET .../user-groups`: the tenant's OWN groups.
@@ -357,17 +358,16 @@ pub async fn list_user_groups(
     ctx: &mut RequestContext,
     auth: &Authenticated,
 ) -> pingora_core::Result<bool> {
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
     let tenant_id = &auth.tenant.id;
-    let user_groups = content
-        .cfg
+    let user_groups = cfg
         .user_groups
         .iter()
         .filter(|group| group.tenant_id == *tenant_id)
         .cloned()
         .collect();
     let view = UserGroupsView {
-        config_version: content.version,
+        config_version: state.store.version(),
         user_groups,
     };
     respond_json(session, ctx, 200, &view).await
@@ -396,11 +396,10 @@ pub async fn list_users(
         .iter()
         .find(|(key, _)| key == "group_id")
         .map(|(_, value)| value.as_str().to_string());
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
     let tenant_id = &auth.tenant.id;
     if let Some(group) = group_id.as_ref() {
-        let owned = content
-            .cfg
+        let owned = cfg
             .user_groups
             .iter()
             .any(|g| g.id == *group && g.tenant_id == *tenant_id);
@@ -420,8 +419,7 @@ pub async fn list_users(
     }
     // Borrowed for the filter below; `group_id` itself moves into the view.
     let wants: Option<&String> = group_id.as_ref();
-    let mut users: Vec<User> = content
-        .cfg
+    let mut users: Vec<User> = cfg
         .users
         .values()
         .filter(|user| user.tenant_id == *tenant_id)
@@ -434,7 +432,7 @@ pub async fn list_users(
     // Deterministic order (`ConfigData::users` is a hash map — see [`UsersView`]).
     users.sort_by(|a, b| a.id.cmp(&b.id));
     let view = UsersView {
-        config_version: content.version,
+        config_version: state.store.version(),
         group_id,
         users,
     };
@@ -560,13 +558,14 @@ fn hierarchy_rows(cfg: &ConfigData) -> usize {
 /// `PUT /tenant/{tenant_id}/api/v1/user-groups`
 async fn user_group_upsert(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
 
     let raw = match super::read_body(session, trace_id).await {
         Ok(body) => body,
@@ -625,7 +624,7 @@ async fn user_group_upsert(
     // (anti-enumeration) and is never upserted into THIS tenant: `db::upsert_user`
     // rewrites `tenant_id` on conflict, so refusing the cross-tenant id is
     // load-bearing, not cosmetic.
-    let existing = content.cfg.user_groups.iter().find(|group| group.id == id);
+    let existing = cfg.user_groups.iter().find(|group| group.id == id);
     if let Some(group) = existing {
         if group.tenant_id != *tenant_id {
             return super::respond_error(
@@ -641,8 +640,7 @@ async fn user_group_upsert(
     // `UNIQUE (tenant_id, name)`: asked the DB this would collide, so answer
     // BEFORE the statement and NAME the constraint instead of leaving the caller
     // with the generic `409 conflict` that `classify_db_err` would produce.
-    let clash = content
-        .cfg
+    let clash = cfg
         .user_groups
         .iter()
         .any(|other| other.tenant_id == *tenant_id && other.name == name && other.id != id);
@@ -665,7 +663,7 @@ async fn user_group_upsert(
     // what it already has. Answered 400 `hierarchy_limit_exceeded` (the same code
     // the api-key ceiling uses) and never a silent partial write.
     if existing.is_none() {
-        let rows = hierarchy_rows(&content.cfg);
+        let rows = hierarchy_rows(&cfg);
         let ceiling = state.tenant_api.max_hierarchy_rows;
         if rows >= ceiling as usize {
             return super::respond_error(
@@ -685,7 +683,7 @@ async fn user_group_upsert(
     // and the write then changes ONLY the fields the body names, so PRESERVING
     // `created_at` is structural: a column added later cannot be "forgotten"
     // into being reset. `now_ts` matches the columns' DDL default and the
-    // `datetime('now')` the upsert stamps `updated_at` with — see the section note.
+    // `CURRENT_TIMESTAMP` the upsert stamps `updated_at` with — see the section note.
     let stamped = crate::admin::handlers::now_ts();
     let mut group: UserGroup = existing.cloned().unwrap_or(UserGroup {
         id,
@@ -701,6 +699,16 @@ async fn user_group_upsert(
 
     let pool = state.store.pool();
     if let Err(e) = crate::db::upsert_user_group(pool, &group).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "no such user-group in this tenant",
+            )
+            .await;
+        }
         let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
         return super::respond_error(
             session,
@@ -712,10 +720,8 @@ async fn user_group_upsert(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     // Echo the row as it now stands: the write is confirmable without a read,
     // and `config_version` is what a later call reconciles against.
@@ -731,6 +737,7 @@ async fn user_group_upsert(
 /// `DELETE /tenant/{tenant_id}/api/v1/user-groups/{id}`
 async fn user_group_delete(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -738,10 +745,10 @@ async fn user_group_delete(
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
     // Unknown id and FOREIGN id answer the SAME 404: the id's existence in ANOTHER
     // tenant is not this caller's to learn.
-    let known = match content.cfg.user_groups.iter().find(|group| group.id == id) {
+    let known = match cfg.user_groups.iter().find(|group| group.id == id) {
         None => false,
         Some(group) => group.tenant_id == *tenant_id,
     };
@@ -759,11 +766,7 @@ async fn user_group_delete(
     // cannot go. Decided on the SNAPSHOT so the answer is the one the caller's
     // own `GET /users?group_id=` would have shown; the FK below is what catches
     // the RACE (a user created between this check and the statement).
-    let populated = content
-        .cfg
-        .users
-        .values()
-        .any(|user| user.user_group_id == id);
+    let populated = cfg.users.values().any(|user| user.user_group_id == id);
     if populated {
         return super::respond_error(
             session,
@@ -776,55 +779,65 @@ async fn user_group_delete(
     }
 
     let pool = state.store.pool();
-    if let Err(e) = crate::db::delete_user_group(pool, id).await {
-        // The race above: the DB saw a user this snapshot did not. Same caller
-        // mistake, so the SAME answer — `classify_db_err` would call it a
-        // `400 foreign_key_violation`, which is true but not actionable.
-        let fk = match e {
-            sqlx::Error::Database(ref err) => err.is_foreign_key_violation(),
-            _ => false,
-        };
-        if fk {
+    let deleted = match crate::db::delete_user_group(pool, tenant_id, id).await {
+        Ok(n) => n,
+        Err(e) => {
+            // The race above: the DB saw a user this snapshot did not. Same caller
+            // mistake, so the SAME answer — `classify_db_err` would call it a
+            // `400 foreign_key_violation`, which is true but not actionable.
+            let fk = match e {
+                sqlx::Error::Database(ref err) => err.is_foreign_key_violation(),
+                _ => false,
+            };
+            if fk {
+                return super::respond_error(
+                    session,
+                    ctx,
+                    409,
+                    "group_not_empty",
+                    "the user-group gained a user between the check and the delete; retry once that user is gone",
+                )
+                    .await;
+            }
+            let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
             return super::respond_error(
                 session,
                 ctx,
-                409,
-                "group_not_empty",
-                "the user-group gained a user between the check and the delete; retry once that user is gone",
+                status_code,
+                code,
+                "the user-group could not be deleted",
             )
-                .await;
+            .await;
         }
-        let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
+    };
+    if deleted == 0 {
         return super::respond_error(
             session,
             ctx,
-            status_code,
-            code,
-            "the user-group could not be deleted",
+            404,
+            "not_found",
+            "no such user-group in this tenant",
         )
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    match published {
-        // The `503 config_not_published` answer was already written by the tail.
-        None => Ok(true),
-        // A deletion is reported by ABSENCE: 204, no body — the same convention as
-        // the api-key revocation and the identity-plane DELETE family.
-        Some(_) => super::respond_raw(session, ctx, 204, Vec::new()).await,
-    }
+    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    // A deletion is reported by ABSENCE: 204, no body — the same convention as
+    // the api-key revocation and the identity-plane DELETE family.
+    super::respond_raw(session, ctx, 204, Vec::new()).await
 }
 
 /// `PUT /tenant/{tenant_id}/api/v1/users`
 async fn user_upsert(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
 
     let raw = match super::read_body(session, trace_id).await {
         Ok(body) => body,
@@ -859,8 +872,7 @@ async fn user_upsert(
         )
         .await;
     }
-    let group_owned = content
-        .cfg
+    let group_owned = cfg
         .user_groups
         .iter()
         .any(|group| group.id == group_id && group.tenant_id == *tenant_id);
@@ -925,7 +937,7 @@ async fn user_upsert(
     // 404 and is NEVER upserted, because `db::upsert_user` rewrites `tenant_id`
     // on conflict — moving another tenant's user into this one would be a
     // privilege escalation dressed up as a rename.
-    let existing = content.cfg.users.get(&id);
+    let existing = cfg.users.get(&id);
     if let Some(user) = existing {
         if user.tenant_id != *tenant_id {
             return super::respond_error(
@@ -944,7 +956,7 @@ async fn user_upsert(
     // (`as_ref()` keeps the outer Option borrowable: `external_id` is still
     // assigned to the row below.)
     if let Some(external) = external_id.as_ref() {
-        let clash = content.cfg.users.values().any(|other| {
+        let clash = cfg.users.values().any(|other| {
             other.tenant_id == *tenant_id
                 && other.id != id
                 && other.external_id.as_deref() == Some(external.as_str())
@@ -969,8 +981,7 @@ async fn user_upsert(
     // snapshot is the right source and what its looseness is.
     if existing.is_none() {
         let ceiling = state.tenant_api.max_users_per_tenant;
-        let held = content
-            .cfg
+        let held = cfg
             .users
             .values()
             .filter(|u| u.tenant_id == *tenant_id)
@@ -989,7 +1000,7 @@ async fn user_upsert(
             )
                 .await;
         }
-        let rows = hierarchy_rows(&content.cfg);
+        let rows = hierarchy_rows(&cfg);
         let global = state.tenant_api.max_hierarchy_rows;
         if rows >= global as usize {
             return super::respond_error(
@@ -1031,6 +1042,16 @@ async fn user_upsert(
 
     let pool = state.store.pool();
     if let Err(e) = crate::db::upsert_user(pool, &user).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "no such user in this tenant",
+            )
+            .await;
+        }
         let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
         return super::respond_error(
             session,
@@ -1042,10 +1063,8 @@ async fn user_upsert(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     respond_json(
         session,
@@ -1061,16 +1080,17 @@ async fn user_upsert(
 /// The same row rules as [`user_upsert`], applied to a batch: every group must be
 /// this tenant's, every named id must not belong to another tenant, generated ids
 /// are minted for entries without one, and the whole batch lands in ONE DB
-/// transaction followed by ONE publish.
+/// transaction followed by ONE reload.
 async fn user_bulk_upsert(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
 
     let raw = match super::read_body(session, trace_id).await {
         Ok(body) => body,
@@ -1100,7 +1120,7 @@ async fn user_bulk_upsert(
             session,
             ctx,
             200,
-            &json!({"users": [], "config_version": content.version}),
+            &json!({"users": [], "config_version": state.store.version()}),
         )
         .await;
     }
@@ -1123,8 +1143,7 @@ async fn user_bulk_upsert(
             )
             .await;
         }
-        let group_owned = content
-            .cfg
+        let group_owned = cfg
             .user_groups
             .iter()
             .any(|group| group.id == group_id && group.tenant_id == *tenant_id);
@@ -1209,7 +1228,7 @@ async fn user_bulk_upsert(
             }
         }
 
-        let existing = content.cfg.users.get(&id);
+        let existing = cfg.users.get(&id);
         if let Some(user) = existing {
             if user.tenant_id != *tenant_id {
                 return super::respond_error(
@@ -1225,7 +1244,7 @@ async fn user_bulk_upsert(
             new_rows += 1;
         }
         if let Some(external) = external_id.as_ref() {
-            let clash = content.cfg.users.values().any(|other| {
+            let clash = cfg.users.values().any(|other| {
                 other.tenant_id == *tenant_id
                     && other.id != id
                     && other.external_id.as_deref() == Some(external.as_str())
@@ -1266,8 +1285,7 @@ async fn user_bulk_upsert(
         out.push(user);
     }
 
-    let held = content
-        .cfg
+    let held = cfg
         .users
         .values()
         .filter(|u| u.tenant_id == *tenant_id)
@@ -1287,7 +1305,7 @@ async fn user_bulk_upsert(
         )
         .await;
     }
-    let rows = hierarchy_rows(&content.cfg);
+    let rows = hierarchy_rows(&cfg);
     let global = state.tenant_api.max_hierarchy_rows;
     if rows + new_rows > global as usize {
         return super::respond_error(
@@ -1306,6 +1324,16 @@ async fn user_bulk_upsert(
 
     let pool = state.store.pool();
     if let Err(e) = crate::db::upsert_users_bulk(pool, &out).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "a user in this batch is not part of this tenant",
+            )
+            .await;
+        }
         let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
         return super::respond_error(
             session,
@@ -1317,10 +1345,8 @@ async fn user_bulk_upsert(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     respond_json(
         session,
@@ -1334,16 +1360,17 @@ async fn user_bulk_upsert(
 /// `PUT /tenant/{tenant_id}/api/v1/user-groups/bulk`
 ///
 /// The bulk counterpart of [`user_group_upsert`]. The batch is validated
-/// tenant-locally, written in ONE transaction and published ONCE.
+/// tenant-locally, written in ONE transaction and reloaded ONCE.
 async fn user_group_bulk_upsert(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
 
     let raw = match super::read_body(session, trace_id).await {
         Ok(body) => body,
@@ -1373,7 +1400,7 @@ async fn user_group_bulk_upsert(
             session,
             ctx,
             200,
-            &json!({"user_groups": [], "config_version": content.version}),
+            &json!({"user_groups": [], "config_version": state.store.version()}),
         )
         .await;
     }
@@ -1437,7 +1464,7 @@ async fn user_group_bulk_upsert(
             .await;
         }
 
-        let existing = content.cfg.user_groups.iter().find(|group| group.id == id);
+        let existing = cfg.user_groups.iter().find(|group| group.id == id);
         if let Some(group) = existing {
             if group.tenant_id != *tenant_id {
                 return super::respond_error(
@@ -1452,8 +1479,7 @@ async fn user_group_bulk_upsert(
         } else {
             new_rows += 1;
         }
-        let clash = content
-            .cfg
+        let clash = cfg
             .user_groups
             .iter()
             .any(|other| other.tenant_id == *tenant_id && other.name == name && other.id != id);
@@ -1485,7 +1511,7 @@ async fn user_group_bulk_upsert(
         out.push(group);
     }
 
-    let rows = hierarchy_rows(&content.cfg);
+    let rows = hierarchy_rows(&cfg);
     let ceiling = state.tenant_api.max_hierarchy_rows;
     if rows + new_rows > ceiling as usize {
         return super::respond_error(
@@ -1504,6 +1530,16 @@ async fn user_group_bulk_upsert(
 
     let pool = state.store.pool();
     if let Err(e) = crate::db::upsert_user_groups_bulk(pool, &out).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "a user-group in this batch is not part of this tenant",
+            )
+            .await;
+        }
         let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
         return super::respond_error(
             session,
@@ -1515,10 +1551,8 @@ async fn user_group_bulk_upsert(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     respond_json(
         session,
@@ -1531,20 +1565,21 @@ async fn user_group_bulk_upsert(
 
 /// `POST /tenant/{tenant_id}/api/v1/api-keys/bulk`
 ///
-/// Mints one key per entry, all in ONE DB transaction and ONE publish. Every
+/// Mints one key per entry, all in ONE DB transaction and ONE reload. Every
 /// target user must belong to this tenant; the key/user/hierarchy ceilings are
 /// checked for the WHOLE batch before anything is minted, so an over-limit caller
 /// never receives plaintext it cannot use. The plaintexts are shown exactly once,
 /// in the response body.
 async fn user_api_key_bulk_create(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
 
     let raw = match super::read_body(session, trace_id).await {
         Ok(body) => body,
@@ -1574,13 +1609,12 @@ async fn user_api_key_bulk_create(
             session,
             ctx,
             200,
-            &json!({"api_keys": [], "config_version": content.version}),
+            &json!({"api_keys": [], "config_version": state.store.version()}),
         )
         .await;
     }
 
-    let own_users: HashSet<String> = content
-        .cfg
+    let own_users: HashSet<String> = cfg
         .users
         .iter()
         .filter(|(_, u)| u.tenant_id == *tenant_id)
@@ -1676,7 +1710,7 @@ async fn user_api_key_bulk_create(
         )
         .await;
     }
-    let hierarchy = hierarchy_rows(&content.cfg);
+    let hierarchy = hierarchy_rows(&cfg);
     let global = state.tenant_api.max_hierarchy_rows;
     if hierarchy + normalized.len() > global as usize {
         return super::respond_error(
@@ -1720,7 +1754,17 @@ async fn user_api_key_bulk_create(
         keys.push(key);
     }
 
-    if let Err(e) = crate::db::insert_user_api_keys_bulk(pool, &keys).await {
+    if let Err(e) = crate::db::insert_user_api_keys_bulk(pool, tenant_id, &keys).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "a user in this batch is not part of this tenant",
+            )
+            .await;
+        }
         let (status, code) = crate::admin::handlers::classify_db_err(&e);
         return super::respond_error(
             session,
@@ -1732,10 +1776,8 @@ async fn user_api_key_bulk_create(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     respond_json(
         session,
@@ -1758,6 +1800,7 @@ async fn user_api_key_bulk_create(
 /// T10's tidy-up, not this endpoint's.
 async fn user_delete(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1765,8 +1808,8 @@ async fn user_delete(
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
-    let known = match content.cfg.users.get(id) {
+    let cfg = state.store.snapshot();
+    let known = match cfg.users.get(id) {
         None => false,
         Some(user) => user.tenant_id == *tenant_id,
     };
@@ -1782,25 +1825,34 @@ async fn user_delete(
     }
 
     let pool = state.store.pool();
-    if let Err(e) = crate::db::delete_user(pool, id).await {
-        let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
+    let deleted = match crate::db::delete_user(pool, tenant_id, id).await {
+        Ok(n) => n,
+        Err(e) => {
+            let (status_code, code) = crate::admin::handlers::classify_db_err(&e);
+            return super::respond_error(
+                session,
+                ctx,
+                status_code,
+                code,
+                "the user could not be deleted",
+            )
+            .await;
+        }
+    };
+    if deleted == 0 {
         return super::respond_error(
             session,
             ctx,
-            status_code,
-            code,
-            "the user could not be deleted",
+            404,
+            "not_found",
+            "no such user in this tenant",
         )
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    match published {
-        // The `503 config_not_published` answer was already written by the tail.
-        None => Ok(true),
-        // 204, no body — reported by ABSENCE like every other delete here.
-        Some(_) => super::respond_raw(session, ctx, 204, Vec::new()).await,
-    }
+    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    // 204, no body — reported by ABSENCE like every other delete here.
+    super::respond_raw(session, ctx, 204, Vec::new()).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,16 +1861,15 @@ async fn user_delete(
 //
 // These endpoints do NOT go through a shared config-write core: that kind of core
 // owns the config-tree resource family, and it has no shape for an api-key row or a
-// user row. Each handler therefore runs ONE statement against this node's own
-// SQLite and then the SAME reload/publish tail [`local_write`] runs — factored here
-// as [`commit_and_publish`] so the `503 config_not_published` semantics (T3.2)
-// cannot drift between the two write faces.
+// user row. Each handler therefore runs ONE statement against the shared
+// database and then the SAME best-effort reload tail [`commit_and_publish`] runs,
+// so the two write faces cannot drift.
 //
 // What is read from WHERE — the asymmetry is load-bearing:
 //
-//   * TENANT scoping, the user row and the billing state: the replication SNAPSHOT
-//     (`store.replication()`), exactly the rule the read-only views use, so a
-//     replica answers like the node that wrote the row.
+//   * TENANT scoping, the user row and the billing state: the config SNAPSHOT
+//     (`store.snapshot()`), exactly the rule the read-only views use, so a node
+//     answers like the process that wrote the row once its snapshot reloads.
 //   * api-key DISPLAY atoms (`name`, `key_prefix`, `key_last4`, `created_at`): the
 //     DATABASE. The snapshot does hold the key set, but only as the derived index
 //     `ConfigData::users_by_api_key_hash`, whose value is the ROUTING atoms
@@ -1913,12 +1964,12 @@ pub async fn list_user_api_keys(
     auth: &Authenticated,
     user_id: &str,
 ) -> pingora_core::Result<bool> {
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
     let tenant_id = &auth.tenant.id;
     // The user must exist AND be this tenant's. Unknown and foreign answer the
     // SAME 404: which half failed would tell a caller whether a user id exists
     // under ANOTHER tenant.
-    let known = match content.cfg.users.get(user_id) {
+    let known = match cfg.users.get(user_id) {
         Some(u) => u.tenant_id == *tenant_id,
         None => false,
     };
@@ -1962,7 +2013,7 @@ pub async fn list_user_api_keys(
         ctx,
         200,
         &UserApiKeysView {
-            config_version: content.version,
+            config_version: state.store.version(),
             user_id: user_id.to_string(),
             api_keys,
         },
@@ -1977,6 +2028,7 @@ pub async fn list_user_api_keys(
 /// atoms; the plaintext never touches the DB, a log line, or an error body.
 async fn user_api_key_create(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1984,8 +2036,8 @@ async fn user_api_key_create(
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
-    let known = match content.cfg.users.get(user_id) {
+    let cfg = state.store.snapshot();
+    let known = match cfg.users.get(user_id) {
         Some(u) => u.tenant_id == *tenant_id,
         None => false,
     };
@@ -2054,7 +2106,7 @@ async fn user_api_key_create(
     // endpoint is always a CREATE, so the check is unconditional — unlike the
     // user-group / user upserts, which skip it when the row already exists.
     {
-        let rows = hierarchy_rows(&content.cfg);
+        let rows = hierarchy_rows(&cfg);
         let ceiling = state.tenant_api.max_hierarchy_rows;
         if rows >= ceiling as usize {
             return super::respond_error(
@@ -2088,8 +2140,7 @@ async fn user_api_key_create(
         }
         Ok(r) => r,
     };
-    let own_users: HashSet<String> = content
-        .cfg
+    let own_users: HashSet<String> = cfg
         .users
         .iter()
         .filter(|(_, u)| u.tenant_id == *tenant_id)
@@ -2117,8 +2168,8 @@ async fn user_api_key_create(
 
     // Mint the credential: 32 CSPRNG bytes, base64url without padding, so the
     // plaintext is `hk_` + 43 characters. It exists for the length of this
-    // statement; what reaches SQLite is the SHA-256 hex and the two display
-    // atoms (decision D-7).
+    // statement; what reaches the database is the SHA-256 hex and the two
+    // display atoms (decision D-7).
     let plaintext = new_api_key_plaintext();
     let key_hash = sha256_hex_string(plaintext.as_bytes());
     let now = now_rfc3339();
@@ -2135,7 +2186,17 @@ async fn user_api_key_create(
         updated_at: now,
     };
 
-    if let Err(e) = crate::db::insert_user_api_key(pool, &key).await {
+    if let Err(e) = crate::db::insert_user_api_key(pool, tenant_id, &key).await {
+        if matches!(e, sqlx::Error::RowNotFound) {
+            return super::respond_error(
+                session,
+                ctx,
+                404,
+                "not_found",
+                "no such user in this tenant",
+            )
+            .await;
+        }
         // The ONE classifier the admin plane uses: a `UNIQUE` hit here can only
         // be the globally-unique `key_hash`, and lock contention is the retryable
         // 503 `storage_busy` — NOT a 500.
@@ -2150,11 +2211,8 @@ async fn user_api_key_create(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        // The `503 config_not_published` answer was already written by the tail.
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     // The plaintext is shown ONCE, here, and never re-derivable. `key_hash` is
     // deliberately absent from the body as well: a display-only view of a key
@@ -2180,8 +2238,13 @@ async fn user_api_key_create(
 /// exists under ANOTHER user is the SAME 404 as a missing one, so this endpoint
 /// cannot be used to probe whether a key id exists somewhere else (the
 /// anti-enumeration property of decision D-5, kept on the write face too).
+// Route params (user_id, key_id), request context, auth, and the reload guard
+// are all distinct inputs; grouping them into a struct would obscure the
+// anti-enumeration pairing documented above without changing the call shape.
+#[allow(clippy::too_many_arguments)]
 async fn user_api_key_delete(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2190,8 +2253,8 @@ async fn user_api_key_delete(
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
-    let known = match content.cfg.users.get(user_id) {
+    let cfg = state.store.snapshot();
+    let known = match cfg.users.get(user_id) {
         Some(u) => u.tenant_id == *tenant_id,
         None => false,
     };
@@ -2227,28 +2290,31 @@ async fn user_api_key_delete(
             .await;
     }
 
-    if let Err(e) = crate::db::delete_user_api_key(pool, key_id).await {
-        let (status, code) = crate::admin::handlers::classify_db_err(&e);
-        return super::respond_error(
-            session,
-            ctx,
-            status,
-            code,
-            "the api-key could not be revoked",
-        )
-        .await;
+    let deleted = match crate::db::delete_user_api_key(pool, tenant_id, key_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            let (status, code) = crate::admin::handlers::classify_db_err(&e);
+            return super::respond_error(
+                session,
+                ctx,
+                status,
+                code,
+                "the api-key could not be revoked",
+            )
+            .await;
+        }
+    };
+    if deleted == 0 {
+        return super::respond_error(session, ctx, 404, "not_found", "no such key for this user")
+            .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    match published {
-        // The `503 config_not_published` answer was already written by the tail.
-        None => Ok(true),
-        // Revocation is reported by absence: 204, no body, like every other
-        // identity-plane DELETE here. An ABSENT id is answered by the pairing
-        // above as 404 — a caller naming a key it does not own must not be told
-        // the statement "succeeded".
-        Some(_) => super::respond_raw(session, ctx, 204, Vec::new()).await,
-    }
+    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    // Revocation is reported by absence: 204, no body, like every other
+    // identity-plane DELETE here. An ABSENT id is answered by the pairing
+    // above as 404 — a caller naming a key it does not own must not be told
+    // the statement "succeeded".
+    super::respond_raw(session, ctx, 204, Vec::new()).await
 }
 
 /// `PUT /tenant/{tenant_id}/api/v1/users/{uid}/billing`
@@ -2259,6 +2325,7 @@ async fn user_api_key_delete(
 /// credential and no provider row.
 async fn user_billing_set(
     state: &AppState,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2266,10 +2333,10 @@ async fn user_billing_set(
     trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
-    let content = state.store.replication();
+    let cfg = state.store.snapshot();
     // The row is decided on the SNAPSHOT the gate used, tenant-scoped: an
     // unknown `uid` and one belonging to ANOTHER tenant answer the same 404.
-    let current: User = match content.cfg.users.get(user_id) {
+    let current: User = match cfg.users.get(user_id) {
         Some(u) if u.tenant_id == *tenant_id => u.clone(),
         _ => {
             return super::respond_error(
@@ -2326,7 +2393,7 @@ async fn user_billing_set(
     // `billing_updated_at` is always stamped — it is "when did the billing state
     // last change", which is what a suspended user's caller reconciles against.
     // (`updated_at` is set here for the same reason, but the DB stamps that
-    // column itself with `datetime('now')`, so the value below is what THIS
+    // column itself with `CURRENT_TIMESTAMP`, so the value below is what THIS
     // response reports, not what a later read will show.)
     updated.billing_updated_at = Some(changed_at.clone());
     updated.updated_at = changed_at;
@@ -2344,10 +2411,8 @@ async fn user_billing_set(
         .await;
     }
 
-    let published = commit_and_publish(state, session, ctx, tenant_id, trace_id).await?;
-    let Some(version) = published else {
-        return Ok(true);
-    };
+    let version =
+        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
 
     // The caller gets the row as it now stands, so the write is confirmable
     // without a second round-trip (and without a `GET /users` route, which this
@@ -2368,72 +2433,43 @@ async fn user_billing_set(
 // T6 write helpers
 // ---------------------------------------------------------------------------
 
-/// The reload+publish tail every user-hierarchy write runs, factored out of the
-/// three handlers above so it cannot drift from [`local_write`]'s copy (T3.2:
-/// the local swap happens first, then the tree is committed to the control
-/// plane, and the failure of that second step is NOT cosmetic).
+/// The reload tail every user-hierarchy write runs after its DB transaction has
+/// committed. Reload is best-effort: the write already succeeded, so a reload
+/// failure is logged and marks the store's snapshot stale (which drives the
+/// `hydra_config_snapshot_stale` gauge) but does NOT fail the response. Returns
+/// the version this node now serves.
 ///
-/// `Ok(Some(version))` — the version the change is live at.
-/// `Ok(None)` — the `503 config_not_published` response has ALREADY been written
-/// to `session`, and the caller must return it (the same "already answered"
-/// convention [`super::run_gate`] uses).
+/// The caller holds the store's reload guard across the write + this tail, so
+/// this goes through the locked entry point and never re-takes the lock.
 async fn commit_and_publish(
     state: &AppState,
-    session: &mut Session,
-    ctx: &mut RequestContext,
+    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    _session: &mut Session,
+    _ctx: &mut RequestContext,
     tenant_id: &str,
     trace_id: &str,
-) -> pingora_core::Result<Option<u64>> {
-    match state.store.reload_all().await {
+) -> pingora_core::Result<u64> {
+    match state.store.reload_all_locked(false, reload_guard).await {
         Ok(changed) => tracing::debug!(
             target: "hydra::tenant_api",
             tenant = %tenant_id,
             trace_id = %trace_id,
             changed,
-            "post-write reload/publish tail complete"
+            "post-write reload tail complete"
         ),
         Err(e) => {
-            if let crate::store::StoreError::NotPublished { reason } = &e {
-                tracing::error!(
-                    target: "hydra::tenant_api",
-                    tenant = %tenant_id,
-                    trace_id = %trace_id,
-                    %reason,
-                    "post-write PUBLISH FAILED: the local SQLite transaction committed and this \
-                     node serves the new config, but the cluster does not have it"
-                );
-                let answered = super::respond_error(
-                    session,
-                    ctx,
-                    503,
-                    "config_not_published",
-                    &format!(
-                        "the change was committed to this node's database but could NOT be \
-                         published to the cluster, so no other node will see it: {reason} — \
-                         retry the same request once the cluster has a majority; an idempotent \
-                         write is published by that retry. If the write is NOT idempotent (for \
-                         example POST /api-keys/bulk), do NOT re-send it: POST \
-                         /api/v1/reload?force=1 publishes the locally committed config (a plain \
-                         reload sees no change and skips the publish)"
-                    ),
-                )
-                .await;
-                return match answered {
-                    Err(e) => Err(e),
-                    Ok(_) => Ok(None),
-                };
-            }
             tracing::error!(
                 target: "hydra::tenant_api",
                 tenant = %tenant_id,
                 trace_id = %trace_id,
                 error = %e,
-                "post-write reload_all FAILED: the in-memory config snapshot is now STALE (the \
-                 write committed locally with no runtime effect until a reload succeeds)"
+                "post-write reload FAILED: the write IS committed but the in-memory config \
+                 snapshot is now STALE (marked in the store, alert gauge set); the response \
+                 remains successful and the change takes effect after a later reload succeeds"
             );
         }
     }
-    Ok(Some(state.store.version()))
+    Ok(state.store.version())
 }
 
 /// A fresh api-key plaintext: `hk_` + 32 CSPRNG bytes, base64url WITHOUT padding
@@ -2490,9 +2526,8 @@ fn now_rfc3339() -> String {
 // already ran in [`super::dispatch`], so the authenticated tenant IS the write target.
 //
 // Each arm dispatches to its own handler, which reads its OWN body (these bodies are
-// several shapes), runs ONE statement against this node's SQLite, and then runs the
-// shared reload/publish tail via [`commit_and_publish`] so the `503 config_not_published`
-// semantics (T3.2) cannot drift between the write faces.
+// several shapes), runs ONE statement against the shared database, and then runs the
+// best-effort reload tail via [`commit_and_publish`].
 //
 // The tenant Bearer and the request body are NEVER logged here.
 
@@ -2520,30 +2555,47 @@ pub async fn write(
     route: TenantWriteRoute<'_>,
 ) -> pingora_core::Result<bool> {
     let trace_id = ctx.trace_id.clone();
-    // ONE local write at a time, from BEFORE the DB mutation through the publish
-    // tail. The materializer takes the SAME lock around restore/swap; without
-    // this, a tick that applies the previous head can wipe a row this handler
-    // already committed but has not published yet (measured: 300 concurrent user
-    // creates left 291 rows, then key creation answered 404 `no such user`).
-    let _write_guard = state.store.publish_guard().await;
+    // ONE write at a time, from BEFORE the DB mutation through the reload tail:
+    // the store's reload lock serialises the snapshot swap with concurrent writes.
+    let _write_guard = state.store.reload_guard().await;
     match route {
         // T6 (D-7 + D-5): these write ROWS in the identity tables, not the config
         // tree, and the boundary they DO need (which user inside this tenant) is carried
         // on the route variant.
         TenantWriteRoute::CreateUserApiKey { user_id, .. } => {
-            return user_api_key_create(state, session, ctx, auth, user_id, &trace_id).await;
+            return user_api_key_create(
+                state,
+                &_write_guard,
+                session,
+                ctx,
+                auth,
+                user_id,
+                &trace_id,
+            )
+            .await;
         }
         TenantWriteRoute::CreateUserApiKeysBulk { .. } => {
-            return user_api_key_bulk_create(state, session, ctx, auth, &trace_id).await;
+            return user_api_key_bulk_create(state, &_write_guard, session, ctx, auth, &trace_id)
+                .await;
         }
         TenantWriteRoute::DeleteUserApiKey {
             user_id, key_id, ..
         } => {
-            return user_api_key_delete(state, session, ctx, auth, user_id, key_id, &trace_id)
-                .await;
+            return user_api_key_delete(
+                state,
+                &_write_guard,
+                session,
+                ctx,
+                auth,
+                user_id,
+                key_id,
+                &trace_id,
+            )
+            .await;
         }
         TenantWriteRoute::SetUserBilling { user_id, .. } => {
-            return user_billing_set(state, session, ctx, auth, user_id, &trace_id).await;
+            return user_billing_set(state, &_write_guard, session, ctx, auth, user_id, &trace_id)
+                .await;
         }
         // T5 writes: the user-group and user rows. Like the identity writes above,
         // each handler reads its OWN body and runs its own statement plus
@@ -2551,22 +2603,24 @@ pub async fn write(
         // flat suffix parses above) and in the path for the two deletes, so only the
         // delete arms bind `id`.
         TenantWriteRoute::UpsertUserGroup { .. } => {
-            return user_group_upsert(state, session, ctx, auth, &trace_id).await;
+            return user_group_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
         }
         TenantWriteRoute::UpsertUserGroupsBulk { .. } => {
-            return user_group_bulk_upsert(state, session, ctx, auth, &trace_id).await;
+            return user_group_bulk_upsert(state, &_write_guard, session, ctx, auth, &trace_id)
+                .await;
         }
         TenantWriteRoute::DeleteUserGroup { id, .. } => {
-            return user_group_delete(state, session, ctx, auth, id, &trace_id).await;
+            return user_group_delete(state, &_write_guard, session, ctx, auth, id, &trace_id)
+                .await;
         }
         TenantWriteRoute::UpsertUser { .. } => {
-            return user_upsert(state, session, ctx, auth, &trace_id).await;
+            return user_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
         }
         TenantWriteRoute::UpsertUsersBulk { .. } => {
-            return user_bulk_upsert(state, session, ctx, auth, &trace_id).await;
+            return user_bulk_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
         }
         TenantWriteRoute::DeleteUser { id, .. } => {
-            return user_delete(state, session, ctx, auth, id, &trace_id).await;
+            return user_delete(state, &_write_guard, session, ctx, auth, id, &trace_id).await;
         }
     }
 }

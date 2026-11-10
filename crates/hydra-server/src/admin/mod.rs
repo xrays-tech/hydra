@@ -14,26 +14,22 @@
 //!   `Authorization: Bearer` on every `/api/v1/*` fetch).
 //! - **No internal mocking**: every handler drives the real `db::repo`,
 //!   `ConfigStore`, `AuthChecker`, `CircuitBreaker` and `HydraCertStore`.
-//! - **Write-after consistency**: every successful config write calls
-//!   `ConfigStore::reload_all()` (design §13.2), serialised by a per-state
-//!   mutex. Cert re-resolution is no longer the admin service's job: the cert
-//!   store follows every config snapshot swap through the `ConfigStore`
-//!   snapshot-change hook registered in `main` (design §12.1 / W4b).
-//! - **Standby mutation forwarding (cluster P3)**: a leader candidate that
-//!   does not hold the lease forwards every admin mutation to the ACTUAL
-//!   lease holder, resolved live from the cluster registry — never to a
-//!   static `HYDRA_CONTROL_URL` (which for a primary candidate points at the
-//!   node itself). Forwarded mutations carry a forward-once marker so any
-//!   (self- or mutual-) forward loop terminates fail-closed with 503 instead
-//!   of a timeout recursion (see `cluster::forward`).
+//! - **Write-after consistency**: every successful config write calls a
+//!   `ConfigStore` reload entry point (design §13.2). The reload lock lives in
+//!   the store; the admin route holds it across the DB write + reload for
+//!   mutations and calls the locked entry point. Cert re-resolution is no longer
+//!   the admin service's job: the cert store follows every config snapshot swap
+//!   through the `ConfigStore` snapshot-change hook registered in `main`
+//!   (design §12.1 / W4b).
+//! - **Database-authoritative writes**: every admin mutation writes the shared
+//!   relational database directly. There is no leader, lease or forwarding path.
 
 use std::sync::Arc;
 
+use crate::db::Pool;
 use async_trait::async_trait;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
-use sqlx::SqlitePool;
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::crypto::KeyProvider;
@@ -45,12 +41,6 @@ pub mod cluster_api;
 pub mod handlers;
 pub mod metrics;
 mod static_files;
-/// Shared transactional sub-tenant / route write core (sub-tenant v2, D5). The
-/// single write path used by the v1 admin handlers now and the v2 leader
-/// internal handler later; not HTTP-specific (typed results, not `Resp`).
-/// Leader internal tenant-config write endpoint (sub-tenant v2, D3/D5/D6/D7):
-/// the A-2 receiver-side gates (lease assertion, tenant re-auth, authorization
-/// family. Cluster-token gated in `AdminService::response`.
 // Re-export the metrics module publicly so the proxy / breaker / tls can reach
 // the `record_*` call-sites and the `/metrics` renderer.
 pub use metrics as metrics_export;
@@ -197,11 +187,12 @@ impl AdminService {
 }
 
 pub struct AdminState {
-    /// The node's SQLite pool. Not an `Option`: every node has one (ADR-0001 D-2 retired the `edge`
-    /// role that used to be the `None` case), so the `/health` probe and `db()` no longer have a
+    /// The node's relational-database pool (PostgreSQL or MySQL). Not an `Option`: every node has
+    /// one (ADR-0001 D-2 retired the `edge` role that used to be the `None` case), so the `/health`
+    /// probe and `db()` no longer have a
     /// "no local database" answer to give — `/health` no longer reports `db: "n/a"` and `db()` no
     /// longer carries an `expect` that could only fire on a node that cannot exist.
-    pub pool: SqlitePool,
+    pub pool: Pool,
     pub store: ConfigStore,
     pub breaker: Arc<CircuitBreaker>,
     /// Master-key provider for sealing/opening provider upstream api-keys
@@ -213,9 +204,6 @@ pub struct AdminState {
     /// `HYDRA_ADMIN_TOKEN` (in `main`); held here so there is no per-request env
     /// read (avoids races under parallel tests). `None` ⇒ fail-closed (deny all).
     pub admin_token: Option<String>,
-    /// Serialises `reload_all` calls so concurrent writes don't race (design §6
-    /// risk note: "最后一次为准").
-    pub reload_lock: Mutex<()>,
     /// Shared admission controller (design §3 / §13.2). Cloned from the same
     /// `Arc<DashMap>` backing the proxy's `AppState.admission` — the
     /// `GET /api/v1/concurrency` endpoint reads live gate state from here.
@@ -232,33 +220,13 @@ pub struct AdminState {
     /// thread through. If that ever gains an env knob, wire the real value here — a unit
     /// test in `admin/mod.rs` asserts the two defaults still agree.
     pub default_concurrency_policy: hydra_core::config::ConcurrencyPolicy,
-    /// `true` when the LAST post-write `reload_all` failed, i.e. the in-memory
-    /// snapshot no longer matches the committed config (same condition as the
-    /// `hydra_config_snapshot_stale` gauge).
-    ///
-    /// PROCESS-level and last-writer-wins: it is set/cleared by the reload path
-    /// and read by every admin response, so a given response may report ANOTHER
-    /// request's reload failure. It answers "is the runtime consistent with the
-    /// DB right now?", not "did MY write apply?" — the response field is
-    /// documented that way on purpose.
-    pub snapshot_stale: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Whether this node is a leader it may accept writes on. `Some(f)` on a cluster node,
-    /// `None` on single-node. Backed by the Arachne **write probe** — not by `leader_hint` (a
-    /// fresh leader's hint does not point at itself) and not by any lease: the Redis lease is
-    /// retired, and so is the `P3` forwarding this used to gate. Gates admin mutations and
-    /// `/healthz/leader`.
-    pub leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-
-    /// Per-tenant config-write throttle (v2 D6): a fixed-window, process-local
-    /// limiter keyed on the authenticated tenant id, applied by the leader's
-    /// internal tenant-config write endpoint. In a cluster all config writes
-    /// land on the leader, so one in-process window covers the cluster.
-    /// **Anti-DoS only**: the window is in-process and therefore resets when
-    /// leadership moves (a bounded burst after failover — the same accepted
-    /// class as the E2 allow-TTL bound). On a single node the data-plane local
-    /// write path is not the internal endpoint and is bounded by the general
-    /// tenant-API per-tenant request budget instead.
+    /// This node's role, reported by `GET /api/v1/cluster/status`. `All` for
+    /// a single-node deployment and `Cluster` when a Redis data plane is
+    /// configured. Injected by `main` via [`Self::with_cluster_identity`].
+    pub role: crate::cluster::NodeRole,
+    /// This node's identity, reported by `GET /api/v1/cluster/status`.
+    pub node_id: String,
     /// Per-IP budget for FAILED admin-token attempts (fixed window, in-process).
     /// Keyed on the PEER address only — `X-Forwarded-For` is deliberately not
     /// consulted here, so a spoofing client cannot rotate buckets; behind a load
@@ -291,17 +259,6 @@ pub struct AdminState {
     /// How long invalidation/fleet reporting waits for confirmation.
     #[cfg(feature = "cluster-redis")]
     pub converge_timeout: std::time::Duration,
-    /// The CONFIGURED member list (ADR-0001): the fleet, as far as any single node can know it.
-    /// `None` off-cluster.
-    #[cfg(feature = "arachne")]
-    pub cluster_peers: Option<Arc<crate::cluster::arachne_node::ClusterPeers>>,
-    /// This node's own identity, so the fleet view can mark which row is "self".
-    #[cfg(feature = "arachne")]
-    pub node_id: String,
-    /// The raft leader's node name, when the control plane knows it (a synchronous read of the
-    /// cache the 250 ms watch maintains).
-    #[cfg(feature = "arachne")]
-    pub leader_name: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 /// The default admission policy the concurrency endpoint resolves providers against.
@@ -324,13 +281,12 @@ impl AdminState {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: SqlitePool,
+        pool: Pool,
         store: ConfigStore,
         breaker: Arc<CircuitBreaker>,
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
         admission: AdmissionControl,
-        leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
         Self {
             pool,
@@ -338,34 +294,33 @@ impl AdminState {
             breaker,
             key_provider,
             admin_token,
-            reload_lock: Mutex::new(()),
-            snapshot_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission,
             default_concurrency_policy: DEFAULT_CONCURRENCY_POLICY,
-            leader_ready,
+            role: crate::cluster::NodeRole::All,
+            node_id: String::new(),
             auth_fail_throttle: Arc::new(crate::tenant_api::throttle::Throttle::new()),
             auth_fail_per_min: admin_auth_fail_limit_per_min_from_env(),
             #[cfg(feature = "cluster-redis")]
             invalidation: None,
             #[cfg(not(feature = "cluster-redis"))]
             invalidation: None,
-            // Both are injected by `main` through the builder below, not by a
-            // new `new` parameter: this constructor has 14 call sites, and a
-            // defaulted parameter is exactly what pushes them back to struct
-            // literals.
-            // Injected by `main` through the builder below, like `live_nodes`: this constructor
-            // has many call sites and a defaulted parameter would push them back to struct literals.
-            #[cfg(feature = "arachne")]
-            cluster_peers: None,
-            #[cfg(feature = "arachne")]
-            node_id: String::new(),
-            #[cfg(feature = "arachne")]
-            leader_name: None,
             #[cfg(feature = "cluster-redis")]
             live_nodes: None,
             #[cfg(feature = "cluster-redis")]
             converge_timeout: std::time::Duration::from_millis(2_000),
         }
+    }
+
+    /// Inject this node's role and identity for `GET /api/v1/cluster/status`.
+    #[must_use]
+    pub fn with_cluster_identity(
+        mut self,
+        node_id: String,
+        role: crate::cluster::NodeRole,
+    ) -> Self {
+        self.node_id = node_id;
+        self.role = role;
+        self
     }
 
     /// Inject the live-node view and the convergence budget for the admin
@@ -393,9 +348,9 @@ impl AdminState {
         self
     }
 
-    /// The node's SQLite pool, for the CRUD handlers.
+    /// The node's relational-database pool, for the CRUD handlers.
     #[must_use]
-    pub fn db(&self) -> &SqlitePool {
+    pub fn db(&self) -> &Pool {
         &self.pool
     }
 }
@@ -469,16 +424,17 @@ impl AdminService {
     ) -> Resp {
         // /metrics — self-hosted exposition (§17).
         if path == "/metrics" {
-            return handlers::metrics_endpoint();
+            return handlers::metrics_endpoint(&self.state);
         }
 
         // ONE admin mutation at a time, from BEFORE the handler's DB write
-        // through reload+publish. The materializer/GC use the same lock; without
-        // it a tick that applies the previous head can wipe a role/token/tenant
-        // that the handler already committed but has not published (measured:
-        // 2000 role creates left 1808 rows).
+        // through reload+publish. The (now-retired) replica materializer/GC used
+        // the same lock; it remains because without it a reload that applies an
+        // older snapshot can wipe a role/token/tenant that the handler already
+        // committed but has not published (measured: 2000 role creates left 1808
+        // rows).
         let _write_guard = if matches!(method, "POST" | "PUT" | "DELETE" | "PATCH") {
-            Some(self.state.store.publish_guard().await)
+            Some(self.state.store.reload_guard().await)
         } else {
             None
         };
@@ -503,7 +459,7 @@ impl AdminService {
                     })
                 })
                 .unwrap_or(false);
-            return cluster_api::reload(&self.state, force, trace_id).await;
+            return cluster_api::reload(&self.state, _write_guard.as_ref(), force, trace_id).await;
         }
         // Auth cache invalidation was HERE (`DELETE /api/v1/auth/cache`). It is retired with
         // the external auth-cache surface, so requests to that path now fall through to the
@@ -524,18 +480,10 @@ impl AdminService {
         if parts == ["stats", "usage"] && method == "GET" {
             return handlers::stats_usage();
         }
-        // The internal control plane was HERE: `GET /api/v1/internal/control?since=N`, which
-        // served version-labelled config snapshots to edge/standby nodes. Retired with the channel
-        // it existed for (ADR-0001 T4.1) — nodes materialize the config tree from Arachne, so
-        // there is no snapshot to hand out and no `since` watermark to compare. A request to that
-        // path is now an ordinary 404.
-        // The `/api/v1/internal/tenant-config/*` family USED to be here: the leader's internal
-        // write endpoint for sub-tenants and routes, reached by a forwarded data-plane write. It
-        // is gone (ADR-0001 D-6, plan T3.5): the entry node applies the write itself, so there is
-        // nothing to relay and no internal write face to authenticate. A request to that path now
-        // falls through to the unknown-path 404 below, which is the honest answer — the family is
-        // retired, not hidden.
-        // Cluster status (cluster P4): whole-fleet view for the Health page.
+        // There is no internal control channel: config authority is the shared
+        // database, so there is no snapshot to hand out and no internal write
+        // face to authenticate. Such paths fall through to the unknown-path 404.
+        // Cluster status: this node's role/identity and database health.
         if parts == ["cluster", "status"] && method == "GET" {
             return cluster_api::cluster_status(&self.state, trace_id).await;
         }
@@ -570,6 +518,7 @@ impl AdminService {
             if parts.len() == 3 {
                 return handlers::tenant_access_token_collection(
                     &self.state,
+                    _write_guard.as_ref(),
                     session,
                     method,
                     &tenant_id,
@@ -579,6 +528,7 @@ impl AdminService {
             }
             return handlers::tenant_access_token_item(
                 &self.state,
+                _write_guard.as_ref(),
                 method,
                 &tenant_id,
                 parts[3],
@@ -593,7 +543,13 @@ impl AdminService {
         // Bulk Global Role upsert: `/global-roles/bulk` would otherwise be read
         // as the item id `bulk` by the generic match below.
         if resource == "global-roles" && id == Some("bulk") && method == "PUT" {
-            return handlers::global_role_bulk(&self.state, session, trace_id).await;
+            return handlers::global_role_bulk(
+                &self.state,
+                _write_guard.as_ref(),
+                session,
+                trace_id,
+            )
+            .await;
         }
         // Reject paths deeper than resource[/id].
         if parts.len() > 2 {
@@ -602,56 +558,143 @@ impl AdminService {
         let state = &self.state;
         match (resource, id) {
             ("providers", None) => {
-                handlers::provider_collection(state, session, method, trace_id).await
+                handlers::provider_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("providers", Some(id)) => {
-                handlers::provider_item(state, session, method, id, trace_id).await
+                handlers::provider_item(state, _write_guard.as_ref(), session, method, id, trace_id)
+                    .await
             }
             ("provider-models", None) => {
-                handlers::provider_model_collection(state, session, method, trace_id).await
+                handlers::provider_model_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("provider-models", Some(id)) => {
-                handlers::provider_model_item(state, session, method, id, trace_id).await
+                handlers::provider_model_item(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    id,
+                    trace_id,
+                )
+                .await
             }
             ("provider-keys", None) => {
-                handlers::provider_key_collection(state, session, method, query, trace_id).await
+                handlers::provider_key_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    query,
+                    trace_id,
+                )
+                .await
             }
             ("provider-keys", Some(id)) => {
-                handlers::provider_key_item(state, session, method, id, trace_id).await
+                handlers::provider_key_item(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    id,
+                    trace_id,
+                )
+                .await
             }
             ("tenants", None) => {
-                handlers::tenant_collection(state, session, method, trace_id).await
+                handlers::tenant_collection(state, _write_guard.as_ref(), session, method, trace_id)
+                    .await
             }
             ("tenants", Some(id)) => {
-                handlers::tenant_item(state, session, method, id, trace_id).await
+                handlers::tenant_item(state, _write_guard.as_ref(), session, method, id, trace_id)
+                    .await
             }
             ("tenant-providers", None) => {
-                handlers::tenant_provider_collection(state, session, method, trace_id).await
+                handlers::tenant_provider_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("tenant-providers", Some(id)) => {
-                handlers::tenant_provider_item(state, method, id, trace_id).await
+                handlers::tenant_provider_item(state, _write_guard.as_ref(), method, id, trace_id)
+                    .await
             }
             ("tenant-models", None) => {
-                handlers::tenant_model_collection(state, session, method, trace_id).await
+                handlers::tenant_model_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("tenant-models", Some(id)) => {
-                handlers::tenant_model_item(state, method, id, trace_id).await
+                handlers::tenant_model_item(state, _write_guard.as_ref(), method, id, trace_id)
+                    .await
             }
             ("limit-roles", None) => {
-                handlers::limit_role_collection(state, session, method, trace_id).await
+                handlers::limit_role_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("limit-roles", Some(id)) => {
-                handlers::limit_role_item(state, session, method, id, trace_id).await
+                handlers::limit_role_item(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    id,
+                    trace_id,
+                )
+                .await
             }
             // Global Roles (plan §3.4): GET answers every rule incl. the DISABLED
             // ones, PUT create-or-replaces the rule AND its provider set in ONE
             // transaction, DELETE removes it (`ON DELETE CASCADE` drops the provider
             // child rows). See `handlers::global_role_collection` for the write order.
             ("global-roles", None) => {
-                handlers::global_role_collection(state, session, method, trace_id).await
+                handlers::global_role_collection(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    trace_id,
+                )
+                .await
             }
             ("global-roles", Some(id)) => {
-                handlers::global_role_item(state, session, method, id, trace_id).await
+                handlers::global_role_item(
+                    state,
+                    _write_guard.as_ref(),
+                    session,
+                    method,
+                    id,
+                    trace_id,
+                )
+                .await
             }
             // The user hierarchy, READ (plan §3.5). The cascading global-role UI
             // needs to render `role → users → keys`, and without these three paths
@@ -702,21 +745,13 @@ fn relayed_trace_id(session: &ServerSession) -> Option<String> {
 #[async_trait]
 impl ServeHttp for AdminService {
     async fn response(&self, session: &mut ServerSession) -> http::Response<Vec<u8>> {
-        // OC-3: the peer that forwarded this request put the TENANT-VISIBLE trace
-        // id in `x-hydra-trace-id` (see `cluster::forward`, which uses the id the
-        // edge also returns to the tenant in `X-Hydra-Trace-Id`). Minting a fresh
-        // id here meant the leader's audit record
-        // (`hydra::tenant_config_write`, formerly written by the retired internal endpoint) carried an
-        // id the tenant could never see, so "here is my trace id, what happened to
-        // my write?" could not be answered from the leader's audit trail at all —
-        // the two sides of the same write were labelled with different strings.
-        //
-        // Adopting the inbound value IS the fix: the id in the audit record, in the
-        // leader's error bodies and in the tenant's response header become one
-        // string. The value is shape-checked first — this line runs BEFORE any
-        // gate, so an unauthenticated caller reaching this port could otherwise
-        // push a newline- or ANSI-bearing novel, or an unbounded string, into
-        // operator-visible logs and response bodies.
+        // A caller may supply the TENANT-VISIBLE trace id in `x-hydra-trace-id`;
+        // adopting it keeps the id in the audit record, in error bodies and in
+        // the tenant's response header consistent. The value is shape-checked
+        // first — this line runs BEFORE any gate, so an unauthenticated caller
+        // reaching this port could otherwise push a newline- or ANSI-bearing
+        // novel, or an unbounded string, into operator-visible logs and response
+        // bodies.
         let trace_id = relayed_trace_id(session).unwrap_or_else(crate::proxy::new_trace_id);
         let method = session.req_header().method.as_str().to_string();
         let path = session.req_header().uri.path().to_string();
@@ -732,14 +767,6 @@ impl ServeHttp for AdminService {
         // enforces exactly that). `/metrics` was token-free here too and is not any
         // more: the series carry tenant/provider/model labels, and publishing them to
         // anyone who can reach the port made the exposure depend on the node's role.
-
-        // Leader probe: 200 when this node is a raft writer, 503 when it has the gate
-        // and the gate says no, 404 when it has no control plane at all (single node).
-        // The ONLY token-free route, because an LB or orchestrator must be able to
-        // route to the writer without holding a secret.
-        if path == "/healthz/leader" {
-            return cluster_api::leader_health(&self.state, &trace_id);
-        }
 
         // The `/api/v1/internal/*` gate used to sit here: it compared the Bearer header against
         // `HYDRA_CLUSTER_TOKEN` and dispatched to `route()`. BOTH members of that family are
@@ -771,13 +798,8 @@ impl ServeHttp for AdminService {
             );
         }
 
-        // NO leader write gate any more (ADR-0001 T3.3). This node executes an admin mutation
-        // LOCALLY and, once the write commits, publishes the resulting config to the control
-        // plane; the raft library forwards those writes — missing entities in bounded chunks,
-        // then toc + head as ONE final atomic `multi_put` (the commit point) — to the leader.
-        // The layer that relayed the whole HTTP request to the lease holder is retired along
-        // with the Redis lease it was built for (the write no longer needs a leader to LAND,
-        // only to be COMMITTED).
+        // Every admin mutation writes the shared database directly; there is no
+        // leader gate or forwarding layer.
         self.route(&method, &path, query.as_deref(), session, &trace_id)
             .await
     }

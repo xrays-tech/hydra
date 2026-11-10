@@ -84,9 +84,9 @@ const SRC_DIR = 'crates/hydra-server/src';
  */
 const NOT_CLUSTER_ONLY = records(process.env.CLUSTER_ENV_NOT_CLUSTER_ONLY, [
   // `HYDRA_ROLE` used to be recorded here as "the selector itself, read in every mode".
-  // ADR-0001 removed that selector: the member list (`HYDRA_CLUSTER_PEERS`) is the decision
-  // now, and nothing under `src/cluster/` reads `HYDRA_ROLE` any more, so the record expired
-  // — the staleness direction of this algebra is what caught it.
+  // The shared-DB rewrite removed that selector: `HYDRA_REDIS_URL` presence is the cluster
+  // decision now, and nothing under `src/cluster/` reads `HYDRA_ROLE` any more, so the record
+  // expired — the staleness direction of this algebra is what caught it.
   ['HOSTNAME', 'the OS hostname (node-id fallback tier); always set, nothing an operator configures'],
 ]);
 
@@ -124,10 +124,6 @@ const NON_LITERAL_READ_OK = records(process.env.CLUSTER_ENV_NON_LITERAL_OK, [
     'the table loop in NodeRole::from_env: it iterates CLUSTER_ONLY_ENV chained with ' +
       'RETIRED_CLUSTER_ENV — both declared in that file, in that scope — and reads each element by ' +
       'value, so the indirection cannot name anything the table does not already contain',
-  ],
-  [
-    'crates/hydra-server/src/cluster/arachne_node.rs@f00be949',
-    'cluster_enabled(): the single read behind the cluster/single-node decision (ADR-0001). It reads PEERS_ENV, a constant declared in that file and nowhere else, so the indirection cannot hide a cluster-only name — that name is the one thing it exists to read. DEFERRED (tracked by plan T1.3 / T4.2): replacing the HYDRA_ROLE-based decision with this one, adding HYDRA_CLUSTER_PEERS and HYDRA_ARACHNE_LISTEN to the table, and removing the seven retired names all happen in the wiring step; until then the two new variables are deliberately absent from the table rather than listed while nothing reads them through it.',
   ],
 ]);
 

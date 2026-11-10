@@ -37,6 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -136,7 +137,7 @@ def start_node(label, admin, data, tls_port=None, db_label=None):
         # database file. The first version keyed the DB on the log label, so the certificate was
         # seeded into `l2_seed.db` while the measured node opened an empty `l2.db` — every
         # certificate leg then reported `certs=0` and the TLS handshake was (correctly) refused.
-        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, db_label or label)}.db?mode=rwc",
+        "HYDRA_DB_URL": env_db_url(f"listener_{db_label or label}"),
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "RUST_LOG": "info",
     })

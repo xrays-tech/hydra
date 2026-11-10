@@ -60,7 +60,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model + one key (the minimal routed
 /// graph). The provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_one(pool: &sqlx::SqlitePool, upstream_endpoint: &str) {
+async fn seed_one(pool: &hydra_server::db::Pool, upstream_endpoint: &str) {
     seed_provider(pool, "p1", "openai", "OpenAI", upstream_endpoint).await;
     repo::insert_provider_model(
         pool,
@@ -106,7 +106,13 @@ async fn seed_one(pool: &sqlx::SqlitePool, upstream_endpoint: &str) {
     seed_default_role(pool, "t1").await;
 }
 
-async fn seed_provider(pool: &sqlx::SqlitePool, id: &str, key: &str, name: &str, endpoint: &str) {
+async fn seed_provider(
+    pool: &hydra_server::db::Pool,
+    id: &str,
+    key: &str,
+    name: &str,
+    endpoint: &str,
+) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -126,7 +132,7 @@ async fn seed_provider(pool: &sqlx::SqlitePool, id: &str, key: &str, name: &str,
     .expect("insert provider");
 }
 
-async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str) {
+async fn seed_tenant(pool: &hydra_server::db::Pool, id: &str, domain: &str) {
     repo::insert_tenant(
         pool,
         &Tenant {
@@ -151,7 +157,7 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str) {
 }
 
 async fn seed_key(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     kp: &StaticKeyProvider,
     id: &str,
     provider_id: &str,
@@ -171,7 +177,7 @@ async fn seed_key(
     .expect("insert provider_key");
 }
 
-async fn seed_default_role(pool: &sqlx::SqlitePool, tenant: &str) {
+async fn seed_default_role(pool: &hydra_server::db::Pool, tenant: &str) {
     repo::insert_limit_role(
         pool,
         &StaticKeyProvider::new([1u8; 32], 1),
@@ -202,14 +208,14 @@ fn ephemeral_port() -> u16 {
 }
 
 /// Build the full AppState from a seeded pool + auth URL.
-async fn build_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
+async fn build_state(pool: &hydra_server::db::Pool) -> Arc<AppState> {
     build_state_with_proxy_config(pool, ProxyConfig::default()).await
 }
 
 /// Same, with an explicit proxy runtime config (review C3: drive
 /// `non_route_strategy` the way the env parser now does).
 async fn build_state_with_proxy_config(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     proxy: ProxyConfig,
 ) -> Arc<AppState> {
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
@@ -969,7 +975,7 @@ async fn send_one(client: &reqwest::Client, url: &str, body: &str) -> reqwest::R
 
 /// Tighten the default limit role (id="default", seeded by `seed_one` with
 /// count=1000) to count=2 so the third request is denied.
-async fn tighten_limit_to_2(pool: &sqlx::SqlitePool) {
+async fn tighten_limit_to_2(pool: &hydra_server::db::Pool) {
     repo::update_limit_role(
         pool,
         &StaticKeyProvider::new([1u8; 32], 1),
@@ -1120,7 +1126,7 @@ async fn rate_limit_429_even_when_routing_would_503() {
 /// Seed a provider with explicit concurrency limits (design-admission-queue §5).
 #[allow(clippy::too_many_arguments)]
 async fn seed_provider_capped(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     id: &str,
     key: &str,
     name: &str,
@@ -3050,7 +3056,7 @@ fn spawn_stalling_sse_upstream(chunks: usize, gap_ms: u64, stall: bool) -> Strin
 /// early kills the auth hop (Hydra then answers fail-closed, i.e. 503) and can
 /// take a *concurrent* test's auth hop down with it.
 async fn state_for_one_upstream(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     endpoint: &str,
 ) -> (MockServer, Arc<AppState>) {
     let auth_server = MockServer::start().await;
@@ -3283,7 +3289,7 @@ async fn a_provider_that_stalls_after_its_headers_trips_the_breaker() {
 
 /// See [`state_for_one_upstream`] for why the `MockServer` handle is returned.
 async fn state_for_body_read(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     body_timeout_secs: u64,
 ) -> (MockServer, Arc<AppState>) {
     let auth_server = MockServer::start().await;

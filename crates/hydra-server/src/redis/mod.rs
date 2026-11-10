@@ -4,7 +4,7 @@
 //!
 //! | subsystem        | key(s)                                        | lands |
 //! |------------------|-----------------------------------------------|-------|
-//! | leader lease     | `hydra:{lease:leader}`                        | P2    |
+//! | config bus       | `hydra:config:changed` (pub/sub)              | P3    |
 //! | invalidation bus | `hydra:{ctl:events}` / `hydra:{ctl:gen}`      | P4    |
 //! | rate limits      | `hydra:{rl:role:bucket}:count|tokens` (Lua)   | P4    |
 //! | breaker          | `hydra:{br}:dead:{p}` / `hydra:{br}:alldead`  | P4    |
@@ -23,6 +23,18 @@
 pub mod breaker;
 pub mod rate_limit;
 
+/// Build the URL that reaches a specific Redis DATABASE index.
+///
+/// Production always uses `HYDRA_REDIS_URL` verbatim; this exists so the test
+/// harness can point a dedicated [`build_subscriber`] connection at the SAME
+/// database as an isolated pool (`redis://host:port/41`). Kept pure and
+/// panic-free so it can sit outside `#[cfg(test)]` and be reachable from
+/// integration-test binaries, which compile the library without `cfg(test)`.
+#[must_use]
+pub fn database_url(base: &str, db: u8) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), db)
+}
+
 /// Real-Redis harness for tests (dev-plan 铁律 2: Redis is an external system
 /// boundary and a REAL instance is available locally and in CI, so the
 /// in-process double is no longer the default for new tests).
@@ -39,7 +51,7 @@ pub mod test_redis {
     use fred::prelude::*;
 
     /// Hand out a distinct Redis DATABASE per test: the key names are shared
-    /// constants (`hydra:{ctl:events}`, `hydra:{lease:leader}`, …), so tests on
+    /// constants (`hydra:{ctl:events}`, `hydra:config:changed`, …), so tests on
     /// one instance would otherwise observe each other's state.
     ///
     /// The range is deliberately wide (lib tests own 1..=40, hand-assigned
@@ -59,6 +71,16 @@ pub mod test_redis {
     /// When `HYDRA_TEST_REDIS_URL` is unset or the instance is unreachable —
     /// with the exact commands needed to start one.
     pub async fn isolated_pool() -> Pool {
+        isolated_pool_with_url().await.0
+    }
+
+    /// [`isolated_pool`] plus the per-test URL, so a dedicated
+    /// [`super::build_subscriber`] connection can join the SAME Redis database
+    /// (the config-bus convergence tests need exactly that).
+    ///
+    /// # Panics
+    /// Same conditions as [`isolated_pool`].
+    pub async fn isolated_pool_with_url() -> (Pool, String) {
         let base = std::env::var("HYDRA_TEST_REDIS_URL").unwrap_or_else(|_| {
             panic!(
                 "HYDRA_TEST_REDIS_URL is not set, and Redis-dependent tests must run against a REAL \
@@ -68,7 +90,7 @@ pub mod test_redis {
             )
         });
         let db = NEXT_DB.fetch_add(1, Ordering::Relaxed) % UNIT_DB_COUNT + 1; // 1..=40
-        let url = format!("{}/{}", base.trim_end_matches('/'), db);
+        let url = super::database_url(&base, db);
         // The SAME construction as production, through the single owner: a harness pool on
         // fred's defaults could not time out (0 = wait forever) and could never reconnect,
         // so it would test a different program than the one that ships.
@@ -86,7 +108,7 @@ pub mod test_redis {
             )
             .await
             .unwrap_or_else(|e| panic!("cannot flush test db {db}: {e}"));
-        pool
+        (pool, url)
     }
 
     /// `true` when a test Redis is configured. Prefer [`isolated_pool`], which
@@ -280,6 +302,28 @@ pub struct RedisBackend {
 /// When the URL does not parse or fred rejects the configuration.
 pub fn build_pool(url: &str, size: usize) -> Result<Pool, RedisError> {
     build_pool_with(url, size, performance_config())
+}
+
+/// Build the dedicated pub/sub client used by the config bus.
+///
+/// A `SubscriberClient` is a separate connection from the shared [`Pool`]:
+/// subscribed connections enter RESP's subscriber mode and must not be mixed
+/// with ordinary commands. It is nevertheless built with the SAME three
+/// non-default settings as [`build_pool`] — command timeout, unresponsive
+/// watchdog, and the never-give-up reconnect policy — through the same helpers,
+/// so the subscriber cannot drift onto fred's defaults (wait forever, never
+/// reconnect) just because it is a different client type.
+///
+/// # Errors
+/// When the URL does not parse or fred rejects the configuration.
+pub fn build_subscriber(url: &str) -> Result<fred::clients::SubscriberClient, RedisError> {
+    let config = Config::from_url(url).map_err(RedisError::from)?;
+    Ok(fred::clients::SubscriberClient::new(
+        config,
+        Some(performance_config()),
+        Some(connection_config()),
+        Some(reconnect_policy()),
+    ))
 }
 
 /// [`build_pool`] with an explicit command timeout, for tests that must make an

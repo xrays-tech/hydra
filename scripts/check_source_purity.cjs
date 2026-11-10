@@ -49,6 +49,23 @@ const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SRC_ROOT = path.join(ROOT, 'crates');
 const FORBID = '#![forbid(unsafe_code)]';
 
+/**
+ * Files that are TEST-ONLY by construction but cannot be excluded by the
+ * `#[cfg(test)] mod` rule above: an integration test compiles the library
+ * WITHOUT `cfg(test)`, so the harness module must be reachable from those
+ * binaries. `db/testing.rs` is that module — it provisions isolated PostgreSQL
+ * schemas / MySQL databases for tests, and its `panic!` calls deliberately print
+ * container/setup instructions instead of returning an error a test would ignore.
+ * Excluding it here keeps the production purity claim honest: no line in this
+ * file runs in a production binary.
+ */
+const TEST_ONLY_FILES = new Map([
+  [
+    'hydra-server/src/db/testing.rs',
+    'integration-test database provisioning harness; not compiled into a production path',
+  ],
+]);
+
 const FORBIDDEN = [
   { name: 'unsafe', re: /\bunsafe\b/ },
   { name: 'unwrap()', re: /\.unwrap\(\)/ },
@@ -257,8 +274,14 @@ function main(argv) {
   const problems = [];
   const allExpects = [];
   const testOnlyExpects = [];
+  const explicitlyExcluded = [];
   let violations = 0;
   for (const file of files) {
+    const rel = path.relative(cratesRoot, file);
+    if (TEST_ONLY_FILES.has(rel)) {
+      explicitlyExcluded.push(`${rel} (${TEST_ONLY_FILES.get(rel)})`);
+      continue;
+    }
     const res = scanFile(file);
     violations += res.violations.length;
     for (const v of res.violations) {
@@ -378,6 +401,12 @@ function main(argv) {
       console.log(
         `[purity] info: ${testOnlyExpects.length} further .expect(...) site(s) in TEST-ONLY modules, ` +
           `excluded as non-production: ${where.join(', ')}`,
+      );
+    }
+    if (explicitlyExcluded.length > 0) {
+      console.log(
+        `[purity] info: ${explicitlyExcluded.length} explicitly TEST-ONLY file(s) excluded: ` +
+          explicitlyExcluded.join(', '),
       );
     }
     return 0;

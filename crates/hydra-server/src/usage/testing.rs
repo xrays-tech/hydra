@@ -2,14 +2,14 @@
 //!
 //! Why this exists at all: the batching engine's contract (a bounded channel that never blocks the
 //! proxy, a flush on size OR time, bounded retry with backoff, a bounded wait on shutdown) used to
-//! be tested through `SqliteSink`, because that was the only sink a test could point at a real
-//! store. When SQLite is retired, testing the engine through a *store* would mean testing it through
-//! whatever backend happens to exist — and the engine would lose its coverage the moment that
-//! backend was swapped.
+//! be tested through the retired `SqliteSink`, because that was the only sink a test could point at
+//! a real store. Once ADR-0002 retired SQLite, testing the engine through a *store* would have meant
+//! testing it through whatever backend happens to exist — and the engine would lose its coverage
+//! the moment that backend was swapped.
 //!
 //! So the engine is tested through a sink that keeps what it was handed. It is deliberately a
 //! faithful copy of how the real backends are wired — [`run_channel_sink`] plus [`drain_on_drop`],
-//! the same two shared pieces `SqliteSink` and `ClickHouseSink` use — so what these tests exercise
+//! the same two shared pieces `ClickHouseSink` uses — so what these tests exercise
 //! is the shared wiring, not a test-only reimplementation of it.
 //!
 //! **It is NOT in `REGISTRY`**, so no `HYDRA_USAGE_SINK` value can select it: a deployment cannot

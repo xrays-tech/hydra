@@ -3,8 +3,9 @@
 # Hydra admin API — integration test runner.
 #
 # Spins up a throwaway Hydra container (image hydra:latest), polls /health,
-# runs test_crud.py against the admin REST API, then tears everything down on
-# exit (container + volume) so each run is hermetic and reproducible.
+# runs test_crud.py against the admin REST API, then tears the container down on
+# exit. The container uses a REAL PostgreSQL/MySQL database supplied in
+# HYDRA_DB_URL (SQLite is retired), so each run needs a disposable schema/database.
 #
 # Prereqs:
 #   - Docker daemon running
@@ -14,7 +15,8 @@
 # Usage:
 #   ./integration/run.sh                 # default: build, run, test, teardown
 #   HYDRA_IT_PORT=8090 ./integration/run.sh
-#   HYDRA_IT_KEEP=1 ./integration/run.sh # keep container + volume after run (debug)
+#   HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra ./integration/run.sh
+#   HYDRA_IT_KEEP=1 ./integration/run.sh # keep the container after a run (debug)
 #
 # Exit code: the test script's exit code (0 = all assertions passed).
 set -uo pipefail
@@ -24,7 +26,6 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 IMAGE="${HYDRA_IT_IMAGE:-hydra:latest}"
 CONTAINER="${HYDRA_IT_CONTAINER:-hydra-it}"
-VOLUME="${HYDRA_IT_VOLUME:-hydra-it-data}"
 PORT="${HYDRA_IT_PORT:-8081}"
 # >= 16 chars: the server fail-closes on a shorter admin token
 # (AdminService::MIN_ADMIN_TOKEN_LEN, main.rs "HYDRA_ADMIN_TOKEN is too short").
@@ -42,18 +43,26 @@ HEALTH_TIMEOUT="${HYDRA_IT_HEALTH_TIMEOUT:-30}"   # seconds to wait for boot
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_PY="${SCRIPT_DIR}/test_crud.py"
 
-# The DB URL uses the cross-compilation-resolved main.rs env name (HYDRA_DB_URL),
-# NOT the HYDRA_DATABASE_URL the Dockerfile sets — main.rs reads HYDRA_DB_URL.
-# (See crates/hydra-server/src/main.rs:97.)
+# The DB URL uses main.rs's env name (HYDRA_DB_URL), NOT HYDRA_DATABASE_URL.
+# SQLite is retired (Phase 2), so the caller supplies a real PostgreSQL/MySQL URL.
+# A disposable schema/database can be provisioned with:
+#   python3 integration/_shared_db.py create integration-run
+# The container must be able to reach that server (the URL is used verbatim).
 #
 # HYDRA_ADMIN_ADDR=0.0.0.0:8081 overrides the localhost-only DEFAULT_ADMIN_LISTEN
 # so the port is reachable from the host. (main.rs:50,242.)
-DB_URL="sqlite:/app/data/hydra.db?mode=rwc"
+DB_URL="${HYDRA_DB_URL:-}"
+if [[ -z "$DB_URL" ]]; then
+    echo "[config] !! set HYDRA_DB_URL to a real PostgreSQL/MySQL URL (SQLite is retired)" >&2
+    echo "[config]    e.g. HYDRA_DB_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra" >&2
+    echo "[config]    or provision one: python3 integration/_shared_db.py create integration-run" >&2
+    exit 2
+fi
 
 # Provider-key encryption master key. The container fail-closes without it
 # (provider api-keys are AES-256-GCM encrypted at rest). The integration DB and
-# its keys are throwaway (re-entered by test_crud.py each run, volume torn down
-# on exit), so a fresh random key per run is correct and hermetic.
+# its keys are throwaway (re-entered by test_crud.py each run), so a fresh random
+# key per run is correct and hermetic.
 if command -v openssl >/dev/null 2>&1; then
     ENC_KEY="$(openssl rand 32 | base64)"
 else
@@ -69,13 +78,12 @@ cleanup() {
     echo ""
     echo "[teardown] cleaning up..."
     if [[ -n "$keep" ]]; then
-        echo "[teardown] HYDRA_IT_KEEP set — leaving container '$CONTAINER' and volume '$VOLUME' running."
+        echo "[teardown] HYDRA_IT_KEEP set — leaving container '$CONTAINER' running."
         return 0
     fi
     docker stop "$CONTAINER" >/dev/null 2>&1 || true
     docker rm "$CONTAINER" >/dev/null 2>&1 || true
-    docker volume rm "$VOLUME" >/dev/null 2>&1 || true
-    echo "[teardown] removed container '$CONTAINER' and volume '$VOLUME'."
+    echo "[teardown] removed container '$CONTAINER'."
 }
 trap cleanup EXIT
 
@@ -96,12 +104,10 @@ echo "[image] ok."
 echo "[run] starting container '$CONTAINER' (port ${PORT}->8081)..."
 # Idempotent: tear down any leftover from a previous interrupted run first.
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker volume rm "$VOLUME" >/dev/null 2>&1 || true
 
 if ! docker run -d \
         --name "$CONTAINER" \
         -p "${PORT}:8081" \
-        -v "${VOLUME}:/app/data" \
         -e "HYDRA_DB_URL=${DB_URL}" \
         -e "HYDRA_ADMIN_ADDR=0.0.0.0:8081" \
         -e "HYDRA_ADMIN_TOKEN=${TOKEN}" \

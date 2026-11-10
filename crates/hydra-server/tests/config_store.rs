@@ -48,7 +48,7 @@ fn tenant(id: &str, domain: &str) -> Tenant {
     }
 }
 
-async fn seed_basic(pool: &sqlx::SqlitePool) {
+async fn seed_basic(pool: &hydra_server::db::Pool) {
     repo::insert_provider(pool, &provider("p1", "openai"))
         .await
         .expect("p1");

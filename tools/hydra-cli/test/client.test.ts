@@ -86,12 +86,14 @@ before(async () => {
       }
       if (last.url === '/api/v1/cluster/status' && last.method === 'GET') {
         return json(res, 200, {
-          cluster: false,
-          mode: 'single',
-          node_id: '',
-          this_node_leader: false,
-          lease_holder: null,
-          nodes: [],
+          cluster: true,
+          mode: 'cluster',
+          node_id: 'node-a',
+          role: 'cluster',
+          config_version: 42,
+          db_reachable: true,
+          redis_configured: true,
+          redis_reachable: null,
         });
       }
       if (last.url === '/api/v1/tenants/auth/test' && last.method === 'POST') {
@@ -218,7 +220,13 @@ describe('HydraClient transport', () => {
     const usage = await client().statsUsage() as Record<string, unknown>;
     assert.equal((usage['totals'] as Record<string, unknown>)['requests'], 42);
     const cluster = await client().clusterStatus() as Record<string, unknown>;
-    assert.equal(cluster['cluster'], false);
+    assert.equal(cluster['cluster'], true);
+    assert.equal(cluster['node_id'], 'node-a');
+    assert.equal(cluster['role'], 'cluster');
+    assert.equal(cluster['config_version'], 42);
+    assert.equal(cluster['db_reachable'], true);
+    assert.equal(cluster['redis_configured'], true);
+    assert.equal(cluster['redis_reachable'], null);
   });
 
   it('probes a tenant auth URL', async () => {

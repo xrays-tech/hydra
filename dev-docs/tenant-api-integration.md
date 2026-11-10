@@ -8,7 +8,7 @@
 ---
 
 > **⚠ 2026-11-04 重大契约变化（T10 已完成，read this first).** 数据面 client-key **鉴权是 INTERNAL**:Hydra 把 your client's api-key 对照 its **stored `user_api_key` rows** under the four-level hierarchy `tenant → user_group → user → api_key` — **`auth_url` is gone entirely** (the column was dropped, migration `0015`), and so is the auth cache. Consequences:
-> - **The old auth-cache and sub-tenant endpoints are REMOVED** — `auth/cache/invalidate`, `/sub-tenants*` and `/sub-tenant-routes*` (read and write) no longer exist, and the error codes they answered (`key_prefix_overlap`, `name_duplicate`, …) are gone from §6. Revoke / disable / delinquency now flip **immediately**: local node next-request, other nodes ≤5 s via config publish. Do not build flows on the removed endpoints.
+> - **The old auth-cache and sub-tenant endpoints are REMOVED** — `auth/cache/invalidate`, `/sub-tenants*` and `/sub-tenant-routes*` (read and write) no longer exist, and the error codes they answered (`key_prefix_overlap`, `name_duplicate`, …) are gone from §6. Revoke / disable / delinquency now flip **immediately**: local node next-request, other nodes ≤5 s via the Redis config notification or the 5 s poll fallback. Do not build flows on the removed endpoints.
 > - **The self-service endpoints (§5.7)** manage your groups / users / api-keys / billing.
 > - `whoami` NO LONGER echoes `auth_url` (the column does not exist any more).
 > - Client api-keys (`hk_…`) and tenant access tokens (`ht_…`) are **hydra-minted, plaintext shown exactly once**; a tenant may hold **multiple** access tokens.
@@ -156,7 +156,7 @@ Authorization: Bearer <tenant access token>
 
 ### 5.3 `GET /tenant/{tenant_id}/api/v1/usage`
 
-查某个时间窗内的用量。数据来自**计量存储**（单节点部署读本地 SQLite；集群部署读共享 ClickHouse），所以是**持久、可重复查询**的账；集群下任何节点查到的都是同一份数据。
+查某个时间窗内的用量。数据来自**计量存储**（ClickHouse 共享用量存储；`HYDRA_USAGE_SINK=none` 时读接口返回 `503 usage_store_unavailable`），所以是**持久、可重复查询**的账；任何节点查到的都是同一份数据。
 
 #### 请求
 
@@ -215,7 +215,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 | `tokens_out` | 模型**返回**的 token |
 | `cache_hit_tokens` | 命中提示词缓存的 token（是 `tokens_in` 的子集） |
 | `errors` | HTTP 状态码 **≥400** 的请求数 |
-| `source` | 本次数据来自哪个存储：`sqlite` \| `clickhouse` |
+| `source` | 本次数据来自哪个存储：`clickhouse`（`none` 时不可读） |
 
 #### 语义边界（**请读完再拿去对账**）
 
@@ -243,7 +243,7 @@ GET /tenant/{tenant_id}/api/v1/usage?since=2026-09-16T00:00:00Z&until=2026-09-17
 
 ### 5.7 The four-level user hierarchy: groups / users / api-keys / billing (2026-11-04, T10 complete)
 
-These endpoints manage **your own** identity rows under `tenant → user_group → user → api_key`. Same access-token gate as everything else (401 / 403 tenant_id_mismatch / 429 / 503 not_ready / config_not_published apply identically). **The four-level rows you create here are exactly what the data plane authenticates against** — no `auth_url`, no auth cache.
+These endpoints manage **your own** identity rows under `tenant → user_group → user → api_key`. Same access-token gate as everything else (401 / 403 tenant_id_mismatch / 429 / 503 not_ready apply identically); writes never answer `config_not_published`. **The four-level rows you create here are exactly what the data plane authenticates against** — no `auth_url`, no auth cache.
 
 #### 5.7.1 Groups
 
@@ -290,13 +290,13 @@ Back to `active` clears it. **This replaces the old `auth_url`-based "欠费停�
 | key live, user `billing_status:"delinquent"` | **402** `user_delinquent` (body above) |
 | everything enabled & active | passes to the model |
 
-Propagation of any of those flips: **on your node the next request**; other nodes within **≤5 s** (config publish + ~1 s replica materialise). There is **no auth-cache residual window any more** — see §7.4's rewrite.
+Propagation of any of those flips: **on your node the next request**; other nodes within **≤5 s** (Redis config notification, or the 5 s poll fallback). There is **no auth-cache residual window any more** — see §7.4's rewrite.
 
 #### 5.7.6 传输语义与对账（写端点，与运维手册 `ops.md` 同义）
 
-- **写就在你连的那个节点上执行**（ADR-0001 D-6）：没有"转发到 leader"层，**任何节点都接受并执行租户写**，LB 指向哪一台都可以。入口节点用**你的令牌**鉴权、在**本地事务**里执行写核心，然后把自己的配置**提交到集群的权威提交点**（`head`)。
-- **提交点是集群的 `head`，不是这个节点**，所以存在一种集群-only 失败：本地提交成功、但提交到 `head` 失败（集群**失去多数派**)⇒ **`503 config_not_published`**。这一台**已经改**了，别的节点看不到它——**先重读资源（同一个节点），等恢复多数后重发完全相同的请求**（幂等写；那次重发才是真正把配置发布出去的动作；没有后台补发）。**非幂等写不要重发**（`POST .../api-keys/bulk` 每次都会 mint 新 key）：改用 `POST /api/v1/reload?force=1` 发布本地已提交的配置（普通 reload 看到 `changed=false` 会跳过发布）。读照常，分区时读继续。
-- **`config_version` 是你的对账基线**：每次成功写（`200`/写响应带它，`404` 幂 `DELETE` 时无 body)；`whoami` 也带它。轮询从"你上次看到的版本"前进即可判断"我的改动是否已生效"。只在把 **`200` 的** `config_version` 当基线（`503 config_not_published` 时本节点的版本**领先**于集群）。
+- **写就在你连的那个节点上执行**：没有"转发到 leader"层，**任何节点都接受并执行租户写**，LB 指向哪一台都可以。入口节点用**你的令牌**鉴权，在**一个数据库事务**里拿 the shared lock row 行（`SELECT … FOR UPDATE`）、执行写、递增 `config_revision` 并提交。**提交后才返回 2xx**。
+- **没有集群-only 的写失败**：数据库事务提交就是写成功，不存在“本地提交但未发布到 `head`”，也没有 `503 config_not_published`。其他节点通过 Redis `hydra:config:changed` 通知（或 5 秒轮询兜底）重新加载；通常在 ≤5 秒内看到你的改动。
+- **`config_version` 是你的对账基线**：每次成功写和 `whoami` 都带它。轮询从"你上次看到的版本"前进即可判断"我的改动是否已生效"。若某节点 reload 失败，写仍然成功（该节点标记 `snapshot_stale`，运维用 `POST /api/v1/reload?force=1` 恢复），不影响你重读同一节点。
 
 ---
 
@@ -318,7 +318,6 @@ Propagation of any of those flips: **on your node the next request**; other node
 | `invalid_until` | 400 | `until` 写法非法 | 否 |
 | `window_too_large` | 400 | 窗口超过上限（默认 31 天） | 否（缩小窗口） |
 | `usage_store_unavailable` | 503 | 计量存储读不到或无法解析 | **是** |
-| `config_not_published` | 503 | **写已在本节点提交，但没能提交到集群**（失去多数派；写端点，§5.7）。读照常 | **是**（幂等写：先重读、等多数派恢复后重发同一请求——那次重发才是发布动作；非幂等写用 `POST /api/v1/reload?force=1`） |
 | `invalid_group` | 400 | `?group_id=` filter, or a `PUT` user's `user_group_id`, names a group that is not one of yours (hierarchy endpoints, §5.7) | 否 (create/fix the group first) |
 | `duplicate_name` | 409 | `PUT /user-groups`: another of your groups already uses that name (unique per tenant, §5.7) | 否 |
 | `group_not_empty` | 409 | `DELETE /user-groups/{id}` while the group still has users (`ON DELETE RESTRICT`, §5.7) | 否 (move/delete the users first) |
@@ -347,7 +346,7 @@ curl -s -X PUT $HYDRA/tenant/$TID/api/v1/users/$UID/billing \
   -d '{"status":"active"}'
 
 # 3) NO invalidate any more: the billing flip takes effect on the NEXT
-#    request (local node immediately, other nodes ≤5 s via config publish).
+#    request (local node immediately, other nodes ≤5 s via Redis notification or the poll fallback).
 #    A *tenant-level* disable (`enabled:false`) is still ops-set via the admin
 #    API — this API cannot write tenant-level config.
 ```
@@ -393,12 +392,12 @@ There is **no auth cache on the data plane at all**: client-key auth matches sto
 
 ### 7.4 How fast does a revoke / ban take effect
 
-**There is no auth-cache residual window any more.** A revoke, a disable, or a delinquency flip is decided by published config, not by a TTL:
+**There is no auth-cache residual window any more.** A revoke, a disable, or a delinquency flip is decided by the shared DB snapshot, not by a TTL:
 
 - **your node**: the **next** request already sees it;
-- **other nodes**: within **≤5 s** (config publish + ~1 s replica materialise).
+- **other nodes**: within **≤5 s** (Redis config notification, or the 5 s poll fallback).
 
-To be sure it landed everywhere, compare `config_version` via `whoami` and use the write endpoints' transport semantics (§5.7.6) — `503 config_not_published` is the only "the cluster has NOT got it yet" answer. A persistently `lagging` node is an ops issue (ops has matching alerts).
+To be sure it landed everywhere, compare `config_version` via `whoami` (§5.7.6). A node that has not converged yet reports an older `config_version`; a persistently stale node (`snapshot_stale`) is an ops issue (ops has matching alerts).
 
 ### 7.5 用量口径
 
@@ -418,10 +417,9 @@ To be sure it landed everywhere, compare `config_version` via `whoami` and use t
 | `405 method_not_allowed` | 方法用错（例如 `POST` 调 `user-groups` list） | `GET` 读端点；`PUT`/`POST`/`DELETE` 按 §5.7 |
 | `429 rate_limited` | 触发限流或锁定 | 读 `Retry-After` 再重试。持**有效令牌**时，429 只会来自每租户**已授权**频率（60/分钟）上限；**失败**锁定（按来源 IP / 令牌摘要）只拦**错误**令牌的来源，不会拦对令牌 |
 | `503 not_ready` | 该节点还没物化配置（启动窗口） | 重试（会落到其他节点） |
-| `503 config_not_published` | 集群**失去多数派**：写已落在这台节点的库上，但没能提交到集群 | **不是你的请求有问题**。幂等写等集群恢复后**重发完全相同的请求**（那次重发才是把改动发布出去的动作）；**非幂等写**（如 `POST .../api-keys/bulk`）不要重发，改用 `POST /api/v1/reload?force=1` 发布本地已提交的配置。需要确认时用**同一个节点**重读资源 |
 | `503 usage_store_unavailable` | 计量存储读不到或返回无法解析 | 重试；持续失败把 `X-Hydra-Trace-Id` 给运维 |
 | client answers 402 `user_delinquent` | that user's `billing_status` is `delinquent` (§5.7) | intended gate; restore with `PUT .../users/{uid}/billing {"status":"active"}` |
-| key still passes after you "revoked" it | you hit a `lagging` node, or the revoke write answered `503 config_not_published` | re-read on the same node, re-send the write (§5.7.6); check `config_version` |
+| key still passes after you "revoked" it | you hit a node that has not converged yet (older `config_version`) | re-read on the same node after it converges, or check `config_version` via `whoami` (§5.7.6) |
 
 **报障时请附上**：`X-Hydra-Trace-Id`（或响应体里的 `error.trace_id`）、请求的完整 URL（令牌请打码）、时间点。
 
@@ -458,4 +456,4 @@ Trace:  响应头 X-Hydra-Trace-Id，报障必带
 E2 判定顺序：先看 HTTP，再看 fleet.state
   200 applied/single_node = 完成 ｜ 202 pending = 未确认（可重试）｜ 503 unavailable = 集群没收到
 E3 判定：as_of 为 null 表示窗口内无记录（不是报错）；集群下 requests 是近似值
-写端点判定：200 = 已写（带 config_version）｜ 204 = 删除（幂等）｜ 503 config_not_published = 已本地写、未集群提交：幂等写重读（`whoami` 同节点）再重发；非幂等写用 `POST /api/v1/reload?force=1`（§5.7.6）
+写端点判定：200 = 数据库事务已提交（带 config_version）｜ 204 = 删除（幂等）。没有 `config_not_published`：写不会“本地成功但集群失败”

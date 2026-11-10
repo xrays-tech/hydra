@@ -17,59 +17,20 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use hydra_server::db;
 
 /// `HYDRA_ENCRYPTION_KEY`: base64 of 32 bytes (all `0x07`), as the binary requires.
 const TEST_MASTER_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
-/// A throwaway migrated SQLite file that the spawned binary opens.
-struct TempDb(PathBuf);
-
-impl TempDb {
-    async fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "hydra-boot-listeners-{}-{}.db",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-        let pool = db::init_pool(&format!("sqlite:{}?mode=rwc", path.display()))
-            .await
-            .expect("init_pool");
-        db::run_migrate(&pool).await.expect("run_migrate");
-        pool.close().await; // the child opens the same file
-        Self(path)
-    }
-
-    fn url(&self) -> String {
-        format!("sqlite:{}?mode=rwc", self.0.display())
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
-}
-
-fn base_command(db: &TempDb, plain: u16, admin: u16) -> Command {
+fn base_command(db: &common::TestDb, plain: u16, admin: u16) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hydra"));
     cmd
         // Required (>= 16 chars): without it the admin API fails closed with 401,
         // so the `/metrics` fallback in case B could never be read.
         .env("HYDRA_ADMIN_TOKEN", "boot-listeners-token")
-        .env("HYDRA_DB_URL", db.url())
+        .env("HYDRA_DB_URL", db.url.clone())
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{plain}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
@@ -145,7 +106,7 @@ fn log_text(log: &Arc<Mutex<String>>) -> String {
 /// must refuse to start rather than come up half-listening.
 #[tokio::test]
 async fn same_plaintext_and_tls_address_is_fatal() {
-    let db = TempDb::new().await;
+    let db = common::setup_db().await;
     let port = common::ephemeral_port();
     let admin = common::ephemeral_port();
     let mut cmd = base_command(&db, port, admin);
@@ -198,7 +159,7 @@ async fn a_taken_admin_port_refuses_startup() {
     let squatter = TcpListener::bind("127.0.0.1:0").expect("bind squatter");
     let taken = squatter.local_addr().expect("addr").port();
 
-    let db = TempDb::new().await;
+    let db = common::setup_db().await;
     let plain = common::ephemeral_port();
     // The squatted port is the ADMIN one.
     let cmd = base_command(&db, plain, taken);
@@ -242,7 +203,7 @@ async fn a_taken_tls_port_degrades_to_plaintext() {
     let squatter = TcpListener::bind("127.0.0.1:0").expect("bind squatter");
     let taken = squatter.local_addr().expect("addr").port();
 
-    let db = TempDb::new().await;
+    let db = common::setup_db().await;
     let plain = common::ephemeral_port();
     let admin = common::ephemeral_port();
     let mut cmd = base_command(&db, plain, admin);
@@ -322,7 +283,7 @@ async fn a_taken_tls_port_degrades_to_plaintext() {
 #[tokio::test]
 #[ignore = "known limitation: same port on different bind addresses is not detected statically"]
 async fn same_port_on_different_addresses_is_not_detected_statically() {
-    let db = TempDb::new().await;
+    let db = common::setup_db().await;
     let port = common::ephemeral_port();
     let admin = common::ephemeral_port();
     let mut cmd = base_command(&db, port, admin);

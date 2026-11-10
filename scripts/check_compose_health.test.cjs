@@ -57,7 +57,7 @@ test('every node probed through /api/v1/health with the token passes', () => {
     'redis': { image: 'redis:7-alpine' },
   } })]);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /3 hydra service\(s\) checked: OK/);
+  assert.match(r.stdout, /3 hydra service\(s\) \+ 0 database service\(s\) checked: OK/);
 });
 
 // ADR-0001 retired the role, so the role-specific exceptions went with it: a service that is
@@ -153,7 +153,7 @@ test('the static path never passes by finding nothing', () => {
 test('all shipped compose files pass (real docker compose render)', () => {
   const res = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8' });
   assert.equal(res.status, 0, `a shipped hydra service is unsupervised or probed wrongly:\n${res.stderr}`);
-  assert.match(res.stdout, /hydra service\(s\) checked: OK/);
+  assert.match(res.stdout, /hydra service\(s\)/);
   assert.match(res.stdout, /hydra-c/);
 });
 

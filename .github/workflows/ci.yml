@@ -8,7 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  SQLX_OFFLINE: "true"
   # dev-plan 铁律 2: Redis-dependent tests must talk to a REAL Redis — the
   # in-process double is forbidden. The service container below publishes
   # 6379 on localhost; a test that needs Redis FAILS LOUDLY when this is unset
@@ -18,6 +17,24 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Phase 2c's test harness consumes this: a superuser URL so each test can create its
+      # own schema/database. The scheme selects the compiled backend (db-postgres below).
+      HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: hydra
+          POSTGRES_DB: hydra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hydra -d hydra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
 
@@ -66,10 +83,10 @@ jobs:
       # (empty) leaves sqlx unresolved and the step fails. Scope the feature to
       # hydra-server via pkg/feat syntax; hydra-core clippies with its defaults.
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/db-postgres -- -D warnings
 
       - name: Build workspace
-        run: cargo build --workspace --features hydra-server/server
+        run: cargo build --workspace --features hydra-server/server,hydra-server/db-postgres
 
       # T1.1 / T1.2 / T10.1 (mirror) / T10.2 — the pure-core suite, incl. the
       # in-process dependency-firewall test. The transcript is kept so the
@@ -102,7 +119,7 @@ jobs:
       - name: Test hydra-server (shell)
         run: |
           set -o pipefail
-          cargo test -p hydra-server --features server 2>&1 | tee "$RUNNER_TEMP/server-tests.log"
+          cargo test -p hydra-server --features server,db-postgres 2>&1 | tee "$RUNNER_TEMP/server-tests.log"
 
       # docs/index.html is published (GitHub Pages) and advertises an exact Rust
       # test count. That number is hand-edited; it already went stale twice, and
@@ -112,30 +129,10 @@ jobs:
       - name: Public claims match the measured suites
         run: node scripts/check_public_claims.cjs --core-log="$RUNNER_TEMP/core-tests.log" --server-log="$RUNNER_TEMP/server-tests.log"
 
-      # P3-5 (2026-10-09): the `.sqlx` offline cache must be FRESH. `SQLX_OFFLINE=true`
-      # (set above) makes the build read query metadata from `.sqlx/` but NEVER checks
-      # it against the migrations — so a schema change that forgets to regenerate the
-      # cache compiles green here and explodes at runtime. This step forces the check by
-      # replaying the migrations against a scratch SQLite and running
-      # `cargo sqlx prepare --check` (exit 1 when the cache is stale). `--workspace`
-      # with the features AFTER `--`, and ALL query-bearing features present — the root
-      # `.sqlx/` holds every crate's queries, and a partial feature set would make the
-      # check unable to notice a drift in the feature-gated ones (HANDOFF.md records the
-      # `--features db` trap: it no longer compiles on its own).
-      - name: .sqlx offline cache is fresh (cargo sqlx prepare --check)
-        run: |
-          set -euo pipefail
-          # The step below needs the sqlx-cli binary; no job installs it, so the
-          # `cargo sqlx ...` commands would fail with "no such command: sqlx" on
-          # first push (found by final review 2026-10-09, N1). Install the same
-          # 0.8.x the crate uses (Cargo.lock), sqlite-only — no live server DB.
-          cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,sqlite --locked
-          rm -f /tmp/hydra-sqlx-prepare.db*
-          export DATABASE_URL="sqlite:///tmp/hydra-sqlx-prepare.db"
-          cargo sqlx database create
-          cargo sqlx migrate run --source crates/hydra-server/migrations
-          cargo sqlx prepare --check --workspace -- \
-            --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
+      # The SQLx offline cache (`.sqlx/`, `SQLX_OFFLINE`, `cargo sqlx prepare --check`) was
+      # deleted in Phase 2b: every statement is built at runtime and passed through
+      # `db::dialect::sql` for placeholder rewriting, so there is no compile-time query
+      # metadata to prepare. Do not reintroduce an offline/prepare step.
 
   # Neither `cluster-redis` (Redis-backed leader lease, cluster rate limits,
   # shared breaker votes, auth-cache L2, invalidation stream) nor
@@ -144,8 +141,28 @@ jobs:
   # ~36 tests — including the entire cross-node suite — could break, or stop
   # compiling, without CI noticing. environment/build.sh ships an image built
   # from exactly this feature set, so a break here ships a broken binary.
+  #
+  # The relational backend is NEVER implied: `db/backend.rs` refuses to compile with
+  # neither (or both) selected. This job is the `db-postgres` half of the backend
+  # matrix; the `db-mysql` job below is the other half, with the same suite.
   optional-features:
     runs-on: ubuntu-latest
+    env:
+      HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: hydra
+          POSTGRES_DB: hydra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hydra -d hydra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
 
@@ -175,10 +192,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (deny warnings, optional features)
-        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres -- -D warnings
 
       - name: Build workspace (optional features)
-        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse
+        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres
 
       # ORDER MATTERS: keep this step BEFORE the full suite. A step that follows a
       # failing one never executes, which would make this automated guard for the
@@ -192,11 +209,72 @@ jobs:
       # ephemeral ports), and the ClickHouse-dependent ignored tests live in
       # `live-deps`.
       - name: Ignored test that needs no service (listener limitation)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test boot_listeners -- --ignored
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --test boot_listeners -- --ignored
 
       - name: Test hydra-server (optional features)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres
 
+  # The `db-mysql` half of the backend matrix. Same optional-feature suite as
+  # `optional-features`, compiled and run against MySQL 8. The URL uses ROOT because
+  # Phase 2c's harness creates a database/schema per test and the `hydra` user created
+  # by the image only owns the seeded `hydra` database (it has no global CREATE DATABASE).
+  db-mysql:
+    runs-on: ubuntu-latest
+    env:
+      HYDRA_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/hydra
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          # root must be reachable through the published port (the runner connects to 127.0.0.1,
+          # which the container sees as a remote host). Phase 2c needs CREATE DATABASE per test.
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: hydra
+          MYSQL_USER: hydra
+          MYSQL_PASSWORD: hydra
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start a real Redis for tests
+        run: |
+          set -euo pipefail
+          docker run -d --name hydra-test-redis -p 6379:6379 \
+            redis:7-alpine redis-server --save "" --appendonly no --databases 64
+          for _ in $(seq 1 30); do
+            if docker exec hydra-test-redis redis-cli ping >/dev/null 2>&1; then
+              echo "redis is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the test Redis did not become reachable"; exit 1
+
+      - name: Install Rust toolchain (pinned 1.98.0)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings, mysql backend)
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-mysql -- -D warnings
+
+      - name: Build workspace (mysql backend)
+        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-mysql
+
+      - name: Ignored test that needs no service (listener limitation)
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql --test boot_listeners -- --ignored
+
+      - name: Test hydra-server (mysql backend)
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql
 
   # The feature combinations that NO other job compiles. Both were holes of the
   # same shape the `optional-features` job above was added to close, and both are
@@ -238,7 +316,7 @@ jobs:
       # compiler, all present on the runner; the first run takes minutes and
       # `Swatinem/rust-cache` caches the result. BoringSSL is still not built.
       - name: Clippy (deny warnings, OpenSSL TLS backend)
-        run: cargo clippy --workspace --all-targets --features hydra-server/tls-openssl -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/tls-openssl,hydra-server/db-postgres -- -D warnings
 
       # Linking, not just lints — and since the `hydra` binary's
       # `required-features` moved from `server` to `proxy`, these steps cover the
@@ -247,13 +325,13 @@ jobs:
       # was silently SKIPPED here, so "proxy must build standalone" and "the OpenSSL
       # backend links" were both unverified claims.
       - name: Build workspace (OpenSSL TLS backend)
-        run: cargo build --workspace --features hydra-server/tls-openssl
+        run: cargo build --workspace --features hydra-server/tls-openssl,hydra-server/db-postgres
 
       - name: Clippy (deny warnings, proxy with NO TLS backend)
-        run: cargo clippy --workspace --all-targets --features hydra-server/proxy -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/proxy,hydra-server/db-postgres -- -D warnings
 
       - name: The binary compiles with NO TLS backend (the documented standalone build)
-        run: cargo check -p hydra-server --features hydra-server/proxy --bin hydra
+        run: cargo check -p hydra-server --features hydra-server/proxy,hydra-server/db-postgres --bin hydra
 
   # The `#[ignore]`d tests are the ONLY end-to-end coverage for two things this
   # repo has already got wrong: ClickHouse retry idempotency (a re-sent batch must
@@ -275,7 +353,21 @@ jobs:
       # Every step that speaks to 8123 uses them, and so does `CH_URL` for the `#[ignore]`d suites.
       CH_USER: hydra
       CH_PASSWORD: hydra-ci-clickhouse
+      HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
     services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: hydra
+          POSTGRES_DB: hydra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hydra -d hydra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
       clickhouse:
         image: clickhouse/clickhouse-server:24.3
         ports:
@@ -353,106 +445,12 @@ jobs:
             printf '%s\n' "$ddl"
             exit 1
           fi
-
-      # The arachne Rust tests, which NO OTHER JOB RUNS. They carry
-      # `#![cfg(feature = "arachne")]`, and the `check` / `optional-features` / `alt-features` jobs
-      # test WITHOUT that feature, so those targets compile EMPTY there: the files existing never
-      # meant they ran, and no guard enforces the difference (`check_ci_wiring.cjs` only demands a
-      # step for `#[ignore]`d tests, and a feature-gated target is not `#[ignore]`d). That is how the
-      # whole ADR-0001 control-plane family — including the causal test for the stale-head refusal —
-      # stayed CI-invisible while being green by hand. Measured: 23 tests, 12 s.
-      #
-      # It runs in THIS job because this is the only one that builds with `arachne`, and it runs
-      # BEFORE the drills: some of these tests bind real loopback ports (17601-18803) and the drills
-      # use neighbouring ones (18800/18801), so no drill may be holding a port when they start.
-      # `arachne_alive_partition` is the one that is deliberately NOT a crash test: three raft runtimes
-      # in ONE process over upstream's in-memory transport, where `firewall(from,to)` drops messages
-      # while keeping both channels alive — the case ADR-0001 §12's ordering rule could break by
-      # turning a merely-partitioned node into a self-inflicted config wipeout.
-      - name: Arachne control plane, in-process Rust tests
-        run: |
-          set -o pipefail
-          cargo test -p hydra-server --features server,cluster-redis,arachne \
-            --lib \
-            --test arachne_adoption \
-            --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch \
-            --test arachne_store --test arachne_three_nodes \
-            --test arachne_cert_fidelity --test arachne_derivation_fidelity
-
-      # Cluster HA, end to end (ADR-0001 gates 1/3/4/5): three REAL hydra processes that are all
-      # raft members — a management write aimed at ANY of them is accepted, `kill -9` on the leader
-      # promotes a new one within 3s with never two claimants, every node ends up serving the same
-      # config, and with a minority alive a write is refused 503 `config_not_published` while the
-      # data plane keeps serving a real proxied request.
-      #
-      # This REPLACES `integration/test_cluster_ha.py`, which drove the retired topology
-      # (`HYDRA_ROLE=leader|edge` + `HYDRA_CONTROL_URL`) and could therefore only report CANNOT
-      # VERIFY. What that drill covered and this one does not: "a standby forwards admin writes to
-      # the active node" (retired by D-3/乙 — any node applies its own write), and edge transparency
-      # (the `edge` role is retired with T4.0; there is no polling to re-point).
-      - name: Arachne control plane (write anywhere, failover, convergence, minority)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
-          python3 integration/test_arachne_control_plane.py
-
-      # A TENANT write that cannot be PUBLISHED must not answer 200. Since D-6 the entry node
-      # applies a tenant self-service write itself and the publish rides on the post-write reload;
-      # when the control plane has no majority the local transaction has ALREADY committed, so the
-      # node serves the new config while the cluster does not have it. Measured 2026-10-05: with 2 of
-      # 3 members killed the write answered `200 {"config_version":3,…}` — and a tenant reads
-      # `config_version` as its reconciliation baseline, so nothing about that answer was true from
-      # the cluster's point of view. The admin path has answered 503 `config_not_published` for the
-      # same failure since T3.2; the tenant path now mirrors it, and this drill pins the answer plus
-      # the recovery (an idempotent retry once quorum returns is what publishes it).
-      - name: tenant write that cannot be published is refused (503 config_not_published)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
-          python3 integration/test_tenant_write_publish_failure.py
-
-      # ACCEPTANCE 2 (ADR-0001): the DATA PLANE under load across a raft failover. The plan's
-      # acceptance list has five rows and this is the one that was never executed — its old driver
-      # (`test_cluster_ha.py`) drove the retired leader/edge topology, so it could only report
-      # CANNOT VERIFY. The claim is D-1/D-2's: the control plane moved to Arachne and the data plane
-      # deliberately did not, so killing the raft leader must be invisible to a request that is not
-      # a management write. 20 rps for 60 s against a FOLLOWER's data port, `kill -9` the leader 15 s
-      # in, and ZERO non-200 responses is the criterion (plus the ±3 s window around the kill, which
-      # a 60-second average would hide). Same build recipe as the acceptance drill above, for the
-      # same reason: without `arachne` a node with a member list refuses to boot.
-      - name: data plane under load across a failover (acceptance 2, 20 rps / 60 s)
-        env:
-          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
-        run: |
-          set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
-          python3 integration/test_data_plane_failover_load.py
-
-      # STARTUP KNOBS on the real binary — two operator-facing promises that used to be prose only:
-      # `HYDRA_REDIS_MODE` with an unsupported value must FAIL FAST **on a cluster node** (round 191
-      # measured `HYDRA_REDIS_MODE=clustr` booting as `single`, i.e. a topology switch silently
-      # ignored; round 194 measured the qualifier — on the single-node default the mode is not read
-      # at all, and K12 pins that boundary rather than the unqualified claim), and cluster wiring a
-      # node is not going to use must be NAMED, variable by variable, including on the path that used
-      # to be completely silent (round 192). It also pins the `Dropped` notice's two groups reaching
-      # the operator in ONE line, and that the ordinary single-node default stays quiet (a rule that
-      # cannot stay quiet on correct input is noise).
-      #
-      # The build MUST include `arachne`: the drill's K1/K2/K3/K11 run against a real
-      # `HYDRA_CLUSTER_PEERS` member, and a binary without the control plane REFUSES to boot with a
-      # member list set — so the legs would fail for a reason that is not the knob under test. (That
-      # is also why the recipe is stated here rather than inherited from an earlier step: this file
-      # has more than one feature recipe, and `cargo test` relinks the binary.)
       - name: startup knobs (fail fast / name what is dropped)
         env:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           set -o pipefail
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_startup_knobs.py
 
       # The three "SDK against a live cluster" steps (Python, TypeScript, Go) were RETIRED on
@@ -461,7 +459,7 @@ jobs:
       # WHY: their C1-C3 legs asserted the world ADR-0001 replaced — `200 applied` with an
       # `event_id`, `202 pending` via `wait=none`, `503 unavailable` from "the edge" whose
       # `/api/v1/health` is 404. But the drills started two PLAIN SINGLE-NODE instances
-      # (`HYDRA_REDIS_MODE=single`, no `HYDRA_CLUSTER_PEERS`), and such a node correctly answers
+      # (`HYDRA_REDIS_MODE=single`, no `HYDRA_REDIS_URL`), and such a node correctly answers
       # `state: "single_node"` (documented in `admin-ui/api-docs.js`: "this node is the whole
       # fleet"). Measured 2026-10-07: with the reported `single_node` body, `eventId: None`,
       # 7 (Python) / 6 (TS) / 5 (Go) assertions failed, so these steps could never pass again
@@ -493,31 +491,8 @@ jobs:
           HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           set -o pipefail
-          # `arachne` is NOT optional here: this drill wires its nodes as a cluster
-          # (`HYDRA_CLUSTER_PEERS`), and since ADR-0001 a build without the control plane REFUSES
-          # to boot on that variable ("this build has no control plane: rebuild with
-          # --features arachne"). Built without it, the step reported exit 2 / CANNOT VERIFY and
-          # the missing feature looked like a broken drill.
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_auth_cache_layers.py
-
-      # REPLICA FIDELITY is RETIRED (2026-10-05), in the same class as `test_cluster_ha.py`: its
-      # subject was a node WITHOUT a local database ("does a promoted edge serve exactly what the
-      # leader was serving?"), proved by pushing a `SnapshotWire` over
-      # `GET /api/v1/internal/control`. ADR-0001 deleted all three: the edge role, the snapshot
-      # channel, and the internal endpoint (T4.1), so the drill could only crash
-      # (`UnboundLocalError: standby`). Its COVERAGE is not gone — it moved:
-      #   * "a node rebuilds the same tables byte-for-byte" →
-      #     `crates/hydra-server/tests/arachne_derivation_fidelity.rs` +
-      #     `tests/arachne_cert_fidelity.rs` (in-process, no cluster needed);
-      #   * "three real nodes agree on one config, and a node can rebuild itself from the tree" →
-      #     `tests/arachne_three_nodes.rs` +
-      #     `integration/test_arachne_control_plane.py` gate 4 (converged content);
-      #   * "the MASKED client key is what `limit_role.matching_key` compares" (decision D-15) →
-      #     `integration/test_limit_roles_enforcement.py`, which is where the mask semantics are
-      #     pinned now (measured: it still passes).
-      # What is genuinely NOT covered any more: a node whose local database was REBUILT from the
-      # tree under a restart. That is recorded in the plan's T4.3 notes rather than left implied.
 
       # CLUSTER RATE LIMITS over Redis, on a real leader + edge and through a CUTTABLE relay:
       # `ops.md` §12's "shared rate-limit counters" (a window filled by both nodes refuses on
@@ -536,12 +511,30 @@ jobs:
           # binary an earlier step left behind is how the round-143 gate went red (a parallel
           # `cargo test --features server` had relinked it feature-poor). `check_gate_entries`
           # enforces exactly that now, against the workflow.
-          # `arachne` is NOT optional here either: the two nodes are wired as a cluster
-          # (`HYDRA_CLUSTER_PEERS`), and since ADR-0001 a build without the control plane REFUSES
-          # to boot on that variable — so this step reported exit 2 / CANNOT VERIFY instead of
-          # exercising the shared windows it exists for.
-          cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_cluster_limits.py
+
+      # THE shared-DB cluster drill (Phase 4a): three real nodes against the SAME PostgreSQL
+      # and one Redis. Replaces the retired raft control-plane/publish-failure drills. It asserts
+      # no leader, write-anywhere, pub/sub config convergence, SIGKILL continuity, and the poll
+      # fallback under a blocked Redis. Per-run schema/database; the job's PG service is disposable.
+      - name: shared-DB cluster (3 nodes, one DB + Redis, node kill + fanout)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
+          python3 integration/test_shared_db_cluster.py
+
+      # The data plane under load across a node kill, with the same shared DB + Redis topology.
+      # 20 rps at a survivor while another node is SIGKILLed; zero non-200 is the assertion.
+      - name: data plane under a node kill (20 rps, shared DB + Redis)
+        env:
+          HYDRA_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
+          python3 integration/test_data_plane_failover_load.py
 
       # The `#[ignore]`d ClickHouse suites: they need a LIVE ClickHouse (`CH_URL`) and Redis.
       # ⚠️ This step's `- name:`/list marker went missing in an earlier uncommitted edit, which
@@ -571,7 +564,7 @@ jobs:
           VALUES ('local', 'ci-provider', 'ci-model', 200, 7, 3, 12, '2026-09-15T12:00:00Z')
           SQL
           curl -sS -u "$CH_USER:$CH_PASSWORD" --data-binary "SELECT count() FROM usage_record WHERE tenant_id = 'local' AND created_at >= '2026-09-15T00:00:00Z' AND created_at < '2026-09-16T00:00:00Z'" http://127.0.0.1:8123/
-          cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test clickhouse_sink --test usage_query -- --ignored
+          cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --test clickhouse_sink --test usage_query -- --ignored
 
   # The three SDKs are shipped artifacts with their own tests, and NO job ran
   # them: the endpoints they call (a data-plane path that used to point at a
@@ -628,6 +621,22 @@ jobs:
   # (it starts its own mocks and hydra, with env-overridable ports).
   integration:
     runs-on: ubuntu-latest
+    env:
+      HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: hydra
+          POSTGRES_DB: hydra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hydra -d hydra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
 
@@ -639,7 +648,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build hydra
-        run: cargo build -p hydra-server --features server --bin hydra
+        run: cargo build -p hydra-server --features server,db-postgres --bin hydra
 
       - name: CRUD lifecycle suite (all 7 entities over real HTTP)
         run: ./integration/run-crud-local.sh
@@ -663,7 +672,7 @@ jobs:
           # exit 2 (CANNOT VERIFY) rather than a failure. This job's first build is `server`
           # alone, so build the production feature set here; the later steps that need it do the
           # same for the same reason.
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_tenant_api_limits.py
 
       # The per-provider admission queue: the saturation bound (queue_depth never exceeds
@@ -733,7 +742,7 @@ jobs:
           # Needs `usage-clickhouse` compiled in: the drill's metering leg points the node at a
           # MOCK ClickHouse by NAMING the sink (`_usage_env.py`), and ADR-0002 D-1 made naming it
           # mandatory — a `server`-only binary refuses to boot, which the drill reports as exit 2.
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_tenant_api_contract.py
 
       # §7's BOUNDARIES, black-box: a suspended tenant keeps the whole self-service API
@@ -746,7 +755,7 @@ jobs:
         run: |
           # Same reason as the contract step above: the drill names a mock ClickHouse sink, which
           # a `server`-only binary cannot build (ADR-0002 D-1 removed the default).
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_tenant_api_boundaries.py
 
       # The STREAMING path — the gap round 63 recorded ("the load test used a single JSON
@@ -760,7 +769,7 @@ jobs:
           # Same reason again: the "metering" half of this drill asserts a row at a MOCK
           # ClickHouse, so the node must be started with a named sink (ADR-0002 D-1) and the
           # binary must carry the feature that builds it.
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_streaming_path.py
 
       # The circuit breaker's documented operator workflow: the dead-set (`GET
@@ -805,12 +814,12 @@ jobs:
       # for `HYDRA_USAGE_SINK=clickhouse`, which the drill reports as exit 2).
       - name: ClickHouse sink wire format (mock ClickHouse, no live deps)
         run: |
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_clickhouse_sink_wire.py
 
-      # A reload that FAILS: a provider row the loader rejects, written straight into SQLite (the
-      # admin write boundary refuses it, so this is what a hand-edited database or a restore
-      # produces). Pins the documented alert and the trap around it — the node keeps serving, the
+      # A reload that FAILS: a provider row the loader rejects, written straight into the shared
+      # PostgreSQL database (the admin write boundary refuses it, so this is what a hand-edited
+      # database or a restore produces). Pins the documented alert and the trap around it — the node keeps serving, the
       # gauge flips to 1, every later admin write answers 2xx with NO runtime effect, each tenant
       # view says `snapshot_stale: true`, and fixing the row + reloading recovers both the gauge
       # and the pending write. Needs no service.
@@ -948,7 +957,7 @@ jobs:
           set -o pipefail
           # Same reason as the cluster-limits step: the drill documents the recipe, so this step
           # provides it rather than riding whatever the previous step built.
-          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_usage_query_wire.py
 
       - name: Proxy E2E suite (mock auth + mock LLM + failover path)
@@ -1022,18 +1031,6 @@ jobs:
 
       - name: gate-entry checker tests
         run: node --test scripts/check_gate_entries.test.cjs
-
-      # Every tests/arachne_*.rs must be NAMED in the arachne step's explicit --test list
-      # (this workflow AND the local gate script): an unnamed integration file is compiled
-      # but never executed, so a green run is not evidence about it (2026-10-10 F1).
-      - name: arachne test wiring (no unnamed tests/arachne_*.rs)
-        run: node scripts/check_arachne_test_wiring.cjs
-
-      - name: arachne wiring tests
-        run: node --test scripts/check_arachne_test_wiring.test.cjs
-
-      # The public-claims checker is exercised in the `check` job (against real
-      # suite transcripts); its own test suite runs here with the other JS suites.
       - name: public claims checker tests
         run: node --test scripts/check_public_claims.test.cjs
 
@@ -1168,7 +1165,7 @@ jobs:
       # Two manifest/binary mismatches no other job caught: `docker-compose.local.yml`
       # still SET variables `RETIRED_CLUSTER_ENV` reports as ignored at boot, and
       # `environment/build.sh` — the recipe that produces the image every manifest here
-      # runs — omitted the `arachne` feature that `HYDRA_CLUSTER_PEERS` needs to boot.
+      # runs — omitted the `cluster-redis` feature a Redis-backed manifest needs.
       # Both rules are read out of the source/manifests, never duplicated in the checker.
       - name: shipped manifests agree with the binary (retired vars + feature set)
         run: node scripts/check_compose_env.cjs
@@ -1257,10 +1254,26 @@ jobs:
   # Real-browser UI gate. The Rust suites cannot see the admin UI: the
   # `invalidateFK` regression ("the write landed and the UI still reported a
   # failure") was invisible to every existing job. This builds the binary,
-  # starts a real instance against a real SQLite file, seeds it over the admin
+  # starts a real instance against a real PostgreSQL database, seeds it over the admin
   # REST API and drives the embedded UI with Chromium.
   ui-e2e:
     runs-on: ubuntu-latest
+    env:
+      HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: hydra
+          POSTGRES_DB: hydra
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hydra -d hydra"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
 
@@ -1272,7 +1285,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build hydra
-        run: cargo build --release --workspace --features hydra-server/server
+        run: cargo build --release --workspace --features hydra-server/server,hydra-server/db-postgres
 
       # The repo ships no root package.json on purpose (the UI has zero build
       # step); the harness's own package.json is created here, in CI only.

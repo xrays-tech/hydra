@@ -16,7 +16,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hydra_core::auth::sha256_hex_string;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
 use hydra_server::crypto::StaticKeyProvider;
@@ -50,7 +49,7 @@ const OTHER_TOKEN: &str = "sk-other-tenant-token-0123456789";
 /// reads is built from it (`ConfigData.tenant_tokens`, enabled rows only). The
 /// retired single-column token field is gone (T10 Stage D).
 async fn seed_tenant(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     id: &str,
     domain: &str,
     token: Option<&str>,
@@ -77,7 +76,7 @@ async fn seed_tenant(
     }
 }
 
-async fn build_state(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppState> {
+async fn build_state(pool: &hydra_server::db::Pool, cfg: TenantApiConfig) -> Arc<AppState> {
     let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
         Arc::new(StaticKeyProvider::new([7u8; 32], 1));
     let store = ConfigStore::load(pool.clone(), kp)
@@ -91,7 +90,7 @@ async fn build_state(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppSt
 
 /// A usage reader that always answers a real zero.
 ///
-/// `for_tests` deliberately gives a node NO reader (ADR-0002 D-3 retired the local SQLite usage
+/// `for_tests` deliberately gives a node NO reader (ADR-0002 D-3 retired the local usage store
 /// store, and "which store answers" belongs to the configured backend). The legs that need
 /// `GET /usage` to answer are about the tenant GATE, so they inject this.
 struct ZeroUsageQuery;
@@ -129,7 +128,10 @@ impl hydra_server::usage::query::UsageQuery for ZeroUsageQuery {
 }
 
 /// As [`build_state`], with the zero reader injected so `GET /usage` answers.
-async fn build_state_with_usage(pool: &sqlx::SqlitePool, cfg: TenantApiConfig) -> Arc<AppState> {
+async fn build_state_with_usage(
+    pool: &hydra_server::db::Pool,
+    cfg: TenantApiConfig,
+) -> Arc<AppState> {
     let base = build_state(pool, cfg).await;
     // The state is an `Arc<AppState>`; the reader is part of it, so it is injected at construction
     // instead. Rebuild through the same path with the extra argument.
@@ -748,96 +750,6 @@ async fn the_reported_base_url_is_actually_usable() {
     assert_eq!(status, 200, "the reported base_url must work: {w}");
 }
 
-/// C12: an EDGE node has no local database at all. E1 must still answer, from
-/// the replicated snapshot — this is the evidence behind "E1 needs no DB and no
-/// forwarding", and it is why an edge can serve the whole tenant API locally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn whoami_works_from_a_materialized_snapshot_alone() {
-    use hydra_server::cluster::content::FidelityRows;
-    use hydra_server::cluster::snapshot::HydratedWire;
-
-    let kp: Arc<dyn hydra_server::crypto::KeyProvider> =
-        Arc::new(StaticKeyProvider::new([7u8; 32], 1));
-
-    // The replica shape: a store whose own database holds nothing, fed one snapshot — its config
-    // comes from the materializer, not from its tables, and the read-only endpoints must not care.
-    let store = ConfigStore::from_data(
-        common::setup_pool().await,
-        hydra_core::config::ConfigData::default(),
-        kp,
-    )
-    .await
-    .expect("from_data");
-    let mut cfg = hydra_core::config::ConfigData::default();
-    let t = Tenant {
-        id: "t1".into(),
-        name: "edge-tenant".into(),
-        domain: "edge.example".into(),
-        cert_key: None,
-        cert_file: None,
-        enabled: true,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    };
-    cfg.tenants_by_domain.insert(t.domain.clone(), t);
-    // The gate authenticates from `ConfigData.tenant_tokens` (hash → identity).
-    // `hydrate` fills it from the `tenant_access_tokens` fidelity rows; here we
-    // are the producer of the wire, so we state the same identity directly.
-    cfg.tenant_tokens.insert(
-        sha256_hex_string(TENANT_TOKEN.as_bytes()),
-        hydra_core::identity::TenantTokenIdentity {
-            tenant_id: "t1".into(),
-            token_name: "edge-token".into(),
-            expires_at: None,
-        },
-    );
-    // `hydrate` does this in production; here we are the producer of the wire.
-    cfg.reindex_tenants();
-    store.apply_snapshot(HydratedWire {
-        version: 7,
-        cfg,
-        fidelity: FidelityRows {
-            limit_roles: vec![],
-            provider_keys: vec![],
-            provider_models: vec![],
-            tenant_providers: vec![],
-            tenant_models: vec![],
-            user_groups: vec![],
-            users: vec![],
-            user_api_keys: vec![],
-            tenant_access_tokens: vec![hydra_core::model::TenantAccessToken {
-                id: "tok-edge".into(),
-                tenant_id: "t1".into(),
-                name: "edge-token".into(),
-                token_hash: sha256_hex_string(TENANT_TOKEN.as_bytes()),
-                token_prefix: "sk-tenant".into(),
-                token_last4: "cdef".into(),
-                enabled: true,
-                expires_at: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            }],
-            global_roles: vec![],
-        },
-    });
-
-    let state = AppState::for_tests(
-        store,
-        Arc::new(CircuitBreaker::new(BreakerConfig::new(5))),
-        Arc::new(RateLimiter::new()),
-        Arc::new(NoopSink) as Arc<dyn UsageSink>,
-        ProxyConfig::default(),
-        TenantApiConfig::default(),
-    );
-    let root = start_proxy(state);
-    let (status, v) = get_whoami(&root, "t1", TENANT_TOKEN).await;
-    assert_eq!(status, 200, "an edge must serve E1 from its snapshot: {v}");
-    assert_eq!(v["tenant_id"], "t1");
-    assert_eq!(v["name"], "edge-tenant");
-    // The snapshot's version, not a database's.
-    assert_eq!(v["config_version"].as_u64(), Some(7));
-}
-
 // ---------------------------------------------------------------------------
 // T21 — failure limiting and lockout (design §5.1)
 // ---------------------------------------------------------------------------
@@ -1308,7 +1220,12 @@ const NOW: &str = "2026-01-01T00:00:00Z";
 
 /// A tenant with a token PLUS the provider/model/bindings a route write needs
 /// (`p1` serving `gpt-4o`, `t` authorised for `p1` with `gpt-4o`).
-async fn seed_full_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Option<&str>) {
+async fn seed_full_tenant(
+    pool: &hydra_server::db::Pool,
+    id: &str,
+    domain: &str,
+    token: Option<&str>,
+) {
     seed_tenant(pool, id, domain, token).await;
     hydra_server::db::insert_provider(
         pool,

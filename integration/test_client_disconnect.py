@@ -33,7 +33,6 @@ import os
 import shutil
 import signal
 import socket
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -43,6 +42,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from _mock_clickhouse import MockClickHouse
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -195,7 +195,7 @@ def start_node():
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
-        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, 'dc.db')}?mode=rwc",
+        "HYDRA_DB_URL": env_db_url("dc"),
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "HYDRA_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS": "5",
         "RUST_LOG": "info",

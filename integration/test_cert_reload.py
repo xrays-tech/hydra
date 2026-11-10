@@ -33,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # integration/ -> repo root
@@ -41,7 +42,7 @@ BIN = os.environ.get("HYDRA_BIN", os.path.join(ROOT, "target", "debug", "hydra")
 # Ports clear of the dev stack (8080-8084/8090) and of the other suites.
 ADMIN, PLAIN, TLS = 18281, 18280, 18243
 TOKEN = "hydra-cert-token-2026"
-DB = os.path.join(DIR, "cert.db")
+DB = "cert_reload"
 KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 failures = []
@@ -138,7 +139,7 @@ def start_hydra():
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{PLAIN}", "HYDRA_TLS_LISTEN": f"127.0.0.1:{TLS}",
-        "HYDRA_DB_URL": f"sqlite://{DB}?mode=rwc", "HYDRA_ENCRYPTION_KEY": KEY,
+        "HYDRA_DB_URL": env_db_url(DB), "HYDRA_ENCRYPTION_KEY": KEY,
         "RUST_LOG": "warn",
     })
     log = open(os.path.join(DIR, "hydra.log"), "w")

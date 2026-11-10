@@ -55,7 +55,7 @@ fn ephemeral_port() -> u16 {
 }
 
 /// Seed the test DB with one tenant/provider/model/key + limit role.
-async fn seed(pool: &sqlx::SqlitePool, upstream: &str) {
+async fn seed(pool: &hydra_server::db::Pool, upstream: &str) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -291,7 +291,6 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------
@@ -525,7 +524,6 @@ async fn all_candidates_failed_produces_empty_provider_sample() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None,
     ));
 
     // --- start Pingora -------------------------------------------------------

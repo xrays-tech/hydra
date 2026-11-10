@@ -95,8 +95,8 @@ use tokio::sync::mpsc as ch_mpsc;
 #[cfg(feature = "usage-clickhouse")]
 use transport::{is_ok_status, parse_clickhouse_url, response_body, send, ClickHouseConfig};
 
-/// Optional ClickHouse `UsageSink`. Same batching/backoff/Drop semantics as the SQLite one; only the
-/// insert transport differs.
+/// Optional ClickHouse `UsageSink`. Uses the shared batching/backoff/Drop engine; only the insert
+/// transport differs.
 #[cfg(feature = "usage-clickhouse")]
 pub struct ClickHouseSink {
     /// `None` once the sink has been shut down (explicitly or via `Drop`).
@@ -160,7 +160,7 @@ impl UsageSink for ClickHouseSink {
                 }
             };
             if let Err(err) = tx.try_send(record) {
-                // Keep the record's trace id, exactly as the SQLite sink above does: the counter
+                // Keep the record's trace id, as the shared drop accounting does: the counter
                 // says HOW MANY rows were lost, and this field is the only thing that says WHICH.
                 // Measured 2026-09-30 (`integration/test_usage_drop_accounting.py`): the
                 // ClickHouse sink used to drop with `error=no available capacity reason=...` and no
@@ -488,8 +488,8 @@ use crate::usage::query::{GroupBy, UsageQuery, UsageQueryError};
 ///
 /// ## Two queries, not one
 ///
-/// The SQLite arm issues the totals query and (when grouping) the group query
-/// separately, and this arm does the same. A single query with a `UNION ALL` of
+/// The ClickHouse arm issues the totals query and (when grouping) the group
+/// query separately, matching the retired SQLite reader's shape. A single query with a `UNION ALL` of
 /// the two would be fewer round-trips, but it **cannot be decoded
 /// positionally**: measured on the bundled ClickHouse 24.3, the same statement
 /// returned the totals row FIRST in 1 of 6 runs, and adding `ORDER BY is_total`

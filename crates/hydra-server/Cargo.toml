@@ -15,28 +15,15 @@ required-features = ["proxy"]
 [features]
 default = []
 
-# Granular, composable feature set, with ONE caveat that is stated here because the
-# previous text claimed the opposite and was wrong:
-#
-#   The bare W2/W3 slices do NOT build. `db` and `http-client` (with or without
-#   `runtime`) both fail to compile today, so the old claim that "W2/W3 must build
-#   with only sqlx/reqwest and never touch pingora/BoringSSL" does not hold. Two
-#   edges couple them back to `proxy`-gated modules (verified by running the
-#   clippy on 2026-09-29: 6 errors in the lib + 3 in the lib test for
-#   `runtime,db,http-client`):
-#     * `http.rs` uses `crate::admin::metrics` at 5 sites — 3 production
-#       `record_*` calls (277, 395, 432) and 2 reads of the `allow_ttl_capped_total`
-#       test getter (1141, 1155) — and `admin` is gated on `proxy`;
-#     * `store.rs` (26-27) and `db/restore.rs` (74) use
-#       `crate::cluster::{content,snapshot}` — `cluster` is gated on `proxy`.
-#   Decoupling them is a small, mechanical change (5 metric call sites already
-#   follow the `#[cfg(feature = "proxy")]` no-op pattern in `sink.rs`) PLUS one
-#   design question: whether the replica-restore path belongs to `db` at all.
-#   Until that is answered, the builds CI actually compiles are:
-#     `server` | `server,cluster-redis,usage-clickhouse` | `tls-openssl` |
-#     `proxy` (no TLS backend — fixed and checked in round 15).
-#   macOS developers who want to avoid BoringSSL need `proxy` (or `tls-openssl`),
-#   not the bare slices — that escape hatch works and is CI-checked.
+# Granular, composable feature set. Persistence is compile-time exclusive:
+# `db` selects the DB module but NOT a driver — exactly one of `db-postgres` /
+# `db-mysql` must be enabled, and neither/both is a `compile_error!`. The builds
+# CI actually compiles are:
+#   `server,db-postgres` | `server,db-mysql`
+#   `server,cluster-redis,usage-clickhouse,db-postgres|db-mysql`
+#   `tls-openssl,db-postgres` | `proxy,db-postgres` (no TLS backend).
+# macOS developers who want to avoid BoringSSL need `proxy` (or `tls-openssl`),
+# not a bare slice — that escape hatch works and is CI-checked.
 #
 # `dep:` syntax is used so enabling a feature does NOT auto-activate the dep
 # under the same name (feature/dep decoupling).
@@ -44,10 +31,8 @@ default = []
 # - `runtime`    : shared async-runtime helpers (tokio, dashmap, arc-swap,
 #                  tracing, prometheus, thiserror, chrono, include_dir).
 #                  Required by every I/O module.
-# - `db`         : sqlx pool / migrations / repo (W2). NOT standalone: `store.rs` /
-#                  `db/restore.rs` depend on `crate::cluster::*`, which `db` does not
-#                  gate (decision D-7, 2026-10-09 — the bare-slice recipe is retired;
-#                  builds that need the store use `--features server`).
+# - `db`         : sqlx pool / migrations / repo. Requires exactly one of
+#                  `db-postgres` / `db-mysql`; there is no SQLite backend.
 # - `http-client`: reqwest auth upstream (W3).
 # - `proxy`        : pingora proxy shell over plain TCP (W4a). No TLS backend —
 #                   the plain `add_tcp` listener. Enables `tls` only via a
@@ -80,6 +65,12 @@ runtime = [
     "dep:serde_json",
 ]
 db = ["runtime", "dep:sqlx", "dep:aes-gcm", "dep:base64", "dep:rand"]
+# Database backends (Phase 2 of the shared-DB rewrite, see
+# `.slim/deepwork/shared-db-no-raft.md` §6.1). Exactly ONE of these is required
+# in every build/test recipe; `db/backend.rs` emits a compile_error! when
+# neither or both are selected. `server` deliberately does not imply a backend.
+db-postgres = ["db", "sqlx/postgres", "sqlx/migrate"]
+db-mysql = ["db", "sqlx/mysql", "sqlx/migrate"]
 http-client = ["runtime", "dep:reqwest"]
 # `proxy` now implies `db` + `http-client`: the proxy shell uses ConfigStore
 # (W2) and reqwest (W3 auth upstream + W4 breaker probe), so `--features proxy`
@@ -109,27 +100,13 @@ tls-boringssl = ["proxy", "pingora-core?/boringssl", "pingora?/boringssl", "ping
 tls-openssl = ["proxy", "pingora-core?/openssl", "pingora?/openssl", "pingora-proxy?/openssl"]
 server = ["db", "http-client", "proxy", "tls-boringssl"]
 
-# Arachne raft-consistent control plane (ADR-0001). Opt-in and INDEPENDENT of
-# `server` and of `cluster-redis`: the default binary must keep zero new
-# dependencies, and a single-node deployment (no `HYDRA_CLUSTER_PEERS`) must not
-# execute any Arachne code path at all.
-#
-# `runtime` + `db` + `proxy` are implied because the control plane replaces the
-# leader election that lives in the proxy shell's bootstrap, and because the
-# config authority it carries is derived from the sqlite-backed ConfigStore.
-# It does NOT imply `cluster-redis`: the Redis backbone stays for the data-plane
-# hot path (rate limit / breaker / auth L2 / invalidation bus, ADR-0001 D-1), and
-# the two features are expected to be combined in a cluster deployment without
-# one silently pulling the other.
-arachne = ["runtime", "db", "proxy", "dep:arachne-kv"]
-
 # Optional usage sink (design §9.3). Off by default.
 # Dependencies are minimal: the sink talks to ClickHouse over its native HTTP
 # interface (INSERT … FORMAT JSONEachRow) and never uses the `clickhouse` crate
 # (the 0.1 placeholder pin was a W1 leftover — see sink.rs module docs).
 # `base64` is only for HTTP Basic auth when the URL carries `user:pass@` creds.
-# Compiling the feature adds BOTH sinks (sqlite + clickhouse) to one binary;
-# the active one is chosen at runtime by HYDRA_USAGE_SINK.
+# Compiling the feature adds the ClickHouse usage sink to the binary; the
+# active backend is chosen at runtime by HYDRA_USAGE_SINK.
 usage-clickhouse = ["dep:base64"]
 
 # TDengine usage backend (ADR-0002 §5.1): taosAdapter over HTTP, implemented as the pattern's first
@@ -139,9 +116,9 @@ usage-clickhouse = ["dep:base64"]
 # Not a delivered backend: see `dev-docs/usage-backends.md`.
 usage-tdengine = []
 
-# Redis backbone (cluster P2+): leader lease, shared rate limits / breaker
-# and the invalidation stream all ride one Redis. Opt-in so the
-# default single-node build keeps zero external deps. `fred` is the fixed
+# Redis backbone: shared rate limits / breaker votes and the invalidation
+# stream ride one Redis. Opt-in so the default single-node build keeps zero
+# external deps. `fred` is the fixed
 # client choice (v8 plan Q8): full single/sentinel/cluster/streams/Lua
 # support; `mocks` powers in-process command-level test doubles; `i-scripts`
 # enables the Lua lease renew / rate-limit scripts.
@@ -165,7 +142,7 @@ http = { version = "1", optional = true }
 # transitive pin, so no new download is required.
 ipnet = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "chrono", "migrate"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 dashmap = { version = "6", optional = true }
 arc-swap = { version = "1", optional = true }
@@ -189,44 +166,12 @@ base64 = { version = "0.22", optional = true }
 # `i-scripts` = Lua `EVAL` (the lease renew, the rate-limit windows, the
 # trim+bump). The former `mocks` feature went away with `redis/mock.rs`: Redis
 # tests run against a REAL instance (dev-plan 铁律 2).
-fred = { version = "10", features = ["i-scripts"], optional = true }
-
-# --- Arachne control plane (ADR-0001, feature `arachne`) --------------------
-# Raft-consistent control plane: leader identity and the config authority.
-#
-# PINNED, and the floor is real: 0.1.1 is NOT usable. Measured against each
-# version (see the probe evidence referenced by ADR-0001 §10):
-#   * 0.1.1 — a linearizable read/write issued at a follower fails immediately
-#     with `QuorumUnavailable` (the redirect path only worked for in-process
-#     peers registered via `register_peer`), so nothing that runs on more than
-#     one process could be built on it;
-#   * 0.1.1 — `Arachne::start` panics when the caller has no ambient tokio
-#     runtime ("there is no reactor running"), on BOTH the single-node and the
-#     member path, because `Runtime::new` built `tokio::time::interval` eagerly;
-#   * 0.1.1 — a node that has just become leader does not name itself in
-#     `leader_hint()` for a long window after a `transfer_leader`.
-# 0.1.2 carries the fixes for all three (`Forward` RPC over tonic, lazy tick
-# interval, self entry in the raft-id -> node-id map). Do not lower this pin
-# without re-running the Phase 0 probes.
-#
-# The default `transport-tonic` feature is required: the `Forward` RPC is how a
-# write issued at a follower reaches the leader (ADR-0001 D-3). The lean core
-# (`default-features = false`) has no remote transport and cannot serve a
-# multi-process cluster.
-arachne-kv = { version = "0.7.0", optional = true }
+fred = { version = "10", features = ["i-scripts", "subscriber-client"], optional = true }
 
 # --- Optional sink --------------------------------------------------------
 # (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,
 # see the `usage-clickhouse` feature comment above)
 
 [dev-dependencies]
-# Test-support only, and dev-only by upstream design: it must never enter a runtime dependency tree.
-# The isolation recipe in ADR-0001’s plan (alive-but-partitioned node) needs its in-memory transport.
-arachne-kv-testsupport = "0.7.0"
-# `Runtime::new` takes a `&slog::Logger`. Production gets one from Arachne's own `assemble_cluster`
-# facade, so this is needed only by a test that builds the runtime ITSELF — i.e. by the
-# alive-partition test, which must own the transport to be able to firewall it. Same major version the
-# control-plane crates already pull in, so nothing new enters the lockfile.
-slog = "2"
 wiremock = "0.6"
 tokio-test = "0.4"

@@ -209,9 +209,9 @@ function loadUi({ apiImpl, entry, sourceTransform, args, fetchImpl, callExpr, gl
 /* ------------------------------------------------------------- fixtures ----- */
 const HEALTH_OK = { status: "ok", db: "ok", breaker_dead: 0, tenants: 2, providers: 3 };
 const CLUSTER_502 = () =>
-  Object.assign(new Error("502 cluster_unavailable: cannot read the cluster registry (Redis unreachable?)"), {
+  Object.assign(new Error("502 status_unavailable: this node could not report its status"), {
     status: 502,
-    code: "cluster_unavailable",
+    code: "status_unavailable",
   });
 
 /** `/health` fine, `/cluster/status` 502 — the state the fix is about. */
@@ -227,8 +227,34 @@ async function apiFailingHealthSingleNodeCluster(method, url) {
     throw Object.assign(new Error("503 storage_busy: db is busy"), { status: 503, code: "storage_busy" });
   }
   if (url === "/cluster/status") {
-    return { cluster: false, mode: "single", node_id: "", this_node_leader: false, lease_holder: null, nodes: [] };
+    return {
+      cluster: false,
+      mode: "single",
+      node_id: "node-a",
+      role: "all",
+      config_version: 42,
+      db_reachable: true,
+      redis_configured: false,
+      redis_reachable: null,
+    };
   }
+  throw new Error("unexpected api call: " + method + " " + url);
+}
+
+/** A successful cluster-mode status whose Redis probe is unavailable (null). */
+const CLUSTER_OK_UNKNOWN_REDIS = {
+  cluster: true,
+  mode: "cluster",
+  node_id: "node-a",
+  role: "cluster",
+  config_version: 42,
+  db_reachable: true,
+  redis_configured: true,
+  redis_reachable: null,
+};
+async function apiHealthyHealthCluster(method, url) {
+  if (url === "/health") return HEALTH_OK;
+  if (url === "/cluster/status") return CLUSTER_OK_UNKNOWN_REDIS;
   throw new Error("unexpected api call: " + method + " " + url);
 }
 
@@ -318,16 +344,16 @@ function assert(name, cond, detail) {
 
     /* 2. ...and the cluster failure must be visible AS a failure, not as
      *    "single-node" (single-node is `200 {cluster:false}`, a different fact). */
-    const nodes = doc.querySelector("#cluster-nodes");
+    const clusterNotes = doc.querySelector("#cluster-nodes");
     assert(
       "the cluster failure is stated with its message",
-      /cannot read the cluster registry/i.test(textOf(nodes)),
-      textOf(nodes).trim().slice(0, 160),
+      /could not report its status/i.test(textOf(clusterNotes)),
+      textOf(clusterNotes).trim().slice(0, 160),
     );
     assert(
       "the cluster failure is NOT misreported as single-node mode",
-      !/HYDRA_ROLE/.test(textOf(nodes)),
-      textOf(nodes).trim().slice(0, 160),
+      !/cluster mode is not enabled/i.test(textOf(clusterNotes)),
+      textOf(clusterNotes).trim().slice(0, 160),
     );
     assert(
       "the cluster panel shows 'unavailable' instead of a skeleton",
@@ -345,15 +371,16 @@ function assert(name, cond, detail) {
     const json = doc.querySelector("#health-json").innerHTML;
     assert(
       "the raw-JSON view keeps both outcomes",
-      json.includes("health") && json.includes("cluster_unavailable"),
+      json.includes("health") && json.includes("status_unavailable"),
       json.slice(0, 140),
     );
   }
 
   /* 4. A failed `/health` probe is reported where the numbers would be, and the
-   *    cluster panel still renders from its own (successful) probe. */
+   *    cluster panel still renders from its own (successful) probe. The
+   *    single-node payload also covers the honest `redis_reachable: null`. */
   {
-    const { doc, run } = loadUi({ apiImpl: apiFailingHealthSingleNodeCluster, entry: "renderHealth" });
+    const { doc, run, context } = loadUi({ apiImpl: apiFailingHealthSingleNodeCluster, entry: "renderHealth" });
     let threw = null;
     try {
       await run;
@@ -374,10 +401,82 @@ function assert(name, cond, detail) {
       byClass(doc.querySelector("#toast-root"), "toast").length === 1,
       "toasts=" + byClass(doc.querySelector("#toast-root"), "toast").length,
     );
+
+    const clusterStats = doc.querySelector("#cluster-stats");
+    const clusterNotes = doc.querySelector("#cluster-nodes");
+    const label = (key) => vm.runInContext(`t(${JSON.stringify(key)})`, context);
+    const cardValue = (grid, labelText) => {
+      const card = byClass(grid, "stat").find((c) => {
+        const sl = findIn(c, ".sl");
+        return sl && textOf(sl) === labelText;
+      });
+      const sv = card && findIn(card, ".sv");
+      return sv ? textOf(sv) : undefined;
+    };
     assert(
       "the cluster panel still renders from its own successful probe",
-      /single-node/i.test(textOf(doc.querySelector("#cluster-stats"))),
-      textOf(doc.querySelector("#cluster-stats")).trim().slice(0, 140),
+      cardValue(clusterStats, label("custom.health.nodeId")) === "node-a" &&
+        cardValue(clusterStats, label("custom.health.role")) === "all" &&
+        cardValue(clusterStats, label("custom.health.configVersion")) === "42",
+      textOf(clusterStats).trim().slice(0, 180),
+    );
+    assert(
+      "cluster=false shows the single-node note",
+      /HYDRA_REDIS_URL/.test(textOf(clusterNotes)) && findIn(clusterNotes, "table") === null,
+      textOf(clusterNotes).trim().slice(0, 160),
+    );
+    assert(
+      "redis_configured=false says not configured",
+      cardValue(clusterStats, label("custom.health.redisConfigured")) === label("custom.health.notConfigured"),
+      textOf(clusterStats).trim().slice(0, 180),
+    );
+    assert(
+      "redis_reachable=null is shown as unknown, not unreachable",
+      cardValue(clusterStats, label("custom.health.redisReachable")) === label("custom.health.unknownPill"),
+      textOf(clusterStats).trim().slice(0, 180),
+    );
+  }
+
+  /* 4b. A successful cluster-mode payload renders this node's own facts and no
+   *      peer table. Redis is configured but its reachability is unknown. */
+  {
+    const { doc, run, context } = loadUi({ apiImpl: apiHealthyHealthCluster, entry: "renderHealth" });
+    await run;
+    const clusterStats = doc.querySelector("#cluster-stats");
+    const clusterNotes = doc.querySelector("#cluster-nodes");
+    const label = (key) => vm.runInContext(`t(${JSON.stringify(key)})`, context);
+    const cardValue = (grid, labelText) => {
+      const card = byClass(grid, "stat").find((c) => {
+        const sl = findIn(c, ".sl");
+        return sl && textOf(sl) === labelText;
+      });
+      const sv = card && findIn(card, ".sv");
+      return sv ? textOf(sv) : undefined;
+    };
+    assert(
+      "cluster mode renders the local node status cards",
+      byClass(clusterStats, "stat").length === 6 &&
+        cardValue(clusterStats, label("custom.health.nodeId")) === "node-a" &&
+        cardValue(clusterStats, label("custom.health.role")) === "cluster" &&
+        cardValue(clusterStats, label("custom.health.configVersion")) === "42" &&
+        cardValue(clusterStats, label("custom.health.dbReachable")) === "ok",
+      textOf(clusterStats).trim().slice(0, 220),
+    );
+    assert(
+      "redis is configured but its reachability is unknown",
+      cardValue(clusterStats, label("custom.health.redisConfigured")) === label("custom.health.configured") &&
+        cardValue(clusterStats, label("custom.health.redisReachable")) === label("custom.health.unknownPill"),
+      textOf(clusterStats).trim().slice(0, 220),
+    );
+    assert(
+      "no peer table and no single-node note are rendered in cluster mode",
+      findIn(clusterNotes, "table") === null && textOf(clusterNotes).trim() === "",
+      textOf(clusterNotes).trim().slice(0, 160),
+    );
+    assert(
+      "no leader/lease wording reaches the page",
+      !/leader|lease holder/i.test(textOf(doc.querySelector("#content"))),
+      textOf(doc.querySelector("#content")).trim().slice(0, 220),
     );
   }
 
@@ -603,6 +702,10 @@ function assert(name, cond, detail) {
    *     twice, which is why the check reads the server's UPDATE statements instead
    *     of a hand-maintained list. */
   const WHOLE_RECORD_TABLES = { providers: "provider", tenants: "tenant" };
+  // DB columns renamed away from reserved words (Phase 2 P1); the admin API and
+  // the form keep the entity field names, so compare the form against the field
+  // that actually carries the column.
+  const DB_COLUMN_FIELD = { provider_code: "key" };
   function coverageGaps(sourceTransform) {
     // A trailing backslash + newline inside the Rust literal is a string
     // continuation: flatten those so each statement is one line.
@@ -614,10 +717,15 @@ function assert(name, cond, detail) {
       .replace(/\\\r?\n\s*/g, " ")
       .replace(/\s+/g, " ");
     const colsByTable = new Map();
-    for (const m of dbSrc.matchAll(/UPDATE (tenant|provider) SET ([^"]*?) WHERE /g)) {
+    for (const m of dbSrc.matchAll(/UPDATE (tenant|provider) SET (.*?) WHERE /g)) {
       const cols = m[2]
         .split(",")
-        .map((x) => x.trim().replace(/\s*=.*$/, ""))
+        .map((x) =>
+          x
+            .trim()
+            .replace(/\s*=.*$/, "")
+            .replace(/["`\\]/g, ""),
+        )
         .filter(Boolean);
       if (!cols.includes("updated_at")) continue;
       const set = colsByTable.get(m[1]) || new Set();
@@ -640,7 +748,8 @@ function assert(name, cond, detail) {
       }
       for (const c of cols) {
         if (c === "updated_at") continue; // collectBody re-sends it from the record
-        if (!(fieldsByKey[key] || []).includes(c)) gaps.push(`${key}.${c}`);
+        const field = DB_COLUMN_FIELD[c] || c;
+        if (!(fieldsByKey[key] || []).includes(field)) gaps.push(`${key}.${c}`);
       }
     }
     return { gaps, colsByTable, fieldsByKey };

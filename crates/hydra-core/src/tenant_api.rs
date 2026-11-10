@@ -89,10 +89,10 @@ pub fn is_canonical_timestamp(s: &str) -> bool {
 /// separators, so byte comparison agrees with chronological comparison. Two
 /// consequences worth stating because both have bitten:
 ///
-/// - A space-separated value (`2026-09-16 23:59:59`, which is what SQLite's
-///   `datetime('now')` produces) compares as **greater** than any `T`-form
-///   value on the same date, because `'T'` (0x54) > `' '` (0x20) — a
-///   comparison against it silently selects the whole day.
+/// - A space-separated value (`2026-09-16 23:59:59`, the shape the retired
+///   SQLite backend produced) compares as **greater** than any `T`-form value on
+///   the same date, because `'T'` (0x54) > `' '` (0x20) — a comparison against it
+///   silently selects the whole day.
 /// - This does **not** generalise to other shapes (offsets, fractional
 ///   seconds), which is why the shell normalises before calling in.
 #[must_use]
@@ -135,8 +135,9 @@ pub fn parse_lenient_u64(v: &Value) -> Option<u64> {
 
 /// `MAX(created_at)` → `Option<String>`.
 ///
-/// SQLite yields `NULL` for an empty set, but **ClickHouse yields `""`** for a
-/// `String` column (measured: `{"last_seen":""}`). Both must become `None`, or
+/// The retired SQLite reader yielded `NULL` for an empty set, but **ClickHouse
+/// yields `""`** for a `String` column (measured: `{"last_seen":""}`). Both must
+/// become `None`, or
 /// the response carries an empty-string `as_of` that looks like a real value.
 #[must_use]
 pub fn normalize_as_of(raw: Option<&str>) -> Option<String> {
@@ -385,7 +386,7 @@ impl TenantWriteRoute<'_> {
 /// The `{id}` segment is the **raw** path segment: an identity-plane row id is
 /// printable ASCII with no `/` (D9), so the raw segment and the stored value are
 /// compared directly, with no percent-decoding asymmetry between the
-/// edge and the leader.
+/// any node.
 #[must_use]
 pub fn parse_write_route<'a>(method: &str, path: &'a str) -> Option<TenantWriteRoute<'a>> {
     let rest = path.strip_prefix("/tenant/")?;
@@ -591,8 +592,8 @@ pub fn decode_usage_json_each_row(body: &str) -> Result<UsageAggregate, DecodeEr
 /// non-empty line is one group row.
 ///
 /// This is a separate function from [`decode_usage_json_each_row`] because the
-/// two backends cannot share a body shape. The SQLite reader issues two queries
-/// (totals, then groups) and so must the ClickHouse reader, because a single
+/// two backends cannot share a body shape. The retired SQLite reader issued two
+/// queries (totals, then groups) and so must the ClickHouse reader, because a single
 /// `UNION ALL` of the two **does not preserve branch order**: measured on the
 /// bundled ClickHouse 24.3, the same query returned the totals row first in 1 of
 /// 6 runs, and adding `ORDER BY is_total` did not fix it (a bare `ORDER BY` after

@@ -1,7 +1,16 @@
-# Hydra full-stack: proxy + mock-tenant auth + ClickHouse usage sink.
+# Hydra full-stack: proxy + shared relational config DB + mock-tenant auth + ClickHouse usage sink.
+#
+# The default stack uses PostgreSQL 16 (`postgres` service, `hydra:postgres`/`hydra:latest`). A MySQL
+# 8 alternative is included under the `mysql` profile; to use it, build `DB_BACKEND=mysql
+# ./environment/build.sh`, point `HYDRA_DB_URL` at `mysql://hydra:hydra@mysql:3306/hydra`, make the
+# node `depends_on` mysql instead of postgres, and start with `docker compose --profile mysql up -d`.
+#
+# Database credentials in this file (`hydra/hydra`, database `hydra`) are LOCAL DEVELOPMENT defaults,
+# not production secrets. Override them for any real deployment.
 #
 # Prerequisites:
-#   1. Build the hydra image:  ./environment/build.sh
+#   1. Build the hydra image:  ./environment/build.sh            # postgres (default)
+#                              DB_BACKEND=mysql ./environment/build.sh   # mysql variant
 #   2. Copy the config template:  cp environment/config.example.json secure/config.json
 #   3. Edit secure/config.json with your real provider api-keys + endpoints.
 #   4. Generate the provider-key encryption master key (REQUIRED, fail-closed):
@@ -45,7 +54,10 @@ services:
       # reachable admin port is a full gateway takeover. Generate:
       #   openssl rand -hex 32
       HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:?set HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)" — required for the admin API}
-      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
+      # Shared relational config database. The URL scheme MUST match the compiled backend:
+      #   postgres -> postgres://USER:PASS@HOST:5432/DB   (postgres://hydra:hydra@postgres:5432/hydra)
+      #   mysql    -> mysql://USER:PASS@HOST:3306/DB      (mysql://hydra:hydra@mysql:3306/hydra)
+      HYDRA_DB_URL: "postgres://hydra:hydra@postgres:5432/hydra"
       # Plaintext entry — always bound. Adding tenant certs does NOT change it;
       # only HYDRA_TLS_LISTEN adds an HTTPS listener (per-tenant cert by SNI).
       HYDRA_LISTEN: "0.0.0.0:8080"
@@ -61,8 +73,10 @@ services:
       HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" — required for provider-key encryption}
       RUST_LOG: info
     volumes:
-      - hydra-data:/app/data
+      - hydra-config:/etc/hydra
     depends_on:
+      postgres:
+        condition: service_healthy
       clickhouse:
         condition: service_healthy
       mock-tenant:
@@ -75,6 +89,52 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
+
+  # ── Shared relational config database (DEFAULT backend) ────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: hydra-postgres
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra
+      POSTGRES_DB: hydra
+    ports:
+      # Loopback only: this holds every tenant/provider/credential row.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── MySQL 8 alternative (opt-in: `--profile mysql`) ────────────────────────
+  # Not started by default. Build the node with DB_BACKEND=mysql and set its
+  # HYDRA_DB_URL to the URL below; see the file header for the full switch.
+  mysql:
+    image: mysql:8
+    container_name: hydra-mysql
+    profiles: ["mysql"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: hydra
+      MYSQL_USER: hydra
+      MYSQL_PASSWORD: hydra
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uhydra -phydra --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
     restart: unless-stopped
 
   mock-tenant:
@@ -142,5 +202,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  hydra-data:
+  hydra-config:
+  postgres-data:
+  mysql-data:
   clickhouse-data:

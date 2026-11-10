@@ -28,8 +28,14 @@ BIN="${HYDRA_BIN:-$ROOT/target/debug/hydra}"
 TOKEN=hydra-handover-token-2026
 LISTEN=18180
 ADMIN=18181
-DB="$DIR/handover.db"
-mkdir -p "$DIR"; rm -f "$DIR"/*.log "$DB"* "$DIR/hits.txt" "$DIR/stop"
+mkdir -p "$DIR"; rm -f "$DIR"/*.log "$DIR/hits.txt" "$DIR/stop"
+
+case "${HYDRA_TEST_DATABASE_URL:-}" in
+  postgres://*|postgresql://*|mysql://*|mariadb://*) ;;
+  *) echo "handover: set HYDRA_TEST_DATABASE_URL to a real PostgreSQL or MySQL base URL" >&2; exit 2 ;;
+esac
+IFS=$'\t' read -r DB_NAME DB_URL < <(python3 integration/_shared_db.py create handover)
+[ -n "${DB_URL:-}" ] || { echo "handover: could not provision a disposable database" >&2; exit 2; }
 
 fail=0
 note() { echo "   $*"; }
@@ -43,7 +49,7 @@ start() { # start <label> [flags...]
   # node starts on its default port — which is how this entry failed with "the first process
   # never served the data port".
   env HYDRA_ADMIN_TOKEN="$TOKEN" HYDRA_ADMIN_ADDR="127.0.0.1:$ADMIN" HYDRA_LISTEN="127.0.0.1:$LISTEN" \
-      HYDRA_DB_URL="sqlite://$DB?mode=rwc" \
+      HYDRA_DB_URL="$DB_URL" \
       HYDRA_USAGE_SINK=none \
       HYDRA_ENCRYPTION_KEY="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
       HYDRA_SHUTDOWN_DRAIN_SECS=1 \
@@ -55,7 +61,10 @@ probe() { curl -sS -o /dev/null -w '%{http_code}' --max-time 3 --connect-timeout
   "http://127.0.0.1:$LISTEN/v1/chat/completions" -H 'Host: load.local' \
   -H 'content-type: application/json' -d '{"model":"echo"}' 2>/dev/null; }
 
-cleanup() { touch "$DIR/stop"; pkill -f "$BIN" 2>/dev/null; }
+cleanup() {
+  touch "$DIR/stop"; pkill -f "$BIN" 2>/dev/null
+  python3 integration/_shared_db.py drop "$DB_NAME" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT INT TERM
 
 [ -x "$BIN" ] || { echo "handover: $BIN not built" >&2; exit 1; }

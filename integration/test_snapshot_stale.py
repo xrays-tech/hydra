@@ -27,7 +27,6 @@ import json
 import os
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -35,6 +34,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url, run_sql
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -139,7 +139,7 @@ def proxied():
 
 
 def db_file():
-    return os.path.join(DIR, "stale.db")
+    return env_db_url("snapshot_stale")
 
 
 def start_node():
@@ -148,7 +148,7 @@ def start_node():
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
-        "HYDRA_DB_URL": f"sqlite://{db_file()}?mode=rwc",
+        "HYDRA_DB_URL": db_file(),
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "RUST_LOG": "info",
     })
@@ -194,13 +194,8 @@ def seed():
     time.sleep(0.3)
 
 
-def sql(statement, params=()):
-    conn = sqlite3.connect(db_file(), timeout=10)
-    try:
-        conn.execute(statement, params)
-        conn.commit()
-    finally:
-        conn.close()
+def sql(statement):
+    run_sql(db_file(), statement)
 
 
 def stale_gauge():
@@ -252,8 +247,8 @@ def main():
         # ---- S1: a row the LOADER rejects, written past the write boundary -----
         # `store::is_usable_endpoint` mirrors the loader at the admin write boundary (so the API
         # would refuse this row); writing it DIRECTLY is what a restore/hand-edited database gives.
-        sql("INSERT INTO provider (id, key, name, endpoint, weight, created_at, updated_at) "
-            "VALUES ('p-bad','p-bad','BAD','api.openai.com',1,'','')")
+        sql("INSERT INTO provider (id, provider_code, name, endpoint, weight) "
+            "VALUES ('p-bad','p-bad','BAD','api.openai.com',1)")
         st1, out1 = admin("POST", "/reload", {})
         gauge1 = stale_gauge()
         log = open(os.path.join(DIR, "stale.log"), errors="replace").read()

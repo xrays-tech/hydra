@@ -1,10 +1,16 @@
-//! §2.1 — migrations & connection: tables created, PRAGMAs applied, idempotent.
+//! §2.1 — migrations & connection: tables created, seeds present, idempotent.
+//!
+//! Backend-agnostic: the metadata queries below are the only place the selected
+//! PostgreSQL/MySQL catalog is named. Everything else runs through the portable
+//! migration set.
 
 mod common;
 
+use hydra_server::db::{self, Pool};
 use sqlx::Row;
 
-const SEVEN_BUSINESS_TABLES: &[&str] = &[
+/// Every table the greenfield baseline creates, plus sqlx's bookkeeping table.
+const EXPECTED_TABLES: &[&str] = &[
     "provider",
     "provider_model",
     "provider_key",
@@ -12,125 +18,93 @@ const SEVEN_BUSINESS_TABLES: &[&str] = &[
     "tenant_provider",
     "tenant_model",
     "limit_role",
+    "user_group",
+    "hydra_user",
+    "user_api_key",
+    "tenant_access_token",
+    "global_role",
+    "global_role_provider",
+    "hydra_lock",
+    "config_revision",
+    "_sqlx_migrations",
 ];
 
-/// The table the SQLite usage store used, DROPPED by migration 0013 (ADR-0002 D-3).
-///
-/// Named here because its ABSENCE is the claim: a migration that silently stopped running, or a
-/// database restored from a pre-0013 backup, would otherwise go unnoticed until someone wondered
-/// why usage was being written locally again.
+/// The table the retired SQLite usage store used. The golden baseline never
+/// recreates it; its ABSENCE is the executable form of ADR-0002 D-3.
 const DROPPED_USAGE_TABLE: &str = "usage_record";
 
-/// T1.1 — after migrate, `sqlite_master` contains all 7 business tables plus
-/// the `_sqlx_migrations` bookkeeping table — and NOT the dropped usage table.
-#[tokio::test]
-async fn migrate_creates_all_tables() {
-    let pool = common::setup_pool().await;
-
-    let rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-        .fetch_all(&pool)
-        .await
-        .expect("query sqlite_master");
+/// The tables the connected schema/database actually contains.
+#[cfg(feature = "db-postgres")]
+async fn table_names(pool: &Pool) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT tablename FROM pg_tables WHERE schemaname = current_schema() ORDER BY tablename",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("query pg_tables");
 
     let mut names: Vec<String> = rows.iter().map(|r| r.get::<String, _>(0)).collect();
     names.sort();
+    names
+}
 
-    for expected in SEVEN_BUSINESS_TABLES
+/// The tables the connected schema/database actually contains.
+///
+/// MySQL's `information_schema` string columns decode as `VARBINARY` through
+/// sqlx; convert the bytes explicitly.
+#[cfg(feature = "db-mysql")]
+async fn table_names(pool: &Pool) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = DATABASE() ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("query information_schema.tables");
+
+    let mut names: Vec<String> = rows
         .iter()
-        .chain(std::iter::once(&"_sqlx_migrations"))
-    {
+        .map(|r| String::from_utf8_lossy(&r.get::<Vec<u8>, _>(0)).into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// T1.1 — after migrate every baseline table exists, and the retired usage
+/// table does not.
+#[tokio::test]
+async fn migrate_creates_all_tables() {
+    let pool = common::setup_pool().await;
+    let names = table_names(&pool).await;
+
+    for expected in EXPECTED_TABLES {
         assert!(
             names.iter().any(|n| n == expected),
             "expected table '{expected}' to exist, tables were: {names:?}"
         );
     }
+    assert!(
+        !names.iter().any(|n| n == DROPPED_USAGE_TABLE),
+        "the retired {DROPPED_USAGE_TABLE} table must not be recreated, tables were: {names:?}"
+    );
 }
 
-// An index-existence assertion stood here for the usage table's secondary index. Migration
-// 0013 drops the table, and an index cannot outlive it, so the subject is gone rather than
-// unasserted — `usage_record_is_gone` below asserts the outcome that matters now.
-
-/// Migration 0013 must have DROPPED the local usage table (ADR-0002 D-3).
-///
-/// The ruling was "delete it, do not keep it", and this is the executable form: a fresh database
-/// must not have the table at all. (The migrations that CREATED and extended it are history and
-/// stay untouched — `sqlx::migrate!` checksums them, so editing them would break every existing
-/// database; a new migration is the only way to remove anything.)
+/// The baseline seeds exactly one lock row and one revision row.
 #[tokio::test]
-async fn usage_record_is_gone() {
+async fn migrate_seeds_lock_and_revision() {
     let pool = common::setup_pool().await;
-    let rows = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")
-        .bind(DROPPED_USAGE_TABLE)
-        .fetch_all(&pool)
-        .await
-        .expect("query sqlite_master");
-    assert!(
-        rows.is_empty(),
-        "migration 0013 must DROP {DROPPED_USAGE_TABLE}; it is still present in a fresh database"
-    );
 
-    // And the indexes that belonged to it went with it (SQLite drops them with the table) — a
-    // leftover index would mean the DROP did not run against the schema this test thinks it has.
-    let leftovers: Vec<String> =
-        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1")
-            .bind(DROPPED_USAGE_TABLE)
-            .fetch_all(&pool)
-            .await
-            .expect("query sqlite_master indexes")
-            .iter()
-            .map(|r| r.get::<String, _>(0))
-            .collect();
-    assert!(
-        leftovers.is_empty(),
-        "the dropped table's indexes must go with it, found: {leftovers:?}"
-    );
-}
-
-/// T2.1 — `foreign_keys=ON` on the in-memory pool; `journal_mode=WAL` (which
-/// requires a file — `:memory:` silently degrades to `memory`) is verified on
-/// a temp file database (wave-2 §6 note).
-#[tokio::test]
-async fn pragma_settings_applied() {
-    // foreign_keys on :memory: (returns 0/1 INTEGER).
-    let mem = common::setup_pool().await;
-    let fk: i64 = sqlx::query("PRAGMA foreign_keys")
-        .fetch_one(&mem)
-        .await
-        .expect("fetch foreign_keys")
-        .get(0);
-    assert_eq!(fk, 1, "foreign_keys must be ON");
-
-    // WAL on a temp file database (WAL needs a file; verify explicitly here).
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("hydra-wal-test-{unique}.db"));
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-
-    let pool = hydra_server::db::init_pool(&url)
-        .await
-        .expect("init_pool file");
-    hydra_server::db::run_migrate(&pool)
-        .await
-        .expect("migrate file");
-
-    // journal_mode returns TEXT ("wal" on a file database).
-    let jm: String = sqlx::query("PRAGMA journal_mode")
+    let lock_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hydra_lock WHERE id = 1")
         .fetch_one(&pool)
         .await
-        .expect("fetch journal_mode")
-        .get(0);
-    assert_eq!(
-        jm.to_ascii_lowercase(),
-        "wal",
-        "journal_mode must be WAL on a file database, got {jm:?}"
-    );
+        .expect("count hydra_lock");
+    assert_eq!(lock_rows.0, 1, "hydra_lock row 1 must be seeded");
 
-    drop(pool);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    let revision: (i64,) = sqlx::query_as("SELECT version FROM config_revision WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .expect("read config_revision");
+    assert_eq!(revision.0, 0, "a fresh database starts at revision 0");
 }
 
 /// T3.1 — running migrate twice does not error and does not change the schema.
@@ -138,25 +112,12 @@ async fn pragma_settings_applied() {
 async fn migrate_idempotent() {
     let pool = common::setup_pool().await;
 
-    let before = table_set(&pool).await;
+    let before = table_names(&pool).await;
 
-    // Second run is a no-op.
-    hydra_server::db::run_migrate(&pool)
+    db::run_migrate(&pool)
         .await
         .expect("re-running migrate must be idempotent");
 
-    let after = table_set(&pool).await;
+    let after = table_names(&pool).await;
     assert_eq!(before, after, "schema must be unchanged after re-migrate");
-}
-
-async fn table_set(pool: &sqlx::SqlitePool) -> Vec<String> {
-    let mut v: Vec<String> = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table'")
-        .fetch_all(pool)
-        .await
-        .expect("fetch tables")
-        .iter()
-        .map(|r| r.get::<String, _>(0))
-        .collect();
-    v.sort();
-    v
 }

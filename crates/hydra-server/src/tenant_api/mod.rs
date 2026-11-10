@@ -443,7 +443,7 @@ pub async fn dispatch(
         // there is nothing that could disagree with the authorisation.
         Endpoint::Whoami => handlers::whoami(session, ctx, &authenticated).await,
         Endpoint::Usage => handlers::usage(state, session, ctx, &authenticated).await,
-        // Read-only, snapshot-fed: no DB, no upstream — an edge serves them
+        // Read-only, snapshot-fed: no DB, no upstream — every node serves them
         // exactly like `whoami`.
         // T6 (D-7/D-5 read face): the caller's OWN keys under one of its OWN users.
         // Fed from the DB rows, not the snapshot — the snapshot's api-key index is
@@ -461,8 +461,8 @@ pub async fn dispatch(
         },
         // T5 reads — the tenant's OWN user groups and users, snapshot-fed exactly
         // like the read-only lists above: the rows and the `config_version` they
-        // are attributed to come from ONE guard, so a replica that has not
-        // materialized a row itself answers like the node that wrote it.
+        // are attributed to come from ONE guard, so a node that has not yet
+        // applied a row itself answers like the node that wrote it.
         // `?group_id=` on `/users` never reaches `parse_route` (`proxy.rs` hands
         // this module `uri.path()`, query-free), so that filter is read from the
         // URI inside `handlers::list_users`.
@@ -509,7 +509,7 @@ async fn run_gate(
     // never before the token is verified, and never on the success path.
     //
     // The old pre-gate check refused EVERY request from a locked IP, valid
-    // token included. Behind the documented LB→edge topology every tenant
+    // token included. Behind the documented LB→gateway topology every tenant
     // shares the LB's egress IP, so ~11 bad tokens blacked out the whole
     // tenant API for the lockout window, renewable (design §5.1). B1 removes
     // that: a request that presents a VALID token is never refused by the
@@ -766,10 +766,8 @@ fn endpoint_label(ctx: &RequestContext) -> &'static str {
 
 /// The `Authorization: Bearer …` value, if present.
 ///
-/// `pub(super)` for the write handler (V5). It used to re-read this to forward the tenant's
-/// bearer to the leader in a dedicated `x-hydra-tenant-token` header; that path is retired
-/// (D-6 乙-full), and the write handler now applies the write itself, so nothing relays the
-/// credential anywhere.
+/// `pub(super)` for the write handler (V5). The write handler applies the write
+/// itself, so nothing relays the credential anywhere.
 pub(super) fn bearer_token(session: &Session) -> Option<&str> {
     session
         .req_header()

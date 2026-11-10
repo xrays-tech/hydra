@@ -5,7 +5,7 @@
 
 > 基于 `dev-docs/proposal.md` 的 LLM 大模型路由中转服务系统设计与实现方案。
 >
-> 技术栈：Rust + Pingora + SQLite(sqlx)
+> 技术栈：Rust + Pingora + PostgreSQL/MySQL(sqlx)
 >
 > 状态：设计阶段（已通过 Oracle Gate Review，P0/P1 已修订，可进入实现）
 
@@ -43,47 +43,43 @@
 | 关注点 | 选型 | 版本 | 说明 |
 | --- | --- | --- | --- |
 | 代理框架 | `pingora` + `pingora-proxy` + `pingora-core` | 0.8.x | Cloudflare 生产级反向代理框架，原生异步、零拷贝、共享连接池 |
-| 数据库 | SQLite + `sqlx` | sqlx 0.8 | 编译期 SQL 校验 + `sqlx::migrate!` 内建迁移；启动读一次、偶发管理写的最佳匹配 |
+| 数据库 | PostgreSQL / MySQL + `sqlx` | sqlx 0.8 | 编译期选定一个后端；`sqlx::migrate!` 内建迁移；共享库是配置权威，启动读一次、偶发管理写 |
 | 异步运行时 | `tokio` | 1.x | Pingora 底层运行时 |
 | Web 框架（管理 API） | Pingora `Service` + `ServeHttp` trait | — | 同进程、同运行时、独立端口；避免额外 Tokio runtime |
 | 序列化 | `serde` + `serde_json` | 1.x | 实体与 API JSON |
 | 无锁热路径 | `arc-swap` | 1.x | 配置热更新，读路径零锁 |
 | 并发字典 | `dashmap` | 6.x | 限流计数器、认证缓存、熔断状态、SWRR 状态 |
-| HTTP 客户端（认证回源） | `reqwest` | 0.12 | 仅用于调用租户 `auth_url`；禁用 `default-features` 或显式排除 `blocking`（防额外 runtime） |
+| HTTP 客户端（上游调用） | `reqwest` | 0.12 | terminate-mode 调 provider；禁用 `default-features` 或显式排除 `blocking`（防额外 runtime） |
 | 日志 | `tracing` + `tracing-subscriber` | 0.1 | 结构化日志 |
 | 指标 | `prometheus` | 0.13 | 自注册默认 registry；由 AdminService 的 `ServeHttp` handler 自托管 `/metrics`（**`pingora-prometheus` 不在 crates.io，弃用**，见 §1.4） |
 | ClickHouse 客户端（可选） | `clickhouse` | behind feature flag | 用量记录的可选 Sink |
 | 字节扫描（零拷贝提取） | `memchr` | 2.7 | SIMD 加速子串扫描，零分配；提取 `"model"`/`"usage"` 等少量元数据，**避免整体 JSON 反序列化**（见 §6 零拷贝原则） |
 | 引用计数缓冲 | `bytes` | 1.x（随 Pingora） | `Bytes::clone()`/`slice()` 为 O(1)（原子计数，无 memcpy）；body filter 借用零拷贝 |
-| api-key 哈希 | `sha2` | 0.10 | 纯密码库（无 I/O），归 `hydra-core`；生成认证缓存 key 的 `sha256`（§11.5） |
+| api-key 哈希 | `sha2` | 0.10 | 纯密码库（无 I/O），归 `hydra-core`；存储 `user_api_key` 摘要与限流 key 摘要 |
 
 > **不使用 `pingora-load-balancing`**：其内建 `LoadBalancer<RoundRobin>` 是**无权重**实现，无 SWRR；本系统候选集合动态（每请求按 model×tenant 计算），故自实现 SWRR（§7.2）。健康检查改由自实现熔断器承担（§8.4）。
 
-### 1.2 数据库选型说明（回应提案的 Turso/libSQL 评估）
+### 1.2 数据库选型说明
 
-提案问：**Turso (libSQL) 本地存储效率行不行？**
+**PostgreSQL 与 MySQL 是仅有的两个后端**，在编译期用 Cargo feature 选择（`db-postgres` / `db-mysql`，恰好一个）。SQLite 已从代码、测试与构建中删除。
 
-**结论：效率完全够用（libSQL 嵌入式本地约 ~190ns/查询），但其核心价值（云同步 / 嵌入式副本）对本系统「单进程 + 启动时全量加载到内存」的场景毫无用处。** 经评估采用 **SQLite + sqlx**：
+- 配置权威是**一个共享关系数据库**：tenants、user groups、users、api-keys、global roles、limit roles、providers/models/keys、证书内容都在里面。多节点不再需要复制控制面。
+- 上层兼容层自己拥有可移植 SQL 片段（占位符 `?`→`$n`、时间戳/upsert/DDL、错误分类），不使用 `sqlx::Any` 或运行时驱动切换：一个二进制只对一个后端。
+- 迁移是绿地基线：`migrations/postgres/0001_init.sql`、`migrations/mysql/0001_init.sql`（无历史迁移重放，也没有 SQLite→PG/MySQL 迁移工具）。
+- 热路径仍是内存快照而非数据库；DB 只承担启动加载与偶发写。
+- 选 PostgreSQL/MySQL 而不是嵌入式 SQLite：多节点共享同一份配置与身份数据，避免“每节点一份物化状态 + 共识/复制”的复杂度；也避免 SQLite 的单写者/文件系统约束。
 
-- 热路径是内存而非数据库，DB 选型对运行时性能几乎无影响；
-- sqlx 提供编译期 SQL 校验与 `sqlx::migrate!` 零摩擦迁移，libSQL 二者均缺失（refinery/sqlx 未正式支持）；
-- libSQL 的 `query()` 多语句陷阱（只执行首条）是真实 footgun；
-- 单二进制部署，零外部依赖；
-- libSQL 不能与 rusqlite/sqlx 共存于同一依赖树（`libsqlite3-sys` links 冲突）。
-
-> 若未来需要多实例云同步，可后续将 `sqlx` SQLite 切换为 Turso 云端，迁移成本可控。
-> （集群模式未走这条路径：多节点配置同步由「快照分发 + 每节点本地 SQLite 副本」实现，
-> 见 §20.3，无需共享/云端 DB。）
+> 编译期 feature 让“忘了选后端”成为编译错误，而不是运行到一个隐式默认。运维侧通过 `DB_BACKEND=postgres|mysql` 映射到同一个 feature。
 
 ### 1.3 关键决策记录（已确认）
 
 | 决策点 | 选择 |
 | --- | --- |
-| 数据库 | **SQLite + sqlx** |
+| 数据库 | **PostgreSQL 或 MySQL + sqlx**（编译期选定） |
 | 管理界面范围 | **REST API + 轻量内建 UI**（同二进制内嵌） |
-| 用量记录 | **可插拔 Sink，默认 SQLite，ClickHouse 为可选适配器** |
+| 用量记录 | **可插拔 Sink：`clickhouse`（共享）或 `none`（显式不计量），`HYDRA_USAGE_SINK` 必填** |
 | 限流计数器 | **内存滑动窗口**（单实例，重启丢失，对窗口限流可接受） |
-| 客户端鉴权 | **外部认证**：每租户**必填** `auth_url`（NOT NULL），缓存优先（默认 5 分钟 TTL），缺失则一律拒绝；提供 Admin 接口强制失效（详见 §11） |
+| 客户端鉴权 | **内部 API-key 鉴权**：对照租户存储的 `user_api_key` 行（unknown/disabled/expired ⇒ 401/403/402）；无 `auth_url`、无认证缓存（详见 ops §5） |
 | 模型访问授权 | **`TenantModel` 缺省放行闸门**：未配置映射的租户默认可用**全部模型**；一旦配置映射，则仅能访问列表内模型（详见 §7.1） |
 | 供应商健康 | **v1 内置内存熔断器**：N 次连续失败 → 内存标记 dead，候选选择跳过，后台探活恢复（详见 §8.4） |
 
@@ -126,12 +122,12 @@
  │  │  │ CircuitBreaker│  │        │          ▲               │  │
  │  │  │ (内存 dead-set)│  │        │          │ 写后热更新      │  │
  │  │  └───────────────┘  │        │  ┌───────┴────────────┐   │  │
- │  └──────────┬──────────┘        │  │ sqlx::SqlitePool   │   │  │
+ │  └──────────┬──────────┘        │  │ shared DB pool     │   │  │
  │             │ upstream          │  │ + migrations       │   │  │
  │             ▼                   │  └────────────────────┘   │  │
  │  ┌─────────────────────┐        │  ┌────────────────────┐   │  │
  │  │ Provider (LLM/Media)│        │  │ UsageSink (trait)  │   │  │
- │  └─────────────────────┘        │  │ ├─ SqliteSink      │   │  │
+ │  └─────────────────────┘        │  │ ├─ ClickHouseSink  │   │  │
  │                                 │  │ └─ ClickHouseSink  │   │  │
  │  ┌─────────────────────┐  缓存  │  ┌────────────────────┐   │  │
  │  │ AuthChecker         │◄──────►│  │ RateLimiter (内存) │   │  │
@@ -152,11 +148,11 @@
 | --- | --- |
 | **ProxyService** | Pingora 反向代理，承载所有 LLM 流量；实现 `ProxyHttp` 完成认证、路由、改写、转发、流式回写、故障转移 |
 | **AdminService** | 独立端口的 Pingora HTTP 服务，承载 REST API + 内嵌 UI + 自托管 Prometheus 指标；所有 DB 写入经此 |
-| **ConfigStore** | 内存配置中心，`ArcSwap` 无锁热路径；启动全量加载；Admin 写后整体热更新（并联动重置运行时状态） |
-| **SqlitePool** | sqlx 连接池；迁移；Admin CRUD 持久化 |
+| **ConfigStore** | 内存配置中心，`ArcSwap` 无锁热路径；启动从共享库全量加载；写提交后 reload，并通过 Redis 通知/轮询收敛 |
+| **DbPool** | sqlx 连接池（PostgreSQL/MySQL）；迁移；Admin/租户 CRUD 直接持久化到共享库 |
 | **AuthChecker** | 外部认证：缓存优先（`AuthCache` 5 分钟 TTL）→ 未命中则回源 `tenant.auth_url`；提供强制失效入口 |
 | **CircuitBreaker** | 内存熔断器：按 `provider_id` 记录连续失败，标记 dead-set；候选选择跳过 dead，后台探活恢复（§8.4） |
-| **UsageSink** | 用量记录可插拔抽象，默认 SQLite，可选 ClickHouse |
+| **UsageSink** | 用量记录可插拔抽象：ClickHouse 或 none |
 | **RateLimiter** | 内存滑动窗口限流器，按 LimitRole 匹配 |
 
 ### 2.3 启动流程
@@ -164,10 +160,10 @@
 严格遵循提案「一次性读取数据库所有的配置内容加载到内存后，启动 Pingora」：
 
 1. 解析 CLI（`pingora_core::server::configuration::Opt`）+ 应用配置文件 `hydra.toml`；
-2. 建立 `SqlitePool`，执行 `sqlx::migrate!`；
-3. `ConfigStore::load()` 全量加载到 `ArcSwap<ConfigData>`（含引用完整性/URL/证书路径校验，见 §5.4）；
-4. 初始化 `AuthChecker`、`CircuitBreaker`、`UsageSink`、`RateLimiter`；
-5. 构建 `ProxyService`（含 TLS 监听器，证书来自 `ConfigStore` 单一来源）+ `AdminService`，注册到 `Server`；
+2. 建立 PostgreSQL/MySQL 连接池，执行对应目录的 `sqlx::migrate!`；
+3. `ConfigStore::load()` 从共享库全量加载到 `ArcSwap<ConfigData>`（含引用完整性/URL/证书路径校验，见 §5.4）；
+4. 初始化 `CircuitBreaker`、`UsageSink`、`RateLimiter`；注入 config notifier（如有 Redis）；
+5. 构建 `ProxyService`（含 TLS 监听器，证书来自 `ConfigStore` 单一来源）+ `AdminService`，注册到 `Server`；启动配置订阅与轮询；
 6. `server.run_forever()`。
 
 ---
@@ -182,8 +178,9 @@ hydra/
 ├── dev-docs/
 │   ├── proposal.md
 │   └── design.md              ← 本文件
-├── migrations/                ← sqlx 迁移（编译期嵌入二进制）
-│   └── 0001_init.sql
+├── migrations/                ← 绿地基线迁移（编译期嵌入二进制）
+│   ├── postgres/0001_init.sql
+│   └── mysql/0001_init.sql
 ├── admin-ui/                  ← 轻量内建 UI 源文件（构建期内嵌）
 │   ├── index.html
 │   ├── app.js
@@ -202,7 +199,7 @@ hydra/
     │   ├── tenant_model.rs
     │   └── limit_role.rs
     ├── db/
-    │   ├── mod.rs             ← SqlitePool 初始化、PRAGMA、migrate
+    │   ├── mod.rs             ← 共享库连接池、迁移、写锁
     │   └── repo.rs            ← 各实体 CRUD（编译期校验 SQL）
     ├── store/
     │   ├── mod.rs             ← ConfigStore（ArcSwap 外壳 + reload_all 联动重置）
@@ -251,129 +248,21 @@ hydra/
 
 ## 4. 数据模型
 
-### 4.1 数据库 Schema（`migrations/0001_init.sql`）
+### 4.1 数据库 Schema（绿地基线）
 
-所有表使用 `TEXT` 主键（UUID/ULID 由应用生成），保持与提案字段一一对应。`sqlx::migrate!` 在编译期嵌入并校验。
+权威 DDL 在 `migrations/postgres/0001_init.sql` 与 `migrations/mysql/0001_init.sql`，两者表达同一组表；`sqlx::migrate!` 在编译期按后端嵌入对应目录。这里只记录**可移植约定**，不复制两份 DDL：
 
-```sql
--- 供应商
-CREATE TABLE provider (
-    id        TEXT PRIMARY KEY,
-    key       TEXT NOT NULL UNIQUE,        -- 供应商关键字
-    name      TEXT NOT NULL,
-    endpoint  TEXT NOT NULL,               -- 后端基地址，如 https://api.openai.com
-    weight    INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 0),  -- 0=软禁用（不参与 RR，详见 §7.2）
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+- **权威数据**：`tenant`、`user_group`、`hydra_user`（`user` 是 PostgreSQL 保留字）、`user_api_key`、`tenant_access_token`、`global_role`（+ `global_role_provider`）、`limit_role`、`provider`、`provider_model`、`provider_key`、`tenant_provider`、`tenant_model`，以及租户证书内容。
+- **写串行化**：`hydra_lock(id=1)` 行，每个写事务开头 `SELECT … FOR UPDATE`；`config_revision(id=1, version BIGINT)` 在同一事务里递增。
+- **id/键/哈希**用 `VARCHAR(255)`（MySQL 的索引要求）；长字段（PEM、endpoint、name、billing_reason、密文）用 `TEXT`/`BLOB`、`BYTEA`。
+- **布尔**用 `SMALLINT`/`BIGINT` 0/1（与行解码一致）；**整数**用 `BIGINT`。
+- **证书/secret**：PEM/密文用 `TEXT`/`BYTEA`；provider key 与证书私钥加密后落库。
+- **过期时间** `user_api_key.expires_at` / `tenant_access_token.expires_at` 用 `VARCHAR` 存 RFC3339 `Z` 字符串，按字符串比较（保持既有语义）；会话时区固定 UTC。
+- 其他时间戳用数据库原生 `TIMESTAMP`/`DATETIME`，解码为 `chrono::NaiveDateTime`，在实体边界按 admin（`%Y-%m-%d %H:%M:%S`）与 tenant（`%Y-%m-%dT%H:%M:%SZ`）两种格式输出。
+- **MySQL 列名**避开保留字：`provider_code`、`model_key`、`limit_window`（见 `ops.md` §13.6）。
+- 所有表使用应用生成的文本主键；外键 + 显式索引；复合唯一索引控制在 MySQL utf8mb4 3072 字节上限内。
 
--- 供应商提供的模型
-CREATE TABLE provider_model (
-    id          TEXT PRIMARY KEY,
-    key         TEXT NOT NULL,             -- 模型英文关键字（路由依据）
-    name        TEXT NOT NULL,             -- 模型名称
-    provider_id TEXT NOT NULL REFERENCES provider(id) ON DELETE CASCADE,
-    status      INTEGER NOT NULL DEFAULT 1 -- 1 在线 / 0 手动离线 / -1 探活离线（由后台健康任务写）
-                  CHECK (status IN (1, 0, -1)),
-    UNIQUE (key, provider_id)
-);
-CREATE INDEX idx_provider_model_key ON provider_model(key);
-CREATE INDEX idx_provider_model_provider ON provider_model(provider_id);
-
--- 供应商 api-key
-CREATE TABLE provider_key (
-    id          TEXT PRIMARY KEY,
-    provider_id TEXT NOT NULL REFERENCES provider(id) ON DELETE CASCADE,
-    api_key     TEXT NOT NULL,             -- 明文存储（见 §16.2）
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_provider_key_provider ON provider_key(provider_id);
-
--- 租户
-CREATE TABLE tenant (
-    id        TEXT PRIMARY KEY,
-    name      TEXT NOT NULL,
-    domain    TEXT NOT NULL UNIQUE,        -- 关联域名（localhost 亦可）
-    auth_url  TEXT NOT NULL,               -- 外部认证地址，必填（缺失则该租户请求一律拒绝）
-    cert_key  TEXT,                        -- 证书密钥路径
-    cert_file TEXT,                        -- 证书文件路径
-    enabled   INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- 租户可访问的供应商
-CREATE TABLE tenant_provider (
-    id          TEXT PRIMARY KEY,
-    tenant_id   TEXT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    provider_id TEXT NOT NULL REFERENCES provider(id) ON DELETE CASCADE,
-    UNIQUE (tenant_id, provider_id)
-);
-
--- 租户可访问的模型（model_key 引用 provider_model.key；作为访问闸门，详见 §7.1）
-CREATE TABLE tenant_model (
-    id        TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    model_key TEXT NOT NULL,
-    UNIQUE (tenant_id, model_key)
-);
-
--- 访问限制角色（任一 matching_* 为 NULL 表示匹配全部）
-CREATE TABLE limit_role (
-    id               TEXT PRIMARY KEY,
-    name             TEXT NOT NULL,
-    matching_key     TEXT,                 -- 匹配客户端 api-key（NULL=全部）；**封存存放**：形如 `sealed:v1:…`（决策 D-16①），NULL 仍表示"匹配全部"
-    matching_model   TEXT,                 -- 匹配 model（NULL=全部）
-    matching_tenant  TEXT,                 -- 匹配租户 id（NULL=全部）
-    matching_provider TEXT,                -- 匹配供应商 id（NULL=全部）。**写入即拒**：该维度在限流前置门禁（路由前）无法匹配，管理写入非 NULL 直接 400 `matching_provider_cannot_match`（决策 D-11，2026-10-09；仅 legacy 行残留并由 config::validate Warn）
-    limit_count      INTEGER,              -- 限额请求数（NULL=不限）
-    limit_token      INTEGER,              -- 限额 token（NULL=不限）
-    window           TEXT NOT NULL CHECK (window IN ('m', 'h', 'd')),
-    enabled          INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- api-key 前缀 → provider 绑定（§7.1b 路由闸门）
-CREATE TABLE provider_key_binding (
-    id          TEXT PRIMARY KEY,
-    key_prefix  TEXT NOT NULL UNIQUE,          -- 客户端 api-key 前缀，如 'sk_aaa_'
-    provider_id TEXT NOT NULL REFERENCES provider(id) ON DELETE CASCADE,
-    enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- 用量记录（默认 SQLite Sink）。token 列为 provider-中性命名（§9.5）：
---   tokens_in        请求发送的 token 数（含缓存命中；OpenAI prompt_tokens /
---                    Anthropic input_tokens）
---   tokens_out       模型返回的 token 数（OpenAI completion_tokens /
---                    Anthropic output_tokens）
---   cache_hit_tokens 命中缓存的 token 数，⊆ tokens_in（OpenAI
---                    prompt_tokens_details.cached_tokens / Anthropic
---                    cache_read_input_tokens）
--- 不存 total_tokens：它是派生值（tokens_in + tokens_out），无计费意义。
-CREATE TABLE usage_record (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id         TEXT NOT NULL,
-    provider_id       TEXT NOT NULL,
-    model_key         TEXT NOT NULL,
-    client_api_key    TEXT,                 -- 脱敏后的客户端 key（见 §9.5）
-    status_code       INTEGER NOT NULL,
-    tokens_in         INTEGER,
-    tokens_out        INTEGER,
-    cache_hit_tokens  INTEGER,
-    latency_ms        INTEGER NOT NULL,
-    forward_latency_ms INTEGER,
-    ttft_ms           INTEGER,
-    upstream_host     TEXT,
-    error             TEXT,
-    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX idx_usage_record_created ON usage_record(created_at);
-CREATE INDEX idx_usage_record_tenant ON usage_record(tenant_id, created_at);
-
--- 内部 schema 版本表由 sqlx::migrate! 自动管理
-```
+`provider_model.status` 语义与 `tenant_model` 访问闸门保持不变；用量行不在本库（见 §9）。
 
 ### 4.2 关于 `provider_model.status` 的语义
 
@@ -387,12 +276,12 @@ CREATE INDEX idx_usage_record_tenant ON usage_record(tenant_id, created_at);
 ```
 tenant ──< tenant_provider >── provider ──< provider_model (key, status)
    │   │                          │            │
-   │   │ auth_url ──(外部)──> 租户认证服务     │
+   │   │ (旧 auth_url 已删除；鉴权走 user_api_key) │
    │   │                          └──< provider_key (api_key)
    │   │
    │   └──< tenant_model (model_key)  ──(访问闸门，引用 provider_model.key)
    │
-   └─ (cert_key/cert_file) ──> 本地证书文件
+   └─ (cert content) ──> 共享库（密封）
 
 limit_role  ──(matching_*)──> 任意实体（软引用，NULL=通配）
 
@@ -407,7 +296,8 @@ limit_role  ──(matching_*)──> 任意实体（软引用，NULL=通配）
 
 - **热路径零锁**：代理转发高频读，使用 `ArcSwap<ConfigData>`，读为原子 load，无 mutex；
 - **启动全量加载**：单次 `load()` 构建完整索引；
-- **写后热更新**：Admin 每次写 DB 后调用 `store.reload_all()`，整体替换 `ArcSwap` 内的 `ConfigData`（COW 整体替换最简单且原子），并**联动重置相关运行时状态**（SWRR、熔断器，见 §5.3）。
+- **写后热更新**：每次写事务提交后调用 reload，整体替换 `ArcSwap` 内的 `ConfigData`（COW 整体替换最简单且原子），并**联动重置相关运行时状态**（SWRR、熔断器，见 §5.3）。
+- **跨节点收敛**：本地写且版本前进后，通过 Redis `hydra:config:changed` 通知对端；对端安静 reload，`HYDRA_CONFIG_POLL_MS` 轮询兜底（§5.5）。
 
 > 注：`AuthCache`、`RateLimiter` 计数器、`CircuitBreaker` dead-set、SWRR 状态属于**运行时状态**（非配置），独立存放于各自的并发结构中，不进入 `ConfigData`。
 
@@ -417,7 +307,7 @@ limit_role  ──(matching_*)──> 任意实体（软引用，NULL=通配）
 // src/store/config_data.rs
 #[derive(Clone)]
 pub struct ConfigData {
-    /// domain(小写) -> 租户（含 localhost 特例；含 auth_url）
+    /// domain(小写) -> 租户（含 localhost 特例；鉴权数据在 user_api_key）
     pub tenants_by_domain: HashMap<String, Tenant>,
 
     /// model_key -> 提供该模型且 status==1 的在线候选（provider_id + weight）
@@ -458,33 +348,37 @@ pub struct ModelProvider {
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<ArcSwap<ConfigData>>,
-    pool: SqlitePool,
-    // 运行时状态句柄（reload_all 时联动重置）
+    pool: db::Pool,                 // PostgreSQL 或 MySQL（编译期选定）
+    notifier: Option<Arc<dyn ConfigNotifier>>,
+    // 运行时状态句柄（reload 时联动重置）
     swrr: Arc<DashMap<(String, String), SwrrState>>,
     breaker: Arc<CircuitBreaker>,
+    version: AtomicU64,
+    snapshot_stale: AtomicBool,
 }
 
 impl ConfigStore {
-    pub async fn load(pool: SqlitePool, swrr: Arc<DashMap<_,_>>, breaker: Arc<CircuitBreaker>)
-        -> Result<Self> { /* load + 校验（§5.4） */ }
+    pub async fn load(pool: db::Pool, /* swrr, breaker */) -> Result<Self> { /* one read txn: revision + rows */ }
 
     /// 热路径读（零锁）
     pub fn snapshot(&self) -> arc_swap::Guard<Arc<ConfigData>> { self.inner.load() }
 
-    /// Admin 写后整体替换（COW）+ 联动重置运行时状态
-    pub async fn reload_all(&self) -> Result<()> {
-        let data = loader::build(&self.pool).await?;   // SELECT * → ConfigData
-        loader::validate(&data)?;                       // §5.4 校验
-        self.inner.store(Arc::new(data));
-        // 修订 P1-B2：候选集合可能变化（权重调整/增删 provider），SWRR 旧状态与新候选不一致 → 清空，下次请求惰性重建。
-        self.swrr.clear();
-        // 证书 map 已在 ConfigData.certs 内被整体替换，HydraCertStore 自动生效。
-        Ok(())
-    }
+    /// 写事务提交后：同一读事务里取 revision + 行 → 校验 → 只在前进时替换 → 只在 Local 且前进时发布
+    pub async fn reload_all(&self) -> Result<bool> { /* ... */ }
 }
 ```
 
-> **策略**：v1 采用「写后 `reload_all()` 整体 COW 替换 + SWRR 清空」；配置规模小（< 数千行），全量重载毫秒级。`CircuitBreaker` dead-set **不清空**（保持对真实故障的判断），仅在对应 provider 被 Admin 删除时移除其条目。
+> **策略**：写事务提交即成功；reload 失败只把 `snapshot_stale` 置 1 并保留旧快照（`POST /api/v1/reload?force=1` 可恢复）。配置规模小（< 数千行），全量重载毫秒级。`CircuitBreaker` dead-set **不清空**（保持对真实故障的判断），仅在对应 provider 被 Admin 删除时移除其条目。
+
+### 5.5 跨节点扇出与轮询
+
+- **写路径**（`ReloadSource::Local`）：事务提交后 reload；本地 revision 前进才在 Redis `hydra:config:changed` 发布 `{"version","origin"}`。
+- **对端**（`PubSub` / `Poll`）：只做安静 reload，**绝不重新发布**；版本不前进则忽略。
+- **轮询兜底**：每 `HYDRA_CONFIG_POLL_MS`（默认 5000）只读 `config_revision.version`；发现更新才做完整配对读 reload。
+- **启动顺序**：先初始加载，再注入 notifier、启动订阅/轮询；启动窗口内的消息被版本闸门忽略。
+- **单节点**：没有 notifier、订阅者或轮询；本地写后 reload 足够。
+
+> 写串行化由共享库承担：每个写事务先 `SELECT … FROM hydra_lock WHERE id=1 FOR UPDATE`，在同一事务里递增 `config_revision`。没有 raft、没有 leader。
 
 ### 5.4 加载期校验（修订 P2-C5）
 
@@ -1021,13 +915,9 @@ pub struct UsageRecord {
   或指标标签；**掩码相同不再共用配额**（升级代价：桶名变化 ⇒ 现有窗口重置一次）。
   ⚠️ **该列自 2026-10-08（决策 D-16①，用户裁定"全封存 + 存量行读时自动封存"）起是封存列**：
   写入走 `kp.seal`（`db.rs::seal_limit_key`），值形如 `sealed:v1:<版本>:<base64(nonce‖密文)>`；
-  配置树里也带同一封存形态（`cluster/arachne_entities.rs::sealed_limit_role`，用 `seal_deterministic`
-  以免内容寻址的树名每次发布都变），副本经 `db/restore.rs` 重新封存落库，**升级前写入的明文行由加载器
+  共享库直接保存同一封存形态（`db::{insert,update}_limit_role`），**升级前写入的明文行由加载器
   自动重新封存**（`db::seal_legacy_limit_keys`，无需人工步骤；主密钥轮换 `hydra --reseal` 也覆盖该列）。
-  **封存不覆盖的部分（已收口，P3-4/2026-10-09）**：`GET /api/v1/limit-roles` 与管理 UI 曾**明文回显**且持主密钥者能还原——已改为**掩码回显**（digest 形式原样、其余 `mask_key`），管理面不再带回可还原的客户端凭据；持主密钥者本身仍能还原密钥信封，这是**密钥持有者**的既有能力，不是 API 回显。**★配置树格式随之上到 `TOC_FORMAT = 4`**（`hydra_ctl` 键空间表
-  见 `cluster.md` §3）：实体字节**形状没变、语义变了** ⇒ 混版本集群互相**按名字拒绝**树，而不是让旧
-  版本把信封文本当匹配值（那会让按 key 限流的角色**静默不再生效**）。详见 `ops.md` §4 与决策项
-  **D-15②/D-16①③**（均已落地）。
+  **封存不覆盖的部分（已收口，P3-4/2026-10-09）**：`GET /api/v1/limit-roles` 与管理 UI 曾**明文回显**且持主密钥者能还原——已改为**掩码回显**（digest 形式原样、其余 `mask_key`），管理面不再带回可还原的客户端凭据；持主密钥者本身仍能还原密钥信封，这是**密钥持有者**的既有能力，不是 API 回显。详见 `ops.md` §4 与决策项 **D-15②/D-16①③**（均已落地）。
 - `matching_model` 为 NULL **或** 等于请求 model_key；
 - `matching_tenant` 为 NULL **或** 等于租户 id；
 - `matching_provider` —— **已死维度（决策 D-11，2026-10-09）**：前置门禁在路由之前运行，`provider` 未知、永不相等，该维度任何非 NULL 值都不可能匹配。管理写入（POST/PUT）非 NULL 直接 400 `matching_provider_cannot_match`；存量 config 由 `config::validate` Warn 点名。实际只可能为 NULL（匹配全部）。
@@ -1297,7 +1187,7 @@ impl TlsAccept for HydraCertStore {
 
 独立 `AdminService`（Pingora `Service` + `ServeHttp`），监听内网端口（默认 `127.0.0.1:8081`）。同进程、同运行时，避免额外 Tokio runtime（提案架构图右侧的 Web API / Web Admin）。
 
-> 路由分发自行实现轻量匹配（避免引入 axum 造成的双 runtime 风险）；handler 内部共享 `AppState { ConfigStore, SqlitePool, AuthChecker, CircuitBreaker, UsageSink, RateLimiter }`。`/metrics` 由 `metrics.rs` 的自托管 handler 暴露 `prometheus` 默认 registry。
+> 路由分发自行实现轻量匹配（避免引入 axum 造成的双 runtime 风险）；handler 内部共享 `AppState { ConfigStore, db::Pool, CircuitBreaker, UsageSink, RateLimiter }`。`/metrics` 由 `metrics.rs` 的自托管 handler 暴露 `prometheus` 默认 registry。
 
 ### 13.2 REST 端点
 
@@ -1351,7 +1241,7 @@ impl TlsAccept for HydraCertStore {
 | --- | --- | --- |
 | `/tenant/{tenant_id}/api/v1/whoami` | GET | 本租户的非机密配置 + 快照版本（`domain` / `auth_url` 只读） |
 | `/tenant/{tenant_id}/api/v1/auth/cache/invalidate` | POST | 清除本租户缓存（跨**全部**数据面节点，含收敛确认） |
-| `/tenant/{tenant_id}/api/v1/usage` | GET | 某时间窗内的 token 用量（单节点读 SQLite，集群读 ClickHouse） |
+| `/tenant/{tenant_id}/api/v1/usage` | GET | 某时间窗内的 token 用量（共享 ClickHouse；`none` 时不可用） |
 
 - 鉴权：`Authorization: Bearer <tenant-access-token>`；身份**只**来自令牌，URL 的 `{tenant_id}` 是一致性**交叉校验**（不一致 → 403），`Host` 不参与判定；
 - 令牌仍在 admin-UI / admin API 配置（`tenant.access_token_hash`，SHA-256 单向存储，永不回显；编辑留空=保留，改值=轮换，显式 `""`=清除）；
@@ -1383,7 +1273,7 @@ Admin 端口仅绑内网 + 单一 Admin Token（`Authorization: Bearer <ADMIN_TO
 - `AdminService` 在 `/admin/*` 路径提供静态资源，`/api/*` 提供数据；UI 用 `fetch` 调用同源 `/api/v1/*`；
 - 页面分区：Providers / Models / Keys / Tenants（含 auth_url 编辑） / TenantAccess / TenantModels / LimitRoles / AuthCache（失效操作）/ Breaker（dead-set 查看+复位） / Health / Stats（用量统计：`GET /api/v1/stats/usage` 按 tenant/provider 聚合 `hydra_requests_total` 与 `hydra_tokens_total`，图表对比 token 总量与请求次数）。
 
-> 复杂可视化（用量趋势）v1 不做，由外部 BI 直查 SQLite/ClickHouse；Stats 页展示的是进程启动以来的累计快照，非时间窗口趋势。
+> 复杂可视化（用量趋势）v1 不做，由外部 BI 直查 ClickHouse；Stats 页展示的是进程启动以来的累计快照，非时间窗口趋势。
 
 ---
 
@@ -1421,7 +1311,7 @@ probe_interval  = "10s"           # dead provider 探活间隔（固定默认，
 # ops.md §6.3；唯一可用的杠杆是 DELETE /api/v1/breaker/{id}。
 
 [database]
-url = "sqlite://./data/hydra.db?mode=rwc"
+url = "postgres://hydra:hydra@127.0.0.1:5432/hydra"   # 或 mysql://…（须匹配编译后端）
 
 [auth]
 allow_ttl_secs = 300            # 认证通过缓存 TTL（默认 5 分钟）
@@ -1430,7 +1320,7 @@ timeout_ms     = 2000           # 回源 auth_url 超时
 fail_mode      = "closed"       # closed（默认，拒绝）| open（放行不缓存）
 
 [usage]
-sink        = "sqlite"             # sqlite | clickhouse
+sink        = "clickhouse"         # clickhouse | none（HYDRA_USAGE_SINK 必填）
 batch_size  = 200
 flush_secs  = 5
 # clickhouse_url = "..."            # sink=clickhouse 时必填
@@ -1444,22 +1334,26 @@ level = "info"
 
 > `/metrics` 端点由 AdminService 自托管（无独立 metrics_addr）。
 
-### 15.2 PRAGMA（SQLite 优化）
+### 15.2 共享库约定（PostgreSQL / MySQL）
 
-初始化时执行：
+没有 SQLite PRAGMA。连接池在 `after_connect` 里固定会话时区 UTC（PG `SET TIME ZONE 'UTC'` /
+MySQL `SET time_zone = '+00:00'`）；写事务统一走 `begin_write`：
 
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA foreign_keys = ON;
-PRAGMA mmap_size = 134217728;
+-- 每个写事务开头（行在启动时幂等播种）
+SELECT id FROM hydra_lock WHERE id = 1 FOR UPDATE;
+-- 数据变更 + 同一事务内
+UPDATE config_revision SET version = version + 1 WHERE id = 1;
 ```
+
+读事务保持普通（不取写锁）。MySQL 的 REPEATABLE READ 下，读-改-写存在性检查必须用
+`SELECT … FOR UPDATE`，否则会读事务开始时的快照。可重试错误（PG 40001/40P01、MySQL
+1213/1205）映射为 503 `storage_busy`。
 
 ### 15.3 部署
 
-- 单二进制 + `data/` 目录（SQLite 文件）+ `hydra.toml`；
-- 证书路径在 `tenant` 表中配置（绝对路径或相对 `data/`）；
+- 单二进制 + 共享 PostgreSQL/MySQL + `hydra.toml`（目标 schema；当前 env-only）；
+- 证书内容存在共享库（密文）；不再依赖本地证书文件系统；
 - 优雅零停机升级：`kill -SIGQUIT <pid>` 后用 `hydra -u` 启新进程（Pingora 内建）。
 
 ---
@@ -1507,7 +1401,7 @@ PRAGMA mmap_size = 134217728;
 
 - Admin 鉴权升级：多用户 + RBAC + Token 轮换（当前单一静态 Token，§13.3）；
 - ~~限流计数器 Redis 化以支持多实例~~ —— **已实现**（共享限流/熔断/认证 L2/失效总线，见 §20 集群模式）；
-- 用量记录多 Sink 并行（同时写 SQLite + ClickHouse）。
+- 用量记录多 Sink 并行（ClickHouse 之外再加后端）。
 
 ---
 
@@ -1542,10 +1436,10 @@ PRAGMA mmap_size = 134217728;
 ### Phase 0 — 工程骨架（0.5d）
 - Cargo workspace、依赖（`pingora`/`sqlx`/`reqwest`/`prometheus`/`dashmap`/`arc-swap`）、`hydra.toml`、日志、错误类型；
 - Pingora 最小 Hello proxy 跑通 `:8080`；
-- SQLite 连接 + PRAGMA + 空 migrate；自托管 `/metrics`。
+- DB 连接池 + 空 migrate（当时为 SQLite；现已换成 PostgreSQL/MySQL）；自托管 `/metrics`。
 
 ### Phase 1 — 数据层与配置中心（1.5d）
-- `0001_init.sql` 全部表（含 `tenant.auth_url`）+ sqlx 编译期校验；
+- 绿地基线迁移全部表（当时含 `tenant.auth_url`，T10 已删除）+ sqlx 迁移；
 - `db::repo` CRUD；
 - `ConfigStore::load` + `ArcSwap` 外壳 + §5.4 加载期校验；
 - 单测：DB → 内存映射一致性、校验失败保留旧快照。
@@ -1572,7 +1466,7 @@ PRAGMA mmap_size = 134217728;
 
 ### Phase 5 — 流式与用量（2d）
 - `upstream_response_body_filter` + 多 schema `UsageAccumulator`（OpenAI + Anthropic + 通用）；
-- `UsageSink` trait + `SqliteSink`（channel 批量）；
+- `UsageSink` trait + ClickHouse sink（channel 批量）；
 - `ClickHouseSink` feature；
 - 真实 OpenAI/Anthropic 流式联调。
 
@@ -1635,7 +1529,7 @@ PRAGMA mmap_size = 134217728;
 | 层 | 方式 |
 | --- | --- |
 | 路由/SWRR/限流/解析/认证缓存判定/熔断计数 | 纯函数单测（无 IO，禁 Mock） |
-| DB 映射 + 加载期校验 | sqlx in-memory SQLite（`:memory:`） |
+| DB 映射 + 加载期校验 | 每测试独立的 PostgreSQL schema / MySQL database（`db::testing`） |
 | 代理转发/故障转移/熔断/流式/大 body | 集成测试，Mock 上游（`wiremock` 或自建） |
 | 外部认证回源 | `MockAuthChecker`（trait Mock，覆盖命中/未命中/拒绝/故障） |
 | TLS | 本地自签证书 + curl 验证 |
@@ -1672,39 +1566,39 @@ PRAGMA mmap_size = 134217728;
 
 ## 20. 集群模式（Cluster Mode）
 
-> **本节不再复写集群的实现细节，这是一个刻意的决定。** 本节此前描述的角色模型
-> （`HYDRA_ROLE=leader|edge`）、Redis 租约选举、节点注册表、配置快照 HTTP 推送与跨节点转发
-> **全部已由 ADR-0001 退役**。同一事实两处维护正是这次基线同步要消掉的东西：一处改了、另一处
-> 没改，读者无法判断哪一处是真的。所以这里只保留**设计定位**与**权威指针**。
+> **本节不复写实现细节，只保留设计定位与权威指针。** 共享库架构取代了 ADR-0001 的
+> Arachne/raft 控制面；旧的角色模型、租约选举、注册表、快照推送与跨节点转发已全部删除。
+> 同一事实只在一处维护：一处改了、另一处没改，读者无法判断哪一处是真的。
 
-### 20.1 定位（ADR-0001 之后）
+### 20.1 定位
 
-- **opt-in，一个开关**：设了 `HYDRA_CLUSTER_PEERS` 就是集群成员，没设就是单节点——§1–§19 全部
-  保持，零外部依赖、零行为变化。
-- **节点同构**（D-2）：集群里每个节点完全一样——都跑数据面、都跑管理面、都是 raft 成员、都能当
-  leader。`edge` 角色与"无状态数据面"已退役；**扩缩容 = raft 成员变更**，不是把副本数 +1。
-- **控制面权威 = Arachne**（raft 线性化 KV；D-3/D-4）；**数据面近似状态 = Redis**（限流 / 熔断 /
-  认证缓存 L2 / 失效总线；D-1 明确"不搬"）。两个方向都不依赖对方：Arachne 失去多数派时数据面继续
-  服务，Redis 断连时控制面毫无感觉。
-- **HA 前提 = ≥3 台奇数同构节点**（D-5）；**每台都需要持久卷**（raft WAL + SQLite）。
-- **单节点模式不启动 Arachne、不需要 Redis**，行为与 §1–§19 完全一致。
-- **配置的顺序由 `ctl/head` 的 log index 给出**（2026-10-07）：物化只在 `incoming_index ≥ applied_index`
-  时应用，否则**拒绝**并继续服务当前配置——因为树名是内容哈希（无序），而应用是替换式的（详见 ADR-0001
-  §12 与 `cluster.md` §3.3）。
+- **opt-in，一个开关**：设了 `HYDRA_REDIS_URL` 就是集群节点；没设就是单节点。单节点同样使用
+  PostgreSQL/MySQL，但不需要 Redis。
+- **节点同构**：集群里每个节点完全一样——都跑数据面、都提供管理面、都**直接写共享数据库**。
+  没有 `edge`、没有只读副本、没有 leader。
+- **配置权威 = 一个共享关系数据库**：tenants、user groups、users、api-keys、global roles、
+  limit roles、providers/models/keys、证书内容。Redis 只承载数据面近似状态（限流 / 熔断 /
+  失效总线）与配置变更通知，不是权威。
+- **写协议**：`hydra_lock(id=1)` 行 + `SELECT … FOR UPDATE` 串行化写；数据变更与
+  `config_revision.version` 递增在同一事务里提交。
+- **缓存协议**：进程内 `ArcSwap<ConfigData>`；本地写且版本前进后，Redis
+  `hydra:config:changed` 广播 `{version, origin}`；对端安静 reload；`HYDRA_CONFIG_POLL_MS`
+  轮询兜底。外部 reload 绝不重新发布。
+- **可用性边界是数据库**（以及共享数据面状态所需的 Redis），不是多数派。节点 kill 只减少容量。
+- **没有 raft 端口、成员表、集群身份或逐节点配置卷。**
 
 ### 20.2 权威文档（本节不复写）
 
 | 主题 | 去哪里看 |
 |---|---|
-| 为什么引入共识层、被否决的备选、兼容边界 | [`ADR-0001`](aegis/adr/ADR-0001-arachne-control-plane.md)（§1 背景事实 C1–C5、§3 九条决策、§6 代价、§7 边界） |
-| 集群**行为与契约**（节点模型 / 环境变量 / 键空间 / 部署 / 演练 / 成员变更 / 限制） | [`cluster.md`](cluster.md) |
-| 运维动作（构建、最小集群、环境变量速查、故障演练、Redis 故障、已知限制） | [`ops.md`](ops.md) §13 |
+| 决策：为什么共享库、为何退役 ADR-0001、被否决的备选、代价 | [`ADR-0004`](aegis/adr/ADR-0004-shared-database-control-plane.md) |
+| 集群**行为与契约**（写协议 / 缓存扇出 / 故障模式 / 部署 / 演练） | [`cluster.md`](cluster.md) |
+| 运维动作（构建、compose、环境变量、故障、备份/恢复、限制） | [`ops.md`](ops.md) §13 |
 | 告警表达式与指标语义 | [`ops.md`](ops.md) §9.1 |
-| 实现与实测的完整记录（含执行中被抓出的缺陷） | [`计划`](aegis/plans/2026-10-05-arachne-control-plane.md) |
+| ADR-0001 的历史决策 | [`ADR-0001`](aegis/adr/ADR-0001-arachne-control-plane.md)（状态：superseded by ADR-0004） |
 
-### 20.3 本节的历史（为什么它看起来"少了一半"）
+### 20.3 历史
 
-被移走的内容不是丢失：ADR-0001 §1 用**实测事实**（C1 切换窗口 11–18 s、C2「谁是 active」三处各存
-一份、C3 同一 `HYDRA_NODE_ID` 两个进程同时自认 leader、C4 转发链需要三层防御、C5 Redis 断连后
-一次都不重拨）说明了它**为什么**必须被取代，而退役对照表在 [`cluster.md`](cluster.md) §10。
-本节的旧文本保留在 git 历史里（`git log -p dev-docs/design.md`）。
+ADR-0001 用实测事实（切换窗口、三处各存一份 active、同 id 双 leader、转发链防御、Redis 不重连）
+说明了为什么需要共识层；共享库架构随后证明这些复杂度可以用“数据库本来就是权威 + 单写者由行锁
+串行化”消掉。旧文本保留在 git 历史与 ADR-0001 中；ADR-0001 的决策不再生效。

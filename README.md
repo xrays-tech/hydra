@@ -43,7 +43,7 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 - **Two client protocols, format-homogeneous**: accept OpenAI (`POST /v1/chat/completions`) **and** Anthropic (`POST /v1/messages`). The path you call selects the format end-to-end — the upstream URL, request body, and usage parser all match (no OpenAI↔Anthropic conversion). `UsageScanner` picks `ProviderKind::Anthropic` for `/v1/messages` (parses `input_tokens`/`output_tokens`/`cache_read_input_tokens`), `Generic` otherwise.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
 - **Key-prefix binding gate**: pin client api-keys by raw prefix to one provider (`sk_aaa_*` → Provider A); longest prefix wins, fail-closed (bound provider unavailable ⇒ 503, never falls back).
-- **Internal API-key auth + four-level user hierarchy**: a client presents its own api-key (`hk_` + CSPRNG, stored only as SHA-256; plaintext shown once at creation), resolved to a user under `tenant → user_group → user → api_key`. Unknown/disabled/expired key → **401**, disabled user/group → **403**, a user flagged delinquent via the tenant API → **402 `user_delinquent`**. No external `auth_url`, no auth cache. Tenant access tokens (`ht_`, multi-token per tenant) gate the tenant self-service API only. The old external-auth path (`auth_url` / `HttpAuthChecker` / `AuthCache`) and the sub-tenant / key-prefix routing layer were REMOVED by the T10 cleanup (migration `0015_drop_legacy.sql`); calls to those old paths are plain 404s.
+- **Internal API-key auth + four-level user hierarchy**: a client presents its own api-key (`hk_` + CSPRNG, stored only as SHA-256; plaintext shown once at creation), resolved to a user under `tenant → user_group → user → api_key`. Unknown/disabled/expired key → **401**, disabled user/group → **403**, a user flagged delinquent via the tenant API → **402 `user_delinquent`**. No external `auth_url`, no auth cache. Tenant access tokens (`ht_`, multi-token per tenant) gate the tenant self-service API only. The old external-auth path (`auth_url` / `HttpAuthChecker` / `AuthCache`) and the sub-tenant / key-prefix routing layer were REMOVED by the T10 cleanup (the greenfield schema has no such tables); calls to those old paths are plain 404s.
 - **Global Role routing**: a `global_role` table keyed on `(tenant, user_group, user, api_key, model)` — each dimension `*` = any — maps to a provider set. Matched rules' providers are **unioned** (dedup, `provider_id` ascending) and always intersected with providers actually serving that model; wildcard-tenant roles still intersect `tenant_providers` (fail-closed). Weighted SWRR by default, or session-sticky weighted rendezvous (`HYDRA_SESSION_AFFINITY`, default on). No match → today's `tenant_providers ∩ models_by_key` behavior.
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.
@@ -61,9 +61,10 @@ export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
 export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 # 1. cross-compile the linux/amd64 binary + build the image
+#    DB_BACKEND=postgres (default) or DB_BACKEND=mysql selects the compiled database backend
 ./environment/build.sh
 
-# 2. run the full stack (hydra + mock-tenant + clickhouse)
+# 2. run the full stack (hydra + postgres + mock-tenant + clickhouse)
 cd environment && docker compose up -d
 
 # 3. register your providers (reads secure/config.json)
@@ -73,8 +74,10 @@ python3 ../environment/init.py
 ### From source
 
 ```bash
-cargo build --release --features server
-# HYDRA_ENCRYPTION_KEY and HYDRA_USAGE_SINK are required (no defaults)
+# exactly one database backend feature is required: db-postgres | db-mysql
+cargo build --release --features server,db-postgres
+# HYDRA_DB_URL must match the compiled backend; HYDRA_ENCRYPTION_KEY and HYDRA_USAGE_SINK are required
+HYDRA_DB_URL=postgres://hydra:hydra@127.0.0.1:5432/hydra \
 HYDRA_ADMIN_TOKEN=<token> \
 HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" \
 HYDRA_USAGE_SINK=none \
@@ -83,11 +86,11 @@ HYDRA_USAGE_SINK=none \
 
 ## Configure
 
-Hydra boots from **environment variables** (runtime) and stores all routing config in **SQLite** (managed via the admin API).
+Hydra boots from **environment variables** (runtime) and stores all routing config in a **shared PostgreSQL or MySQL database** (managed via the admin API). The backend is selected at compile time: `DB_BACKEND=postgres|mysql` maps to the `db-postgres` / `db-mysql` Cargo feature. SQLite is gone. Migrations are greenfield baselines under `migrations/postgres/` and `migrations/mysql/`, applied at boot.
 
 | Env var              | Default                          | Purpose                                              |
 | -------------------- | -------------------------------- | ---------------------------------------------------- |
-| `HYDRA_DB_URL`       | `sqlite:hydra.db?mode=rwc`       | SQLite database location                             |
+| `HYDRA_DB_URL`       | *(compiled-backend dev fallback)* | **Required in practice.** PostgreSQL/MySQL URL; its scheme must match the compiled backend (`db-postgres` ⇒ `postgres://…`, `db-mysql` ⇒ `mysql://…`). |
 | `HYDRA_LISTEN`       | `0.0.0.0:8080`                   | Proxy **plaintext** listen address (always bound)    |
 | `HYDRA_TLS_LISTEN`   | *(unset)*                        | Optional proxy **TLS** listen address, e.g. `0.0.0.0:8443`. Setting it (not the tenant certs) is what creates the HTTPS listener; per-tenant certs are selected by SNI. |
 | `HYDRA_ADMIN_ADDR`   | `127.0.0.1:8081`                 | Admin REST + UI + `/metrics` listen address          |
@@ -95,18 +98,19 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | `HYDRA_ENCRYPTION_KEY` | —                              | Base64 of 32 bytes; encrypts provider api-keys at rest (**required**, fail-closed). Generate: `openssl rand 32 \| base64`. |
 | `HYDRA_USAGE_SINK`   | — (**required**)                 | `clickhouse` (shared store) or `none` (no metering)   |
 | `HYDRA_CLICKHOUSE_URL` | —                              | ClickHouse HTTP endpoint (when sink=clickhouse)      |
+| `HYDRA_CONFIG_POLL_MS` | `5000`                         | Cluster-only config revision-probe interval; unset/`0`/garbage ⇒ 5000 |
 | `RUST_LOG` | *unset* | Log level; in-process default when unset is tracing's `error` — `info` is the recommended/deployed value |
 
-> The only switch between single-node and cluster is **`HYDRA_CLUSTER_PEERS`**: unset = single node (the table above is all you need); set (≥3 entries, byte-identical on all three nodes) = enter a raft cluster — you then also need:
+> The only switch between single-node and cluster is **`HYDRA_REDIS_URL`**: unset = single node with no Redis; set = cluster data-plane state and config fanout. There is no raft, no leader, and no member list.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HYDRA_CLUSTER_PEERS` | — (**required for cluster**) | Static member list, `name=host:port` comma-separated; **order is the raft id**; ≥3 entries; identical on every node |
-| `HYDRA_NODE_ID` | — (**required**) | This node's name from the member list; unique per node |
-| `HYDRA_ARACHNE_LISTEN` | — (**required**) | This node's raft transport address; must equal its own entry in the member list |
-| `HYDRA_CLUSTER_ID` | hash of the member list (**set explicitly**) | Cluster identity; setting it explicitly lets you change the member list later |
-| `HYDRA_REDIS_URL` | — (**required**) | Shared data-plane state backbone (Redis is one cluster dependency, alongside the usage sink) |
-| `HYDRA_REDIS_MODE` | `single` | Read by the cluster only; only `single` is accepted |
+| `HYDRA_REDIS_URL` | — | Set ⇒ cluster mode. Shared rate limits / breaker votes / invalidation, plus the `hydra:config:changed` fanout channel. |
+| `HYDRA_NODE_ID` | hostname, else random | Stable node identity for logs, fanout origin and breaker votes |
+| `HYDRA_CONFIG_POLL_MS` | `5000` | Revision-probe fallback for a missed pub/sub message or Redis outage |
+| `HYDRA_REDIS_MODE` | `single` | Read when set; only `single` is accepted |
+
+Three retired raft-era variables (`HYDRA_CLUSTER_PEERS`, `HYDRA_CLUSTER_ID`, `HYDRA_ARACHNE_LISTEN`) and the other Arachne names are **ignored with a startup ERROR** if still set; remove them from manifests.
 
 **Ports**: `8080` proxy (plaintext, always bound) · `8443` proxy (TLS, only if `HYDRA_TLS_LISTEN` is set) · `8081` admin (REST + UI + metrics).
 
@@ -164,37 +168,42 @@ dev-docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 
 ## Cluster Mode
 
-Single node needs no external dependency; **the only cluster switch is `HYDRA_CLUSTER_PEERS`**
-(a static member list, `name=host:port` comma-separated). Set it (≥3 entries) and this process is a
-raft cluster member; leave it unset and you stay single-node with unchanged behavior. The member
-list **order is the raft id** and must be byte-identical on every node. **Minimum 3 members**
-(`MINIMUM_MEMBERS = 3`); fewer is rejected while parsing the member list.
+Single node needs no Redis. **The only cluster switch is `HYDRA_REDIS_URL`**: set it and this
+process joins the shared data-plane state and the config-change fanout; leave it unset and it is
+a single-node deployment.
 
-The cluster is three **identical** raft members (each runs data plane + admin API + local SQLite +
-raft); there is **no edge role and no `--scale`**. Exactly **one writer** exists at any time, decided
-by a raft write probe. The control plane is Arachne (raft-linearizable KV); Redis only carries
-approximate data-plane state.
+The cluster is **three identical nodes sharing one relational database**. There is no raft, no
+leader and no static member list. Every node proxies, serves the admin API and writes the shared
+database directly. Write serialization is a `hydra_lock` row taken with `SELECT … FOR UPDATE`;
+every write bumps `config_revision.version` in the same transaction. Each process serves an
+in-process `ArcSwap<ConfigData>` cache. After a committed local write and reload, the node
+publishes `{version, origin}` on Redis `hydra:config:changed`; peers reload quietly. A
+`HYDRA_CONFIG_POLL_MS` (default 5000) revision probe is the missed-message/outage backstop.
+External reloads never republish. `/healthz/leader` is gone (404); cluster status is local-node
+only (`node_id`, `role`, `config_version`, `db_reachable`, `redis_configured`,
+`redis_reachable`).
 
 Cluster build / run:
 
 ```bash
-# requires the arachne feature, or a node with HYDRA_CLUSTER_PEERS set refuses to boot
-cargo build --release --features server,cluster-redis,arachne,usage-clickhouse
+# one database backend feature is required; the image also bundles Redis + ClickHouse
+cargo build --release --features server,cluster-redis,usage-clickhouse,db-postgres
 export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # every node uses it
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # identical across the cluster
-cd environment && docker compose -f docker-compose.cluster.yml up -d   # 3 identical members, do NOT --scale
+cd environment && docker compose -f docker-compose.cluster.yml up -d   # 3 identical nodes, one shared Postgres
 ```
 
-Per node: `HYDRA_CLUSTER_PEERS` (identical on all), a distinct `HYDRA_NODE_ID` and
-`HYDRA_ARACHNE_LISTEN` (the latter must equal this node's own entry in the list), `HYDRA_REDIS_URL`,
-`HYDRA_ADMIN_TOKEN`, `HYDRA_ENCRYPTION_KEY` (identical), `HYDRA_USAGE_SINK`; **strongly set
-`HYDRA_CLUSTER_ID` explicitly** (default = hash of the member list, so changing the list changes
-cluster identity and makes every node refuse to start).
+Per node: the same `HYDRA_DB_URL`, `HYDRA_REDIS_URL`, `HYDRA_ADMIN_TOKEN`, `HYDRA_ENCRYPTION_KEY`
+and `HYDRA_USAGE_SINK`; a distinct `HYDRA_NODE_ID` is recommended but defaults to the hostname.
+There are no per-node config volumes and no raft ports.
 
-Measured (3 real processes, docker Redis): election/failover **~1.1–1.6 s**, no dual writer ever
-observed, and on quorum loss admin writes return 503 immediately while the data plane keeps serving.
-See **[`dev-docs/cluster.md`](dev-docs/cluster.md)** (member list, failure matrix, membership-change SOP)
-and [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml).
+A killed node only removes capacity, not write availability: any survivor keeps writing the shared
+database. Its cache converges from the Redis notification, or from the poll fallback if the
+notification was missed. The availability boundary is the database (and Redis for shared
+data-plane state), not a quorum.
+
+See **[`dev-docs/cluster.md`](dev-docs/cluster.md)** (write/cache protocol, failure modes, node-kill
+drill) and [`environment/docker-compose.cluster.yml`](environment/docker-compose.cluster.yml).
 
 ## More
 

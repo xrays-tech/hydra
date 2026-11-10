@@ -43,9 +43,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,7 +62,7 @@ const TEST_MASTER_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const TENANT_DOMAIN: &str = "acme.com";
 
 /// How long a test waits for a listener the config asked for. Generous: the
-/// spawned process has to open SQLite, migrate and boot Pingora first.
+/// spawned process has to open its database, migrate and boot Pingora first.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn fixture(name: &str) -> String {
@@ -83,62 +81,24 @@ fn fixture_cert_der(name: &str) -> Vec<u8> {
 // Temp DB
 // ---------------------------------------------------------------------------
 
-/// A throwaway SQLite **file** (the spawned binary opens it itself; an
-/// in-memory pool would be invisible to another process).
-struct TempDb(PathBuf);
-
-impl TempDb {
-    /// Create a migrated DB file and (optionally) seed one tenant whose cert
-    /// columns point at the fixture PEMs.
-    async fn new(with_cert: bool) -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "hydra-listener-topology-{}-{}.db",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-
-        let pool = db::init_pool(&format!("sqlite:{}?mode=rwc", path.display()))
-            .await
-            .expect("init_pool on the temp DB file");
-        db::run_migrate(&pool).await.expect("run_migrate");
-        if with_cert {
-            db::insert_tenant(
-                &pool,
-                &Tenant {
-                    id: "t1".into(),
-                    name: "t1-tenant".into(),
-                    domain: TENANT_DOMAIN.into(),
-                    cert_key: Some(fixture("acme.key")),
-                    cert_file: Some(fixture("acme.crt")),
-                    enabled: true,
-                    created_at: NOW.into(),
-                    updated_at: NOW.into(),
-                },
-            )
-            .await
-            .expect("insert tenant");
-        }
-        // The binary opens the same file: release our handle first.
-        pool.close().await;
-        Self(path)
-    }
-
-    fn url(&self) -> String {
-        format!("sqlite:{}?mode=rwc", self.0.display())
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
+/// A throwaway isolated schema/database. The spawned binary opens the same
+/// database through `db.url`; the pooling `TestDb` is kept alive by [`Hydra`].
+async fn seed_tenant_cert(db: &common::TestDb) {
+    db::insert_tenant(
+        &db.pool,
+        &Tenant {
+            id: "t1".into(),
+            name: "t1-tenant".into(),
+            domain: TENANT_DOMAIN.into(),
+            cert_key: Some(fixture("acme.key")),
+            cert_file: Some(fixture("acme.crt")),
+            enabled: true,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("insert tenant");
 }
 
 // ---------------------------------------------------------------------------
@@ -152,13 +112,16 @@ struct Hydra {
     plain: u16,
     tls: Option<u16>,
     log: Arc<Mutex<String>>,
-    _db: TempDb,
+    _db: common::TestDb,
 }
 
 impl Hydra {
     /// Spawn the real binary. `tls_listen` mirrors `HYDRA_TLS_LISTEN`.
     async fn start(with_cert: bool, tls_listen: bool) -> Self {
-        let db = TempDb::new(with_cert).await;
+        let db = common::setup_db().await;
+        if with_cert {
+            seed_tenant_cert(&db).await;
+        }
         let plain = common::ephemeral_port();
         let tls = tls_listen.then(common::ephemeral_port);
         let admin = common::ephemeral_port();
@@ -273,9 +236,9 @@ impl Drop for Hydra {
     }
 }
 
-fn base_command(db: &TempDb, plain: u16, admin: u16) -> Command {
+fn base_command(db: &common::TestDb, plain: u16, admin: u16) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hydra"));
-    cmd.env("HYDRA_DB_URL", db.url())
+    cmd.env("HYDRA_DB_URL", db.url.clone())
         .env("HYDRA_ENCRYPTION_KEY", TEST_MASTER_KEY)
         .env("HYDRA_LISTEN", format!("127.0.0.1:{plain}"))
         .env("HYDRA_ADMIN_ADDR", format!("127.0.0.1:{admin}"))
@@ -449,8 +412,8 @@ async fn an_unbindable_entry_port_is_loud() {
     let held = TcpListener::bind("127.0.0.1:0").expect("occupy a port");
     let held_port = held.local_addr().expect("local_addr").port();
 
-    let db = TempDb::new(false).await;
-    let url = db.url();
+    let db = common::setup_db().await;
+    let url = db.url.clone();
     let admin = common::ephemeral_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hydra"));
     cmd.env("HYDRA_DB_URL", url)

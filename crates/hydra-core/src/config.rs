@@ -135,10 +135,9 @@ pub struct ConfigData {
 impl ConfigData {
     /// 从 `tenants_by_domain` 重建 `tenants_by_id`（唯一写入口）。
     ///
-    /// 纯函数：无 I/O、不确定输入之外的状态。两个调用点都必须经过它 ——
-    /// `store.rs::build_config`（节点从自己的数据库加载）与
-    /// `cluster/snapshot.rs` 的物化路径（副本从控制面重建之后）。因为它们共用同一个实现，
-    /// 派生规则不可能分叉，也不需要 `WIRE_VERSION` 变更：`serde(skip)` 之后两侧都由本函数产生。
+    /// 纯函数：无 I/O、不确定输入之外的状态。唯一的调用点是
+    /// `store.rs::build_config`（节点从共享数据库加载）。派生规则集中在一处，
+    /// 不需要 `WIRE_VERSION` 变更：`serde(skip)` 之后索引都由本函数产生。
     ///
     /// 空的 `tenants_by_domain`（尚未物化出任何配置的节点）产生空索引，这是正确的：
     /// 此时 `ConfigStore::version()` 为 0（"什么都还没应用"），令牌闸门回 503 `not_ready`，
@@ -158,10 +157,9 @@ impl ConfigData {
     /// `user_api_key` rows — the ONE write entry point for the identity index
     /// (plan §3.2 "身份索引推导（承重规则）").
     ///
-    /// Same-shape rule as [`reindex_tenants`]: both the leader loader
-    /// (`store.rs::build_config`) and the replica materializer (plan §3.5, after
-    /// tree decode) call THIS implementation, so the derived index cannot fork
-    /// between the two, and the wire never carries it.
+    /// Same-shape rule as [`reindex_tenants`]: the loader
+    /// (`store.rs::build_config`) calls THIS implementation, so the derived index
+    /// cannot fork between callers, and the wire never carries it.
     ///
     /// `keys` MUST be the FULL table (incl. `enabled = false` / expired rows),
     /// and `self.users` / the group dimension likewise: a disabled key stays KNOWN
@@ -586,10 +584,10 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
     // --- User hierarchy / Global Role referential integrity (plan §3.1
     //  write-time invariants, load-time WARN backstop) ---------------------
     //
-    // The SQLite FKs prevent most of this at write time, but the config graph is
-    // the authority a replica rebuilds from, and a hand-edited DB or a restored
-    // snapshot can still dangle; WARN (not Fatal) so the snapshot still publishes
-    // and the affected rows are inert at auth/match time.
+    // The database FKs prevent most of this at write time, but the config graph is
+    // rebuilt from rows and a hand-edited DB or an import can still dangle; WARN
+    // (not Fatal) so the snapshot still loads and the affected rows are inert at
+    // auth/match time.
     let group_ids: HashSet<&str> = cfg.user_groups.iter().map(|g| g.id.as_str()).collect();
     let api_key_ids: HashSet<&str> = cfg
         .users_by_api_key_hash

@@ -33,8 +33,20 @@ function tree(files) {
   return root;
 }
 
-function run(files) {
-  const root = tree(files);
+// The config-bus seam guard (R3) requires the definitions to exist; a fixture
+// that is only about the pool rules must not turn into CANNOT VERIFY because it
+// omitted a file it never cared about. Tests that exercise the seam add their
+// own `main.rs`/call sites on top.
+const CONFIG_BUS_STUB =
+  'pub fn with_channel() {}\npub async fn spawn_config_watch_on() {}\n' +
+  'pub async fn spawn_config_watch() {}\npub fn RedisConfigNotifier() {}\n';
+const CONFIG_BUS_REL = 'crates/hydra-server/src/cluster/config_bus.rs';
+
+function run(files, { injectConfigBus = true } = {}) {
+  const withBus = injectConfigBus
+    ? { [CONFIG_BUS_REL]: CONFIG_BUS_STUB, ...files }
+    : files;
+  const root = tree(withBus);
   try {
     const out = execFileSync('node', [SCRIPT], {
       encoding: 'utf8',
@@ -211,12 +223,86 @@ check(
   `exit=${r.code} out=${r.out.trim().slice(0, 120)}`,
 );
 
-console.log();
-if (failures.length) {
-  console.log(`redis-pool guard tests: FAILED (${failures.length}): ${failures.join('; ')}`);
-  process.exit(1);
-}
-console.log('redis-pool guard tests: PASSED (17 assertions, both directions + cannot-verify)');
+
+/* --- Config-bus channel seam (R3): test-only helpers must not reach production ------- */
+
+// main.rs using the fixed wrappers is the shape production must have.
+r = run({
+  [OWNER]: GOOD_OWNER,
+  [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
+  'crates/hydra-server/src/main.rs':
+    'fn boot() { let n = RedisConfigNotifier::new(pool, id); spawn_config_watch(store, sub, poll); }\n',
+});
+check(
+  'R3: main.rs using `RedisConfigNotifier::new`/`spawn_config_watch` passes',
+  r.code === 0,
+  `exit=${r.code} out=${r.out.trim().slice(0, 120)}`,
+);
+
+// A production caller of the explicit-channel watcher would subscribe to a channel
+// nothing publishes on.
+r = run({
+  [OWNER]: GOOD_OWNER,
+  [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
+  'crates/hydra-server/src/main.rs':
+    'fn boot() { spawn_config_watch_on(store, sub, poll, "x"); }\n',
+});
+check(
+  'R3: production `spawn_config_watch_on` is a violation naming the file',
+  r.code === 1 && /main\.rs:1/.test(r.out) && /spawn_config_watch_on/.test(r.out),
+  `exit=${r.code} out=${r.out.trim().slice(0, 140)}`,
+);
+
+// Any other src file is production too.
+r = run({
+  [OWNER]: GOOD_OWNER,
+  [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
+  'crates/hydra-server/src/admin/mod.rs':
+    'fn boot(pool: Pool) { let _ = RedisConfigNotifier::with_channel(pool, "n", "c"); }\n',
+});
+check(
+  'R3: `with_channel` outside config_bus.rs is a violation',
+  r.code === 1 && /admin\/mod\.rs:1/.test(r.out) && /with_channel/.test(r.out),
+  `exit=${r.code} out=${r.out.trim().slice(0, 140)}`,
+);
+
+// The seam exists for integration tests; `tests/` is not scanned.
+r = run({
+  [OWNER]: GOOD_OWNER,
+  [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
+  'crates/hydra-server/tests/config_fanout.rs':
+    'fn t() { spawn_config_watch_on(store, sub, poll, "chan"); }\n',
+});
+check(
+  'R3: integration tests may use the seam',
+  r.code === 0,
+  `exit=${r.code} out=${r.out.trim().slice(0, 120)}`,
+);
+
+// A comment mentioning a helper is not a call site.
+r = run({
+  [OWNER]: GOOD_OWNER,
+  [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
+  'crates/hydra-server/src/other.rs':
+    '// never call spawn_config_watch_on or with_channel in production\nfn f() {}\n',
+});
+check(
+  'R3: comments mentioning the seam are not violations',
+  r.code === 0,
+  `exit=${r.code} out=${r.out.trim().slice(0, 120)}`,
+);
+
+// Deleting the definitions must not make the seam check silently vacuous.
+r = run(
+  { [OWNER]: GOOD_OWNER, 'crates/hydra-server/src/other.rs': 'fn f() {}\n' },
+  { injectConfigBus: false },
+);
+check(
+  'R3: a missing config_bus.rs exits 2 (cannot verify)',
+  r.code === 2 && /config_bus\.rs is missing/.test(r.out),
+  `exit=${r.code} out=${r.out.trim().slice(0, 140)}`,
+);
+
 
 /* Round 130: R2's "the 4th argument must be `Some(...)`" was satisfied by an argument that is not
  * the policy: `splitArgs` walked the raw text, so a comma inside a TOP-LEVEL string argument shifted
@@ -244,3 +330,10 @@ check(
   r.code === 0,
   `exit=${r.code} out=${r.out.trim().slice(0, 140)}`,
 );
+
+console.log();
+if (failures.length) {
+  console.log(`redis-pool guard tests: FAILED (${failures.length}): ${failures.join('; ')}`);
+  process.exit(1);
+}
+console.log('redis-pool guard tests: PASSED (25 assertions, both directions + cannot-verify)');

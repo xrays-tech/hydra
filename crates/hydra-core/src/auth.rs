@@ -43,15 +43,18 @@ pub fn sha256_hex_string(input: &[u8]) -> String {
 ///
 /// ## Why a MAC lives in this module
 ///
-/// The Arachne config tree is **content-addressed**: its name is the hash of its
-/// bytes, so a secret sealed with a random nonce renames the tree on every publish
-/// and every node re-materializes for nothing. `hydra_server::cluster::arachne_entities`
-/// therefore seals with a nonce DERIVED from the plaintext and the master key
-/// (`hydra_server::crypto::KeyProvider::seal_deterministic`), and a plaintext-derived
-/// nonce has to be a keyed function — otherwise anyone who guesses a plaintext knows
-/// the nonce. That needs a MAC; `sha2` is the only digest dependency in the workspace
-/// and provides none, and hand-rolling one next to the code that uses it is how
-/// primitives get subtly wrong.
+/// The former Arachne config tree was **content-addressed**: its name was the hash
+/// of its bytes, so a secret sealed with a random nonce renamed the tree on every
+/// publish and every node re-materialized for nothing. The server therefore kept
+/// `KeyProvider::seal_deterministic`, whose nonce is DERIVED from the plaintext and
+/// the master key. A plaintext-derived nonce has to be a keyed function — otherwise
+/// anyone who guesses a plaintext knows the nonce. That needs a MAC; `sha2` is the
+/// only digest dependency in the workspace and provides none, and hand-rolling one
+/// next to the code that uses it is how primitives get subtly wrong.
+///
+/// (The Arachne control plane was retired by the shared-DB architecture; the
+/// deterministic-sealing primitive and its HMAC stay so the trait contract and its
+/// test vectors do not silently disappear.)
 ///
 /// Implemented from RFC 2104. **Validated against the RFC 4231 test vectors**
 /// below, whose expected values were produced with an independent implementation

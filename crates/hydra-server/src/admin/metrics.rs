@@ -41,7 +41,11 @@
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
 //! | `hydra_admission_resizes_total` | counter | provider | admission module (hot-reload generations swapped, decision item D-14 — implemented 2026-10-09) |
-//! | `hydra_config_snapshot_stale` | gauge | — | `admin::reload_best_effort` (1 = last reload failed, snapshot stale) |
+//! | `hydra_config_snapshot_stale` | gauge | — | `ConfigStore` reload outcome (1 = last reload failed, snapshot stale; mirrored to `/metrics` from `store.snapshot_stale()`) |
+//! | `hydra_config_reload_total` | counter | source, changed | `ConfigStore` reload (source=local\|pubsub\|poll, changed=true\|false) |
+//! | `hydra_config_notify_total` | counter | result | `ConfigStore` local-change fanout (result=ok\|error) |
+//! | `hydra_config_version` | gauge | — | `ConfigStore` (local last-applied revision) |
+//! | `hydra_config_watch_last_ok_unixtime` | gauge | — | `cluster::config_bus` watcher (unix seconds of the last completed poll tick / handled pub/sub message; alert when `time() - gauge > 3× poll interval`) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
@@ -52,12 +56,6 @@
 //! | `hydra_upstream_stream_idle_timeout_total` | counter | provider | proxy stream path (upstream sent headers, then no body byte within the idle bound) |
 //! | `hydra_invalidation_trimmed_total` | counter | — | invalidation stream trim task (entries dropped; whether or not a bump was needed) |
 //! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ consumers must treat old cached state as unsafe) |
-//! | `hydra_replica_materialize_retries_total` | counter | outcome | replica materialization passes (attempt\|succeeded\|failed\|throttled) — `main.rs`'s convergence loop |
-//! | `hydra_arachne_this_node_leader` | gauge | — | raft `ArachneControl` leader watch (1 = this node is the writer) |
-//! | `hydra_arachne_leader_flips_total` | counter | — | raft `ArachneControl` leader watch (a change of answer) |
-//! | `hydra_arachne_publish_total` | counter | result | `ArachneConfigStore::publish` + `ConfigPublisher` (ok\|not_leader\|quorum_unavailable\|error\|refused) |
-//! | `hydra_arachne_config_bytes` | gauge | — | bytes in the tree the last publish committed (`ArachneConfigStore::publish`) |
-//! | `hydra_arachne_quorum_unavailable_total` | counter | op | raft operation that failed because no majority was reachable (publish\|read) |
 //! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
@@ -151,13 +149,27 @@ struct Metrics {
     /// snapshot is stale (later admin writes may have silently not taken
     /// effect). Alert on this (audit §3.14).
     config_snapshot_stale: IntGauge,
+    /// Config reload attempts by trigger source (`local` / `pubsub` / `poll`)
+    /// and whether the served snapshot actually changed. A steady stream of
+    /// `changed="false"` polls is the cheap-probe steady state, not an error.
+    config_reload: IntCounterVec,
+    /// Cross-node notification outcomes (`result=ok|error`). An error here is
+    /// logged but never fails the write/reload; the poller is the backstop.
+    config_notify: IntCounterVec,
+    /// Local last-applied config revision (the same value `store.version()`
+    /// returns). Compare with a peer's gauge to spot a node that stopped
+    /// converging.
+    config_version: IntGauge,
+    /// Unix seconds when the config watcher last completed a poll tick or
+    /// handled a well-formed pub/sub message. A frozen value means the detached
+    /// watcher task died (a panic in a hook or in the Redis client/SELECT loop)
+    /// while `/metrics` — served by a different task — keeps answering.
+    config_watch_last_ok_unixtime: IntGauge,
     /// Usage records the sink dropped, by reason. Billing data loss must be
     /// alertable, not just a WARN in the log (audit §3.9).
     usage_dropped: IntCounterVec,
-    // ── Control plane (cluster P1) ──────────────────────────────────────
     /// Control-channel poll outcomes (result=ok|error).
     control_poll: IntCounterVec,
-    /// Last config snapshot version applied (edge/standby).
     /// Entries dropped from the invalidation stream by the trim task, whether or
     /// not a generation bump was needed.
     ///
@@ -165,15 +177,11 @@ struct Metrics {
     /// steadily because the fleet is busy" from "we are dropping events somebody
     /// had not read" — the two used to be the same event, and the whole chain was
     /// invisible.
-    /// Replica materialization retries by outcome. `failed` non-zero with
-    /// `throttled` growing means a node that cannot materialize (and therefore
-    /// cannot lead) — the state that used to be both permanent and invisible.
     /// Failed admin-token attempts by outcome. Before this existed the admin
     /// gate had no counter at all and logged at `debug!` (filtered out at the
     /// shipped `RUST_LOG=info`), so a brute-force run against the single secret
     /// gating every provider key was completely invisible.
     admin_auth_failures: IntCounterVec,
-    replica_materialize_retries: IntCounterVec,
     invalidation_trimmed: IntCounter,
     /// Trims that dropped an entry a LIVE consumer had not applied. Each one
     /// means consumers must treat cached state derived from the stream tail as
@@ -217,55 +225,6 @@ struct Metrics {
     /// hot-reloaded at runtime, so a boot-time-only gauge would be permanently
     /// stale in exactly the scenario this alert targets.
     listener_tenant_certs: IntGauge,
-    // ── Arachne control plane (ADR-0001) ────────────────────────────────
-    //
-    // The node registry that used to sit here is DELETED, and so are its two
-    // series (`hydra_registry_nodes`, `hydra_registry_reaped_total`): the reaper
-    // went with the registry (T4.1), so the metrics had no recorder left — their
-    // two alert rows could never fire, which is the exact failure mode
-    // `check_documented_metrics` and the §9.1 table exist to prevent. What
-    // replaces them is the raft surface below: "is anyone the writer" and "is
-    // publishing getting through" are the questions an operator actually has now.
-    /// 1 while THIS node is the raft leader (the writer), labelled by node id.
-    /// `sum()` over the fleet is 0 when the cluster has no writer — the alert that
-    /// replaces "registry rows piling up".
-    ///
-    /// A `Vec`, not a bare gauge, and that is load-bearing: a bare `IntGauge` is
-    /// exported with its zero as soon as it is registered, so on a SINGLE-NODE
-    /// deployment (no raft node exists, the watch never runs) it would read 0 and
-    /// an alert written as `sum(...) == 0` would fire forever on every deployment
-    /// that is not a cluster. A `Vec` exports no series until a label set is used,
-    /// so the series exists exactly where the question is meaningful — the same
-    /// reason `hydra_invalidation_consumer_*` is labelled by node.
-    arachne_this_node_leader: IntGaugeVec,
-    /// How many times this node's answer to "am I the leader" CHANGED. A node
-    /// that flaps is a cluster whose commit point keeps moving.
-    arachne_leader_flips_total: IntCounter,
-    /// Publish outcomes: `ok` (the head moved), `not_leader` (the library refused
-    /// the commit), `quorum_unavailable` (no majority), `error` (anything else,
-    /// including a malformed tree), `refused` (a PRE-propose rejection — either the encoder
-    /// refused the config: the per-value size limit, an unkeyable id, a failed seal; a toc shard
-    /// exceeded `SHARD_MAX_BYTES` at plan time; or a `multi_put` entity/shard chunk / the final
-    /// manifest+head batch overran its entry-count/total-byte/per-value bound.
-    /// The capacity alarm ADR-0001 risk R2 asks for).
-    arachne_publish_total: IntCounterVec,
-    /// Read-back guard outcomes: `stale` (head index regressed / absent),
-    /// `conflict` (same index names a different tree), `superseded` (a newer
-    /// concurrent head won).
-    arachne_publish_readback_total: IntCounterVec,
-    /// Watch lifecycle / head-cache outcomes.
-    arachne_watch_total: IntCounterVec,
-    /// Per-key watch content-cache outcomes.
-    arachne_watch_cache_total: IntCounterVec,
-    /// Bytes in the tree the last successful publish committed. The growth series
-    /// for the capacity question R2 raises; the HARD signal is
-    /// `publish_total{result="refused"}`, not a byte threshold invented here.
-    arachne_config_bytes: IntGauge,
-    /// Raft operations that failed because no majority was reachable, by
-    /// operation (`publish`|`read`). Distinct from `error`: a lost quorum is a
-    /// cluster-level fact with a different fix (start a majority) from a
-    /// transport or codec failure.
-    arachne_quorum_unavailable_total: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -486,6 +445,29 @@ fn metrics() -> Option<&'static Metrics> {
                 "1 = the last post-write reload_all failed: the in-memory snapshot is stale"
             )
             .ok()?,
+            // ── Config fanout (Phase 3; shared-DB no-raft §7.4) ───────────
+            config_reload: register_int_counter_vec!(
+                "hydra_config_reload_total",
+                "Config reload attempts by trigger source and whether the served snapshot changed",
+                &["source", "changed"]
+            )
+            .ok()?,
+            config_notify: register_int_counter_vec!(
+                "hydra_config_notify_total",
+                "Cross-node config-change notification outcomes",
+                &["result"]
+            )
+            .ok()?,
+            config_version: register_int_gauge!(
+                "hydra_config_version",
+                "Local last-applied config revision"
+            )
+            .ok()?,
+            config_watch_last_ok_unixtime: register_int_gauge!(
+                "hydra_config_watch_last_ok_unixtime",
+                "Unix seconds of the last completed config-watch poll tick or handled pub/sub message"
+            )
+            .ok()?,
             // ── Control plane (cluster P1) ────────────────────────────────
             control_poll: register_int_counter_vec!(
                 "hydra_control_poll_total",
@@ -497,12 +479,6 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_admin_auth_failures_total",
                 "Failed credential attempts on the admin port, by gate and outcome (admin|cluster _denied|_throttled)",
                 &["result"]
-            )
-            .ok()?,
-            replica_materialize_retries: register_int_counter_vec!(
-                "hydra_replica_materialize_retries_total",
-                "Replica materialization retries by outcome (attempt|succeeded|failed|throttled)",
-                &["outcome"]
             )
             .ok()?,
             invalidation_trimmed: register_int_counter!(
@@ -548,53 +524,6 @@ fn metrics() -> Option<&'static Metrics> {
             listener_tenant_certs: register_int_gauge!(
                 "hydra_listener_tenant_certs",
                 "Tenant certificates present in the config snapshot"
-            )
-            .ok()?,
-            // ── Arachne control plane (ADR-0001) ──────────────────────
-            arachne_this_node_leader: register_int_gauge_vec!(
-                "hydra_arachne_this_node_leader",
-                "1 = this node currently answers the raft write probe; the fleet sum is the writer count (node = raft member name)",
-                &["node"]
-            )
-            .ok()?,
-            arachne_leader_flips_total: register_int_counter!(
-                "hydra_arachne_leader_flips_total",
-                "Changes of this node's own leadership answer (0 -> 1 or 1 -> 0)"
-            )
-            .ok()?,
-            arachne_publish_total: register_int_counter_vec!(
-                "hydra_arachne_publish_total",
-                "Config publish outcomes (result=ok|not_leader|quorum_unavailable|error|refused)",
-                &["result"]
-            )
-            .ok()?,
-            arachne_publish_readback_total: register_int_counter_vec!(
-                "hydra_arachne_publish_readback_total",
-                "Publish head read-back outcomes (result=stale|conflict|superseded)",
-                &["result"]
-            )
-            .ok()?,
-            arachne_watch_total: register_int_counter_vec!(
-                "hydra_arachne_watch_total",
-                "Arachne watch/head-cache outcomes (result=started|failed|disconnected|head_hit|head_fallback|content_capped)",
-                &["result"]
-            )
-            .ok()?,
-            arachne_watch_cache_total: register_int_counter_vec!(
-                "hydra_arachne_watch_cache_total",
-                "Arachne watch content-cache lookups (result=hit|miss)",
-                &["result"]
-            )
-            .ok()?,
-            arachne_config_bytes: register_int_gauge!(
-                "hydra_arachne_config_bytes",
-                "Bytes in the config tree the last successful publish committed"
-            )
-            .ok()?,
-            arachne_quorum_unavailable_total: register_int_counter_vec!(
-                "hydra_arachne_quorum_unavailable_total",
-                "Raft operations refused for lack of a majority (op=publish|read)",
-                &["op"]
             )
             .ok()?,
         })
@@ -876,15 +805,88 @@ pub fn record_listener_misconfig(kind: &str) {
 }
 
 /// Publish whether the in-memory config snapshot is stale because the last
-/// post-write `reload_all` failed (1) or is in sync with the DB (0).
+/// reload failed (1) or is in sync with the DB (0).
 ///
-/// This is the ops-visible signal the audit asked for in §3.14: a write that is
-/// committed to SQLite but cannot be loaded leaves the API answering 200 while
-/// the runtime keeps serving the PREVIOUS config — key rotation and revocation
-/// silently stop taking effect. Alert on `hydra_config_snapshot_stale == 1`.
+/// The source of truth is [`crate::store::ConfigStore::snapshot_stale`]; the
+/// store calls this on every reload outcome and the `/metrics` handler mirrors
+/// it again at scrape time. This is the ops-visible signal the audit asked for
+/// in §3.14: a write that is committed to the DB but cannot be loaded leaves the
+/// API answering 200 while the runtime keeps serving the PREVIOUS config — key
+/// rotation and revocation silently stop taking effect. Alert on
+/// `hydra_config_snapshot_stale == 1`.
 pub fn record_config_snapshot_stale(stale: bool) {
     if let Some(m) = metrics() {
         m.config_snapshot_stale.set(i64::from(stale));
+    }
+}
+
+/// Count a completed config reload attempt.
+///
+/// `source` is one of the bounded values `local` / `pubsub` / `poll` (the
+/// Phase 3a reload-mode labels); `changed` distinguishes an actual snapshot
+/// swap from a version-gated no-op. Keeping both on one family means a
+/// dashboard can see "polls are probing but nothing changed" without inventing
+/// per-source families.
+pub fn record_config_reload(source: &str, changed: bool) {
+    if let Some(m) = metrics() {
+        let changed = if changed { "true" } else { "false" };
+        m.config_reload.with_label_values(&[source, changed]).inc();
+    }
+}
+
+/// Count a cross-node config-change notification outcome
+/// (`result=ok|error`). A publish failure never fails the reload/write.
+pub fn record_config_notify(ok: bool) {
+    if let Some(m) = metrics() {
+        let result = if ok { "ok" } else { "error" };
+        m.config_notify.with_label_values(&[result]).inc();
+    }
+}
+
+/// Set `hydra_config_version` to the local last-applied config revision.
+pub fn record_config_version(version: u64) {
+    if let Some(m) = metrics() {
+        m.config_version
+            .set(i64::try_from(version).unwrap_or(i64::MAX));
+    }
+}
+
+/// Refresh `hydra_config_watch_last_ok_unixtime` to "now" (unix seconds).
+///
+/// The config watcher runs in a detached task. A panic in a snapshot hook or in
+/// the Redis client's select loop kills that task silently: the process stays
+/// up, `/metrics` (served by another task) keeps answering, and a node quietly
+/// stops following config changes. This gauge makes that state alertable with
+/// `time() - hydra_config_watch_last_ok_unixtime > 3 × poll_interval`.
+///
+/// The watcher calls it after every COMPLETED poll tick (the probe answered,
+/// whether or not a reload was needed, and even if the reload it triggered
+/// failed — the tick itself proves the task is alive) and after every
+/// WELL-FORMED pub/sub message. It deliberately does not refresh on a malformed
+/// payload or a failed revision probe: those are not proof of a healthy watcher,
+/// and letting garbage reset it would mask exactly the failure this alerts on.
+pub fn record_config_watch_ok() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    record_config_watch_ok_at(now);
+}
+
+/// [`record_config_watch_ok`] with an explicit timestamp, kept separate so the
+/// value can be asserted deterministically (the real helper reads the clock).
+fn record_config_watch_ok_at(unix_secs: u64) {
+    if let Some(m) = metrics() {
+        m.config_watch_last_ok_unixtime
+            .set(i64::try_from(unix_secs).unwrap_or(i64::MAX));
+    }
+}
+
+/// Current value of `hydra_config_watch_last_ok_unixtime` (tests).
+#[must_use]
+pub fn config_watch_last_ok_unixtime() -> f64 {
+    match metrics() {
+        Some(m) => m.config_watch_last_ok_unixtime.get() as f64,
+        None => 0.0,
     }
 }
 
@@ -985,16 +987,6 @@ pub fn admin_auth_failures_total(result: &str) -> f64 {
     }
 }
 
-/// Count a replica materialization retry by `outcome`
-/// (`attempt`/`succeeded`/`failed`/`throttled`).
-pub fn record_replica_materialize_retry(outcome: &str) {
-    if let Some(m) = metrics() {
-        m.replica_materialize_retries
-            .with_label_values(&[outcome])
-            .inc();
-    }
-}
-
 /// Count entries the invalidation trim dropped.
 pub fn record_invalidation_trimmed(entries: i64) {
     if let Some(m) = metrics() {
@@ -1047,91 +1039,6 @@ pub fn record_upstream_stream_idle_timeout(provider: &str) {
 pub fn record_listener_tenant_certs(n: usize) {
     if let Some(m) = metrics() {
         m.listener_tenant_certs.set(n as i64);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Arachne control plane (ADR-0001) — the raft surface an operator alerts on
-// ---------------------------------------------------------------------------
-
-/// Publish whether THIS node is the raft leader.
-///
-/// Called by the leader watch on every round, so the fleet `sum()` answers "does
-/// the cluster have a writer" — the question the retired registry answered with a
-/// heartbeat table, and the one an operator must be able to alert on.
-pub fn record_arachne_leader(node: &str, is_leader: bool) {
-    if let Some(m) = metrics() {
-        m.arachne_this_node_leader
-            .with_label_values(&[node])
-            .set(i64::from(is_leader));
-    }
-}
-
-/// Count a CHANGE in this node's own leadership answer (either direction).
-///
-/// Separate from the gauge because a flapping leader is invisible in a sampled
-/// gauge: by the time a scrape lands the answer is true again.
-pub fn record_arachne_leader_flip() {
-    if let Some(m) = metrics() {
-        m.arachne_leader_flips_total.inc();
-    }
-}
-
-/// Count a config publish by outcome.
-///
-/// The outcomes are not interchangeable, which is why they are one family with a
-/// label rather than one counter: `not_leader` is momentary (the library retries
-/// on the next write), `quorum_unavailable` is an outage, `refused` is a config
-/// that can never be published as it stands, and `error` is a bug or a
-/// transport failure.
-pub fn record_arachne_publish(result: &str) {
-    if let Some(m) = metrics() {
-        m.arachne_publish_total.with_label_values(&[result]).inc();
-    }
-}
-
-/// Count a publish read-back guard outcome (`stale`, `conflict`, `superseded`).
-pub fn record_arachne_publish_readback(result: &str) {
-    if let Some(m) = metrics() {
-        m.arachne_publish_readback_total
-            .with_label_values(&[result])
-            .inc();
-    }
-}
-
-/// Count a watch lifecycle/head-cache outcome.
-pub fn record_arachne_watch(result: &str) {
-    if let Some(m) = metrics() {
-        m.arachne_watch_total.with_label_values(&[result]).inc();
-    }
-}
-
-/// Count a watch content-cache lookup.
-pub fn record_arachne_watch_cache(result: &str) {
-    if let Some(m) = metrics() {
-        m.arachne_watch_cache_total
-            .with_label_values(&[result])
-            .inc();
-    }
-}
-
-/// Publish the size of the tree the last publish committed.
-pub fn record_arachne_config_bytes(bytes: usize) {
-    if let Some(m) = metrics() {
-        m.arachne_config_bytes.set(bytes as i64);
-    }
-}
-
-/// Count a raft operation that failed because no majority was reachable.
-///
-/// `op` is `publish` or `read`: a lost quorum makes the cluster unable to commit
-/// a new config while still serving the materialized one, and the two operations
-/// show that asymmetry at different times.
-pub fn record_arachne_quorum_unavailable(op: &str) {
-    if let Some(m) = metrics() {
-        m.arachne_quorum_unavailable_total
-            .with_label_values(&[op])
-            .inc();
     }
 }
 
@@ -1253,11 +1160,8 @@ pub fn candidate_skipped_total(provider: &str, reason: &str) -> u64 {
 ///    UNREACHABLE — deleting every `provider_key` row and reloading makes the
 ///    request fail with "no candidates" rather than entering the loop, and an
 ///    unparseable endpoint makes `ConfigStore::reload_all` return
-///    `FatalValidation`. (That path leaves the snapshot unpublished; the replica
-///    hydrate path `ConfigStore::apply_snapshot` does not re-validate, so
-///    "never published" rests on the upstream invariant that only a validated
-///    leader snapshot is shipped — see `store.rs`.) Those branches fire only if a
-///    future change lets such a candidate reach the loop.
+///    `FatalValidation`, which keeps the previous snapshot. Those branches fire
+///    only if a future change lets such a candidate reach the loop.
 ///
 /// `no_key` is deliberately the SAME string in both families: an operator
 /// alerting on "a provider has no usable key" should not have to know which
@@ -1494,50 +1398,14 @@ mod tests {
         );
     }
 
-    /// The raft surface must actually be PUBLISHED, not merely panic-free.
-    ///
-    /// This replaces the same test for the retired registry metrics, which had
-    /// exactly this purpose and outlived their recorder: a `record_*` helper that
-    /// nothing calls is indistinguishable from a working signal until someone
-    /// writes an alert rule against it. These five families are what an operator
-    /// alerts on now, so the exposition is asserted rather than assumed — and the
-    /// LABELS with it, because a renamed label value is a rule that stops firing.
+    /// The raft/Arachne and materializer series must be GONE, or an old
+    /// dashboard keeps rendering a flat line that no longer means anything.
     #[test]
-    fn arachne_metrics_reach_the_exposition() {
-        record_arachne_leader("probe-node", true);
-        record_arachne_leader_flip();
-        record_arachne_publish("ok");
-        record_arachne_publish("quorum_unavailable");
-        record_arachne_publish("refused");
-        record_arachne_publish_readback("stale");
-        record_arachne_publish_readback("superseded");
-        record_arachne_watch("started");
-        record_arachne_watch("disconnected");
-        record_arachne_watch_cache("hit");
-        record_arachne_watch_cache("miss");
-        record_arachne_config_bytes(4096);
-        record_arachne_quorum_unavailable("read");
+    fn retired_control_plane_metrics_are_not_exposed() {
         let out = render();
-        for needle in [
-            "hydra_arachne_this_node_leader{node=\"probe-node\"} 1",
-            "hydra_arachne_leader_flips_total 1",
-            "hydra_arachne_publish_total{result=\"ok\"} 1",
-            "hydra_arachne_publish_total{result=\"quorum_unavailable\"} 1",
-            "hydra_arachne_publish_total{result=\"refused\"} 1",
-            "hydra_arachne_publish_readback_total{result=\"stale\"} 1",
-            "hydra_arachne_publish_readback_total{result=\"superseded\"} 1",
-            "hydra_arachne_watch_total{result=\"started\"} 1",
-            "hydra_arachne_watch_total{result=\"disconnected\"} 1",
-            "hydra_arachne_watch_cache_total{result=\"hit\"} 1",
-            "hydra_arachne_watch_cache_total{result=\"miss\"} 1",
-            "hydra_arachne_config_bytes 4096",
-            "hydra_arachne_quorum_unavailable_total{op=\"read\"} 1",
-        ] {
-            assert!(out.contains(needle), "missing {needle}:\n{out}");
-        }
-        // The retired series must be GONE, or an old dashboard keeps rendering a
-        // flat line that no longer means anything.
         for dead in [
+            "hydra_arachne_",
+            "hydra_replica_materialize_retries_total",
             "hydra_registry_nodes",
             "hydra_registry_reaped_total",
             "hydra_control_snapshot_version",
@@ -1572,6 +1440,33 @@ mod tests {
         record_admission_decision("p", "acquired");
         // Mid-stream observability (P2-9).
         record_mid_stream_error("p");
+        // Config fanout (Phase 3a).
+        record_config_reload("local", true);
+        record_config_reload("pubsub", false);
+        record_config_reload("poll", false);
+        record_config_notify(true);
+        record_config_notify(false);
+        record_config_version(42);
+    }
+
+    #[test]
+    fn config_watch_liveness_gauge_tracks_the_last_successful_tick() {
+        // Deterministic timestamp first, then the real helper: the second call
+        // must move the gauge forward, which is what the alert compares.
+        record_config_watch_ok_at(1_700_000_000);
+        assert_eq!(config_watch_last_ok_unixtime(), 1_700_000_000.0);
+        record_config_watch_ok_at(1_700_000_005);
+        assert_eq!(config_watch_last_ok_unixtime(), 1_700_000_005.0);
+        record_config_watch_ok();
+        assert!(
+            config_watch_last_ok_unixtime() >= 1_700_000_005.0,
+            "the live helper must not move the gauge backwards"
+        );
+        // It is a real registered series, not just a helper-local value.
+        assert!(
+            render().contains("hydra_config_watch_last_ok_unixtime"),
+            "the watcher-liveness gauge must appear on /metrics"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR-0001 — 用 Arachne（raft 线性化 KV）取代 Redis 控制面
 
-- **Status**：`recorded-from-plan`（决策已定稿；实现从 Phase 1 开始，见 §实施计划）
+- **Status**：`superseded by ADR-0004`（[`ADR-0004-shared-database-control-plane.md`](ADR-0004-shared-database-control-plane.md)）。本文件保留历史决策与实施记录，不再代表当前架构。原状态：`recorded-from-plan`（决策已定稿；实现从 Phase 1 开始）
 - **Date**：`2026-10-05`
 - **Deciders**：用户（架构方向与六条决策的最终裁定）
 - **Source Evidence**：`dev-docs/aegis/plans/2026-10-05-arachne-control-plane.md`（实施计划，含 Phase 0 实测与上游修复复核）

@@ -10,10 +10,10 @@
 //!
 //! ## Why the caller must not just probe for a pool
 //!
-//! A node in a cluster **also** has a local SQLite file while its sink is ClickHouse — so that file
-//! contains no usage rows at all. A reader that decided "is there a pool?" would answer a
-//! perfectly-formed `{"requests":0}` from an empty table. The capability is chosen once, from the
-//! configured backend, and `usage::open` is where that choice is made.
+//! A node **also** has the shared relational database (PostgreSQL/MySQL) while its sink is
+//! ClickHouse — so that database contains no usage rows at all. A reader that decided "is there a
+//! pool?" would answer a perfectly-formed `{"requests":0}` from an empty table. The capability is
+//! chosen once, from the configured backend, and `usage::open` is where that choice is made.
 //!
 //! ## Time bounds
 //!

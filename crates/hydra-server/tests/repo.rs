@@ -1,4 +1,4 @@
-//! §2.2 — repo CRUD per entity (real `:memory:` SQLite, no mock).
+//! §2.2 — repo CRUD per entity (real database, no mock).
 
 mod common;
 
@@ -55,7 +55,7 @@ fn tenant(id: &str, domain: &str, enabled: bool) -> Tenant {
     }
 }
 
-/// T4.1 — provider CRUD incl. UNIQUE `key` conflict.
+/// T4.1 — provider CRUD incl. UNIQUE `provider_code` conflict.
 #[tokio::test]
 async fn provider_crud() {
     let pool = common::setup_pool().await;
@@ -453,10 +453,11 @@ async fn limit_role_crud() {
     assert_eq!(got, role);
 
     // window CHECK: invalid value.
-    let err = sqlx::query("INSERT INTO limit_role (id, name, window) VALUES ('lrbad','bad','s')")
-        .execute(&pool)
-        .await
-        .expect_err("window='s' must violate CHECK");
+    let err =
+        sqlx::query("INSERT INTO limit_role (id, name, limit_window) VALUES ('lrbad','bad','s')")
+            .execute(&pool)
+            .await
+            .expect_err("window='s' must violate CHECK");
     let db_err = match err {
         sqlx::Error::Database(d) => d,
         other => panic!("expected database error, got {other:?}"),
@@ -468,7 +469,7 @@ async fn limit_role_crud() {
 
     // enabled CHECK: invalid value.
     let err = sqlx::query(
-        "INSERT INTO limit_role (id, name, window, enabled) VALUES ('lrbad2','bad','h', 3)",
+        "INSERT INTO limit_role (id, name, limit_window, enabled) VALUES ('lrbad2','bad','h', 3)",
     )
     .execute(&pool)
     .await
@@ -621,12 +622,13 @@ async fn provider_key_encrypted_at_rest() {
     .expect("insert encrypted key");
 
     // The ciphertext stored in the DB must NOT be the plaintext.
-    let row: (Vec<u8>,) =
-        sqlx::query_as("SELECT api_key_ciphertext FROM provider_key WHERE id = ?")
-            .bind("k1")
-            .fetch_one(&pool)
-            .await
-            .expect("read ciphertext column");
+    let row: (Vec<u8>,) = sqlx::query_as(&repo::dialect::sql(
+        "SELECT api_key_ciphertext FROM provider_key WHERE id = ?",
+    ))
+    .bind("k1")
+    .fetch_one(&pool)
+    .await
+    .expect("read ciphertext column");
     assert_ne!(
         row.0,
         plaintext.as_bytes(),

@@ -13,7 +13,7 @@
 //!
 //! 1. Initialise tracing (`tracing_subscriber`).
 //! 2. On a dedicated **background runtime** (so Pingora can own its own):
-//!    open the SQLite pool and run migrations, load [`ConfigStore`], build the
+//!    open the PostgreSQL/MySQL pool and run migrations, load [`ConfigStore`], build the
 //!    auth checker / usage sink / breaker / limiter, and spawn the long-lived
 //!    background tasks (breaker probe, limiter GC). The runtime is **kept
 //!    alive** for the process lifetime — the tasks need it.
@@ -54,10 +54,14 @@ use hydra_server::proxy::{AppState, HydraProxy};
 use hydra_server::store::ConfigStore;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
-use std::time::Duration;
 use tracing::{error, info, warn};
 
-const DEFAULT_DB_URL: &str = "sqlite:hydra.db?mode=rwc";
+#[cfg(feature = "db-postgres")]
+const DEFAULT_DB_URL: &str = "postgres://hydra:hydra@127.0.0.1:5432/hydra";
+#[cfg(feature = "db-mysql")]
+const DEFAULT_DB_URL: &str = "mysql://hydra:hydra@127.0.0.1:3306/hydra";
+#[cfg(not(any(feature = "db-postgres", feature = "db-mysql")))]
+const DEFAULT_DB_URL: &str = "";
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 
@@ -147,9 +151,8 @@ fn main() {
 /// (so the resulting `Arc`s are usable both by Pingora's services and by the
 /// bg tasks that share them).
 async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> {
-    // (0) Node role (cluster P0b): all (default, single-node) | leader | edge.
-    //     ADR-0001: the role is now derived from `HYDRA_CLUSTER_PEERS` — the member list IS
-    //     the decision — and a node with the list set is a raft member.
+    // (0) Node role: `all` (default, single-node) or `cluster`. Cluster mode is
+    //     exactly "HYDRA_REDIS_URL is configured"; there is no raft control plane.
     let role = hydra_server::cluster::NodeRole::from_env();
 
     // DD-1 (2026-10-09): `HYDRA_REDIS_MODE` is validated whenever it is SET —
@@ -166,120 +169,30 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         }
     }
 
-    // (0b) Arachne control plane (ADR-0001). Started HERE, inside the async bootstrap, and
-    //      that placement is a requirement rather than a preference: `Arachne::start` builds a
-    //      `tokio::time::Interval` while assembling its actor and panics with
-    //      "there is no reactor running" when called from a synchronous context (measured on
-    //      both the single-node and the member path). `main` runs the bootstrap inside the
-    //      background runtime, so this is the one place the call is legal.
-    //
-    //      In single-node mode (`HYDRA_CLUSTER_PEERS` unset) this is a no-op and the process
-    //      keeps zero new dependencies on its path.
-    #[cfg(feature = "arachne")]
-    let arachne_control: Option<
-        std::sync::Arc<hydra_server::cluster::arachne_node::ArachneControl>,
-    > = {
-        let sqlite_path = std::env::var("HYDRA_DB").unwrap_or_else(|_| "hydra.db".to_string());
-        let data_dir_override = std::env::var("HYDRA_ARACHNE_DATA_DIR").ok();
-        hydra_server::cluster::arachne_node::ArachneControl::start_from_env(
-            &sqlite_path,
-            data_dir_override.as_deref(),
-        )
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> {
-            format!("arachne control plane refused to start: {e}").into()
-        })?
-    };
-    // Without the feature the control plane does not exist at all; the binding stays so the
-    // `leader_ready` merge below is written once rather than twice (the same shape the
-    // `invalidation_stream` / `fleet_live` fields use in `BootstrapComponents`).
-    #[cfg(not(feature = "arachne"))]
-    #[allow(unused_variables, clippy::no_effect_underscore_binding)]
-    let _arachne_control: Option<()> = None;
-    // Does the raft control plane carry the WRITER decision on this node? True only when a raft
-    // node was actually started (`HYDRA_CLUSTER_PEERS` set and the feature compiled in), because
-    // `ArachneControl::start_from_env` returns `None` on a standalone node.
-    //
-    // This is what the cluster-mode startup contract below is gated on — NOT the retired Redis
-    // control path, which no longer exists (the lease election, the snapshot-polling client and the
-    // standby materializer were all deleted, ADR-0001 T3/T4). The gate used to be named for that
-    // path, and the refusal it guards used to name a retired variable with it.
-    //
-    // Measured 2026-10-05 by `integration/test_arachne_control_plane.py`: before this gate existed,
-    // a raft member refused to boot at all (the product still demanded a variable that only the
-    // retired world read), so the acceptance gates could not be executed against the new model.
-    #[cfg(feature = "arachne")]
-    let arachne_carries_leadership = arachne_control
-        .as_ref()
-        .is_some_and(|c| c.config_store().is_some());
-    #[cfg(not(feature = "arachne"))]
-    let arachne_carries_leadership = false;
-
     info!(role = %role, "hydra gateway starting");
 
-    // Cluster-mode fail-closed startup contract:
-    // - `HYDRA_REDIS_URL` is the data-plane backbone — required whenever a node
-    //   participates in a cluster (ADR-0001 D-1: the control plane moved to
-    //   Arachne, Redis stayed for the hot path).
-    // - `HYDRA_CLUSTER_TOKEN` gates the internal endpoints. NOTE: no
-    //   `/api/v1/internal/*` route exists any more (they went with the snapshot
-    //   channel and the forwarded write, T3.5/T4.1), so the token is currently a
-    //   BOOT requirement with no consumer — kept, not silently dropped, because
-    //   removing it is a deployment change that needs its own decision.
-    // - the usage sink must be ClickHouse — per-node SQLite usage records are
-    //   meaningless across a cluster (each node would hold its own slice).
-    // - the `cluster-redis` cargo feature must be enabled for the shared data
-    //   plane (rate limits / breaker / auth L2 / invalidation bus).
-    // Read for `node_id` under `cluster-redis` (breaker votes and the invalidation watermark); a
-    // build without that feature never looks at it, which the attribute makes explicit rather than
-    // leaving a warning that invites someone to delete a value the cluster build needs.
-    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_variables))]
+    // Cluster data plane: `HYDRA_REDIS_URL` is the only cluster switch. Every
+    // node writes the shared relational database directly, so no control plane
+    // or leader is required. The config is read from `cluster` later for the
+    // node id (breaker votes / invalidation watermark) and the admin status.
     let cluster = hydra_server::cluster::ClusterConfig::from_env(role);
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_variables))]
     let redis_url = std::env::var("HYDRA_REDIS_URL")
         .ok()
         .filter(|u| !u.is_empty());
-    if role.is_cluster() && redis_url.is_none() {
-        // Names the member list, NOT the retired `HYDRA_ROLE`: an operator who follows a
-        // message that tells them to set a retired variable makes the deployment worse, and
-        // that variable is exactly what this build reports as IGNORED at boot. Pinned by
-        // `cluster::tests::no_operator_facing_message_names_a_retired_variable`.
-        return Err(
-            "cluster mode (HYDRA_CLUSTER_PEERS is set) requires HYDRA_REDIS_URL (the \
-                 data-plane backbone); refusing to start"
-                .into(),
-        );
-    }
-    // NO `HYDRA_CLUSTER_TOKEN` requirement any more (2026-10-05, user ruling). It gated the
-    // `/api/v1/internal/*` family, and BOTH of its members are retired — the config snapshot channel
-    // (T4.1) and the internal tenant-write family (T3.5, D-6). Requiring a secret for endpoints that
-    // do not exist made every deployment provision, rotate and leak-check a credential that guarded
-    // nothing. The name is now in `RETIRED_CLUSTER_ENV`, so a deployment that still sets it is TOLD
-    // rather than left believing it does something.
     if role.is_cluster()
         && std::env::var("HYDRA_ADMIN_TOKEN")
             .map(|t| t.is_empty())
             .unwrap_or(true)
     {
-        // Still required, but no longer because a standby relays with it (that layer is retired,
-        // T3.3): every node now serves its own admin API, so the token is what gates EACH node's
-        // admin surface. A cluster node without one would expose an unauthenticated admin API.
+        // Each node serves its own admin API, so the token is what gates EACH
+        // node's admin surface. A cluster node without one would expose an
+        // unauthenticated admin API.
         return Err(
             "cluster mode requires HYDRA_ADMIN_TOKEN (each node serves its own admin API); \
              refusing to start"
                 .into(),
         );
-    }
-    // Cluster mode IS the raft member list: without the control plane there is no writer to agree
-    // on, and the old answer (a Redis lease) has been deleted. Refused at startup rather than
-    // served as "no leader", which would accept writes on every node with no commit point.
-    if role.is_cluster() && !arachne_carries_leadership {
-        return Err(format!(
-            "HYDRA_CLUSTER_PEERS is set but this build has no control plane: rebuild with \
-             --features arachne (the member list is the cluster, and raft is what decides the \
-             writer). Refusing to start as a 'cluster' whose nodes each believe they are alone; \
-             got role={role}."
-        )
-        .into());
     }
     // Admin-token strength (design §13.3). Refuse to BOOT on a short token
     // rather than warn: the gate has no rate limit or lockout, and the admin
@@ -297,11 +210,6 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             .into());
         }
     }
-    // The old mode validations lived here: `HYDRA_ROLE=leader` needing the Redis backbone and a
-    // control URL, and `HYDRA_ROLE=edge` needing one too. All three are retired — there is no role
-    // variable (the member list decides), no control channel to point at, and no stateless role.
-    // What replaced them is the pair above: cluster mode requires the control plane, and it
-    // requires an admin token, because every node now serves its own admin API.
     // REQUIRED, with no default (ADR-0002 D-1): "where does the billing data go" is a decision, and
     // every value this product could guess is wrong for someone. The list of accepted values comes
     // from the registry, so this message cannot rot into naming a backend that no longer exists.
@@ -394,160 +302,17 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         }
     }
 
-    // (2c) Config store (initial snapshot). ONE path: every node loads its config from its own
-    // database (ADR-0001 D-2). The `match &pool` that used to be here had an edge arm that built a
-    // snapshot-fed store with no database at all — the role is retired, and with it the branch.
-    let store = ConfigStore::load(pool.clone(), key_provider.clone()).await?;
-    // (2c') Migration-0007 transition: backfill legacy path-based
-    // tenant certs into PEM content (best-effort; path fallback keeps
-    // serving on failure), so the DB becomes self-contained and the
-    // shared cert volume can be dropped in cluster deployments.
-    db::backfill_legacy_certs(&pool, key_provider.as_ref()).await;
-    info!("legacy cert backfill finished");
-    info!("config store loaded");
+    // (2c) Startup-only secret migration: the loader is READ-ONLY, so the
+    // pre-D-16 plaintext `limit_role.matching_key` rewrite happens here.
+    if let Err(e) = db::seal_legacy_limit_keys(&pool, key_provider.as_ref()).await {
+        warn!(error = %e, "legacy limit-key sealing failed; serving existing rows");
+    }
 
-    // (2c-arachne) The two halves of the Arachne control plane that touch the config store
-    // (ADR-0001, plan T3.2). Both are no-ops when the control plane did not start (single-node
-    // mode, i.e. no `HYDRA_CLUSTER_PEERS`), which is the same condition under which
-    // `arachne_control` is `None`.
-    //
-    // 1. PUBLISHER: a management write commits its config to the cluster instead of only to this
-    //    node's database. Attached here because this is the only place that knows whether a
-    //    control plane exists.
-    // 2. MATERIALIZER: every node follows `ctl/head`, so a write on ANY node reaches all of them.
-    //    Spawned here, and this is load-bearing — publishing without it would move the head that
-    //    nobody reads, and the cluster would silently diverge.
-    #[cfg(feature = "arachne")]
-    let store = match arachne_control.as_ref().and_then(|c| c.config_store()) {
-        Some(ctl_store) => {
-            use hydra_server::cluster::arachne_materializer::{Materializer, ReplicaTarget};
-            use hydra_server::cluster::arachne_publish::ConfigPublisher;
-
-            let publisher = Arc::new(ConfigPublisher::new(
-                ctl_store.clone(),
-                key_provider.clone(),
-            ));
-            let store = store.with_publisher(publisher);
-
-            // The config tree is content-addressed and append-only. Without GC
-            // every publish leaves its old toc/entities in Arachne forever; at
-            // 4k entities that produced 447–511 MB snapshots, and the 64 MB
-            // snapshot threshold made the leader build a half-gigabyte snapshot
-            // every few hundred writes. Snapshot creation blocks apply, so the
-            // leader lost quorum and flapped. Keep only the CURRENT tree, in
-            // bounded batches, on whichever node currently leads.
-            #[cfg(feature = "arachne")]
-            if let Some(ctl) = arachne_control.as_ref() {
-                let gc_store = store.clone();
-                let ctl = Arc::clone(ctl);
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(10));
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        tick.tick().await;
-                        if !ctl.is_leader() {
-                            continue;
-                        }
-                        match gc_store.gc(200).await {
-                            Ok(Some(stats)) if stats.deleted() > 0 => info!(
-                                toc_deleted = stats.toc_deleted,
-                                entities_deleted = stats.entities_deleted,
-                                remaining = stats.remaining(),
-                                "arachne config GC: removed old content-addressed versions"
-                            ),
-                            Err(e) => warn!(error = %e, "arachne config GC failed; will retry"),
-                            _ => {}
-                        }
-                    }
-                });
-            }
-
-            let target = Arc::new(ReplicaTarget::new(store.clone(), key_provider.clone()));
-            let mut materializer = Materializer::new(ctl_store, target, key_provider.clone());
-            tokio::spawn(async move {
-                // One head read per tick in the steady state, so the interval is what bounds
-                // propagation latency (the measured follower convergence is milliseconds;
-                // ADR-0001 §10 F-5). That read is `get_stale`, i.e. NOT monotone, and what the gate
-                // does with the value is an APPLY that replaces this node's database and snapshot —
-                // a known hazard with a measured shape; read `ArachneConfigStore::current_hash`'s
-                // comment before touching either side — the "obvious" fix (make that read
-                // linearizable) was tried and REJECTED by a clean idle-machine A/B: 4/5 acceptance
-                // failures against 0/5, because a node that needs a quorum to read the head can no
-                // longer learn about newer config while it is in a minority.
-                let mut tick = tokio::time::interval(Duration::from_secs(1));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    // `hydra_replica_materialize_retries_total` was registered with this loop in
-                    // mind and had NO caller until 2026-10-05 — while `ops.md` §13 told the operator
-                    // to watch `{outcome="failed"}` and ADR-0001 risk R7 offered it as the mitigation
-                    // for the N-fold materialization cost. A documented series nobody records is a
-                    // panel that can never move.
-                    let outcome = match materializer.converge().await {
-                        Ok(hydra_server::cluster::arachne_materializer::Converged::Applied {
-                            hash,
-                        }) => {
-                            info!(head = %hash, "config materialized from the control plane");
-                            // A real apply: the tree moved and this node now serves it.
-                            Some("succeeded")
-                        }
-                        // Nothing to do (the head already names what we serve) — NOT an
-                        // attempt, so it does not count. The steady state is one of these
-                        // per second and counting it would drown the signal.
-                        Ok(hydra_server::cluster::arachne_materializer::Converged::NoChange) => {
-                            None
-                        }
-                        // A previous failure is still inside its backoff window.
-                        Ok(_) => Some("throttled"),
-                        Err(e) => {
-                            // Not fatal: the node keeps serving its last-known-good config, and
-                            // an un-materialized node is not eligible to lead.
-                            warn!(error = %e, "config materialization did not complete; will retry");
-                            Some("failed")
-                        }
-                    };
-                    if let Some(o) = outcome {
-                        // `attempt` counts every pass that TRIED to materialize a new tree,
-                        // including the ones that succeeded or failed, so a rate on it answers
-                        // "how much work is this loop doing" separately from the outcome mix.
-                        if o != "throttled" {
-                            hydra_server::admin::metrics::record_replica_materialize_retry(
-                                "attempt",
-                            );
-                        }
-                        hydra_server::admin::metrics::record_replica_materialize_retry(o);
-                    }
-                }
-            });
-            info!("config materialization loop started (poll every 1s)");
-            store
-        }
-        None => store,
-    };
-
-    // (2c'') Resolved-cert store (design §12.1) + its single wiring: follow the
-    //        snapshot. It is created here, not in `run_server`, because the
-    //        control client (spawned below) can apply a snapshot — carrying new
-    //        tenant certs — before Pingora starts, and because the snapshot is
-    //        the only thing this consumer needs to observe. The previous design
-    //        re-resolved certs from two admin handler call sites only, so an
-    //        edge node never saw a cert pushed through the control plane until
-    //        it restarted (审核四 P3 / F-3).
-    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-    let cert_store: Option<Arc<hydra_server::tls::HydraCertStore>> = {
-        let cs = Arc::new(hydra_server::tls::HydraCertStore::new(None));
-        // The wiring itself lives in `tls::follow_snapshot` so the integration
-        // suite drives the production path instead of a copy of it.
-        hydra_server::tls::follow_snapshot(&store, &cs);
-        info!("tenant cert store wired to the config snapshot");
-        Some(cs)
-    };
-    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
-    let cert_store: Option<()> = None;
-
-    // (2c-redis) Cluster Redis backbone (P4): every cluster node (leader AND
-    // edge) shares one Redis for the lease, registry, invalidation bus,
-    // shared limits / breaker.
+    // (2c-redis) Cluster Redis backbone: build the pool BEFORE the config store
+    // is loaded. The pool does not depend on the store, and Phase 3b needs the
+    // notifier (which borrows this pool) injected before the watcher starts.
+    // A cluster node shares one Redis for the invalidation bus, shared limits
+    // and breaker votes; config authority is the shared database, not Redis.
     #[cfg(feature = "cluster-redis")]
     let redis_backend: Option<hydra_server::redis::RedisBackend> = if role.is_cluster() {
         Some(
@@ -566,9 +331,69 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[allow(unused_variables)]
     let redis_backend: Option<()> = None;
 
-    // (2c-registry) The node registry USED TO BE HERE: every cluster node registered and sent
-    // heartbeats into Redis, and edges followed the active leader through it. Retired (ADR-0001
-    // T4.1) — membership is the static member list, leadership is raft's, and no node polls a peer.
+    // (2c) Config store (initial snapshot). ONE path: every node loads its config from its own
+    // database (ADR-0001 D-2). The `match &pool` that used to be here had an edge arm that built a
+    // snapshot-fed store with no database at all — the role is retired, and with it the branch.
+    let store = ConfigStore::load(pool.clone(), key_provider.clone()).await?;
+    // (2c') Migration-0007 transition: backfill legacy path-based
+    // tenant certs into PEM content (best-effort; path fallback keeps
+    // serving on failure), so the DB becomes self-contained and the
+    // shared cert volume can be dropped in cluster deployments.
+    db::backfill_legacy_certs(&pool, key_provider.as_ref()).await;
+    // The backfill is a WRITE and bumps `config_revision` only when it actually
+    // rewrote a row; the store above was loaded before it. A non-forced reload
+    // observes that advance and is a no-op otherwise — forcing here would bump
+    // the shared revision on every process start for no config change, and in a
+    // cluster that would wake every peer's cache for nothing.
+    if let Err(e) = store.reload_all().await {
+        warn!(error = %e, "legacy cert backfill reload failed; serving the pre-backfill snapshot");
+    }
+    info!("legacy cert backfill finished");
+    info!("config store loaded");
+
+    // (2c-bus) Config fanout (Phase 3b). The notifier is injected and the
+    // watcher started only AFTER the initial load + cert-backfill reload, so a
+    // message that arrived during boot cannot roll the snapshot backwards. The
+    // watcher gets a clone; `store` is later moved into `AppState`.
+    //
+    // Single-node builds keep `store` exactly as loaded: no notifier, no
+    // subscriber, no poller (the `cluster-redis` cfg removes all of it).
+    #[cfg(feature = "cluster-redis")]
+    let mut store = store;
+    #[cfg(feature = "cluster-redis")]
+    if let Some(redis) = &redis_backend {
+        store = store.with_notifier(Arc::new(
+            hydra_server::cluster::config_bus::RedisConfigNotifier::new(
+                redis.pool().clone(),
+                cluster.node_id.clone(),
+            ),
+        ));
+        let subscriber = hydra_server::redis::build_subscriber(
+            redis_url
+                .as_deref()
+                .ok_or("HYDRA_REDIS_URL must be set in cluster mode")?,
+        )?;
+        let poll = hydra_server::cluster::config_bus::poll_interval_from_env();
+        hydra_server::cluster::config_bus::spawn_config_watch(store.clone(), subscriber, poll)
+            .await?;
+        info!(poll_ms = poll.as_millis(), "config bus watcher started");
+    }
+
+    // (2c'') Resolved-cert store (design §12.1) + its single wiring: follow the
+    //        snapshot. Created here because the snapshot is the only thing this
+    //        consumer needs to observe, and a config reload can carry new tenant
+    //        certs before Pingora starts.
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    let cert_store: Option<Arc<hydra_server::tls::HydraCertStore>> = {
+        let cs = Arc::new(hydra_server::tls::HydraCertStore::new(None));
+        // The wiring itself lives in `tls::follow_snapshot` so the integration
+        // suite drives the production path instead of a copy of it.
+        hydra_server::tls::follow_snapshot(&store, &cs);
+        info!("tenant cert store wired to the config snapshot");
+        Some(cs)
+    };
+    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+    let cert_store: Option<()> = None;
 
     // (2c) The external auth checker went with the auth-cache surface (T10 stage
     // B): client api-keys are decided only against the identity index on the
@@ -827,7 +652,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     //
     // `usage` is chosen once, from the configured sink kind, by a LIBRARY function
     // rather than a branch in this file: the choice is what stops a cluster node
-    // (which has a local SQLite file that the ClickHouse sink never writes to)
+    // (whose shared relational database the ClickHouse sink never writes usage to)
     // from answering a well-formed "zero usage".
     // The tenant API's live-node view.
     //
@@ -878,66 +703,11 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
             );
         }
     }
-    // The live-node view the admin service's fleet reporting uses. (The tenant
-    // API's own converge-and-confirm consumer of this view was retired with the
-    // external-auth surface.) It used to be
-    // refreshed from the registry's heartbeat table; with the registry retired (ADR-0001 T4.1) the
-    // honest membership is the CONFIGURED member list, which is what the convergence barrier can
-    // verify against (a peer that is down cannot answer, and the barrier's timeout is what
-    // expresses that).
-    #[cfg(all(feature = "cluster-redis", feature = "arachne"))]
-    let fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = arachne_control
-        .as_ref()
-        .and_then(|c| c.peers())
-        .map(|peers| {
-            let names: Vec<String> = peers
-                .order()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            Arc::new(move || names.clone()) as Arc<dyn Fn() -> Vec<String> + Send + Sync>
-        });
-    #[cfg(all(feature = "cluster-redis", not(feature = "arachne")))]
-    let fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>> = None;
-
-    // ...and the TENANT API needs the same view — which is what T4.1 dropped.
-    //
-    // Before the registry was deleted, ONE refresh task fed both: `tenant_api_cfg.live_nodes = view`
-    // and `fleet_live = view`. The replacement (the configured member list) was wired into the ADMIN
-    // state only, so `TenantApiConfig::live_nodes` stayed `None` and the tenant self-service
-    // `DELETE /tenant/{id}/api/v1/auth/cache` could never confirm anything: `fan_out_and_confirm` got
-    // an EMPTY live list, which reports `nodes_total: 0` and `pending` forever — with `lagging` empty
-    // too, so the tenant could not even see which member was behind. Measured 2026-10-05 by
-    // `integration/test_auth_cache_layers.py`, whose PREMISE leg requires the fleet report to say
-    // `applied` before its L2 legs mean anything.
-    //
-    // The ADMIN route was unaffected, which is why nothing else noticed: two entry points to the same
-    // barrier reported different things, and only the quieter one was broken.
-    #[cfg(all(feature = "cluster-redis", feature = "arachne"))]
-    if let Some(view) = fleet_live.clone() {
-        tenant_api_cfg.live_nodes = Some(view);
-    }
-
     // The reader came from the SAME `open` call as the writer: a backend either reads back what it
     // writes, or it declared why it cannot (`usage::ReaderContract`), and the registry refuses a
     // descriptor whose declaration and behaviour disagree. `None` here is the documented
     // `503 usage_store_unavailable` in the tenant handler, not an accident.
     let usage = usage_backend.query.clone();
-
-    #[cfg(feature = "arachne")]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = match &arachne_control {
-        Some(control) => {
-            let control = Arc::clone(control);
-            info!(
-                node_id = %control.node_id(),
-                "leadership is decided by the Arachne write probe (raft)"
-            );
-            Some(Arc::new(move || control.is_leader()) as Arc<dyn Fn() -> bool + Send + Sync>)
-        }
-        None => None,
-    };
-    #[cfg(not(feature = "arachne"))]
-    let leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> = None;
 
     let state = Arc::new(AppState {
         store: store.clone(),
@@ -960,80 +730,31 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     #[cfg(not(feature = "cluster-redis"))]
     let invalidation_stream: Option<()> = None;
 
-    // (2f') The edge polling client USED TO BE HERE (cluster P1): an `edge` node polled the
-    // leader's control endpoint for config snapshots. Retired with the role itself (ADR-0001 D-2:
-    // nodes are homogeneous, and each one materializes the config tree locally).
-
-    // The Redis control path USED TO BE HERE: the lease election, the standby sync (the
-    // snapshot-polling client plus its replica materializer) and the leader-lease gate they fed.
-    // All of it is retired (ADR-0001 T4.1). Leadership is the raft write probe, and the per-node
-    // materializer follows `ctl/head` — see the Arachne block below, which is now the ONLY source
-    // of `leader_ready`.
-    //
-    // A cluster build therefore has no leader notion at all without the `arachne` feature, which is
-    // refused at startup rather than served as "no leader": a cluster whose nodes never agree on a
-    // writer is worse than one that does not start.
-
-    // Arachne control plane (ADR-0001): when it is up, leadership comes from the WRITE PROBE
-    // and not from the Redis lease. The probe answers "can THIS node commit", which is the
-    // question `/healthz/leader` and the admin write path actually ask; the lease answered
-    // "does this node hold a key with a TTL", which was only ever a proxy for it. The Redis
-    // election above still runs when its feature is compiled in, because the data-plane
-    // subsystems (rate limit, breaker, L2 cache, invalidation) are still backed by Redis —
-    // retiring the lease itself is plan T4.1.
-    // The ONLY source of `leader_ready` now. When the control plane did not start — single-node
-    // mode, i.e. no `HYDRA_CLUSTER_PEERS` — there is deliberately no leader notion at all and
-    // `/healthz/leader` answers 404 rather than fabricating one (the documented single-node shape).
-
-    #[cfg(feature = "arachne")]
-    let (cluster_peers, node_id, leader_name) = match arachne_control.as_ref() {
-        Some(ctl) => {
-            let leader_ctl = Arc::clone(ctl);
-            (
-                ctl.peers().cloned().map(Arc::new),
-                ctl.node_id().to_string(),
-                Some(Arc::new(move || leader_ctl.leader_name())
-                    as Arc<dyn Fn() -> Option<String> + Send + Sync>),
-            )
-        }
-        None => (None, String::new(), None),
-    };
     Ok(BootstrapComponents {
         pool,
         store,
         breaker,
         key_provider,
         state,
-        leader_ready,
         cert_store,
-        #[cfg(feature = "arachne")]
-        cluster_peers,
-        #[cfg(feature = "arachne")]
-        node_id,
-        #[cfg(feature = "arachne")]
-        leader_name,
         #[cfg(feature = "cluster-redis")]
         invalidation_stream,
         #[cfg(not(feature = "cluster-redis"))]
         invalidation_stream,
-        #[cfg(feature = "cluster-redis")]
-        fleet_live,
-        #[cfg(feature = "cluster-redis")]
-        converge_timeout: tenant_api_cfg.converge_timeout,
+        cluster,
     })
 }
 
 /// The shared components built by [`bootstrap`] and consumed by [`run_server`].
 struct BootstrapComponents {
-    // `cluster` used to be carried here for the admin service's cluster token. That token is deleted
-    // (2026-10-05), and `ClusterConfig` is read inside `bootstrap` itself — so the field is gone
-    // rather than kept as dead weight that a reader would have to check.
-    pool: sqlx::SqlitePool,
+    pool: db::Pool,
     store: ConfigStore,
     breaker: Arc<CircuitBreaker>,
     key_provider: Arc<dyn crypto::KeyProvider>,
     state: Arc<AppState>,
-    leader_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// This node's role and identity (breaker votes, invalidation watermarks,
+    /// and the admin cluster-status payload).
+    cluster: hydra_server::cluster::ClusterConfig,
     /// Invalidation bus publisher (cluster P4): handed to the admin service so
     /// config invalidation broadcasts cluster-wide.
     #[cfg(feature = "cluster-redis")]
@@ -1041,21 +762,6 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     invalidation_stream: Option<()>,
-    /// The live-node view the tenant API uses, carried to `run_server` so the
-    /// admin service waits on the SAME fleet — a second view could disagree.
-    #[cfg(feature = "cluster-redis")]
-    fleet_live: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
-    /// The convergence budget, same value for both entry points.
-    #[cfg(feature = "cluster-redis")]
-    converge_timeout: std::time::Duration,
-    /// Arachne fleet view for `/api/v1/cluster/status`: the configured member
-    /// list, this node's id, and the raft leader cache (all `None`/empty off-cluster).
-    #[cfg(feature = "arachne")]
-    cluster_peers: Option<Arc<hydra_server::cluster::arachne_node::ClusterPeers>>,
-    #[cfg(feature = "arachne")]
-    node_id: String,
-    #[cfg(feature = "arachne")]
-    leader_name: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     /// Resolved multi-tenant cert store (design §12.1 single source). Built in
     /// `bootstrap` — not in `run_server` — because it registers itself as a
     /// follower of the config snapshot, and a snapshot can be applied (by the
@@ -1280,46 +986,23 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     let admin_addr =
         std::env::var("HYDRA_ADMIN_ADDR").unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_string());
 
-    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
-    let mut admin_state = AdminState::new(
+    let admin_state = AdminState::new(
         c.pool,
         c.store,
         c.breaker,
         c.key_provider.clone(),
         admin_token.clone(),
         admission.clone(),
-        // Leader gate (/healthz/leader + admin mutation forwarding, P2/P3).
-        // The forward target is resolved LIVE from the cluster registry (the
-        // actual lease holder) at forward time — never from HYDRA_CONTROL_URL,
-        // which for a primary leader candidate points at this node itself.
-        c.leader_ready,
-    );
+    )
+    .with_cluster_identity(c.cluster.node_id.clone(), c.cluster.role);
+    #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
+    let mut admin_state = admin_state;
     // Invalidation bus publisher (P4): admin config invalidations are
     // broadcast cluster-wide, not just applied locally.
     #[cfg(feature = "cluster-redis")]
     {
         admin_state.invalidation = c.invalidation_stream;
     }
-    // Arachne fleet view (/api/v1/cluster/status): the member list, this node's
-    // identity, and the raft leader cache are injected here. They used to stay at
-    // their `AdminState::new` defaults (`None`/empty), so a real 3-node raft
-    // cluster reported `cluster:false, mode:"single"` while serving traffic.
-    #[cfg(feature = "arachne")]
-    {
-        admin_state.cluster_peers = c.cluster_peers;
-        admin_state.node_id = c.node_id;
-        admin_state.leader_name = c.leader_name;
-    }
-    // The live-node view and convergence budget the admin service reports
-    // against, so it can answer fleet questions honestly (and so the two
-    // entry points cannot disagree about what "applied" means).
-    #[cfg(feature = "cluster-redis")]
-    let admin_state = match c.fleet_live {
-        Some(view) => admin_state.with_fleet(view, c.converge_timeout),
-        // No live-node view (not a cluster): the local clear is the whole
-        // answer and the report says `single_node`.
-        None => admin_state,
-    };
     let admin_state = Arc::new(admin_state);
     let admin_app = AdminService::new(admin_state);
     // Same reasoning as the plaintext probe above, and the failure shape is INVERTED

@@ -61,7 +61,7 @@ fn tenant_full(id: &str, domain: &str) -> Tenant {
 /// Seed a coherent graph used by several loader tests: 2 providers (one with
 /// weight 0 soft-disabled), an offline model, keys, a tenant with provider +
 /// model grants.
-async fn seed(pool: &sqlx::SqlitePool) {
+async fn seed(pool: &hydra_server::db::Pool) {
     repo::insert_provider(pool, &provider("p1", "openai", 3))
         .await
         .expect("p1");

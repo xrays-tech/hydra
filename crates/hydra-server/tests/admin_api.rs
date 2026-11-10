@@ -2,7 +2,7 @@
 //!
 //! Exercises the REAL `AdminService` (a Pingora `ServeHttp` app) via real HTTP
 //! requests from `reqwest` against a real Pingora `Service` bound to
-//! `127.0.0.1:0`, backed by a real `:memory:` SQLite. No internal logic is
+//! `127.0.0.1:0`, backed by a real database. No internal logic is
 //! mocked (dev-plan §1 铁律 2): `db::repo`, `ConfigStore` and
 //! `CircuitBreaker` are the production types.
 
@@ -63,7 +63,6 @@ async fn admin_state_with(auth_fail_per_min: u32) -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
     );
     state.auth_fail_per_min = auth_fail_per_min;
     Arc::new(state)
@@ -1575,13 +1574,36 @@ async fn a_failed_secret_write_rolls_back_the_whole_tenant() {
 
     // Fault injection: any attempt to store certificate content aborts. The
     // tenant INSERT is in the same transaction, so it must be undone with it.
-    sqlx::query(
-        "CREATE TRIGGER block_cert BEFORE UPDATE OF cert_pem ON tenant \
-         BEGIN SELECT RAISE(ABORT, 'oracle: certificate write blocked'); END",
-    )
-    .execute(state.db())
-    .await
-    .expect("install trigger");
+    // The trigger is backend-specific: PostgreSQL needs a plpgsql function,
+    // MySQL signals with a single-statement trigger body.
+    #[cfg(feature = "db-postgres")]
+    {
+        sqlx::raw_sql(
+            "CREATE FUNCTION hydra_block_cert_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'oracle: certificate write blocked'; END $$",
+        )
+        .execute(state.db())
+        .await
+        .expect("install Postgres trigger function");
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_cert BEFORE UPDATE OF cert_pem ON tenant \
+             FOR EACH ROW EXECUTE FUNCTION hydra_block_cert_write()",
+        )
+        .execute(state.db())
+        .await
+        .expect("install Postgres trigger");
+    }
+    #[cfg(feature = "db-mysql")]
+    {
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_cert BEFORE UPDATE ON tenant FOR EACH ROW \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = \
+             'oracle: certificate write blocked'",
+        )
+        .execute(state.db())
+        .await
+        .expect("install MySQL trigger");
+    }
 
     let body = serde_json::json!({
         "id": "t-atomic",
@@ -1632,6 +1654,25 @@ async fn a_failed_secret_write_rolls_back_the_whole_tenant() {
             .all(|tok| tok.tenant_id != "t-atomic"),
         "no tenant access token may survive a rolled-back tenant write"
     );
+
+    #[cfg(feature = "db-postgres")]
+    {
+        sqlx::raw_sql("DROP TRIGGER IF EXISTS block_cert ON tenant")
+            .execute(state.db())
+            .await
+            .expect("drop Postgres trigger");
+        sqlx::raw_sql("DROP FUNCTION IF EXISTS hydra_block_cert_write()")
+            .execute(state.db())
+            .await
+            .expect("drop Postgres trigger function");
+    }
+    #[cfg(feature = "db-mysql")]
+    {
+        sqlx::raw_sql("DROP TRIGGER IF EXISTS block_cert")
+            .execute(state.db())
+            .await
+            .expect("drop MySQL trigger");
+    }
 }
 
 /// T9.3 — a write that COMMITS but whose post-write reload fails is reported as
@@ -1864,7 +1905,6 @@ async fn concurrency_snapshot_reports_live_gates() {
         key_provider,
         Some(TOKEN.to_string()),
         admission,
-        None, // no leader election in tests
     ));
     let port = start_admin(state);
 
@@ -2323,7 +2363,6 @@ async fn tenant_model_catalog_orphan_provider_row_dropped() {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
     ));
     let port = start_admin(state);
 
@@ -2874,6 +2913,7 @@ async fn user_hierarchy_reads_http() {
     let key_hash = hydra_core::auth::sha256_hex_string(plaintext.as_bytes());
     repo::insert_user_api_key(
         pool,
+        "t1",
         &UserApiKey {
             id: "k1".into(),
             user_id: "u1".into(),

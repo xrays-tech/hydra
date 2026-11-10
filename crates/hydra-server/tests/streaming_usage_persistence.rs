@@ -1,4 +1,4 @@
-//! Streaming SSE usage → SQLite persistence end-to-end tests.
+//! Streaming SSE usage persistence end-to-end tests.
 //!
 //! Proves that streaming SSE responses through the real Pingora proxy have
 //! their usage tokens correctly extracted (by `UsageScanner`) and persisted
@@ -7,10 +7,10 @@
 //!
 //! Both format paths are covered:
 //! - **OpenAI streaming** (`/v1/chat/completions`): SSE with `usage` in the
-//!   final chunk → prompt=10, completion=5, total=15 in SQLite.
+//!   final chunk → prompt=10, completion=5, total=15 in the usage store.
 //! - **Anthropic coalesced streaming** (`/v1/messages`): `message_start` +
 //!   `message_delta` in ONE mock body (the BUG-1 scenario) → prompt=42,
-//!   completion=13, cached=7, total=55 in SQLite.
+//!   completion=13, cached=7, total=55 in the usage store.
 //!
 //! Deterministic observation strategy: a recording sink so each
 //! record flushes immediately when the background task polls the channel,
@@ -48,7 +48,7 @@ const NOW: &str = "2026-01-01 00:00:00";
 
 /// Seed one tenant + one provider + one model (`model_key`) + one key. The
 /// provider endpoint is pointed at `upstream_endpoint`.
-async fn seed_routed(pool: &sqlx::SqlitePool, upstream_endpoint: &str, model_key: &str) {
+async fn seed_routed(pool: &hydra_server::db::Pool, upstream_endpoint: &str, model_key: &str) {
     repo::insert_provider(
         pool,
         &Provider {
@@ -215,8 +215,8 @@ struct UsageRow {
 
 /// A sink that KEEPS the records the proxy hands it.
 ///
-/// This test used to write through a real `SqliteSink` and poll the `usage_record` table. That
-/// store is retired (ADR-0002 D-3), and the property under test is "the streaming path produces a
+/// This test used to write through a real local SQL sink and poll the retired
+/// `usage_record` table. That store is gone (ADR-0002 D-3), and the property under test is "the streaming path produces a
 /// usage record with the tokens the upstream reported" — a claim about the proxy's logging path,
 /// for which the sink is the instrument, not the subject. The sink still goes through the shared
 /// batching engine (`run_channel_sink`), so a record that never reaches the backend would still
@@ -262,7 +262,7 @@ impl UsageSink for RecordingSink {
 
 /// Build the full AppState from a seeded pool, with the recording sink as the usage store.
 async fn build_state_with_recording_sink(
-    pool: sqlx::SqlitePool,
+    pool: hydra_server::db::Pool,
 ) -> (std::sync::Arc<AppState>, RecordingSink) {
     let key_provider: std::sync::Arc<dyn KeyProvider> =
         std::sync::Arc::new(StaticKeyProvider::new([1u8; 32], 1));
@@ -288,12 +288,12 @@ async fn build_state_with_recording_sink(
 // Tests
 // ===========================================================================
 
-/// **OpenAI streaming SSE → SQLite**: a streaming `/v1/chat/completions`
+/// **OpenAI streaming SSE → usage sink**: a streaming `/v1/chat/completions`
 /// request through the real Pingora proxy against a mock upstream returning
 /// OpenAI SSE (content deltas + final `usage` chunk + `[DONE]`). The extracted
-/// tokens must be persisted to `usage_record` with the correct values.
+/// tokens must be persisted with the correct values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn openai_streaming_usage_persists_to_sqlite() {
+async fn openai_streaming_usage_persists_to_the_sink() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
@@ -344,14 +344,14 @@ async fn openai_streaming_usage_persists_to_sqlite() {
     assert_eq!(row.cached, None, "no cache-hit field in this usage");
 }
 
-/// **Anthropic coalesced streaming SSE → SQLite**: a streaming `/v1/messages`
+/// **Anthropic coalesced streaming SSE → usage sink**: a streaming `/v1/messages`
 /// request where the mock upstream returns `message_start` (input_tokens:42,
 /// output_tokens:1) and `message_delta` (output_tokens:13,
 /// cache_read_input_tokens:7) in a SINGLE HTTP body (the BUG-1 coalesced-chunk
 /// scenario). Both usage objects must be parsed and persisted with correct
 /// last-wins values: tokens_in=42, tokens_out=13, cache_hit_tokens=7.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
+async fn anthropic_coalesced_streaming_usage_persists_to_the_sink() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(

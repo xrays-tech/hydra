@@ -70,6 +70,7 @@ const UNVERIFIED_OK = records(process.env.CTEC_UNVERIFIED_OK, [
   ["invalid_since", "emitted by `BoundError::code()` (`tenant_api/time_bound.rs:51`); the 400 lives at the call site in `tenant_api/handlers.rs:467`, and following `.code()` across files once attributed a DIFFERENT enum's status"],
   ["invalid_until", "same shape as `invalid_since` (`time_bound.rs:52` + `handlers.rs:467`)"],
   ["window_too_large", "same shape as `invalid_since` (`time_bound.rs:53` + `handlers.rs:467`)"],
+  ["config_not_published", "RETIRED by the shared-DB rewrite: the Arachne publish-failure 503 path was removed (admin and tenant handlers now commit to the DB and reload best-effort); the docs table still names it until the Phase 4 cleanup"],
 ]);
 
 /** code -> documented HTTP status, from the §6 table. */

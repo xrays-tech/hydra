@@ -76,6 +76,18 @@ const BUILTIN_ABSENT_ON_PURPOSE = [
   ['hydra_registry_nodes', 'retired with the node registry (ADR-0001 T4.1); ops.md §9.1 marks its alert row RETIRED'],
   ['hydra_registry_reaped_total', 'retired with the node registry reaper (ADR-0001 T4.1); ops.md §9.1 marks its alert row RETIRED'],
   ['hydra_control_snapshot_version', 'retired with the polling control client (ADR-0001 T4.1); nothing recorded it, so it read 0 forever — ops.md §9.1 marks its alert row RETIRED'],
+  // The raft/Arachne control-plane and replica-materializer series were deleted by the shared-DB
+  // rewrite. The operator docs still name them until the Phase 4 docs cleanup, so each exact name
+  // is recorded here rather than silently entrenching a dead dashboard panel.
+  ['hydra_arachne_this_node_leader', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_leader_flips_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_publish_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_publish_readback_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_watch_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_watch_cache_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_config_bytes', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_arachne_quorum_unavailable_total', 'retired with the raft/Arachne control plane (shared-DB architecture); docs cleanup is Phase 4'],
+  ['hydra_replica_materialize_retries_total', 'retired with the Arachne replica materializer (shared-DB architecture); docs cleanup is Phase 4'],
 ];
 
 /**

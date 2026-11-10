@@ -41,6 +41,8 @@ const {
   hasOwnKey,
   healthcheckDisabled,
   healthcheckTest,
+  serviceBlocks,
+  scalarOwn,
   unjudgeableServices,
 } = require('./compose_static.cjs');
 
@@ -52,6 +54,10 @@ const COMPOSE_FILES = [
 ];
 const MIN_SERVICES = Number(process.env.COMPOSE_HEALTH_MIN_SERVICES || 4);
 const IMAGE_RE = /(^|\/)hydra(-local)?:/;
+// The relational config database(s) are part of the shipped topology now: a node that
+// `depends_on: condition: service_healthy` needs the database to actually PROBE something.
+const DB_SERVICE_NAMES = new Set(['postgres', 'mysql']);
+const DB_IMAGE_RE = /(^|\/)(postgres|mysql)(:|\/)/;
 const DUMMY_ENV = {
   HYDRA_ADMIN_TOKEN: 'dummy-admin-token-for-validation',
   HYDRA_CLUSTER_TOKEN: 'dummy-cluster-token-for-validation',
@@ -110,7 +116,21 @@ function evaluateService({ label, name, hasHealthcheck, test }) {
     if (!adminHealth) probs.push('every hydra node runs the admin API — probe /api/v1/health');
     if (!hasAuth) probs.push('/api/v1/health answers 401 without the admin token — the probe needs Authorization: Bearer $HYDRA_ADMIN_TOKEN');
   }
-  return { label, name, test: test.slice(0, 120), probs };
+  return { label, name, kind: 'hydra', test: test.slice(0, 120), probs };
+}
+
+/** A relational database service: it needs a readiness probe (`pg_isready` / `mysqladmin ping`). */
+function evaluateDbService({ label, name, hasHealthcheck, test }) {
+  const probs = [];
+  if (!hasHealthcheck) {
+    probs.push('no healthcheck (hydra waits for the DB on `condition: service_healthy`, which without a probe is only the container start)');
+  }
+  return { label, name, kind: 'db', test: (test || '').slice(0, 120), probs };
+}
+
+/** The database services in a rendered/static service map, by name or image. */
+function isDbService(name, image) {
+  return DB_SERVICE_NAMES.has(name) || DB_IMAGE_RE.test(String(image || ''));
 }
 
 /**
@@ -150,8 +170,7 @@ function staticHealthCheck(label, file) {
   // cluster file): without them the role of a service that MERGES its environment read as null and
   // was silently replaced by `'all'` below — a merged `edge` would then be told to probe the admin
   // API it does not have. Unresolvable merges are refused by `unjudgeableServices` above.
-  const anchors = collectAnchors(text);
-  return services.map(({ name, block }) => evaluateService({
+  const hydra = services.map(({ name, block }) => evaluateService({
     label: `${label} (static)`,
     name,
     // The probe command comes from this service's OWN `healthcheck:` (a nested decoy appearing
@@ -161,6 +180,18 @@ function staticHealthCheck(label, file) {
     hasHealthcheck: hasOwnKey(block, 'healthcheck') && !healthcheckDisabled(block),
     test: healthcheckTest(block) || '',
   }));
+  const dbs = [];
+  for (const [name, block] of serviceBlocks(text)) {
+    const image = scalarOwn(block, 'image');
+    if (!isDbService(name, image)) continue;
+    dbs.push(evaluateDbService({
+      label: `${label} (static)`,
+      name,
+      hasHealthcheck: hasOwnKey(block, 'healthcheck') && !healthcheckDisabled(block),
+      test: healthcheckTest(block) || '',
+    }));
+  }
+  return [...hydra, ...dbs];
 }
 
 /**
@@ -229,7 +260,14 @@ function main(argv) {
       continue;
     }
     for (const [name, svc] of Object.entries(src.doc.services || {})) {
-      if (!IMAGE_RE.test(String(svc.image || ''))) {
+      const image = String(svc.image || '');
+      if (isDbService(name, image)) {
+        const hc = svc.healthcheck;
+        const test = hc && Array.isArray(hc.test) ? hc.test.join(' ') : (hc ? String(hc.test) : '');
+        results.push(evaluateDbService({ label: src.label, name, hasHealthcheck: Boolean(hc && hc.test), test }));
+        continue;
+      }
+      if (!IMAGE_RE.test(image)) {
         // A service NAMED like a hydra node whose image does not match the filter used to be skipped
         // silently (round 185): its role/healthcheck were never checked while the OK line counted
         // "N hydra service(s) checked" as if they had been. The filter must not eat a service by NAME.
@@ -251,17 +289,19 @@ function main(argv) {
     }
   }
 
-  if (results.length < MIN_SERVICES) {
-    throw new ScanError(`only ${results.length} hydra-image service(s) found (< floor ${MIN_SERVICES}); the compose files may have changed shape`);
+  const hydraCount = results.filter((r) => r.kind === 'hydra').length;
+  const dbCount = results.filter((r) => r.kind === 'db').length;
+  if (hydraCount < MIN_SERVICES) {
+    throw new ScanError(`only ${hydraCount} hydra-image service(s) found (< floor ${MIN_SERVICES}); the compose files may have changed shape`);
   }
   const bad = results.filter((r) => r.probs.length > 0);
   if (bad.length === 0) {
-    console.log(`[compose-health] ${results.length} hydra service(s) checked: OK`);
+    console.log(`[compose-health] ${hydraCount} hydra service(s) + ${dbCount} database service(s) checked: OK`);
     for (const r of results) console.log(`[compose-health]   OK ${r.label} · ${r.name}`);
     for (const s of skipped) console.log(`[compose-health]   SKIP ${s}`);
     return 0;
   }
-  console.error(`[compose-health] FAIL: ${bad.length} of ${results.length} hydra service(s)`);
+  console.error(`[compose-health] FAIL: ${bad.length} of ${results.length} service(s) (${hydraCount} hydra, ${dbCount} database)`);
   for (const r of bad) console.error(`[compose-health]   ${r.label} · ${r.name}: ${r.probs.join('; ')}`);
   return 1;
 }

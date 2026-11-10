@@ -10,8 +10,8 @@
 # 116/116, which is exactly the point: that should be a fact CI checks, not a
 # thing we find out years later.
 #
-# Same shape as `scripts/e2e-local.sh`: scratch SQLite under `.acceptance/`
-# (gitignored), scratch ports, everything torn down on exit.
+# Same shape as `scripts/e2e-local.sh`: a disposable real PostgreSQL/MySQL schema
+# (HYDRA_TEST_DATABASE_URL), scratch ports, everything torn down on exit.
 #
 # Usage:
 #   integration/run-crud-local.sh
@@ -27,6 +27,17 @@ ADMIN_PORT="${HYDRA_IT_ADMIN_PORT:-18081}"
 DATA_PORT="${HYDRA_IT_DATA_PORT:-18080}"
 TOKEN="${HYDRA_IT_TOKEN:-hydra-it-token-2026}"
 BASE_URL="http://127.0.0.1:${ADMIN_PORT}"
+
+# The database backend is compile-time selected. Derive it from the test URL so this script
+# works for both PG and MySQL; a build with neither backend is a deliberate compile error.
+case "${HYDRA_TEST_DATABASE_URL:-}" in
+  postgres://*|postgresql://*) DB_FEATURE=db-postgres ;;
+  mysql://*|mariadb://*)        DB_FEATURE=db-mysql ;;
+  *)
+    echo "it-crud: set HYDRA_TEST_DATABASE_URL to a real PostgreSQL or MySQL base URL" >&2
+    echo "         e.g. postgres://hydra:hydra@127.0.0.1:55432/hydra" >&2
+    exit 2 ;;
+esac
 
 # The server fail-closes on a token shorter than 16 chars (main.rs).
 if [ "${#TOKEN}" -lt 16 ]; then
@@ -44,15 +55,15 @@ if [ "$needs_build" = 0 ]; then
 fi
 if [ "$needs_build" = 1 ]; then
   echo "==> building target/debug/hydra"
-  cargo build -p hydra-server --features server --bin hydra >/dev/null
+  cargo build -p hydra-server --features "server,$DB_FEATURE" --bin hydra >/dev/null
 fi
 
 rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
 
-# The DB URL is a URL, not a path — the same stripping the ops runbook documents
-# (§5, key rotation) is used here, so that snippet is exercised too.
-DB_URL="sqlite://$ROOT/$SCRATCH/it.db?mode=rwc"
-DB_PATH="${DB_URL#sqlite://}"; DB_PATH="${DB_PATH%%\?*}"
+# A disposable real schema/database owned by the integration helper. The URL is
+# printed as `name<TAB>url`; the name is what cleanup drops.
+IFS=$'\t' read -r DB_NAME DB_URL < <(python3 integration/_shared_db.py create it-crud)
+[ -n "${DB_URL:-}" ] || { echo "it-crud: could not provision a disposable database" >&2; exit 2; }
 
 # `HYDRA_USAGE_SINK=none` (required since ADR-0002 D-1: there is NO default) is hard-set rather
 # than overridable, and it sits INSIDE the assignment chain — a `#` comment between two
@@ -71,6 +82,7 @@ PID=$!
 cleanup() {
   kill "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
+  python3 integration/_shared_db.py drop "$DB_NAME" >/dev/null 2>&1 || true
   [ "${KEEP:-0}" = 1 ] || rm -rf "$SCRATCH"
 }
 trap cleanup EXIT INT TERM
@@ -88,30 +100,8 @@ HYDRA_BASE_URL="$BASE_URL" HYDRA_ADMIN_TOKEN="$TOKEN" python3 integration/test_c
 crud_rc=$?
 [ "$crud_rc" = 0 ] || exit "$crud_rc"
 
-# ── the DOCUMENTED backup procedure (ops.md §1.4), on the SAME live database ──
-# A WAL database cannot be backed up with `cp` (recent commits live in `-wal`), so
-# the runbook tells operators to use `VACUUM INTO`. That advice is only trustworthy
-# if something runs it: this takes a snapshot of the running instance's DB and
-# asserts the snapshot contains every row the live DB has.
-echo "==> python3 - (ops.md §1.4 backup: VACUUM INTO a LIVE database)"
-HYDRA_IT_DB_PATH="$DB_PATH" HYDRA_IT_SNAP="$SCRATCH/backup.db" python3 - <<'PYBK'
-import os, sqlite3
-live = os.environ["HYDRA_IT_DB_PATH"]; snap = os.environ["HYDRA_IT_SNAP"]
-con = sqlite3.connect(live)
-con.execute("VACUUM INTO ?", (snap,))
-con.close()
-tables = ("provider", "provider_key", "tenant", "tenant_provider", "tenant_model")
-def counts(path):
-    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    return {t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
-live_c, snap_c = counts(live), counts(snap)
-print(f"[it-crud] backup snapshot {snap_c} vs live {live_c}")
-assert sum(snap_c.values()) > 0, "the snapshot is empty — did the backup procedure break?"
-assert snap_c == live_c, f"the snapshot lost rows: {snap_c} != {live_c}"
-print("[it-crud] backup snapshot is complete (every table matches the live DB)")
-PYBK
-bak_rc=$?
-[ "$bak_rc" = 0 ] || { echo "it-crud: the documented backup procedure failed (see above)" >&2; exit 1; }
+# The SQLite `VACUUM INTO` backup assertion that used to live here was retired with SQLite.
+# The backup/restore runbook is rewritten against PostgreSQL/MySQL in the Phase 4b docs pass.
 
 # ── the ERROR CONTRACT, on the same disposable instance ────────────────────
 # `admin-ui/app.js` grew HTML/empty-body handling for error responses, which means

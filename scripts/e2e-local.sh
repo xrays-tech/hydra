@@ -10,7 +10,7 @@
 # first time the suite was ever executed locally it failed immediately.
 #
 # So: no user data, no port clashes, nothing left behind.
-#   * a scratch SQLite file under `.acceptance/` (gitignored) and scratch ports
+#   * a disposable PostgreSQL/MySQL schema (HYDRA_TEST_DATABASE_URL) and scratch ports
 #     (18080/18081 by default, override with E2E_DATA_PORT / E2E_ADMIN_PORT), so a
 #     running `hydra-a/b/c` dev stack is untouched;
 #   * the JS runner is installed into `.acceptance/tmp-pw` (gitignored) and reused;
@@ -75,6 +75,13 @@ die() { echo "e2e-local: $*" >&2; exit 1; }
 command -v jq >/dev/null || die "jq is required by tests/e2e/seed.sh"
 command -v curl >/dev/null || die "curl is required"
 
+# The database backend is compile-time selected; derive it from the test URL.
+case "${HYDRA_TEST_DATABASE_URL:-}" in
+  postgres://*|postgresql://*) DB_FEATURE=db-postgres ;;
+  mysql://*|mariadb://*)        DB_FEATURE=db-mysql ;;
+  *) die "set HYDRA_TEST_DATABASE_URL to a real PostgreSQL or MySQL base URL" ;;
+esac
+
 # 1. Runner. `E2E_PLAYWRIGHT_BIN` = the caller installed it (CI: pinned 1.55.0 + Chromium by
 #    `npx playwright install --with-deps chromium`); otherwise install the version/browser pair below
 #    into the ignored scratch dir and reuse it.
@@ -133,12 +140,14 @@ else
   fi
   if [ "$needs_build" = 1 ]; then
     echo "==> building $BIN"
-    cargo build -p hydra-server --features server --bin hydra >/dev/null || die "cargo build failed"
+    cargo build -p hydra-server --features "server,$DB_FEATURE" --bin hydra >/dev/null || die "cargo build failed"
   fi
 fi
 
-# 3. Scratch state.
+# 3. Scratch state + a disposable real database.
 rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
+IFS=$'\t' read -r DB_NAME DB_URL < <(python3 integration/_shared_db.py create e2e-local)
+[ -n "${DB_URL:-}" ] || die "could not provision a disposable database"
 
 # 4. Disposable instance.
 echo "==> playwright ${PW_VERSION} (matches the CI pin: ${MATCHES_CI}); browsers: ${PLAYWRIGHT_BROWSERS_PATH:-~/.cache/ms-playwright}"
@@ -152,7 +161,7 @@ echo "==> starting hydra on ${ADMIN_URL} (data plane 127.0.0.1:${DATA_PORT})"
 HYDRA_ADMIN_TOKEN="$TOKEN" \
 HYDRA_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
 HYDRA_LISTEN="127.0.0.1:${DATA_PORT}" \
-HYDRA_DB_URL="sqlite://$ROOT/$SCRATCH/e2e.db?mode=rwc" \
+HYDRA_DB_URL="$DB_URL" \
 HYDRA_USAGE_SINK=none \
 HYDRA_ENCRYPTION_KEY="${HYDRA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}" \
 RUST_LOG="${RUST_LOG:-warn}" \
@@ -161,6 +170,7 @@ HYDRA_PID=$!
 cleanup() {
   kill "$HYDRA_PID" 2>/dev/null || true
   wait "$HYDRA_PID" 2>/dev/null || true
+  python3 integration/_shared_db.py drop "$DB_NAME" >/dev/null 2>&1 || true
   [ "${KEEP:-0}" = 1 ] || rm -rf "$SCRATCH"
 }
 trap cleanup EXIT INT TERM

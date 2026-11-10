@@ -397,9 +397,10 @@ test('the real repository tree passes (the table names exactly the cluster topol
   assert.ok(decl, 'CLUSTER_ONLY_ENV declaration not found');
   const declared = [...decl[2].matchAll(/"([A-Z0-9_]+)"/g)].map((m) => m[1]);
   assert.match(res.stdout, new RegExp(`${declared.length} cluster-only name\\(s\\)`));
-  assert.match(res.stdout, /HYDRA_CLUSTER_PEERS/);
-  assert.match(res.stdout, /HYDRA_CLUSTER_ID/);
-  assert.match(res.stdout, /HYDRA_ARACHNE_LISTEN/);
+  assert.match(res.stdout, /HYDRA_REDIS_URL/);
+  assert.match(res.stdout, /HYDRA_REDIS_MODE/);
+  assert.match(res.stdout, /HYDRA_NODE_ID/);
+  assert.match(res.stdout, /HYDRA_BREAKER_QUORUM/);
 });
 
 test('the shipped table still matches the Rust test that pins it', () => {

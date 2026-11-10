@@ -130,7 +130,7 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
 ///
 /// `pub(super)` because the tenant-config write core answers through it too: this
 /// mapping must have exactly one owner, and a hand-copied twin had already drifted
-/// (it lost the SQLITE_BUSY → 503 `storage_busy` branch).
+/// (it lost the lock-contention → 503 `storage_busy` branch).
 pub(crate) fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
     if let sqlx::Error::Database(db) = e {
         if db.is_unique_violation() {
@@ -145,15 +145,13 @@ pub(crate) fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
         if matches!(db.kind(), sqlx::error::ErrorKind::NotNullViolation) {
             return (400, "missing_required_field");
         }
-        // SQLite lock contention (SQLITE_BUSY = 5, SQLITE_BUSY_SNAPSHOT = 517):
-        // the writer could not get or keep the write lock inside `busy_timeout`.
-        // This is TRANSIENT — the same request usually succeeds immediately — so
+        // Serialization/lock contention (PostgreSQL 40001/40P01, MySQL
+        // 1213/1205): the transaction lost a race and may be retried. This is
+        // TRANSIENT — the same request usually succeeds immediately — so
         // reporting it as 500 (an internal error) told clients "there is a bug"
         // and made them retry at human speed, when what they need is a short
-        // backoff. All write transactions now take the lock up front via
-        // `db::begin_write`, so this path is the residual case (a lock held past
-        // the timeout by a long transaction).
-        if matches!(db.code().as_deref(), Some("5") | Some("517")) {
+        // backoff. Every write takes the shared lock via `db::begin_write`.
+        if crate::db::is_retryable(e) {
             return (503, "storage_busy");
         }
     }
@@ -179,7 +177,7 @@ fn is_not_found(e: &sqlx::Error) -> bool {
 /// The validation warnings that belong to ONE limit role, for the write response (decision D-17).
 ///
 /// The warnings were already produced at write time — `reload_all` validates and logs them — but a
-/// scripted operator sees only `201` and has to go read the leader's log to learn that, say, the role
+/// scripted operator sees only `201` and has to go read the node's log to learn that, say, the role
 /// it just created can never match. `ValidationIssue::subject` makes them filterable; issues with no
 /// subject are about the configuration as a whole and are deliberately NOT returned here (returning
 /// them would make every write look noisy and train operators to ignore the field).
@@ -225,64 +223,40 @@ fn limit_role_body(state: &AdminState, role: &LimitRole) -> serde_json::Value {
     body
 }
 
-async fn reload_best_effort(state: &AdminState, trace_id: &str) -> Option<Resp> {
-    let _guard = state.reload_lock.lock().await;
-    if let Err(e) = state.store.reload_all().await {
-        // ADR-0001 D-9/T3.2: the local commit succeeded but the config did NOT reach the cluster
-        // (Arachne refused to encode or the head could not be committed). This is NOT the
-        // best-effort case below — the response has to say "local only" or an operator will
-        // believe a change is fleet-wide when exactly one node has it.
-        if let crate::store::StoreError::NotPublished { reason } = &e {
-            tracing::error!(
-                target: "hydra::admin",
-                trace_id, %reason,
-                "post-write PUBLISH FAILED: the local SQLite transaction committed and this node \
-                 serves the new config, but the cluster does not have it"
-            );
-            note_reload_outcome(state, false);
-            return Some(err_json(
-                503,
-                "config_not_published",
-                &format!(
-                    "the change was committed to this node's database but could NOT be published \
-                     to the cluster, so no other node will see it: {reason}"
-                ),
-                trace_id,
-            ));
-        }
+/// Reload after a committed admin write.
+///
+/// `write_guard` is the store reload guard the router already holds for the
+/// mutation; when present the call goes through
+/// [`crate::store::ConfigStore::reload_all_locked`] and never re-takes the lock.
+/// The `None` fallback exists so a direct/test caller that is not inside the
+/// router still reloads safely through the public entry point (which locks
+/// internally).
+///
+/// The store owns the stale flag and the `hydra_config_snapshot_stale` gauge, so
+/// this function only logs the failure. The write response still reports
+/// success: the DB transaction committed, and a later reload recovers the
+/// snapshot.
+async fn reload_best_effort(
+    state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
+    trace_id: &str,
+) -> Option<Resp> {
+    let result = match write_guard {
+        Some(guard) => state.store.reload_all_locked(false, guard).await,
+        None => state.store.reload_all().await,
+    };
+    if let Err(e) = result {
         // ERROR, not WARN (audit §3.14): the write was committed, but the
-        // runtime is now permanently serving the PREVIOUS snapshot — every later
-        // write (key rotation, revocation, tenant disable) will also fail to
-        // take effect. That must be impossible to miss in logs and alertable
-        // from /metrics.
+        // runtime is now serving the PREVIOUS snapshot — every later write (key
+        // rotation, revocation, tenant disable) will also fail to take effect.
+        // That must be impossible to miss in logs and alertable from /metrics.
         tracing::error!(
             target: "hydra::admin",
             trace_id, error = %e,
             "post-write reload_all FAILED: the in-memory config snapshot is now STALE              (design §5.3 keeps the old snapshot; admin writes will keep returning              2xx while having no runtime effect until a reload succeeds)"
         );
-        note_reload_outcome(state, true);
-        return None;
     }
-    note_reload_outcome(state, false);
     None
-}
-
-/// Record the outcome of a config reload — **the single owner** of
-/// `hydra_config_snapshot_stale` and of `AdminState::snapshot_stale`.
-///
-/// Why it exists: the post-write path ([`reload_best_effort`]) recorded the outcome, and the
-/// explicit `POST /api/v1/reload` endpoint (`admin::cluster_api::reload`) did **not** — it shared
-/// the loading but not the recording. Measured 2026-09-30 (`integration/test_snapshot_stale.py`):
-/// a failing explicit reload answered `400 reload_failed` ("old snapshot retained") while the
-/// documented gauge stayed **0**, so the alert the docs point operators at never fired for it; and
-/// after a later successful explicit reload the gauge stayed **1**, so the alert kept firing after
-/// the documented recovery — while `ops.md` §9.1 tells an operator to alert on exactly that gauge
-/// and §5.3 to recover by reloading.
-pub(super) fn note_reload_outcome(state: &AdminState, stale: bool) {
-    metrics::record_config_snapshot_stale(stale);
-    state
-        .snapshot_stale
-        .store(stale, std::sync::atomic::Ordering::Release);
 }
 
 /// Write-boundary mirror of the loader's **fatal** endpoint check
@@ -314,9 +288,9 @@ fn endpoint_error(p: &Provider, trace_id: &str) -> Option<Resp> {
 
 // `pub(crate)` because the tenant-API row handlers (`tenant_api::handlers`, plan
 // T5) stamp `created_at`/`updated_at` for the user hierarchy, and those columns'
-// DDL default is SQLite `datetime('now')` — this is the ONE wall-clock formatter
-// that matches it. A second copy is how two faces of one column start holding
-// two formats.
+// DDL default is `CURRENT_TIMESTAMP` (the same `%Y-%m-%d %H:%M:%S` shape on
+// PostgreSQL and MySQL) — this is the ONE wall-clock formatter that matches it.
+// A second copy is how two faces of one column start holding two formats.
 pub(crate) fn now_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -419,6 +393,7 @@ fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8], trace_id: &str) -> Resu
 
 pub(super) async fn provider_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -454,7 +429,7 @@ pub(super) async fn provider_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &p)
@@ -465,6 +440,7 @@ pub(super) async fn provider_collection(
 
 pub(super) async fn provider_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -498,7 +474,7 @@ pub(super) async fn provider_item(
             }
             match crate::db::get_provider(state.db(), id).await {
                 Ok(p) => {
-                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                         return r;
                     }
                     ok_json(200, &p)
@@ -508,7 +484,7 @@ pub(super) async fn provider_item(
         }
         "DELETE" => match crate::db::delete_provider(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -525,6 +501,7 @@ pub(super) async fn provider_item(
 
 pub(super) async fn provider_model_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -547,7 +524,7 @@ pub(super) async fn provider_model_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &m)
@@ -558,6 +535,7 @@ pub(super) async fn provider_model_collection(
 
 pub(super) async fn provider_model_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -585,7 +563,7 @@ pub(super) async fn provider_model_item(
             }
             match crate::db::get_provider_model(state.db(), id).await {
                 Ok(m) => {
-                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                         return r;
                     }
                     ok_json(200, &m)
@@ -595,7 +573,7 @@ pub(super) async fn provider_model_item(
         }
         "DELETE" => match crate::db::delete_provider_model(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -612,6 +590,7 @@ pub(super) async fn provider_model_item(
 
 pub(super) async fn provider_key_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     query: Option<&str>,
@@ -670,7 +649,7 @@ pub(super) async fn provider_key_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         // Never echo plaintext back (P1-5) — re-expose only via the masked DTO.
@@ -689,6 +668,7 @@ pub(super) async fn provider_key_collection(
 
 pub(super) async fn provider_key_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -743,7 +723,7 @@ pub(super) async fn provider_key_item(
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }
-            if let Some(r) = reload_best_effort(state, trace_id).await {
+            if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                 return r;
             }
             let masked = hydra_core::rewrite::mask_key(&k.api_key);
@@ -757,7 +737,7 @@ pub(super) async fn provider_key_item(
         }
         "DELETE" => match crate::db::delete_provider_key(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -798,7 +778,7 @@ struct TenantView {
     tenant: Tenant,
     /// The write IS committed; this only says the post-write reload failed, so
     /// the running config still shows the previous value. Process-level flag —
-    /// see `AdminState::snapshot_stale`.
+    /// see `ConfigStore::snapshot_stale`.
     snapshot_stale: bool,
 }
 
@@ -812,12 +792,7 @@ impl TenantView {
 
     /// Build from live admin state (the common case).
     fn from_state(state: &AdminState, tenant: Tenant) -> Self {
-        Self::new(
-            tenant,
-            state
-                .snapshot_stale
-                .load(std::sync::atomic::Ordering::Acquire),
-        )
+        Self::new(tenant, state.store.snapshot_stale())
     }
 }
 
@@ -963,6 +938,7 @@ fn resolved_cert_write(action: CertWrite) -> Option<(Option<String>, Option<Stri
 
 pub(super) async fn tenant_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -1029,7 +1005,7 @@ pub(super) async fn tenant_collection(
         {
             return db_err_resp(e, trace_id);
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &TenantView::from_state(state, t))
@@ -1040,6 +1016,7 @@ pub(super) async fn tenant_collection(
 
 pub(super) async fn tenant_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -1091,7 +1068,7 @@ pub(super) async fn tenant_item(
             }
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
-                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                         return r;
                     }
                     ok_json(200, &TenantView::from_state(state, t))
@@ -1104,7 +1081,7 @@ pub(super) async fn tenant_item(
         }
         "DELETE" => match crate::db::delete_tenant(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -1121,6 +1098,7 @@ pub(super) async fn tenant_item(
 
 pub(super) async fn tenant_provider_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -1146,7 +1124,7 @@ pub(super) async fn tenant_provider_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &tp)
@@ -1157,6 +1135,7 @@ pub(super) async fn tenant_provider_collection(
 
 pub(super) async fn tenant_provider_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     method: &str,
     id: &str,
     trace_id: &str,
@@ -1171,7 +1150,7 @@ pub(super) async fn tenant_provider_item(
         },
         "DELETE" => match crate::db::delete_tenant_provider(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -1184,6 +1163,7 @@ pub(super) async fn tenant_provider_item(
 
 pub(super) async fn tenant_model_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -1209,7 +1189,7 @@ pub(super) async fn tenant_model_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &tm)
@@ -1220,6 +1200,7 @@ pub(super) async fn tenant_model_collection(
 
 pub(super) async fn tenant_model_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     method: &str,
     id: &str,
     trace_id: &str,
@@ -1234,7 +1215,7 @@ pub(super) async fn tenant_model_item(
         },
         "DELETE" => match crate::db::delete_tenant_model(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -1425,6 +1406,7 @@ fn masked_limit_role(role: &LimitRole) -> LimitRole {
 
 pub(super) async fn limit_role_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -1460,7 +1442,7 @@ pub(super) async fn limit_role_collection(
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
-        if let Some(r) = reload_best_effort(state, trace_id).await {
+        if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
             return r;
         }
         ok_json(201, &limit_role_body(state, &r))
@@ -1471,6 +1453,7 @@ pub(super) async fn limit_role_collection(
 
 pub(super) async fn limit_role_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -1503,7 +1486,7 @@ pub(super) async fn limit_role_item(
             }
             match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await {
                 Ok(r) => {
-                    if let Some(r) = reload_best_effort(state, trace_id).await {
+                    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                         return r;
                     }
                     ok_json(200, &limit_role_body(state, &r))
@@ -1513,7 +1496,7 @@ pub(super) async fn limit_role_item(
         }
         "DELETE" => match crate::db::delete_limit_role(state.db(), id).await {
             Ok(()) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -1642,7 +1625,11 @@ pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
 // Metrics (§17) — self-hosted exposition
 // ===========================================================================
 
-pub(super) fn metrics_endpoint() -> Resp {
+pub(super) fn metrics_endpoint(state: &AdminState) -> Resp {
+    // The gauge's source of truth is the store (the tenant write path and the
+    // reload paths all mark it there). Refresh it at scrape time so a node whose
+    // last reload failed cannot present a stale 0.
+    metrics::record_config_snapshot_stale(state.store.snapshot_stale());
     let body = metrics::render();
     Response::builder()
         .status(200)
@@ -1976,10 +1963,11 @@ fn global_role_write_warnings(role: &GlobalRole) -> Vec<String> {
 /// 4. WARN (log + response) about a pinned `model_key`;
 /// 5. persist rule + provider set in ONE transaction
 ///    ([`crate::db::upsert_global_role_with_providers`]);
-/// 6. [`reload_best_effort`] — a refused PUBLISH answers 503 `config_not_published`
-///    (ADR-0001 D-9: the local commit succeeded, the cluster did NOT get it).
+/// 6. [`reload_best_effort`] — the DB commit is the write's success; a reload
+///    failure is logged and marks the snapshot stale without failing the response.
 async fn global_role_put(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     path_id: Option<String>,
     trace_id: &str,
@@ -2052,7 +2040,7 @@ async fn global_role_put(
         Err(e) => return db_err_resp(e, trace_id),
     }
 
-    if let Some(r) = reload_best_effort(state, trace_id).await {
+    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
         return r;
     }
 
@@ -2082,6 +2070,7 @@ const MAX_BULK_ROLES: usize = 5_000;
 /// transaction and is followed by ONE reload/publish.
 pub(super) async fn global_role_bulk(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     trace_id: &str,
 ) -> Resp {
@@ -2196,7 +2185,7 @@ pub(super) async fn global_role_bulk(
         Err(e) => return db_err_resp(e, trace_id),
     }
 
-    if let Some(r) = reload_best_effort(state, trace_id).await {
+    if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
         return r;
     }
 
@@ -2212,6 +2201,7 @@ pub(super) async fn global_role_bulk(
 /// identically (plan §3.4 determinism).
 pub(super) async fn global_role_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     trace_id: &str,
@@ -2222,7 +2212,7 @@ pub(super) async fn global_role_collection(
             Err(e) => db_err_resp(e, trace_id),
         }
     } else if method == "PUT" {
-        global_role_put(state, session, None, trace_id).await
+        global_role_put(state, write_guard, session, None, trace_id).await
     } else {
         method_not_allowed(trace_id)
     }
@@ -2235,6 +2225,7 @@ pub(super) async fn global_role_collection(
 /// there ⇒ 404 (the provider child rows go with it through `ON DELETE CASCADE`).
 pub(super) async fn global_role_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
@@ -2248,11 +2239,11 @@ pub(super) async fn global_role_item(
             },
             Err(e) => db_err_resp(e, trace_id),
         },
-        "PUT" => global_role_put(state, session, Some(id.to_string()), trace_id).await,
+        "PUT" => global_role_put(state, write_guard, session, Some(id.to_string()), trace_id).await,
         "DELETE" => match crate::db::delete_global_role(state.db(), id).await {
             Ok(0) => err_json(404, "not_found", "global role not found", trace_id),
             Ok(_) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)
@@ -2586,6 +2577,7 @@ fn normalize_expires_at(raw: Option<&str>) -> Result<Option<String>, String> {
 /// be a dangling credential the moment its INSERT met the FK.
 pub(super) async fn tenant_access_token_collection(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     method: &str,
     tenant_id: &str,
@@ -2603,7 +2595,9 @@ pub(super) async fn tenant_access_token_collection(
             }
             Err(e) => db_err_resp(e, trace_id),
         },
-        "POST" => tenant_access_token_create(state, session, tenant_id, trace_id).await,
+        "POST" => {
+            tenant_access_token_create(state, write_guard, session, tenant_id, trace_id).await
+        }
         _ => method_not_allowed(trace_id),
     }
 }
@@ -2614,6 +2608,7 @@ pub(super) async fn tenant_access_token_collection(
 /// (see [`tenant_access_token_collection`]'s note on why 404 beats an FK 400).
 async fn tenant_access_token_create(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     session: &mut ServerSession,
     tenant_id: &str,
     trace_id: &str,
@@ -2646,7 +2641,7 @@ async fn tenant_access_token_create(
     };
 
     // `UNIQUE(tenant_id, name)` pre-checked from the CURRENT rows so the answer is
-    // the OPERATOR-legible `duplicate_name`, not a raw SQLite constraint message.
+    // the OPERATOR-legible `duplicate_name`, not a raw database constraint message.
     let existing: Vec<TenantAccessToken> =
         match crate::db::list_tenant_access_tokens(state.db()).await {
             Ok(rows) => rows,
@@ -2680,9 +2675,9 @@ async fn tenant_access_token_create(
         enabled: true,
         expires_at,
         created_at: now_rfc3339(),
-        // The INSERT binds the column's own `datetime('now')` for `updated_at`
-        // (see `db::insert_tenant_access_token`); carried here so the in-memory
-        // row stays coherent.
+        // The INSERT lets the column's own `CURRENT_TIMESTAMP` default fill
+        // `updated_at` (see `db::insert_tenant_access_token`); carried here so the
+        // in-memory row stays coherent.
         updated_at: now_rfc3339(),
     };
 
@@ -2704,21 +2699,9 @@ async fn tenant_access_token_create(
         return db_err_resp(e, trace_id);
     }
 
-    // Committed locally ⇒ the PUBLISH outcome decides 2xx vs 503 (ADR-0001 D-9):
-    // `config_not_published` says the token is live ON THIS node only. The plaintext
-    // has NOT been handed out yet, and we cannot recover it after this point, so a
-    // failed publish must roll the row back: otherwise the operator gets a 503 with a
-    // live-but-unusable credential nobody knows. (Greenfield: no migration/backfill.)
-    if let Some(r) = reload_best_effort(state, trace_id).await {
-        if let Err(e) = crate::db::delete_tenant_access_token(state.db(), &token.id).await {
-            tracing::error!(
-                error = %e,
-                token_id = %token.id,
-                "failed to roll back access token after publish failure; token row is orphaned"
-            );
-        }
-        return r;
-    }
+    // The DB row is committed; a reload failure only marks the in-memory
+    // snapshot stale and is deliberately NOT turned into a failed write.
+    let _ = reload_best_effort(state, write_guard, trace_id).await;
 
     ok_json(
         201,
@@ -2746,6 +2729,7 @@ async fn tenant_access_token_create(
 /// of tenants they are not allowed to see.
 pub(super) async fn tenant_access_token_item(
     state: &AdminState,
+    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
     method: &str,
     tenant_id: &str,
     token_id: &str,
@@ -2768,7 +2752,7 @@ pub(super) async fn tenant_access_token_item(
         Some(_) => match crate::db::delete_tenant_access_token(state.db(), token_id).await {
             Ok(0) => err_json(404, "not_found", "access token not found", trace_id),
             Ok(_) => {
-                if let Some(r) = reload_best_effort(state, trace_id).await {
+                if let Some(r) = reload_best_effort(state, write_guard, trace_id).await {
                     return r;
                 }
                 empty(204)

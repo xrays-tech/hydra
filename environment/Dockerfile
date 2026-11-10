@@ -38,14 +38,24 @@ WORKDIR /app
 # The cross-compiled binary (staged by build.sh)
 COPY --chown=hydra:hydra bin/hydra /usr/local/bin/hydra
 
-# Runtime layout. Config + certs + SQLite data are supplied at run time
-# (volumes / mounts / env — see dev-docs/ops.md).
+# Runtime layout. Config + certs live in the relational database; /app/data is
+# kept for operator-supplied files (mounts — see dev-docs/ops.md).
 RUN mkdir -p /app/data /etc/hydra && chown -R hydra:hydra /app /etc/hydra
 
-# Sensible defaults; override at `docker run` with -e / mounts.
-# NOTE: the binary reads HYDRA_DB_URL (see crates/hydra-server/src/main.rs).
-ENV HYDRA_DB_URL=sqlite:/app/data/hydra.db?mode=rwc \
-    RUST_LOG=info
+# NO DATABASE URL DEFAULT IS BAKED IN. The binary is built with exactly one backend
+# (`db-postgres` or `db-mysql` — see environment/build.sh), and the matching URL must
+# come from the deployment (compose `environment:`, Kubernetes secret, or -e):
+#
+#   postgres (hydra:postgres / hydra:latest):
+#     HYDRA_DB_URL=postgres://hydra:hydra@postgres:5432/hydra
+#   mysql (hydra:mysql):
+#     HYDRA_DB_URL=mysql://hydra:hydra@mysql:3306/hydra
+#
+# The example credentials (`hydra/hydra`) are the local compose defaults, not a
+# recommendation for production. Hardcoding one backend here would let a mysql image
+# silently start against a postgres URL (and vice versa); `db/backend.rs` refuses a
+# build with neither backend selected, so the URL must agree with the compiled feature.
+ENV RUST_LOG=info
 
 USER hydra
 

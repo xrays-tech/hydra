@@ -9,7 +9,7 @@
 # step could never fail. The firewall is a grep over the tree (as CI does it).
 set -uo pipefail
 export RUSTFLAGS="-D warnings"
-export SQLX_OFFLINE=true
+export HYDRA_TEST_DATABASE_URL="${HYDRA_TEST_DATABASE_URL:-postgres://hydra:hydra@127.0.0.1:5432/hydra}"
 export HYDRA_TEST_REDIS_URL="redis://127.0.0.1:6380"   # 本地只有 6380 映射到宿主；CI 是 6379
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -32,9 +32,9 @@ run() {
 }
 
 run "fmt --check"    cargo fmt --check
-run "clippy-server"  cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
+run "clippy-server"  cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/db-postgres -- -D warnings
 run "core-tests"     cargo test -p hydra-core
-run "server-tests"   cargo test -p hydra-server --features server
+run "server-tests"   cargo test -p hydra-server --features server,db-postgres
 
 step "core-firewall"
 tree="$(cargo tree -p hydra-core --no-default-features 2>&1)"

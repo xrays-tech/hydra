@@ -147,7 +147,7 @@ fn start_tls_server(state: Arc<AppState>, cert_store: &HydraCertStore) -> u16 {
 /// Build the shared app state over an in-memory DB. The proxy HTTP path is not
 /// exercised here (only the TLS handshake), but a real `HydraProxy` hosts the
 /// listener — no test-only `ProxyHttp` stub.
-async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
+async fn build_state(pool: hydra_server::db::Pool) -> (ConfigStore, Arc<AppState>) {
     let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
     let store = ConfigStore::load(pool, key_provider)
         .await
@@ -170,7 +170,7 @@ async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
 /// the minimum for a publishable snapshot; the TLS callback only consumes the
 /// tenant's cert paths via `ConfigData.certs`.
 async fn seed_tenant_with_cert(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     id: &str,
     domain: &str,
     cert_file: &str,
@@ -696,21 +696,17 @@ fn t6_6_single_cert_pem_has_an_empty_chain() {
     assert!(resolved.chain.is_empty(), "a single cert has no chain");
 }
 
-/// T6.7 — the cert store follows **every** snapshot swap, including the
-/// control-plane path an edge uses (审核四 P3 / F-3).
+/// T6.7 — the cert store follows **every** config reload (审核四 P3 / F-3).
 ///
-/// Before this, cert re-resolution was wired to two admin handler call sites,
-/// so it only ever ran on the node that received the admin write. An `edge`
-/// node applies config through `ConfigStore::apply_snapshot` (control-plane
-/// poll) and never touches an admin handler: a certificate pushed to the
-/// cluster therefore stayed invisible to the TLS callback — the SNI callback
-/// kept selecting the certs the process had at boot — until someone restarted
-/// the pod. This drives the production wiring (`tls::follow_snapshot`, the same
-/// call `main`'s bootstrap makes) through the edge path.
+/// Cert re-resolution used to be wired to admin handler call sites, so it only
+/// ever ran on the node that received the admin write. This drives the
+/// production wiring (`tls::follow_snapshot`, the same call `main`'s bootstrap
+/// makes) through the DB-authority path: the certificate is written to the
+/// database, then `reload_all` swaps the snapshot and the hook resolves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t6_7_cert_store_follows_control_plane_snapshots() {
+async fn t6_7_cert_store_follows_config_reloads() {
     let pool = common::setup_pool().await;
-    let (store, _state) = build_state(pool).await;
+    let (store, _state) = build_state(pool.clone()).await;
 
     let cert_store = Arc::new(HydraCertStore::new(None));
     hydra_server::tls::follow_snapshot(&store, &cert_store);
@@ -719,27 +715,25 @@ async fn t6_7_cert_store_follows_control_plane_snapshots() {
         "nothing is configured yet"
     );
 
-    // A control-plane snapshot arrives carrying acme.com's certificate. This is
-    // the edge path: no admin write, no restart.
-    let mut cfg = hydra_core::config::ConfigData::default();
-    cfg.certs.insert(
-        "acme.com".to_string(),
-        CertMeta {
-            domain: "acme.com".to_string(),
-            cert_file: Some(fixture("acme.crt")),
-            cert_key: Some(fixture("acme.key")),
-            cert_pem: None,
-            cert_key_pem: None,
-        },
+    // The database is the authority: write the tenant + cert paths, then reload.
+    let cert_file = fixture("acme.crt");
+    let cert_key = fixture("acme.key");
+    seed_tenant_with_cert(&pool, "t1", "acme.com", &cert_file, &cert_key).await;
+
+    assert!(
+        store.reload_all().await.expect("reload_all"),
+        "a tenant cert written to the DB must change the served config"
     );
-    store.apply_snapshot(common::hydrated(42, cfg));
+    assert!(
+        store.snapshot().certs.contains_key("acme.com"),
+        "the new tenant cert must be in the swapped-in snapshot"
+    );
 
     let loaded = cert_store.resolved();
     assert_eq!(
         loaded.len(),
         1,
-        "the TLS callback's cert map must follow a control-plane snapshot \
-         without a restart (this is what an edge node needs)"
+        "the TLS callback's cert map must follow a config reload without a restart"
     );
     assert!(
         loaded.contains_key("acme.com"),

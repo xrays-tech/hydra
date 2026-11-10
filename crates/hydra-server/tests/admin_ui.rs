@@ -43,7 +43,6 @@ async fn admin_state() -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
     ))
 }
 

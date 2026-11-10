@@ -5,16 +5,14 @@
 //!
 //! `matching_key` is the one column in this database that has held a CLIENT credential in plaintext
 //! since the first release. The user's ruling (2026-10-08) was "seal everything, and re-seal legacy
-//! rows without a manual step", so there are four things to hold to account, and each has its own
+//! rows without a manual step", so there are three things to hold to account, and each has its own
 //! test below:
 //!
 //! 1. a row written NOW is not the key in the clear — asserted against the BARE COLUMN, not through
 //!    the API that is supposed to hide it;
 //! 2. a row written BEFORE the change is still readable, and the loader re-seals it (that is the
 //!    migration: no operator step);
-//! 3. a replica rebuilding from the config tree stores it sealed too — the replica is a different
-//!    write path (`db/restore.rs`) and would otherwise be the one node still storing the key;
-//! 4. the one place this deliberately does NOT fail closed (a plaintext value) is distinguishable
+//! 3. the one place this deliberately does NOT fail closed (a plaintext value) is distinguishable
 //!    from the place it does (an envelope that will not open) — the second must be an error, never
 //!    the ciphertext wearing the key's clothes.
 //!
@@ -25,7 +23,6 @@ mod common;
 
 use hydra_core::limit::{match_roles, MatchCtx};
 use hydra_core::model::LimitRole;
-use hydra_server::cluster::content::FidelityRows;
 use hydra_server::crypto::{KeyProvider, Sealed, StaticKeyProvider, KEY_LEN};
 use hydra_server::{db as repo, store::build_config};
 
@@ -51,25 +48,26 @@ fn role(id: &str, matching_key: Option<&str>) -> LimitRole {
     }
 }
 
-/// The BARE `matching_key` column — what someone reading the database file, a backup or a replica
-/// would see. Every "it is sealed" claim in this file is made against THIS, because asking the repo
-/// layer returns the opened value by design and would prove nothing.
-async fn stored_matching_key(pool: &sqlx::SqlitePool, id: &str) -> Option<String> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT matching_key FROM limit_role WHERE id = ?")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .expect("select the bare column");
+/// The BARE `matching_key` column — what someone reading the database file or a backup would see.
+/// Every "it is sealed" claim in this file is made against THIS, because asking the repo layer
+/// returns the opened value by design and would prove nothing.
+async fn stored_matching_key(pool: &hydra_server::db::Pool, id: &str) -> Option<String> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(&hydra_server::db::dialect::sql(
+        "SELECT matching_key FROM limit_role WHERE id = ?",
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .expect("select the bare column");
     row.and_then(|r| r.0)
 }
 
 /// Write a row the way the code did BEFORE decision D-16: plaintext, straight into the column.
-async fn insert_legacy_plaintext_row(pool: &sqlx::SqlitePool, id: &str, key: &str) {
-    sqlx::query(
-        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 'm', 1, '2026-01-01 00:00:00')",
-    )
+async fn insert_legacy_plaintext_row(pool: &hydra_server::db::Pool, id: &str, key: &str) {
+    sqlx::query(&hydra_server::db::dialect::sql(
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, limit_window, enabled, \
+         created_at) VALUES (?, ?, ?, ?, 'm', 1, '2026-01-01 00:00:00')",
+    ))
     .bind(id)
     .bind(id)
     .bind(key)
@@ -217,7 +215,15 @@ async fn a_legacy_plaintext_row_is_readable_and_the_loader_reseals_it() {
         Some(RAW)
     );
 
-    // The LOADER is what an upgrade runs (boot + every reload), and it migrates.
+    // The STARTUP migration is what an upgrade runs (main calls it before the
+    // first load), and it migrates. The loader itself is read-only.
+    assert_eq!(
+        repo::seal_legacy_limit_keys(&pool, &kp)
+            .await
+            .expect("startup re-seal"),
+        1,
+        "the plaintext row must be rewritten exactly once"
+    );
     let cfg = build_config(&pool, &kp).await.expect("build_config");
     assert_eq!(
         cfg.limit_roles[0].matching_key.as_deref(),
@@ -231,7 +237,7 @@ async fn a_legacy_plaintext_row_is_readable_and_the_loader_reseals_it() {
         .expect("still has a key");
     assert!(
         !after.contains(RAW),
-        "the loader must have rewritten the plaintext row: {after}"
+        "the startup migration must have rewritten the plaintext row: {after}"
     );
     assert!(
         after.starts_with("sealed:v1:"),
@@ -267,53 +273,7 @@ async fn a_legacy_plaintext_row_is_readable_and_the_loader_reseals_it() {
 // a copy of the code rather than the code. It now lives next to the two production halves it
 // composes: `db.rs`, `#[cfg(test)] mod tests::the_legacy_reseal_refuses_a_row_that_changed_after_the_read`.
 
-/// (3) A replica rebuilding from the config tree stores the key sealed as well.
-///
-/// The replica writes through a DIFFERENT function (`db::restore_config`, which binds the fidelity
-/// rows it was handed). It is the path a failover exercises, and if it bound `matching_key` verbatim
-/// the fleet would end up with one node — the one that just took over — storing client keys in the
-/// clear.
-///
-/// Falsification: bind `&r.matching_key` in `db/restore.rs` and the first assertion fails.
-#[tokio::test]
-async fn a_replica_rebuild_stores_the_matching_key_sealed() {
-    let leader = common::setup_pool().await;
-    let replica = common::setup_pool().await;
-    let kp = kp();
-    repo::insert_limit_role(&leader, &kp, &role("r-rep", Some(RAW)))
-        .await
-        .expect("insert");
-
-    let cfg = build_config(&leader, &kp).await.expect("build_config");
-    let fidelity = FidelityRows {
-        // The fidelity rows carry the key in memory (the matcher needs it); the sealing happens at
-        // the boundary that WRITES it, exactly like the provider api-keys.
-        limit_roles: cfg.limit_roles.clone(),
-        ..FidelityRows::default()
-    };
-    repo::restore_config(&replica, &kp, &cfg, &fidelity, 1)
-        .await
-        .expect("restore");
-
-    let stored = stored_matching_key(&replica, "r-rep")
-        .await
-        .expect("the restored row has a key");
-    assert!(
-        stored.starts_with("sealed:v1:") && !stored.contains(RAW),
-        "a materializing node must not store the client key in the clear: {stored}"
-    );
-    assert_eq!(
-        repo::get_limit_role(&replica, &kp, "r-rep")
-            .await
-            .expect("get")
-            .matching_key
-            .as_deref(),
-        Some(RAW),
-        "…and the key must still be usable on the node that rebuilds"
-    );
-}
-
-/// (4) The boundary, in both directions: a plaintext value is READ (that is the migration), an
+/// (3) The boundary, in both directions: a plaintext value is READ (that is the migration), an
 /// envelope that will not open is an ERROR — never the ciphertext, and never silently "no key".
 ///
 /// The second half is the one that matters operationally: a rotation that forgot to keep the old key
@@ -330,10 +290,10 @@ async fn an_envelope_that_will_not_open_is_refused_and_never_becomes_a_key() {
     let other = StaticKeyProvider::new([9u8; KEY_LEN], 1);
     // A row sealed under master-key material this process does not have — a rotation gone wrong.
     let foreign = other.seal(RAW.as_bytes()).expect("seal").to_text();
-    sqlx::query(
-        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
-         VALUES ('r-foreign', 'r-foreign', ?, 600, 'm', 1, '2026-01-01 00:00:00')",
-    )
+    sqlx::query(&hydra_server::db::dialect::sql(
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, limit_window, enabled, \
+         created_at) VALUES ('r-foreign', 'r-foreign', ?, 600, 'm', 1, '2026-01-01 00:00:00')",
+    ))
     .bind(&foreign)
     .execute(&pool)
     .await
@@ -362,12 +322,12 @@ async fn an_envelope_that_will_not_open_is_refused_and_never_becomes_a_key() {
 }
 
 /// (4b) A NULL `matching_key` stays NULL (match-all), and it is not turned into an envelope of the
-/// empty string on the way through the write path.
+/// empty string on the way through the write path or the loader.
 ///
 /// `None` means "this role matches any key" (design §10.1). `Some("")` would mean "matches the key
 /// that is the empty string" — a role nobody can ever hit, which is the opposite of the intent.
 #[tokio::test]
-async fn a_null_matching_key_stays_null_through_every_write_path() {
+async fn a_null_matching_key_stays_null_through_the_write_path() {
     let pool = common::setup_pool().await;
     let kp = kp();
     repo::insert_limit_role(&pool, &kp, &role("r-null", None))
@@ -379,18 +339,24 @@ async fn a_null_matching_key_stays_null_through_every_write_path() {
         "NULL must stay NULL: `Some(\"\")` would match nothing instead of everything"
     );
 
-    let replica = common::setup_pool().await;
-    let cfg = build_config(&pool, &kp).await.expect("build_config");
-    let fidelity = FidelityRows {
-        limit_roles: cfg.limit_roles.clone(),
-        ..FidelityRows::default()
-    };
-    repo::restore_config(&replica, &kp, &cfg, &fidelity, 1)
+    // An UPDATE with `None` must not seal the absent value into an envelope either.
+    repo::update_limit_role(&pool, &kp, &role("r-null", None))
         .await
-        .expect("restore");
+        .expect("update");
     assert_eq!(
-        stored_matching_key(&replica, "r-null").await,
+        stored_matching_key(&pool, "r-null").await,
         None,
-        "the restore path must not seal an absent key into an envelope"
+        "the update path must not seal an absent key into an envelope"
+    );
+
+    let cfg = build_config(&pool, &kp).await.expect("build_config");
+    let got = cfg
+        .limit_roles
+        .iter()
+        .find(|r| r.id == "r-null")
+        .expect("the null role is loaded");
+    assert_eq!(
+        got.matching_key, None,
+        "the loader must keep a NULL key as match-all"
     );
 }

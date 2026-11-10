@@ -41,7 +41,7 @@ use hydra_server::usage::{self, EnvView};
 /// a machine that happens to have it set.
 fn open_backend(
     kind: &str,
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     ch_url: Option<&str>,
 ) -> Result<usage::Backend, usage::BackendError> {
     let env = match ch_url {
@@ -70,7 +70,7 @@ const TOKEN: &str = "sk-tenant-token-0123456789abcdef";
 const OTHER_TOKEN: &str = "sk-other-tenant-token-0123456789";
 const T: &str = "t1";
 
-async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Option<&str>) {
+async fn seed_tenant(pool: &hydra_server::db::Pool, id: &str, domain: &str, token: Option<&str>) {
     hydra_server::db::insert_tenant(
         pool,
         &Tenant {
@@ -97,7 +97,7 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, token: Opt
 /// The state a node would build, with the usage capability **injected** exactly
 /// as `main` injects it. `None` mirrors a node with no readable store.
 async fn build_state(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     cfg: TenantApiConfig,
     usage: Option<Arc<dyn UsageQuery>>,
 ) -> Arc<AppState> {
@@ -119,7 +119,7 @@ async fn build_state(
 
 /// A node with a usage READER that always answers a real zero.
 ///
-/// Replaces `build_sqlite_state`, which injected the retired SQLite reader. The legs that use it are
+/// Replaces the retired local usage-reader harness. The legs that use it are
 /// about the HTTP layer — bound validation, the `group_by` whitelist, whose usage is read, the
 /// response envelope — so all they need is a reader that answers; store-specific behaviour has its
 /// own tests (the ClickHouse legs in this file, and the registry's).
@@ -195,7 +195,7 @@ impl UsageQuery for OneTenantQuery {
 }
 
 /// A node whose usage reader always answers zero (see [`ZeroUsageQuery`]).
-async fn build_sqlite_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
+async fn build_db_state(pool: &hydra_server::db::Pool) -> Arc<AppState> {
     let usage = Some(Arc::new(ZeroUsageQuery) as Arc<dyn UsageQuery>);
     build_state(pool, TenantApiConfig::default(), usage).await
 }
@@ -206,7 +206,7 @@ async fn build_sqlite_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
 /// there is no backend to open, and an ungated helper would be dead code (which `-D warnings`
 /// refuses).
 #[cfg(feature = "usage-clickhouse")]
-fn reader(kind: &str, pool: &sqlx::SqlitePool, ch_url: Option<&str>) -> Arc<dyn UsageQuery> {
+fn reader(kind: &str, pool: &hydra_server::db::Pool, ch_url: Option<&str>) -> Arc<dyn UsageQuery> {
     match open_backend(kind, pool, ch_url) {
         Ok(b) => b.query.expect("this backend reads"),
         Err(e) => panic!("{kind} must open: {e}"),
@@ -261,9 +261,9 @@ async fn get_json(c: &reqwest::Client, url: &str, bearer: &str) -> (u16, Value) 
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
-async fn usage_url(pool: &sqlx::SqlitePool) -> (String, reqwest::Client) {
+async fn usage_url(pool: &hydra_server::db::Pool) -> (String, reqwest::Client) {
     seed_tenant(pool, T, "acme.example", Some(TOKEN)).await;
-    let root = start_proxy(build_sqlite_state(pool).await);
+    let root = start_proxy(build_db_state(pool).await);
     let c = client();
     // Probe once so the listener is up before the measured request.
     let _ = get_until_ready(&c, &format!("{root}/tenant/{T}/api/v1/whoami"), Some(TOKEN)).await;
@@ -631,17 +631,17 @@ async fn fake_clickhouse_sequence(bodies: Vec<String>) -> (String, wiremock::Moc
     (server.uri(), server)
 }
 
-/// A ClickHouse-backed node: the gate reads the local SQLite config, the usage
+/// A ClickHouse-backed node: the gate reads the local config database, the usage
 /// read goes to the double — the shape C13 describes, where only the USAGE store
 /// differs from the default.
 #[cfg(feature = "usage-clickhouse")]
-async fn build_ch_state(pool: &sqlx::SqlitePool, ch_url: &str) -> Arc<AppState> {
+async fn build_ch_state(pool: &hydra_server::db::Pool, ch_url: &str) -> Arc<AppState> {
     let usage = reader("clickhouse", pool, Some(ch_url));
     build_state(pool, TenantApiConfig::default(), Some(usage)).await
 }
 
 #[cfg(feature = "usage-clickhouse")]
-async fn ch_usage(pool: &sqlx::SqlitePool, ch_url: &str, query: &str) -> (u16, Value) {
+async fn ch_usage(pool: &hydra_server::db::Pool, ch_url: &str, query: &str) -> (u16, Value) {
     seed_tenant(pool, T, "acme.example", Some(TOKEN)).await;
     let root = start_proxy(build_ch_state(pool, ch_url).await);
     let c = client();
@@ -950,7 +950,7 @@ async fn clickhouse_binds_its_parameters_instead_of_interpolating_them() {
     // A tenant id built to break out of a string literal, plus a `&` that would
     // truncate the query string if the value were not encoded.
     let evil = "t1' OR 1=1 --&x=1";
-    // A node whose usage lives in ClickHouse still keeps its CONFIG in its own SQLite database, so
+    // A node whose usage lives in ClickHouse still keeps its CONFIG in its own database, so
     // the backend is opened against a real (empty) pool.
     let reader = reader(
         "clickhouse",

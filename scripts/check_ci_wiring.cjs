@@ -62,7 +62,7 @@ const CI_PATH = path.join(ROOT, ".github", "workflows", "ci.yml");
 // would not have tripped it (measured 2026-09-30), and `MIN_E2E_SPECS` was exactly the real count,
 // so a legitimate two-into-one spec merge would fail. Round 133.
 const MIN_SCRIPTS = Number(process.env.CI_WIRING_MIN_SCRIPTS ?? 20);
-const MIN_CRATE_TESTS = Number(process.env.CI_WIRING_MIN_CRATE_TESTS ?? 45);
+const MIN_CRATE_TESTS = Number(process.env.CI_WIRING_MIN_CRATE_TESTS ?? 35);
 const MIN_E2E_SPECS = Number(process.env.CI_WIRING_MIN_E2E_SPECS ?? 2);
 // Rule 5 discovers artifacts of several kinds; ONE global floor can be fed by a single category
 // (81% of the real 47 are `integration/`), so each kind also has its own floor.
@@ -797,6 +797,57 @@ for (const t of ignoredTargets) {
   const targetFlag = new RegExp(`(^|\\s)--test(?:=|\\s+)${t.target.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}(?![A-Za-z0-9_-])`);
   const wired = cargoTestInvocations.some((c) => targetFlag.test(c) && /(^|\s)--ignored(\s|$)/.test(c));
   if (!wired) problems.push(`${t.rel} contains #[ignore] tests but no step runs \`--test ${t.target} … --ignored\``);
+}
+
+/* 4c. every server build/test names EXACTLY ONE relational backend -----------------
+ *
+ * Phase 2 replaced the single SQLite default with two compile-time backends. `db/backend.rs` emits
+ * `compile_error!` when NEITHER is selected (and when BOTH are), so a `cargo build/test/clippy` for
+ * `server` without a backend is a hard CI failure — and, more importantly, a build that silently
+ * tested only one backend would leave the other uncompiled. This rule is per COMMAND: each
+ * invocation must select exactly one of `db-postgres` / `db-mysql`, and (on the real tree) both
+ * backends must appear somewhere so the matrix is real. */
+const DB_FEATURES = ['db-postgres', 'db-mysql'];
+/** Strip the `hydra-server/` package prefix: the same feature is spelled two ways in CI. */
+function featureTokens(command) {
+  const m = /--features\s+(?:["']?)([^"'\s]+)/.exec(command);
+  if (!m) return null;
+  return m[1].split(',').map((f) => f.trim()).filter(Boolean).map((f) => f.replace(/^.*\//, ''));
+}
+const cargoInvocations = commands.flatMap((c) => logicalCommands(c));
+const backendSeen = new Set();
+for (const cmd of cargoInvocations) {
+  if (!/\bcargo\s+(?:build|test|check|clippy)\b/.test(cmd)) continue;
+  const features = featureTokens(cmd);
+  if (!features) continue;
+  // Only the commands that compile hydra-server's Rust surface: `server`, the proxy shell, or an
+  // alternative TLS backend. A pure `hydra-core` build has no DB feature and must not be nagged.
+  if (!features.some((f) => f === 'server' || f === 'proxy' || f.startsWith('tls-'))) continue;
+  const backends = DB_FEATURES.filter((b) => features.includes(b));
+  if (backends.length === 0) {
+    problems.push(
+      `\`${cmd.slice(0, 100)}\` builds hydra-server with NO database backend — enable exactly one ` +
+        `of ${DB_FEATURES.join(' / ')} (db/backend.rs refuses to compile without one)`,
+    );
+  } else if (backends.length > 1) {
+    problems.push(
+      `\`${cmd.slice(0, 100)}\` selects ${backends.join(' AND ')} — the database backends are ` +
+        'mutually exclusive (db/backend.rs emits compile_error!)',
+    );
+  }
+  for (const b of backends) backendSeen.add(b);
+}
+// The matrix must actually cover both. Judged only on the real workflow: the falsification
+// skeletons deliberately contain one backend or none.
+if (!process.env.HYDRA_WIRING_ROOT && backendSeen.size > 0) {
+  for (const b of DB_FEATURES) {
+    if (!backendSeen.has(b)) {
+      problems.push(
+        `ci.yml never builds/tests a hydra-server command with \`${b}\` — the backend matrix has ` +
+          'only one half, so the other backend is uncompiled and untested',
+      );
+    }
+  }
 }
 
 /* 5. test artifacts EVERYWHERE else ----------------------------------------

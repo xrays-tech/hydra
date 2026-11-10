@@ -485,8 +485,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 <!-- ================= marquee ================= -->
 <div class="marquee" aria-hidden="true">
   <div class="track">
-    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>Control Plane<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
-    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>SQLite<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Cluster HA<i>·</i></span><span>Control Plane<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
+    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>PostgreSQL / MySQL<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Shared-DB Cluster<i>·</i></span><span>Redis Fanout<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
+    <span>Rust<i>·</i></span><span>Pingora<i>·</i></span><span>OpenAI<i>·</i></span><span>Anthropic<i>·</i></span><span>SWRR<i>·</i></span><span>Circuit Breaker<i>·</i></span><span>PostgreSQL / MySQL<i>·</i></span><span>ClickHouse<i>·</i></span><span>Prometheus<i>·</i></span><span>Shared-DB Cluster<i>·</i></span><span>Redis Fanout<i>·</i></span><span>mTLS / SNI<i>·</i></span><span>SSE Streaming<i>·</i></span><span>zh · en · fr · de<i>·</i></span>
   </div>
 </div>
 
@@ -516,8 +516,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <div class="num"><span data-count="0" data-fmt="int">0</span><span class="unit">unsafe</span></div>
       <div class="lab" data-l="zh">生产代码无 unwrap / panic / unsafe</div>
       <div class="lab" data-l="en">unsafe / unwrap / panic in production code</div>
-      <div class="note" data-l="zh">792 项 Rust 测试 · 浏览器 / SDK / JS 套件 · clippy -D warnings 硬门禁（2026-10-10）</div>
-      <div class="note" data-l="en">792 Rust tests · browser / SDK / JS suites · clippy -D warnings gate (2026-10-10)</div>
+      <div class="note" data-l="zh">794 项 Rust 测试 · 浏览器 / SDK / JS 套件 · clippy -D warnings 硬门禁（2026-11-10）</div>
+      <div class="note" data-l="en">794 Rust tests · browser / SDK / JS suites · clippy -D warnings gate (2026-11-10)</div>
     </div>
   </div>
   <div class="wrap">
@@ -582,7 +582,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
         <span class="idx">06</span>
         <h3 data-l="zh">多租户</h3><h3 data-l="en">Multi-tenant</h3>
         <p data-l="zh">按域名识别租户，各自独立的认证端点、TLS 证书（SNI）、模型闸门与密钥前缀绑定。</p>
-        <p data-l="en">Tenants resolved by domain with their own auth endpoint, SNI TLS certificates, model gate and key-prefix bindings.</p>
+        <p data-l="en">Tenants resolved by domain, internal per-user API-key auth, SNI TLS certificates, model gate and Global Role routing.</p>
         <div class="tags"><span>per-tenant TLS</span><span>model gate</span></div>
       </article>
 
@@ -596,10 +596,10 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 
       <article class="fcard reveal" data-d="1">
         <span class="idx">08</span>
-        <h3 data-l="zh">认证缓存</h3><h3 data-l="en">Auth cache</h3>
-        <p data-l="zh">租户认证判定缓存 5 分钟，支持即时失效；租户凭自助令牌即可清除本租户缓存（欠费停机/付费恢复）。</p>
-        <p data-l="en">Auth verdicts cached 5 min with instant invalidation; tenants can clear their own cache with a self-service token.</p>
-        <div class="tags"><span>invalidate</span><span>self-service</span></div>
+        <h3 data-l="zh">内部鉴权</h3><h3 data-l="en">Internal auth</h3>
+        <p data-l="zh">鉴权直接对照租户存储的 per-user API-key 行：没有外部认证跳转，也没有认证缓存。吊销/欠费在下一个请求生效。</p>
+        <p data-l="en">Auth matches the tenant's stored per-user API-key rows: no external auth hop, no auth cache. A revoke or delinquency flip takes effect on the next request.</p>
+        <div class="tags"><span>no auth_url</span><span>next request</span></div>
       </article>
 
       <article class="fcard reveal" data-d="2">
@@ -612,17 +612,17 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 
       <article class="fcard reveal">
         <span class="idx">10</span>
-        <h3 data-l="zh">集群高可用</h3><h3 data-l="en">Cluster HA</h3>
-        <p data-l="zh">Redis 租约选主 + 快照控制面同步，standby 透明转发写请求；限流/熔断/认证跨节点共享。</p>
-        <p data-l="en">Redis lease leader election + snapshot control plane; standby forwards writes transparently; limits, breaker and auth shared cluster-wide.</p>
-        <div class="tags"><span>leader election</span><span>shared state</span></div>
+        <h3 data-l="zh">共享数据库集群</h3><h3 data-l="en">Shared-database cluster</h3>
+        <p data-l="zh">PostgreSQL/MySQL 是唯一配置权威；每个节点都直接写库，行锁串行化写者。Redis 只做数据面共享状态与配置通知，没有 raft、没有 leader。</p>
+        <p data-l="en">PostgreSQL/MySQL is the single config authority; every node writes directly and a lock row serializes writers. Redis only carries shared data-plane state and config notifications — no raft, no leader.</p>
+        <div class="tags"><span>shared database</span><span>no leader</span></div>
       </article>
 
       <article class="fcard reveal" data-d="1">
         <span class="idx">11</span>
         <h3 data-l="zh">可观测性</h3><h3 data-l="en">Observability</h3>
-        <p data-l="zh">Prometheus /metrics 免令牌暴露，健康检查 + 集群状态视图，按租户/提供方的用量统计图表。</p>
-        <p data-l="en">Token-free Prometheus /metrics, health + cluster views, usage charts by tenant and provider.</p>
+        <p data-l="zh">Prometheus /metrics（admin token 门禁），健康检查 + 本节点集群状态视图，按租户/提供方的用量统计图表。</p>
+        <p data-l="en">Prometheus /metrics (admin-token gated), health + local-node cluster views, usage charts by tenant and provider.</p>
         <div class="tags"><span>prometheus</span><span>usage stats</span></div>
       </article>
 
@@ -643,50 +643,50 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
   <div class="wrap">
     <div class="sec-head reveal">
       <span class="sec-tag" data-l="zh">// 架构</span><span class="sec-tag" data-l="en">// ARCHITECTURE</span>
-      <h2 data-l="zh">一个节点，就是完整网关；<br>一群节点，是一个控制面。</h2>
-      <h2 data-l="en">One node is already a gateway.<br>A fleet of them is a control plane.</h2>
-      <p class="sec-sub" data-l="zh">请求在边缘终结，状态在集群共享。限流、熔断、认证判定在任何节点上都一致；写变更只有一个权威，其余节点透明跟随——规模不是重新设计，是加一台机器。</p>
-      <p class="sec-sub" data-l="en">Requests end at the edge; state is shared across the cluster. Rate limits, breaker verdicts and auth decisions are identical on every node. There is exactly one writer — the rest follow transparently. Scaling is adding a machine, not redesigning.</p>
+      <h2 data-l="zh">一个节点，就是完整网关；<br>一群节点，共享一个数据库。</h2>
+      <h2 data-l="en">One node is already a gateway.<br>A fleet shares one database.</h2>
+      <p class="sec-sub" data-l="zh">每个节点都能代理、都能提供管理面、都直接写共享数据库。写与写由数据库行锁串行化，没有 leader；每个进程的内存快照通过 Redis 通知收敛，丢消息时由轮询兜底。规模不是重新设计，是加一台机器。</p>
+      <p class="sec-sub" data-l="en">Every node proxies, serves the admin API and writes the shared database directly. A database lock row serializes writers — there is no leader. Each process converges its in-memory snapshot via Redis notifications, with a poll fallback for missed messages. Scaling is adding a machine, not redesigning.</p>
     </div>
 
     <div class="pipeline reveal">
       <div class="pnode"><div class="pt" data-l="zh">客户端</div><div class="pt" data-l="en">Clients</div><div class="pd" data-l="zh">同一入口，任意节点</div><div class="pd" data-l="en">one entry, any node</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode hot"><div class="pt">leader</div><div class="pd" data-l="zh">active · 唯一写者</div><div class="pd" data-l="en">active · sole writer</div></div>
+      <div class="pnode hot"><div class="pt" data-l="zh">任意 Hydra 节点</div><div class="pt" data-l="en">any Hydra node</div><div class="pd" data-l="zh">代理 · 管理 · 写库</div><div class="pd" data-l="en">proxy · admin · writer</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
       <div class="pnode"><div class="pt" data-l="zh">提供方</div><div class="pt" data-l="en">Providers</div><div class="pd">OpenAI · Anthropic · …</div></div>
     </div>
     <div class="pipeline reveal" data-d="1">
       <div class="pnode"><div class="pt" data-l="zh">客户端</div><div class="pt" data-l="en">Clients</div><div class="pd" data-l="zh">直连数据面</div><div class="pd" data-l="en">straight to the plane</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode"><div class="pt">edge ×N</div><div class="pd" data-l="zh">无状态 · 任意扩缩</div><div class="pd" data-l="en">stateless · scale freely</div></div>
+      <div class="pnode"><div class="pt" data-l="zh">节点 ×N</div><div class="pt" data-l="en">Nodes ×N</div><div class="pd" data-l="zh">无状态 · 任意扩缩</div><div class="pd" data-l="en">stateless · scale freely</div></div>
       <div class="parrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></div>
-      <div class="pnode"><div class="pt" data-l="zh">提供方</div><div class="pt" data-l="en">Providers</div><div class="pd" data-l="zh">与 leader 相同的路由</div><div class="pd" data-l="en">same routes as leader</div></div>
+      <div class="pnode"><div class="pt" data-l="zh">共享数据库</div><div class="pt" data-l="en">Shared DB</div><div class="pd" data-l="zh">配置权威 · 行锁</div><div class="pd" data-l="en">authority · lock row</div></div>
     </div>
     <div class="cp-bar reveal" data-d="2">
-      <span class="cp-t" data-l="zh">控制面 · 一个 Redis，七种用途</span>
-      <span class="cp-t" data-l="en">CONTROL PLANE · ONE REDIS, SEVEN JOBS</span>
-      <span class="cp-items"><b>lease</b> · <b>registry</b> · <b>shared limits</b> · <b>shared breaker</b> · <b>auth L2</b> · <b>invalidation bus</b></span>
+      <span class="cp-t" data-l="zh">共享状态 · 一个数据库 + 一个 Redis</span>
+      <span class="cp-t" data-l="en">SHARED STATE · ONE DATABASE + ONE REDIS</span>
+      <span class="cp-items"><b>config authority</b> · <b>write lock</b> · <b>ArcSwap cache</b> · <b>Redis fanout</b> · <b>poll fallback</b></span>
     </div>
 
     <div class="grid" style="margin-bottom:30px">
       <article class="fcard reveal">
         <span class="idx">α</span>
-        <h3 data-l="zh">恰一个写者</h3><h3 data-l="en">Exactly one writer</h3>
-        <p data-l="zh">Redis 租约裁定唯一 active；时间栅栏杜绝双写。故障切换 ≈ 11–18s，数据面与调用方都无感。</p>
-        <p data-l="en">A Redis lease crowns a single active; fencing forbids double writes. Failover ≈ 11–18s, invisible to the data plane.</p>
+        <h3 data-l="zh">任意节点都能写</h3><h3 data-l="en">Any node can write</h3>
+        <p data-l="zh">共享库的锁行 + 事务串行化写者；提交即成功。没有 leader 选举，也没有“本地已写、集群未发布”的中间态。</p>
+        <p data-l="en">A lock row plus a database transaction serializes writers; commit is success. No leader election and no “written locally, not published” state.</p>
       </article>
       <article class="fcard reveal" data-d="1">
         <span class="idx">β</span>
-        <h3 data-l="zh">无状态数据面</h3><h3 data-l="en">Stateless data plane</h3>
-        <p data-l="zh">edge 只持 last-known-good 快照与本地缓存，可任意增删；Redis 失联，数据面依旧应答。</p>
-        <p data-l="en">Edges carry only last-known-good snapshots and local caches; they come and go freely. Redis goes dark — the plane keeps answering.</p>
+        <h3 data-l="zh">无状态节点</h3><h3 data-l="en">Stateless nodes</h3>
+        <p data-l="zh">没有 PVC、没有 raft 端口、没有成员表。节点从共享库加载配置，杀掉一台只减少容量，幸存节点继续写库。</p>
+        <p data-l="en">No PVC, raft port or member list. Nodes load config from the shared DB; killing one only removes capacity, survivors keep writing.</p>
       </article>
       <article class="fcard reveal" data-d="2">
         <span class="idx">γ</span>
-        <h3 data-l="zh">一个 Redis，七种用途</h3><h3 data-l="en">One Redis, seven jobs</h3>
-        <p data-l="zh">租约、注册表、共享限流、共享熔断、认证 L2、失效总线……共享是架构属性，不是插件。</p>
-        <p data-l="en">Leases, registry, shared limits, shared breaker, auth L2, invalidation bus… sharing is an architectural property, not a plugin.</p>
+        <h3 data-l="zh">Redis 通知 + 轮询兜底</h3><h3 data-l="en">Redis fanout + poll fallback</h3>
+        <p data-l="zh">本地写提交后广播版本；对端安静重载，丢消息或 Redis 故障由 5 秒轮询修复。外部重载绝不重发。</p>
+        <p data-l="en">A committed write broadcasts its version; peers reload quietly, and a 5 s poll repairs a missed message or Redis outage. External reloads never republish.</p>
       </article>
     </div>
 
@@ -697,10 +697,10 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
 
     <div class="term reveal">
       <div class="term-head"><i></i><i></i><i></i><span class="t">hydra — join the cluster</span></div>
-      <pre><span class="c">$</span> <span class="k">HYDRA_CLUSTER_PEERS</span>=a=hydra-a:8091,b=hydra-b:8092,c=hydra-c:8093 <span class="k">HYDRA_REDIS_URL</span>=redis://… ./hydra
+      <pre><span class="c">$</span> <span class="k">HYDRA_DB_URL</span>=postgres://… <span class="k">HYDRA_REDIS_URL</span>=redis://… ./hydra
 <span class="c"># …</span>
-<span class="a">[edge]</span> bootstrap → <span class="k">snapshot v42</span> · routes synced · serving <span class="a">:8080</span>
-<span class="a">[edge]</span> limits <span class="k">shared</span> · breaker <span class="k">shared</span> · auth L2 <span class="k">hot</span><span class="cursor"></span></pre>
+<span class="a">[hydra]</span> config <span class="k">loaded from shared db</span> · version 42 · serving <span class="a">:8080</span>
+<span class="a">[hydra]</span> write <span class="k">committed</span> · notify <span class="k">hydra:config:changed</span> · peers reload<span class="cursor"></span></pre>
     </div>
   </div>
 </section>
@@ -745,8 +745,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
         <span data-l="en">Methodology: <code>10-core machine</code> + threaded mock upstream, no real paid provider hit. Full methodology + 8C16G VPS extrapolation in the <a href="https://github.com/xrays-tech/hydra/blob/main/dev-docs/evaluation-report.html" style="color:var(--accent)" target="_blank" rel="noopener">evaluation report</a> (dated 2026-08-09 · v0.1.0 · macOS 10-core / 24 GB), threaded Python mock upstream, no real paid provider.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid">
-        <span data-l="zh">正确性门禁：<code>262 core + 530 server</code> 测试（2026-10-10 计数）、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
-        <span data-l="en">Correctness gates: <code>262 core + 530 server</code> tests (counted 2026-10-10), <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
+        <span data-l="zh">正确性门禁：<code>228 core + 566 server</code> 测试（2026-11-10 计数）、<code>clippy -D warnings</code>、依赖防火墙（core 零 I/O 依赖）——CI 硬门槛。</span>
+        <span data-l="en">Correctness gates: <code>228 core + 566 server</code> tests (counted 2026-11-10), <code>clippy -D warnings</code>, dependency firewall (core has zero I/O deps) — hard CI gate.</span>
       </div>
       <div class="note" style="margin-top:16px;border-style:solid;border-color:var(--accent);background:rgba(255,90,31,.05)">
         <span data-l="zh"><b style="color:var(--accent)">横向扩展 ∝ N：</b>数据面无状态，吞吐随节点数近似线性增长——K8s HPA 就绪，加副本就是加吞吐。集群 ≈ 单节点 × N（受上游与网络约束）。</span>
@@ -780,8 +780,8 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <span class="sec-tag" data-l="zh">// 部署</span><span class="sec-tag" data-l="en">// DEPLOY</span>
       <h2 data-l="zh">30 秒跑起来，几分钟接入生产。</h2>
       <h2 data-l="en">Running in 30 seconds. In production in minutes.</h2>
-      <p class="sec-sub" data-l="zh">一个二进制，两个端口：8080 代理 / 8081 管理。配置存 SQLite，改完即热加载。</p>
-      <p class="sec-sub" data-l="en">One binary, two ports: 8080 proxy / 8081 admin. Config lives in SQLite and hot-reloads on change.</p>
+      <p class="sec-sub" data-l="zh">一个二进制，两个端口：8080 代理 / 8081 管理。配置存共享 PostgreSQL/MySQL，改完即热加载。</p>
+      <p class="sec-sub" data-l="en">One binary, two ports: 8080 proxy / 8081 admin. Config lives in a shared PostgreSQL/MySQL database and hot-reloads on change.</p>
     </div>
     <div class="hero-cta reveal" data-d="1">
       <a class="btn primary" href="https://github.com/xrays-tech/hydra" target="_blank" rel="noopener">
@@ -823,7 +823,7 @@ footer{border-top:1px solid var(--line);padding:44px 0 56px;background:var(--ink
       <div class="foot-col">
         <h4 data-l="zh">生态</h4><h4 data-l="en">Stack</h4>
         <span>Rust · Pingora</span>
-        <span>SQLite · ClickHouse</span>
+        <span>PostgreSQL / MySQL · Redis · ClickHouse</span>
         <span>Prometheus</span>
       </div>
     </div>

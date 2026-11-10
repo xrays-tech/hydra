@@ -285,37 +285,72 @@ test('a SERVICE-level merge is refused (its grace/healthcheck may come from the 
   );
 });
 
-test('REGRESSION on the real cluster file: the three members read the SAME member list', () => {
+test('REGRESSION on the real cluster file: the three nodes share Redis and have distinct ids', () => {
   const fsmod = require('node:fs');
   const pathmod = require('node:path');
   const file = pathmod.resolve(__dirname, '..', 'environment', 'docker-compose.cluster.yml');
   const text = fsmod.readFileSync(file, 'utf8');
   const anchors = collectAnchors(text);
-  // ADR-0001: there is no role to read any more. What the real file MUST get right is the thing the
-  // cluster's identity depends on — every member carries the SAME `HYDRA_CLUSTER_PEERS` string (the
-  // order is positional raft identity, so a member with a different list is a different cluster),
-  // and each carries its OWN node id / raft address.
-  const peers = {};
+  // Shared-DB/no-raft: every member carries the SAME Redis data-plane wiring and its OWN node id.
+  const redisUrls = {};
   const nodes = {};
-  const listen = {};
   for (const [name, block] of serviceBlocks(text)) {
     if (!/^hydra-/.test(name)) continue;
-    peers[name] = envValue(block, 'HYDRA_CLUSTER_PEERS', anchors);
+    redisUrls[name] = envValue(block, 'HYDRA_REDIS_URL', anchors);
     nodes[name] = envValue(block, 'HYDRA_NODE_ID', anchors);
-    listen[name] = envValue(block, 'HYDRA_ARACHNE_LISTEN', anchors);
   }
-  const names = Object.keys(peers).sort();
+  const names = Object.keys(redisUrls).sort();
   assert.equal(names.length, 3, `expected three members, got ${names.join(', ')}`);
-  const distinctPeers = new Set(Object.values(peers));
-  assert.deepEqual(
-    [...distinctPeers].filter((v) => v !== null).length,
+  assert.equal(
+    new Set(Object.values(redisUrls)).size,
     1,
-    `every member must carry the SAME member list, got ${JSON.stringify(peers)}`,
+    `every member must carry the SAME Redis URL, got ${JSON.stringify(redisUrls)}`,
   );
   assert.equal(new Set(Object.values(nodes)).size, 3, `each member needs its own node id, got ${JSON.stringify(nodes)}`);
-  assert.equal(new Set(Object.values(listen)).size, 3, `each member needs its own raft address, got ${JSON.stringify(listen)}`);
   // ...and the real file must NOT be refused: every anchor it merges is defined inline.
   assert.deepEqual(unjudgeableServices(text), []);
+});
+
+/* Phase 2d: config authority moved from per-node SQLite volumes to ONE shared relational
+ * database. These assertions are on the real files, because the failure they prevent is a
+ * per-node database that silently diverges (a write on node A invisible on node B). */
+test('REGRESSION on the real cluster/local files: every node shares ONE postgres DB', () => {
+  const fsmod = require('node:fs');
+  const pathmod = require('node:path');
+  for (const f of ['docker-compose.cluster.yml', 'docker-compose.local.yml']) {
+    const file = pathmod.resolve(__dirname, '..', 'environment', f);
+    const text = fsmod.readFileSync(file, 'utf8');
+    const anchors = collectAnchors(text);
+    const urls = {};
+    for (const [name, block] of serviceBlocks(text)) {
+      if (!/^hydra-/.test(name)) continue;
+      urls[name] = envValue(block, 'HYDRA_DB_URL', anchors);
+    }
+    const names = Object.keys(urls).sort();
+    assert.equal(names.length, 3, `${f}: expected three members, got ${names.join(', ')}`);
+    assert.equal(
+      new Set(Object.values(urls)).size,
+      1,
+      `${f}: every member must carry the SAME HYDRA_DB_URL, got ${JSON.stringify(urls)}`,
+    );
+    assert.match(Object.values(urls)[0], /^postgres(ql)?:\/\//, `${f}: the default backend is postgres`);
+    for (const url of Object.values(urls)) assert.doesNotMatch(url, /^sqlite:/, `${f}: SQLite is retired`);
+  }
+});
+
+test('the shipped postgres/mysql services declare a database readiness probe', () => {
+  const fsmod = require('node:fs');
+  const pathmod = require('node:path');
+  for (const f of ['docker-compose.yml', 'docker-compose.cluster.yml', 'docker-compose.local.yml']) {
+    const text = fsmod.readFileSync(pathmod.resolve(__dirname, '..', 'environment', f), 'utf8');
+    const blocks = serviceBlocks(text);
+    for (const name of ['postgres', 'mysql']) {
+      const block = blocks.get(name);
+      if (!block) continue; // mysql is a profile/alternative in two files
+      assert.ok(hasOwnKey(block, 'healthcheck'), `${f} · ${name}: no healthcheck`);
+      assert.match(healthcheckTest(block) || '', name === 'postgres' ? /pg_isready/ : /mysqladmin ping/, `${f} · ${name}: wrong readiness probe`);
+    }
+  }
 });
 
 /* Round 156: a value at the service's OWN level that is interpolated (`stop_grace_period: ${VAR:-30s}`)

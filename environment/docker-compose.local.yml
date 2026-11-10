@@ -6,12 +6,18 @@
 #
 # What is real here:
 #   * the upstream LLM is the REAL SiliconFlow API (no mock LLM);
-#   * redis and clickhouse are the real services;
-#   * three real Hydra processes, ALL IDENTICAL raft members (ADR-0001: no leader/edge split)
-#     over a real Redis backbone, with ClickHouse usage metering.
+#   * redis, clickhouse and postgres are the real services;
+#   * three real Hydra processes, ALL IDENTICAL nodes over a real Redis backbone, sharing ONE
+#     PostgreSQL config database, with ClickHouse usage metering. Config authority is the relational
+#     database; there is no raft control plane/leader.
 # Hydra authenticates client api-keys INTERNALLY (no auth_url hop). The local mock-llm
 # below is the upstream stand-in used by the stability drills; no external auth service
 # is needed.
+#
+# Database credentials in this file (`hydra/hydra`, database `hydra`) are LOCAL defaults.
+# The default backend is PostgreSQL; a MySQL 8 service is present for the mysql variant
+# (`DB_BACKEND=mysql ./environment/release.sh`, then switch every node's HYDRA_DB_URL to
+# `mysql://hydra:hydra@mysql:3306/hydra` and add `--profile mysql`).
 #
 # One small image is built from the repo Dockerfile (environment/Dockerfile),
 # which COPYs the staged ./bin/hydra and installs ca-certificates + tini. An
@@ -23,14 +29,14 @@
 # BUILDX_CONFIG are redirected into the workspace because ~/.docker is not
 # writable here.
 #
-#   build:  ./environment/release.sh      # builds the FULL feature set
+#   build:  ./environment/release.sh      # postgres (default) full feature set
+#           DB_BACKEND=mysql ./environment/release.sh   # mysql variant
 #           mkdir -p bin && cp -f target/release/hydra bin/hydra
 #           DOCKER_CONFIG=$PWD/.docker BUILDX_CONFIG=$PWD/.buildx \
 #             docker build -t hydra-local:latest -f environment/Dockerfile .
 #
-# A build WITHOUT the `arachne` feature REFUSES to boot once HYDRA_CLUSTER_PEERS is set
-# (main.rs), so a binary from a narrower recipe can never join the cluster this file
-# declares. `scripts/check_compose_env.cjs` derives that requirement from this file.
+# Cluster mode is enabled by `HYDRA_REDIS_URL`; there is no static member list or raft transport.
+# `scripts/check_compose_env.cjs` derives the feature set from this file.
 #
 # Environment/Dockerfile is unchanged from the repo: it expects the binary
 # staged at bin/hydra and already sets ENTRYPOINT tini + hydra and USER hydra.
@@ -46,7 +52,7 @@
 name: hydra-local
 
 services:
-  # ── Hydra node A - raft member (identical to node B and node C) ────────────
+  # ── Hydra node A - identical to the other two ────────────
   hydra-a:
     image: hydra-local:latest
     container_name: hydra-a
@@ -65,17 +71,13 @@ services:
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
-      # ADR-0001: the member list IS the cluster, and its ORDER is the cluster's identity
-      # (raft ids are positional). Same string on all three nodes.
-      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-a"
-      HYDRA_ARACHNE_LISTEN: "172.28.0.11:8091"
-      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
-      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
+      # ONE shared config DB for all three nodes (same URL on every node).
+      HYDRA_DB_URL: "postgres://hydra:hydra@postgres:5432/hydra"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       # Bound every Redis command: a stalled Redis degrades instead of hanging
@@ -83,19 +85,16 @@ services:
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
-      # Scale-test envelope (test env only): 25k users + 100k keys + 25k roles (150k rows).
-      HYDRA_MAX_USERS_PER_TENANT: "30000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "120000"
+      # Scale-test envelope (test env only): 35k users + 140k keys + 35k roles (210k rows).
+      HYDRA_MAX_USERS_PER_TENANT: "40000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "150000"
       HYDRA_MAX_HIERARCHY_ROWS: "300000"
-      # Test-only: the 150k ladder needs 256 MiB; production keeps the 64 MiB LAN preset.
-      HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB: "256"
       RUST_LOG: "info"
-    volumes:
-      - hydra-a-data:/app/data
     ports:
       - "127.0.0.1:8080:8080"   # proxy entry (data plane)
       - "127.0.0.1:8081:8081"   # admin REST + UI + /metrics
     depends_on:
+      postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
       mock-llm: { condition: service_healthy }
@@ -106,7 +105,7 @@ services:
       retries: 6
       start_period: 20s
 
-  # ── Hydra node B - raft member (identical to node A and node C) ────────────
+  # ── Hydra node B - identical to the other two ────────────
   hydra-b:
     image: hydra-local:latest
     container_name: hydra-b
@@ -125,33 +124,28 @@ services:
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
-      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-b"
-      HYDRA_ARACHNE_LISTEN: "172.28.0.12:8092"
-      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
-      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
+      # ONE shared config DB for all three nodes (same URL on every node).
+      HYDRA_DB_URL: "postgres://hydra:hydra@postgres:5432/hydra"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
-      # Scale-test envelope (test env only): 25k users + 100k keys + 25k roles (150k rows).
-      HYDRA_MAX_USERS_PER_TENANT: "30000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "120000"
+      # Scale-test envelope (test env only): 35k users + 140k keys + 35k roles (210k rows).
+      HYDRA_MAX_USERS_PER_TENANT: "40000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "150000"
       HYDRA_MAX_HIERARCHY_ROWS: "300000"
-      # Test-only: the 150k ladder needs 256 MiB; production keeps the 64 MiB LAN preset.
-      HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB: "256"
       RUST_LOG: "info"
-    volumes:
-      - hydra-b-data:/app/data
     ports:
       - "127.0.0.1:8083:8080"
       - "127.0.0.1:8082:8081"
     depends_on:
+      postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
       mock-llm: { condition: service_healthy }
@@ -162,7 +156,7 @@ services:
       retries: 6
       start_period: 20s
 
-  # ── Hydra node C - raft member (identical to node A and node B) ────────────
+  # ── Hydra node C - identical to the other two ────────────
   hydra-c:
     image: hydra-local:latest
     container_name: hydra-c
@@ -181,25 +175,22 @@ services:
     restart: unless-stopped
     env_file: [../secure/local-test.env]
     environment:
-      HYDRA_CLUSTER_PEERS: "node-a=172.28.0.11:8091,node-b=172.28.0.12:8092,node-c=172.28.0.13:8093"
       HYDRA_NODE_ID: "node-c"
-      HYDRA_ARACHNE_LISTEN: "172.28.0.13:8093"
-      HYDRA_ARACHNE_DATA_DIR: "/app/data/arachne"
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: "single"
       HYDRA_USAGE_SINK: "clickhouse"
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      # ONE shared config DB for all three nodes (same URL on every node).
+      HYDRA_DB_URL: "postgres://hydra:hydra@postgres:5432/hydra"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_REDIS_COMMAND_TIMEOUT_MS: "500"
       # Test-only: the bulk CRUD drill is intentionally far above the default 60/min tenant budget.
       HYDRA_TENANT_API_RATE_LIMIT_PER_MIN: "100000"
-      # Scale-test envelope (test env only): 25k users + 100k keys + 25k roles (150k rows).
-      HYDRA_MAX_USERS_PER_TENANT: "30000"
-      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "120000"
+      # Scale-test envelope (test env only): 35k users + 140k keys + 35k roles (210k rows).
+      HYDRA_MAX_USERS_PER_TENANT: "40000"
+      HYDRA_MAX_USER_API_KEYS_PER_TENANT: "150000"
       HYDRA_MAX_HIERARCHY_ROWS: "300000"
-      # Test-only: the 150k ladder needs 256 MiB; production keeps the 64 MiB LAN preset.
-      HYDRA_ARACHNE_SNAPSHOT_THRESHOLD_MB: "256"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8090:8080"   # client traffic enters here (any node can serve it)
@@ -209,9 +200,8 @@ services:
       # ADR-0001 deleted that role, and a container built before the change still
       # answers /metrics 200 with no token — a stale local stack, not the contract.)
       - "127.0.0.1:8084:8081"
-    volumes:
-      - hydra-c-data:/app/data
     depends_on:
+      postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       clickhouse-init: { condition: service_completed_successfully }
       mock-llm: { condition: service_healthy }
@@ -259,6 +249,55 @@ services:
       interval: 5s
       timeout: 2s
       retries: 10
+    restart: unless-stopped
+
+  # ── Shared relational config database (DEFAULT backend: PostgreSQL 16) ──────
+  # All three Hydra nodes point at this ONE database (same HYDRA_DB_URL), so a
+  # write through any node's admin API is visible to the other two.
+  # Endpoint for `cargo test`/the drills: HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:5432/hydra
+  postgres:
+    image: postgres:16-alpine
+    container_name: hydra-local-postgres
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra
+      POSTGRES_DB: hydra
+    ports:
+      - "127.0.0.1:5432:5432"   # loopback only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── MySQL 8 alternative (opt-in: `--profile mysql`) ────────────────────────
+  # Build with DB_BACKEND=mysql, point every node's HYDRA_DB_URL at
+  # mysql://hydra:hydra@mysql:3306/hydra, and start with `--profile mysql`.
+  # Endpoint for tests: HYDRA_TEST_DATABASE_URL=mysql://root:root@127.0.0.1:3306/hydra
+  mysql:
+    image: mysql:8
+    container_name: hydra-local-mysql
+    profiles: ["mysql"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: hydra
+      MYSQL_USER: hydra
+      MYSQL_PASSWORD: hydra
+    ports:
+      - "127.0.0.1:3306:3306"   # loopback only
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uhydra -phydra --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
     restart: unless-stopped
 
   # ── Usage metering store (cluster mode REQUIRES HYDRA_USAGE_SINK=clickhouse) ─
@@ -386,8 +425,7 @@ networks:
         - subnet: 172.28.0.0/24
 
 volumes:
-  hydra-a-data:
-  hydra-b-data:
-  hydra-c-data:
+  postgres-data:
+  mysql-data:
   redis-data:
   clickhouse-data:

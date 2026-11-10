@@ -53,6 +53,8 @@ const WORKFLOW = path.join(ROOT, process.env.CGE_WORKFLOW || '.github/workflows/
 const GATE = path.join(ROOT, process.env.HYDRA_WIRING_GATE || path.join('.acceptance', 'round10-gate.sh'));
 // The documented precondition, as the drills spell it in their headers.
 const BUILD_RE = /cargo build -p hydra-server[^\n]*--bin hydra/;
+// Phase 2: exactly ONE relational backend is compiled into every hydra-server build/test.
+const DB_FEATURES = ['db-postgres', 'db-mysql'];
 // Floors, all measured 2026-10-05 against the tracked workflow and set BELOW the measurement with
 // margin (a floor equal to the measurement reddens on any legitimate consolidation — the
 // `MIN_E2E_SPECS` lesson). Measured: 129 steps with a `run:` block, 4 judged preconditions, 40 steps
@@ -153,6 +155,25 @@ function readsPrebuiltBinary(text) {
 /** The rules every entry source shares: build-what-you-run, no `;`-build, no swallowed verdict. */
 function judgeEntries(entries, src, problems, counters) {
   for (const e of entries) {
+    // Phase 2: a hydra-server build/test must name exactly one relational backend
+    // (`db/backend.rs` refuses neither or both). Checked on every `--features` list, so a
+    // multi-line `cargo test … \` continuation is judged too.
+    for (const m of e.command.matchAll(/--features\s+(?:["']?)([^"'\s\\]+)/g)) {
+      const features = m[1].split(',').map((f) => f.trim().replace(/^.*\//, '')).filter(Boolean);
+      if (!features.some((f) => f === 'server' || f === 'proxy' || f.startsWith('tls-'))) continue;
+      const backends = DB_FEATURES.filter((b) => features.includes(b));
+      if (backends.length === 0) {
+        problems.push(
+          `entry "${e.name}" (line ${e.line}) builds hydra-server with NO database backend — ` +
+            `enable exactly one of ${DB_FEATURES.join(' / ')} (db/backend.rs refuses to compile)`,
+        );
+      } else if (backends.length > 1) {
+        problems.push(
+          `entry "${e.name}" (line ${e.line}) selects ${backends.join(' AND ')} — the database ` +
+            'backends are mutually exclusive',
+        );
+      }
+    }
     for (const n of src.keys()) {
       if (!e.command.includes(n)) continue;
       const drill = src.get(n);

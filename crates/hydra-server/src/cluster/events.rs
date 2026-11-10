@@ -1,9 +1,9 @@
 //! # Invalidation bus (cluster P4)
 //!
 //! Invalidation events travel as **Redis Streams** entries
-//! (`hydra:{ctl:events}`), so every node (edge AND leader) can track whether it
-//! has acknowledged them — and, unlike a leader-held buffer, the stream
-//! **survives leader failover** (it lives in Redis, not in a leader's memory).
+//! (`hydra:{ctl:events}`), so every node can track whether it has acknowledged
+//! them — and, unlike the retired leader-held buffer, the stream **survives any
+//! node's failure** (it lives in Redis, not in one node's memory).
 //! Consumers track their last-read id and publish that position as a per-node
 //! applied watermark. A background trim keeps the stream bounded to `maxlen`;
 //! when a trim removes entries the `generation` counter (`hydra:{ctl:gen}`) is
@@ -155,9 +155,9 @@ impl FleetReport {
 
     /// No stream at all: this node's own event is the whole answer. Only
     /// reachable for the single-node `all` role — `main` refuses to start a
-    /// `leader`/`edge` without a Redis backbone, so "cluster member with no
-    /// channel" cannot occur, and a stream that exists but fails is
-    /// `unavailable` (503), not this.
+    /// cluster node without a Redis backbone, so "cluster member with no channel"
+    /// cannot occur, and a stream that exists but fails is `unavailable` (503),
+    /// not this.
     #[must_use]
     pub fn single_node() -> Self {
         Self {

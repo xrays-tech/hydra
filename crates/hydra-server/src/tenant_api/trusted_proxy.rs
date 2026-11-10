@@ -3,7 +3,7 @@
 //! ## Why this exists (design §5.1, C)
 //!
 //! The per-IP auth-failure lockout keys on the caller's source IP. In the
-//! documented **LB→edge** topology every tenant shares the load balancer's
+//! documented **LB→gateway** topology every tenant shares the load balancer's
 //! egress IP, so the "source IP" is really the LB — and a single tenant's ~11
 //! bad tokens black out the whole tenant API for the lockout window, renewable.
 //!

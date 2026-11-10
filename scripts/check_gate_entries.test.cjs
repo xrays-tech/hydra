@@ -17,7 +17,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const GUARD = path.join(__dirname, 'check_gate_entries.cjs');
-const DOC_LINE = '#   cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra\n';
+const DOC_LINE = '#   cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra\n';
 
 /** A fixture tree: a WORKFLOW, a gate script, and integration drills.
  *
@@ -81,7 +81,7 @@ test('an entry that runs a documenting drill WITHOUT building the binary is drif
 
 test('CONTROL: the same entry WITH the build passes', () => {
   const root = fixture({
-    entry: 'gate "cluster thing" bash -c \'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    entry: 'gate "cluster thing" bash -c \'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'',
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
@@ -107,7 +107,7 @@ test('a gate script that prints RED but does not RETURN its verdict is drift', (
 
 test('the judged floor refuses to pass when the rule reaches almost nothing', () => {
   const root = fixture({
-    entry: 'gate "cluster thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    entry: 'gate "cluster thing" bash -c \'cargo build -p hydra-server --features server,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'',
   });
   const r = run(root, { CGE_MIN_JUDGED: '9' });
   assert.equal(r.status, 2, `status=${r.status} ${r.out}`);
@@ -169,7 +169,7 @@ test('CONTROL: an earlier entry that builds the binary is enough', () => {
   const root = fixture({
     entry: 'gate "tenant thing" python3 integration/test_doc.py',
     drill: BIN_DRILL,
-    extraEntries: 'gate "build the binary under test" cargo build -p hydra-server --features server --bin hydra\n',
+    extraEntries: 'gate "build the binary under test" cargo build -p hydra-server --features server,db-postgres --bin hydra\n',
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
@@ -178,7 +178,7 @@ test('CONTROL: an earlier entry that builds the binary is enough', () => {
 
 test('CONTROL: an entry that builds the binary itself is enough', () => {
   const root = fixture({
-    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'',
     drill: BIN_DRILL,
   });
   const r = run(root);
@@ -195,7 +195,7 @@ test('CONTROL: a drill that does NOT start the prebuilt binary is not judged', (
 
 test('the binary-dependency floor refuses to pass when the rule reaches nothing', () => {
   const root = fixture({
-    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'',
     drill: BIN_DRILL,
   });
   const r = run(root, { CGE_MIN_BINARY_DEPS: '9' });
@@ -212,7 +212,7 @@ test('the OK line reports the self-build/inherit split (inheriting entry)', () =
   const root = fixture({
     entry: 'gate "tenant thing" python3 integration/test_doc.py',
     drill: BIN_DRILL,
-    extraEntries: 'gate "build the binary under test" cargo build -p hydra-server --features server --bin hydra\n',
+    extraEntries: 'gate "build the binary under test" cargo build -p hydra-server --features server,db-postgres --bin hydra\n',
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
@@ -221,7 +221,7 @@ test('the OK line reports the self-build/inherit split (inheriting entry)', () =
 
 test('the OK line reports the self-build/inherit split (self-building entry)', () => {
   const root = fixture({
-    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'',
     drill: BIN_DRILL,
   });
   const r = run(root);
@@ -236,7 +236,7 @@ test('CONTROL: the split counts both shapes in one run', () => {
   const root = fixture({
     entry: 'gate "tenant second" python3 integration/test_doc.py',
     drill: BIN_DRILL,
-    extraEntries: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'\n',
+    extraEntries: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-postgres --bin hydra >/dev/null && python3 integration/test_doc.py\'\n',
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
@@ -266,7 +266,7 @@ test('the CI condition passes: workflow present, gitignored gate script ABSENT',
   fs.writeFileSync(path.join(root, 'integration', 'test_doc.py'), DOC_LINE + 'print("ok")\n');
   fs.writeFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), cleanWorkflow(
     '      - name: builds and runs\n' +
-    '        run: cargo build -p hydra-server --features server --bin hydra && python3 integration/test_doc.py\n'));
+    '        run: cargo build -p hydra-server --features server,db-postgres --bin hydra && python3 integration/test_doc.py\n'));
   const r = run(root);
   assert.equal(r.status, 0, `status=${r.status} ${r.out}`);
   assert.match(r.out, /1 drill\(s\) DOCUMENT a build/);
@@ -353,4 +353,37 @@ test('CONTROL: a column-zero double-quoted entry is parsed (no completeness find
   const r = run(root);
   assert.equal(r.status, 0, r.out);
   assert.doesNotMatch(r.out, /looks like a gate entry/);
+});
+
+/* Phase 2d: the relational backend is compile-time selected; an entry that builds hydra-server
+ * without one is a build that cannot compile (db/backend.rs compile_error!), and one with both is
+ * likewise refused. */
+test('FALSIFY: an entry building hydra-server with no database backend is drift', () => {
+  const root = fixture({
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    drill: BIN_DRILL,
+  });
+  const r = run(root);
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /NO database backend/);
+  assert.match(r.out, /db-postgres \/ db-mysql/);
+});
+
+test('FALSIFY: an entry selecting BOTH database backends is drift', () => {
+  const root = fixture({
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-postgres,db-mysql --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    drill: BIN_DRILL,
+  });
+  const r = run(root);
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /selects db-postgres AND db-mysql/);
+});
+
+test('CONTROL: an entry with exactly one database backend passes', () => {
+  const root = fixture({
+    entry: 'gate "tenant thing" bash -c \'cargo build -p hydra-server --features server,db-mysql --bin hydra >/dev/null && python3 integration/test_doc.py\'',
+    drill: BIN_DRILL,
+  });
+  const r = run(root);
+  assert.equal(r.status, 0, r.out);
 });

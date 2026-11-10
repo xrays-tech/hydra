@@ -24,13 +24,16 @@
  *      A new call site belongs in the shared builder (`build_pool` / `build_pool_with`).
  *   R2 no `None` policy: in that file the 4th argument of every `Pool::new(` call is `Some(`.
  *      (`None` is the defect itself; it is invisible until Redis actually goes away.)
+ *   R3 the config-bus channel seam (`spawn_config_watch_on` / `with_channel`) is TEST-ONLY:
+ *      no `crates/hydra-server/src/**` caller outside `cluster/config_bus.rs`, and `main.rs`
+ *      uses the fixed-channel wrappers (`spawn_config_watch` / `RedisConfigNotifier::new`).
  *
  * The 4th argument is located by taking the argument list of the call and splitting it at
  * top level on commas — not by a regex over the whole file, because the call spans lines and
  * its arguments contain nested parens.
  *
- * Exit codes: 0 clean, 1 a violation, 2 CANNOT VERIFY (the owner file is missing or has no
- * `Pool::new` call at all — a scan that matches nothing is not a pass).
+ * Exit codes: 0 clean, 1 a violation, 2 CANNOT VERIFY (the owner file or `config_bus.rs` is missing,
+ * or the owner has no `Pool::new` call at all — a scan that matches nothing is not a pass).
  */
 const fs = require('fs');
 const path = require('path');
@@ -103,6 +106,66 @@ function splitArgs(text) {
   const tail = text.slice(start).trim();
   if (tail) args.push(tail);
   return args;
+}
+
+
+// ---------------------------------------------------------------------------
+// R3 — the config-bus channel seam stays TEST-ONLY
+// ---------------------------------------------------------------------------
+//
+// `RedisConfigNotifier::with_channel` and `spawn_config_watch_on` exist so
+// integration tests can run in parallel: Redis pub/sub is SERVER-GLOBAL, so two
+// tests sharing `CHANNEL` would consume each other's messages. Production must
+// use the fixed-channel wrappers (`RedisConfigNotifier::new` /
+// `spawn_config_watch`), which are the only call sites that know the real
+// channel. A production caller of a `_on`/`with_channel` variant would silently
+// subscribe to a channel nothing publishes on, or publish somewhere no watcher
+// listens. `config_bus.rs` itself is exempt (it defines both and unit-tests them).
+const CONFIG_BUS = 'crates/hydra-server/src/cluster/config_bus.rs';
+const MAIN = 'crates/hydra-server/src/main.rs';
+
+function configBusSeamViolations() {
+  const root = path.resolve(CRATES, 'hydra-server/src');
+  const bus = path.resolve(CRATES, 'hydra-server/src/cluster/config_bus.rs');
+  const main = path.resolve(CRATES, 'hydra-server/src/main.rs');
+  if (!fs.existsSync(root)) return { scanned: 0, violations: [] };
+  if (!fs.existsSync(bus)) {
+    return {
+      scanned: 0,
+      cannotVerify: `${CONFIG_BUS} is missing; the config-bus seam cannot be checked`,
+      violations: [],
+    };
+  }
+  const violations = [];
+  let scanned = 0;
+  for (const file of rustFiles(root)) {
+    const rel = path.relative(ROOT, file);
+    const src = fs.readFileSync(file, 'utf8');
+    const code = blankCommentsAndStrings(src);
+    scanned += 1;
+    if (path.resolve(file) === path.resolve(bus)) continue;
+    for (const [re, name, replacement] of [
+      [/\bspawn_config_watch_on\b/g, 'spawn_config_watch_on', 'spawn_config_watch'],
+      [/\bwith_channel\s*\(/g, 'with_channel', 'RedisConfigNotifier::new'],
+    ]) {
+      for (const m of code.matchAll(re)) {
+        violations.push(
+          `${rel}:${lineOf(code, m.index)}: production code calls the test-only ` +
+            `\`${name}\` seam — use \`${replacement}\` so the fixed \`CHANNEL\` is used`
+        );
+      }
+    }
+  }
+  if (fs.existsSync(main)) {
+    const code = blankCommentsAndStrings(fs.readFileSync(main, 'utf8'));
+    if (!/\bspawn_config_watch\s*\(/.test(code)) {
+      violations.push(`${MAIN}: must start the watcher through \`spawn_config_watch\` (fixed channel)`);
+    }
+    if (!/\bRedisConfigNotifier::new\s*\(/.test(code)) {
+      violations.push(`${MAIN}: must construct \`RedisConfigNotifier::new\` (fixed channel)`);
+    }
+  }
+  return { scanned, violations };
 }
 
 /** Line number (1-based) of an offset in `src`. */
@@ -251,6 +314,9 @@ function main() {
     }
   }
 
+  const seam = configBusSeamViolations();
+  violations.push(...seam.violations);
+
   // Violations are reported FIRST: a tree whose owner lost its call but which has a call
   // elsewhere must fail as a violation, not dissolve into "cannot verify" (the first version
   // of this script hid exactly that case behind the exit-2 branch).
@@ -265,9 +331,13 @@ function main() {
         `nothing, which is not the same as "everything is fine"`);
     process.exit(2);
   }
+  if (seam.cannotVerify) {
+    console.error(`[redis-pool] CANNOT VERIFY: ${seam.cannotVerify}`);
+    process.exit(2);
+  }
   console.log(
     `OK  (one \`Pool::new\` call, in ${OWNER}, with a non-\`None\` reconnect policy; ` +
-      `${scanned} Rust file(s) scanned)`);
+      `config-bus seam clean over ${seam.scanned} src file(s); ${scanned} Rust file(s) scanned)`);
   return 0;
 }
 

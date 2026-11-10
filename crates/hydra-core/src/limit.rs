@@ -29,7 +29,7 @@ pub struct MatchCtx<'a> {
     /// built with `api_key: mask_key(<presented key>)` alone, so a role whose `matching_key` was the
     /// RAW key — the form `design.md` §10.1 describes ("NULL **or equal to** the client api-key")
     /// and the form an operator copies out of their own inventory — **never fired**: four requests,
-    /// all `200`, on both a leader and an edge. Only the mask matched, which is not documented
+    /// all `200`, on both roles that existed then (leader and edge). Only the mask matched, which is not documented
     /// anywhere and has no documented way to be obtained.
     ///
     /// Matching now accepts **either** form, which is deliberately the non-breaking direction: every

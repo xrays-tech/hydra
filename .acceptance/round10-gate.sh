@@ -14,7 +14,9 @@
 # `pkill -f cargo`, whose pattern also matches the command line you typed it in (it killed the
 # shell that was about to move the log out of the way).
 cd /home/alex/Projects/hydra
-export SQLX_OFFLINE=true
+# Phase 2: there is no SQLx offline cache (`.sqlx/` is gone); every statement is runtime-built.
+# The test harness creates a schema/database per test from this admin-capable URL.
+export HYDRA_TEST_DATABASE_URL="${HYDRA_TEST_DATABASE_URL:-postgres://hydra:hydra@127.0.0.1:5432/hydra}"
 export HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380
 export CH_URL=http://127.0.0.1:8123
 LOG=".acceptance/round10-gate.log"
@@ -39,54 +41,40 @@ gate() {
 # the very files they check; only a human re-reading the transcript could tell.
 gate "tree manifest (record)"           node scripts/tree_manifest.cjs --write .acceptance/gate-manifest.txt
 gate "fmt --check"                     cargo fmt --check
-gate "clippy server (CI check job)"    cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
-gate "clippy optional (CI job)"        cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse -- -D warnings
-gate "clippy tls-openssl (new CI job)" cargo clippy --workspace --all-targets --features hydra-server/tls-openssl -- -D warnings
+gate "clippy server (CI check job)"    cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/db-postgres -- -D warnings
+gate "clippy optional (CI job)"        cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres -- -D warnings
+gate "clippy tls-openssl (new CI job)" cargo clippy --workspace --all-targets --features hydra-server/tls-openssl,hydra-server/db-postgres -- -D warnings
 # The `alt-features` job's second combination. Documented as a supported build
 # ("must build standalone") and it did NOT compile until round 15.
-gate "clippy proxy-only (CI alt-features)" cargo clippy --workspace --all-targets --features hydra-server/proxy -- -D warnings
+gate "clippy proxy-only (CI alt-features)" cargo clippy --workspace --all-targets --features hydra-server/proxy,hydra-server/db-postgres -- -D warnings
 # `set -o pipefail` is mandatory in these two: the transcripts feed the public-
 # claims check below, but a plain `cargo test | tee` would report TEE's exit
 # code and hide a failing suite — the same swallowing this gate exists to stop.
 gate "test hydra-core"                 bash -c 'set -o pipefail; cargo test -p hydra-core 2>&1 | tee .acceptance/round10-gate-core.log'
-gate "test hydra-server (server)"      bash -c 'set -o pipefail; cargo test -p hydra-server --features server 2>&1 | tee .acceptance/round10-gate-server.log'
+gate "test hydra-server (server)"      bash -c 'set -o pipefail; cargo test -p hydra-server --features server,db-postgres 2>&1 | tee .acceptance/round10-gate-server.log'
 # `--no-fail-fast` is NOT optional here. Without it `cargo test` stops launching
 # further test binaries after the first failing one, so the suite reported
 # "299 passed" while the real total is 644 — every binary after the failure would
 # be silently skipped, which is the same class of lie as the exit-code swallowing
 # above (a test that never runs looks a lot like a test that passes).
-gate "test optional + live redis/CH"   cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --no-fail-fast
-# The arachne control-plane Rust tests. They are `#![cfg(feature = "arachne")]`, so EVERY other
-# entry here (and every CI job except `live-deps`) compiles them EMPTY: "the file exists" never
-# meant "it runs", and nothing enforced the difference until 2026-10-08. This entry mirrors the CI
-# step of the same name (`.github/workflows/ci.yml`, first step of `live-deps`, before the drills
-# because several of these tests bind real loopback ports near the drills').
-#
-# `--lib` added in round 210, for the same reason one level deeper: the `--test` list below covers the
-# INTEGRATION targets, while `crates/hydra-server/src/cluster/`'s own `#[cfg(test)] mod tests` (the
-# entity codec, the key space, the store) were executed by NO entry in this gate and NO step in CI —
-# `--features server` compiles that module out, so the entries that "run the server tests" never saw
-# them. Measured before adding it: `cargo test -p hydra-server --features server,cluster-redis,arachne
-# --lib` is 278 passed / 0 failed. The `--test` list stays (it pins the port-binding order); `--lib`
-# joins it in the same entry, because both need exactly this feature set.
-gate "arachne rust tests (in-process)"  cargo test -p hydra-server --features server,cluster-redis,arachne --lib --test arachne_adoption --test arachne_alive_partition --test arachne_cluster --test arachne_leader_watch --test arachne_store --test arachne_three_nodes --test arachne_cert_fidelity --test arachne_derivation_fidelity
+gate "test optional + live redis/CH"   cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --no-fail-fast
 # `#[ignore]`d tests: no CI job ran them before round 15, and the only carrier was
 # a script outside version control. This one needs no service.
-gate "ignored: listener limitation"     cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test boot_listeners -- --ignored
+gate "ignored: listener limitation"     cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --test boot_listeners -- --ignored
 # The ClickHouse end-to-end tests. They run in CI's `live-deps` job (service
 # container + `init.sql` applied and asserted); locally they need the CH_URL
 # exported above. Leaving them out of the local gate is how the only e2e coverage
 # for retry-idempotency went unrun for months.
-gate "ignored: clickhouse e2e"          cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse --test clickhouse_sink --test usage_query -- --ignored
+gate "ignored: clickhouse e2e"          cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --test clickhouse_sink --test usage_query -- --ignored
 # The BINARY UNDER TEST, built once up front — the same command CI's `integration` job runs before
-# its first drill (`ci.yml`: `cargo build -p hydra-server --features server --bin hydra`).
+# its first drill (`ci.yml`: `cargo build -p hydra-server --features server,db-postgres --bin hydra`).
 # Measured 2026-09-30: 38 entries run a drill that starts `target/debug/hydra`; 9 of them build it
 # themselves and the rest run BEFORE the first build of the file (line ~140), so they inherited
 # whatever binary the preceding cargo command happened to leave — feature-poor in the round-143
 # incident, and simply absent on a fresh checkout. `check_gate_entries.cjs` now enforces the rule
 # this entry satisfies: an entry running such a drill must build the binary itself or follow one that
 # does. Drills that declare cluster features still build their own (also as in CI).
-gate "build the binary under test"      cargo build -p hydra-server --features server --bin hydra
+gate "build the binary under test"      cargo build -p hydra-server --features server,db-postgres --bin hydra
 # The compose files are deliverables and nothing validated them.
 # Same split as CI: the two official stacks always, the LOCAL one only when its
 # (gitignored) env_file is present — `docker compose config` exits 1 for a missing
@@ -108,11 +96,6 @@ gate "test tail checker tests"         node --test scripts/check_test_tails.test
 # The gate's OWN entries: a drill must not depend on what another entry happened to build.
 gate "gate entries build what they run" node scripts/check_gate_entries.cjs
 gate "gate entry checker tests"        node --test scripts/check_gate_entries.test.cjs
-# Every tests/arachne_*.rs must be NAMED in the explicit --test lists (workflow + this script):
-# an unnamed integration file is compiled but never executed, so a green gate would not be
-# evidence about it (2026-10-10 F1: arachne_adoption.rs missed both lists).
-gate "arachne test wiring"             node scripts/check_arachne_test_wiring.cjs
-gate "arachne wiring tests"            node --test scripts/check_arachne_test_wiring.test.cjs
 gate "ci wiring"                       node scripts/check_ci_wiring.cjs
 gate "ci wiring tests"                  node --test scripts/check_ci_wiring.test.cjs
 # The shared JS masker: a backtick inside a REGEX literal used to blank 74% of a real guard
@@ -187,17 +170,17 @@ gate "trusted-proxy keying"            python3 integration/test_trusted_proxies.
 # itself, exactly like the CI step for the same drill. This is the round-143 lesson applied to
 # FEATURES as well as to ordering: a drill must not inherit whatever binary the previous entry
 # happened to leave.
-gate "tenant API limits"               bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_tenant_api_limits.py'
+gate "tenant API limits"               bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_tenant_api_limits.py'
 # The external tenant contract: routes, the 405-vs-404 rule, envelope + trace id, identity,
 # idempotency, parameter validation.
-gate "tenant API contract"             bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_tenant_api_contract.py'
+gate "tenant API contract"             bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_tenant_api_contract.py'
 # §7 boundaries: suspended tenant (recovery path), prefix invalidation silent no-op,
 # no tenant_id query parameter, empty window, and the two different error envelopes.
-gate "tenant API boundaries"           bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_tenant_api_boundaries.py'
+gate "tenant API boundaries"           bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_tenant_api_boundaries.py'
 # The SSE path: incremental delivery, the stream idle bound + its §9.1 metric, mid-stream
 # death + its metric, and metering of streamed requests (the metering leg is why it needs the
 # feature above).
-gate "streaming path (SSE)"            bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_streaming_path.py'
+gate "streaming path (SSE)"            bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_streaming_path.py'
 # The breaker's documented workflow: trip -> dead-set + skip counter -> manual reset -> recover.
 gate "circuit breaker lifecycle"       python3 integration/test_breaker_lifecycle.py
 # limit_roles enforcement: count/token ceilings, the documented Retry-After, scoping,
@@ -213,12 +196,12 @@ gate "sub-tenant steering"             python3 integration/test_sub_tenant_steer
 # body (not param_* — that is the reader's form), a path in the URL trimmed rather than glued
 # to the port (the 2026-09-30 fix), and a 500 that never breaks the client. The sink needs the
 # `usage-clickhouse` feature compiled in, so build that set first.
-gate "clickhouse sink wire format"     bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_clickhouse_sink_wire.py'
+gate "clickhouse sink wire format"     bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_clickhouse_sink_wire.py'
 # The tenant API's usage READER over ClickHouse (the same mock-only property): §5.3's
 # string-encoded counters, the bound `param_*` window, grouped reads as a second query, the
 # empty-window `""` -> `as_of: null`, and every unreadable-store shape as an attributed 503
 # rather than a zeroed 200.
-gate "tenant usage read over CH"       bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse --bin hydra >/dev/null && python3 integration/test_usage_query_wire.py'
+gate "tenant usage read over CH"       bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && python3 integration/test_usage_query_wire.py'
 # A dead route (never-completing connect) must FAIL OVER, not surface as 502: the connect
 # bound turns it into a connect error; the silent-upstream contrast keeps the 502 policy.
 gate "upstream connect bound"          python3 integration/test_upstream_connect_bound.py
@@ -260,10 +243,7 @@ gate "listener signals"                python3 integration/test_listener_signals
 # per-tenant flag, and recovery.
 gate "snapshot stale"                  python3 integration/test_snapshot_stale.py
 # The two-layer auth verdict cache on a real cluster + Redis (L1, the shared L2, fleet clear).
-# `arachne` is required, as in CI: the two nodes are wired with `HYDRA_CLUSTER_PEERS`, and a build
-# without the control plane REFUSES to boot on that variable (ADR-0001) — the reason this entry sat
-# at exit 2 CANNOT VERIFY while its CI step, which already passed `arachne`, was green.
-gate "auth cache layers (L1+L2)"       bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_auth_cache_layers.py' 
+gate "auth cache layers (L1+L2)"       bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_auth_cache_layers.py'
 # What a replica must still know (enabled limit roles, token hashes, sub-tenant routes) and
 # what `matching_key` really compares against (the MASKED key — D-15 evidence).
 #
@@ -274,21 +254,12 @@ gate "auth cache layers (L1+L2)"       bash -c 'cargo build -p hydra-server --fe
 # left them testing a feature-poor binary — both reported `CANNOT VERIFY … the binary lacks the
 # cluster features` and the gate went RED for a reason unrelated to the code. A drill must never
 # depend on what another entry happened to build.
-# "replica fidelity" RETIRED 2026-10-05: it drove the edge role and the snapshot channel, both
-# deleted by ADR-0001 T4.1 (it could only crash with `UnboundLocalError: standby`). Its coverage moved
-# to tests/arachne_derivation_fidelity.rs, tests/arachne_cert_fidelity.rs,
-# tests/arachne_three_nodes.rs + the acceptance drill's gate 4, and the D-15 mask semantics are pinned
-# by integration/test_limit_roles_enforcement.py. See the CI step's note in .github/workflows/ci.yml.
 # The tenant-write drill documents the build precondition now, so the guard's judged count is
 # unchanged (4).
 # Cluster rate limits: the SHARED count + token windows across two real nodes, the
 # hard-coded fail-open under a cut Redis (with its metric), and RECOVERY after the bus
 # returns — the leg that caught the missing fred reconnect policy (P1, 2026-09-30).
-# `arachne` for the same reason as the auth-cache entry above (the nodes carry
-# `HYDRA_CLUSTER_PEERS`), and `leader + edge` in that older sentence is retired wording.
-gate "cluster rate limits (shared+FO)"  bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_cluster_limits.py'
-gate "tenant write publish failure"     bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_tenant_write_publish_failure.py'
-gate "data plane under failover (acc 2)" bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_data_plane_failover_load.py'
+gate "cluster rate limits (shared+FO)"  bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_cluster_limits.py'
 gate "admission queue"                python3 integration/test_admission_queue.py
 # ops.md §1.4 (backup & restore): the naive `cp` of a live WAL database loses rows,
 # `VACUUM INTO` is complete, a stale -wal beside a REPLACED db refuses to boot, and a
@@ -303,19 +274,11 @@ gate "upgrade handover"                bash scripts/handover.test.sh
 # ops.md §3.1: a PUT makes the new tenant cert live with no restart; SNI picks per
 # tenant; an already-open session keeps the cert it negotiated.
 gate "cert hot-reload + SNI"           python3 integration/test_cert_reload.py
-# ARACHNE CONTROL PLANE (acceptance 1/3/4/5) — the CI step that REPLACED `test_cluster_ha.py`.
-# The old entry here ran a drill ADR-0001 deleted (`python3: can't open file
-# 'integration/test_cluster_ha.py'`), so for as long as this script kept it, the gate could never
-# be green and the Arachne drill ran in CI ONLY. Three real hydra processes, all raft members.
-gate "arachne control plane (CI live-deps)" bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_arachne_control_plane.py'
 # Startup knobs on the REAL binary (needs the cluster feature set + the 6380 test Redis):
 # a misspelt HYDRA_REDIS_MODE must refuse to start naming the value (round 191 — it used to
 # boot as `single`), and cluster wiring that a non-cluster role will NOT use must be named
 # on ALL paths that reach it, including `HYDRA_ROLE` unset (round 192 — that path was silent).
-# `arachne` is part of the set since ADR-0001: the drill wires a cluster (`HYDRA_CLUSTER_PEERS`)
-# and a build without the control plane REFUSES to boot on that variable — which is exactly how
-# this entry went red while CI's copy of the same step already passed `arachne`.
-gate "startup knobs (refuse/name)"     bash -c 'cargo build -p hydra-server --features server,cluster-redis,arachne,usage-clickhouse --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_startup_knobs.py'
+gate "startup knobs (refuse/name)"     bash -c 'cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra >/dev/null && HYDRA_TEST_REDIS_URL=redis://127.0.0.1:6380 python3 integration/test_startup_knobs.py'
 # The three SDK `--cluster` entries were RETIRED 2026-10-07, together with the CI steps they
 # mirrored: they asserted the pre-ADR-0001 world (`applied` + `event_id`, `202 pending`, "the
 # edge") while starting two PLAIN single-node instances, which correctly answer `single_node`.

@@ -47,7 +47,6 @@ async fn admin_state() -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         hydra_server::proxy::admission::AdmissionControl::new(),
-        None, // no leader gate in tests
     ))
 }
 
@@ -265,15 +264,20 @@ async fn rejects_a_blank_access_token_name() {
 #[tokio::test]
 async fn rejects_an_unknown_tenant_access_token_create() {
     let port = start_admin(admin_state().await);
-    let r = client()
-        .post(format!(
-            "http://127.0.0.1:{port}/api/v1/tenants/missing/access-tokens"
-        ))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .json(&serde_json::json!({ "name": "ci" }))
-        .send()
-        .await
-        .expect("create");
+    let r = wait_ready(|| {
+        let c = client();
+        Box::pin(async move {
+            c.post(format!(
+                "http://127.0.0.1:{port}/api/v1/tenants/missing/access-tokens"
+            ))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .json(&serde_json::json!({ "name": "ci" }))
+            .send()
+            .await
+            .ok()
+        })
+    })
+    .await;
     assert_eq!(r.status().as_u16(), 404, "got {r:?}");
     let e: serde_json::Value = r.json().await.expect("json");
     assert_eq!(e["error"]["code"], "not_found", "got {e}");

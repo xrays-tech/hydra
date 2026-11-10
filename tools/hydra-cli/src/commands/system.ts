@@ -17,13 +17,13 @@ const USAGE_ROW_COLUMNS = [
   { field: 'tokens_completion', header: 'COMPLETION', width: 12 },
 ];
 
-const CLUSTER_NODE_COLUMNS = [
+const CLUSTER_STATUS_COLUMNS = [
   { field: 'node_id', header: 'NODE', width: 18 },
   { field: 'role', header: 'ROLE', width: 10 },
-  { field: 'control_url', header: 'CONTROL_URL', width: 36 },
-  { field: 'alive', header: 'ALIVE', width: 7 },
-  { field: 'is_lease_holder', header: 'LEADER', width: 7 },
-  { field: 'is_self', header: 'SELF', width: 6 },
+  { field: 'config_version', header: 'CONFIG_VERSION', width: 14 },
+  { field: 'db_reachable', header: 'DB_REACHABLE', width: 12 },
+  { field: 'redis_configured', header: 'REDIS_CONFIGURED', width: 16 },
+  { field: 'redis_reachable', header: 'REDIS_REACHABLE', width: 15 },
 ];
 
 /** Build `hydra-admin breaker` — inspect/reset the circuit-breaker dead set. */
@@ -161,15 +161,15 @@ export function buildStatsCommand(): Command {
   return cmd;
 }
 
-/** Build `hydra-admin cluster` — whole-cluster fleet status. */
+/** Build `hydra-admin cluster` — this node's cluster status. */
 export function buildClusterCommand(): Command {
   const cmd = addGlobalOptions(
-    new Command('cluster').description('Inspect cluster fleet status.'),
+    new Command('cluster').description('Inspect this node\'s cluster status.'),
   );
   const statusCmd = addGlobalOptions(
     cmd
       .command('status', { isDefault: true })
-      .description('Show cluster status and fleet nodes.'),
+      .description('Show this node\'s cluster status and local facts.'),
   );
   statusCmd.action(
     withErrorHandler(async (...args: unknown[]) => {
@@ -187,12 +187,19 @@ export function buildClusterCommand(): Command {
       }
       if (res['cluster'] === false) {
         printNotice(`single-node mode (${String(res['mode'] ?? 'single')})`);
-        return;
       }
-      const nodes = Array.isArray(res['nodes']) ? res['nodes'] as Array<Record<string, unknown>> : [];
-      printTable(CLUSTER_NODE_COLUMNS, nodes);
-      const leaseHolder = res['lease_holder'] == null ? '' : String(res['lease_holder']);
-      console.log(`lease holder: ${leaseHolder || '(none)'}`);
+      const triState = (value: unknown): string =>
+        value === true ? 'yes' : value === false ? 'no' : 'unknown';
+      printTable(CLUSTER_STATUS_COLUMNS, [
+        {
+          node_id: res['node_id'] ?? '',
+          role: res['role'] ?? '',
+          config_version: res['config_version'] ?? '',
+          db_reachable: triState(res['db_reachable']),
+          redis_configured: triState(res['redis_configured']),
+          redis_reachable: triState(res['redis_reachable']),
+        },
+      ]);
     }),
   );
   return cmd;

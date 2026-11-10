@@ -37,6 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # integration/ -> repo root
@@ -108,7 +109,7 @@ def start_hydra():
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
-        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, 'adm.db')}?mode=rwc",
+        "HYDRA_DB_URL": env_db_url("adm.db"),
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "RUST_LOG": "info",   # INFO shows the hot-reload resize line (Q4 asserts it)
     })

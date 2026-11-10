@@ -49,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -280,7 +281,7 @@ def start_node(label, ch_url, admin_port, data_port, extra=None):
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{admin_port}",
         "HYDRA_LISTEN": f"127.0.0.1:{data_port}",
-        "HYDRA_DB_URL": f"sqlite://{os.path.join(DIR, label)}.db?mode=rwc",
+        "HYDRA_DB_URL": env_db_url(label),
         "HYDRA_ENCRYPTION_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         "HYDRA_USAGE_SINK": "clickhouse",
         "HYDRA_CLICKHOUSE_URL": ch_url,

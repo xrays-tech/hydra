@@ -41,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from _shared_db import env_db_url
 from _usage_env import usage_env
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -172,7 +173,8 @@ def proxied():
 
 
 def db_path():
-    return os.path.join(DIR, "rotate.db")
+    # One isolated DB for every restart in this drill.
+    return env_db_url("key_rotation")
 
 
 def base_env(**extra):
@@ -181,7 +183,7 @@ def base_env(**extra):
     env.update({
         "HYDRA_ADMIN_TOKEN": TOKEN, "HYDRA_ADMIN_ADDR": f"127.0.0.1:{ADMIN}",
         "HYDRA_LISTEN": f"127.0.0.1:{DATA}",
-        "HYDRA_DB_URL": f"sqlite://{db_path()}?mode=rwc",
+        "HYDRA_DB_URL": db_path(),
         "RUST_LOG": "info",
     })
     env.update(extra)

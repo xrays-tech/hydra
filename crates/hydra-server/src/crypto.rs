@@ -52,9 +52,10 @@ pub enum CryptoError {
 
 /// One encrypted secret as persisted: ciphertext + nonce + key version.
 ///
-/// Serialisable because it now travels inside a config-tree entity
-/// (`arachne_entities::FidelityTreeEntity`), not only through the snapshot wire's DTOs. The
-/// serialized form carries the same three fields the DTO does, so nothing new is exposed.
+/// Serialisable because envelopes are persisted in rows (and historically
+/// travelled inside the retired Arachne config-tree entity). The serialized form
+/// carries the same three fields the snapshot wire's DTO did, so nothing new is
+/// exposed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sealed {
     pub ciphertext: Vec<u8>,
@@ -135,11 +136,11 @@ impl Sealed {
     ///   envelope" means "written before D-16", not "corrupt", and inventing an error for it would
     ///   break those paths over a value that is perfectly usable.
     ///
-    ///   The config TREE is deliberately NOT one of those carriers: D-16 changed what a `limit_role`
-    ///   entity's bytes mean, so it is a `TOC_FORMAT` bump and an older tree is refused by the toc.
-    ///   The tree decoder refuses a plaintext value outright
-    ///   (`cluster::arachne_entities::opened_limit_role`) — a per-field fallback there would let a
-    ///   mis-decoded tree through, which is how a limit silently stops being enforced.
+    ///   The retired config TREE was deliberately NOT one of those carriers: D-16 changed what a
+    ///   `limit_role` entity's bytes mean, so it was a `TOC_FORMAT` bump and an older tree was
+    ///   refused by the toc. The tree decoder refused a plaintext value outright — a per-field
+    ///   fallback there would let a mis-decoded tree through, which is how a limit silently stops
+    ///   being enforced.
     /// * A value that DOES parse but does not open is an ERROR. A wrong or rotated-away master key
     ///   is never handed back as "the key", and there is no path here that returns ciphertext.
     ///
@@ -173,12 +174,13 @@ pub trait KeyProvider: Send + Sync {
     ///
     /// ## Why this exists
     ///
-    /// The Arachne config tree is content-addressed: its name is the hash of its bytes. A secret
-    /// sealed with a random nonce therefore gives ONE UNCHANGED CONFIG a new name on every publish
-    /// — the head advances, and every node re-materializes the whole config for nothing. (Measured
-    /// while building it: the first version sealed during encoding and named two different trees
-    /// for one config.) Deterministic sealing is what makes the tree's name a function of the
-    /// LOGICAL config, on any node.
+    /// The former Arachne config tree was content-addressed: its name was the hash of its bytes. A
+    /// secret sealed with a random nonce therefore gave ONE UNCHANGED CONFIG a new name on every
+    /// publish — the head advanced, and every node re-materialized the whole config for nothing.
+    /// (Measured while building it: the first version sealed during encoding and named two
+    /// different trees for one config.) Deterministic sealing made the tree's name a function of the
+    /// LOGICAL config, on any node. The tree is retired; the primitive stays because the trait
+    /// contract and its tests are the reference for any future content-addressed consumer.
     ///
     /// ## What it costs, stated plainly
     ///
@@ -614,9 +616,9 @@ mod tests {
     ///
     /// * making `seal` deterministic would make at-rest ciphertexts comparable across rows and
     ///   across backups, for no benefit (nothing hashes those bytes);
-    /// * making `seal_deterministic` random renames the config tree on every publish, so every node
-    ///   re-materializes the whole config for nothing — the failure the tree's content-addressing
-    ///   cannot tolerate.
+    /// * making `seal_deterministic` random renamed the (now-retired) config tree on every publish,
+    ///   so every node re-materialized the whole config for nothing — the failure the tree's
+    ///   content-addressing could not tolerate.
     ///
     /// Falsification: call `seal` from `seal_deterministic` and the first pair of assertions fails;
     /// route both through `deterministic_nonce` and the second pair fails.

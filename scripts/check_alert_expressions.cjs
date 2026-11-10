@@ -50,6 +50,23 @@ const MIN_REFS = Number(process.env.CAE_MIN_REFS ?? 10);   // distinct metrics; 
 const MIN_LABELS = Number(process.env.CAE_MIN_LABELS ?? 3);  // distinct label selectors; measured 4
 const SECTION = "### 9.1 Alerting";
 
+/**
+ * Series the shared-DB rewrite removed from the code but whose RETIRED alert rows remain in the
+ * operator docs until the Phase 4 docs cleanup. They are deliberately not required to resolve;
+ * the rows that USE them are retired, not live rules.
+ */
+const RETIRED_METRICS = new Set([
+  'hydra_arachne_this_node_leader',
+  'hydra_arachne_leader_flips_total',
+  'hydra_arachne_publish_total',
+  'hydra_arachne_publish_readback_total',
+  'hydra_arachne_watch_total',
+  'hydra_arachne_watch_cache_total',
+  'hydra_arachne_config_bytes',
+  'hydra_arachne_quorum_unavailable_total',
+  'hydra_replica_materialize_retries_total',
+]);
+
 /** metric name -> { labels, file } from every `register_*!` macro under crates/<crate>/src. */
 function registeredMetrics(sources) {
   const consts = {};
@@ -174,6 +191,7 @@ function main() {
   for (const expr of cells) {
     for (const m of expr.matchAll(/(hydra_[a-z0-9_]+)(\{[^}]*\})?/g)) {
       const [, name, selector] = m;
+      if (RETIRED_METRICS.has(name)) continue;
       refs++;
       distinctMetrics.add(name);
       if (!metrics.has(name)) {

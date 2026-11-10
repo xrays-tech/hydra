@@ -8,16 +8,16 @@
 //! assembled graph but no external I/O — most importantly provider-endpoint
 //! scheme sanity, which is the [`Severity::Fatal`] source today: a provider
 //! whose endpoint is not a parseable `http://` / `https://` URL cannot become
-//! an `HttpPeer`, so publishing such a snapshot would route every request for
+//! an `HttpPeer`, so serving such a snapshot would route every request for
 //! that provider to failure. A fatal issue aborts [`ConfigStore::reload_all`]
 //! and keeps the previous snapshot (design §5.3).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, Guard};
 use dashmap::DashMap;
-use sqlx::SqlitePool;
 
 use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity};
 use hydra_core::identity::TenantTokenIdentity;
@@ -27,10 +27,8 @@ use hydra_core::model::{
 };
 use hydra_core::swrr::SwrrState;
 
-use crate::cluster::content::{FidelityRows, ReplicationContent};
-use crate::cluster::snapshot::HydratedWire;
 use crate::crypto::KeyProvider;
-use crate::db;
+use crate::db::{self, Pool};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -46,22 +44,64 @@ pub enum StoreError {
     #[error("crypto: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
     /// One or more fatal validation issues were found; the snapshot was not
-    /// published (the caller keeps the previous one).
+    /// applied (the caller keeps the previous one).
     #[error("fatal config validation: {0}")]
     FatalValidation(String),
-    /// The config committed to the LOCAL database but could not be published to
-    /// the control plane (Arachne), so the rest of the cluster will not see it.
-    ///
-    /// The wording is deliberate: the SQLite transaction DID commit, so this is
-    /// not "the write failed" — it is "the write is local only". An operator who
-    /// reads "database error" would look for a rollback that never happened.
-    #[error(
-        "the config was committed to the local database but NOT PUBLISHED to the cluster: {reason}"
-    )]
-    NotPublished { reason: String },
-    /// Legacy config GC failed; the cluster keeps serving, and the next pass retries.
-    #[error("config GC failed: {0}")]
-    Gc(String),
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node config-change notifier seam (Phase 3a)
+// ---------------------------------------------------------------------------
+
+/// Cross-node config-change notification seam.
+///
+/// The transport (Phase 3b: Redis pub/sub) owns the node identity/origin; the
+/// store only hands it the revision that was successfully applied locally. A
+/// notifier is best-effort: a publish failure is logged and counted, never
+/// returned to the writer, because the DB is already committed and the poll
+/// fallback is the correctness backstop.
+#[async_trait::async_trait]
+pub trait ConfigNotifier: Send + Sync {
+    /// Announce `version` to the other nodes. Implementations must be
+    /// timeout-bounded; the caller holds the reload guard while this runs.
+    async fn publish(&self, version: u64) -> Result<(), String>;
+}
+
+/// Where a reload was triggered from.
+///
+/// Only [`ReloadSource::Local`] — a write on THIS node (admin API, tenant API,
+/// forced `POST /reload`) — may publish a change to peers. [`Self::PubSub`]
+/// and [`Self::Poll`] are the QUIET paths: they consume another node's change
+/// and must never relay it, or the fleet would rebroadcast the same revision
+/// forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadSource {
+    /// A local write/admin action; the only source allowed to publish.
+    Local,
+    /// A message from the config bus (Phase 3b subscriber).
+    PubSub,
+    /// The cheap revision probe (Phase 3b poller).
+    Poll,
+}
+
+impl ReloadSource {
+    /// Stable, bounded `source` label value for `hydra_config_reload_total`.
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::PubSub => "pubsub",
+            Self::Poll => "poll",
+        }
+    }
+
+    /// The external reload paths are quiet by construction. Downgrade an
+    /// accidental `Local` rather than risk a rebroadcast loop.
+    fn quiet(self) -> Self {
+        match self {
+            Self::Local => Self::Poll,
+            other => other,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,35 +111,20 @@ pub enum StoreError {
 /// Build a [`ConfigData`] snapshot from the DB and run load-time validation
 /// (design §5.3 `loader::build` + §5.4 `validate`).
 ///
-/// Returns `Ok(ConfigData)` when the snapshot is publishable (non-fatal issues
+/// Returns `Ok(ConfigData)` when the snapshot is serveable (non-fatal issues
 /// are logged at `WARN`). Returns `Err(StoreError::FatalValidation)` when any
 /// fatal issue is found, so [`ConfigStore::reload_all`] keeps the old snapshot.
-pub async fn build_config(
-    pool: &SqlitePool,
-    kp: &dyn KeyProvider,
-) -> Result<ConfigData, StoreError> {
-    let rows = load_config_rows(pool, kp).await?;
+pub async fn build_config(pool: &Pool, kp: &dyn KeyProvider) -> Result<ConfigData, StoreError> {
+    let (rows, _version) = load_config_rows(pool, kp).await?;
     config_from_rows(&rows)
 }
 
-/// Load the DB rows ONCE and build both the served config and the fidelity rows
-/// the control plane carries.
+/// Every raw row set the loader needs, read at ONE applied database snapshot.
 ///
-/// `reload_all_with` used to call [`build_config`] and then
-/// [`ReplicationContent::load`], which each read the full hierarchy tables
-/// (48k rows in the scale drill) — ~600 ms of duplicated SQLite work on every
-/// management write. This helper reads everything in ONE read transaction, then
-/// derives both views from those rows.
-pub(crate) async fn build_config_with_fidelity(
-    pool: &SqlitePool,
-    kp: &dyn KeyProvider,
-) -> Result<(ConfigData, FidelityRows), StoreError> {
-    let rows = load_config_rows(pool, kp).await?;
-    let cfg = config_from_rows(&rows)?;
-    Ok((cfg, fidelity_from_rows(rows)))
-}
-
-/// Every raw row set the loader needs, read at ONE applied SQLite snapshot.
+/// This is both the loader input and the store's change-detection state: a
+/// reload compares the freshly-read rows against these to decide whether the
+/// served config actually changed. All entity types derive `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigRows {
     providers: Vec<Provider>,
     provider_models: Vec<ProviderModel>,
@@ -116,33 +141,20 @@ struct ConfigRows {
     global_roles: Vec<GlobalRole>,
 }
 
-/// Read every config row in one read-only SQLite transaction.
+/// Read every config row AND the shared `config_revision.version` in one
+/// read-only transaction. Returning the version with the rows is load-bearing
+/// (Oracle P0-2): a revision read from a different snapshot can tag stale
+/// content with a newer version and pin it forever.
 ///
-/// One transaction is load-bearing: the served config and the fidelity rows must
-/// describe the same revision, or a replica can be rebuilt with a user whose key,
-/// group or role came from a different commit. `seal_legacy_limit_keys` is a
-/// WRITE, so it runs before the transaction (the same order `build_config` used).
+/// The loader is READ-ONLY. Startup migrations (`seal_legacy_limit_keys`,
+/// `backfill_legacy_certs`) run before the first load; a reader never writes.
 async fn load_config_rows(
-    pool: &SqlitePool,
+    pool: &Pool,
     kp: &dyn KeyProvider,
-) -> Result<ConfigRows, StoreError> {
-    // `seal_legacy_limit_keys` runs BEFORE the read, and it is the whole of the D-16 migration: a
-    // `matching_key` written before 2026-10-08 is plaintext in the column, and this is the pass that
-    // rewrites it (the loader runs at boot and on every reload, so an upgrade needs no operator
-    // step). It is a separate call because it WRITES — see its own docs for why the reader cannot do
-    // it. Note the order: sealing first means the rows this loader reads are already in the form a
-    // replica will end up storing, so leader and replica cannot disagree about it.
-    let resealed = db::seal_legacy_limit_keys(pool, kp).await?;
-    if resealed > 0 {
-        tracing::info!(
-            target: "hydra::store",
-            count = resealed,
-            "sealed {} legacy plaintext `limit_role.matching_key` value(s) (decision D-16)",
-            resealed
-        );
-    }
-
+) -> Result<(ConfigRows, u64), StoreError> {
     let mut tx = pool.begin().await?;
+    let version = db::read_revision_on(&mut *tx).await?;
+
     let providers = db::list_providers_on(&mut *tx).await?;
     let provider_models = db::list_provider_models_on(&mut *tx).await?;
     let provider_keys = db::list_provider_keys_on(&mut *tx, kp).await?;
@@ -158,21 +170,24 @@ async fn load_config_rows(
     let global_roles = db::list_global_roles_on_conn(&mut tx).await?;
     tx.commit().await?;
 
-    Ok(ConfigRows {
-        providers,
-        provider_models,
-        provider_keys,
-        tenants,
-        tenant_certs,
-        tenant_providers,
-        tenant_models,
-        limit_roles,
-        user_groups,
-        users,
-        user_api_keys,
-        tenant_access_tokens,
-        global_roles,
-    })
+    Ok((
+        ConfigRows {
+            providers,
+            provider_models,
+            provider_keys,
+            tenants,
+            tenant_certs,
+            tenant_providers,
+            tenant_models,
+            limit_roles,
+            user_groups,
+            users,
+            user_api_keys,
+            tenant_access_tokens,
+            global_roles,
+        },
+        version,
+    ))
 }
 
 /// Derive the served [`ConfigData`] from one consistent row set.
@@ -180,7 +195,7 @@ async fn load_config_rows(
 /// The filtering asymmetry is load-bearing (plan §3.2):
 ///   * identity rows (groups/users/keys) load FULL — disabled/expired/delinquent
 ///     entities must stay KNOWN (401/402/403 by status, never "unknown" 401-
-///     equivalent that lets a replica enumerate live keys);
+///     equivalent that lets a caller enumerate live keys);
 ///   * tenant_tokens load ENABLED-ONLY — a revoked tenant token is simply
 ///     GONE (the token index is not an enumeration surface);
 ///   * global_roles load ENABLED-ONLY — a disabled rule must match NOTHING,
@@ -324,7 +339,7 @@ fn config_from_rows(rows: &ConfigRows) -> Result<ConfigData, StoreError> {
     let mut cfg = ConfigData {
         tenants_by_domain,
         // 派生索引：由紧随其后的 reindex_tenants 填充（唯一写入口，
-        // 在 core 里，与副本侧的 hydrate 共用同一实现）。
+        // 在 core 里）。
         tenants_by_id: HashMap::new(),
         models_by_key,
         tenant_providers,
@@ -345,36 +360,15 @@ fn config_from_rows(rows: &ConfigRows) -> Result<ConfigData, StoreError> {
         certs,
     };
 
-    // 派生索引在这里一次性建好：loader 是 leader 侧唯一的构建点，
-    // 与副本侧 hydrate 的调用共用 core 里的同一个实现。
+    // 派生索引在这里一次性建好：loader 是唯一的构建点。
     cfg.reindex_tenants();
     // Identity index + Global Role indexes (plan §3.2/§3.5): same single-entry-point
-    // rule; the replica hydrate path calls the same two functions (plan §3.5).
+    // rule.
     cfg.reindex_identity(user_api_keys);
     cfg.reindex_global_roles();
 
     validate_and_log(&cfg)?;
     Ok(cfg)
-}
-
-/// Derive the FULL row sets the control plane carries from the same rows.
-///
-/// Unlike [`ConfigData`], fidelity rows keep disabled/expired rows: a replica must
-/// rebuild the leader's tables byte-faithfully, including rows that no request
-/// currently matches.
-fn fidelity_from_rows(rows: ConfigRows) -> FidelityRows {
-    FidelityRows {
-        limit_roles: rows.limit_roles,
-        provider_keys: rows.provider_keys,
-        provider_models: rows.provider_models,
-        tenant_providers: rows.tenant_providers,
-        tenant_models: rows.tenant_models,
-        user_groups: rows.user_groups,
-        users: rows.users,
-        user_api_keys: rows.user_api_keys,
-        tenant_access_tokens: rows.tenant_access_tokens,
-        global_roles: rows.global_roles,
-    }
 }
 
 /// Run the pure [`validate`] plus the loader-side fatal checks.
@@ -425,8 +419,6 @@ fn validate_and_log(cfg: &ConfigData) -> Result<(), StoreError> {
 pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
     // The loader, the admin write boundary and the upstream dialler all ask the
     // SAME question, through the SAME parser: can this endpoint become a peer?
-    // The previous hand-rolled prefix test here was weaker than
-    // `proxy::peer::parse_endpoint`, and the gap was reachable — see §21.
     hydra_core::rewrite::EndpointUrl::parse(endpoint).is_some()
 }
 
@@ -437,66 +429,74 @@ pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
 /// Hot-read config centre. The snapshot is held behind [`ArcSwap`] (lock-free
 /// reads on the hot path); [`reload_all`] does an atomic COW replacement.
 ///
+/// The DB is the sole authority. A reload reads the rows and the shared
+/// `config_revision.version` in one transaction; only an advanced revision (or
+/// `force`) rebuilds and swaps the snapshot.
+///
 /// The SWRR state map is owned here and cleared on every successful reload
 /// (design §5.3 / P1-B2: candidate sets may change, so stale per-`(tenant,
-/// model)` weights must not survive a reload). The concurrent `CircuitBreaker`
-/// wiring lands in W4; `reload_all` will also prune deleted-provider breaker
-/// entries there — out of scope for this wave.
+/// model)` weights must not survive a reload).
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<ArcSwap<ConfigData>>,
-    /// The node's local SQLite pool.
-    ///
-    /// It used to be `Option`, because an `edge` node had no local config database by design
-    /// (cluster P0b) and `from_snapshot` built one without a pool. That role was retired with the
-    /// homogeneous topology (ADR-0001 D-2), and with it the possibility: **every node has a local
-    /// database**, `main.rs` builds the store from `HYDRA_DB_URL` unconditionally, and the
-    /// `if false { None } else { … }` that had kept the two shapes compiling was the last thing
-    /// pretending otherwise. The guards that answered "no local database" —
-    /// `tenant_api::local_write`'s `not_ready` and `ReplicaTarget::apply`'s refusal — were therefore
-    /// unreachable, and are gone with the type: a check that cannot fail is not a check.
-    pool: SqlitePool,
+    /// The shared relational-DB pool. Every node has one.
+    pool: Pool,
     swrr: Arc<DashMap<(String, String), SwrrState>>,
     key_provider: Arc<dyn KeyProvider>,
-    /// The replicated bytes, version included (cluster P1/P2). The generation
-    /// predicate is defined HERE, so "the version advanced" and "the replicated
-    /// content changed" are one statement, and [`Self::version`] DERIVES from it
-    /// (a second `AtomicU64` would be a second owner — review C16).
-    ///
-    /// `Arc<ArcSwap<..>>`: the outer `Arc` is required because `ArcSwapAny` is not `Clone` and
-    /// `ConfigStore` is `#[derive(Clone)]`.
-    ///
-    /// It was an `ArcSwapOption` until 2026-10-05, on the theory that a store could exist "before
-    /// its first snapshot". No path produces that state: [`Self::assemble`] builds the content at
-    /// CONSTRUCTION (from the pool), [`Self::apply_snapshot`] replaces it, and the None was written
-    /// by exactly one function — the deleted `from_snapshot` (the `edge` role). The `None` branch
-    /// that readers had to handle was therefore about a shape no configuration can build, and the
-    /// guards it fed (a `503 not_ready` in the tenant API, a skipped publish in
-    /// [`Self::reload_all_with`]) could not fire: an EMPTY store is `Some(empty content at version
-    /// 0)`, which is what a brand-new node actually holds, and it is a different state — one the
-    /// code now has to answer for on its merits instead of pattern-matching it away.
-    replication: Arc<arc_swap::ArcSwap<ReplicationContent>>,
     /// Snapshot-change hooks (审核四 P3). Every swap path funnels through
     /// [`Self::notify`], so a consumer that has to follow the snapshot cannot
     /// be forgotten by one of the writers.
     hooks: Arc<std::sync::Mutex<Vec<SnapshotHook>>>,
-    /// Serializes local publish/read-modify-publish coordination without changing
-    /// reload/publish semantics. Shared through `Arc` so `ConfigStore` clones (and
-    /// therefore the whole store view) guard the same lock.
-    publish_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Highest raft index this node has PUBLISHED locally. The materializer must
-    /// not apply a head below it: a stale `get_stale` read after a local write
-    /// used to let it rebuild the DB from an older tree and silently delete the
-    /// just-committed rows (measured: random role losses under 2000-role load).
-    local_write_index: Arc<std::sync::atomic::AtomicU64>,
-    /// The head hash this node last published locally. On a FOLLOWER the local
-    /// raft replica can lag; without this gate the materializer applies an older
-    /// head and wipes the committed-but-not-yet-materialized write.
-    pending_head: Arc<std::sync::Mutex<Option<String>>>,
-    /// The Arachne publisher (ADR-0001), present only in a cluster node built with the `arachne`
-    /// feature. `None` in single-node mode, where a local reload IS the whole truth.
-    #[cfg(feature = "arachne")]
-    publisher: Option<Arc<crate::cluster::arachne_publish::ConfigPublisher>>,
+    /// Serializes reload coordination without changing reload semantics. Shared
+    /// through `Arc` so `ConfigStore` clones guard the same lock.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Cross-node change fanout (Phase 3a seam; the Redis implementation is
+    /// injected in Phase 3b). `None` on a single-node deployment: a local
+    /// write reload is then the whole story.
+    notifier: Option<Arc<dyn ConfigNotifier>>,
+    /// The rows matching the currently-served snapshot, used as the change
+    /// signal across reloads. `None` for a store built from an in-memory
+    /// `ConfigData` ([`Self::from_data`]), which forces the first reload to
+    /// rebuild from the DB.
+    last_rows: Arc<std::sync::Mutex<Option<ConfigRows>>>,
+    /// Last-applied config version. Stored separately from the snapshot so
+    /// [`Self::version`] is a cheap lock-free read; actual updates are
+    /// serialized by the reload lock.
+    version: Arc<AtomicU64>,
+    /// `true` when the LAST reload failed, i.e. the in-memory snapshot may no
+    /// longer match the committed config. Owned here (not by `AdminState`) so
+    /// the tenant self-service write path gets the flag for free: every reload
+    /// entry point funnels through this store.
+    ///
+    /// PROCESS-level and last-writer-wins, because the store is shared by every
+    /// admin and tenant request. It answers "is the runtime consistent with the
+    /// DB right now?", not "did MY write apply?".
+    ///
+    /// A failed reload sets it; only a successful rebuild + swap clears it. A
+    /// no-op (`Ok(false)`) leaves it UNCHANGED: the rows looked unchanged, but
+    /// that says nothing about whether the last rebuild succeeded (the previous
+    /// failure may be why the snapshot is stale).
+    snapshot_stale: Arc<AtomicBool>,
+    /// Serialization observation used by the concurrency test. Public reloads
+    /// must hold `reload_lock` for the whole rebuild, so `max_active` can never
+    /// exceed 1. The atomics are untouched outside `cfg(test)`; keeping the
+    /// field unconditional avoids a `#[cfg(test)]` FIELD attribute, which the
+    /// repo's Rust blanker (scripts/rust_blank.test.cjs) would mis-handle.
+    #[allow(dead_code)]
+    reload_probe: Arc<ReloadProbe>,
+}
+
+/// Instrumentation proving that the public reload entry points serialize on
+/// [`ConfigStore::reload_lock`]. Only the `#[cfg(test)]` branch in
+/// [`ConfigStore::reload_all_locked`] touches it.
+#[allow(dead_code)]
+#[derive(Default)]
+struct ReloadProbe {
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+    /// Artificial delay inside the critical section, in milliseconds. Zero
+    /// outside the concurrency test so ordinary reload tests stay fast.
+    delay_ms: AtomicU64,
 }
 
 /// A consumer that follows every snapshot swap (see
@@ -504,123 +504,94 @@ pub struct ConfigStore {
 pub type SnapshotHook = Arc<dyn Fn(&ConfigData) + Send + Sync>;
 
 impl ConfigStore {
-    /// Build the initial snapshot from the DB and wrap it in `ArcSwap`
-    /// (leader/all mode).
-    pub async fn load(
-        pool: SqlitePool,
-        key_provider: Arc<dyn KeyProvider>,
-    ) -> Result<Self, StoreError> {
-        let (cfg, fidelity) = build_config_with_fidelity(&pool, key_provider.as_ref()).await?;
-        Self::assemble(pool, cfg, Some(fidelity), key_provider).await
+    /// Build the initial snapshot from the DB and wrap it in `ArcSwap`.
+    pub async fn load(pool: Pool, key_provider: Arc<dyn KeyProvider>) -> Result<Self, StoreError> {
+        Self::assemble(pool, None, key_provider).await
     }
 
-    /// A store serving a config built IN MEMORY, materialized into `pool` — the seam the tests use
-    /// to drive the store with a `ConfigData` they assembled by hand, in place of the deleted
-    /// `from_snapshot` (which took no pool, because the `edge` role had none).
+    /// A store serving a config built IN MEMORY — the seam the tests use to
+    /// drive the store with a `ConfigData` they assembled by hand.
     ///
-    /// It takes the pool for the same reason every other path does: the store's claim is "the
-    /// config THIS NODE serves is in THIS NODE's database", and a store built without one could not
-    /// honour it — the fidelity rows, the version watermark and every `pool()` reader would have
-    /// been describing a database that does not exist. Everything else is shared verbatim with
-    /// [`Self::load`] (see [`Self::assemble`]), so a test store cannot end up with a shape
-    /// production never builds.
+    /// No rows are recorded, so the next reload rebuilds from the DB (which is
+    /// the authority) rather than treating the injected config as the baseline.
     pub async fn from_data(
-        pool: SqlitePool,
+        pool: Pool,
         cfg: ConfigData,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
-        Self::assemble(pool, cfg, None, key_provider).await
+        Self::assemble(pool, Some(cfg), key_provider).await
     }
 
-    /// The ONE construction path: an already-built config, plus the pool it is (or is about to be)
-    /// materialized into.
+    /// The ONE construction path.
     ///
-    /// `preloaded_fidelity` is `Some` only from [`Self::load`], which already read every row in one
-    /// transaction. Passing it through avoids a second full hierarchy read at boot; `from_data`
-    /// passes `None` and falls back to [`ReplicationContent::load`].
+    /// `prebuilt` is `Some` only from [`Self::from_data`], the test seam that
+    /// injects a hand-made `ConfigData`. Otherwise the DB is read ONCE, the
+    /// `ConfigData` is built from those rows, and the same rows are recorded as
+    /// the change-detection baseline. The persisted version is always resumed
+    /// from the DB.
     async fn assemble(
-        pool: SqlitePool,
-        cfg: ConfigData,
-        preloaded_fidelity: Option<FidelityRows>,
+        pool: Pool,
+        prebuilt: Option<ConfigData>,
         key_provider: Arc<dyn KeyProvider>,
     ) -> Result<Self, StoreError> {
-        // Resume the config version from the DB instead of restarting at 1:
-        // a restarted leader otherwise serves a LOW version watermark and
-        // peers (`since` comparison) never re-sync from it — even when its
-        // snapshot is newer (accepted live: failover-then-rejoin regressed
-        // the config). Monotonicity across restarts is what makes the
-        // control channel's `?since=` watermark meaningful.
-        let persisted = match db::get_config_version(&pool).await {
-            Ok(v) => v,
-            Err(e) => {
-                // A read FAILURE is not "no marker": keep the loud path.
-                tracing::warn!(target: "hydra::store", error = %e, "could not read the persisted config version");
-                db::ConfigVersion::Absent
+        // The DB is the authority. The normal path reads rows + revision in ONE
+        // transaction; the `from_data` test seam has no rows to pair, so it only
+        // resumes the persisted watermark.
+        let (cfg, rows, version) = match prebuilt {
+            Some(cfg) => {
+                let version = match db::get_config_version(&pool).await {
+                    Ok(db::ConfigVersion::Value(v)) => v,
+                    Ok(db::ConfigVersion::Absent) => 0,
+                    Ok(db::ConfigVersion::Corrupt(raw)) => {
+                        tracing::warn!(
+                            target: "hydra::store",
+                            raw = %raw,
+                            "config_revision.version is not usable; starting from 0"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "hydra::store", error = %e, "could not read the persisted config version");
+                        0
+                    }
+                };
+                (cfg, None, version)
             }
-        };
-        // Three states, three different meanings — the freshness gate depends on
-        // telling them apart:
-        // - a parsed watermark → use it;
-        // - no marker (predates migration 0008, or was imported) → version 1 if
-        //   config content exists: the cluster really does have config, so peers
-        //   polling with `since = 0` are sent a full snapshot;
-        // - no marker AND no content (a brand-new DB) → version 0: this node
-        //   holds NOTHING, so an `UpToDate` poll must not count as "synced" (an
-        //   empty replica must not be eligible to lead — F-4);
-        // - a CORRUPT marker → cannot be used as a watermark, but must not stop
-        //   the data plane from serving valid config (that would turn metadata
-        //   corruption into an outage). Fall back to the "content but no marker"
-        //   value, loudly: `replica_is_current` already fails closed on Corrupt,
-        //   so this node cannot lead until a materialization rewrites the marker.
-        let has_content = db::config_content_exists(&pool).await.unwrap_or(false);
-        let version = match persisted {
-            db::ConfigVersion::Value(v) => v,
-            db::ConfigVersion::Absent => u64::from(has_content),
-            db::ConfigVersion::Corrupt(raw) => {
-                tracing::warn!(
-                    target: "hydra::store",
-                    raw = %raw,
-                    "config_meta.config_version is not a number; serving with the conservative \
-                     watermark and refusing leader eligibility until it is rewritten"
-                );
-                u64::from(has_content)
-            }
-        };
-        // The replication content is built at construction (not lazily): a
-        // leader that served a wire with EMPTY fidelity rows would instruct
-        // every replica to wipe its fidelity tables and insert nothing.
-        let content = match preloaded_fidelity {
-            // `ConfigStore::load` read the rows in one transaction; reuse them
-            // instead of issuing a second full hierarchy read at boot.
-            Some(fidelity) => ReplicationContent::from_loaded(cfg.clone(), fidelity, version),
             None => {
-                ReplicationContent::load(&pool, key_provider.as_ref(), cfg.clone(), version).await?
+                let (rows, version) = load_config_rows(&pool, key_provider.as_ref()).await?;
+                let cfg = config_from_rows(&rows)?;
+                (cfg, Some(rows), version)
             }
         };
+        // Publish the resumed watermark at boot so `/metrics` has a value even
+        // before the first reload (Phase 3b adds the fanout watcher).
+        #[cfg(feature = "proxy")]
+        crate::admin::metrics::record_config_version(version);
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
             pool,
             swrr: Arc::new(DashMap::new()),
             key_provider,
-            replication: Arc::new(arc_swap::ArcSwap::from_pointee(content)),
             hooks: Arc::new(std::sync::Mutex::new(Vec::new())),
-            publish_lock: Arc::new(tokio::sync::Mutex::new(())),
-            local_write_index: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending_head: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(feature = "arachne")]
-            publisher: None,
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            notifier: None,
+            last_rows: Arc::new(std::sync::Mutex::new(rows)),
+            version: Arc::new(AtomicU64::new(version)),
+            snapshot_stale: Arc::new(AtomicBool::new(false)),
+            reload_probe: Arc::new(ReloadProbe::default()),
         })
     }
 
-    /// The current replication content, version included (one atomic load).
+    /// Attach the cross-node config-change notifier (Phase 3b injects the
+    /// Redis-backed implementation). Cloned with the store, so every clone
+    /// publishes through the same handle.
     ///
-    /// NEVER absent: a store is built with content ([`Self::assemble`]) and every later swap
-    /// ([`Self::apply_snapshot`], [`Self::reload_all_with`]) replaces it. "This node holds no
-    /// config yet" is the EMPTY content at version 0, not a missing one — see the field's note for
-    /// why that distinction had to become the caller's problem rather than a `None` to match on.
+    /// `None` (the default) keeps a single-node deployment dependency-free: the
+    /// local reload after a write is all that is needed.
     #[must_use]
-    pub fn replication(&self) -> Guard<Arc<ReplicationContent>> {
-        self.replication.load()
+    pub fn with_notifier(mut self, n: Arc<dyn ConfigNotifier>) -> Self {
+        self.notifier = Some(n);
+        self
     }
 
     /// Lock-free hot-path read. Returns a [`Guard`] that derefs to
@@ -636,94 +607,56 @@ impl ConfigStore {
         &self.swrr
     }
 
-    /// The local SQLite pool: every node has one (see the field's note).
+    /// The node's shared-backend pool.
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &Pool {
         &self.pool
     }
 
-    /// Current config version (cluster P1): the `since` watermark for the
-    /// control channel and the local last-applied version.
+    /// Current config version: the local last-applied version.
     ///
-    /// Version 0 means "nothing applied yet" — the content is present but empty (see
-    /// [`Self::replication`]), NOT absent.
+    /// Version 0 means "nothing applied yet" — the snapshot is present but
+    /// empty, NOT absent.
     #[must_use]
     pub fn version(&self) -> u64 {
-        self.replication.load().version
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Cheap poll probe for the Phase 3b fallback: is the shared DB watermark
+    /// ahead of the revision this node has applied?
+    ///
+    /// This is ONE `SELECT` — it does not rebuild the row set or decrypt any
+    /// secrets. The poller calls the paired-read reload only when this is true.
+    pub async fn has_newer_revision(&self) -> Result<bool, StoreError> {
+        Ok(db::read_revision(&self.pool).await? > self.version())
+    }
+
+    /// Whether the last reload failed, leaving the served snapshot behind the
+    /// committed DB. Set/cleared by [`Self::reload_all_locked`] (and therefore
+    /// by every public reload entry point). See the field docs for the exact
+    /// no-op semantics.
+    #[must_use]
+    pub fn snapshot_stale(&self) -> bool {
+        self.snapshot_stale.load(Ordering::Acquire)
     }
 
     /// Register a hook that runs after **every** snapshot swap.
     ///
     /// Single owner for "something has to follow the config": the resolved TLS
-    /// cert store is why it exists. Wiring that re-resolution at each writer is
-    /// how the cluster path was missed — an edge node applies a snapshot
-    /// containing new tenant certs and kept serving the old ones until a
-    /// restart (`main.rs` carried the fossil: `on_poll: None, // edge TLS cert
-    /// re-resolution lands with the edge TLS wiring`). Both swap paths
-    /// ([`Self::reload_all`], [`Self::apply_snapshot`]) funnel through
-    /// [`Self::notify`], so a future writer cannot forget.
-    ///
-    /// The hook runs synchronously on the caller's thread, after the swap, with
-    /// no lock of ours held — it must not block or panic (a panicking hook would
-    /// abort a reload that already succeeded).
+    /// cert store is why it exists. The hook runs synchronously on the caller's
+    /// thread, after the swap, with no lock of ours held — it must not block or
+    /// panic (a panicking hook would abort a reload that already succeeded).
     pub fn on_snapshot_change(&self, hook: SnapshotHook) {
         let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
         hooks.push(hook);
     }
 
-    /// One bounded legacy-config GC pass, serialized with local writes/publish.
-    ///
-    /// `None` off-cluster (no publisher). The control plane keeps old content-addressed
-    /// entities/tocs forever otherwise; at scale their snapshots block the raft leader.
-    #[cfg(feature = "arachne")]
-    pub async fn gc(
-        &self,
-        max_deletes: usize,
-    ) -> Result<Option<crate::cluster::arachne_store::GcStats>, StoreError> {
-        let _guard = self.publish_guard().await;
-        match &self.publisher {
-            Some(p) => p.gc(max_deletes).await.map(Some).map_err(StoreError::Gc),
-            None => Ok(None),
-        }
+    /// Acquire the reload coordination lock.
+    pub async fn reload_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reload_lock.lock().await
     }
 
-    /// The head this node published locally and has not yet observed applied.
-    #[must_use]
-    pub fn pending_head(&self) -> Option<String> {
-        self.pending_head
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// Clear the pending marker once the materializer has applied that head.
-    pub fn clear_pending_head(&self, head: &str) {
-        let mut guard = self.pending_head.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.as_deref() == Some(head) {
-            *guard = None;
-        }
-    }
-
-    /// Highest raft index this node has published locally (0 before any write).
-    #[must_use]
-    pub fn local_write_index(&self) -> u64 {
-        self.local_write_index
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Acquire the publish coordination lock.
-    pub async fn publish_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.publish_lock.lock().await
-    }
-
-    /// The same lock, as an owned handle for a consumer that must hold it across
-    /// an entire async loop (the materializer: head read -> plan -> apply).
-    #[must_use]
-    pub fn write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.publish_lock)
-    }
-
-    /// Run every registered hook against the snapshot that was just published.
+    /// Run every registered hook against the snapshot that was just swapped in.
     fn notify(&self, cfg: &ConfigData) {
         // Cloned out of the lock before calling: a hook may (re)register.
         let hooks: Vec<SnapshotHook> = {
@@ -735,113 +668,238 @@ impl ConfigStore {
         }
     }
 
-    /// Atomically apply a snapshot received from the control plane (the materializer, ADR-0001
-    /// §3). Same COW semantics as [`Self::reload_all`]:
-    /// the swap is lock-free for readers and the SWRR map is cleared so stale
-    /// per-`(tenant, model)` weights never survive a config change. The store
-    /// adopts the control-plane `version` (monotonic across the cluster).
-    pub fn apply_snapshot(&self, hydrated: HydratedWire) {
-        let content = ReplicationContent::from_hydrated(
-            hydrated.version,
-            Arc::new(hydrated.cfg.clone()),
-            hydrated.fidelity,
-        );
-        self.inner.store(Arc::new(hydrated.cfg));
-        self.replication.store(Arc::new(content));
-        self.swrr.clear();
-        self.notify(&self.snapshot());
-    }
-
     /// Rebuild the snapshot from the DB and atomically swap it in (design §5.3).
     ///
     /// On a **fatal** validation issue the old snapshot is kept (`Err`
-    /// returned, `inner` untouched). On success the new snapshot is published
-    /// (version bumped) and the SWRR map is cleared so per-`(tenant, model)`
-    /// weights are rebuilt lazily on the next request.
-    /// Returns whether the REPLICATION CONTENT actually changed (plan T6).
+    /// returned, `inner` untouched). On success the new snapshot is swapped in,
+    /// the persisted version is advanced, and the SWRR map is cleared so
+    /// per-`(tenant, model)` weights are rebuilt lazily on the next request.
+    /// Returns whether the served config actually changed.
+    /// Takes the reload lock internally, so a caller cannot forget it. Callers
+    /// that must hold the lock across a write + reload use
+    /// [`Self::reload_all_locked`] instead.
     pub async fn reload_all(&self) -> Result<bool, StoreError> {
         self.reload_all_with(false).await
     }
 
-    /// Reload from the DB and publish, advancing the generation **only when the
-    /// replication content changed**.
+    /// [`Self::reload_all`] with the operator's "push this out anyway" flag.
     ///
-    /// An unconditional bump made an idempotent `POST /reload` (and any write
-    /// that touched no replicated column) rebuild every replica for nothing.
-    /// `force` restores the operator's "push this out anyway".
+    /// Takes the reload lock internally and delegates to
+    /// [`Self::reload_all_locked`]. This is the LOCAL (notify) path: a forced
+    /// `POST /reload` must let the other nodes know too.
+    ///
+    /// ORDER IS LOAD-BEARING:
+    ///   1. read rows AND `config_revision.version` in one plain read transaction;
+    ///   2. if the shared revision did not advance and `force` is false → `Ok(false)`;
+    ///   3. for `force`, bump the shared revision in a write transaction first
+    ///      (unless the paired read already saw a newer one), then re-read;
+    ///   4. build + validate the new `ConfigData`;
+    ///   5. swap the snapshot and record the rows/version, then run hooks;
+    ///   6. on a LOCAL swap only, publish the new revision (best-effort).
     pub async fn reload_all_with(&self, force: bool) -> Result<bool, StoreError> {
-        let pool = self.pool.clone();
-        let kp = self.key_provider.clone();
-        let (new_cfg, fidelity) = build_config_with_fidelity(&pool, kp.as_ref()).await?;
-        // Fatal validation surfaced as Err above → we never reach the store,
-        // so the previous snapshot is preserved.
-        //
-        // ORDER IS LOAD-BEARING: `ReplicationContent` derives `PartialEq`
-        // INCLUDING `version`, so the candidate is loaded at the CURRENT version
-        // and compared before the new version is applied. Loading it at
-        // `prev + 1` would make the comparison unequal always ⇒ the generation
-        // would still advance on every reload (the defect this predicate
-        // exists to remove).
-        let prev_version = self.version();
-        let candidate = ReplicationContent::from_loaded(new_cfg, fidelity, prev_version);
-        let changed = force || self.replication.load().as_ref() != &candidate;
+        let guard = self.reload_lock.lock().await;
+        self.reload_all_locked(force, &guard).await
+    }
 
-        if !changed {
-            tracing::debug!(version = prev_version, "reload: no replicated change");
+    /// Quiet reload for another node's change (Phase 3b pub/sub or poll).
+    ///
+    /// Acquires the reload lock internally and NEVER publishes: the change
+    /// originated elsewhere, so relaying it would loop. Returns whether the
+    /// local snapshot actually advanced.
+    pub async fn reload_external(&self) -> Result<bool, StoreError> {
+        self.reload_external_with_source(false, ReloadSource::Poll)
+            .await
+    }
+
+    /// Quiet reload with the operator's force flag (poll probe / tests).
+    pub async fn reload_external_with(&self, force: bool) -> Result<bool, StoreError> {
+        self.reload_external_with_source(force, ReloadSource::Poll)
+            .await
+    }
+
+    /// Quiet reload with an explicit trigger source, so Phase 3b can label a
+    /// subscriber-driven reload `pubsub` and a probe-driven one `poll`.
+    ///
+    /// Takes the reload lock internally. The external path is quiet by
+    /// construction; `Local` is downgraded so a caller cannot accidentally
+    /// rebroadcast.
+    pub async fn reload_external_with_source(
+        &self,
+        force: bool,
+        source: ReloadSource,
+    ) -> Result<bool, StoreError> {
+        let guard = self.reload_lock.lock().await;
+        self.reload_external_locked(force, &guard, source).await
+    }
+
+    /// Quiet reload **assuming the caller already holds [`Self::reload_guard`]**.
+    ///
+    /// Like [`Self::reload_all_locked`] but never notifies. Passing `Local`
+    /// is downgraded to `Poll`, because a message/probe must never be relayed.
+    pub async fn reload_external_locked(
+        &self,
+        force: bool,
+        _guard: &tokio::sync::MutexGuard<'_, ()>,
+        source: ReloadSource,
+    ) -> Result<bool, StoreError> {
+        self.reload_with_source(force, source.quiet()).await
+    }
+
+    /// Reload **assuming the caller already holds [`Self::reload_guard`]**.
+    ///
+    /// This is the only path that does not take the lock itself; passing the
+    /// guard by reference makes that assumption explicit at the call site.
+    /// Used by callers whose lock must span a DB write + the reload (admin
+    /// mutations and the tenant self-service write path). It must never be
+    /// called without the guard — doing so would let two reloads interleave
+    /// read/compare/persist/swap.
+    ///
+    /// This is the LOCAL (write/admin) path, so a successful swap publishes the
+    /// new revision to peers.
+    ///
+    /// Snapshot-staleness ownership lives here too: an `Err` marks the snapshot
+    /// stale, a successful rebuild + swap clears it, and a no-op leaves it
+    /// unchanged (see [`Self::snapshot_stale`]).
+    pub async fn reload_all_locked(
+        &self,
+        force: bool,
+        _guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, StoreError> {
+        // The locked write path is always local (Local → publish).
+        self.reload_with_source(force, ReloadSource::Local).await
+    }
+
+    /// Instrumented reload wrapper shared by the local and quiet entry points.
+    ///
+    /// Owns the reload probe, the snapshot-staleness bookkeeping and the
+    /// `hydra_config_reload_total` label; the source decides whether a
+    /// successful swap is announced ([`ReloadSource::Local`]) or stays quiet.
+    async fn reload_with_source(
+        &self,
+        force: bool,
+        source: ReloadSource,
+    ) -> Result<bool, StoreError> {
+        #[cfg(test)]
+        {
+            let active = self.reload_probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.reload_probe
+                .max_active
+                .fetch_max(active, Ordering::SeqCst);
+            let delay_ms = self.reload_probe.delay_ms.load(Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        let result = self.reload_impl(force, source).await;
+
+        #[cfg(test)]
+        self.reload_probe.active.fetch_sub(1, Ordering::SeqCst);
+
+        match &result {
+            // Only a successful rebuild + swap proves the runtime caught up.
+            Ok(true) => {
+                self.record_snapshot_outcome(false);
+                #[cfg(feature = "proxy")]
+                crate::admin::metrics::record_config_version(self.version());
+            }
+            // A no-op did not rebuild: the previous failure may still be the
+            // reason the snapshot is stale, so leave the flag alone.
+            Ok(false) => {}
+            Err(_) => self.record_snapshot_outcome(true),
+        }
+        #[cfg(feature = "proxy")]
+        crate::admin::metrics::record_config_reload(
+            source.metric_label(),
+            matches!(&result, Ok(true)),
+        );
+        result
+    }
+
+    /// The actual paired-read → revision gate → build → swap body. The caller
+    /// owns the reload lock.
+    ///
+    /// `source` is load-bearing at the END of the function: after the swap and
+    /// the snapshot hooks, only a `Local` change is published. Quiet
+    /// (`PubSub`/`Poll`) reloads must not relay, or the fleet would loop.
+    async fn reload_impl(&self, force: bool, source: ReloadSource) -> Result<bool, StoreError> {
+        let local = self.version();
+        let (mut rows, mut db_version) =
+            load_config_rows(&self.pool, self.key_provider.as_ref()).await?;
+
+        // Revision is the gate (never a separate content read): a reload only
+        // rebuilds when the shared watermark advanced.
+        if !force && db_version <= local {
+            tracing::debug!(version = local, "reload: revision unchanged");
             return Ok(false);
         }
 
-        let mut new_content = candidate;
-        new_content.version = prev_version + 1;
-        // PERSIST FIRST, THEN PUBLISH (review N3): a durable watermark that lags
-        // the in-memory one reads as "this node is behind".
-        db::set_config_version(&pool, new_content.version).await?;
-        self.inner.store(new_content.cfg.clone());
-        self.replication.store(Arc::new(new_content));
+        // `force` means "advance the shared revision even if the content looks
+        // the same". Bump inside a write transaction first, then re-read the
+        // paired rows/version so this node and every other process converge.
+        if force && db_version <= local {
+            let _ = db::bump_config_revision(&self.pool).await?;
+            (rows, db_version) = load_config_rows(&self.pool, self.key_provider.as_ref()).await?;
+        }
+
+        let new_cfg = config_from_rows(&rows)?;
+        let new_version = db_version.max(local + 1);
+
+        self.inner.store(Arc::new(new_cfg));
+        {
+            let mut last = self.last_rows.lock().unwrap_or_else(|e| e.into_inner());
+            *last = Some(rows);
+        }
+        self.version.store(new_version, Ordering::Release);
         self.swrr.clear();
         // Followers of the snapshot (the TLS cert store) re-resolve here, so a
         // cert written through the admin API is live on the very next
-        // handshake — on every node, the write and the apply being independent paths.
+        // handshake.
         self.notify(&self.snapshot());
 
-        // ...and now the CLUSTER. Order (local swap, then publish) is deliberate: the SQLite
-        // transaction committed before any of this, so this node's own state must be consistent
-        // with its own database whether or not the cluster accepts the publish. A failure here is
-        // returned as `NotPublished` — the admin layer turns that into a 503 saying the change is
-        // local only — and the local config STAYS SERVED by this node until some other node's
-        // publish moves the head, at which point the materializer rebuilds this node from that
-        // head and the un-published change is gone. That is the correct direction (the head is
-        // the authority) and it is why the 503 must not be silent.
-        #[cfg(feature = "arachne")]
-        if let Some(publisher) = &self.publisher {
-            let content = self.replication();
-            let (published_head, final_index) = publisher
-                .publish_with_index(&content.cfg, content.fidelity())
-                .await
-                .map_err(|reason| StoreError::NotPublished { reason })?;
-            *self.pending_head.lock().unwrap_or_else(|e| e.into_inner()) = Some(published_head);
-            // The final manifest/head batch's index IS the tree generation. Record it directly:
-            // a follow-up head read could race a newer publish and watermark this node with the
-            // wrong generation.
-            self.local_write_index
-                .store(final_index, std::sync::atomic::Ordering::Release);
+        // Publish AFTER the local swap/hooks, while the reload guard is held.
+        // Only an actually-applied LOCAL change is announced; a no-op, a
+        // quiet external reload, and a failed reload never publish.
+        if source == ReloadSource::Local {
+            self.publish_notification(new_version).await;
         }
         Ok(true)
     }
 
-    /// Attach the Arachne publisher (ADR-0001, plan T3.2).
+    /// Best-effort announcement of a successfully applied local revision.
     ///
-    /// A builder rather than a `load` parameter: single-node and non-`arachne` builds have no
-    /// publisher at all, and the call site that HAS one is the cluster bootstrap, which is also the
-    /// only place that knows whether the control plane started.
-    #[cfg(feature = "arachne")]
-    #[must_use]
-    pub fn with_publisher(
-        mut self,
-        publisher: Arc<crate::cluster::arachne_publish::ConfigPublisher>,
-    ) -> Self {
-        self.publisher = Some(publisher);
-        self
+    /// A notify failure is a warning + metric, never an error: the DB write is
+    /// committed and the local snapshot is live, and the Phase 3b poller is the
+    /// correctness backstop. Redis publish is timeout-bounded, so holding the
+    /// reload guard here is acceptable.
+    async fn publish_notification(&self, version: u64) {
+        let Some(notifier) = self.notifier.as_ref() else {
+            return;
+        };
+        match notifier.publish(version).await {
+            Ok(()) => {
+                #[cfg(feature = "proxy")]
+                crate::admin::metrics::record_config_notify(true);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "hydra::store",
+                    version,
+                    error = %error,
+                    "config change notification failed; peers will converge by polling"
+                );
+                #[cfg(feature = "proxy")]
+                crate::admin::metrics::record_config_notify(false);
+            }
+        }
+    }
+
+    /// Record the reload outcome in the single source of truth, and mirror it
+    /// to the alertable gauge when the admin service is compiled in.
+    fn record_snapshot_outcome(&self, stale: bool) {
+        self.snapshot_stale.store(stale, Ordering::Release);
+        #[cfg(feature = "proxy")]
+        crate::admin::metrics::record_config_snapshot_stale(stale);
     }
 }
 
@@ -854,29 +912,8 @@ mod tests {
         std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1))
     }
 
-    /// A hydrated wire with NO fidelity rows, for tests that only exercise the
-    /// config swap. Production never builds one this way: the leader uses
-    /// `ReplicationContent::load` and a replica uses `hydrate` on a real wire.
-    fn hydrated(version: u64, cfg: ConfigData) -> HydratedWire {
-        HydratedWire {
-            version,
-            cfg,
-            fidelity: crate::cluster::content::FidelityRows {
-                limit_roles: Vec::new(),
-                provider_keys: Vec::new(),
-                provider_models: Vec::new(),
-                tenant_providers: Vec::new(),
-                tenant_models: Vec::new(),
-                ..crate::cluster::content::FidelityRows::default()
-            },
-        }
-    }
-
     /// Insert one provider row so the next `reload_all` sees a REAL change.
-    ///
-    /// The generation now advances only when the replication content changes
-    /// (plan T6), so a test that wants a notify/marker write must first make one.
-    async fn seed_change(pool: &sqlx::SqlitePool, id: &str) {
+    async fn seed_change(pool: &Pool, id: &str) {
         crate::db::insert_provider(
             pool,
             &hydra_core::model::Provider {
@@ -885,8 +922,8 @@ mod tests {
                 name: id.to_string(),
                 endpoint: "http://127.0.0.1:1/".to_string(),
                 weight: 1,
-                created_at: String::new(),
-                updated_at: String::new(),
+                created_at: "2026-01-01 00:00:00".to_string(),
+                updated_at: "2026-01-01 00:00:00".to_string(),
                 max_concurrency: None,
                 max_queue_depth: None,
                 queue_wait_timeout_ms: None,
@@ -912,101 +949,222 @@ mod tests {
         );
     }
 
+    /// Record every publish without any transport. `calls` is the exactly-once
+    /// assertion; `last` is the version the store announced.
+    #[derive(Default)]
+    struct MockNotifier {
+        calls: AtomicU64,
+        last: AtomicU64,
+    }
+
+    impl MockNotifier {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn last(&self) -> u64 {
+            self.last.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigNotifier for MockNotifier {
+        async fn publish(&self, version: u64) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last.store(version, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// Every snapshot swap must notify the registered followers.
     ///
     /// This is the invariant that keeps the TLS cert store honest (审核四 P3).
-    /// Re-resolving certs from the admin write path only is how the cluster
-    /// path was missed: a node applies snapshots through
-    /// [`ConfigStore::apply_snapshot`] and never touches an admin handler, so a
-    /// cert pushed through the control plane stayed invisible to the TLS
-    /// callback until the process restarted. Both paths are asserted here, so a
-    /// future writer that bypasses `notify` fails this test instead of shipping.
     #[tokio::test]
     async fn every_snapshot_swap_notifies_followers() {
-        let pool = crate::db::init_pool("sqlite::memory:")
-            .await
-            .expect("init_pool");
-        crate::db::run_migrate(&pool).await.expect("migrate");
+        let pool = crate::db::testing::setup_pool().await;
         let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
 
-        let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = seen.clone();
         store.on_snapshot_change(Arc::new(move |cfg: &ConfigData| {
             // The hook must observe the NEW snapshot, not the old one.
             recorded
                 .lock()
                 .expect("hook mutex")
-                .push(cfg.tenants_by_domain.len() as u64);
+                .push(cfg.providers.len());
         }));
 
-        // Control-plane path (materialized snapshot): one config version.
-        store.apply_snapshot(hydrated(7, ConfigData::default()));
-        // Local rebuild path (admin write, `POST /api/v1/reload`). The content
-        // must ACTUALLY change: the generation now advances — and followers are
-        // notified — only when the replicated bytes differ (plan T6).
         seed_change(&pool, "p-notify").await;
         assert!(
             store.reload_all().await.expect("reload_all"),
-            "a real DB change must advance the replication content"
+            "a real DB change must swap the snapshot"
         );
 
         let seen = seen.lock().expect("hook mutex").clone();
+        assert_eq!(seen, vec![1], "reload must notify followers");
+    }
+
+    /// Phase 3a: a LOCAL write + reload announces the new revision exactly once.
+    #[tokio::test]
+    async fn local_reload_publishes_exactly_once_with_the_new_version() {
+        let pool = crate::db::testing::setup_pool().await;
+        let notifier = MockNotifier::new();
+        let store = ConfigStore::load(pool.clone(), kp())
+            .await
+            .expect("load")
+            .with_notifier(notifier.clone());
+
+        seed_change(&pool, "p-local-notify").await;
+        assert!(
+            store.reload_all().await.expect("reload_all"),
+            "the seeded write must advance the revision"
+        );
+
+        assert_eq!(notifier.calls(), 1, "one local swap = exactly one publish");
         assert_eq!(
-            seen.len(),
-            2,
-            "both snapshot swap paths must notify their followers; saw {seen:?}"
+            notifier.last(),
+            store.version(),
+            "the announced version is the one just applied"
+        );
+    }
+
+    /// Phase 3a: a no-op reload does not publish (nothing changed).
+    #[tokio::test]
+    async fn no_op_reload_does_not_publish() {
+        let pool = crate::db::testing::setup_pool().await;
+        let notifier = MockNotifier::new();
+        let store = ConfigStore::load(pool.clone(), kp())
+            .await
+            .expect("load")
+            .with_notifier(notifier.clone());
+
+        assert!(
+            !store.reload_all().await.expect("no-op reload"),
+            "a fresh DB has no new revision"
+        );
+        assert_eq!(notifier.calls(), 0, "a no-op must not announce anything");
+    }
+
+    /// Phase 3a: the quiet external path swaps an advanced revision but NEVER
+    /// publishes — this is what prevents a pub/sub/poll rebroadcast loop.
+    #[tokio::test]
+    async fn external_reload_swaps_without_publishing() {
+        let pool = crate::db::testing::setup_pool().await;
+        let notifier = MockNotifier::new();
+        let store = ConfigStore::load(pool.clone(), kp())
+            .await
+            .expect("load")
+            .with_notifier(notifier.clone());
+
+        seed_change(&pool, "p-external").await;
+        assert!(
+            store.reload_external().await.expect("external reload"),
+            "the external reload must apply the advanced revision"
+        );
+        assert!(
+            store.snapshot().providers.contains_key("p-external"),
+            "the quiet reload still swaps the snapshot"
+        );
+        assert_eq!(
+            notifier.calls(),
+            0,
+            "an external change must never be relayed"
+        );
+
+        // An already-current external reload is a no-op, still silent.
+        assert!(
+            !store
+                .reload_external()
+                .await
+                .expect("second external reload"),
+            "nothing advanced since the last swap"
+        );
+        assert_eq!(notifier.calls(), 0);
+    }
+
+    /// Phase 3a: the poll probe is cheap and tracks the shared watermark.
+    #[tokio::test]
+    async fn has_newer_revision_tracks_the_shared_watermark() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+
+        assert!(
+            !store.has_newer_revision().await.expect("probe"),
+            "a fresh store matches the shared revision"
+        );
+
+        seed_change(&pool, "p-poll").await;
+        assert!(
+            store.has_newer_revision().await.expect("probe"),
+            "a committed write must make the probe true"
+        );
+
+        assert!(store.reload_external().await.expect("quiet reload"));
+        assert!(
+            !store.has_newer_revision().await.expect("probe"),
+            "after applying the revision the probe is false again"
         );
     }
 
     /// REVIEW N3 — `reload_all` must persist the version marker BEFORE it
-    /// publishes the new snapshot.
-    /// It used to swap the snapshot and advance the counter first, then write
-    /// the marker "best-effort" (warn only). One failed write therefore left the
-    /// in-memory version ahead of the durable one — and the evidence-based
-    /// freshness gate (`replica::replica_is_current`) reads that as "this node's
-    /// replica is behind", disqualifying a node whose replica is exactly what it
-    /// serves. Failing the reload is recoverable; a silently diverging watermark
-    /// is not.
+    /// swaps in the new snapshot.
     ///
-    /// Fault injection is a real SQLite trigger (no mock).
+    /// The old test aborted the marker write with a SQLite trigger; that
+    /// mechanism does not exist on PostgreSQL/MySQL. The backend-agnostic
+    /// equivalent is the `#[cfg(test)]` persist hook in `db.rs`.
     #[tokio::test]
-    async fn reload_all_persists_the_marker_before_publishing() {
-        let pool = crate::db::init_pool("sqlite::memory:")
+    async fn reload_all_persists_the_marker_before_swap() {
+        let pool = crate::db::testing::setup_pool().await;
+        let notifier = MockNotifier::new();
+        let store = ConfigStore::load(pool.clone(), kp())
             .await
-            .expect("init_pool");
-        crate::db::run_migrate(&pool).await.expect("migrate");
-        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+            .expect("load")
+            .with_notifier(notifier.clone());
         let before = store.version();
-        // Make a REAL change first: an unchanged store skips the marker write
-        // entirely under the new predicate, which would make the fault
-        // injection below vacuous (plan T6 step 7).
-        seed_change(&pool, "p-marker").await;
 
-        sqlx::query(
-            "CREATE TRIGGER block_marker BEFORE INSERT ON config_meta \
-             BEGIN SELECT RAISE(ABORT, 'oracle: marker write blocked'); END",
-        )
-        .execute(&pool)
-        .await
-        .expect("install trigger");
-
+        let failure = crate::db::test_fault::fail_persist();
         assert!(
-            store.reload_all().await.is_err(),
+            store.reload_all_with(true).await.is_err(),
             "an unpersistable version must fail the reload"
+        );
+        assert_eq!(
+            notifier.calls(),
+            0,
+            "a failed reload must not announce a change"
+        );
+        assert!(
+            store.snapshot_stale(),
+            "a failed reload must mark the snapshot stale"
         );
         assert_eq!(
             store.version(),
             before,
             "the in-memory watermark must not advance past the durable one"
         );
+        assert_eq!(
+            crate::db::get_config_version(&pool)
+                .await
+                .expect("read marker"),
+            crate::db::ConfigVersion::Value(before),
+            "the durable marker must not advance when the persist step fails"
+        );
 
-        // Dropping the trigger lets the same call succeed and advance both.
-        sqlx::query("DROP TRIGGER block_marker")
-            .execute(&pool)
+        // Releasing the failure lets the same call succeed and advance both.
+        drop(failure);
+        store
+            .reload_all_with(true)
             .await
-            .expect("drop trigger");
-        store.reload_all().await.expect("reload now succeeds");
+            .expect("reload now succeeds");
         assert_eq!(store.version(), before + 1);
+        assert_eq!(
+            notifier.calls(),
+            1,
+            "the successful forced local reload announces once"
+        );
         assert_eq!(
             crate::db::get_config_version(&pool)
                 .await
@@ -1016,264 +1174,147 @@ mod tests {
         );
     }
 
-    /// A store built from a hand-made `ConfigData` serves it, swaps it, and is backed by the pool it
-    /// was handed.
-    ///
-    /// This replaces `from_snapshot_serves_and_applies`, whose first assertion was
-    /// `store.pool().is_none()` — the store type itself asserted the retired "no local database"
-    /// shape. The rest of the test is unchanged, because the behavior under test (serve, then
-    /// replace on `apply_snapshot`, clearing SWRR) was never about that shape.
+    /// A no-op reload returns `false` without bumping the version; `force`
+    /// bypasses the row comparison.
     #[tokio::test]
-    async fn from_data_serves_and_applies() {
-        let pool = crate::db::init_pool("sqlite::memory:")
-            .await
-            .expect("init_pool");
-        crate::db::run_migrate(&pool).await.expect("migrate");
+    async fn no_op_reload_returns_false_and_force_bumps() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+        let before = store.version();
+
+        assert!(
+            !store.reload_all().await.expect("no-op reload"),
+            "unchanged rows must not swap the snapshot"
+        );
+        assert_eq!(store.version(), before, "no-op reload must not bump");
+
+        assert!(
+            store.reload_all_with(true).await.expect("forced reload"),
+            "force must swap even with unchanged rows"
+        );
+        assert_eq!(store.version(), before + 1, "force advances the version");
+    }
+
+    /// A changed DB reload bumps the version AND swaps the served snapshot.
+    #[tokio::test]
+    async fn changed_reload_bumps_version_and_swaps_snapshot() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+        let before = store.version();
+        assert!(store.snapshot().providers.is_empty());
+
+        seed_change(&pool, "p-changed").await;
+        assert!(store.reload_all().await.expect("changed reload"));
+        assert_eq!(store.version(), before + 1);
+        assert!(
+            store.snapshot().providers.contains_key("p-changed"),
+            "the new snapshot must serve the row just written"
+        );
+    }
+
+    /// A store built from a hand-made `ConfigData` serves it; the DB remains
+    /// the authority, so a later reload rebuilds from the DB and clears SWRR.
+    #[tokio::test]
+    async fn from_data_serves_and_reload_rebuilds_from_db() {
+        let pool = crate::db::testing::setup_pool().await;
         let mut c1 = ConfigData::default();
         cfg_with_tenant(&mut c1);
         let store = ConfigStore::from_data(pool, c1, kp())
             .await
             .expect("from_data");
-        // The store's pool is a real handle to a real (empty) database, which is the point: it is
-        // the database `version()` reports on and the one every `pool()` reader queries.
-        assert!(
-            !crate::db::config_content_exists(store.pool())
-                .await
-                .expect("content probe"),
-            "a config injected in memory is NOT in the database until a write puts it there"
-        );
-        // Version 0: the database carries no watermark yet, so this node's first control poll asks
-        // with `?since=0` and is sent a full snapshot.
         assert_eq!(store.version(), 0);
-
-        // Initial snapshot is served.
         assert!(store.snapshot().tenants_by_domain.contains_key("acme.com"));
 
-        // Seed some SWRR state, then apply a new snapshot: it replaces the
-        // config AND clears SWRR (same semantics as reload_all).
+        // Seed some SWRR state, then reload: the DB (empty) is the authority,
+        // so the injected config is replaced and SWRR is cleared.
         store.swrr().insert(
             ("t1".into(), "gpt-4".into()),
             hydra_core::swrr::SwrrState::default(),
         );
         assert!(!store.swrr().is_empty());
 
-        let c2 = ConfigData::default();
-        store.apply_snapshot(hydrated(42, c2));
+        assert!(store.reload_all_with(true).await.expect("reload"));
         assert!(
             store.snapshot().tenants_by_domain.is_empty(),
-            "apply_snapshot replaced the config"
+            "reload replaced the injected config with the DB's"
         );
-        assert!(store.swrr().is_empty(), "apply_snapshot cleared SWRR state");
-        assert_eq!(
-            store.version(),
-            42,
-            "apply_snapshot adopts the control-plane version"
+        assert!(store.swrr().is_empty(), "reload cleared SWRR state");
+        assert_eq!(store.version(), 1, "the first DB-backed reload bumps");
+    }
+
+    /// P1-2: the store owns `snapshot_stale`, so the tenant write path (which
+    /// never touches `AdminState`) gets the flag from the same reload that
+    /// records it.
+    ///
+    /// A failed reload sets it; a successful rebuild + swap clears it; a no-op
+    /// leaves it untouched because it did not rebuild.
+    #[tokio::test]
+    async fn reload_failure_marks_snapshot_stale_and_success_clears_it() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+        assert!(!store.snapshot_stale(), "a fresh store is not stale");
+
+        let failure = crate::db::test_fault::fail_persist();
+        assert!(
+            store.reload_all_with(true).await.is_err(),
+            "the marker write must fail the reload"
+        );
+        assert!(
+            store.snapshot_stale(),
+            "a failed reload must set the store-owned flag"
+        );
+        assert!(
+            store.snapshot().providers.is_empty(),
+            "a failed reload must keep the previously served snapshot"
+        );
+
+        // The revision did not move, so this is a no-op; it must NOT clear a
+        // flag set by the failure above.
+        assert!(
+            !store.reload_all().await.expect("no-op reload"),
+            "an unchanged revision is a no-op"
+        );
+        assert!(
+            store.snapshot_stale(),
+            "a no-op reload did not rebuild, so it must leave the stale flag alone"
+        );
+
+        drop(failure);
+        assert!(
+            store.reload_all_with(true).await.expect("forced reload"),
+            "force rebuilds and swaps even when rows are unchanged"
+        );
+        assert!(
+            !store.snapshot_stale(),
+            "a successful rebuild + swap must clear the flag"
         );
     }
 
-    // `reload_all_without_db_errors` stood here: it built a pool-less store and asserted
-    // `StoreError::NoDatabase`. Both the constructor and the variant are gone — a store without a
-    // database is not a state this process can be in — so the test went with them rather than
-    // being rewritten to assert something else under the same name.
-
-    /// The combined reload path must derive the SAME config and fidelity rows as
-    /// the two separate loaders it replaced.
+    /// P1-1: public reloads take the internal lock, so two concurrent calls
+    /// cannot interleave read/compare/persist/swap.
     ///
-    /// `reload_all_with` used to call `build_config` and then
-    /// `ReplicationContent::load`, reading the hierarchy twice. The one-read
-    /// version is only a win if it is not a silent divergence. The fixture
-    /// carries enabled AND disabled hierarchy rows plus an offline provider
-    /// model, so the load-bearing filtering asymmetry (full fidelity rows vs
-    /// enabled-only served config) participates in the comparison.
-    #[tokio::test]
-    async fn combined_loader_matches_the_separate_loaders() {
-        use hydra_core::model::{
-            BillingStatus, GlobalRole, LimitRole, ProviderKey, ProviderModel, Tenant,
-            TenantAccessToken, UserApiKey,
-        };
+    /// The test hook (compiled only under `#[cfg(test)]`) counts tasks inside
+    /// the critical section and can stretch it; with the lock the maximum is
+    /// 1. Without it both tasks would sleep concurrently and the maximum would
+    /// be 2, which is exactly the stale-swap interleaving this guards against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_reloads_serialize_on_the_internal_lock() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool, kp()).await.expect("load");
+        store.reload_probe.delay_ms.store(40, Ordering::SeqCst);
 
-        let pool = crate::db::init_pool("sqlite::memory:")
-            .await
-            .expect("init_pool");
-        crate::db::run_migrate(&pool).await.expect("migrate");
+        let a = store.clone();
+        let b = store.clone();
+        let first = tokio::spawn(async move { a.reload_all_with(true).await });
+        let second = tokio::spawn(async move { b.reload_all_with(true).await });
+        let (first, second) = tokio::join!(first, second);
+        first.expect("first task").expect("first reload");
+        second.expect("second task").expect("second reload");
 
-        crate::db::insert_tenant(
-            &pool,
-            &Tenant {
-                id: "t1".into(),
-                name: "T".into(),
-                domain: "acme.com".into(),
-                cert_key: None,
-                cert_file: None,
-                enabled: true,
-                created_at: String::new(),
-                updated_at: String::new(),
-            },
-        )
-        .await
-        .expect("tenant");
-        crate::db::upsert_user_group(
-            &pool,
-            &hydra_core::model::UserGroup {
-                id: "g1".into(),
-                tenant_id: "t1".into(),
-                name: "g".into(),
-                enabled: true,
-                created_at: String::new(),
-                updated_at: String::new(),
-            },
-        )
-        .await
-        .expect("group");
-        crate::db::upsert_user(
-            &pool,
-            &User {
-                id: "u1".into(),
-                tenant_id: "t1".into(),
-                user_group_id: "g1".into(),
-                external_id: None,
-                name: "u".into(),
-                enabled: true,
-                billing_status: BillingStatus::Active,
-                billing_reason: None,
-                billing_updated_at: None,
-                created_at: String::new(),
-                updated_at: String::new(),
-            },
-        )
-        .await
-        .expect("user");
-        crate::db::insert_user_api_key(
-            &pool,
-            &UserApiKey {
-                id: "k1".into(),
-                user_id: "u1".into(),
-                name: "k".into(),
-                key_hash: "hash-k1".into(),
-                key_prefix: "hk_".into(),
-                key_last4: "k1".into(),
-                enabled: true,
-                expires_at: None,
-                created_at: String::new(),
-                updated_at: String::new(),
-            },
-        )
-        .await
-        .expect("key");
-
-        // Provider row + two keys sharing a second-granularity `created_at`:
-        // the loader's total order (`, id` tie-breaker) must be identical in
-        // both paths.
-        seed_change(&pool, "p-combined").await;
-        for (id, api_key) in [("pk1", "sk-one"), ("pk2", "sk-two")] {
-            crate::db::insert_provider_key(
-                &pool,
-                kp().as_ref(),
-                &ProviderKey {
-                    id: id.into(),
-                    provider_id: "p-combined".into(),
-                    api_key: api_key.into(),
-                    created_at: "2026-01-01 00:00:00".into(),
-                },
-            )
-            .await
-            .expect("provider key");
-        }
-        // One online model enters `models_by_key`; the offline row is dropped
-        // from the served config but MUST stay in the fidelity rows.
-        for (id, key, status) in [("pm-online", "m-online", 1), ("pm-offline", "m-offline", 0)] {
-            crate::db::insert_provider_model(
-                &pool,
-                &ProviderModel {
-                    id: id.into(),
-                    key: key.into(),
-                    name: key.into(),
-                    provider_id: "p-combined".into(),
-                    status,
-                },
-            )
-            .await
-            .expect("provider model");
-        }
-        // Enabled + disabled limit roles / tokens / global roles: the served
-        // config keeps only the enabled ones; fidelity keeps BOTH.
-        for (id, enabled) in [("lr-on", true), ("lr-off", false)] {
-            crate::db::insert_limit_role(
-                &pool,
-                kp().as_ref(),
-                &LimitRole {
-                    id: id.into(),
-                    name: id.into(),
-                    matching_key: None,
-                    matching_model: None,
-                    matching_tenant: None,
-                    matching_provider: None,
-                    limit_count: Some(1),
-                    limit_token: None,
-                    window: "m".into(),
-                    enabled,
-                    created_at: String::new(),
-                },
-            )
-            .await
-            .expect("limit role");
-        }
-        for (id, enabled) in [("tok-on", true), ("tok-off", false)] {
-            crate::db::insert_tenant_access_token(
-                &pool,
-                &TenantAccessToken {
-                    id: id.into(),
-                    tenant_id: "t1".into(),
-                    name: id.into(),
-                    token_hash: format!("hash-{id}"),
-                    token_prefix: "ht_".into(),
-                    token_last4: "abcd".into(),
-                    enabled,
-                    expires_at: None,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                },
-            )
-            .await
-            .expect("tenant token");
-        }
-        for (id, enabled) in [("role-on", true), ("role-off", false)] {
-            crate::db::upsert_global_role_with_providers(
-                &pool,
-                &GlobalRole {
-                    id: id.into(),
-                    name: id.into(),
-                    tenant_id: "t1".into(),
-                    user_group_id: "*".into(),
-                    user_id: "*".into(),
-                    api_key_id: "*".into(),
-                    model_key: "*".into(),
-                    provider_ids: Vec::new(),
-                    enabled,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                },
-                &[],
-            )
-            .await
-            .expect("global role");
-        }
-
-        let cfg_only = build_config(&pool, kp().as_ref())
-            .await
-            .expect("build_config");
-        let expected = ReplicationContent::load(&pool, kp().as_ref(), cfg_only.clone(), 7)
-            .await
-            .expect("separate load");
-
-        let (cfg, fidelity) = build_config_with_fidelity(&pool, kp().as_ref())
-            .await
-            .expect("combined load");
-        assert_eq!(cfg, cfg_only, "the served config view must not change");
         assert_eq!(
-            ReplicationContent::from_loaded(cfg, fidelity, 7),
-            expected,
-            "the combined loader must produce the same config + fidelity rows"
+            store.reload_probe.max_active.load(Ordering::SeqCst),
+            1,
+            "two public reloads overlapped inside the critical section"
         );
     }
 }

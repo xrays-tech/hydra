@@ -95,7 +95,7 @@ function storeToken(value) {
   } catch { /* storage disabled (private mode): stay in-memory only */ }
 }
 /** Re-entrant suppression for the global 401 handler. A COUNTER, not a
- *  boolean: the leader banner poll fires background requests, and a single
+ *  boolean: session restore and sign-in run background requests, and a single
  *  flag would let one of those 401s be swallowed by a concurrent sign-in. */
 const suppress401 = {
   n: 0,
@@ -2005,7 +2005,9 @@ async function renderHealth() {
       el("span", { class: "skeleton", style: "width:100%;height:60px" }),
     ),
   ));
-  // Whole-cluster view (cluster P4): fleet nodes + lease holder.
+  // This node's own status. The shared-database shape has no peer list, no
+  // lease holder and no raft term: it reports only facts one node can know
+  // about itself.
   content.appendChild(el("div", { class: "panel" },
     el("div", { class: "panel-head" }, el("h2", {}, el("span", { text: t("custom.health.cluster") })), el("div", { class: "spacer" })),
     el("div", { class: "stat-grid", id: "cluster-stats" },
@@ -2017,14 +2019,12 @@ async function renderHealth() {
   // Each panel renders from ITS OWN result. `Promise.all` used to let a failed
   // cluster probe discard the `/health` payload that had ALREADY arrived: the
   // Status panel kept its skeleton forever while the process was healthy, and the
-  // raw-JSON view showed only the cluster error. Note the asymmetry this fixes —
-  // `refreshLeaderBanner` polls this same endpoint and already tolerates its
-  // failure (`catch { return; }`), while the health page let it take the page down.
+  // raw-JSON view showed only the cluster error.
   //
-  // `cluster_unavailable` (502) means "cannot read the cluster registry (Redis
-  // unreachable?)" — NOT "single node": single-node mode answers
-  // `200 {cluster:false}` (`cluster_api.rs:92-95` -> `single_node_status`). So a
-  // 502 here is a real degradation and is rendered as one.
+  // A failed `/cluster/status` probe is a real degradation and is rendered as
+  // one. It must not be presented as "single-node": single-node mode is a
+  // successful answer with `cluster:false`, a different fact from "this node
+  // could not answer the status route".
   const errText = (r) => (r && r.message) || t("common.empty.unknownError");
   const [healthRes, clusterRes] = await Promise.allSettled([
     api("GET", "/health"),
@@ -2060,79 +2060,49 @@ function renderHealthProbeError(e) {
 }
 
 /** The `/cluster/status` probe failed. Deliberately NOT `clusterNotEnabled`:
- *  that message ASSERTS "no member list / single node", which is a different
- *  fact from "this node could not answer the status route". */
+ *  that message ASSERTS "cluster mode is off / single node", which is a
+ *  different fact from "this node could not answer the status route". */
 function renderClusterUnavailable(e) {
   const stats = $("#cluster-stats");
-  const nodes = $("#cluster-nodes");
-  clear(stats); clear(nodes);
+  const notes = $("#cluster-nodes");
+  clear(stats); clear(notes);
   stats.appendChild(el("div", { class: "stat warn" },
     el("div", { class: "sl", text: t("custom.health.mode") }),
     el("div", { class: "sv", text: t("custom.health.unavailable") })));
-  nodes.appendChild(el("p", { class: "muted",
+  notes.appendChild(el("p", { class: "muted",
     text: t("custom.health.clusterUnavailable", { msg: (e && e.message) || t("common.empty.unknownError") }) }));
 }
+
+/** Three-state Redis reachability: `null` means this layer has no probe, so it
+ *  is shown as unknown — never as "unreachable". */
+function redisReachability(c) {
+  if (c.redis_reachable === true) return { label: t("custom.health.reachable"), cls: "ok" };
+  if (c.redis_reachable === false) return { label: t("custom.health.unreachable"), cls: "warn" };
+  return { label: t("custom.health.unknownPill"), cls: "" };
+}
+
 function renderClusterStatus(c) {
   const stats = $("#cluster-stats");
-  const nodes = $("#cluster-nodes");
-  clear(stats); clear(nodes);
-  if (!c || !c.cluster) {
-    stats.appendChild(el("div", { class: "stat" },
-      el("div", { class: "sl", text: t("custom.health.mode") }), el("div", { class: "sv", text: t("custom.health.singleNode") })));
-    nodes.appendChild(el("p", { class: "muted",
-      text: t("custom.health.clusterNotEnabled") }));
-    return;
-  }
-  // `alive` is a THREE-state field since ADR-0001 T4.1: `true` for this node, `null` for a peer
-  // whose liveness this node cannot observe (there is no registry and no per-node RPC to ask).
-  // Counting null as "not alive" would render a healthy peer as DOWN, which is a claim nobody
-  // measured — so the card counts what is known and says so when something is not.
-  const alive = c.nodes.filter((n) => n.alive === true).length;
-  const unknown = c.nodes.filter((n) => n.alive === null || n.alive === undefined).length;
+  const notes = $("#cluster-nodes");
+  clear(stats); clear(notes);
+  const redisConfigured = !!(c && c.redis_configured);
+  const redis = redisReachability(c || {});
+  const dbOk = !!(c && c.db_reachable === true);
   const cards = [
-    { l: t("custom.health.mode"), v: c.mode, cls: "" },
-    { l: t("custom.health.leaseHolder"), v: c.lease_holder ?? "—", cls: c.lease_holder ? "ok" : "warn" },
-    {
-      l: t("custom.health.nodesAlive"),
-      v: unknown > 0 ? `${alive}/${c.nodes.length} (+${unknown} ${t("custom.health.unknownPill")})` : `${alive}/${c.nodes.length}`,
-      cls: unknown > 0 ? "" : alive === c.nodes.length && c.nodes.length > 0 ? "ok" : "warn",
-    },
-    { l: t("custom.health.self"), v: c.node_id || "—", cls: "" },
+    { l: t("custom.health.nodeId"), v: (c && c.node_id) || "—", cls: "" },
+    { l: t("custom.health.role"), v: (c && c.role) || ((c && c.cluster) ? "cluster" : "all"), cls: "" },
+    { l: t("custom.health.configVersion"), v: c && c.config_version !== undefined && c.config_version !== null ? c.config_version : "—", cls: "" },
+    { l: t("custom.health.dbReachable"), v: dbOk ? "ok" : "warn", cls: dbOk ? "ok" : "warn" },
+    { l: t("custom.health.redisConfigured"), v: t(redisConfigured ? "custom.health.configured" : "custom.health.notConfigured"), cls: redisConfigured ? "ok" : "warn" },
+    { l: t("custom.health.redisReachable"), v: redis.label, cls: redis.cls },
   ];
   for (const k of cards) stats.appendChild(el("div", { class: `stat ${k.cls}` },
     el("div", { class: "sl", text: k.l }), el("div", { class: "sv", text: String(k.v) })));
 
-  const th = (label) => el("th", { text: label });
-  // Columns since ADR-0001 (the role is gone, so the old ROLE column is too):
-  //   NODE          | the member, with `self` marked
-  //   RAFT ADDRESS  | the address in `control_url` — which is the raft TRANSPORT address now, not
-  //                 a control URL (the field name is kept because it is this table's key; the
-  //                 header must not keep lying about it)
-  //   LEADER        | `leader` for the member raft's hint names, `member` otherwise. This used to
-  //                 be `n.role`, a field the DTO no longer HAS — so the cell rendered `undefined`
-  //                 (an empty pill under a header that said "RULE", itself a mistranslation of
-  //                 ROLE). One pill per fact: the leader is named HERE, not twice.
-  //   STATE         | the three-state liveness (`alive` null = this node cannot observe the peer)
-  const rows = [el("tr", {}, th(t("custom.health.node")), th(t("custom.health.raftAddr")),
-    th(t("custom.health.leaderCol")), th(t("custom.health.state")))];
-  for (const n of c.nodes) {
-    const name = el("span", { text: n.node_id });
-    if (n.is_self) name.appendChild(el("span", { class: "pill info", text: t("custom.health.selfPill") }));
-    rows.push(el("tr", {},
-      el("td", {}, name),
-      el("td", { class: "mono" }, n.control_url || "—"),
-      el("td", {}, n.is_lease_holder
-        ? el("span", { class: "pill ok", text: t("custom.health.leaderPill") })
-        : el("span", { class: "pill", text: t("custom.health.memberPill") })),
-      el("td", {}, n.alive === true
-        ? el("span", { class: "pill ok", text: t("custom.health.alivePill") })
-        : n.alive === false
-          ? el("span", { class: "pill dead", text: t("custom.health.downPill") })
-          : el("span", { class: "pill", text: t("custom.health.unknownPill") })),
-    ));
+  if (!c || !c.cluster) {
+    notes.appendChild(el("p", { class: "muted",
+      text: t("custom.health.clusterNotEnabled") }));
   }
-  nodes.appendChild(el("div", { class: "table-wrap" },
-    el("table", {}, el("thead", {}, rows[0]), el("tbody", {}, ...rows.slice(1)))));
 }
 function renderHealthStats(h) {
   const grid = $("#health-stats");
@@ -2159,55 +2129,6 @@ function highlightJson(obj) {
   html = html.replace(/\bnull\b/g, '<span class="b">null</span>');
   html = html.replace(/\b(-?\d+\.?\d*)\b/g, '<span class="n">$&</span>');
   return html;
-}
-
-/* ===========================================================================
- * Leader banner (T9.5 / §7-5)
- * ======================================================================== */
-/** Show a banner when this admin UI is NOT on the node raft says is leading.
- *
- *  Every node serves its own admin API since ADR-0001 (there is no edge), and writes are accepted
- *  on ANY node — the library forwards them to the leader — so unlike the old leader/edge topology
- *  this banner no longer warns about a write that is about to bounce. It says which node leads,
- *  which is what an operator needs when reading the fleet view from a follower.
- *
- *  The "jump to the leader's admin URL" link is GONE, and it is not a missing feature: the link
- *  was built from `HYDRA_PUBLIC_URL` per node, a variable this plan retired, and the field the DTO
- *  still calls `control_url` now carries the node's **raft transport** address — linking a browser
- *  at that would dial a raft port. Naming the leader is the honest thing that is left.
- *
- *  Re-entrant: it is called on login, every 30s, and after a language change, so
- *  it reuses the existing element instead of stacking banners. */
-async function refreshLeaderBanner() {
-  let cluster = null;
-  try {
-    cluster = await api("GET", "/cluster/status");
-  } catch {
-    return; // not cluster-enabled, or the probe failed: no banner either way
-  }
-  const existing = document.getElementById("leader-banner");
-  if (
-    !cluster ||
-    !cluster.cluster ||
-    // `lease_holder` is `null` while this node does not yet know who leads (cold start, lost
-    // quorum). That is "not known", not "I am the leader" — so it shows NO banner rather than a
-    // claim in either direction.
-    !cluster.lease_holder ||
-    cluster.node_id === cluster.lease_holder
-  ) {
-    if (existing) existing.remove();
-    return;
-  }
-  const banner = existing || el("div", { id: "leader-banner" });
-  clear(banner);
-  banner.appendChild(
-    el("span", {
-      text: t("common.leaderBanner.notLeader", { node: cluster.lease_holder }),
-    }),
-  );
-  // Insert into `.main` (the content column), NOT `#app`: `#app` is a flex ROW
-  // of sidebar + main, so prepending there renders a squeezed third column.
-  if (!existing) $(".main").prepend(banner);
 }
 
 /* ===========================================================================
@@ -2258,11 +2179,6 @@ function enterApp() {
   tEl.textContent = t("common.auth.authenticated");
   renderNav();
   go(CURRENT);
-  // T9.5: the banner is installed now; the guard stays so a scrollback to a
-  // build without it cannot throw `ReferenceError` on login — the failure class
-  // this repo has already shipped once ("the write landed and the UI still
-  // reported a failure").
-  if (typeof refreshLeaderBanner === "function") refreshLeaderBanner();
 }
 
 /** The single 401 handler for the whole app: drop the ticket, go back to the
@@ -2358,12 +2274,6 @@ function wireEvents() {
     langSel.value = currentLang();
     langSel.addEventListener("change", (e) => setLang(e.target.value));
   }
-  // The lease can move under us (failover) while this page stays open: keep the
-  // banner honest without a reload. The request is suppressed-aware for 401s,
-  // like every other background call.
-  setInterval(() => {
-    if (TOKEN) refreshLeaderBanner().catch(() => {});
-  }, 30000);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -2377,10 +2287,6 @@ document.addEventListener("DOMContentLoaded", () => {
     if (sel) sel.value = code;
     renderNav();
     go(CURRENT);
-    // The banner's text interpolates the node id, so it cannot use `data-i18n`
-    // (there is no variable interpolation in `applyStaticI18n`) — it has to be
-    // rebuilt for the new language.
-    refreshLeaderBanner();
   };
   wireEvents();
   applyStaticI18n();

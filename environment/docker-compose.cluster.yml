@@ -1,8 +1,16 @@
-# Hydra cluster: three IDENTICAL nodes + redis + clickhouse (ADR-0001).
+# Hydra cluster: three IDENTICAL nodes + one shared PostgreSQL + redis + clickhouse.
+#
+# Shared DB + Redis fanout (wired in Phase 3): a write on ANY node commits to the
+# shared relational DB and bumps `config_revision.version`; that node then
+# publishes `{version,origin}` on `hydra:config:changed`, and every peer reloads
+# its in-process snapshot. A 5 s poll of the shared revision is the backstop for
+# a missed message or a Redis outage. There is no leader and no raft: the shared
+# DB is authoritative, and every node is an equal writer.
 #
 # Build the image first:  ./environment/build.sh
-#   (the image bundles server,cluster-redis,arachne,usage-clickhouse — see environment/build.sh,
-#    and scripts/check_compose_env.cjs, which derives the required set from THESE manifests)
+#   (the image bundles server, one DB backend (db-postgres), cluster-redis and usage-clickhouse —
+#    see environment/build.sh, and scripts/check_compose_env.cjs, which derives the required set
+#    from THESE manifests)
 #
 # Prereqs:
 #   export HYDRA_ADMIN_TOKEN="$(openssl rand -hex 32)"          # admin API, >= 16 chars
@@ -15,24 +23,22 @@
 # Start:
 #   docker compose -f docker-compose.cluster.yml up -d
 #
-# ## What changed in ADR-0001, and why this file looks different
+# ## Shared-DB, no-raft topology
 #
 # * **Every node is the same node.** There is no leader/edge split: each one proxies, serves the
-#   admin API, holds its own SQLite, and is a raft member. The old `HYDRA_ROLE` and the edge
-#   service are gone, so the three services below differ ONLY in identity (node id, raft address,
-#   published ports, volume) — the environment block is one anchor.
-# * **The member list IS the cluster.** `HYDRA_CLUSTER_PEERS` is the same string on every node, and
-#   the ORDER is part of the cluster's identity (Arachne derives each member's numeric raft id from
-#   its position). Changing the order means changing the cluster.
-# * **Membership is FIXED at three.** You cannot `--scale` a raft member: adding or removing one is
-#   a membership change that must reach every member, and it is NOT yet wrapped by a command in
-#   this repo — change the list on all members together and restart them (see `dev-docs/ops.md`
-#   §13). Three is the minimum that tolerates one failure.
-# * **No control URL, no lease TTL, no poll interval.** Config reaches each node by materializing
-#   the tree from Arachne; leadership is raft's. A deployment that still sets those variables gets
-#   a startup ERROR naming them (`RETIRED_CLUSTER_ENV`).
-# * Certs ship inside the config tree (migration 0007), not via mounts, and each node keeps its own
-#   data volume — there is nothing to share.
+#   admin API, and shares the SAME PostgreSQL config database. The three services below differ ONLY
+#   in identity (node id and published ports) — the environment block is one anchor.
+# * **The cluster switch is `HYDRA_REDIS_URL`.** Redis carries the data-plane state (shared rate
+#   limits, breaker votes, invalidation); config authority is the relational database. There is no
+#   static member list and no raft transport.
+# * **One database, zero per-node volumes.** `HYDRA_DB_URL` is byte-identical on all three nodes;
+#   there is no local config DB and no node-*-data volume to drift or to restore separately.
+# * Certs ship inside the config rows (migration 0007), not via mounts.
+#
+# Database credentials below (`hydra/hydra`, database `hydra`) are LOCAL defaults, not production
+# secrets. The URL scheme MUST match the compiled backend:
+#   postgres://hydra:hydra@postgres:5432/hydra   (hydra:postgres / hydra:latest)
+#   mysql://hydra:hydra@mysql:3306/hydra         (hydra:mysql; add a mysql service for it)
 
 services:
   redis:
@@ -45,6 +51,28 @@ services:
       interval: 5s
       timeout: 2s
       retries: 10
+    restart: unless-stopped
+
+  # One shared config database for all three members. A single writer transaction serializes
+  # through `hydra_lock` (see crates/hydra-server/src/db.rs), so this is the config authority.
+  postgres:
+    image: postgres:16-alpine
+    container_name: hydra-postgres
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra
+      POSTGRES_DB: hydra
+    ports:
+      # Loopback only: every tenant/provider/credential row lives here.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------------------------
@@ -61,13 +89,11 @@ services:
     # the default SIGTERM path with slack; use 40s if you also set `stop_signal: SIGQUIT`.
     stop_grace_period: 30s
     environment: &node-env
-      HYDRA_CLUSTER_PEERS: "a=hydra-a:8091,b=hydra-b:8092,c=hydra-c:8093"
       HYDRA_NODE_ID: a                                         # differs (a/b/c)
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8091"                     # differs; must match the table above
       HYDRA_REDIS_URL: "redis://redis:6379"
       HYDRA_REDIS_MODE: single
-      # REQUIRED — no default: it authenticates the internal endpoints (health/status) and
-      # identifies a peer.
+      # SAME database URL on every node — there is no per-node config DB.
+      HYDRA_DB_URL: "postgres://hydra:hydra@postgres:5432/hydra"
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_LISTEN: "0.0.0.0:8080"
       HYDRA_USAGE_SINK: clickhouse
@@ -79,10 +105,9 @@ services:
     ports:
       # Loopback only — the admin port has no TLS (see docker-compose.yml).
       - "127.0.0.1:8081:8081"   # admin (differs per node: 8081/8082/8083)
-      - "127.0.0.1:8091:8091"   # raft  (differs per node: 8091/8092/8093)
-    volumes:
-      - node-a-data:/app/data
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       clickhouse:
@@ -104,13 +129,11 @@ services:
     environment:
       <<: *node-env
       HYDRA_NODE_ID: b
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8092"
     ports:
       - "127.0.0.1:8082:8081"
-      - "127.0.0.1:8092:8092"
-    volumes:
-      - node-b-data:/app/data
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       clickhouse:
@@ -130,13 +153,11 @@ services:
     environment:
       <<: *node-env
       HYDRA_NODE_ID: c
-      HYDRA_ARACHNE_LISTEN: "0.0.0.0:8093"
     ports:
       - "127.0.0.1:8083:8081"
-      - "127.0.0.1:8093:8093"
-    volumes:
-      - node-c-data:/app/data
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       clickhouse:
@@ -173,7 +194,5 @@ services:
 
 volumes:
   redis-data:
-  node-a-data:
-  node-b-data:
-  node-c-data:
+  postgres-data:
   clickhouse-data:

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sqlx::SqlitePool;
+use crate::db::Pool;
 
 pub use engine::UsageSink;
 pub use query::UsageQuery;
@@ -90,15 +90,16 @@ impl EnvView {
 
 /// What a backend needs in order to be opened: the node's own database, and its configuration.
 pub struct BackendConfig {
-    /// This node's SQLite pool. Every node has one (ADR-0001 D-2), and the single-node backends
-    /// read and write their rows there.
-    pub pool: SqlitePool,
+    /// This node's relational-database pool (PostgreSQL or MySQL). Every node has one
+    /// (ADR-0001 D-2); a backend that keeps its rows in the node database reads and writes them
+    /// here. The shipped ClickHouse sink does not use it.
+    pub pool: Pool,
     pub env: EnvView,
 }
 
 impl BackendConfig {
     #[must_use]
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             pool,
             env: EnvView::Process,
@@ -336,7 +337,7 @@ pub(crate) mod testing;
 mod tests {
     use super::*;
 
-    async fn pool() -> SqlitePool {
+    async fn pool() -> Pool {
         crate::db::test_pool().await
     }
 

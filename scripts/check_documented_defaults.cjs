@@ -80,13 +80,15 @@ const UNVERIFIED_OK = records(process.env.CDD_UNVERIFIED_OK, [
   ['HYDRA_TLS_LISTEN', 'documented default is "unset" — the TLS listener is bound iff the variable is set'],
   ['HYDRA_CLICKHOUSE_URL', 'documented default is *(unset)*; it is REQUIRED by the clickhouse backend whenever that backend is selected (the registry declares it, and `check_usage_backends` keeps the declaration and this table in step)'],
   ['HYDRA_USAGE_SINK', 'REQUIRED since ADR-0002 D-1 — there is no default to compare: "where does the billing data go" is a decision, and the code refuses to start without it'],
-  ['HYDRA_CLUSTER_PEERS', 'REQUIRED in cluster mode — there is no default to compare: the list is the decision itself (unset means single-node, which is a different mode rather than a fallback value)'],
-  ['HYDRA_ARACHNE_LISTEN', 'REQUIRED in cluster mode — no default: the raft transport must be told where to bind'],
-  ['HYDRA_CLUSTER_ID', 'optional; its default is a HASH of the member list (computed, not a literal), which the extractor cannot read'],
   ['HYDRA_NODE_ID', 'documented default is derived at startup (host:port), not a literal'],
   ['HYDRA_TRUSTED_PROXIES', 'documented default is empty; the code splits a list, no scalar fallback'],
   ['HYDRA_TENANT_API', 'documented default `on`; the code parses it as a boolean master switch'],
   ['HYDRA_SESSION_AFFINITY', 'documented default `on`; the code parses a vocabulary (`off`/`false`/`0` select the no-session-header path, anything else keeps `on`) — there is no scalar fallback to compare'],
+  // Phase 2: the URL has ONE code owner per backend, selected at COMPILE time by the
+  // `db-postgres`/`db-mysql` feature. There is no single literal to compare: a `db-postgres` build
+  // and a `db-mysql` build fall back to DIFFERENT hosts/schemes. The runbook documents both URLs
+  // (Phase 4 docs cleanup); the guard verifies below that the source really carries both.
+  ['HYDRA_DB_URL', 'the default URL is selected by the compiled backend (db-postgres vs db-mysql), so there is no single literal to compare'],
 ]);
 
 
@@ -366,6 +368,24 @@ function sourceFiles() {
   return out;
 }
 
+/**
+ * The backend-selected `DEFAULT_DB_URL` literals, in source order.
+ *
+ * Phase 2 compiles exactly one relational backend; each carries its own `#[cfg(feature = …)]`
+ * constant. Two distinct values means the documented default cannot be a single string, so
+ * `HYDRA_DB_URL` is reported as UNVERIFIED (with the reason in `UNVERIFIED_OK`) rather than
+ * compared against whichever `const` appears first.
+ */
+function backendUrlDefaults(sources) {
+  const values = [];
+  for (const f of sources) {
+    for (const m of f.text.matchAll(/const\s+DEFAULT_DB_URL\s*:\s*&str\s*=\s*"([^"]*)"/g)) {
+      if (m[1]) values.push(m[1]);
+    }
+  }
+  return [...new Set(values)];
+}
+
 function main() {
   let ops;
   try {
@@ -400,47 +420,75 @@ function main() {
     return { rel: path.relative(ROOT, f), text: code, lines: code.split("\n") };
   });
 
+  // Retired cluster knobs may still appear in the operator docs until the Phase 4 docs
+  // cleanup. They are not shipped settings any more, so there is no default to compare; the
+  // single owner of the retired list is `RETIRED_CLUSTER_ENV`.
+  const retiredClusterEnv = new Set();
+  try {
+    const owner = fs.readFileSync(
+      path.join(ROOT, 'crates/hydra-server/src/cluster/mod.rs'),
+      'utf8',
+    );
+    const decl = owner.match(/const\s+RETIRED_CLUSTER_ENV\s*:\s*\[&str;\s*\d+\]\s*=\s*\[([\s\S]*?)\];/);
+    if (decl) {
+      for (const m of decl[1].matchAll(/"([A-Z0-9_]+)"/g)) retiredClusterEnv.add(m[1]);
+    }
+  } catch {
+    // A fixture tree may not carry the Rust source; judge all rows as before.
+  }
+
   const rows = new Map(); // varName -> row text (first occurrence wins)
   for (const line of ops) {
     const m = line.match(/^\|\s*`?(HYDRA_[A-Z0-9_]+)`?\s*\|/);
     if (m && !rows.has(m[1])) rows.set(m[1], line);
   }
 
+  // A backend-selected `DEFAULT_DB_URL` is not a single comparable literal. Print the values so the
+  // reader can see what the two builds fall back to (and so a deleted backend literal is visible).
+  const dbUrlDefaults = backendUrlDefaults(sources);
+  const multiBackendDbUrl = dbUrlDefaults.length > 1;
+  if (dbUrlDefaults.length > 0) {
+    console.log(`  note  HYDRA_DB_URL default(s) in source: ${dbUrlDefaults.join(' | ')}`);
+  }
+
   const problems = [];
   const compared = [];
   const unverified = [];
   for (const [name, row] of rows) {
+    if (retiredClusterEnv.has(name)) continue;
     const doc = documentedDefault(row);
     let code = null;
     let where = null;
-    for (const f of sources) {
-      const hit = codeDefault(sources, name, f.lines);
-      if (hit && hit.value !== null) {
-        code = hit.value;
-        where = `${f.rel}:${hit.line} (${hit.how})`;
-        break;
-      }
-    }
-    // Second pass: a NON-numeric default (an address, a URL, a mode word). Only attempted when
-    // the numeric path found nothing, so every number keeps going through the old route.
-    if (doc === null || code === null) {
-      const docStr = documentedStringDefault(row);
-      let codeStr = null;
+    if (!(name === 'HYDRA_DB_URL' && multiBackendDbUrl)) {
       for (const f of sources) {
-        const hit = codeStringDefault(sources, name, f.lines);
-        if (hit) {
-          codeStr = hit;
+        const hit = codeDefault(sources, name, f.lines);
+        if (hit && hit.value !== null) {
+          code = hit.value;
+          where = `${f.rel}:${hit.line} (${hit.how})`;
           break;
         }
       }
-      if (docStr && docStr.value !== null && codeStr) {
-        compared.push({ name, doc: docStr.value, code: codeStr.value, where: `${codeStr.how}`, how: docStr.how });
-        if (docStr.value !== codeStr.value) {
-          problems.push(
-            `${name}: ops.md says \`${docStr.value}\` (${docStr.how}) but the code falls back to \`${codeStr.value}\` @ ${codeStr.how}`,
-          );
+      // Second pass: a NON-numeric default (an address, a URL, a mode word). Only attempted when
+      // the numeric path found nothing, so every number keeps going through the old route.
+      if (doc === null || code === null) {
+        const docStr = documentedStringDefault(row);
+        let codeStr = null;
+        for (const f of sources) {
+          const hit = codeStringDefault(sources, name, f.lines);
+          if (hit) {
+            codeStr = hit;
+            break;
+          }
         }
-        continue;
+        if (docStr && docStr.value !== null && codeStr) {
+          compared.push({ name, doc: docStr.value, code: codeStr.value, where: `${codeStr.how}`, how: docStr.how });
+          if (docStr.value !== codeStr.value) {
+            problems.push(
+              `${name}: ops.md says \`${docStr.value}\` (${docStr.how}) but the code falls back to \`${codeStr.value}\` @ ${codeStr.how}`,
+            );
+          }
+          continue;
+        }
       }
     }
     if (doc === null || code === null) {

@@ -6,7 +6,7 @@
 //! unopenable, `ConfigStore::load` failed, the process refused to start, and the
 //! admin API that could have re-entered the keys runs in that same process.
 //!
-//! Real SQLite, real AES-GCM, no mocks: the assertions are about the bytes that
+//! Real database, real AES-GCM, no mocks: the assertions are about the bytes that
 //! are actually stored.
 
 use std::sync::Arc;
@@ -28,19 +28,25 @@ fn ring_a_to_b() -> StaticKeyProvider {
     StaticKeyProvider::with_previous([2u8; KEY_LEN], 2, [1u8; KEY_LEN], 1)
 }
 
-async fn seed_provider_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str, secret: &str) {
+async fn seed_provider_key(
+    pool: &hydra_server::db::Pool,
+    kp: &dyn KeyProvider,
+    id: &str,
+    secret: &str,
+) {
     sqlx::query(
-        "INSERT INTO provider (id, key, name, endpoint, weight, created_at, updated_at) \
-         VALUES ('p1', 'openai', 'O', 'https://api.openai.com', 1, '', '')",
+        "INSERT INTO provider (id, provider_code, name, endpoint, weight, created_at, updated_at) \
+         VALUES ('p1', 'openai', 'O', 'https://api.openai.com', 1, \
+         '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
     )
     .execute(pool)
     .await
     .ok();
     let sealed = kp.seal(secret.as_bytes()).expect("seal");
-    sqlx::query(
+    sqlx::query(&db::dialect::sql(
         "INSERT INTO provider_key (id, provider_id, api_key_ciphertext, api_key_nonce, \
-         key_version, created_at) VALUES (?, 'p1', ?, ?, ?, '')",
-    )
+         key_version, created_at) VALUES (?, 'p1', ?, ?, ?, '2026-01-01 00:00:00')",
+    ))
     .bind(id)
     .bind(&sealed.ciphertext)
     .bind(sealed.nonce.to_vec())
@@ -50,20 +56,25 @@ async fn seed_provider_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &s
     .expect("insert provider_key");
 }
 
-async fn seed_tenant_cert(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str, pem: &str) {
-    sqlx::query(
+async fn seed_tenant_cert(
+    pool: &hydra_server::db::Pool,
+    kp: &dyn KeyProvider,
+    id: &str,
+    pem: &str,
+) {
+    sqlx::query(&db::dialect::sql(
         "INSERT INTO tenant (id, name, domain, enabled, created_at, updated_at) \
-         VALUES (?, 't', 'localhost', 1, '', '')",
-    )
+         VALUES (?, 't', 'localhost', 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+    ))
     .bind(id)
     .execute(pool)
     .await
     .expect("insert tenant");
     let sealed = kp.seal(pem.as_bytes()).expect("seal");
-    sqlx::query(
+    sqlx::query(&db::dialect::sql(
         "UPDATE tenant SET cert_pem = 'CERT PEM', cert_key_ciphertext = ?, cert_key_nonce = ?, \
          cert_key_version = ? WHERE id = ?",
-    )
+    ))
     .bind(&sealed.ciphertext)
     .bind(sealed.nonce.to_vec())
     .bind(i64::from(sealed.key_version))
@@ -76,12 +87,17 @@ async fn seed_tenant_cert(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &st
 /// Seed a `limit_role` whose `matching_key` is sealed under `kp` — the third sealed column, added by
 /// decision D-16 (2026-10-08), and the one with no `key_version` column of its own: the version
 /// lives INSIDE the envelope, which is why the rotation has to parse it rather than read it.
-async fn seed_limit_role_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str, key: &str) {
+async fn seed_limit_role_key(
+    pool: &hydra_server::db::Pool,
+    kp: &dyn KeyProvider,
+    id: &str,
+    key: &str,
+) {
     let sealed = kp.seal(key.as_bytes()).expect("seal").to_text();
-    sqlx::query(
-        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
-         VALUES (?, ?, ?, 600, 'm', 1, '')",
-    )
+    sqlx::query(&db::dialect::sql(
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, limit_window, enabled, \
+         created_at) VALUES (?, ?, ?, 600, 'm', 1, '2026-01-01 00:00:00')",
+    ))
     .bind(id)
     .bind(id)
     .bind(sealed)
@@ -91,7 +107,11 @@ async fn seed_limit_role_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: 
 }
 
 /// Read a stored `matching_key` back through the repo layer (the path the loader uses).
-async fn read_limit_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str) -> Option<String> {
+async fn read_limit_key(
+    pool: &hydra_server::db::Pool,
+    kp: &dyn KeyProvider,
+    id: &str,
+) -> Option<String> {
     db::get_limit_role(pool, kp, id)
         .await
         .ok()
@@ -101,13 +121,13 @@ async fn read_limit_key(pool: &sqlx::SqlitePool, kp: &dyn KeyProvider, id: &str)
 /// Read a stored provider key back through a provider (the same path the loader
 /// uses at boot).
 async fn read_provider_key(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     kp: &dyn KeyProvider,
     id: &str,
 ) -> Option<String> {
-    let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(&db::dialect::sql(
         "SELECT api_key_ciphertext, api_key_nonce, key_version FROM provider_key WHERE id = ?",
-    )
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -124,13 +144,13 @@ async fn read_provider_key(
 }
 
 async fn read_tenant_cert_key(
-    pool: &sqlx::SqlitePool,
+    pool: &hydra_server::db::Pool,
     kp: &dyn KeyProvider,
     id: &str,
 ) -> Option<String> {
-    let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(&db::dialect::sql(
         "SELECT cert_key_ciphertext, cert_key_nonce, cert_key_version FROM tenant WHERE id = ?",
-    )
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -276,8 +296,9 @@ async fn the_rotation_also_seals_a_plaintext_limit_key_it_finds() {
     let pool = common::setup_pool().await;
     // The way the pre-D-16 code wrote it: plaintext, straight into the column.
     sqlx::query(
-        "INSERT INTO limit_role (id, name, matching_key, limit_count, window, enabled, created_at) \
-         VALUES ('r-legacy', 'r-legacy', 'sk-legacy-plaintext', 600, 'm', 1, '')",
+        "INSERT INTO limit_role (id, name, matching_key, limit_count, limit_window, enabled, \
+         created_at) VALUES ('r-legacy', 'r-legacy', 'sk-legacy-plaintext', 600, 'm', 1, \
+         '2026-01-01 00:00:00')",
     )
     .execute(&pool)
     .await

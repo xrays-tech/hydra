@@ -919,7 +919,7 @@ const delegatedSkeleton = (scriptBody) =>
   //     working after the rules became line-aware.
   const ci = baseCi([
     "      - run: |",
-    "          cargo test -p hydra-server --features server,cluster-redis \\",
+    "          cargo test -p hydra-server --features server,cluster-redis,db-postgres \\",
     "            --test usage_query -- --ignored",
   ].join("\n"));
   const root = skeleton({

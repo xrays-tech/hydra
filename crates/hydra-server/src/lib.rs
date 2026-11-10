@@ -5,27 +5,30 @@
 //! All "internal logic" lives in the pure core; this crate only translates
 //! between I/O (sessions / rows / responses) and core types.
 //!
-//! **Status:** Wave-1 foundation skeleton — modules are feature-gated and
-//! intentionally empty. Waves 2–6 fill them in.
-//!
-//! ## Feature model
-//!
-//! The crate is split into composable Cargo features so each wave compiles
+//! **Status:** implemented. The modules are feature-gated so a build compiles
 //! only the slice of the I/O shell it needs (see `Cargo.toml` `[features]`):
 //!
-//! | Feature        | Module(s)        | Wave  | Native dep        |
-//! | -------------- | ---------------- | ----- | ----------------- |
-//! | `runtime`      | `sink`, `admin`  | W3/W5 | tokio/dashmap/... |
-//! | `db`           | `db`, `store`    | W2    | sqlx (sqlite)     |
-//! | `http-client`  | `http`           | W3    | reqwest (rustls)  |
-//! | `proxy`        | `proxy`, `tls`   | W4    | pingora/BoringSSL |
-//! | `server`       | (umbrella)       | W4+   | all of the above  |
-//! | `usage-clickhouse` | (within sink) | W3  | clickhouse (opt)  |
+//! | Feature        | Module(s)        | Wave  | Native dep                     |
+//! | -------------- | ---------------- | ----- | ------------------------------ |
+//! | `runtime`      | `sink`, `admin`  | W3/W5 | tokio/dashmap/...              |
+//! | `db`           | `db`, `store`    | W2    | sqlx (PostgreSQL / MySQL)      |
+//! | `http-client`  | `http`           | W3    | reqwest (rustls)               |
+//! | `proxy`        | `proxy`, `tls`   | W4    | pingora/BoringSSL              |
+//! | `server`       | (umbrella)       | W4+   | all of the above               |
+//! | `usage-clickhouse` | (within sink) | W3  | clickhouse (opt)               |
 //!
-//! With no features the crate is an empty lib; `db,http-client` builds sqlx +
-//! reqwest/rustls **without** pingora/BoringSSL, letting W2/W3 run natively
-//! on macOS.
+//! `db-postgres` or `db-mysql` is mandatory (exactly one); `db,http-client`
+//! builds sqlx + reqwest/rustls **without** pingora/BoringSSL, which is what
+//! lets the persistence and HTTP layers build natively on macOS.
 #![forbid(unsafe_code)]
+
+// Phase 2: every hydra-server recipe selects exactly one relational backend. A
+// feature-less build must fail loudly instead of compiling an empty shell that
+// looks deployable.
+#[cfg(not(any(feature = "db-postgres", feature = "db-mysql")))]
+compile_error!(
+    "hydra-server requires exactly one database backend feature: `db-postgres` or `db-mysql`"
+);
 
 // --- W2: persistence & config store ---------------------------------------
 /// At-rest encryption for persisted secrets (provider upstream api-keys).
@@ -70,18 +73,17 @@ pub mod db;
 #[cfg(feature = "db")]
 pub mod store;
 
-// --- Cluster mode (v8 plan) ------------------------------------------------
-/// Node role (`HYDRA_ROLE`: all/leader/edge), control config, snapshot wire
-/// and the control-plane client. Needs the full proxy shell (`proxy` implies
-/// `db` + `http-client`).
+// --- Cluster mode (shared-DB architecture) ---------------------------------
+/// Node role (`HYDRA_ROLE`: all|cluster) and cluster configuration. Needs the
+/// full proxy shell (`proxy` implies `db` + `http-client`).
 #[cfg(feature = "proxy")]
 pub mod cluster;
 
-// --- Redis backbone (cluster P2+, v8 plan Q5/Q6) ---------------------------
-/// Shared Redis state: leader lease (P2), node registry / invalidation bus /
-/// shared limits / auth L2 (P4). Opt-in via `cluster-redis` so the default
-/// single-node build keeps zero external deps. Requires the proxy shell (the
-/// lease store plugs into the cluster module).
+// --- Redis backbone (cluster P2+) ------------------------------------------
+/// Shared Redis state: the invalidation stream, shared rate limits, breaker
+/// votes and the auth L2 cache. The leader lease and node registry were retired
+/// by the shared-DB architecture. Opt-in via `cluster-redis` so the default
+/// single-node build keeps zero external deps. Requires the proxy shell.
 #[cfg(all(feature = "cluster-redis", feature = "proxy"))]
 pub mod redis;
 

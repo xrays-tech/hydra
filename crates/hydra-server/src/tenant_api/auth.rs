@@ -6,21 +6,25 @@
 //! by running a full-table tenant-token read on **every attempt** — an unbounded,
 //! unordered read with no rate limit and no lockout, driven by an unauthenticated caller. Moving
 //! the endpoint to the internet-facing data-plane listener without changing that
-//! would have turned it into a cheap remote amplifier against the leader's
-//! SQLite.
+//! would have turned it into a cheap remote amplifier against the shared
+//! database.
 //!
-//! The snapshot already carries what is needed: the cluster replication content
-//! holds `FidelityRows::tenant_access_tokens`, and `ConfigData.tenant_tokens` is
-//! derived from those rows during snapshot hydration. So the gate is **zero I/O**, works
-//! on every role (leader, standby and edge all hold a replication content), and agrees
-//! with the rest of the cluster by construction rather than by expiry.
+//! The snapshot already carries what is needed: `ConfigData.tenant_tokens` is
+//! derived from the `tenant_access_token` rows when the snapshot is built. So the
+//! gate is **zero I/O** and agrees with the shared database by construction
+//! rather than by expiry.
 //!
-//! ## One guard, both halves
+//! ## One snapshot, both halves
 //!
 //! The token identities and the tenant rows are read from the **same**
-//! `replication()` guard. `ReplicationContent` holds the data and config behind both (`fidelity()` and the
-//! `cfg` it was built with), so a request can never be authenticated against one
-//! generation of the snapshot and answered from another.
+//! `snapshot()` guard. The version reported with the decision is a SECOND read
+//! of the store's version counter, not atomically paired with that guard: a
+//! concurrent swap between the two reads can make `config_version` describe the
+//! newer generation while the decision used the older one. That is benign for
+//! authorisation (the decision is internally consistent) and only affects the
+//! advisory `config_version` in the response. Phase 3 restores a paired read by
+//! carrying the version inside the snapshot or taking both under the reload
+//! lock; until then this comment must not claim a single atomic generation.
 
 use hydra_core::auth::sha256_hex_string;
 
@@ -43,7 +47,7 @@ pub enum AuthError {
     /// or calling the token wrong. Two states say it:
     ///
     /// - the node holds no configuration at all (version 0): a node that has just started or joined,
-    ///   before the materializer applies the head. The tenant contract documents this as a retryable
+    ///   before its first reload applies a snapshot. The tenant contract documents this as a retryable
     ///   503 — see `tenant-api-integration.md`;
     /// - the snapshot names a token digest with no matching tenant row: a config that cannot be
     ///   trusted, so nothing is authenticated against it.
@@ -70,18 +74,18 @@ pub struct AuthenticatedTenant {
 /// fold is needed here.
 pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTenant, AuthError> {
     let present = sha256_hex_string(bearer.as_bytes());
-    // ONE atomic read: the token identities, tenant rows and version all come from the same
-    // generation (see `AuthenticatedTenant`).
-    let content = store.replication();
+    // The token identities and tenant rows come from ONE snapshot guard (the
+    // decision is internally consistent). The version below is a separate read;
+    // see the module note — Phase 3 will pair them.
+    let snapshot = store.snapshot();
+    let cfg: &ConfigData = &snapshot;
+    let config_version = store.version();
 
     // "This node holds no configuration yet" is version 0 — the watermark for "nothing has ever been
-    // applied" (`ConfigStore::version`, F-4).
-    if content.version == 0 {
+    // applied".
+    if config_version == 0 {
         return Err(AuthError::NotReady);
     }
-
-    let cfg: &ConfigData = &content.cfg;
-    let config_version = content.version;
     let identity = match cfg.tenant_tokens.get(&present) {
         Some(identity) => identity,
         None => return Err(AuthError::Unauthorized),
@@ -126,8 +130,6 @@ pub(crate) use crate::admin::handlers::constant_time_eq;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::content::FidelityRows;
-    use crate::cluster::snapshot::HydratedWire;
     use hydra_core::config::ConfigData;
     use hydra_core::identity::TenantTokenIdentity;
     use hydra_core::model::Tenant;
@@ -180,8 +182,10 @@ mod tests {
     // NOTE: the BROADER positive and negative resolution paths (a token for
     // another tenant, a tenant with no token, and the snapshot-vs-database
     // property) are covered end-to-end in `crates/hydra-server/tests/tenant_api.rs`.
-    // The cases below build a REAL replication content through the production `apply_snapshot`
-    // path, so no test-only constructor is added to `ConfigStore`.
+    // The cases below build a `ConfigData` and inject it through the store's
+    // test seam, with a persisted version of 1 so the gate sees a populated
+    // snapshot; this keeps token-without-tenant (an impossible DB state because
+    // of the FK) expressible.
 
     async fn store_with_tenant_tokens(
         tenants: &[(String, String)],
@@ -208,23 +212,20 @@ mod tests {
             cfg.tenant_tokens.insert(
                 sha256_hex_string(token.as_bytes()),
                 TenantTokenIdentity {
-                    tenant_id: tenant_id.clone(),
-                    token_name: token_name.clone(),
+                    tenant_id,
+                    token_name,
                     expires_at,
                 },
             );
         }
 
-        let store =
-            ConfigStore::from_data(crate::db::test_pool().await, ConfigData::default(), kp())
-                .await
-                .expect("from_data");
-        store.apply_snapshot(HydratedWire {
-            version: 1,
-            cfg,
-            fidelity: FidelityRows::default(),
-        });
-        store
+        let pool = crate::db::test_pool().await;
+        crate::db::set_config_version(&pool, 1)
+            .await
+            .expect("seed config version");
+        ConfigStore::from_data(pool, cfg, kp())
+            .await
+            .expect("from_data")
     }
 
     #[tokio::test]

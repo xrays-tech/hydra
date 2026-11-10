@@ -159,7 +159,7 @@ mod tests {
             expires_at: Some("2026-12-01T00:00:00Z".into()),
         };
         let json = serde_json::to_string(&id).expect("serialize");
-        // `billing_status` must serialize snake_case (the SQLite CHECK domain).
+        // `billing_status` must serialize snake_case (the database CHECK domain).
         assert!(json.contains("\"delinquent\""), "json was {json}");
         let back: ApiKeyIdentity = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, id, "round-trip must be exact");
