@@ -159,6 +159,27 @@ pub async fn begin_write(pool: &Pool) -> Result<Tx<'static>, sqlx::Error> {
     Ok(tx)
 }
 
+/// True when the DB error means the backend is UNAVAILABLE, not that the
+/// request was invalid: the connection failed, the pool could not hand out a
+/// connection in time, TLS failed, or the pool/configuration was never usable.
+///
+/// This is the transport half of the classification. It deliberately excludes
+/// `Database` errors (a live server answered with a constraint/serialization
+/// error) and `Protocol`/decode errors (a live connection produced bad data).
+/// Callers map this to a retryable `503 database_unavailable`, never a `500`:
+/// during a shared-DB partition the request may succeed unchanged after
+/// reconnecting.
+pub fn is_unavailable(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Io(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Configuration(_)
+    )
+}
+
 /// True when the DB error is a transient serialization/lock failure that the
 /// caller may retry: PostgreSQL SQLSTATE `40001`/`40P01`, MySQL `1213`/`1205`.
 pub fn is_retryable(e: &sqlx::Error) -> bool {
@@ -397,5 +418,45 @@ pub(crate) mod test_fault {
             .unwrap_or_else(|e| e.into_inner())
             .insert(db.clone());
         FailPersistGuard { db }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unavailable;
+
+    #[test]
+    fn unavailable_covers_connection_and_pool_failures() {
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        for error in [
+            io,
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Tls("handshake failed".into()),
+            sqlx::Error::Configuration("bad database url".into()),
+        ] {
+            assert!(
+                is_unavailable(&error),
+                "{error:?} must classify as DB-unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_excludes_request_and_data_errors() {
+        for error in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol("unexpected packet".into()),
+            sqlx::Error::InvalidArgument("bad bind".into()),
+            sqlx::Error::ColumnNotFound("missing".into()),
+        ] {
+            assert!(
+                !is_unavailable(&error),
+                "{error:?} is not a transport outage"
+            );
+        }
     }
 }

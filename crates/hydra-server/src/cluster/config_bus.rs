@@ -48,6 +48,31 @@ pub const MIN_POLL_MS: u64 = 50;
 /// needs a bound it can reason about.
 pub const MAX_POLL_MS: u64 = 3_600_000;
 
+/// Backoff after the broadcast receiver reports `Closed`.
+///
+/// A closed receiver has no further senders, so retrying immediately would
+/// hot-spin a worker while the poll fallback still has to run (and still
+/// refreshes liveness only on a completed tick). Bounded and short: the watcher
+/// stays responsive if the client resubscribes.
+const CLOSED_RECV_BACKOFF: Duration = Duration::from_millis(500);
+
+/// The two failure modes of the broadcast receiver, classified separately so
+/// the loop cannot lump a recoverable lag together with a dead channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvFault {
+    /// `n` messages were dropped from the ring buffer before we read them.
+    Lagged(u64),
+    /// No senders remain; the channel will never yield another message.
+    Closed,
+}
+
+fn classify_recv_error(error: &tokio::sync::broadcast::error::RecvError) -> RecvFault {
+    match error {
+        tokio::sync::broadcast::error::RecvError::Lagged(n) => RecvFault::Lagged(*n),
+        tokio::sync::broadcast::error::RecvError::Closed => RecvFault::Closed,
+    }
+}
+
 /// Wire payload of one config-change announcement.
 ///
 /// `origin` is the publishing node's id: it makes a message attributable in
@@ -276,15 +301,60 @@ pub async fn spawn_config_watch_on(
                             // watcher in the alert `time() - gauge > 3× poll interval`.
                             crate::admin::metrics::record_config_watch_ok();
                         }
-                        Err(e) => {
-                            // A disconnected broadcast receiver is not fatal; the poll loop
-                            // below keeps converging.
-                            tracing::warn!(
-                                channel = %channel,
-                                error = %e,
-                                "config-bus message stream ended"
-                            );
-                        }
+                        Err(e) => match classify_recv_error(&e) {
+                            RecvFault::Lagged(missed) => {
+                                // The receiver fell behind the broadcast ring buffer, so the
+                                // message that advanced the shared revision may be GONE. Do
+                                // not wait for the next poll tick: probe the watermark and
+                                // apply the missing revision now. This stays quiet (PubSub),
+                                // so a lagged consumer cannot relay another node's change.
+                                crate::admin::metrics::record_config_bus_lagged(missed);
+                                tracing::warn!(
+                                    channel = %channel,
+                                    missed,
+                                    "config-bus receiver lagged; reconciling immediately"
+                                );
+                                match store.has_newer_revision().await {
+                                    Ok(true) => {
+                                        if let Err(e) = store
+                                            .reload_external(false, ReloadSource::PubSub)
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "config-bus lag recovery reload failed; poll fallback will retry"
+                                            );
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        // Nothing newer survived the lag: the lost messages were
+                                        // already-applied revisions.
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "config-bus lag recovery probe failed; poll fallback will retry"
+                                        );
+                                    }
+                                }
+                                // Deliberately do NOT refresh the liveness gauge here: a
+                                // lagging subscriber is not proof that it handled the change.
+                            }
+                            RecvFault::Closed => {
+                                // No senders remain. A closed receiver is not fatal (the poll
+                                // loop below still converges), but looping without a pause
+                                // would hot-spin when no messages can ever arrive. Keep the
+                                // liveness gauge untouched so the dead subscription remains
+                                // alertable instead of looking healthy.
+                                tracing::warn!(
+                                    channel = %channel,
+                                    error = %e,
+                                    backoff_ms = CLOSED_RECV_BACKOFF.as_millis(),
+                                    "config-bus message stream closed; backing off"
+                                );
+                                tokio::time::sleep(CLOSED_RECV_BACKOFF).await;
+                            }
+                        },
                     }
                 }
                 _ = ticker.tick() => {
@@ -339,6 +409,22 @@ mod tests {
         assert_eq!(encoded, r#"{"version":42,"origin":"node-a"}"#);
         let decoded: ConfigChanged = serde_json::from_str(&encoded).expect("parse");
         assert_eq!(decoded, changed);
+    }
+
+    #[test]
+    fn receiver_faults_are_classified_separately() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        assert_eq!(
+            classify_recv_error(&RecvError::Lagged(7)),
+            RecvFault::Lagged(7),
+            "a lag carries the skipped-message count"
+        );
+        assert_eq!(
+            classify_recv_error(&RecvError::Closed),
+            RecvFault::Closed,
+            "a closed channel must not be treated as a recoverable lag"
+        );
     }
 
     #[test]

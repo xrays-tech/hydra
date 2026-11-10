@@ -46,6 +46,7 @@
 //! | `hydra_config_notify_total` | counter | result | `ConfigStore` local-change fanout (result=ok\|error) |
 //! | `hydra_config_version` | gauge | — | `ConfigStore` (local last-applied revision) |
 //! | `hydra_config_watch_last_ok_unixtime` | gauge | — | `cluster::config_bus` watcher (unix seconds of the last completed poll tick / handled pub/sub message; alert when `time() - gauge > 3× poll interval`) |
+//! | `hydra_config_bus_lagged_total` | counter | — | `cluster::config_bus` broadcast receiver (`RecvError::Lagged`; messages skipped before they could be read, followed by an immediate revision probe/reload) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
@@ -165,6 +166,10 @@ struct Metrics {
     /// watcher task died (a panic in a hook or in the Redis client/SELECT loop)
     /// while `/metrics` — served by a different task — keeps answering.
     config_watch_last_ok_unixtime: IntGauge,
+    /// Messages the config-bus broadcast receiver skipped because it lagged
+    /// behind the ring buffer. A non-zero rate is a subscriber that needs the
+    /// immediate watermark reconciliation (not just the next poll tick).
+    config_bus_lagged: IntCounter,
     /// Usage records the sink dropped, by reason. Billing data loss must be
     /// alertable, not just a WARN in the log (audit §3.9).
     usage_dropped: IntCounterVec,
@@ -466,6 +471,11 @@ fn metrics() -> Option<&'static Metrics> {
             config_watch_last_ok_unixtime: register_int_gauge!(
                 "hydra_config_watch_last_ok_unixtime",
                 "Unix seconds of the last completed config-watch poll tick or handled pub/sub message"
+            )
+            .ok()?,
+            config_bus_lagged: register_int_counter!(
+                "hydra_config_bus_lagged_total",
+                "Config-bus messages skipped because the subscriber lagged behind the broadcast channel"
             )
             .ok()?,
             // ── Control plane (cluster P1) ────────────────────────────────
@@ -878,6 +888,17 @@ fn record_config_watch_ok_at(unix_secs: u64) {
     if let Some(m) = metrics() {
         m.config_watch_last_ok_unixtime
             .set(i64::try_from(unix_secs).unwrap_or(i64::MAX));
+    }
+}
+
+/// Count `missed` config-bus messages skipped by a lagging broadcast receiver.
+///
+/// The watcher follows a `Lagged` error with an immediate revision probe, so
+/// this counter measures the repair path, not data loss: the shared DB remains
+/// authoritative and a newer revision is applied at once.
+pub fn record_config_bus_lagged(missed: u64) {
+    if let Some(m) = metrics() {
+        m.config_bus_lagged.inc_by(missed);
     }
 }
 
@@ -1447,6 +1468,8 @@ mod tests {
         record_config_notify(true);
         record_config_notify(false);
         record_config_version(42);
+        record_config_bus_lagged(0);
+        record_config_bus_lagged(7);
     }
 
     #[test]
@@ -1466,6 +1489,15 @@ mod tests {
         assert!(
             render().contains("hydra_config_watch_last_ok_unixtime"),
             "the watcher-liveness gauge must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn config_bus_lag_counter_is_registered() {
+        record_config_bus_lagged(3);
+        assert!(
+            render().contains("hydra_config_bus_lagged_total"),
+            "the config-bus lag counter must appear on /metrics"
         );
     }
 

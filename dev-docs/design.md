@@ -375,6 +375,7 @@ impl ConfigStore {
 - **写路径**（`ReloadSource::Local`）：事务提交后 reload；本地 revision 前进才在 Redis `hydra:config:changed` 发布 `{"version","origin"}`。
 - **对端**（`PubSub` / `Poll`）：只做安静 reload，**绝不重新发布**；版本不前进则忽略。
 - **轮询兜底**：每 `HYDRA_CONFIG_POLL_MS`（默认 5000）只读 `config_revision.version`；发现更新才做完整配对读 reload。
+- **广播滞后/关闭**：`RecvError::Lagged(n)` 记录 `hydra_config_bus_lagged_total` 并**立即**探测 revision、必要时安静 reload；`RecvError::Closed` 日志后睡眠 500ms 再循环，二者都不刷新 watcher 存活 gauge。
 - **启动顺序**：先初始加载，再注入 notifier、启动订阅/轮询；启动窗口内的消息被版本闸门忽略。
 - **单节点**：没有 notifier、订阅者或轮询；本地写后 reload 足够。
 
@@ -1256,7 +1257,7 @@ Admin 端口仅绑内网 + 单一 Admin Token（`Authorization: Bearer <ADMIN_TO
 
 ### 13.4 错误模型
 
-统一 JSON：`{ "error": { "code": "...", "message": "...", "trace_id": "..." } }`，HTTP 状态码语义化（400 校验/404 不存在/409 唯一冲突/500 内部）。
+统一 JSON：`{ "error": { "code": "...", "message": "...", "trace_id": "..." } }`，HTTP 状态码语义化（400 校验/404 不存在/409 唯一冲突/503 `storage_busy` 或 `database_unavailable`/500 内部）。数据库连接/连接池/TLS/配置不可用属于可重试的 503 `database_unavailable`，不是 500。
 
 ---
 
@@ -1348,7 +1349,8 @@ UPDATE config_revision SET version = version + 1 WHERE id = 1;
 
 读事务保持普通（不取写锁）。MySQL 的 REPEATABLE READ 下，读-改-写存在性检查必须用
 `SELECT … FOR UPDATE`，否则会读事务开始时的快照。可重试错误（PG 40001/40P01、MySQL
-1213/1205）映射为 503 `storage_busy`。
+1213/1205）映射为 503 `storage_busy`；连接/连接池/TLS/配置不可用映射为 503
+`database_unavailable`。
 
 ### 15.3 部署
 

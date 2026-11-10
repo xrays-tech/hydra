@@ -142,7 +142,16 @@ http = { version = "1", optional = true }
 # transitive pin, so no new download is required.
 ipnet = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "chrono", "migrate"], optional = true }
+# Feature diet: SQLx's defaults pull in `any`, `macros`, `migrate`, `json` and
+# all bundled drivers. We need only the driver selected by
+# `db-postgres`/`db-mysql`, the Tokio runtime, `chrono` timestamps, and the
+# proc-macro machinery: `macros` supplies `#[derive(sqlx::FromRow)]` (via its
+# implied `derive`) and the `sqlx::migrate!` macro — in 0.8.6 that macro lives
+# in `src/macros/mod.rs` behind the `macros` feature, not `migrate` alone
+# (`migrate` enables the runtime Migrator API). We never use `sqlx::Any` and
+# there is no SQLite backend, so `any`/`sqlite` stay off and those crates are
+# not compiled.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "chrono", "migrate", "macros"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 dashmap = { version = "6", optional = true }
 arc-swap = { version = "1", optional = true }

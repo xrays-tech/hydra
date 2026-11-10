@@ -12,4 +12,11 @@
 fn main() {
     // Relative to this crate's root (crates/hydra-server).
     println!("cargo:rerun-if-changed=../../admin-ui");
+
+    // `sqlx::migrate!` reads these directories at compile time. Stable cargo
+    // does not track files a proc macro reads, so adding/editing a migration
+    // would leave the crate "fresh" and re-link a binary carrying the PREVIOUS
+    // embedded set. Declaring both backend directories invalidates it.
+    println!("cargo:rerun-if-changed=migrations/postgres");
+    println!("cargo:rerun-if-changed=migrations/mysql");
 }

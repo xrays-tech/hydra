@@ -17,6 +17,9 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Budget: two toolchains' worth of compilation plus the full PG suite and
+    # clippy. A hung cargo/test process must not hold a runner for six hours.
+    timeout-minutes: 60
     env:
       # Phase 2c's test harness consumes this: a superuser URL so each test can create its
       # own schema/database. The scheme selects the compiled backend (db-postgres below).
@@ -147,6 +150,8 @@ jobs:
   # matrix; the `db-mysql` job below is the other half, with the same suite.
   optional-features:
     runs-on: ubuntu-latest
+    # Same shape as `check`, plus the cluster/ClickHouse feature build.
+    timeout-minutes: 60
     env:
       HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
     services:
@@ -220,6 +225,8 @@ jobs:
   # by the image only owns the seeded `hydra` database (it has no global CREATE DATABASE).
   db-mysql:
     runs-on: ubuntu-latest
+    # The MySQL half of the matrix: compile + full suite against MySQL 8.
+    timeout-minutes: 60
     env:
       HYDRA_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/hydra
     services:
@@ -304,6 +311,8 @@ jobs:
   # No Redis is needed: both steps only compile and lint.
   alt-features:
     runs-on: ubuntu-latest
+    # OpenSSL is compiled from source here (vendored), so allow a generous bound.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -357,6 +366,9 @@ jobs:
   # checked fact instead of a claim.
   live-deps:
     runs-on: ubuntu-latest
+    # Several full binary builds plus integration drills against live
+    # PostgreSQL/ClickHouse/Redis; the largest job.
+    timeout-minutes: 90
     env:
       # Credentials for the ClickHouse service below. They exist because the official image now
       # REFUSES network access for an unauthenticated `default` user — see the service's comment.
@@ -569,6 +581,8 @@ jobs:
   # nothing executed.
   sdks:
     runs-on: ubuntu-latest
+    # Three SDK suites + the admin CLI, all mocked; no service containers.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -618,6 +632,8 @@ jobs:
   # (it starts its own mocks and hydra, with env-overridable ports).
   integration:
     runs-on: ubuntu-latest
+    # Many full binary builds + black-box drills (one PostgreSQL service).
+    timeout-minutes: 90
     env:
       HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
     services:
@@ -963,6 +979,8 @@ jobs:
 
   scripts:
     runs-on: ubuntu-latest
+    # Static Node guards only; cheap and parallel.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -1033,6 +1051,15 @@ jobs:
 
       - name: SQL dialect guard tests
         run: node --test scripts/check_dialect_sql.test.cjs
+
+      # Each backend embeds its OWN `sqlx::migrate!` set and only one is compiled per
+      # build, so a migration added to a single directory is invisible to every suite.
+      # This pins that postgres and mysql carry the same filenames/versions.
+      - name: migration backend parity (postgres vs mysql)
+        run: node scripts/check_migration_parity.cjs
+
+      - name: migration parity checker tests
+        run: node --test scripts/check_migration_parity.test.cjs
 
       # The operator runbook's config table is a promise: every variable it lists
       # must be read by something. It listed a `HYDRA_LOG` alias that no code has
@@ -1303,6 +1330,8 @@ jobs:
   # REST API and drives the embedded UI with Chromium.
   ui-e2e:
     runs-on: ubuntu-latest
+    # Release build + Playwright install + browser suite.
+    timeout-minutes: 40
     env:
       HYDRA_TEST_DATABASE_URL: postgres://hydra:hydra@127.0.0.1:5432/hydra
     services:

@@ -72,7 +72,7 @@ pub use limit_role::{
 };
 pub use pool::{
     begin_read_snapshot, begin_write, bump_config_revision, get_config_version, init_pool,
-    is_retryable, read_revision, run_migrate, set_config_version, ConfigVersion,
+    is_retryable, is_unavailable, read_revision, run_migrate, set_config_version, ConfigVersion,
 };
 pub use provider::{
     delete_provider, delete_provider_key, delete_provider_model, get_provider, get_provider_key,

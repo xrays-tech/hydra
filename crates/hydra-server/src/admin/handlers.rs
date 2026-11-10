@@ -127,6 +127,8 @@ fn to_json<T: Serialize>(value: &T) -> Vec<u8> {
 ///
 /// - UNIQUE violation → 409
 /// - CHECK / NOT NULL / FK violation → 400 (FK e.g. model→provider, §13.2)
+/// - connection/pool/TLS/configuration failure → 503 `database_unavailable`
+/// - serialization/lock contention → 503 `storage_busy`
 /// - everything else → 500
 ///
 /// `pub(super)` because the tenant-config write core answers through it too: this
@@ -155,6 +157,13 @@ pub(crate) fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
         if crate::db::is_retryable(e) {
             return (503, "storage_busy");
         }
+    }
+    // Transport-level failure: the DB is unreachable / the pool is exhausted or
+    // closed, NOT a bad request. A shared-DB partition must look retryable to
+    // clients, not like an application bug. The architecture review observed
+    // this path answering 500 `database_error` during a socket cut.
+    if crate::db::is_unavailable(e) {
+        return (503, "database_unavailable");
     }
     (500, "database_error")
 }
@@ -2726,7 +2735,7 @@ mod tests {
     use hydra_core::model::GlobalRole;
 
     // A nested `mod` does not see the enclosing module's names implicitly.
-    use super::{global_role_write_error, global_role_write_warnings, RoleDims};
+    use super::{classify_db_err, global_role_write_error, global_role_write_warnings, RoleDims};
 
     // The validator is PURE over these fixtures — no DB, no HTTP. It is worth
     // pinning because the alternative is a bad rule that PUBLISHES and ROUTES:
@@ -3047,6 +3056,38 @@ mod tests {
                 "every documented field is present: {body}"
             );
         }
+    }
+
+    #[test]
+    fn db_transport_outages_map_to_retryable_503_not_500() {
+        let outage = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "socket cut",
+        ));
+        assert_eq!(
+            classify_db_err(&outage),
+            (503, "database_unavailable"),
+            "a DB partition must be retryable, not reported as an application bug"
+        );
+
+        for error in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Tls("handshake failed".into()),
+            sqlx::Error::Configuration("bad database url".into()),
+        ] {
+            assert_eq!(
+                classify_db_err(&error),
+                (503, "database_unavailable"),
+                "{error:?} is a transport outage"
+            );
+        }
+
+        assert_eq!(
+            classify_db_err(&sqlx::Error::RowNotFound),
+            (500, "database_error"),
+            "row-not-found is still the caller's normal 404 path, not an outage code"
+        );
     }
 }
 

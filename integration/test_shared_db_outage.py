@@ -172,8 +172,8 @@ def main():
         )
         fail_elapsed = time.monotonic() - t0
         code = status_code(body)
-        check("2a: an admin write while the DB is unreachable FAILS (500/503, never 2xx)",
-              500 <= st_fail < 600,
+        check("2a: an admin write while the DB is unreachable answers 503 database_unavailable (never 2xx)",
+              st_fail == 503 and code == "database_unavailable",
               f"HTTP {st_fail} in {fail_elapsed:.2f}s code={code!r} body={body[:140]!r}")
         check("2b: ...and the failure is not a `config_not_published` write lie",
               code != "config_not_published", f"code={code!r}")
@@ -266,7 +266,7 @@ def main():
         print(f"DB OUTAGE: FAILED ({len(failures)}): " + "; ".join(failures))
         return 1
     print(
-        "DB OUTAGE: PASSED (admin write fails 5xx while the DB is cut, data plane serves the stale "
+        "DB OUTAGE: PASSED (admin write answers 503 database_unavailable while the DB is cut, data plane serves the stale "
         "snapshot, pool reconnects, version advances, post-recovery config is served)"
     )
     return 0

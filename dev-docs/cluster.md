@@ -186,6 +186,7 @@ Deployment/StatefulSet 指向**托管数据库**即可（StatefulSet 仍可用�
 | `hydra_config_notify_total{result="ok\|error"}` | 本地变更扇出成功/失败。失败只告警，不失败写；轮询会兜底 |
 | `hydra_config_version` | 本节点最后应用的 revision |
 | `hydra_config_snapshot_stale` | 1 = 上次 reload 失败，内存快照落后于数据库 |
+| `hydra_config_bus_lagged_total` | 广播订阅者落后而跳过的消息数；随后立即探测 revision 并安静 reload，不等下一轮轮询 |
 
 Watcher 存活时间指标 `hydra_config_watch_last_ok_unixtime` 记录最近一次成功订阅/轮询的
 Unix 秒；配合 `hydra_config_version` 与 `snapshot_stale` 判断是否收敛。
