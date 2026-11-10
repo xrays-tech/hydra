@@ -99,7 +99,7 @@ async fn store_reload_all_replaces_atomically() {
         .await
         .expect("p2");
 
-    store.reload_all().await.expect("reload");
+    store.reload_local(false).await.expect("reload");
 
     let after = store.snapshot();
     assert_eq!(
@@ -141,7 +141,7 @@ async fn store_reload_clears_swrr() {
         .expect("seed a second provider");
 
     assert!(
-        store.reload_all().await.expect("reload"),
+        store.reload_local(false).await.expect("reload"),
         "a real DB change must advance the replication content"
     );
     assert!(
@@ -167,7 +167,7 @@ async fn store_noop_reload_keeps_swrr_and_the_version() {
     // Settle the baseline: the first reload publishes the content the store was
     // constructed from (its version label may differ), so everything after this
     // must be a strict no-op.
-    store.reload_all().await.expect("baseline reload");
+    store.reload_local(false).await.expect("baseline reload");
     let version = store.version();
 
     store.swrr().insert(
@@ -180,7 +180,7 @@ async fn store_noop_reload_keeps_swrr_and_the_version() {
 
     // No DB write in between ⇒ the replicated bytes are identical.
     assert!(
-        !store.reload_all().await.expect("no-op reload"),
+        !store.reload_local(false).await.expect("no-op reload"),
         "an unchanged reload must report `changed == false`"
     );
     assert_eq!(store.version(), version, "and must not advance the version");
@@ -212,12 +212,12 @@ async fn store_noop_reload_does_not_notify_followers() {
     }));
 
     // Settle: publish the content the store was built from.
-    store.reload_all().await.expect("baseline reload");
+    store.reload_local(false).await.expect("baseline reload");
     let after_baseline = calls.load(std::sync::atomic::Ordering::SeqCst);
 
     // No DB write ⇒ identical content ⇒ no notify.
-    assert!(!store.reload_all().await.expect("no-op reload"));
-    assert!(!store.reload_all().await.expect("no-op reload again"));
+    assert!(!store.reload_local(false).await.expect("no-op reload"));
+    assert!(!store.reload_local(false).await.expect("no-op reload again"));
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         after_baseline,
@@ -229,7 +229,7 @@ async fn store_noop_reload_does_not_notify_followers() {
     repo::insert_provider(&pool, &provider("p-notify", "notify"))
         .await
         .expect("seed a provider");
-    assert!(store.reload_all().await.expect("changed reload"));
+    assert!(store.reload_local(false).await.expect("changed reload"));
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         after_baseline + 1,
@@ -265,7 +265,7 @@ async fn store_reload_validate_fail_keeps_old() {
         .expect("insert bad provider");
 
     let err = store
-        .reload_all()
+        .reload_local(false)
         .await
         .expect_err("reload must fail on fatal");
     let msg = format!("{err}");

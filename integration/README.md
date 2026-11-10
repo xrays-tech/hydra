@@ -156,6 +156,43 @@ What it proves:
 The shared process/request/seed helpers live in `integration/_cluster_harness.py`
 and are used by both this drill and `test_shared_db_cluster.py`.
 
+### Database-outage drill
+
+`integration/test_shared_db_outage.py` puts a raw TCP relay in front of the
+shared database (`integration/_db_harness.py`) and cuts it under a running node.
+The node keeps its normal database name/credentials, but its host:port is the
+relay.
+
+```sh
+export HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra
+python3 integration/test_shared_db_outage.py
+# MySQL: export HYDRA_TEST_DATABASE_URL=mysql://... and build db-mysql
+```
+
+It asserts:
+
+- before the cut, the seeded tenant/provider/model is served by `/v1/models`;
+- while the DB is unreachable, an admin write fails **5xx** (never 2xx) and does
+  not advance `config_version`, while the data plane still serves the stale
+  committed snapshot with 200;
+- the process never exits, the failure is not `config_not_published`;
+- after `restore()`, the pool reconnects, the same write succeeds within the
+  bounded 30 s budget, `config_version` advances, and a post-recovery
+  provider-model/tenant-model change appears on the data plane.
+
+### Compose database-start smoke
+
+CI's `scripts` job not only renders the compose files with `config -q`; it starts
+the real `environment/docker-compose.yml` database services:
+
+- `postgres` (default backend), waits for `pg_isready`, runs `SELECT 1`;
+- `mysql` under `--profile mysql`, waits for `mysqladmin ping`, runs `SELECT 1`;
+- tears both down with their volumes, including on failure.
+
+Hydra itself is not started and no real secret is required. This catches a
+service definition that renders but cannot boot (bad health command, volume or
+environment), which `config -q` cannot see.
+
 ## Configuration (env vars)
 
 | Variable | Default | Purpose |

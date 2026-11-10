@@ -258,7 +258,7 @@ pub async fn spawn_config_watch_on(
                             // stale message.
                             if changed.version > store.version() {
                                 if let Err(e) = store
-                                    .reload_external_with_source(false, ReloadSource::PubSub)
+                                    .reload_external(false, ReloadSource::PubSub)
                                     .await
                                 {
                                     tracing::warn!(
@@ -294,7 +294,7 @@ pub async fn spawn_config_watch_on(
                         Ok(newer) => {
                             if newer {
                                 if let Err(e) = store
-                                    .reload_external_with_source(false, ReloadSource::Poll)
+                                    .reload_external(false, ReloadSource::Poll)
                                     .await
                                 {
                                     tracing::warn!(

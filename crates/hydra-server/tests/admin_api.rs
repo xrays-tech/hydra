@@ -2145,7 +2145,7 @@ async fn tenant_model_catalog_config_view() {
 
     // Publish the seeded rows into the live snapshot (repo writes bypass the
     // store; the admin endpoints reload on write, but direct inserts don't).
-    state.store.reload_all().await.expect("reload_all");
+    state.store.reload_local(false).await.expect("reload_all");
 
     let port = start_admin(state);
     let r = req(
@@ -2248,7 +2248,7 @@ async fn tenant_model_catalog_existing_tenant_no_grants_is_200_empty() {
     cat_seed_provider(&state, "pA", "openai", 1).await;
     cat_seed_model(&state, "m1", "alpha", "pA", 1).await;
     cat_seed_tenant(&state, "t1", "acme.test").await;
-    state.store.reload_all().await.expect("reload_all");
+    state.store.reload_local(false).await.expect("reload_all");
 
     let port = start_admin(state);
     let r = req(

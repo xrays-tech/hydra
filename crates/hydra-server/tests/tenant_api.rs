@@ -402,7 +402,7 @@ async fn the_gate_reads_the_snapshot_not_the_database() {
     );
 
     // After a reload the snapshot catches up and the roles swap.
-    state.store.reload_all().await.expect("reload");
+    state.store.reload_local(false).await.expect("reload");
     let (old_after, _) =
         body_json(send_until_ready(&c, &url, Some(TENANT_TOKEN), None).await).await;
     let (new_after, _) = body_json(send_until_ready(&c, &url, Some(rotated), None).await).await;

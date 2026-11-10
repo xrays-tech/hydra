@@ -514,6 +514,15 @@ jobs:
           cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
           python3 integration/test_shared_db_random_fanout.py
 
+      # A REAL database outage: a raw TCP relay in front of PostgreSQL is cut. The admin write
+      # must fail 5xx (never a 2xx write lie) while the data plane keeps serving its local
+      # snapshot; after restore the pool reconnects and a write advances the config version.
+      - name: shared-DB outage (admin fails closed, data plane serves stale snapshot)
+        run: |
+          set -o pipefail
+          cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra
+          python3 integration/test_shared_db_outage.py
+
       # The data plane under load across a node kill, with the same shared DB + Redis topology.
       # 20 rps at a survivor while another node is SIGKILLed; zero non-200 is the assertion.
       - name: data plane under a node kill (20 rps, shared DB + Redis)
@@ -1231,6 +1240,61 @@ jobs:
           else
             echo "SKIP environment/docker-compose.local.yml: secure/local-test.env is not in the checkout (it is gitignored), and compose refuses to render a missing env_file"
           fi
+
+      # `config -q` proves the compose files PARSE, not that the DB services actually start and
+      # accept a query. Start the real Postgres definition and the opt-in MySQL profile, wait on
+      # their health endpoints, run one trivial SQL statement each, then tear both down with their
+      # volumes. Hydra itself is never started and no real secret is required.
+      - name: Compose DB services really start (Postgres + MySQL profile)
+        env:
+          HYDRA_ADMIN_TOKEN: dummy-admin-token-for-compose-smoke
+          HYDRA_CLUSTER_TOKEN: dummy-cluster-token-for-compose-smoke
+          HYDRA_ENCRYPTION_KEY: ZHVtbXkta2V5LWZvci1jb21wb3NlLXNtb2tlADAwMDA=
+        run: |
+          set -euo pipefail
+          PROJECT=hydra-compose-db-smoke
+          COMPOSE=(docker compose -p "$PROJECT" -f environment/docker-compose.yml --profile mysql)
+          cleanup() {
+            "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "==> starting postgres"
+          timeout 240 "${COMPOSE[@]}" up -d postgres
+          ready=no
+          for _ in $(seq 1 60); do
+            if "${COMPOSE[@]}" exec -T postgres pg_isready -U hydra -d hydra >/dev/null 2>&1; then
+              ready=yes; break
+            fi
+            sleep 2
+          done
+          [ "$ready" = yes ] || { echo "::error::postgres did not become ready"; exit 1; }
+          "${COMPOSE[@]}" exec -T postgres \
+            psql -U hydra -d hydra -v ON_ERROR_STOP=1 -c 'SELECT 1 AS compose_postgres_ok'
+
+          echo "==> starting mysql (profile)"
+          timeout 300 "${COMPOSE[@]}" up -d mysql
+          ready=no
+          for _ in $(seq 1 90); do
+            if "${COMPOSE[@]}" exec -T mysql \
+                 mysqladmin ping -h 127.0.0.1 -uhydra -phydra --silent >/dev/null 2>&1; then
+              ready=yes; break
+            fi
+            sleep 2
+          done
+          [ "$ready" = yes ] || { echo "::error::mysql did not become ready"; exit 1; }
+          "${COMPOSE[@]}" exec -T mysql \
+            mysql -uhydra -phydra hydra -e 'SELECT 1 AS compose_mysql_ok'
+
+          echo "==> both DB services started and answered a query"
+          cleanup
+          trap - EXIT
+
+      - name: Compose DB smoke cleanup (always)
+        if: always()
+        run: |
+          docker compose -p hydra-compose-db-smoke -f environment/docker-compose.yml --profile mysql \
+            down -v --remove-orphans >/dev/null 2>&1 || true
 
   # Real-browser UI gate. The Rust suites cannot see the admin UI: the
   # `invalidateFK` regression ("the write landed and the UI still reported a

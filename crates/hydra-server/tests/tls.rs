@@ -309,7 +309,7 @@ async fn t6_2_hot_reload_swaps_cert() {
         .await
         .expect("update tenant");
 
-    store.reload_all().await.expect("reload_all");
+    store.reload_local(false).await.expect("reload_all");
     cert_store.resolve_and_store(&store.snapshot().certs);
 
     // Next handshake uses v2 (no server restart).
@@ -721,7 +721,7 @@ async fn t6_7_cert_store_follows_config_reloads() {
     seed_tenant_with_cert(&pool, "t1", "acme.com", &cert_file, &cert_key).await;
 
     assert!(
-        store.reload_all().await.expect("reload_all"),
+        store.reload_local(false).await.expect("reload_all"),
         "a tenant cert written to the DB must change the served config"
     );
     assert!(

@@ -195,7 +195,7 @@ async fn two_stores_converge_via_pubsub() {
         .await
         .expect("insert provider");
     assert!(
-        store_a.reload_all().await.expect("A reload"),
+        store_a.reload_local(false).await.expect("A reload"),
         "the committed write must advance A's revision"
     );
     let a_version = store_a.version();
@@ -256,7 +256,7 @@ async fn poll_fallback_converges_without_pubsub() {
     db::insert_provider(&db.pool, &provider("p-fallback"))
         .await
         .expect("insert provider");
-    assert!(store_a.reload_all().await.expect("A reload"));
+    assert!(store_a.reload_local(false).await.expect("A reload"));
     assert_eq!(
         publisher.calls(),
         1,
@@ -320,7 +320,7 @@ async fn subscriber_reload_does_not_relay() {
     db::insert_provider(&db.pool, &provider("p-no-relay"))
         .await
         .expect("insert provider");
-    assert!(store_a.reload_all().await.expect("A reload"));
+    assert!(store_a.reload_local(false).await.expect("A reload"));
     let a_version = store_a.version();
 
     wait_until(
@@ -406,7 +406,7 @@ async fn startup_race_does_not_roll_back() {
     db::insert_provider(&db.pool, &provider("p-race"))
         .await
         .expect("insert provider");
-    assert!(store_a.reload_all().await.expect("A reload"));
+    assert!(store_a.reload_local(false).await.expect("A reload"));
     let a_version = store_a.version();
     wait_until(
         "B to apply the valid message after ignoring the stale one",
@@ -434,7 +434,7 @@ async fn startup_race_does_not_roll_back() {
     db::insert_provider(&db.pool, &provider("p-preload"))
         .await
         .expect("insert provider");
-    assert!(store_a2.reload_all().await.expect("A2 reload"));
+    assert!(store_a2.reload_local(false).await.expect("A2 reload"));
     let preload_version = store_a2.version();
 
     // B now loads and must resume the LATEST watermark, not the published one.
@@ -481,7 +481,7 @@ async fn startup_race_does_not_roll_back() {
     db::insert_provider(&db.pool, &provider("p-postload"))
         .await
         .expect("insert provider");
-    assert!(store_a2.reload_all().await.expect("A2 reload"));
+    assert!(store_a2.reload_local(false).await.expect("A2 reload"));
     let postload_version = store_a2.version();
     wait_until(
         "B to apply the newer post-load write",

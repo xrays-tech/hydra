@@ -223,7 +223,7 @@ async fn tenant_cert_gauge_tracks_snapshot_changes() {
     .expect("update cert");
 
     assert!(
-        store.reload_all().await.expect("reload"),
+        store.reload_local(false).await.expect("reload"),
         "cert is a change"
     );
 

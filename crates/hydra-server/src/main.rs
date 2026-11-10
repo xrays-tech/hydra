@@ -345,7 +345,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // observes that advance and is a no-op otherwise — forcing here would bump
     // the shared revision on every process start for no config change, and in a
     // cluster that would wake every peer's cache for nothing.
-    if let Err(e) = store.reload_all().await {
+    if let Err(e) = store.reload_local(false).await {
         warn!(error = %e, "legacy cert backfill reload failed; serving the pre-backfill snapshot");
     }
     info!("legacy cert backfill finished");

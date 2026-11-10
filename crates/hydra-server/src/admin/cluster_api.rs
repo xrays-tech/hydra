@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::handlers::{err_json, ok_json, Resp};
 use super::AdminState;
+use crate::store::{ReloadGuard, ReloadSource};
 
 /// This node's view of itself. `cluster=false` on a single-node deployment —
 /// the UI then renders just the local Health panel.
@@ -84,17 +85,22 @@ struct ReloadBody {
 /// failure here is recorded by the same code that serves the write paths.
 pub(super) async fn reload(
     state: &AdminState,
-    write_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
+    write_guard: Option<&ReloadGuard<'_>>,
     force: bool,
     trace_id: &str,
 ) -> Resp {
     // A fatal validation failure is reported as 400 (design §5.3: the old
     // snapshot is retained). Certs follow the swap via the `ConfigStore` hook.
     let result = match write_guard {
-        Some(guard) => state.store.reload_all_locked(force, guard).await,
+        Some(guard) => {
+            state
+                .store
+                .reload_with(guard, force, ReloadSource::Local)
+                .await
+        }
         // Defensive fallback for a direct/test caller outside the router: the
         // public entry point takes the lock itself, so this cannot deadlock.
-        None => state.store.reload_all_with(force).await,
+        None => state.store.reload_local(force).await,
     };
     let changed = match result {
         Ok(changed) => changed,

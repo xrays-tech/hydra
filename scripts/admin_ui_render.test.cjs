@@ -712,8 +712,12 @@ function assert(name, cond, detail) {
     // them, then read the column lists of the statements that touch `updated_at`
     // (the targeted single-column UPDATEs — cert ciphertext —
     // are written by their own paths and must NOT be form fields).
+    const dbDir = path.join(__dirname, "..", "crates", "hydra-server", "src", "db");
     const dbSrc = fs
-      .readFileSync(path.join(__dirname, "..", "crates", "hydra-server", "src", "db.rs"), "utf8")
+      .readdirSync(dbDir)
+      .filter((f) => f.endsWith(".rs") && f !== "testing.rs")
+      .map((f) => fs.readFileSync(path.join(dbDir, f), "utf8"))
+      .join("\n")
       .replace(/\\\r?\n\s*/g, " ")
       .replace(/\s+/g, " ");
     const colsByTable = new Map();

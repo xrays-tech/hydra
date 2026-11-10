@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Guard: every production SQL call in `db.rs` must pass through
+/* Guard: every production SQL call under `src/db/**` must pass through
  * `dialect::sql(...)`. A raw `sqlx::query("... ? ...")` compiles and runs on
  * MySQL (which accepts `?`) and only fails on PostgreSQL at runtime, so this
  * cannot be left to review.
@@ -9,6 +9,7 @@
  * (1615). It is counted and named, not silently skipped.
  *
  * Run: node scripts/check_dialect_sql.cjs [--file=PATH]
+ *      (no --file: scan every production `src/db/**\/*.rs`)
  * Exit: 0 clean · 1 finding · 2 cannot verify.
  */
 "use strict";
@@ -17,15 +18,34 @@ const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
-const DEFAULT_FILE = path.join(ROOT, "crates", "hydra-server", "src", "db.rs");
+const DB_DIR = path.join(ROOT, "crates", "hydra-server", "src", "db");
+const EXCLUDED = new Set([path.join(DB_DIR, "testing.rs")]);
 
-/** The production half of the file (the `#[cfg(test)] mod tests` tail is not production). */
+/** Walk `dir` for `.rs` files, skipping the test-only provisioning harness. */
+function rustFiles(dir, out = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    console.error(`[dialect-sql] CANNOT VERIFY: cannot read ${dir}: ${e.message}`);
+    process.exit(2);
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) rustFiles(full, out);
+    else if (entry.isFile() && entry.name.endsWith(".rs") && !EXCLUDED.has(full)) out.push(full);
+  }
+  return out;
+}
+
+/** The production half of a file (the `#[cfg(test)] mod tests` tail is not production). */
 function productionSource(src) {
   const m = src.search(/\n#\[cfg\(test\)\]\s*\nmod tests\b/);
   return m >= 0 ? src.slice(0, m) : src;
 }
 
-function check(file) {
+/** Collect this file's findings; `relative` is used in every report. */
+function checkFile(file) {
   let src;
   try {
     src = fs.readFileSync(file, "utf8");
@@ -34,6 +54,7 @@ function check(file) {
     process.exit(2);
   }
 
+  const relative = path.relative(ROOT, file);
   const lines = productionSource(src).split(/\r?\n/);
   const problems = [];
   let queries = 0;
@@ -49,7 +70,7 @@ function check(file) {
     const window = lines.slice(i, i + 3).join("\n");
     if (!window.includes("dialect::sql(")) {
       problems.push(
-        `${path.relative(ROOT, file)}:${i + 1}: SQL does not pass through dialect::sql(): ${line.trim()}`,
+        `${relative}:${i + 1}: SQL does not pass through dialect::sql(): ${line.trim()}`,
       );
     }
   }
@@ -59,14 +80,35 @@ function check(file) {
     const count = (lines[i].match(/sqlx::raw_sql/g) || []).length;
     if (count > 0) raw.push({ line: lines[i], index: i + 1, count });
   }
-  const rawCount = raw.reduce((sum, entry) => sum + entry.count, 0);
+
+  return { relative, queries, raw, problems };
+}
+
+/** Aggregate the same rule over every file. */
+function check(files) {
+  const problems = [];
+  let queries = 0;
+  let rawCount = 0;
+  const rawCalls = [];
+
+  for (const file of files) {
+    const result = checkFile(file);
+    queries += result.queries;
+    problems.push(...result.problems);
+    for (const entry of result.raw) {
+      rawCount += entry.count;
+      rawCalls.push({ ...entry, relative: result.relative });
+    }
+  }
+
   if (rawCount > 1) {
     problems.push(
-      `${path.relative(ROOT, file)}: ${rawCount} sqlx::raw_sql call(s); only delete_tenant's MySQL escape hatch is allowed`,
+      `${rawCalls.map((r) => r.relative).filter((v, i, a) => a.indexOf(v) === i).join(", ")}: ` +
+        `${rawCount} sqlx::raw_sql call(s); only delete_tenant's MySQL escape hatch is allowed`,
     );
-  } else if (rawCount === 1 && !raw[0].line.includes("raw_sql(&sql)")) {
+  } else if (rawCount === 1 && !rawCalls[0].line.includes("raw_sql(&sql)")) {
     problems.push(
-      `${path.relative(ROOT, file)}:${raw[0].index}: raw_sql is not the documented delete_tenant escape hatch`,
+      `${rawCalls[0].relative}:${rawCalls[0].index}: raw_sql is not the documented delete_tenant escape hatch`,
     );
   }
 
@@ -74,7 +116,7 @@ function check(file) {
 }
 
 function parseArgs(argv) {
-  const opts = { file: DEFAULT_FILE };
+  const opts = { file: null };
   for (const arg of argv) {
     if (arg === "--help" || arg === "-h") {
       console.log("usage: node scripts/check_dialect_sql.cjs [--file=PATH]");
@@ -90,7 +132,13 @@ function parseArgs(argv) {
 }
 
 const { file } = parseArgs(process.argv.slice(2));
-const { queries, raw, problems } = check(file);
+const files = file ? [file] : rustFiles(DB_DIR);
+if (files.length === 0) {
+  console.error(`[dialect-sql] CANNOT VERIFY: no production .rs files found under ${DB_DIR}`);
+  process.exit(2);
+}
+
+const { queries, raw, problems } = check(files);
 
 if (problems.length > 0) {
   console.error("[dialect-sql] FAIL");
@@ -103,5 +151,6 @@ if (problems.length > 0) {
 }
 
 console.log(
-  `[dialect-sql] OK (${queries} query call(s) through dialect::sql; ${raw} allowlisted raw_sql)`,
+  `[dialect-sql] OK (${queries} query call(s) through dialect::sql across ${files.length} file(s); ` +
+    `${raw} allowlisted raw_sql)`,
 );

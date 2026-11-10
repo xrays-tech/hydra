@@ -3835,7 +3835,7 @@ async fn a_provider_that_lost_its_keys_is_named_in_metrics_while_requests_succee
     repo::delete_provider_key(&pool, "pk_gone")
         .await
         .expect("delete provider key");
-    state.store.reload_all().await.expect("reload_all");
+    state.store.reload_local(false).await.expect("reload_all");
 
     // p_live still serves, so the request succeeds — and p_gone is named.
     let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
@@ -3867,7 +3867,7 @@ async fn a_provider_that_lost_its_keys_is_named_in_metrics_while_requests_succee
     repo::delete_provider_key(&pool, "pk_live")
         .await
         .expect("delete provider key");
-    state.store.reload_all().await.expect("reload_all");
+    state.store.reload_local(false).await.expect("reload_all");
     let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
     assert_eq!(
         resp.status(),

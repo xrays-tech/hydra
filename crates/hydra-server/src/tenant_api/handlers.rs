@@ -30,6 +30,7 @@ use hydra_core::tenant_api::TenantWriteRoute;
 
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
+use crate::store::{ReloadGuard, ReloadSource};
 use crate::tenant_api::{respond_json, Authenticated};
 /// The body of `GET /whoami`.
 ///
@@ -558,7 +559,7 @@ fn hierarchy_rows(cfg: &ConfigData) -> usize {
 /// `PUT /tenant/{tenant_id}/api/v1/user-groups`
 async fn user_group_upsert(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -737,7 +738,7 @@ async fn user_group_upsert(
 /// `DELETE /tenant/{tenant_id}/api/v1/user-groups/{id}`
 async fn user_group_delete(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -830,7 +831,7 @@ async fn user_group_delete(
 /// `PUT /tenant/{tenant_id}/api/v1/users`
 async fn user_upsert(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1083,7 +1084,7 @@ async fn user_upsert(
 /// transaction followed by ONE reload.
 async fn user_bulk_upsert(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1363,7 +1364,7 @@ async fn user_bulk_upsert(
 /// tenant-locally, written in ONE transaction and reloaded ONCE.
 async fn user_group_bulk_upsert(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1572,7 +1573,7 @@ async fn user_group_bulk_upsert(
 /// in the response body.
 async fn user_api_key_bulk_create(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -1800,7 +1801,7 @@ async fn user_api_key_bulk_create(
 /// T10's tidy-up, not this endpoint's.
 async fn user_delete(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2028,7 +2029,7 @@ pub async fn list_user_api_keys(
 /// atoms; the plaintext never touches the DB, a log line, or an error body.
 async fn user_api_key_create(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2244,7 +2245,7 @@ async fn user_api_key_create(
 #[allow(clippy::too_many_arguments)]
 async fn user_api_key_delete(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2325,7 +2326,7 @@ async fn user_api_key_delete(
 /// credential and no provider row.
 async fn user_billing_set(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
@@ -2443,13 +2444,17 @@ async fn user_billing_set(
 /// this goes through the locked entry point and never re-takes the lock.
 async fn commit_and_publish(
     state: &AppState,
-    reload_guard: &tokio::sync::MutexGuard<'_, ()>,
+    reload_guard: &ReloadGuard<'_>,
     _session: &mut Session,
     _ctx: &mut RequestContext,
     tenant_id: &str,
     trace_id: &str,
 ) -> pingora_core::Result<u64> {
-    match state.store.reload_all_locked(false, reload_guard).await {
+    match state
+        .store
+        .reload_with(reload_guard, false, ReloadSource::Local)
+        .await
+    {
         Ok(changed) => tracing::debug!(
             target: "hydra::tenant_api",
             tenant = %tenant_id,

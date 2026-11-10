@@ -8,11 +8,12 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const SCRIPT = path.join(__dirname, "check_dialect_sql.cjs");
-const REAL_DB = path.join(__dirname, "..", "crates", "hydra-server", "src", "db.rs");
+const REAL_DB_DIR = path.join(__dirname, "..", "crates", "hydra-server", "src", "db");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "hydra-dialect-sql-"));
 
 function run(file) {
-  const r = spawnSync(process.execPath, [SCRIPT, `--file=${file}`], { encoding: "utf8" });
+  const args = file ? [SCRIPT, `--file=${file}`] : [SCRIPT];
+  const r = spawnSync(process.execPath, args, { encoding: "utf8" });
   return { status: r.status, out: `${r.stdout || ""}${r.stderr || ""}` };
 }
 
@@ -27,10 +28,12 @@ function test(name, fn) {
   tests.push([name, fn]);
 }
 
-test("the real db.rs passes", () => {
-  const r = run(REAL_DB);
+test("the real db tree passes", () => {
+  assert.ok(fs.existsSync(REAL_DB_DIR), "the split db directory must exist");
+  const r = run();
   assert.strictEqual(r.status, 0, r.out);
-  assert.match(r.out, /through dialect::sql/);
+  assert.match(r.out, /through dialect::sql across \d+ file\(s\)/);
+  assert.match(r.out, /1 allowlisted raw_sql/);
 });
 
 test("a query through dialect::sql passes", () => {

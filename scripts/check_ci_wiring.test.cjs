@@ -1724,6 +1724,27 @@ const BLOCK_WITH_DASH = (realCommand) => [
     "status=" + r50b.status + " out=" + r50b.out.trim().slice(0, 240),
   );
 
+  /* 51: the shared-DB OUTAGE drill has a runner too. Same shape as 50, kept separate so deleting
+   * either Phase-4 step cannot silently drop both drills from the guard's evidence. */
+  const outageFile = { "integration/test_shared_db_outage.py": "#!/usr/bin/env python3\n" };
+  const r51a = run(skeleton({ ci: baseCi(), extraFiles: outageFile,
+                             playwright: fanoutPlaywright }));
+  assert(
+    "51a: an unwired shared-DB outage drill is reported",
+    r51a.status === 1 && /test_shared_db_outage\.py is never executed/.test(r51a.out),
+    "status=" + r51a.status + " out=" + r51a.out.trim().slice(0, 240),
+  );
+  const r51b = run(skeleton({
+    ci: baseCi("      - run: python3 integration/test_shared_db_outage.py"),
+    extraFiles: outageFile,
+    playwright: fanoutPlaywright,
+  }));
+  assert(
+    "51b: naming the outage drill in a CI step wires it",
+    r51b.status === 0 && !/test_shared_db_outage\.py is never executed/.test(r51b.out),
+    "status=" + r51b.status + " out=" + r51b.out.trim().slice(0, 240),
+  );
+
   // 49: the floor, with its own explicit value.
   const r49 = run(skel({ "orphan.sh": "#!/bin/sh\n" }), { CI_WIRING_MIN_SHELL_SCRIPTS: "9" });
   assert(

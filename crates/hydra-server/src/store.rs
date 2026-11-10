@@ -9,8 +9,8 @@
 //! scheme sanity, which is the [`Severity::Fatal`] source today: a provider
 //! whose endpoint is not a parseable `http://` / `https://` URL cannot become
 //! an `HttpPeer`, so serving such a snapshot would route every request for
-//! that provider to failure. A fatal issue aborts [`ConfigStore::reload_all`]
-//! and keeps the previous snapshot (design §5.3).
+//! that provider to failure. A fatal issue aborts a reload and keeps the
+//! previous snapshot (design §5.3).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -113,7 +113,7 @@ impl ReloadSource {
 ///
 /// Returns `Ok(ConfigData)` when the snapshot is serveable (non-fatal issues
 /// are logged at `WARN`). Returns `Err(StoreError::FatalValidation)` when any
-/// fatal issue is found, so [`ConfigStore::reload_all`] keeps the old snapshot.
+/// fatal issue is found, so a reload keeps the old snapshot.
 pub async fn build_config(pool: &Pool, kp: &dyn KeyProvider) -> Result<ConfigData, StoreError> {
     let (rows, _version) = load_config_rows(pool, kp).await?;
     config_from_rows(&rows)
@@ -417,7 +417,7 @@ fn validate_and_log(cfg: &ConfigData) -> Result<(), StoreError> {
 /// `pub(crate)` so the **write boundary** (admin provider POST/PUT) can reject
 /// exactly the set the loader treats as fatal. Before that call-site existed, a
 /// typo such as `"api.openai.com"` (missing scheme) was persisted with a 201,
-/// after which *every* later `reload_all` failed fatal validation: the snapshot
+/// after which *every* later reload failed fatal validation: the snapshot
 /// froze and key rotation / revocation silently stopped taking effect (audit
 /// §3.14). Write-side and load-side now share one predicate by construction.
 pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
@@ -431,7 +431,7 @@ pub(crate) fn is_usable_endpoint(endpoint: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Hot-read config centre. The snapshot is held behind [`ArcSwap`] (lock-free
-/// reads on the hot path); [`reload_all`] does an atomic COW replacement.
+/// reads on the hot path); a reload does an atomic COW replacement.
 ///
 /// The DB is the sole authority. A reload reads the rows and the shared
 /// `config_revision.version` in one transaction; only an advanced revision (or
@@ -492,7 +492,7 @@ pub struct ConfigStore {
 
 /// Instrumentation proving that the public reload entry points serialize on
 /// [`ConfigStore::reload_lock`]. Only the `#[cfg(test)]` branch in
-/// [`ConfigStore::reload_all_locked`] touches it.
+/// [`ConfigStore::reload_with_source`] touches it.
 #[allow(dead_code)]
 #[derive(Default)]
 struct ReloadProbe {
@@ -502,6 +502,17 @@ struct ReloadProbe {
     /// outside the concurrency test so ordinary reload tests stay fast.
     delay_ms: AtomicU64,
 }
+
+/// Proof that the caller holds the store's reload lock.
+///
+/// Only [`ConfigStore::reload_guard`] can create one; the wrapped
+/// `MutexGuard` is private so no call site can take the lock directly or
+/// fabricate a guard. [`ConfigStore::reload_with`] requires this type, which
+/// makes "write + reload under one lock" the only expressible combination.
+pub struct ReloadGuard<'a>(
+    // Held for its `Drop` (the unlock); intentionally never read.
+    #[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>,
+);
 
 /// A consumer that follows every snapshot swap (see
 /// [`ConfigStore::on_snapshot_change`]).
@@ -606,7 +617,7 @@ impl ConfigStore {
     }
 
     /// Handle to the SWRR state map. Exposed so W4 (and tests) can reach it
-    /// for the per-request `order` transition and for `reload_all` assertions.
+    /// for the per-request `order` transition and for reload assertions.
     pub fn swrr(&self) -> &Arc<DashMap<(String, String), SwrrState>> {
         &self.swrr
     }
@@ -636,7 +647,7 @@ impl ConfigStore {
     }
 
     /// Whether the last reload failed, leaving the served snapshot behind the
-    /// committed DB. Set/cleared by [`Self::reload_all_locked`] (and therefore
+    /// committed DB. Set/cleared by the reload write path (and therefore
     /// by every public reload entry point). See the field docs for the exact
     /// no-op semantics.
     #[must_use]
@@ -656,8 +667,13 @@ impl ConfigStore {
     }
 
     /// Acquire the reload coordination lock.
-    pub async fn reload_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.reload_lock.lock().await
+    ///
+    /// The returned [`ReloadGuard`] is the ONLY proof that the caller holds the
+    /// lock, and its inner `MutexGuard` is private. A write that must make its
+    /// reload atomic with the DB mutation therefore has exactly one shape:
+    /// hold this guard across the write and call [`Self::reload_with`].
+    pub async fn reload_guard(&self) -> ReloadGuard<'_> {
+        ReloadGuard(self.reload_lock.lock().await)
     }
 
     /// Run every registered hook against the snapshot that was just swapped in.
@@ -672,25 +688,13 @@ impl ConfigStore {
         }
     }
 
-    /// Rebuild the snapshot from the DB and atomically swap it in (design §5.3).
+    /// Rebuild the snapshot from the DB and atomically swap it in (design §5.3),
+    /// acquiring the reload lock internally.
     ///
-    /// On a **fatal** validation issue the old snapshot is kept (`Err`
-    /// returned, `inner` untouched). On success the new snapshot is swapped in,
-    /// the persisted version is advanced, and the SWRR map is cleared so
-    /// per-`(tenant, model)` weights are rebuilt lazily on the next request.
-    /// Returns whether the served config actually changed.
-    /// Takes the reload lock internally, so a caller cannot forget it. Callers
-    /// that must hold the lock across a write + reload use
-    /// [`Self::reload_all_locked`] instead.
-    pub async fn reload_all(&self) -> Result<bool, StoreError> {
-        self.reload_all_with(false).await
-    }
-
-    /// [`Self::reload_all`] with the operator's "push this out anyway" flag.
-    ///
-    /// Takes the reload lock internally and delegates to
-    /// [`Self::reload_all_locked`]. This is the LOCAL (notify) path: a forced
-    /// `POST /reload` must let the other nodes know too.
+    /// This is the LOCAL (notify) path used by a bare reload such as boot or
+    /// `POST /reload`; a successful swap publishes the new revision to peers.
+    /// Callers that must hold the lock across a DB write use
+    /// [`Self::reload_guard`] + [`Self::reload_with`] instead.
     ///
     /// ORDER IS LOAD-BEARING:
     ///   1. read rows AND `config_revision.version` in one plain read transaction;
@@ -700,77 +704,46 @@ impl ConfigStore {
     ///   4. build + validate the new `ConfigData`;
     ///   5. swap the snapshot and record the rows/version, then run hooks;
     ///   6. on a LOCAL swap only, publish the new revision (best-effort).
-    pub async fn reload_all_with(&self, force: bool) -> Result<bool, StoreError> {
-        let guard = self.reload_lock.lock().await;
-        self.reload_all_locked(force, &guard).await
+    pub async fn reload_local(&self, force: bool) -> Result<bool, StoreError> {
+        let guard = self.reload_guard().await;
+        self.reload_with(&guard, force, ReloadSource::Local).await
     }
 
-    /// Quiet reload for another node's change (Phase 3b pub/sub or poll).
+    /// Quiet reload for another node's change (Phase 3b pub/sub or poll),
+    /// acquiring the reload lock internally.
     ///
-    /// Acquires the reload lock internally and NEVER publishes: the change
-    /// originated elsewhere, so relaying it would loop. Returns whether the
-    /// local snapshot actually advanced.
-    pub async fn reload_external(&self) -> Result<bool, StoreError> {
-        self.reload_external_with_source(false, ReloadSource::Poll)
-            .await
-    }
-
-    /// Quiet reload with the operator's force flag (poll probe / tests).
-    pub async fn reload_external_with(&self, force: bool) -> Result<bool, StoreError> {
-        self.reload_external_with_source(force, ReloadSource::Poll)
-            .await
-    }
-
-    /// Quiet reload with an explicit trigger source, so Phase 3b can label a
-    /// subscriber-driven reload `pubsub` and a probe-driven one `poll`.
-    ///
-    /// Takes the reload lock internally. The external path is quiet by
-    /// construction; `Local` is downgraded so a caller cannot accidentally
-    /// rebroadcast.
-    pub async fn reload_external_with_source(
+    /// NEVER publishes: the change originated elsewhere, so relaying it would
+    /// loop. `source` labels the metric; an accidental `Local` is downgraded
+    /// rather than trusted. Returns whether the local snapshot advanced.
+    pub async fn reload_external(
         &self,
         force: bool,
         source: ReloadSource,
     ) -> Result<bool, StoreError> {
-        let guard = self.reload_lock.lock().await;
-        self.reload_external_locked(force, &guard, source).await
+        let guard = self.reload_guard().await;
+        self.reload_with(&guard, force, source.quiet()).await
     }
 
-    /// Quiet reload **assuming the caller already holds [`Self::reload_guard`]**.
+    /// Reload **assuming the caller already holds a [`ReloadGuard`]**.
     ///
-    /// Like [`Self::reload_all_locked`] but never notifies. Passing `Local`
-    /// is downgraded to `Poll`, because a message/probe must never be relayed.
-    pub async fn reload_external_locked(
-        &self,
-        force: bool,
-        _guard: &tokio::sync::MutexGuard<'_, ()>,
-        source: ReloadSource,
-    ) -> Result<bool, StoreError> {
-        self.reload_with_source(force, source.quiet()).await
-    }
-
-    /// Reload **assuming the caller already holds [`Self::reload_guard`]**.
+    /// This is the write+reload path: the caller has held the guard across its
+    /// DB mutation, so the reload cannot interleave with another writer's
+    /// read/compare/persist/swap. The guard argument is the proof; there is no
+    /// unlocked variant.
     ///
-    /// This is the only path that does not take the lock itself; passing the
-    /// guard by reference makes that assumption explicit at the call site.
-    /// Used by callers whose lock must span a DB write + the reload (admin
-    /// mutations and the tenant self-service write path). It must never be
-    /// called without the guard — doing so would let two reloads interleave
-    /// read/compare/persist/swap.
-    ///
-    /// This is the LOCAL (write/admin) path, so a successful swap publishes the
-    /// new revision to peers.
+    /// A successful `Local` swap publishes the new revision to peers; an
+    /// external source (`PubSub`/`Poll`) is always quiet.
     ///
     /// Snapshot-staleness ownership lives here too: an `Err` marks the snapshot
     /// stale, a successful rebuild + swap clears it, and a no-op leaves it
     /// unchanged (see [`Self::snapshot_stale`]).
-    pub async fn reload_all_locked(
+    pub async fn reload_with(
         &self,
+        _guard: &ReloadGuard<'_>,
         force: bool,
-        _guard: &tokio::sync::MutexGuard<'_, ()>,
+        source: ReloadSource,
     ) -> Result<bool, StoreError> {
-        // The locked write path is always local (Local → publish).
-        self.reload_with_source(force, ReloadSource::Local).await
+        self.reload_with_source(force, source).await
     }
 
     /// Instrumented reload wrapper shared by the local and quiet entry points.
@@ -916,7 +889,7 @@ mod tests {
         std::sync::Arc::new(crate::crypto::StaticKeyProvider::new([1u8; 32], 1))
     }
 
-    /// Insert one provider row so the next `reload_all` sees a REAL change.
+    /// Insert one provider row so the next reload sees a REAL change.
     async fn seed_change(pool: &Pool, id: &str) {
         crate::db::insert_provider(
             pool,
@@ -1004,7 +977,7 @@ mod tests {
 
         seed_change(&pool, "p-notify").await;
         assert!(
-            store.reload_all().await.expect("reload_all"),
+            store.reload_local(false).await.expect("reload_all"),
             "a real DB change must swap the snapshot"
         );
 
@@ -1024,7 +997,7 @@ mod tests {
 
         seed_change(&pool, "p-local-notify").await;
         assert!(
-            store.reload_all().await.expect("reload_all"),
+            store.reload_local(false).await.expect("reload_all"),
             "the seeded write must advance the revision"
         );
 
@@ -1047,7 +1020,7 @@ mod tests {
             .with_notifier(notifier.clone());
 
         assert!(
-            !store.reload_all().await.expect("no-op reload"),
+            !store.reload_local(false).await.expect("no-op reload"),
             "a fresh DB has no new revision"
         );
         assert_eq!(notifier.calls(), 0, "a no-op must not announce anything");
@@ -1066,7 +1039,10 @@ mod tests {
 
         seed_change(&pool, "p-external").await;
         assert!(
-            store.reload_external().await.expect("external reload"),
+            store
+                .reload_external(false, ReloadSource::Poll)
+                .await
+                .expect("external reload"),
             "the external reload must apply the advanced revision"
         );
         assert!(
@@ -1079,10 +1055,11 @@ mod tests {
             "an external change must never be relayed"
         );
 
-        // An already-current external reload is a no-op, still silent.
+        // An already-current external reload is a no-op, still silent. Pass
+        // `Local` deliberately: the external path must downgrade it, never relay.
         assert!(
             !store
-                .reload_external()
+                .reload_external(false, ReloadSource::Local)
                 .await
                 .expect("second external reload"),
             "nothing advanced since the last swap"
@@ -1107,21 +1084,24 @@ mod tests {
             "a committed write must make the probe true"
         );
 
-        assert!(store.reload_external().await.expect("quiet reload"));
+        assert!(store
+            .reload_external(false, ReloadSource::Poll)
+            .await
+            .expect("quiet reload"));
         assert!(
             !store.has_newer_revision().await.expect("probe"),
             "after applying the revision the probe is false again"
         );
     }
 
-    /// REVIEW N3 — `reload_all` must persist the version marker BEFORE it
+    /// REVIEW N3 — a local reload must persist the version marker BEFORE it
     /// swaps in the new snapshot.
     ///
     /// The old test aborted the marker write with a SQLite trigger; that
     /// mechanism does not exist on PostgreSQL/MySQL. The backend-agnostic
     /// equivalent is the `#[cfg(test)]` persist hook in `db.rs`.
     #[tokio::test]
-    async fn reload_all_persists_the_marker_before_swap() {
+    async fn reload_local_persists_the_marker_before_swap() {
         let pool = crate::db::testing::setup_pool().await;
         let notifier = MockNotifier::new();
         let store = ConfigStore::load(pool.clone(), kp())
@@ -1130,9 +1110,9 @@ mod tests {
             .with_notifier(notifier.clone());
         let before = store.version();
 
-        let failure = crate::db::test_fault::fail_persist();
+        let failure = crate::db::test_fault::fail_persist(&pool).await;
         assert!(
-            store.reload_all_with(true).await.is_err(),
+            store.reload_local(true).await.is_err(),
             "an unpersistable version must fail the reload"
         );
         assert_eq!(
@@ -1159,10 +1139,7 @@ mod tests {
 
         // Releasing the failure lets the same call succeed and advance both.
         drop(failure);
-        store
-            .reload_all_with(true)
-            .await
-            .expect("reload now succeeds");
+        store.reload_local(true).await.expect("reload now succeeds");
         assert_eq!(store.version(), before + 1);
         assert_eq!(
             notifier.calls(),
@@ -1187,13 +1164,13 @@ mod tests {
         let before = store.version();
 
         assert!(
-            !store.reload_all().await.expect("no-op reload"),
+            !store.reload_local(false).await.expect("no-op reload"),
             "unchanged rows must not swap the snapshot"
         );
         assert_eq!(store.version(), before, "no-op reload must not bump");
 
         assert!(
-            store.reload_all_with(true).await.expect("forced reload"),
+            store.reload_local(true).await.expect("forced reload"),
             "force must swap even with unchanged rows"
         );
         assert_eq!(store.version(), before + 1, "force advances the version");
@@ -1208,7 +1185,7 @@ mod tests {
         assert!(store.snapshot().providers.is_empty());
 
         seed_change(&pool, "p-changed").await;
-        assert!(store.reload_all().await.expect("changed reload"));
+        assert!(store.reload_local(false).await.expect("changed reload"));
         assert_eq!(store.version(), before + 1);
         assert!(
             store.snapshot().providers.contains_key("p-changed"),
@@ -1237,7 +1214,7 @@ mod tests {
         );
         assert!(!store.swrr().is_empty());
 
-        assert!(store.reload_all_with(true).await.expect("reload"));
+        assert!(store.reload_local(true).await.expect("reload"));
         assert!(
             store.snapshot().tenants_by_domain.is_empty(),
             "reload replaced the injected config with the DB's"
@@ -1258,9 +1235,9 @@ mod tests {
         let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
         assert!(!store.snapshot_stale(), "a fresh store is not stale");
 
-        let failure = crate::db::test_fault::fail_persist();
+        let failure = crate::db::test_fault::fail_persist(&pool).await;
         assert!(
-            store.reload_all_with(true).await.is_err(),
+            store.reload_local(true).await.is_err(),
             "the marker write must fail the reload"
         );
         assert!(
@@ -1275,7 +1252,7 @@ mod tests {
         // The revision did not move, so this is a no-op; it must NOT clear a
         // flag set by the failure above.
         assert!(
-            !store.reload_all().await.expect("no-op reload"),
+            !store.reload_local(false).await.expect("no-op reload"),
             "an unchanged revision is a no-op"
         );
         assert!(
@@ -1285,7 +1262,7 @@ mod tests {
 
         drop(failure);
         assert!(
-            store.reload_all_with(true).await.expect("forced reload"),
+            store.reload_local(true).await.expect("forced reload"),
             "force rebuilds and swaps even when rows are unchanged"
         );
         assert!(
@@ -1309,8 +1286,8 @@ mod tests {
 
         let a = store.clone();
         let b = store.clone();
-        let first = tokio::spawn(async move { a.reload_all_with(true).await });
-        let second = tokio::spawn(async move { b.reload_all_with(true).await });
+        let first = tokio::spawn(async move { a.reload_local(true).await });
+        let second = tokio::spawn(async move { b.reload_local(true).await });
         let (first, second) = tokio::join!(first, second);
         first.expect("first task").expect("first reload");
         second.expect("second task").expect("second reload");
