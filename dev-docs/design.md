@@ -50,7 +50,7 @@
 | 无锁热路径 | `arc-swap` | 1.x | 配置热更新，读路径零锁 |
 | 并发字典 | `dashmap` | 6.x | 限流计数器、认证缓存、熔断状态、SWRR 状态 |
 | HTTP 客户端（上游调用） | `reqwest` | 0.12 | terminate-mode 调 provider；禁用 `default-features` 或显式排除 `blocking`（防额外 runtime） |
-| 日志 | `tracing` + `tracing-subscriber` | 0.1 | 结构化日志 |
+| 日志 | `tracing` + `tracing-subscriber` | 0.3 | 结构化日志 |
 | 指标 | `prometheus` | 0.13 | 自注册默认 registry；由 AdminService 的 `ServeHttp` handler 自托管 `/metrics`（**`pingora-prometheus` 不在 crates.io，弃用**，见 §1.4） |
 | ClickHouse 客户端（可选） | `clickhouse` | behind feature flag | 用量记录的可选 Sink |
 | 字节扫描（零拷贝提取） | `memchr` | 2.7 | SIMD 加速子串扫描，零分配；提取 `"model"`/`"usage"` 等少量元数据，**避免整体 JSON 反序列化**（见 §6 零拷贝原则） |
@@ -200,7 +200,7 @@ hydra/
     │   └── limit_role.rs
     ├── db/
     │   ├── mod.rs             ← 共享库连接池、迁移、写锁
-    │   └── repo.rs            ← 各实体 CRUD（编译期校验 SQL）
+    │   └── db_crud.rs         ← 各实体 CRUD/ordering/revision/级联
     ├── store/
     │   ├── mod.rs             ← ConfigStore（ArcSwap 外壳 + reload_all 联动重置）
     │   ├── config_data.rs     ← ConfigData 内存结构
@@ -1246,7 +1246,7 @@ impl TlsAccept for HydraCertStore {
 
 - 鉴权：`Authorization: Bearer <tenant-access-token>`；身份**只**来自令牌，URL 的 `{tenant_id}` 是一致性**交叉校验**（不一致 → 403），`Host` 不参与判定；
 - 令牌仍在 admin-UI / admin API 配置（`tenant.access_token_hash`，SHA-256 单向存储，永不回显；编辑留空=保留，改值=轮换，显式 `""`=清除）；
-- 3 个端点在**全部角色**（含集群 edge）上可用，且**没有任何转发**——集群不需要把请求转给 leader，因为用量读的是共享 ClickHouse、失效是广播 + 水位确认；
+- 3 个端点在**全部集群节点**上可用，且**没有任何转发**——集群不需要把请求转给某个 leader，因为用量读的是共享 ClickHouse、失效是广播 + 水位确认；
 - 完整契约、错误码、限流、残余窗口上界（`HYDRA_AUTH_ALLOW_TTL_MAX_SECS`）见 **`design-tenant-api.md`**（本文件不再重复维护）。
 
 **写后一致性**：除认证缓存失效/熔断复位外，每个配置写 handler 成功后立即 `store.reload_all()`，确保内存与 DB 一致；返回最新快照给调用方。

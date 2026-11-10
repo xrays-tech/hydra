@@ -332,9 +332,9 @@ pub sub_tenant_routes: Vec<SubTenantRoute>,
 - `enabled` 在 DB 边界映射 `i64`↔`bool`。
 - `updated_at` 更新走 SQL `datetime('now')`。
 
-**测试**：`crates/hydra-server/tests/repo.rs` 追加 `sub_tenant_crud`（round-trip + `UNIQUE(tenant_id,name)`/`UNIQUE(tenant_id,key_prefix)` 冲突 + route 的 NULL 部分唯一冲突 + `ON DELETE CASCADE`）。
+**测试**：`crates/hydra-server/tests/db_crud.rs` 追加 `sub_tenant_crud`（round-trip + `UNIQUE(tenant_id,name)`/`UNIQUE(tenant_id,key_prefix)` 冲突 + route 的 NULL 部分唯一冲突 + `ON DELETE CASCADE`）。
 
-**验证**：`cargo test -p hydra-server --features server --test repo`。
+**验证**：`cargo test -p hydra-server --features server --test db_crud`。
 > **执行期修正（T2 实测）**：`--features db` **单独不能编译**本 crate——`store.rs` 在 `db` 下 `use crate::cluster::*`，而 `cluster` 门控在 `proxy`（`db/restore.rs` 亦然）。这是本仓既有特性门控事实（`changelog-gap-remediation` 计划亦记录过），CI 用 `--features server`。原文与 T9 配方里的 `--features db` 已一并更正。
 
 ---
@@ -588,7 +588,7 @@ cargo fmt --all -- --check
 RUSTFLAGS=-D warnings cargo clippy --workspace --all-targets --features server -- -D warnings
 cargo build --workspace --features server
 cargo test -p hydra-core
-cargo test -p hydra-server --features server --test repo --test loader
+cargo test -p hydra-server --features server --test db_crud --test loader
 cargo test -p hydra-server --features server
 cargo test -p hydra-server --features server,cluster-redis   # 集群路（T3/T5）
 # 依赖防火墙
@@ -641,7 +641,7 @@ T1..T7 ─> T8 (文档) ─> T9 (门禁 + 证据)
 | 任务 | 产物 | 状态 |
 |---|---|---|
 | T1 | `migrations/0010_sub_tenant.sql`、`model.rs` 两实体、`config.rs` 两字段 + warn 校验 | ✅ |
-| T2 | `db.rs` 12 个 CRUD/on-fn + `tests/repo.rs::sub_tenant_crud` | ✅ |
+| T2 | `db.rs` 12 个 CRUD/on-fn + `tests/db_crud.rs::sub_tenant_crud` | ✅ |
 | T3 | `store.rs` enabled-only 加载、`content.rs` `FidelityRows`、`snapshot.rs` `FidelityWireRows` + **WIRE_VERSION 3**、`db/restore.rs` wipe/INSERT | ✅ |
 | T4 | `router.rs::match_sub_tenant_route` + (3.6) 闸门 + `accessible_models` 镜像 + 10 单测 | ✅ |
 | T5 | `proxy.rs::passthrough_candidates` 默认路由收窄 + 2 集成测试 | ✅ |
@@ -666,7 +666,7 @@ cargo tree -p hydra-core | rg 'tokio|pingora|sqlx|reqwest|hyper'   # 空（依�
 - core `router.rs`：10（T4）
 - core `sub_tenant.rs`：19（T6 写校验矩阵）
 - core `tenant_api.rs`：`parse_route` 正/负例（T7）
-- server `repo.rs`：`sub_tenant_crud`（T2）
+- server `db_crud.rs`：`sub_tenant_crud`（T2）
 - server `loader.rs` / `fidelity_disabled_rows.rs` / `cluster.rs`：3（T3，含 `WIRE_VERSION==3` round-trip）
 - server `sub_tenant_admin.rs`：4（T6 HTTP CRUD + 热加载）
 - server `tenant_api.rs`：6（T7 只读 + 跨租户隔离 + edge 快照）

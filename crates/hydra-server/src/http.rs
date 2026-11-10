@@ -1,10 +1,14 @@
-//! # Shared JSON-body helpers — `http-client`.
+//! # Shared HTTP/API helpers — `http-client`.
 //!
 //! Small, precise flat-field scans for the tiny control-surface contract bodies
 //! used by HTTP handlers and their tests. They are dependency-light on purpose:
 //! the bodies are bounded and the fields are top-level primitives, so a real
 //! JSON parse is reserved for the object-shape guard and the flat scans below
 //! stay allocation-conscious.
+//!
+//! The module also owns the display-atom and identity-timestamp helpers shared
+//! by the admin and tenant APIs. They live here (rather than in a handler) so
+//! the masking rules and the canonical RFC 3339 form have exactly one owner.
 
 use serde_json::Value;
 
@@ -80,6 +84,45 @@ pub fn json_string_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
         }
     }
     Some(&rest[..end])
+}
+
+// ---------------------------------------------------------------------------
+// Display atoms + canonical identity timestamps (admin & tenant APIs)
+// ---------------------------------------------------------------------------
+
+/// The first `n` characters of a value, as its own string (a display atom).
+///
+/// Character-based rather than byte-sliced: this alphabet is ASCII, but a byte
+/// slice on a non-ASCII string PANICS, and an atom helper should not be the
+/// thing that discovers that.
+#[must_use]
+pub fn head_chars(value: &str, n: usize) -> String {
+    value.chars().take(n).collect()
+}
+
+/// The last `n` characters of a value (a display atom).
+///
+/// A short value is returned whole: truncation must never lose characters or
+/// panic, because the caller uses this to show the tail of a credential.
+#[must_use]
+pub fn tail_chars(value: &str, n: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= n {
+        return value.to_string();
+    }
+    chars[chars.len() - n..].iter().collect()
+}
+
+/// "Now" in the canonical RFC 3339 UTC form (e.g. `2026-08-09T12:34:56Z`).
+///
+/// Deliberately NOT `admin::handlers::now_ts`, whose `%Y-%m-%d %H:%M:%S` shape
+/// sorts WRONG against a `Z`-terminated expiry: `'T'` (0x54) is greater than
+/// `' '` (0x20), so mixed spellings make an expiry test lie about WHEN, not
+/// about WHETHER. Lexicographic RFC 3339 comparison is safe because these
+/// strings are normalized at write time.
+#[must_use]
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[cfg(test)]

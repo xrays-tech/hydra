@@ -17,9 +17,10 @@
 //!
 //! [`ApiKeyIdentity`] is the value of `ConfigData::users_by_api_key_hash`, and
 //! that index is built from FULL rows — disabled keys, disabled users/groups,
-//! delinquent users ALL present. A revoked key on a replica therefore reads
+//! delinquent users ALL present. A revoked key on any node therefore reads
 //! "known but revoked → 401", never "unknown → 401": the anti-enumeration property
-//! survives replication. The enabled/disabled/expired/billing distinction is NOT
+//! holds because every node builds the index from the same full shared-DB rows.
+//! The enabled/disabled/expired/billing distinction is NOT
 //! baked in here (except `billing_status`, which the principal must carry to
 //! answer 402 without a second hop); the T3 checker applies the truth table:
 //!

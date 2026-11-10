@@ -28,6 +28,7 @@ use hydra_core::config::ConfigData;
 use hydra_core::model::{BillingStatus, User, UserApiKey, UserGroup};
 use hydra_core::tenant_api::TenantWriteRoute;
 
+use crate::http::{head_chars, now_rfc3339, tail_chars};
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
 use crate::store::{ReloadGuard, ReloadSource};
@@ -321,11 +322,11 @@ pub async fn usage(
 //     that is NOT leaf-only.
 //
 // Timestamps use [`crate::admin::handlers::now_ts`] (`%Y-%m-%d %H:%M:%S`), NOT
-// this module's [`now_rfc3339`]: the columns' own DDL default is
+// the shared [`crate::http::now_rfc3339`]: the columns' own DDL default is
 // `CURRENT_TIMESTAMP` (the same `%Y-%m-%d %H:%M:%S` shape on PostgreSQL and
 // MySQL), and every upsert stamps `updated_at` with it, so a `T`-separated
 // `created_at` in the same column would be two formats for one field.
-// [`now_rfc3339`] stays right for IDENTITY expiry, which is compared
+// `now_rfc3339` stays right for IDENTITY expiry, which is compared
 // lexicographically by `time_bound`.
 
 /// The body of `GET .../user-groups`: the tenant's OWN groups.
@@ -2491,36 +2492,6 @@ fn new_api_key_plaintext() -> String {
     rand::thread_rng().fill_bytes(bytes.as_mut());
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     format!("hk_{encoded}")
-}
-
-/// The first `n` characters of a value, as its own string.
-///
-/// Used for the display atoms. Character-based rather than byte-slicing: the
-/// alphabet here is ASCII, but a byte slice on a non-ASCII string panics, and an
-/// atom helper should not be the thing that discovers that.
-#[must_use]
-fn head_chars(value: &str, n: usize) -> String {
-    value.chars().take(n).collect()
-}
-
-/// The last `n` characters of a value.
-#[must_use]
-fn tail_chars(value: &str, n: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= n {
-        return value.to_string();
-    }
-    chars[chars.len() - n..].iter().collect()
-}
-
-/// "Now" in the canonical RFC3339 UTC form the identity rows are normalized to
-/// (plan §3.1). Deliberately NOT [`crate::admin::handlers::now_ts`], which
-/// formats `%Y-%m-%d %H:%M:%S`: lexicographic expiry comparisons only work
-/// because every identity timestamp is this fixed-width `Z`-terminated form
-/// (see `tenant_api::time_bound`'s note on the same property for usage bounds).
-#[must_use]
-fn now_rfc3339() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -19,8 +19,8 @@
 //! on the group/user/key dimensions — never a concrete id.
 //!
 //! Determinism: the two index lists are `Vec<usize>` in load order, but a snapshot
-//! with several matching rules must hand the SAME order to the leader and to every
-//! replica (plan §3.4 "节点一致": same data ⇒ same provider chosen). The result is
+//! with several matching rules must hand the SAME order to every node (plan §3.4
+//! "节点一致": same shared-DB snapshot ⇒ same provider chosen). The result is
 //! therefore sorted by `role.id` before it leaves [`match_global_roles`], and
 //! [`union_role_providers`] deduplicates + sorts through a `BTreeSet` rather than
 //! a hash set.
@@ -66,8 +66,8 @@ fn dim_matches(rule_value: &str, presented: Option<&str>) -> bool {
 /// rather than panicking — core has no logger; the server-side loader is the place
 /// that would report it.
 ///
-/// The result is sorted by `role.id` (the PK of `global_role`) so the leader and
-/// every replica — and every run of the leader — see one order.
+/// The result is sorted by `role.id` (the PK of `global_role`) so every node loading
+/// the same shared-DB snapshot — and every reload — sees one order.
 #[must_use]
 pub fn match_global_roles<'a>(
     cfg: &'a ConfigData,
@@ -127,7 +127,7 @@ pub fn match_global_roles<'a>(
 
 /// The UNION of the matched rules' provider sets: deduplicated and sorted
 /// (a [`BTreeSet`], so the order is byte order of `provider_id` — identical on
-/// leader and replicas no matter which rule supplied a provider first).
+/// every node no matter which rule supplied a provider first).
 ///
 /// An EMPTY result is meaningful, not an error: either nothing matched, or every
 /// matching rule has an empty `provider_ids`. The router lane treats both as
@@ -346,7 +346,7 @@ mod tests {
 
     // -------------------------------------------------------------------------
     // Union: several matching rules fold into ONE provider set — deduplicated
-    // and sorted (`BTreeSet`), so leader and replicas agree byte-for-byte.
+    // and sorted (`BTreeSet`), so every node agrees byte-for-byte.
     // -------------------------------------------------------------------------
 
     #[test]

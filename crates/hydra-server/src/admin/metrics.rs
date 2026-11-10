@@ -16,7 +16,6 @@
 //! | `hydra_retries_total` | counter | tenant, model, stage | proxy `fail_to_connect`/`error_while_proxy` |
 //! | `hydra_tokens_total` | counter | tenant, provider, model, kind | proxy `logging` |
 //! | `hydra_auth_decisions_total` | counter | tenant, verdict, source | proxy `request_filter` |
-//! | `hydra_auth_upstream_error_total` | counter | tenant | proxy `request_filter` |
 //! | `hydra_tenant_api_usage_query_total` | counter | source, group_by, result | `tenant_api::handlers::usage` |
 //! | `hydra_tenant_api_usage_query_seconds` | histogram | source | `tenant_api::handlers::usage` |
 //! | `hydra_tenant_api_requests_total` | counter | endpoint, status | `tenant_api` response writers |
@@ -97,7 +96,6 @@ struct Metrics {
     retries: IntCounterVec,
     tokens: IntCounterVec,
     auth_decisions: IntCounterVec,
-    auth_upstream_error: IntCounterVec,
     /// E3 usage reads, by store / grouping / outcome (`result` includes
     /// `decode_error`, which the tenant sees only as "unavailable").
     tenant_api_usage_query: IntCounterVec,
@@ -292,12 +290,6 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_auth_decisions_total",
                 "Auth verdicts",
                 &["tenant", "verdict", "source"]
-            )
-            .ok()?,
-            auth_upstream_error: register_int_counter_vec!(
-                "hydra_auth_upstream_error_total",
-                "Auth upstream failures",
-                &["tenant"]
             )
             .ok()?,
             tenant_api_usage_query: register_int_counter_vec!(
@@ -600,7 +592,6 @@ pub fn record_request_duration(tenant: &str, provider: &str, model: &str, secs: 
 }
 
 /// Observe upstream (time-to-first-byte) latency in seconds.
-#[allow(dead_code)]
 pub fn record_upstream_duration(provider: &str, model: &str, secs: f64) {
     if let Some(m) = metrics() {
         m.upstream_duration
@@ -610,7 +601,6 @@ pub fn record_upstream_duration(provider: &str, model: &str, secs: f64) {
 }
 
 /// Increment a failover retry (`stage` = "connect" | "proxy").
-#[allow(dead_code)]
 pub fn record_retry(tenant: &str, model: &str, stage: &str) {
     if let Some(m) = metrics() {
         m.retries.with_label_values(&[tenant, model, stage]).inc();
@@ -618,7 +608,6 @@ pub fn record_retry(tenant: &str, model: &str, stage: &str) {
 }
 
 /// Increment token usage (`kind` = "prompt" | "completion") by `n`.
-#[allow(dead_code)]
 pub fn record_tokens(tenant: &str, provider: &str, model: &str, kind: &str, n: u64) {
     if let Some(m) = metrics() {
         m.tokens
@@ -629,7 +618,6 @@ pub fn record_tokens(tenant: &str, provider: &str, model: &str, kind: &str, n: u
 
 /// Record an auth verdict (`verdict` = "allowed" | "denied",
 /// `source` = "hit" | "miss" | "local").
-#[allow(dead_code)]
 pub fn record_auth_decision(tenant: &str, verdict: &str, source: &str) {
     if let Some(m) = metrics() {
         m.auth_decisions
@@ -638,18 +626,9 @@ pub fn record_auth_decision(tenant: &str, verdict: &str, source: &str) {
     }
 }
 
-/// Increment the auth-upstream-error counter for a tenant.
-#[allow(dead_code)]
-pub fn record_auth_upstream_error(tenant: &str) {
-    if let Some(m) = metrics() {
-        m.auth_upstream_error.with_label_values(&[tenant]).inc();
-    }
-}
-
 /// Record a tenant model catalog GET answered locally (`GET /v1/models`, P0).
 /// Error paths (unknown domain / disabled tenant / unauthorised key) short-
 /// circuit before this point, so the counter counts served catalogs only.
-#[allow(dead_code)]
 pub fn record_catalog(tenant: &str) {
     if let Some(m) = metrics() {
         m.catalog_requests.with_label_values(&[tenant]).inc();
@@ -969,7 +948,6 @@ pub fn config_watch_last_ok_unixtime() -> f64 {
 }
 
 /// Set `hydra_breaker_dead{provider}` to `val` (1 dead / 0 alive).
-#[allow(dead_code)]
 pub fn record_breaker_dead(provider: &str, val: i64) {
     if let Some(m) = metrics() {
         m.breaker_dead.with_label_values(&[provider]).set(val);
@@ -977,7 +955,6 @@ pub fn record_breaker_dead(provider: &str, val: i64) {
 }
 
 /// Increment a breaker transition (`to` = "dead" | "alive").
-#[allow(dead_code)]
 pub fn record_breaker_transition(provider: &str, to: &str) {
     if let Some(m) = metrics() {
         m.breaker_transitions
@@ -987,7 +964,6 @@ pub fn record_breaker_transition(provider: &str, to: &str) {
 }
 
 /// Increment a rate-limit rejection (`dim` = "count" | "token").
-#[allow(dead_code)]
 /// `dim` is `"count"` or `"tokens"` — the exact label values, because the two gates record
 /// different dimensions and a rule written against the wrong spelling can never match.
 pub fn record_limit_rejected(tenant: &str, role: &str, dim: &str) {
@@ -999,7 +975,6 @@ pub fn record_limit_rejected(tenant: &str, role: &str, dim: &str) {
 }
 
 /// Increment a routing failure (`reason` = stable slug).
-#[allow(dead_code)]
 pub fn record_route_error(tenant: &str, reason: &str) {
     if let Some(m) = metrics() {
         m.route_errors.with_label_values(&[tenant, reason]).inc();
@@ -1007,7 +982,6 @@ pub fn record_route_error(tenant: &str, reason: &str) {
 }
 
 /// Observe Time To First Token in seconds (`ttft_ms / 1000.0`).
-#[allow(dead_code)]
 pub fn record_ttft(tenant: &str, provider: &str, model: &str, secs: f64) {
     if let Some(m) = metrics() {
         m.ttft
@@ -1018,7 +992,6 @@ pub fn record_ttft(tenant: &str, provider: &str, model: &str, secs: f64) {
 
 /// Increment prompt-cache hit tokens by `n` (OpenAI `cached_tokens` /
 /// Anthropic `cache_read_input_tokens`).
-#[allow(dead_code)]
 pub fn record_cached_tokens(tenant: &str, provider: &str, model: &str, n: u64) {
     if let Some(m) = metrics() {
         m.cached_tokens
@@ -1032,7 +1005,12 @@ pub fn record_cached_tokens(tenant: &str, provider: &str, model: &str, n: u64) {
 // ---------------------------------------------------------------------------
 
 /// Count a control-channel poll outcome (`result` = "ok" | "error").
-#[allow(dead_code)]
+///
+/// Only the Redis-backed cluster paths record this, so a standalone build has no
+/// call site. The helper (and the registration it reads) still exist in every
+/// build: the allowance is narrowed to exactly the configuration without that
+/// feature rather than hiding the whole helper from dead-code analysis.
+#[cfg_attr(not(feature = "cluster-redis"), allow(dead_code))]
 pub fn record_control_poll(result: &str) {
     if let Some(m) = metrics() {
         m.control_poll.with_label_values(&[result]).inc();
@@ -1125,7 +1103,6 @@ pub fn record_listener_tenant_certs(n: usize) {
 // ---------------------------------------------------------------------------
 
 /// Set the in-flight permits gauge for a provider.
-#[allow(dead_code)]
 pub fn record_permit_inflight(provider: &str, n: i64) {
     if let Some(m) = metrics() {
         m.permit_inflight.with_label_values(&[provider]).set(n);
@@ -1133,7 +1110,6 @@ pub fn record_permit_inflight(provider: &str, n: i64) {
 }
 
 /// Set the available (free) permits gauge for a provider.
-#[allow(dead_code)]
 pub fn record_permit_available(provider: &str, n: i64) {
     if let Some(m) = metrics() {
         m.permit_available.with_label_values(&[provider]).set(n);
@@ -1141,7 +1117,6 @@ pub fn record_permit_available(provider: &str, n: i64) {
 }
 
 /// Set the queue-depth (current waiters) gauge for a provider.
-#[allow(dead_code)]
 pub fn record_queue_depth(provider: &str, n: i64) {
     if let Some(m) = metrics() {
         m.queue_depth.with_label_values(&[provider]).set(n);
@@ -1149,7 +1124,6 @@ pub fn record_queue_depth(provider: &str, n: i64) {
 }
 
 /// Observe a queue wait duration in seconds (time spent waiting for a permit).
-#[allow(dead_code)]
 pub fn record_queue_wait(provider: &str, secs: f64) {
     if let Some(m) = metrics() {
         m.queue_wait.with_label_values(&[provider]).observe(secs);
@@ -1166,7 +1140,6 @@ pub fn record_queue_wait(provider: &str, secs: f64) {
 /// A counter rather than a gauge on purpose: what an operator wants to know is "how many
 /// times have limits changed and been applied", and `rate()` on this answers that
 /// unambiguously. The gate also logs an INFO on each resize.
-#[allow(dead_code)]
 pub fn record_admission_resize(provider: &str) {
     if let Some(m) = metrics() {
         m.admission_resizes.with_label_values(&[provider]).inc();
@@ -1174,7 +1147,6 @@ pub fn record_admission_resize(provider: &str) {
 }
 
 /// Increment a queue drop (`reason` = "full" | "timeout" | "closed" | "client_gone").
-#[allow(dead_code)]
 pub fn record_queue_drop(provider: &str, reason: &str) {
     if let Some(m) = metrics() {
         m.queue_drops.with_label_values(&[provider, reason]).inc();
@@ -1182,7 +1154,6 @@ pub fn record_queue_drop(provider: &str, reason: &str) {
 }
 
 /// Increment an admission decision (`outcome` = "acquired" | "queued" | "dropped").
-#[allow(dead_code)]
 pub fn record_admission_decision(provider: &str, outcome: &str) {
     if let Some(m) = metrics() {
         m.admission_decisions
@@ -1256,7 +1227,6 @@ pub fn record_candidate_skipped(provider: &str, reason: &str) {
 /// failed AFTER the 200 + first chunk was already sent to the client (the point
 /// of no failover). Observability only; the existing close-connection behavior
 /// stays.
-#[allow(dead_code)]
 pub fn record_mid_stream_error(provider: &str) {
     if let Some(m) = metrics() {
         m.mid_stream_errors.with_label_values(&[provider]).inc();
@@ -1506,7 +1476,6 @@ mod tests {
         record_route_error("t", "model_not_found");
         record_upstream_duration("p", "m", 0.1);
         record_request_duration("t", "p", "m", 0.2);
-        record_auth_upstream_error("t");
         record_ttft("t", "p", "m", 0.35);
         record_cached_tokens("t", "p", "m", 42);
         // Admission metrics (design-admission-queue §10).

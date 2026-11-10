@@ -43,14 +43,13 @@ pub struct ConfigData {
     /// `tenant_id` → tenant. **派生索引**，与 `tenants_by_domain` 同源（同一次
     /// 加载、同一批行），供"由令牌反查租户"的 O(1) 取用。
     ///
-    /// **不上集群线缆**（`serde(skip)`）：它是派生值，副本侧由
-    /// [`ConfigData::reindex_tenants`] 从 `tenants_by_domain` 重建 —— 传输它既会让
-    /// 每份快照把租户行传两遍，也会引入"旧 leader / 新副本"的字段缺失问题
-    /// （缺字段时若静默成空索引，有效令牌会被判 403）。
+    /// **不进入序列化/快照**（`serde(skip)`）：它是派生值，每个节点都从共享
+    /// 数据库加载的 `tenants_by_domain` 经 [`ConfigData::reindex_tenants`] 重建；
+    /// 序列化它既会把租户行写两遍，也会让一个缺失字段静默成空索引，把有效
+    /// 令牌判成 403。
     ///
-    /// **只有一个写入口**：[`ConfigData::reindex_tenants`]。别处写它会让
-    /// `ReplicationContent` 的 `PartialEq` 代际判定出现"无源变化"
-    /// （`ReplicationContent` 持 `Arc<ConfigData>`，而本结构体 derive `PartialEq`）。
+    /// **只有一个写入口**：[`ConfigData::reindex_tenants`]。别处写它会让本结构体
+    /// derive 的 `PartialEq` 出现"无源变化"（派生值必须由单一入口与源数据保持同步）。
     #[serde(skip, default)]
     pub tenants_by_id: HashMap<String, Tenant>,
 
@@ -93,12 +92,12 @@ pub struct ConfigData {
     /// `sha256(client api-key)` → identity record. **派生索引** — see
     /// [`ConfigData::reindex_identity`], its single write entry point.
     ///
-    /// **不上集群线缆**（`serde(skip)`）: built from the FULL `users` + the FULL
+    /// **不进入序列化/快照**（`serde(skip)`）: built from the FULL `users` + the FULL
     /// `user_api_key` rows (incl. disabled/expired keys, disabled users/groups),
-    /// so a revoked key on a replica is "known → 401", never "unknown" — the same
-    /// source-of-truth rule as `tenants_by_id`: leader (`build_config`) and replica
-    /// (tree decode, plan §3.5) derive it with ONE implementation, and a missing
-    /// field on the wire must never degrade a valid key to 401.
+    /// so a revoked key on any node is "known → 401", never "unknown" — the same
+    /// source-of-truth rule as `tenants_by_id`: every node derives it from the
+    /// shared DB with ONE implementation (`build_config`), and a missing field in
+    /// the snapshot must never degrade a valid key to 401.
     #[serde(skip, default)]
     pub users_by_api_key_hash: HashMap<String, ApiKeyIdentity>,
 
@@ -166,7 +165,7 @@ impl ConfigData {
     /// (401 `invalid_api_key`, per the truth table), a disabled user/group is
     /// distinguishable at auth time (403), and a delinquent user is recorded on
     /// the principal (402). This is decision D-5: revocation must not become
-    /// indistinguishable from never-having-existed, or every replica can enumerate
+    /// indistinguishable from never-having-existed, or any node can enumerate
     /// live keys.
     ///
     /// A key whose `user_id` is absent from `self.users` is an ORPHAN the schema
@@ -210,7 +209,7 @@ impl ConfigData {
     /// Rebuild the Global Role indexes (`global_roles_by_tenant` /
     /// `global_roles_any_tenant`) from `self.global_roles` — the ONE write entry
     /// point for both (same derived-index rule as [`reindex_tenants`]: `serde(skip)`,
-    /// loader + replica share this implementation).
+    /// the loader on every node shares this implementation).
     ///
     /// ENABLED rules only, and the index stores INDICES into `global_roles` (plan
     /// §3.2), so the matcher (`router` lane, T6/T7) reads the role bodies from the
@@ -353,7 +352,7 @@ impl ValidationIssue {
     }
 
     /// A warning about ONE entity. The subject is what lets `POST/PUT /api/v1/limit-roles` answer with
-    /// "and here is what is wrong with what you just wrote" instead of leaving it in the leader's log
+    /// "and here is what is wrong with what you just wrote" instead of leaving it in the server's log
     /// (decision D-17).
     fn warn_about(subject: String, message: String) -> Self {
         Self {

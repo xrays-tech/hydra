@@ -467,7 +467,7 @@ pub tenants_by_id: HashMap<String, Tenant>,
    - `config.rs`：`pub tenants_by_id: HashMap<String, Tenant>,` 加在 `tenants_by_domain` 之后，doc 注释写明"派生索引，与 `tenants_by_domain` 同源；不是第二份真相"；
    - `ConfigData::default()` 补 `HashMap::new()`；
    - `store.rs::build_config`：在填 `tenants_by_domain` 的同一循环里同时 `insert(t.id.clone(), t.clone())`（**同一批行、同一循环**，禁止第二次查库）。
-4. **Verify GREEN**：`cargo test -p hydra-core` + `cargo test -p hydra-server --features server --test loader`（红灯转绿）+ `cargo test -p hydra-server --features server --test repo`。
+4. **Verify GREEN**：`cargo test -p hydra-core` + `cargo test -p hydra-server --features server --test loader`（红灯转绿）+ `cargo test -p hydra-server --features server --test db_crud`。
 5. 编译并修掉因新增字段而失败的构造点：**预期只有 `crates/hydra-core/tests/validate.rs:275` 一处**（`store.rs:178` 已在步骤 3 改过）。若编译器报出第三处，说明有未预期的穷举字面量，**必须停下报告**而不是顺手补上——那意味着 `ConfigData` 的构造分散程度超出本计划已知的事实。
 6. **Commit**：`feat(core,server): derive ConfigData.tenants_by_id alongside tenants_by_domain`
 
@@ -475,7 +475,7 @@ pub tenants_by_id: HashMap<String, Tenant>,
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
 cargo test -p hydra-core
-cargo test -p hydra-server --features server --test loader --test repo --test config_store
+cargo test -p hydra-server --features server --test loader --test db_crud --test config_store
 ```
 
 ### T3 — **commit 1**：CH 传输下沉到 `clickhouse.rs`（零行为差异）

@@ -26,9 +26,9 @@
 //! ## Purity
 //!
 //! No I/O, no time, no global state, no randomness: every decision is a
-//! deterministic function of the inputs, which is the whole point. The leader
-//! and every replica MUST resolve the same session to the same provider from
-//! the same data, so the choice is derived from a digest rather than from per-node
+//! deterministic function of the inputs, which is the whole point. Every node
+//! MUST resolve the same session to the same provider from the same shared-DB
+//! snapshot, so the choice is derived from a digest rather than from per-node
 //! mutable state.
 //!
 //! ## Why rendezvous (HRW), not a hash-into-a-list
@@ -91,8 +91,8 @@ pub fn sticky_key(tenant_id: &str, model_key: &str, api_key_id: &str, session: &
 /// `2^64`.
 ///
 /// `key` is the hex TEXT from [`sticky_key`] here, never raw digest bytes —
-/// keeping the same string form on both sides of the pipe is what lets a replica
-/// recompute an identical pick.
+/// keeping the same string form on both sides of the pipe is what lets another
+/// node recompute an identical pick.
 #[must_use]
 fn unit_interval(key: &str, provider_id: &str) -> f64 {
     let mut material = String::new();

@@ -27,6 +27,7 @@ use rand::RngCore;
 
 use super::AdminState;
 use crate::admin::metrics;
+use crate::http::{head_chars, now_rfc3339, tail_chars};
 use crate::store::{ReloadGuard, ReloadSource};
 
 /// A fully-built HTTP response (the `ServeHttp` return type).
@@ -2457,36 +2458,6 @@ fn new_access_token_plaintext() -> String {
     rand::thread_rng().fill_bytes(bytes.as_mut());
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     format!("ht_{encoded}")
-}
-
-/// The first `n` characters of a value, as its own string (a display atom).
-///
-/// Character-based rather than byte-sliced: this alphabet is ASCII, but a byte
-/// slice on a non-ASCII string PANICS, and an atom helper should not be the thing
-/// that discovers that.
-#[must_use]
-fn head_chars(value: &str, n: usize) -> String {
-    value.chars().take(n).collect()
-}
-
-/// The last `n` characters of a value.
-#[must_use]
-fn tail_chars(value: &str, n: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= n {
-        return value.to_string();
-    }
-    chars[chars.len() - n..].iter().collect()
-}
-
-/// "Now" in the canonical RFC3339 UTC form the identity-family rows use.
-///
-/// Deliberately NOT [`now_ts`], whose `%Y-%m-%d %H:%M:%S` shape would sort WRONG
-/// against a `Z`-terminated expiry: `'T'` (0x54) is greater than `' '` (0x20), so
-/// mixed spellings make an expiry test lie about WHEN, not about WHETHER.
-#[must_use]
-fn now_rfc3339() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// The create request's NAME rule, PURE (no DB, no HTTP): trimmed, and a name

@@ -33,6 +33,7 @@ use constant_time_eq as ct_eq;
 use hydra_core::config::ConfigData;
 use hydra_core::model::Tenant;
 
+use crate::http::now_rfc3339;
 use crate::store::ConfigStore;
 
 /// Why a presented bearer could not be attributed to a tenant.
@@ -109,13 +110,6 @@ pub fn authenticate(store: &ConfigStore, bearer: &str) -> Result<AuthenticatedTe
         // tenant).
         None => Err(AuthError::NotReady),
     }
-}
-
-/// Current time as an RFC 3339 UTC string (e.g. `2026-08-09T12:34:56Z`).
-///
-/// Lexicographic RFC3339 comparison is safe because these strings are normalized at write time.
-fn now_rfc3339() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Constant-time string comparison — the SAME implementation the admin

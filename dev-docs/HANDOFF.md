@@ -6,7 +6,7 @@
 **Purpose:** This document is the starting point for the next development round — it captures the architecture as it now stands, what was built/verified this round, where things live, and what is deliberately deferred.
 
 
-> ⚠ **Archive warning (2026-11-04).** The external-auth cache (`auth_url`, `AuthCache`, `auth/cache*`), the sub-tenant / key-prefix routing plane and `usage_record.sub_tenant_id` described below **were all REMOVED by T10** (Stages B/C/D, migration `0015_drop_legacy.sql`). Treat every such mention as the state at the archive date, not the current architecture — the live picture is `dev-docs/ops.md` + `dev-docs/tenant-api-integration.md` + `dev-docs/aegis/adr/ADR-0003-user-hierarchy-global-role.md`.
+> ⚠ **Archive warning (2026-11-04; extended 2026-11-10).** The external-auth cache (`auth_url`, `AuthCache`, `auth/cache*`), the sub-tenant / key-prefix routing plane and `usage_record.sub_tenant_id` described below **were all REMOVED by T10** (Stages B/C/D, migration `0015_drop_legacy.sql`). The SQLite storage/usage sink, the `leader`/`replica`/`edge` role model, and the raft/Arachne materialized control plane described below were likewise removed by the shared-DB rewrite (ADR-0001 superseded by ADR-0004). Treat every such mention as the state at the archive date, not the current architecture — the live picture is `dev-docs/ops.md` + `dev-docs/cluster.md` + `dev-docs/aegis/adr/ADR-0004-shared-database-control-plane.md` (tenant API: `dev-docs/tenant-api-integration.md`; identity: `dev-docs/aegis/adr/ADR-0003-user-hierarchy-global-role.md`).
 
 
 ---
@@ -14,19 +14,21 @@
 ## 0. Quick start
 
 ```bash
-# Build (release, all features)
-cargo build --release --features server
+# Build (release, all features; exactly one DB backend feature is required)
+cargo build --release --features server,db-postgres
 
 # Run (master key is REQUIRED — provider keys are AES-256-GCM encrypted at rest)
 export HYDRA_ADMIN_TOKEN=...           # admin Bearer token (required)
 export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"   # 32-byte base64 (required, fail-closed)
-HYDRA_DB_URL=sqlite:hydra.db?mode=rwc  ./target/release/hydra     # or ~/.cargo/global-target/release/hydra
+HYDRA_DB_URL=postgres://hydra:hydra@127.0.0.1:5432/hydra \
+HYDRA_USAGE_SINK=none \
+  ./target/release/hydra     # or ~/.cargo/global-target/release/hydra
 # (note: this project's shell wrapper `rtk` uses a global target dir at ~/.cargo/global-target)
 
-# Test (offline sqlx cache — no DATABASE_URL needed)
-SQLX_OFFLINE=true cargo test -p hydra-core                       # 114 tests
-SQLX_OFFLINE=true cargo test -p hydra-server --features server   # 173 tests
-SQLX_OFFLINE=true cargo clippy --features server --workspace --all-targets -- -D warnings
+# Test (migrations are greenfield PostgreSQL/MySQL; no offline sqlx cache)
+cargo test -p hydra-core
+cargo test -p hydra-server --features server,db-postgres
+cargo clippy --features server,db-postgres --workspace --all-targets -- -D warnings
 ```
 
 ---
@@ -40,17 +42,18 @@ traffic to upstream providers. Two crates, strict layering:
   rate limiter, SSE usage parser, config model + validation). **Dependency firewall** (CI-enforced):
   only `serde`/`serde_json`/`memchr`/`bytes`/`sha2`. No `tokio`/`pingora`/`sqlx`. All state driven by
   an injected `Instant` (deterministic tests). `#![forbid(unsafe_code)]`.
-- **`hydra-server`** — the Pingora proxy shell: terminate-mode `request_filter`, SQLite (sqlx) +
-  ClickHouse sinks, reqwest upstream client, per-tenant TLS SNI, admin REST + UI + Prometheus
-  metrics, external auth cache, **provider-key encryption (crypto module)**, **per-provider bounded
-  admission queue (admission module)**.
+- **`hydra-server`** — the Pingora proxy shell: terminate-mode `request_filter`, PostgreSQL/MySQL (sqlx)
+  persistence, ClickHouse/none usage sinks, reqwest upstream client, per-tenant TLS SNI, admin REST + UI
+  + Prometheus metrics, internal API-key auth, **provider-key encryption (crypto module)**,
+  **per-provider bounded admission queue (admission module)**.
 
 Both crates: `#![forbid(unsafe_code)]`; in production `src/` there is **zero** `unwrap()`,
-**zero** `panic!()`, and **8** `expect()` calls, every one asserting an unreachable invariant
-(the reachable checks are all `match`/`?` on a typed error). The eight
-(re-measured 2026-09-29 by `scripts/check_source_purity.cjs`):
+**zero** `panic!()`, and **8** `expect()` calls at the archive date, every one asserting an
+unreachable invariant (the reachable checks are all `match`/`?` on a typed error). The eight
+(re-measured 2026-09-29 by `scripts/check_source_purity.cjs`; some modules listed below were
+removed by the shared-DB rewrite):
 `crates/hydra-server/src/main.rs` (cert store built whenever a TLS listener is configured),
-`crates/hydra-server/src/admin/mod.rs` (admin SQLite pool, leader mode only),
+`crates/hydra-server/src/admin/mod.rs` (admin shared-DB pool),
 `crates/hydra-server/src/cluster/control_client.rs` ×4 (reqwest build once, `url` mutex ×3),
 and — added by the P1-1 redirect fixes after this list was written, which is why the count
 here used to say 6 — `crates/hydra-server/src/cluster/forward.rs` and
@@ -82,18 +85,17 @@ crates/hydra-server/src/
     admission.rs   AdmissionControl(DashMap<provider,ProviderGate>) Semaphore+timeout; Permit RAII; snapshot()  ← NEW MODULE
     limiter.rs / breaker_wrap.rs / config.rs (default_concurrency_policy) / provider_client.rs / ctx.rs / peer.rs
   crypto.rs       KeyProvider trait + StaticKeyProvider (AES-256-GCM); KMS slot reserved               ← NEW MODULE
-  db.rs           sqlx compile-time query!/query_as! (count grows over time); encrypt-on-write/decrypt-on-read for provider keys
+  db.rs           runtime-checked sqlx queries + `dialect::sql` placeholder rewriting; encrypt-on-write/decrypt-on-read for provider keys
   store.rs        ArcSwap hot-reload ConfigStore (holds key_provider)
-  http.rs         AuthCache (SHA-256 client keys)
-  sink.rs         batched SQLite + ClickHouse usage sink
+  http.rs         shared JSON-body helpers for control-surface contract bodies
+  sink.rs         usage sink registry (ClickHouse or none)
   tls.rs          per-tenant SNI cert callback
   admin/          mod.rs (routes incl. GET /api/v1/concurrency) / handlers.rs (always-mask provider keys) /
                   metrics.rs (17+ Prometheus metrics incl. 6 admission + mid_stream_errors) / static_files.rs (embedded UI)
 
-migrations/  0001_init · 0002_usage_metrics · 0003_provider_key_encryption · 0004_provider_concurrency
-               · … · 0010_sub_tenant (sub-tenant + sub-tenant-route tables, see design-sub-tenant.md)
-.sqlx/       offline query cache (query-*.json) — committed; count grows as compile-time queries are
-               added (44 as of this commit, 2026-09-18); CI builds with SQLX_OFFLINE=true
+migrations/  greenfield baselines under `crates/hydra-server/migrations/postgres/0001_init.sql`
+             and `crates/hydra-server/migrations/mysql/0001_init.sql` (no SQLite, no historical replay)
+             The old per-crate `.sqlx/` offline cache is gone: queries are runtime-checked.
 ```
 
 ---
@@ -101,7 +103,7 @@ migrations/  0001_init · 0002_usage_metrics · 0003_provider_key_encryption · 
 ## 3. Feature inventory — what's built (this round's work marked ★)
 
 **Original (pre-review):** terminate-mode proxy, SWRR + circuit breaker + sliding-window limiter,
-external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI + Prometheus, hot-reload.
+internal API-key auth, ClickHouse/none usage sinks, per-tenant TLS, admin REST + UI + Prometheus, hot-reload.
 
 **★ This round:**
 1. **Provider-key encryption at rest** (P1-4) — AES-256-GCM; `KeyProvider` trait (`StaticKeyProvider`
@@ -114,8 +116,9 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
    **§7 boundary: admission errors never trip the breaker**; 503+Retry-After only when all candidates
    exhausted; migration 0004; 6 metrics; `GET /api/v1/concurrency` inspect endpoint. See
    **`dev-docs/design-admission-queue.md`** (the authoritative design).
-3. **sqlx compile-time SQL checking** (P1-6) — all compile-time queries are `query!`/`query_as!`;
-    `.sqlx/` offline cache; `SQLX_OFFLINE=true` in CI (SQL drift fails the build).
+3. **sqlx compile-time SQL checking** (P1-6) — *historical*: the `.sqlx/` offline cache and
+   `query!`/`query_as!` macros were tied to the retired SQLite dialect and were removed by the
+   shared-DB rewrite; statements are now runtime-checked and go through `dialect::sql`.
 4. **Admin API no longer returns plaintext keys** (P1-5) — always masked. The format has a
    **minimum hidden middle**: `L >= 20` ⇒ 前十 + 中星 + 后四; `6 <= L < 20` ⇒ 前二 + 中星 + 后二;
    `L < 6` ⇒ 全星。 (The original `L >= 14` long tier returned a 14-char key **verbatim** — 0 stars —
@@ -134,7 +137,7 @@ external auth cache, SQLite + ClickHouse sinks, per-tenant TLS, admin REST + UI 
 
 | Property | Evidence |
 |---|---|
-| Provider keys NOT in DB file | raw SQLite grep of canary = **0 hits**; `api_key` column DROPPED; ciphertext/nonce/key_version stored |
+| Provider keys NOT in DB file | raw shared-DB/backup grep of canary = **0 hits**; `api_key` column DROPPED; ciphertext/nonce/key_version stored |
 | Fail-closed boot | hydra refuses to start without `HYDRA_ENCRYPTION_KEY` (clear error) |
 | No plaintext via admin API | runtime check: 4 paths (collection ±reveal, single ±reveal) all `plaintext_leak=0`, return masked `sk-provide*********mock` |
 | §7 breaker boundary | `admission_wait_timeout_does_not_trip_breaker` test: `fail_count` stays 0 |
@@ -168,8 +171,8 @@ queue_wait_timeout_ms # 1000-5000
 |---|---|---|
 | **Admission P1.1 — client-disconnect cancellation** | @librarian confirmed pingora 0.8 terminate mode exposes **no** clean client-gone signal (private socket stream; `watch_h2_stream_reset` is PR #911, H2-only). RAII `Permit` already self-heals (releases slot on write error), so waste is transient. | When pingora ships PR #911 (H2), OR if `hydra_queue_wait_seconds`/queue-drop metrics show real waste. |
 | **Admission P1.2 — per-tenant queue reservation** | Cross-tenant fairness (Envoy priority levels); only matters under multi-tenant contention on one weak upstream. | When production metrics show a single tenant monopolizing a capped provider's queue. |
-| **Admission P2 — per-(provider,model) / per-(provider,key) granularity; Redis multi-instance counter** | Finer-grained limits + shared state for multi-instance deployments. | When single-instance caps are insufficient or Hydra runs >1 replica. |
-| **sqlx `query!` for dynamic queries** | A few queries use dynamic SQL (column lists / `IN` lists) and stay runtime-checked. | If dynamic-SQL queries proliferate. |
+| **Admission P2 — per-(provider,model) / per-(provider,key) granularity; Redis multi-instance counter** | Finer-grained limits + shared state for multi-instance deployments. | When single-instance caps are insufficient or Hydra runs more than one node. |
+| **Dynamic SQL** | A few queries use dynamic SQL (column lists / `IN` lists) and stay runtime-checked. | If dynamic-SQL queries proliferate. |
 
 ---
 
@@ -186,6 +189,9 @@ queue_wait_timeout_ms # 1000-5000
 ## 8. Resume hints for the next round
 
 - **Read first:** `dev-docs/design-admission-queue.md` (admission), `dev-docs/ops.md` (ops), this file.
+- **Historical (removed by T10 — kept as archive record; not the live architecture):** the
+  sub-tenant / key-prefix routing plane below, including its leader/lease forwarding and its
+  SQLite usage column, was deleted by the shared-DB rewrite. Do not build on any of these paths.
 - **Sub-tenant (post-archive, 2026-09-18):** since this archive the sub-tenant feature landed —
   migration `0010_sub_tenant.sql` (`sub_tenant` + `sub_tenant_route` tables), projected through
   `ConfigData`/`FidelityRows`/`FidelityWireRows`/`restore.rs`, route gate (3.6) in `router.rs` +
@@ -236,32 +242,13 @@ queue_wait_timeout_ms # 1000-5000
   nothing else to do. Size `max_concurrency` to the upstream's *measured SSE concurrency* (load-test it).
 - **Crypto boundary:** any new persisted secret should go through `crypto::KeyProvider` (seal on write,
   open on read) at the `db.rs` boundary, never in `hydra-core`.
-- **SQL changes:** after any migration or query edit, regenerate the offline cache
-  and commit it — CI builds with `SQLX_OFFLINE=true` and reads the cache at the
-  **workspace root**. Measured procedure (sqlx-cli 0.9.x):
-
-  ```bash
-  export CARGO_HOME="$PWD/.cargo-cache/home"; export PATH="$CARGO_HOME/bin:$PATH"
-  export DATABASE_URL="sqlite://$PWD/.prepare.db?mode=rwc"
-  cargo sqlx database create && cargo sqlx migrate run --source crates/hydra-server/migrations
-  ( cd crates/hydra-server && SQLX_OFFLINE=false cargo sqlx prepare -- --features server )
-  mv crates/hydra-server/.sqlx/* .sqlx/ && rmdir crates/hydra-server/.sqlx
-  git status --short .sqlx/     # must show your change before you commit it
-  ```
-
-  **Three traps, all measured:**
-  1. `--features db` no longer compiles on its own — `store.rs` / `db/restore.rs`
-     use `crate::cluster::*`, which the `db` feature does not enable (the `db`
-     feature remains for `hydra-core`-free consumers; recipes that used it must
-     say `--features server`).
-  2. Features go **after `--`** now; `cargo sqlx prepare --workspace --features
-     server` is accepted but reports "no queries found" and **deletes every entry
-     in the root `.sqlx/`**, which then breaks the `SQLX_OFFLINE=true` build.
-  3. `prepare` writes the cache next to the CRATE you run it in, so running it in
-     `crates/hydra-server` creates `crates/hydra-server/.sqlx/` — which CI does not
-     read. Move it to the workspace root (step 5 above).
+- **SQL changes:** there is no offline cache to regenerate. Statements are runtime-checked and go
+  through `dialect::sql` (PostgreSQL `$n` / MySQL `?`); the schema is the greenfield baseline under
+  `crates/hydra-server/migrations/{postgres,mysql}/`. After editing SQL, run the backend-specific
+  build/test (`cargo test -p hydra-server --features server,db-postgres` and, when relevant,
+  `--features server,db-mysql`) and `node scripts/check_dialect_sql.cjs`.
 - **Verification discipline:** never trust a delegated agent's "compiles/clean" claim — re-run
-  `cargo build --features server` + full `cargo test` + targeted runtime checks (encryption grep,
+  `cargo build --features server,db-postgres` + full `cargo test` + targeted runtime checks (encryption grep,
   reveal-mask, fail-closed) yourself.
 - **`rtk` quirk:** this machine's `rtk` wrapper builds to `~/.cargo/global-target/` (global target dir),
   not `./target/`. A plain `cargo build` (no `rtk`) builds to `./target/`. Don't test a stale binary —

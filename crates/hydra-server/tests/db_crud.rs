@@ -210,6 +210,15 @@ async fn provider_and_model_crud_and_ordering() {
     assert_eq!(got.key, "first");
     assert_eq!(got.max_concurrency, Some(8));
 
+    // UNIQUE(provider.key): a second id may not reuse the code.
+    let err = db::insert_provider(pool, &provider("p-dup", "first", &ts(2)))
+        .await
+        .expect_err("duplicate provider key must error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on provider.key, got {err:?}"
+    );
+
     let mut p2 = got_for(&db::get_provider(pool, "p2").await);
     p2.name = "renamed".into();
     p2.weight = 0;
@@ -222,6 +231,15 @@ async fn provider_and_model_crud_and_ordering() {
     assert_eq!(p2.weight, 0);
     assert_eq!(p2.created_at, ts(1), "created_at must not change");
 
+    // status CHECK: only 1 / 0 / -1 are valid.
+    let err = db::insert_provider_model(pool, &provider_model("m-bad", "bad", "p1", 7))
+        .await
+        .expect_err("status outside 1/0/-1 must violate CHECK");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_check_violation()),
+        "expected CHECK violation on provider_model.status, got {err:?}"
+    );
+
     db::insert_provider_model(pool, &provider_model("m-z", "zmodel", "p1", 1))
         .await
         .expect("insert z model");
@@ -232,12 +250,29 @@ async fn provider_and_model_crud_and_ordering() {
     rev += 1;
     assert_eq!(revision(pool).await, rev);
 
+    // UNIQUE(key, provider_id): the same pair cannot repeat.
+    let err = db::insert_provider_model(pool, &provider_model("m-dup", "zmodel", "p1", 1))
+        .await
+        .expect_err("duplicate (key, provider_id) must error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on provider_model(key, provider_id), got {err:?}"
+    );
+
     let models = db::list_provider_models(pool).await.expect("list models");
     assert_eq!(
         models.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
         vec!["amodel", "zmodel"],
         "models are ordered by (key, provider_id)"
     );
+
+    // ...but another provider may host the same key.
+    db::insert_provider_model(pool, &provider_model("m-cross", "zmodel", "p2", 1))
+        .await
+        .expect("the same model key under another provider is allowed");
+    rev += 1;
+    assert_eq!(revision(pool).await, rev);
+
     let mut model = db::get_provider_model(pool, "m-a")
         .await
         .expect("get model");
@@ -350,6 +385,24 @@ async fn provider_key_crud_and_sealing() {
     .await
     .expect("raw ciphertext");
     assert_ne!(raw.0, b"sk-one".to_vec());
+    assert!(!raw.0.is_empty(), "ciphertext must be non-empty");
+
+    // The old plaintext column is gone (hard cutover).
+    let has_plaintext_column = sqlx::query("SELECT api_key FROM provider_key LIMIT 1")
+        .fetch_all(pool)
+        .await
+        .is_ok();
+    assert!(
+        !has_plaintext_column,
+        "api_key plaintext column must have been dropped"
+    );
+
+    // A different master key fails closed instead of returning garbage.
+    let wrong_kp = StaticKeyProvider::new([8u8; 32], 1);
+    assert!(
+        db::list_provider_keys(pool, &wrong_kp).await.is_err(),
+        "wrong master key must fail to decrypt"
+    );
 
     db::upsert_provider_key(pool, &kp, &provider_key("k1", "p1", "sk-one-v2", &ts(0)))
         .await
@@ -390,31 +443,99 @@ async fn tenant_grants_and_certificate_crud() {
         TenantWrite {
             tenant: &tenant("t1", "one.example", &ts(0)),
             is_create: true,
-            cert: Some((
-                Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----".into()),
-                Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----".into()),
-            )),
+            cert: None,
         },
     )
     .await
-    .expect("write tenant + cert");
+    .expect("write tenant");
     rev += 1;
     assert_eq!(revision(pool).await, rev);
 
     let got = db::get_tenant(pool, "t1").await.expect("get tenant");
     assert_eq!(got.domain, "one.example");
-    let cert = db::get_tenant_cert(pool, &kp, "t1")
+    assert_eq!(got.name, "tenant-t1");
+
+    // A tenant row may exist without a certificate; presence is about the cert
+    // columns, not the row.
+    let none_cert = db::get_tenant_cert(pool, &kp, "t1")
         .await
         .expect("get cert")
         .expect("tenant exists");
-    assert!(cert.cert_pem.as_deref().is_some_and(|p| p.contains("AAA")));
-    assert!(cert
-        .cert_key_pem
-        .as_deref()
-        .is_some_and(|p| p.contains("BBB")));
+    assert!(none_cert.cert_pem.is_none() && none_cert.cert_key_pem.is_none());
+
+    // UNIQUE(tenant.domain).
+    let err = db::insert_tenant(pool, &tenant("t2", "one.example", &ts(1)))
+        .await
+        .expect_err("duplicate domain must error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on tenant.domain, got {err:?}"
+    );
+
+    // enabled CHECK (raw SQL bypasses the model's bool).
+    let err = sqlx::query(
+        "INSERT INTO tenant (id, name, domain, enabled) \
+         VALUES ('tbad','bad','bad.example', 2)",
+    )
+    .execute(pool)
+    .await
+    .expect_err("enabled=2 must violate CHECK");
+    let db_err = match err {
+        sqlx::Error::Database(d) => d,
+        other => panic!("expected database error, got {other:?}"),
+    };
+    assert!(
+        db_err.is_check_violation(),
+        "expected CHECK violation on tenant.enabled, got {db_err}"
+    );
+
+    // Certificate round-trip preserves the exact PEM content.
+    let cert = TenantCert {
+        tenant_id: "t1".into(),
+        cert_pem: Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".into()),
+        cert_key_pem: Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".into()),
+    };
+    db::update_tenant_cert(pool, &kp, &cert)
+        .await
+        .expect("write cert");
+    rev += 1;
+    assert_eq!(revision(pool).await, rev);
+
+    let round_trip = db::get_tenant_cert(pool, &kp, "t1")
+        .await
+        .expect("get cert")
+        .expect("cert present");
+    assert_eq!(round_trip, cert);
+
+    // At rest: the certificate PEM is plaintext, the private key is ciphertext.
+    let row: (Option<String>, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT cert_pem, cert_key_ciphertext FROM tenant WHERE id = 't1'")
+            .fetch_one(pool)
+            .await
+            .expect("raw row");
     assert_eq!(
-        db::list_tenant_certs(pool, &kp).await.expect("certs").len(),
-        1
+        row.0.as_deref(),
+        Some("-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n")
+    );
+    let ciphertext = row.1.expect("ciphertext present");
+    assert_ne!(
+        ciphertext,
+        b"-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n".to_vec(),
+        "plaintext key must never be persisted"
+    );
+
+    let all = db::list_tenant_certs(pool, &kp).await.expect("certs");
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0].cert_key_pem.as_deref(),
+        Some("-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----\n")
+    );
+
+    // Wrong master key must fail closed, never return the ciphertext as a key.
+    let wrong_kp = StaticKeyProvider::new([8u8; 32], 1);
+    assert!(
+        db::get_tenant_cert(pool, &wrong_kp, "t1").await.is_err(),
+        "wrong master key must not decrypt the cert key"
     );
 
     let mut upd = got.clone();
@@ -429,6 +550,7 @@ async fn tenant_grants_and_certificate_crud() {
     assert_eq!(got.name, "renamed");
     assert!(!got.enabled);
 
+    // Replacing the cert may keep the certificate and drop the key.
     db::update_tenant_cert(
         pool,
         &kp,
@@ -447,6 +569,21 @@ async fn tenant_grants_and_certificate_crud() {
         .expect("tenant exists");
     assert!(cert.cert_pem.as_deref().is_some_and(|p| p.contains("CCC")));
     assert!(cert.cert_key_pem.is_none());
+
+    // Explicit clear: both None → columns NULLed, not left stale.
+    let cleared = TenantCert {
+        tenant_id: "t1".into(),
+        cert_pem: None,
+        cert_key_pem: None,
+    };
+    db::update_tenant_cert(pool, &kp, &cleared)
+        .await
+        .expect("clear cert");
+    rev += 1;
+    assert_eq!(
+        db::get_tenant_cert(pool, &kp, "t1").await.unwrap(),
+        Some(cleared)
+    );
     assert_eq!(revision(pool).await, rev);
 
     db::insert_provider(pool, &provider("p1", "granted", &ts(0)))
@@ -469,6 +606,15 @@ async fn tenant_grants_and_certificate_crud() {
         1
     );
 
+    // UNIQUE(tenant_id, provider_id).
+    let err = db::insert_tenant_provider(pool, &tenant_provider("tp2", "t1", "p1"))
+        .await
+        .expect_err("duplicate (tenant, provider) must error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on tenant_provider, got {err:?}"
+    );
+
     db::insert_tenant_model(pool, &tenant_model("tm1", "t1", "gpt-4"))
         .await
         .expect("insert tenant model");
@@ -481,6 +627,15 @@ async fn tenant_grants_and_certificate_crud() {
         "gpt-4"
     );
     assert_eq!(db::list_tenant_models(pool).await.expect("models").len(), 1);
+
+    // UNIQUE(tenant_id, model_key).
+    let err = db::insert_tenant_model(pool, &tenant_model("tm2", "t1", "gpt-4"))
+        .await
+        .expect_err("duplicate (tenant, model_key) must error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(d) if d.is_unique_violation()),
+        "expected UNIQUE violation on tenant_model, got {err:?}"
+    );
 
     db::delete_tenant_provider(pool, "tp1")
         .await
@@ -523,7 +678,11 @@ async fn limit_role_crud_and_sealed_matching_key() {
         vec!["r1", "r2"]
     );
     let got = db::get_limit_role(pool, &kp, "r1").await.expect("get r1");
+    assert_eq!(got.name, "role-r1");
     assert_eq!(got.matching_key.as_deref(), Some("sk-one"));
+    assert_eq!(got.matching_model.as_deref(), Some("gpt-4"));
+    assert_eq!(got.limit_token, Some(10_000));
+    assert!(got.enabled);
 
     // The bare column holds an envelope, not the client key.
     let raw: (Option<String>,) = sqlx::query_as(&db::dialect::sql(
@@ -536,6 +695,38 @@ async fn limit_role_crud_and_sealed_matching_key() {
     let raw = raw.0.expect("sealed value");
     assert_ne!(raw, "sk-one");
     assert!(raw.starts_with("sealed:v1:"), "got {raw}");
+
+    // limit_window CHECK: only m / h / d are valid.
+    let err =
+        sqlx::query("INSERT INTO limit_role (id, name, limit_window) VALUES ('lrbad','bad','s')")
+            .execute(pool)
+            .await
+            .expect_err("window='s' must violate CHECK");
+    let db_err = match err {
+        sqlx::Error::Database(d) => d,
+        other => panic!("expected database error, got {other:?}"),
+    };
+    assert!(
+        db_err.is_check_violation(),
+        "expected CHECK violation on limit_role.window, got {db_err}"
+    );
+
+    // enabled CHECK (raw SQL bypasses the model's bool).
+    let err = sqlx::query(
+        "INSERT INTO limit_role (id, name, limit_window, enabled) \
+         VALUES ('lrbad2','bad','h', 3)",
+    )
+    .execute(pool)
+    .await
+    .expect_err("enabled=3 must violate CHECK");
+    let db_err = match err {
+        sqlx::Error::Database(d) => d,
+        other => panic!("expected database error, got {other:?}"),
+    };
+    assert!(
+        db_err.is_check_violation(),
+        "expected CHECK violation on limit_role.enabled, got {db_err}"
+    );
 
     let mut upd = got.clone();
     upd.name = "renamed".into();
@@ -917,6 +1108,22 @@ async fn delete_tenant_cascades_all_child_rows() {
         .await
         .expect("provider key");
     rev += 1;
+    db::insert_provider(pool, &provider("p2", "cascade-second", &ts(1)))
+        .await
+        .expect("second provider");
+    rev += 1;
+    db::insert_provider_model(pool, &provider_model("pm2", "m2", "p2", 1))
+        .await
+        .expect("second provider model");
+    rev += 1;
+    db::insert_provider_model(pool, &provider_model("pm3", "offline", "p1", 0))
+        .await
+        .expect("offline provider model");
+    rev += 1;
+    db::insert_provider_key(pool, &kp, &provider_key("pk2", "p2", "sk-second", &ts(1)))
+        .await
+        .expect("second provider key");
+    rev += 1;
     db::insert_tenant(pool, &tenant("t1", "cascade.example", &ts(0)))
         .await
         .expect("tenant");
@@ -924,6 +1131,10 @@ async fn delete_tenant_cascades_all_child_rows() {
     db::insert_tenant_provider(pool, &tenant_provider("tp", "t1", "p1"))
         .await
         .expect("tenant provider");
+    rev += 1;
+    db::insert_tenant_provider(pool, &tenant_provider("tp2", "t1", "p2"))
+        .await
+        .expect("second tenant provider");
     rev += 1;
     db::insert_tenant_model(pool, &tenant_model("tm", "t1", "m"))
         .await
@@ -948,10 +1159,25 @@ async fn delete_tenant_cascades_all_child_rows() {
     assert_eq!(revision(pool).await, rev);
 
     // Child rows exist before the delete; this is the shape that used to answer
-    // MySQL 1615 from a cached prepared statement.
+    // MySQL 1615 from a cached prepared statement. The written graph also reads
+    // back with the same shape: 1 tenant, 2 providers, 3 models, 2 keys, 2
+    // grants and 1 tenant model.
+    let tenants = db::list_tenants(pool).await.expect("tenants");
+    assert_eq!(tenants.len(), 1);
+    assert_eq!(tenants[0].domain, "cascade.example");
+    assert_eq!(tenants[0].name, "tenant-t1");
+    assert_eq!(db::list_providers(pool).await.expect("providers").len(), 2);
+    assert_eq!(
+        db::list_provider_models(pool).await.expect("models").len(),
+        3
+    );
+    assert_eq!(
+        db::list_provider_keys(pool, &kp).await.expect("keys").len(),
+        2
+    );
     assert_eq!(
         db::list_tenant_providers(pool).await.expect("grants").len(),
-        1
+        2
     );
     assert_eq!(db::list_tenant_models(pool).await.expect("models").len(), 1);
     assert_eq!(db::list_user_groups(pool).await.expect("groups").len(), 1);
@@ -994,7 +1220,13 @@ async fn delete_tenant_cascades_all_child_rows() {
         .expect("delete provider with child rows");
     rev += 1;
     assert!(db::get_provider_model(pool, "pm").await.is_err());
+    assert!(db::get_provider_model(pool, "pm3").await.is_err());
     assert!(db::get_provider_key(pool, &kp, "pk").await.is_err());
+    // The other provider and its children are untouched.
+    assert!(db::get_provider(pool, "p2").await.is_ok());
+    assert!(db::get_provider_model(pool, "pm2").await.is_ok());
+    assert!(db::get_provider_key(pool, &kp, "pk2").await.is_ok());
+    assert_eq!(db::list_providers(pool).await.expect("providers").len(), 1);
     assert_eq!(revision(pool).await, rev);
 
     test_db.cleanup().await;

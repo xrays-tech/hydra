@@ -143,7 +143,7 @@ TDD Route:
 | `crates/hydra-server/src/store.rs` | 修改（build_config 加载） | 4 |
 | `crates/hydra-server/src/admin/handlers.rs` | 修改（2 handler + 导入） | 5 |
 | `crates/hydra-server/src/admin/mod.rs` | 修改（路由段） | 5 |
-| `crates/hydra-server/tests/repo.rs` | 修改（CRUD round-trip） | 7 |
+| `crates/hydra-server/tests/db_crud.rs` | 修改（CRUD round-trip） | 7 |
 | `crates/hydra-server/tests/loader.rs` | 修改（enabled-only 加载） | 7 |
 | `crates/hydra-server/tests/admin_api.rs` | 修改（HTTP CRUD + snapshot 断言） | 7 |
 | `admin-ui/app.js` | 修改（CRUD section + NAV + 注释） | 6 |
@@ -1012,7 +1012,7 @@ pub(super) async fn provider_key_binding_item(
 # Task 7 — 集成测试（repo / loader / admin_api）
 
 **Files**
-- 修改 `crates/hydra-server/tests/repo.rs`、`crates/hydra-server/tests/loader.rs`、`crates/hydra-server/tests/admin_api.rs`
+- 修改 `crates/hydra-server/tests/db_crud.rs`、`crates/hydra-server/tests/loader.rs`、`crates/hydra-server/tests/admin_api.rs`
 
 **Why**：覆盖 db CRUD、loader 加载、HTTP CRUD + 热加载生效三条链路。
 
@@ -1022,7 +1022,7 @@ pub(super) async fn provider_key_binding_item(
 
 **Verification**：`SQLX_OFFLINE=true cargo test -p hydra-server --features server`。
 
-## 步骤 7.1 — repo.rs：CRUD round-trip + CASCADE
+## 步骤 7.1 — db_crud.rs：CRUD round-trip + CASCADE
 
 文件末尾追加（复用既有 `provider()` / `now()` helper）：
 
