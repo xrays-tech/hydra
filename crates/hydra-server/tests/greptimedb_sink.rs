@@ -26,11 +26,13 @@ use hydra_server::usage::{self, BackendConfig, EnvView};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// A raw-TCP GreptimeDB double: it records the `sql=` body of every request and answers a fixed
-/// 200. The response body is the canned SELECT answer.
+/// A raw-TCP GreptimeDB double: it records the HTTP request line (so a test can see WHICH database
+/// each statement targets) and the `sql=` body of every request, and answers a fixed 200. The
+/// response body is the canned SELECT answer.
 struct Mock {
     port: u16,
-    requests: Arc<Mutex<Vec<String>>>,
+    /// `(request line, decoded sql)` for every request the double received.
+    requests: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// Decode the `application/x-www-form-urlencoded` `sql=` value from a request body.
@@ -117,11 +119,15 @@ async fn spawn_mock(totals_body: &'static str, grouped_body: &'static str) -> Mo
         while let Ok((mut sock, _)) = listener.accept().await {
             let raw = read_request(&mut sock).await;
             let text = String::from_utf8_lossy(&raw).into_owned();
+            let line = text.lines().next().unwrap_or("").to_string();
             let body = match text.find("\r\n\r\n") {
                 Some(i) => form_sql(&text[i + 4..]),
                 None => String::new(),
             };
-            recorded.lock().expect("requests").push(body.clone());
+            recorded
+                .lock()
+                .expect("requests")
+                .push((line, body.clone()));
 
             // The real GreptimeDB answers DDL/INSERT with `output[0].affectedrows` and a SELECT
             // with `output[0].records{…}`. Answering a SELECT with the INSERT envelope is the exact
@@ -283,18 +289,36 @@ async fn the_wire_mock_sees_the_ddl_insert_and_read_and_the_schema_matches() {
 
     // The bootstrap issued the two DDL statements; the insert is a multi-row INSERT. The mock
     // answered them with `affectedrows`, which the writer reads to confirm the write landed.
-    let create_table = reqs
+    //
+    // THE REGRESSION GUARD: `CREATE DATABASE` must target GreptimeDB's default `public` database —
+    // sending it with `?db=hydra_usage` asks the server to run the statement INSIDE the database it
+    // is creating, and a FRESH server refuses with
+    // `{"code":4004,"error":"Database not found: hydra_usage"}`.
+    let (create_db_line, _) = reqs
         .iter()
-        .find(|s| s.starts_with("CREATE TABLE"))
+        .find(|(_, sql)| sql.starts_with("CREATE DATABASE"))
+        .expect("CREATE DATABASE was sent");
+    assert!(
+        create_db_line.contains("/v1/sql?db=public"),
+        "CREATE DATABASE must run in the default `public` database, not the one it creates: \
+         {create_db_line}"
+    );
+    let (create_table_line, create_table) = reqs
+        .iter()
+        .find(|(_, sql)| sql.starts_with("CREATE TABLE"))
         .expect("CREATE TABLE was sent");
     assert!(
-        reqs.iter().any(|s| s.starts_with("CREATE DATABASE")),
-        "CREATE DATABASE was sent: {reqs:?}"
+        create_table_line.contains("/v1/sql?db=hydra_usage"),
+        "CREATE TABLE must target the configured database: {create_table_line}"
     );
-    let insert = reqs
+    let (insert_line, insert) = reqs
         .iter()
-        .find(|s| s.starts_with("INSERT INTO"))
+        .find(|(_, sql)| sql.starts_with("INSERT INTO"))
         .expect("INSERT was sent");
+    assert!(
+        insert_line.contains("/v1/sql?db=hydra_usage"),
+        "the INSERT must target the configured database: {insert_line}"
+    );
     assert!(
         insert.matches("),(").count() >= 1,
         "a batch is a MULTI-ROW INSERT: {insert}"
@@ -331,9 +355,9 @@ async fn the_wire_mock_sees_the_ddl_insert_and_read_and_the_schema_matches() {
     );
 
     // The totals SELECT escaped the tenant literal (there is no bind parameter).
-    let totals_sql = reqs
+    let (_, totals_sql) = reqs
         .iter()
-        .find(|s| s.starts_with("SELECT count(*)"))
+        .find(|(_, sql)| sql.starts_with("SELECT count(*)"))
         .expect("a totals SELECT was sent");
     assert!(
         totals_sql.contains("tenant_id = 'tenant-1'"),
@@ -356,9 +380,9 @@ async fn the_wire_mock_sees_the_ddl_insert_and_read_and_the_schema_matches() {
     );
 
     // The grouped SELECT aliases the whitelisted expression as `group_key` and groups by it.
-    let grouped_sql = reqs
+    let (_, grouped_sql) = reqs
         .iter()
-        .find(|s| s.contains(" AS group_key"))
+        .find(|(_, sql)| sql.contains(" AS group_key"))
         .expect("a grouped SELECT was sent");
     assert!(
         grouped_sql.contains("model_key AS group_key"),

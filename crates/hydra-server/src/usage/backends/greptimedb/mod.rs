@@ -177,13 +177,25 @@ fn bootstrap(cfg: &GreptimedbConfig) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let statements = [
-        format!("CREATE DATABASE IF NOT EXISTS {db}"),
-        CREATE_TABLE.to_string(),
+    // `CREATE DATABASE` must NOT be addressed to the database it is creating. `transport::send`
+    // always builds `/v1/sql?db=<database_or_default>`, so sending the statement with the configured
+    // database asks GreptimeDB to run it INSIDE a database that does not exist yet — measured against
+    // `greptime/greptimedb:v1.3.0` as:
+    //   greptimedb refused the statement (status HTTP/1.1 400 Bad Request):
+    //   {"code":4004,"error":"Database not found: hydra_usage"}
+    // (It appeared to work in the first tests only because a previous run had already created the
+    // database.) The database is therefore created in GreptimeDB's default `public` database; the
+    // table DDL then targets the configured one.
+    let create_database = format!("CREATE DATABASE IF NOT EXISTS {db}");
+    let mut create_db_cfg = cfg.clone();
+    create_db_cfg.database = Some("public".to_string());
+    let statements: [(&GreptimedbConfig, String); 2] = [
+        (&create_db_cfg, create_database),
+        (cfg, CREATE_TABLE.to_string()),
     ];
-    for sql in statements {
-        let cfg = cfg.clone();
-        let resp = tokio::task::block_in_place(|| rt.block_on(transport::send(&cfg, &sql)))?;
+    for (target, sql) in statements {
+        let target = target.clone();
+        let resp = tokio::task::block_in_place(|| rt.block_on(transport::send(&target, &sql)))?;
         if resp.is_failure() {
             return Err(format!(
                 "the GreptimeDB usage schema could not be created ({sql}): {}",
