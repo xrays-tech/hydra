@@ -93,6 +93,8 @@ const PROSE_ONLY_OK = records(process.env.DOC_ENV_PROSE_OK, [
   ['HYDRA_ENCRYPTION_KEY_PREVIOUS_VERSION', 'read at `crypto.rs:186`; named in the rotation procedure example'],
   ['HYDRA_BREAKER_QUORUM', 'read at `main.rs:73`; named in the breaker prose and in the not-wired list'],
   ['HYDRA_MAX_USER_API_KEYS_PER_TENANT', "WIRED, but read through a multi-line `env_positive_u32(\"HYDRA_MAX_USER_API_KEYS_PER_TENANT\", DEFAULT_MAX_USER_API_KEYS_PER_TENANT)` at `tenant_api/mod.rs:233-235`; the helper literal is on its own line so this checker's single-line \"literal-argument\" shape does not see it. Documented in prose (ops.md) rather than as a config-table first-column row, since a table row would be a promise the guard cannot mechanically verify and wiring it into the table must not require editing product code."],
+  ['HYDRA_TEST_DATABASE_URL', 'TEST-ONLY knob: it is the connection URL the integration suite points at to fork a throwaway `hydra_test_%` schema/database, and its evidence lives in the test-scoped code this guard intentionally skips (`crates/hydra-server/tests/**`, `db/testing.rs`). It is also genuinely READ by the operator-facing cleanup script `scripts/clean-test-dbs.cjs` (`parseDatabaseUrl(env.HYDRA_TEST_DATABASE_URL)`), but ops.md names it only in the test-DB runbook prose, not as a runtime knob, so it is recorded here rather than given a table row.'],
+  ['HYDRA_TEST_DROP_DBS', 'TEST-ONLY knob: it switches the test harness between eagerly dropping each `hydra_test_%` database and leaving it for a later sweep. Its only readers are test-scoped (`crates/hydra-server/tests/**`, `db/testing.rs`), the exact code this guard skips, and ops.md names it only in the test-DB runbook prose ("keep using `HYDRA_TEST_DROP_DBS=1`"); no first-column table row is warranted.'],
 ]);
 
 class ScanError extends Error {
@@ -218,7 +220,22 @@ function directRead(line, ext, name) {
 
 /** The name handed to a helper as a whole literal argument: `f("X", …)` / `f("X")`. */
 function helperArgument(line, name) {
-  return new RegExp(`[(,]\\s*"${name}"\\s*[,)]`).test(line) ? 'passed as a literal argument' : null;
+  if (new RegExp(`[(,]\\s*"${name}"\\s*[,)]`).test(line)) return 'passed as a literal argument';
+  // A `cargo fmt`-wrapped argument list puts the literal on its OWN line:
+  //
+  //     parse(
+  //         &mut lookup,
+  //         "HYDRA_DB_LOCK_TIMEOUT_MS",
+  //         Self::DEFAULT_LOCK_TIMEOUT_MS,
+  //     )
+  //
+  // The line consists solely of the string literal plus a trailing comma, so it IS an argument
+  // element — the same read the single-line shape sees, just wrapped. Accepting it is still a
+  // READ, not a mention: a bare `"X",` line can only be whoever's argument list encloses it.
+  if (new RegExp(`^\\s*"${name}"\\s*,\\s*$`).test(line)) {
+    return 'passed as a literal argument (wrapped argument line)';
+  }
+  return null;
 }
 
 /** `const IDENT: &str = "X";` / `static IDENT: &str = "X";` on one line, or null. */

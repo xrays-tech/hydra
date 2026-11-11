@@ -57,9 +57,16 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_ENCRYPTION_KEY_PREVIOUS` (+ `_PREVIOUS_VERSION`) | the OLD master key during a rotation window: with it set, the provider keeps a key ring so existing ciphertext still opens while `HYDRA_RESEAL_SECRETS=1` rewrites every row. Drop both after a clean re-seal report. |
 | `HYDRA_RESEAL_SECRETS` | *(unset)* | **One-shot maintenance switch**: set to `1`, `true`, `yes` or `on` (case-insensitive) to re-seal every stored secret under `HYDRA_ENCRYPTION_KEY`/`_VERSION` and EXIT — the process does not serve traffic in this mode. Run it once during a rotation, with the old key still present in `HYDRA_ENCRYPTION_KEY_PREVIOUS`; the report (`provider_keys=… tenant_certs=… limit_keys=… already_current=… failed=…`) decides the exit code, and `failed` non-empty means **do not delete the previous key**. A row whose version already equals the current one is re-verified by actually opening it, so "already current" means "opens under the current key" — measured live 2026-09-30 with a row *labelled* current but sealed with other material: it is reported as `reseal FAILED: … labelled key_version 2 (the CURRENT version) but it does NOT open under the current key …`, exit 1. `0`/`false`/`no`/`off` (and unset) mean "serve normally" as you would expect. **Any other value is REFUSED at startup** (`exit 1`, with the offending value echoed): before 2026-09-30 every unrecognised value — `YES`, `on`, `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally", so a typo in this one-shot command left the operator with a healthy-looking node and **no indication that the rotation never ran** (measured in `integration/test_key_rotation_live.py`). See §3. |
 | `HYDRA_DB_URL` | *(compiled-backend fallback)* | **Required in practice.** Shared PostgreSQL/MySQL URL. The scheme must match the compiled backend (`db-postgres` ⇒ `postgres://…`, `db-mysql` ⇒ `mysql://…`); there is no runtime driver switch. **Production transport:** add `sslmode=verify-full` (PostgreSQL) or `ssl-mode=VERIFY_IDENTITY` (MySQL) and verify the server certificate/hostname; `require`/`REQUIRED`/`prefer`/`PREFERRED`/`disable` are not acceptable. See §1.3. |
+| `HYDRA_DB_REQUIRE_TLS` | `0` | Opt-in **runtime enforcement** of the §1.3 transport requirement. With `1`, boot parses `HYDRA_DB_URL` (the compiled-in fallback URL too, so the check still applies when the variable is unset) and **refuses to start** unless it carries PostgreSQL `sslmode=require\|verify-ca\|verify-full`, or MySQL `ssl-mode`/`sslmode` = `REQUIRED`/`VERIFY_CA`/`VERIFY_IDENTITY` (keys and values case-insensitive). Recommended `1` in production; `0` (default) keeps existing deployments compatible. Any value other than `0`/`1` (and the boolean words) is refused at startup rather than silently read as "off". |
+| `HYDRA_DB_LOCK_TIMEOUT_MS` | `5000` | Transaction-scoped PostgreSQL `lock_timeout` used for the shared write-lock acquisition in `db::begin_write` (read by `DbGuardrails::from_lookup`). Clamped to `1..=3600000` ms; unset/blank/non-numeric/negative → `5000`. **Sanity rule:** it must not exceed `HYDRA_DB_STATEMENT_TIMEOUT_MS` — a larger value is clamped **down** to the statement timeout (single warning) because the statement would otherwise be cancelled while still waiting for the lock. A retryable acquisition failure (serialization/deadlock codes, or PostgreSQL `55P03 lock_not_available`) is retried up to 3 times with bounded jitter, so the worst-case added write latency before the mutation surfaces **503 `storage_busy`** is ≈ `3 × lock_timeout` (~15 s at this default) plus jitter; a mutation that fails AFTER acquisition is returned unchanged and never replayed. |
+| `HYDRA_DB_STATEMENT_TIMEOUT_MS` | `60000` | Session-wide PostgreSQL `statement_timeout` applied to pooled connections by `init_pool` (and read by `begin_write`'s guardrails). Clamped to `1..=3600000` ms; unset/blank/non-numeric → `60000`. It is also the upper bound for `HYDRA_DB_LOCK_TIMEOUT_MS`. |
+| `HYDRA_DB_IDLE_TX_TIMEOUT_MS` | `60000` | Session `idle_in_transaction_session_timeout`: a pooled transaction left open and idle is terminated rather than pinning locks/rows. Clamped to `1..=3600000` ms; unset/blank/non-numeric → `60000`. |
+| `HYDRA_DB_LOCK_WAIT_TIMEOUT_SECS` | `10` | MySQL `innodb_lock_wait_timeout` for a pooled session (the MySQL counterpart to `HYDRA_DB_LOCK_TIMEOUT_MS`). Clamped to `1..=3600` s; unset/blank/non-numeric → `10`. |
+| `HYDRA_REDIS_REQUIRE_AUTH` | `0` | Opt-in **authentication enforcement** for the cluster Redis: with `1`, boot refuses to start unless `HYDRA_REDIS_URL` carries a **non-empty password** (`redis://:PASSWORD@host:port/db` only — a bare username or empty password does not count). `rediss://` is TLS and does **not** satisfy this by itself. It proves nothing server-side: the Redis ACL / publish restriction in §13.5a remains a separate policy. Any value other than `0`/`1` (and the boolean words) is refused at startup. |
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy **plaintext** listener. Always bound — the listener topology is derived from configuration only, never from whether tenants have certs (see `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`). |
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
+| `HYDRA_ADMIN_AUDIT_RETENTION_DAYS` | `90` | Retention window, in days, for the append-only `admin_audit` table (§1.5). The daily cleanup deletes rows older than this with a plain `DELETE` (no config lock, no reload); `0` = **keep forever**; a negative value is clamped to `0`, and a missing/unparseable value falls back to `90`. Deleted rows are counted on `hydra_admin_audit_deleted_total`. |
 | `HYDRA_USAGE_SINK` | ***(required — no default)*** | Where usage goes. Accepted values are the registered backends (`dev-docs/usage-backends.md` is the list's owner): `clickhouse` — the shared store every node writes to (needs `HYDRA_CLICKHOUSE_URL`, and a build with `--features usage-clickhouse`; the release scripts build it) — or `none`, which records **nothing** and says so at startup, counts every discarded record on `hydra_usage_records_dropped_total{reason="sink_disabled"}` and answers `503 usage_store_unavailable` on `GET /usage`. Unset ⇒ the process **refuses to start** (ADR-0002 D-1: "where does the billing data go" is a decision, not a guess). `sqlite` was retired on 2026-10-07 and is refused **by name**; it wrote usage into the node's own database, so a cluster's usage was scattered across nodes and the node answering `GET /usage` was usually not the one that recorded the request. |
 | `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. **Do not put a path in this URL** — the sink always POSTs to `/`; a path is *trimmed* rather than used (measured 2026-09-30: before that fix `http://host:8123/clickhouse` failed at connect with `invalid port value`, because the path was still glued to the port when it was parsed). **What the sink actually puts on the wire** (measured 2026-09-30 against a mock ClickHouse, `integration/test_clickhouse_sink_wire.py`): `POST /?<your params>&query=INSERT%20INTO%20usage_record%20(…)%20SETTINGS%20…%20FORMAT%20JSONEachRow`, with the usage **row values in the request BODY** as one JSON object per line — **not** as `param_*` query parameters (that binding form belongs to the usage *reader*, `usage/backends/clickhouse/mod.rs` — moved there from `usage_query.rs` by ADR-0002 T1.3). Useful when diagnosing from a network capture: the SQL appears percent-encoded in the URL, the row values do not, and `client_api_key` in the body is **masked** (`sk*******-1`), never the tenant's real key. |
 | `RUST_LOG` | `info` (set by the image + every compose file) | `tracing` env filter — `main.rs:172` uses `EnvFilter::from_default_env()`. **`HYDRA_LOG` is NOT read**: it was listed here as an alias until 2026-09-29 and has never existed in code (`grep -rn HYDRA_LOG crates/ scripts/ tools/ environment/` is empty). Measured 2026-09-29 on a live instance: started with **only** `HYDRA_LOG=debug` it logs **0 lines** (while `/health` and the API still answer 200), with `RUST_LOG=debug` it logs ~130 lines — so an operator reaching for the documented alias during an incident gets no extra logging. Also note `info` is a **deployment** default, not a binary default: with neither variable set the same instance logs **0 lines** (`from_default_env()` defaults to ERROR-level), and the shipped `Dockerfile`/compose files are what set `RUST_LOG=info`. |
@@ -162,6 +169,10 @@ traffic; losing its confidentiality or server authentication loses the control p
   verification; `prefer`/`disable` may not encrypt at all.
 - **MySQL:** the URL must carry `ssl-mode=VERIFY_IDENTITY`. `REQUIRED` encrypts but does
   not verify the server identity; `PREFERRED`/`DISABLED` are not acceptable.
+- **Enforce it at boot:** set `HYDRA_DB_REQUIRE_TLS=1` so a URL that lacks one of the modes
+  above stops the process before it opens a connection (`HYDRA_DB_REQUIRE_TLS` in §1.1).
+  This is opt-in because the default must stay compatible with local/legacy URLs; production
+  is exactly where the check is worth turning on.
 - **Credentials in the shipped compose manifests are local-dev/drill only.** They are not
   production credentials; use a dedicated least-privilege account and deliver the URL
   through a secret mechanism (Kubernetes secret, External Secrets, root-owned
@@ -296,42 +307,74 @@ second home in the node's own SQLite database, and migration `0013` **drops that
 loads the same shared database; there is no replica rebuild from a leader and no
 `db::restore_config` any more.
 
-### 1.5 Admin audit table (implemented; retention/export separate)
+### 1.5 Admin + tenant audit table, retention and `/metrics` methods
 
-Migration `0002_admin_audit` adds an append-only `admin_audit` table to the shared
-database. The admin router records every **authenticated admin mutation attempt**
-(POST/PUT/DELETE/PATCH) after the handler returns; read-only GETs are not audited. The
-tenant API is not audited in this phase.
+Migrations `0002_admin_audit` and `0003_admin_audit_tenant` add an append-only
+`admin_audit` table to the shared database. Two surfaces write rows, both
+**best-effort after the mutation has run**:
+
+- the **admin router** records every authenticated admin mutation attempt
+  (POST/PUT/DELETE/PATCH); read-only GETs are not audited, and `/metrics` is never
+  audited (see below);
+- the **tenant self-service API** records a write only AFTER the token gate and
+  URL cross-check pass, immediately around `handlers::write`. Pre-gate refusals
+  (`401` missing/bad token, `403` URL/token mismatch, `429` throttle,
+  `503 not_ready`) are **not** audited because there is no authenticated actor to
+  attribute them to. The `actor` and `tenant_id` are the identity the ACCESS TOKEN
+  resolved to — never the tenant id from the URL claim — and no request body is
+  stored.
 
 Columns:
 
 | column | meaning |
 |---|---|
 | `id` | database-generated row id |
-| `actor` | the admin surface (`admin`); no tenant identity in this phase |
+| `actor` | `admin` for the admin plane; the AUTHENTICATED tenant id for a tenant write |
 | `action` | lowercased HTTP verb (`post`, `put`, …) |
 | `method` | original HTTP method (`POST`, `PUT`, …) |
-| `path` | full `/api/v1/...` request path |
-| `entity_type` | first path segment after `/api/v1/` (e.g. `tenants`), when present |
+| `path` | full request path (`/api/v1/...` or `/tenant/{id}/api/v1/...`) |
+| `entity_type` | first path segment after `/api/v1/` (e.g. `tenants`, `user-groups`), when present |
 | `request_id` | the request's `X-Hydra-Trace-Id` / `error.trace_id` |
+| `tenant_id` | `NULL` for an admin row; the authenticated tenant id for a tenant write (nullable, added by `0003`) |
 | `created_at` | database `CURRENT_TIMESTAMP` in UTC |
 
 The row is redacted by construction: no request body, token, provider key, certificate or
 other secret is stored.
 
-The insert is **best-effort at the router level**, deliberately NOT part of the
+The insert is **best-effort at the router/handler level**, deliberately NOT part of the
 config-write transaction. A mutation therefore keeps its own success/error response even
 if audit storage is missing or broken. `hydra_admin_audit_write_total{result="ok|error"}`
 is the degradation signal; the first insert failure per process is also logged once,
 rather than once per request. This means the audit table is not transactionally coupled
 to a mutation: a committed write whose audit insert failed is not retried automatically.
 
+**Retention** (`HYDRA_ADMIN_AUDIT_RETENTION_DAYS`, default `90`, `0` = keep forever) is
+implemented by a daily task that deletes rows older than the window. It uses a **plain
+`DELETE`**, deliberately NOT `begin_write`: `admin_audit` is outside the config write
+lock / `config_revision`, so cleanup takes no write lock and triggers no reload fan-out. The
+first pass runs at startup, then once per day; failures are logged and retried next
+interval. Rows deleted are counted on `hydra_admin_audit_deleted_total`.
+
+**`/metrics` methods**: the admin endpoint accepts **GET and HEAD only**. Any other
+method is answered `405 method_not_allowed` and is not written to `admin_audit`. `HEAD`
+returns the same `Content-Length` a `GET` would, with an **empty body** (the exposition
+text is not sent).
+
+**Lock contention is transient, never a 500.** Every write takes the shared write lock
+through `db::begin_write`; when acquisition loses that lock the error is classified as
+lock contention and answered **`503 storage_busy`** — this includes PostgreSQL
+`55P03 lock_not_available` (the normal result of the transaction-scoped lock timeout),
+plus `40001`/`40P01` and MySQL `1213`/`1205`. A client should back off briefly and retry:
+the same request usually succeeds immediately, whereas a 500 would tell it a bug exists.
+The acquisition itself is retried up to 3 times before this response, as described under
+`HYDRA_DB_LOCK_TIMEOUT_MS` in §1.1.
+
 `created_at` is the schema's first DB-native timestamp column; the config tables store
 TEXT-formatted ISO stamps. A future export should not assume one uniform timestamp format
 across tables.
 
-Retention, export (e.g. to a SIEM), tamper-evidence and a transactional-outbox upgrade
-remain separate decisions; none is implemented here.
+Export (e.g. to a SIEM), tamper-evidence and a transactional-outbox upgrade remain
+separate decisions; none is implemented here.
 
 ---
 
@@ -1235,6 +1278,26 @@ re-prepared`**. Hydra handles it with a scoped text-protocol delete
 If you see 1615 from your own tooling, use a text-protocol client/statement rather
 than a prepared statement that outlives a schema change.
 
+### 10.5c Leaked test databases (`hydra_test_%` / `hydra_tmpl_%`)
+
+The real-database test harness (`db/testing.rs`) **leaks** its isolated databases
+by design; CI containers are disposable, but a long-lived local PG/MySQL
+accumulates them. Clean them up explicitly (never as part of the parallel test
+run):
+
+```bash
+HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra \
+  node scripts/clean-test-dbs.cjs --dry-run   # show what would go
+HYDRA_TEST_DATABASE_URL=postgres://hydra:hydra@127.0.0.1:55432/hydra \
+  node scripts/clean-test-dbs.cjs             # drop them
+```
+
+It uses the `psql`/`mysql` CLI (no npm driver) and PostgreSQL matches the harness
+exactly: terminate leftover sessions, then `DROP DATABASE ... WITH (FORCE)`.
+MySQL uses a plain `DROP DATABASE IF EXISTS`. A missing client is a hard error
+with install instructions — there is no silent skip. To drop each test database
+eagerly instead, keep using `HYDRA_TEST_DROP_DBS=1` (costly under parallel tests).
+
 ### 10.6 Upgrade fails with "address already in use"
 
 The new process could not take over the listening socket from the old one.
@@ -1457,6 +1520,13 @@ read-amplification/denial-of-service vector: each spoofed message can trigger a 
 snapshot rebuild per subscribed node (subject to the §9.0b coalescing window). Losing
 publish permission is not a correctness failure: the `HYDRA_CONFIG_POLL_MS` fallback
 still converges.
+
+Set `HYDRA_REDIS_REQUIRE_AUTH=1` to make the *client* half enforceable too: boot then
+refuses to start unless `HYDRA_REDIS_URL` carries a non-empty password. Note what this
+does and does not prove — `rediss://` is **TLS, not authentication**, and a non-empty
+password only says a credential was supplied, not that `PUBLISH` is restricted. The ACL in
+this section is still the server-side policy; the URL check is the part Hydra can verify
+about its own configuration.
 
 ### 13.5b Shutdown drain vs `terminationGracePeriodSeconds`
 

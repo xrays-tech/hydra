@@ -98,9 +98,14 @@ fn peer_ip(session: &ServerSession) -> String {
     }
 }
 
-/// True for the methods the admin router audits as mutation attempts.
-fn is_audited_method(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
+/// True for the (path, method) pairs the admin router audits as mutation
+/// attempts.
+///
+/// `/metrics` is deliberately excluded: it is an observability endpoint, not an
+/// `/api/v1/*` mutation, and the method-strictness guard answers a non-GET/HEAD
+/// with `405` rather than treating it as a mutation attempt to record.
+fn is_audited_method(path: &str, method: &str) -> bool {
+    path != "/metrics" && matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
 }
 
 /// The first `/api/v1/<segment>` path segment, for the audit row's optional
@@ -124,6 +129,29 @@ fn note_admin_audit_failure(error: &sqlx::Error) {
             error = %error,
             "admin_audit insert failed: audit trail is DEGRADED, but mutation responses are unaffected (see hydra_admin_audit_write_total)"
         );
+    }
+}
+
+/// Insert one audit row **best-effort**: never returns an error to a caller and
+/// never changes a mutation response.
+///
+/// Shared by the admin router and the tenant self-service API so both surfaces
+/// have exactly one degradation contract:
+///
+/// * `hydra_admin_audit_write_total{result}` counts every outcome;
+/// * only the FIRST failure per process is logged (`note_admin_audit_failure`),
+///   because a broken schema would otherwise log once per request and drown the
+///   alertable counter.
+///
+/// `pub(crate)` so `tenant_api` (also gated on `proxy`) can reuse it without
+/// reaching into `AdminService`.
+pub(crate) async fn record_admin_audit(pool: &Pool, entry: &AdminAudit<'_>) {
+    match crate::db::insert_admin_audit(pool, entry).await {
+        Ok(()) => crate::admin::metrics::record_admin_audit_write("ok"),
+        Err(error) => {
+            crate::admin::metrics::record_admin_audit_write("error");
+            note_admin_audit_failure(&error);
+        }
     }
 }
 
@@ -491,7 +519,7 @@ impl AdminService {
         let response = self
             .route_inner(method, path, query, session, trace_id)
             .await;
-        if is_audited_method(method) {
+        if is_audited_method(path, method) {
             self.write_admin_audit(method, path, trace_id).await;
         }
         response
@@ -512,14 +540,9 @@ impl AdminService {
             path,
             entity_type: audit_entity_type(path),
             request_id: Some(trace_id),
+            tenant_id: None,
         };
-        match crate::db::insert_admin_audit(self.state.db(), &entry).await {
-            Ok(()) => crate::admin::metrics::record_admin_audit_write("ok"),
-            Err(e) => {
-                crate::admin::metrics::record_admin_audit_write("error");
-                note_admin_audit_failure(&e);
-            }
-        }
+        record_admin_audit(self.state.db(), &entry).await;
     }
 
     async fn route_inner(
@@ -530,9 +553,20 @@ impl AdminService {
         session: &mut ServerSession,
         trace_id: &str,
     ) -> Resp {
-        // /metrics — self-hosted exposition (§17).
+        // /metrics — self-hosted exposition (§17). GET and HEAD only: a HEAD is
+        // answered with the GET `Content-Length` and an EMPTY body, and any other
+        // method is a `405` (the route is observable, not a mutation surface, so
+        // it is also excluded from the audit wrapper in `route`).
         if path == "/metrics" {
-            return handlers::metrics_endpoint(&self.state);
+            return match method {
+                "GET" | "HEAD" => handlers::metrics_endpoint(&self.state, method),
+                _ => handlers::err_json(
+                    405,
+                    "method_not_allowed",
+                    "/metrics accepts GET and HEAD only",
+                    trace_id,
+                ),
+            };
         }
 
         // ONE admin mutation at a time, from BEFORE the handler's DB write

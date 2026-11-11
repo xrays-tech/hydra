@@ -134,6 +134,9 @@ function documentedDefault(row) {
  *   2. in the window:     `var("VAR")… .unwrap_or(120)`   (any number of lines apart)
  *   3. a local parser:    `parse_x(var("VAR")…)` whose body ends `.unwrap_or(20)`
  *   4. a named constant:  `.unwrap_or(DEFAULT_FORWARD_TIMEOUT_SECS)` → `const … = 5`
+ *   5. a WRAPPED helper argument: the literal sits on its own line and the fallback is the
+ *      next argument line, generally a `DEFAULT_*` const (F4's `DbGuardrails::from_lookup`
+ *      uses `parse(&mut lookup, "HYDRA_DB_LOCK_TIMEOUT_MS", Self::DEFAULT_LOCK_TIMEOUT_MS, …)`).
  * `32 * 1024 * 1024` is evaluated; anything else is reported UNVERIFIED rather than
  * guessed.
  */
@@ -276,6 +279,26 @@ function codeDefault(sources, varName, rawLines) {
     }
     const secs = window.match(new RegExp(`"${varName}"[\\s\\S]{0,300}?from_secs\\(\\s*([\\d_]+)`));
     if (secs) return { value: numericLiteral(secs[1]), how: "Duration::from_secs", line: i + 1 };
+    // shape 5: a WRAPPED helper argument. `cargo fmt` puts the literal on its own line, with
+    // the fallback as the next argument (`parse(&mut lookup, "VAR", Self::DEFAULT_X, MAX_X)`).
+    // Only a literal or a `DEFAULT_*` const is accepted there: any other identifier could be a
+    // neighbour's bound, which is the misattribution `lineMentions` was fixed to avoid.
+    const escapedVar = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`^\\s*"${escapedVar}"\\s*,\\s*$`).test(rawLines[i])) {
+      for (let k = i + 1; k < Math.min(i + 5, rawLines.length); k++) {
+        const arg = rawLines[k].trim().replace(/,$/, "").trim();
+        if (!arg || arg.startsWith(")")) break;
+        if (/^[\d_]/.test(arg)) {
+          const n = numericLiteral(arg);
+          if (n !== null) return { value: n, how: "wrapped helper argument (next line)", line: k + 1 };
+        }
+        if (/^(?:[A-Za-z_][A-Za-z0-9_]*::)*DEFAULT_[A-Z0-9_]+$/.test(arg)) {
+          const c = constValue(sources, arg) || anyConstIn(sources, arg);
+          if (c) return { value: c.value, how: `wrapped helper argument -> ${c.where}`, line: k + 1 };
+        }
+        break;
+      }
+    }
     // shape 3: the site calls a local parser — follow it one level. The call may be on
     // the PREVIOUS line (the var is one of its arguments).
     const callCandidates = [];

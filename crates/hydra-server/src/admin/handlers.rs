@@ -149,13 +149,16 @@ pub(crate) fn classify_db_err(e: &sqlx::Error) -> (u16, &'static str) {
         if matches!(db.kind(), sqlx::error::ErrorKind::NotNullViolation) {
             return (400, "missing_required_field");
         }
-        // Serialization/lock contention (PostgreSQL 40001/40P01, MySQL
-        // 1213/1205): the transaction lost a race and may be retried. This is
-        // TRANSIENT — the same request usually succeeds immediately — so
-        // reporting it as 500 (an internal error) told clients "there is a bug"
-        // and made them retry at human speed, when what they need is a short
-        // backoff. Every write takes the shared lock via `db::begin_write`.
-        if crate::db::is_retryable(e) {
+        // Serialization/lock contention. This includes PostgreSQL 40001/40P01
+        // and MySQL 1213/1205, plus PostgreSQL 55P03 (`lock_not_available`) —
+        // the normal outcome of `begin_write`'s transaction-scoped
+        // `lock_timeout` on `hydra_lock`. It is TRANSIENT — the same request
+        // usually succeeds immediately — so reporting it as 500 (an internal
+        // error) told clients "there is a bug" and made them retry at human
+        // speed, when what they need is a short backoff. Every write takes the
+        // shared lock via `db::begin_write`, so `is_lock_contention` is the
+        // exact predicate for this mapping.
+        if crate::db::is_lock_contention(e) {
             return (503, "storage_busy");
         }
     }
@@ -1568,17 +1571,27 @@ pub(super) async fn health(state: &AdminState, trace_id: &str) -> Resp {
 // Metrics (§17) — self-hosted exposition
 // ===========================================================================
 
-pub(super) fn metrics_endpoint(state: &AdminState) -> Resp {
+pub(super) fn metrics_endpoint(state: &AdminState, method: &str) -> Resp {
     // The gauge's source of truth is the store (the tenant write path and the
     // reload paths all mark it there). Refresh it at scrape time so a node whose
     // last reload failed cannot present a stale 0.
     metrics::record_config_snapshot_stale(state.store.snapshot_stale());
     let body = metrics::render();
+    // A HEAD must advertise exactly the GET body length while sending no body.
+    // Rendering once and reusing its length keeps the two methods consistent;
+    // embedding the exposition body in a HEAD reply (as a naive implementation
+    // would) is both wasteful and wrong.
+    let content_length = body.len().to_string();
+    let bytes = if method == "HEAD" {
+        Vec::new()
+    } else {
+        body.into_bytes()
+    };
     Response::builder()
         .status(200)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .header("content-length", body.len().to_string())
-        .body(body.into_bytes())
+        .header("content-length", content_length)
+        .body(bytes)
         .unwrap_or_else(|_| Response::new(vec![]))
 }
 

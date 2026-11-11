@@ -122,3 +122,48 @@ async fn migrate_idempotent() {
     let after = table_names(&pool).await;
     assert_eq!(before, after, "schema must be unchanged after re-migrate");
 }
+
+/// The columns of `admin_audit` that the connected schema actually has.
+#[cfg(feature = "db-postgres")]
+async fn admin_audit_columns(pool: &Pool) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'admin_audit' AND table_schema = current_schema() \
+         ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("query information_schema.columns");
+    rows.iter().map(|r| r.get::<String, _>(0)).collect()
+}
+
+/// The columns of `admin_audit` that the connected schema actually has.
+///
+/// MySQL's `information_schema` string columns decode as `VARBINARY` through
+/// sqlx; convert the bytes explicitly (same as `table_names`).
+#[cfg(feature = "db-mysql")]
+async fn admin_audit_columns(pool: &Pool) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_name = 'admin_audit' AND table_schema = DATABASE() \
+         ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("query information_schema.columns");
+    rows.iter()
+        .map(|r| String::from_utf8_lossy(&r.get::<Vec<u8>, _>(0)).into_owned())
+        .collect()
+}
+
+/// F2 — migration `0003` adds the nullable, tenant-scoped `tenant_id` column to
+/// `admin_audit` (the tenant audit writer and the retention pass depend on it).
+#[tokio::test]
+async fn migrate_adds_tenant_id_to_admin_audit() {
+    let pool = common::setup_pool().await;
+    let cols = admin_audit_columns(&pool).await;
+    assert!(
+        cols.iter().any(|c| c == "tenant_id"),
+        "migration 0003 must add admin_audit.tenant_id, columns were: {cols:?}"
+    );
+}

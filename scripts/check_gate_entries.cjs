@@ -47,6 +47,9 @@
  */
 const fs = require('fs');
 const path = require('path');
+// F7 single-source: the workflow/step enumeration is shared with `check_ci_wiring.cjs` so the two
+// guards cannot disagree about which `run:` blocks exist.
+const { extractSteps } = require('./lib/ci_steps.cjs');
 
 const ROOT = path.resolve(process.env.CGE_ROOT || path.join(__dirname, '..'));
 const WORKFLOW = path.join(ROOT, process.env.CGE_WORKFLOW || '.github/workflows/ci.yml');
@@ -67,50 +70,18 @@ const MIN_BINARY_DEPS = Number(process.env.CGE_MIN_BINARY_DEPS ?? 20);
 /**
  * The steps of the tracked workflow, in file order, each `{ line, name, job, run }`.
  *
- * Deliberately a small explicit reader rather than a YAML dependency: the shapes this repository
- * uses are `- name: …` (or `- uses: …`) with an indented `run: |` block or a one-line `run: …`, and
- * a reader that silently mis-parses would judge the wrong text. Anything it cannot attribute is
- * caught by the completeness rule below, which is why that rule exists.
+ * Delegates to the shared `scripts/lib/ci_steps.cjs` parser (F7 single-source): the JS/YAML
+ * enumeration used to be a second, narrower copy here, which meant a shape this guard did not model
+ * (a differently-indented step, a job boundary) was judged by one guard and ignored by the other. The
+ * completeness rule below still catches anything the shared parser cannot attribute.
  */
 function workflowSteps(text) {
-  const lines = text.split('\n');
-  const out = [];
-  let job = '?';
-  let inJobs = false;
-  let current = null;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (/^jobs:\s*$/.test(line)) {
-      inJobs = true;
-      continue;
-    }
-    if (!inJobs) continue;
-    const jm = /^  ([a-zA-Z][a-zA-Z0-9_-]*):\s*$/.exec(line);
-    if (jm) {
-      job = jm[1];
-      current = null;
-      continue;
-    }
-    const sm = /^      - (?:name:\s*(.*)|uses:\s*.*)$/.exec(line);
-    if (sm) {
-      current = { line: i + 1, name: (sm[1] || '').trim() || '(unnamed step)', job, run: [] };
-      out.push(current);
-      continue;
-    }
-    const rm = /^        run:\s*(.*)$/.exec(line);
-    if (rm) {
-      if (current === null) {
-        current = { line: i + 1, name: '(step without a name)', job, run: [] };
-        out.push(current);
-      }
-      const rest = rm[1].trim();
-      if (rest !== '' && rest !== '|' && rest !== '>' && rest !== '|-') current.run.push(rest);
-      continue;
-    }
-    // A continuation line of a block scalar: deeper than the `run:` key itself.
-    if (current !== null && /^          \S/.test(line)) current.run.push(line.trim());
-  }
-  return out.filter((s) => s.run.length > 0);
+  return extractSteps(text).map((s) => ({
+    line: s.line,
+    name: s.name,
+    job: s.job === null ? '?' : s.job,
+    run: s.run.split('\n'),
+  }));
 }
 
 /** The `gate "name" command` entries of the LOCAL gate script, in order. */

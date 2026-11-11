@@ -186,7 +186,8 @@ hydra/
 │   ├── app.js
 │   └── style.css
 └── src/
-    ├── main.rs                ← 入口：Server bootstrap、服务装配
+    ├── main.rs                ← 入口（20 行）：调用 boot/ 模块完成 Server bootstrap、服务装配
+    ├── boot/                  ← env/database/state/fanout/listeners 装配（F6 从 main.rs 拆出）
     ├── app.rs                 ← AppState：所有共享组件的持有者
     ├── config.rs              ← hydra.toml + env 配置解析
     ├── error.rs               ← 统一错误类型（thiserror + Pingora Error）

@@ -47,6 +47,7 @@
 //! | `hydra_config_notify_total` | counter | result | `ConfigStore` local-change fanout (result=ok\|error) |
 //! | `hydra_config_version` | gauge | — | `ConfigStore` (local last-applied revision) |
 //! | `hydra_config_watch_last_ok_unixtime` | gauge | — | `cluster::config_bus` watcher (unix seconds of the last completed poll tick / handled pub/sub message; alert when `time() - gauge > 3× poll interval`) |
+//! | `hydra_config_watch_restarts_total` | counter | task | `cluster::config_bus` supervisor (a supervised watcher task panicked/ended and was restarted; task=pubsub\|poll) |
 //! | `hydra_config_bus_lagged_total` | counter | — | `cluster::config_bus` broadcast receiver (`RecvError::Lagged`; messages skipped before they could be read, followed by an immediate revision probe/reload) |
 //! | `hydra_config_reload_coalesced_total` | counter | — | `cluster::config_bus` reload debounce (well-formed pub/sub notifications folded into a reload already pending; suppressed full rebuilds, not data loss) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
@@ -61,6 +62,7 @@
 //! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ consumers must treat old cached state as unsafe) |
 //! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
 //! | `hydra_admin_audit_write_total` | counter | result | best-effort `admin_audit` insert outcomes (result=ok\|error); an error means audit coverage is degraded, the mutation response is unaffected |
+//! | `hydra_admin_audit_deleted_total` | counter | — | `admin_audit` retention task (rows deleted older than `HYDRA_ADMIN_AUDIT_RETENTION_DAYS`; `0` keeps forever) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -181,6 +183,11 @@ struct Metrics {
     /// watcher task died (a panic in a hook or in the Redis client/SELECT loop)
     /// while `/metrics` — served by a different task — keeps answering.
     config_watch_last_ok_unixtime: IntGauge,
+    /// How many times a supervised config-watch task had to be restarted after
+    /// it panicked or ended unexpectedly, by task (`pubsub` | `poll`). A
+    /// non-zero rate is the alertable form of "the watcher died and was revived";
+    /// without it a crash-loop was only a log line.
+    config_watch_restarts: IntCounterVec,
     /// Messages the config-bus broadcast receiver skipped because it lagged
     /// behind the ring buffer. A non-zero rate is a subscriber that needs the
     /// immediate watermark reconciliation (not just the next poll tick).
@@ -211,6 +218,10 @@ struct Metrics {
     /// Best-effort `admin_audit` insert outcomes (`result=ok|error`). An error
     /// means audit coverage is degraded; the mutation response is unaffected.
     admin_audit_write: IntCounterVec,
+    /// Rows deleted by the `admin_audit` retention task. A stuck or zero value
+    /// with a non-zero row count is the signal that the window is disabled
+    /// (`0` = keep forever) or cleanup is failing (see the retention WARN log).
+    admin_audit_deleted: IntCounter,
     invalidation_trimmed: IntCounter,
     /// Trims that dropped an entry a LIVE consumer had not applied. Each one
     /// means consumers must treat cached state derived from the stream tail as
@@ -502,6 +513,12 @@ fn metrics() -> Option<&'static Metrics> {
                 "Unix seconds of the last completed config-watch poll tick or handled pub/sub message"
             )
             .ok()?,
+            config_watch_restarts: register_int_counter_vec!(
+                "hydra_config_watch_restarts_total",
+                "Supervised config-watch tasks restarted after a panic or unexpected exit, by task (pubsub|poll)",
+                &["task"]
+            )
+            .ok()?,
             config_bus_lagged: register_int_counter!(
                 "hydra_config_bus_lagged_total",
                 "Config-bus messages skipped because the subscriber lagged behind the broadcast channel"
@@ -529,6 +546,11 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_admin_audit_write_total",
                 "Best-effort admin mutation audit insert outcomes (result=ok|error)",
                 &["result"]
+            )
+            .ok()?,
+            admin_audit_deleted: register_int_counter!(
+                "hydra_admin_audit_deleted_total",
+                "Admin audit rows deleted by the retention task (older than HYDRA_ADMIN_AUDIT_RETENTION_DAYS; 0 keeps forever)"
             )
             .ok()?,
             invalidation_trimmed: register_int_counter!(
@@ -949,6 +971,28 @@ fn record_config_watch_ok_at(unix_secs: u64) {
     }
 }
 
+/// Count one restart of a supervised config-watch task.
+///
+/// `task` is `pubsub` (the Redis broadcast consumer) or `poll` (the shared-DB
+/// watermark poller). The supervisor awaits the dead task, increments this, and
+/// respawns it after a fixed backoff, so a crash-loop is bounded AND visible.
+/// This is the only signal that a treated-as-immortal watcher actually died: the
+/// process and `/metrics` keep answering while config stops converging.
+pub fn record_config_watch_restart(task: &str) {
+    if let Some(m) = metrics() {
+        m.config_watch_restarts.with_label_values(&[task]).inc();
+    }
+}
+
+/// Current value of `hydra_config_watch_restarts_total{task}` (tests).
+#[must_use]
+pub fn config_watch_restarts_total(task: &str) -> u64 {
+    match metrics() {
+        Some(m) => m.config_watch_restarts.with_label_values(&[task]).get(),
+        None => 0,
+    }
+}
+
 /// Count `missed` config-bus messages skipped by a lagging broadcast receiver.
 ///
 /// The watcher follows a `Lagged` error with an immediate revision probe, so
@@ -1105,6 +1149,27 @@ pub fn admin_audit_write_total(result: &str) -> f64 {
     match metrics() {
         Some(m) => m.admin_audit_write.with_label_values(&[result]).get() as f64,
         None => 0.0,
+    }
+}
+
+/// Count rows removed by the `admin_audit` retention task.
+///
+/// Retention is housekeeping, not a request path, so a failure is only logged.
+/// This counter is what makes the cleanup observable: a growing `admin_audit`
+/// table with a flat counter means the window is `0` (keep forever) or the
+/// DELETE keeps failing.
+pub fn record_admin_audit_deleted(deleted: u64) {
+    if let Some(m) = metrics() {
+        m.admin_audit_deleted.inc_by(deleted);
+    }
+}
+
+/// Current value of `hydra_admin_audit_deleted_total` (tests).
+#[must_use]
+pub fn admin_audit_deleted_total() -> u64 {
+    match metrics() {
+        Some(m) => m.admin_audit_deleted.get(),
+        None => 0,
     }
 }
 
@@ -1566,8 +1631,11 @@ mod tests {
         record_config_bus_lagged(0);
         record_config_bus_lagged(7);
         record_config_reload_coalesced();
+        record_config_watch_restart("pubsub");
+        record_config_watch_restart("poll");
         record_admin_audit_write("ok");
         record_admin_audit_write("error");
+        record_admin_audit_deleted(3);
     }
 
     #[test]
@@ -1609,6 +1677,20 @@ mod tests {
     }
 
     #[test]
+    fn config_watch_restart_counter_is_registered_and_increments() {
+        let before = config_watch_restarts_total("pubsub");
+        record_config_watch_restart("pubsub");
+        assert!(
+            config_watch_restarts_total("pubsub") >= before.saturating_add(1),
+            "the restart helper must increment the registered series"
+        );
+        assert!(
+            render().contains("hydra_config_watch_restarts_total"),
+            "the config-watch restart counter must appear on /metrics"
+        );
+    }
+
+    #[test]
     fn config_bus_lag_counter_is_registered() {
         record_config_bus_lagged(3);
         assert!(
@@ -1642,6 +1724,20 @@ mod tests {
         assert!(
             render().contains("hydra_admin_audit_write_total"),
             "the admin-audit outcome counter must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn admin_audit_deleted_counter_is_registered_and_increments() {
+        let before = admin_audit_deleted_total();
+        record_admin_audit_deleted(2);
+        assert!(
+            admin_audit_deleted_total() >= before + 2,
+            "the retention helper must increment the registered series"
+        );
+        assert!(
+            render().contains("hydra_admin_audit_deleted_total"),
+            "the admin-audit retention counter must appear on /metrics"
         );
     }
 

@@ -36,7 +36,7 @@ function tree(files) {
 // The config-bus seam guard (R3) requires the definitions to exist; a fixture
 // that is only about the pool rules must not turn into CANNOT VERIFY because it
 // omitted a file it never cared about. Tests that exercise the seam add their
-// own `main.rs`/call sites on top.
+// own `boot/fanout.rs`/call sites on top.
 const CONFIG_BUS_STUB =
   'pub fn with_channel() {}\npub async fn spawn_config_watch_on() {}\n' +
   'pub async fn spawn_config_watch() {}\npub fn RedisConfigNotifier() {}\n';
@@ -226,15 +226,17 @@ check(
 
 /* --- Config-bus channel seam (R3): test-only helpers must not reach production ------- */
 
-// main.rs using the fixed wrappers is the shape production must have.
+// The boot wiring using the fixed wrappers is the shape production must have.
+// (It was `main.rs` before the F6 split; the config-bus wiring now lives in
+// `boot/fanout.rs`.)
 r = run({
   [OWNER]: GOOD_OWNER,
   [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
-  'crates/hydra-server/src/main.rs':
+  'crates/hydra-server/src/boot/fanout.rs':
     'fn boot() { let n = RedisConfigNotifier::new(pool, id); spawn_config_watch(store, sub, poll); }\n',
 });
 check(
-  'R3: main.rs using `RedisConfigNotifier::new`/`spawn_config_watch` passes',
+  'R3: boot/fanout.rs using `RedisConfigNotifier::new`/`spawn_config_watch` passes',
   r.code === 0,
   `exit=${r.code} out=${r.out.trim().slice(0, 120)}`,
 );
@@ -244,12 +246,12 @@ check(
 r = run({
   [OWNER]: GOOD_OWNER,
   [CONFIG_BUS_REL]: CONFIG_BUS_STUB,
-  'crates/hydra-server/src/main.rs':
+  'crates/hydra-server/src/boot/fanout.rs':
     'fn boot() { spawn_config_watch_on(store, sub, poll, "x"); }\n',
 });
 check(
   'R3: production `spawn_config_watch_on` is a violation naming the file',
-  r.code === 1 && /main\.rs:1/.test(r.out) && /spawn_config_watch_on/.test(r.out),
+  r.code === 1 && /boot\/fanout\.rs:1/.test(r.out) && /spawn_config_watch_on/.test(r.out),
   `exit=${r.code} out=${r.out.trim().slice(0, 140)}`,
 );
 

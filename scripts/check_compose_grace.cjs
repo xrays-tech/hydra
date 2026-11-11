@@ -22,11 +22,11 @@
  *     container restart was cutting the drain short. None of the shipped compose
  *     files set `stop_grace_period`; they do now (30s).
  *
- * The threshold is not hard-coded here: it is read from `main.rs`
- * (`grace_period_seconds: Some(shutdown_drain_secs())` with the default parsed
- * out of `parse_shutdown_drain_secs`, plus the literal
- * `graceful_shutdown_timeout_seconds`), so raising the drain default makes this
- * check demand a larger deployment grace period automatically.
+ * The threshold is not hard-coded here: it is read from the boot code that owns
+ * it — `src/main.rs` plus the `boot/*` split that now holds the shutdown budget
+ * (`src/boot/env.rs` for the `parse_shutdown_drain_secs` default, `src/boot/mod.rs`
+ * for `graceful_shutdown_timeout_seconds`) — so raising the drain default makes
+ * this check demand a larger deployment grace period automatically.
  *
  * Usage: node scripts/check_compose_grace.cjs
  *        node scripts/check_compose_grace.cjs --compose-json=rendered.json   # tests
@@ -41,6 +41,14 @@ const { hydraServices, scalarOwn, unjudgeableServices } = require('./compose_sta
 
 const ROOT = path.resolve(__dirname, '..');
 const MAIN_RS = path.join(ROOT, 'crates', 'hydra-server', 'src', 'main.rs');
+const BOOT_ENV_RS = path.join(ROOT, 'crates', 'hydra-server', 'src', 'boot', 'env.rs');
+const BOOT_MOD_RS = path.join(ROOT, 'crates', 'hydra-server', 'src', 'boot', 'mod.rs');
+// The shutdown budget spans the F6 `main.rs → boot/*` split: the drain default
+// lives in `boot/env.rs`, the final runtime step and the `grace_period_seconds`
+// wiring live in `boot/mod.rs`. Each file is scanned on its own (never
+// concatenated) so a match can neither span a file boundary nor be masked by one;
+// the check follows the code wherever it moves.
+const DEFAULT_MAIN_RS = [MAIN_RS, BOOT_ENV_RS, BOOT_MOD_RS];
 const COMPOSE_FILES = [
   path.join(ROOT, 'environment', 'docker-compose.yml'),
   path.join(ROOT, 'environment', 'docker-compose.cluster.yml'),
@@ -62,7 +70,7 @@ class ScanError extends Error {
 }
 
 function parseArgs(argv) {
-  const opts = { composeJson: [], staticFiles: [], mainRs: process.env.COMPOSE_GRACE_MAIN_RS || MAIN_RS, help: false };
+  const opts = { composeJson: [], staticFiles: [], mainRs: process.env.COMPOSE_GRACE_MAIN_RS || DEFAULT_MAIN_RS, help: false };
   for (const arg of argv) {
     if (arg.startsWith('--compose-json=')) opts.composeJson.push(arg.slice('--compose-json='.length));
     else if (arg.startsWith('--static-file=')) opts.staticFiles.push(arg.slice('--static-file='.length));
@@ -74,12 +82,22 @@ function parseArgs(argv) {
 }
 
 /** The two code constants the deployment grace period must cover. */
-function codeBudget(mainRs = MAIN_RS) {
-  const text = fs.readFileSync(mainRs, 'utf8');
-  const drainFn = /fn parse_shutdown_drain_secs[\s\S]*?unwrap_or\((\d+)\)/.exec(text);
-  const finalStep = /graceful_shutdown_timeout_seconds:\s*Some\((\d+)\)/.exec(text);
+function codeBudget(sources = DEFAULT_MAIN_RS) {
+  const list = Array.isArray(sources) ? sources : [sources];
+  const where = list.map((f) => path.relative(ROOT, f)).join(' + ');
+  // Match each source file SEPARATELY: joining them first let `[\s\S]*?` cross a
+  // file boundary, so a constant missing from its own file could be answered by
+  // the next one. The two constants live in different files after the F6 split,
+  // so each pattern is searched in every listed file and the first hit wins.
+  let drainFn = null;
+  let finalStep = null;
+  for (const f of list) {
+    const text = fs.readFileSync(f, 'utf8');
+    if (!drainFn) drainFn = /fn parse_shutdown_drain_secs[\s\S]*?unwrap_or\((\d+)\)/.exec(text);
+    if (!finalStep) finalStep = /graceful_shutdown_timeout_seconds:\s*Some\((\d+)\)/.exec(text);
+  }
   if (!drainFn || !finalStep) {
-    throw new ScanError(`could not read the shutdown budget from ${path.relative(ROOT, mainRs)} (drain default ${drainFn ? drainFn[1] : '?'}, final step ${finalStep ? finalStep[1] : '?'})`);
+    throw new ScanError(`could not read the shutdown budget from ${where} (drain default ${drainFn ? drainFn[1] : '?'}, final step ${finalStep ? finalStep[1] : '?'})`);
   }
   return { drain: Number(drainFn[1]), final: Number(finalStep[1]) };
 }
@@ -273,7 +291,8 @@ function hydraNamedServices(text) {
 function main(argv) {
   const opts = parseArgs(argv);
   if (opts.help) {
-    console.log('usage: node scripts/check_compose_grace.cjs [--compose-json=FILE]… [--static-file=FILE]…');
+    console.log('usage: node scripts/check_compose_grace.cjs [--compose-json=FILE]… [--static-file=FILE]… [--main-rs=FILE]');
+    console.log('  default shutdown-budget sources: crates/hydra-server/src/main.rs + src/boot/env.rs + src/boot/mod.rs');
     return 0;
   }
 

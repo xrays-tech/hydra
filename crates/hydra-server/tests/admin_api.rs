@@ -3402,3 +3402,146 @@ async fn admin_audit_insert_failure_does_not_fail_the_mutation() {
         "each failed audit insert must be counted (before={before}, after={after})"
     );
 }
+
+/// F2 retention: a plain DELETE removes rows older than the window and leaves
+/// newer rows alone; a window of `0` means "keep forever" and deletes nothing.
+#[tokio::test]
+async fn admin_audit_retention_deletes_only_rows_past_the_window() {
+    use hydra_server::db::{delete_admin_audit_older_than, dialect};
+
+    let state = admin_state().await;
+    let pool = state.db();
+
+    let old = chrono::Utc::now().naive_utc() - chrono::Duration::days(10);
+    let fresh = chrono::Utc::now().naive_utc();
+    for (path, created_at) in [("/api/v1/old", old), ("/api/v1/fresh", fresh)] {
+        sqlx::query(&dialect::sql(
+            "INSERT INTO admin_audit \
+             (actor, action, method, path, tenant_id, created_at) \
+             VALUES ('admin', 'post', 'POST', ?, NULL, ?)",
+        ))
+        .bind(path)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed audit row");
+    }
+
+    let deleted = delete_admin_audit_older_than(pool, 5)
+        .await
+        .expect("retention pass");
+    assert_eq!(deleted, 1, "only the row older than 5 days is deleted");
+
+    let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+        .fetch_one(pool)
+        .await
+        .expect("count admin_audit");
+    assert_eq!(remaining, 1, "the fresh row survives");
+
+    let paths: Vec<String> = sqlx::query_as::<_, (String,)>("SELECT path FROM admin_audit")
+        .fetch_all(pool)
+        .await
+        .expect("list surviving paths")
+        .into_iter()
+        .map(|(path,)| path)
+        .collect();
+    assert_eq!(paths, vec!["/api/v1/fresh".to_string()]);
+
+    // A second ancient row proves `0` is a real no-op, not "delete everything".
+    sqlx::query(&dialect::sql(
+        "INSERT INTO admin_audit \
+         (actor, action, method, path, tenant_id, created_at) \
+         VALUES ('admin', 'post', 'POST', '/api/v1/old-2', NULL, ?)",
+    ))
+    .bind(old)
+    .execute(pool)
+    .await
+    .expect("seed second old row");
+
+    let deleted = delete_admin_audit_older_than(pool, 0)
+        .await
+        .expect("zero-window pass");
+    assert_eq!(deleted, 0, "0 = keep forever");
+    let (after,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+        .fetch_one(pool)
+        .await
+        .expect("count admin_audit");
+    assert_eq!(after, 2, "nothing was deleted with the disabled window");
+}
+
+/// `/metrics` is GET/HEAD only: another method is a `405`, and the refused
+/// attempt is NOT written to `admin_audit` (the route is not a mutation).
+#[tokio::test]
+async fn metrics_rejects_other_methods_and_is_not_audited() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/metrics",
+        Some(TOKEN),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(r.status(), 405, "POST /metrics must be refused");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "method_not_allowed");
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+        .fetch_one(state.db())
+        .await
+        .expect("count admin_audit");
+    assert_eq!(count, 0, "a refused /metrics method must not be audited");
+}
+
+/// HEAD `/metrics` advertises the GET `Content-Length` and sends an EMPTY body
+/// (never the exposition text).
+#[tokio::test]
+async fn metrics_head_has_the_get_length_and_an_empty_body() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+
+    // The registry is process-wide and other tests may increment a counter
+    // between the two requests, so retry until both reads observe the same
+    // snapshot rather than pinning one render's byte count.
+    for _ in 0..10 {
+        let get = req(port, reqwest::Method::GET, "/metrics", Some(TOKEN), None).await;
+        assert_eq!(get.status(), 200);
+        let get_len: usize = get
+            .headers()
+            .get("content-length")
+            .expect("GET content-length")
+            .to_str()
+            .expect("ascii")
+            .parse()
+            .expect("number");
+        let get_body = get.bytes().await.expect("GET body");
+        assert_eq!(
+            get_body.len(),
+            get_len,
+            "GET Content-Length must describe its body"
+        );
+
+        let head = req(port, reqwest::Method::HEAD, "/metrics", Some(TOKEN), None).await;
+        assert_eq!(head.status(), 200);
+        let head_len: usize = head
+            .headers()
+            .get("content-length")
+            .expect("HEAD content-length")
+            .to_str()
+            .expect("ascii")
+            .parse()
+            .expect("number");
+        let head_body = head.bytes().await.expect("HEAD body");
+        assert!(
+            head_body.is_empty(),
+            "HEAD must not send the exposition body"
+        );
+        if head_len == get_len {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("HEAD and GET Content-Length never agreed within 10 attempts");
+}

@@ -13,13 +13,19 @@
 - **数据库传输必须加密并校验服务端身份**：PostgreSQL 连接串带 `sslmode=verify-full`，
   MySQL 连接串带 `ssl-mode=VERIFY_IDENTITY`。`require`/`REQUIRED`/`prefer`/`PREFERRED`/
   `disable` 不够——它们要么不加密，要么不验证证书里的主机名，不能作为生产配置。
+- **把上述要求变成启动硬门**：设 `HYDRA_DB_REQUIRE_TLS=1`。此时启动会解析 `HYDRA_DB_URL`
+  （以及编译内置的兜底 URL），不带 `sslmode=require|verify-ca|verify-full`（PG）或
+  `ssl-mode`/`sslmode` = `REQUIRED|VERIFY_CA|VERIFY_IDENTITY`（MySQL）就**拒绝启动**。
+  默认 `0` 只影响本地/旧配置；生产建议打开（见 §5）。
 - **共享库属于信任边界本身**：它持有**所有租户**的身份与配置、全部 client api-key 摘要，
   以及用 `HYDRA_ENCRYPTION_KEY` 封装的 provider key / 证书私钥。DB 链路的机密性与身份校验
   不是“可选加固”，泄露或篡改它等同于泄露整个控制面。
 - **compose 清单里的 DB 用户名/口令/URL 只用于本地开发与演练**，不是生产凭据。生产必须用
   独立的最小权限账号，并通过 secret 管理分发。
 - **Redis 只在内网/回环可达**，`hydra:config:changed` 的 `PUBLISH` 必须用 Redis ACL 限制到
-  Hydra 节点（见 `cluster.md` §8、`ops.md` §13.5a）。
+  Hydra 节点（见 `cluster.md` §8、`ops.md` §13.5a）。集群可再设 `HYDRA_REDIS_REQUIRE_AUTH=1`
+  强制 `HYDRA_REDIS_URL` 必须带非空口令（如 `redis://:PASSWORD@host:6379/0`）；注意
+  `rediss://` 是 TLS、**不等于**认证，且 URL 口令只证明“提供了凭据”，ACL 仍须在服务端配置。
 
 ---
 
@@ -333,7 +339,13 @@ kubectl -n hydra exec deploy/hydra -- sh -c \
 | 变量 | 单节点 | 集群 | 说明 |
 |---|---|---|---|
 | `HYDRA_DB_URL` | **必填** | **必填，所有节点相同** | PostgreSQL/MySQL URL；scheme 必须匹配编译后端。生产必须带 `sslmode=verify-full`（PG）或 `ssl-mode=VERIFY_IDENTITY`（MySQL），见 §0 |
+| `HYDRA_DB_REQUIRE_TLS` | 建议 `1` | 建议 `1` | 为 `1` 时，DB URL 不带可校验的 TLS 参数就拒绝启动（默认 `0`，兼容旧配置） |
+| `HYDRA_DB_LOCK_TIMEOUT_MS` | 默认 `5000` | 同左 | 写锁获取的 PostgreSQL `lock_timeout`；钳制在 `1..=3600000` ms。必须 ≤ `HYDRA_DB_STATEMENT_TIMEOUT_MS`，否则被向下钳到语句超时。可重试的锁获取失败最多重试 3 次，最坏新增写延迟 ≈ `3 × lock_timeout`（约 15 s）后返回 `503 storage_busy` |
+| `HYDRA_DB_STATEMENT_TIMEOUT_MS` | 默认 `60000` | 同左 | 连接池会话的 PostgreSQL `statement_timeout`；钳制在 `1..=3600000` ms，并作为 lock timeout 的上界 |
+| `HYDRA_DB_IDLE_TX_TIMEOUT_MS` | 默认 `60000` | 同左 | 空闲事务超时（`idle_in_transaction_session_timeout`），避免长期占锁；钳制在 `1..=3600000` ms |
+| `HYDRA_DB_LOCK_WAIT_TIMEOUT_SECS` | 默认 `10` | 同左 | MySQL `innodb_lock_wait_timeout`；钳制在 `1..=3600` s（PostgreSQL 用 `HYDRA_DB_LOCK_TIMEOUT_MS`） |
 | `HYDRA_REDIS_URL` | 不设置 | **必填** | 集群开关；数据面共享状态 + 配置扇出 |
+| `HYDRA_REDIS_REQUIRE_AUTH` | — | 建议 `1` | 为 `1` 时，`HYDRA_REDIS_URL` 必须带非空口令；`rediss://` 是 TLS，不是认证 |
 | `HYDRA_CONFIG_POLL_MS` | — | 默认 `5000` | revision 探测兜底；`0`/垃圾值回退 5000 |
 | `HYDRA_NODE_ID` | 自动 | 建议每台不同 | 默认 hostname，其次随机 |
 | `HYDRA_REDIS_MODE` | — | 只接受 `single` | 设置时校验 |

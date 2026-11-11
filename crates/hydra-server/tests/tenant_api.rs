@@ -1825,3 +1825,165 @@ async fn write_near_miss_is_a_local_404_not_a_fallthrough() {
         );
     }
 }
+
+// ===========================================================================
+// F2 — tenant self-service writes are audited against the AUTHENTICATED tenant
+// ===========================================================================
+
+/// Poll for the tenant audit row.
+///
+/// The tenant write handler flushes the HTTP response to the client from inside
+/// `handlers::write`, so the best-effort audit insert that runs right after it
+/// can lag the response by a scheduling tick. Wait for the row instead of racing
+/// it (the same reason the admin suite polls for effects).
+#[allow(clippy::type_complexity)]
+async fn wait_for_tenant_audit_row(
+    pool: &hydra_server::db::Pool,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    for _ in 0..200 {
+        let row = sqlx::query_as(
+            "SELECT actor, action, method, path, entity_type, request_id, tenant_id \
+             FROM admin_audit",
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("query tenant audit");
+        if let Some(row) = row {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("tenant write must leave one audit row");
+}
+
+/// One post-gate write inserts exactly one `admin_audit` row, attributed to the
+/// tenant the ACCESS TOKEN resolved to (never the URL claim) and carrying the
+/// same id in `tenant_id`, plus the verb, path, path-derived entity type and the
+/// request trace id. No body is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_write_is_audited_with_the_authenticated_tenant() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let (status, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-audit", "team-audit").await;
+    assert_eq!(status, 200, "got {v}");
+
+    let (actor, action, method, path, entity_type, request_id, tenant_id) =
+        wait_for_tenant_audit_row(&pool).await;
+
+    assert_eq!(
+        actor, "t1",
+        "actor is the authenticated tenant, not `admin`"
+    );
+    assert_eq!(action, "put");
+    assert_eq!(method, "PUT");
+    assert_eq!(path, "/tenant/t1/api/v1/user-groups");
+    assert_eq!(entity_type.as_deref(), Some("user-groups"));
+    let request_id = request_id.expect("request_id is populated");
+    assert!(
+        request_id.starts_with("hydra-") && !request_id.is_empty(),
+        "request_id must carry the request trace id, got {request_id:?}"
+    );
+    assert_eq!(
+        tenant_id.as_deref(),
+        Some("t1"),
+        "the tenant-scoped column equals the authenticated actor"
+    );
+}
+
+/// A write refused BEFORE the handler runs is not a mutation attempt: 401 (no
+/// token) and 403 (token for another tenant) must leave `admin_audit` empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_gate_refused_write_is_not_audited() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", Some(OTHER_TOKEN)).await;
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    async fn audit_count(pool: &hydra_server::db::Pool) -> i64 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+            .fetch_one(pool)
+            .await
+            .expect("count admin_audit");
+        count
+    }
+    assert_eq!(audit_count(&pool).await, 0, "fresh database");
+
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/user-groups",
+        None,
+        Some(json!({ "id": "evil", "name": "evil", "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, 401, "got {v}");
+    assert_eq!(
+        audit_count(&pool).await,
+        0,
+        "a 401 refusal has no authenticated actor and must not be audited"
+    );
+
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/user-groups",
+        Some(OTHER_TOKEN),
+        Some(json!({ "id": "evil", "name": "evil", "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, 403, "got {v}");
+    assert_eq!(
+        audit_count(&pool).await,
+        0,
+        "a 403 URL/token mismatch must not be audited"
+    );
+}
+
+/// The per-tenant success budget answers 429 BEFORE `handlers::write`; that is
+/// a refusal, not a mutation attempt, so the first (successful) write is the
+/// only audited row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_throttled_before_the_handler_is_not_audited() {
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    let cfg = TenantApiConfig {
+        rate_limit_per_min: 1,
+        ..TenantApiConfig::default()
+    };
+    let state = build_state(&pool, cfg).await;
+    let root = start_proxy(state);
+
+    let (status, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-first", "first").await;
+    assert_eq!(status, 200, "the first authorised write is served: {v}");
+
+    // The audit insert can lag the flushed response; wait for it before proving
+    // the throttled attempt added nothing.
+    wait_for_tenant_audit_row(&pool).await;
+
+    let (status, v) = put_user_group(&root, "t1", TENANT_TOKEN, "grp-second", "second").await;
+    assert_eq!(
+        status, 429,
+        "the success budget refuses the second write: {v}"
+    );
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("count admin_audit");
+    assert_eq!(
+        count, 1,
+        "only the write that reached the handler is audited"
+    );
+}

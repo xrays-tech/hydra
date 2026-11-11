@@ -386,15 +386,29 @@ mod tests {
     /// The retirement diagnostic exists so a deployment that still carries a
     /// retired knob is TOLD. The opposite failure is just as expensive: a
     /// REFUSAL that names one sends the operator to set a variable the same
-    /// build reports as ignored. The scan is over `main.rs`'s string LITERALS
-    /// only: a mention in a comment is deliberate documentation, and the two
-    /// live in the same file.
+    /// build reports as ignored. The scan covers `main.rs` plus the `boot/*`
+    /// modules (F6 moved the startup literals there): a mention in a comment is
+    /// deliberate documentation, and a literal is what an operator can see.
     #[test]
     fn no_operator_facing_message_names_a_retired_variable() {
-        let src = include_str!("../main.rs");
+        let src = concat!(
+            include_str!("../main.rs"),
+            "\n",
+            include_str!("../boot/mod.rs"),
+            "\n",
+            include_str!("../boot/env.rs"),
+            "\n",
+            include_str!("../boot/database.rs"),
+            "\n",
+            include_str!("../boot/state.rs"),
+            "\n",
+            include_str!("../boot/fanout.rs"),
+            "\n",
+            include_str!("../boot/listeners.rs"),
+        );
         assert!(
             src.contains("fn main("),
-            "the scan read {} bytes of main.rs and found no `fn main(` — the include path is wrong, \
+            "the scan read {} bytes of main.rs + boot/* and found no `fn main(` — the include path is wrong, \
              so an empty scan would pass for the wrong reason",
             src.len()
         );
@@ -402,7 +416,7 @@ mod tests {
         let literals = string_literals(src);
         assert!(
             literals.len() > 100,
-            "only {} literal(s) parsed out of main.rs — the scan is not looking at the file",
+            "only {} literal(s) parsed out of main.rs + boot/* — the scan is not looking at the files",
             literals.len()
         );
 
@@ -410,7 +424,7 @@ mod tests {
             for lit in &literals {
                 assert!(
                     !lit.contains(name),
-                    "main.rs has a string literal naming the RETIRED variable {name}: {:?}\n\
+                    "main.rs or boot/* has a string literal naming the RETIRED variable {name}: {:?}\n\
                      A refusal or log line that names it tells the operator to set a variable this \
                      build reports as IGNORED (RETIRED_CLUSTER_ENV). Name the live knob instead — \
                      for cluster mode that is HYDRA_REDIS_URL.",

@@ -102,10 +102,21 @@ test('finding no hydra services is exit 2, never a silent pass', () => {
 
 test('the threshold follows the code, not a hard-coded number', () => {
   // Simulate a maintainer raising the drain default from 20s to 60s, in a FIXTURE
-  // main.rs (never the real one: a killed mutation probe could leave it patched).
-  const mainRs = path.join(REPO, 'crates', 'hydra-server', 'src', 'main.rs');
-  const patched = fs.readFileSync(mainRs, 'utf8').replace(/(fn parse_shutdown_drain_secs[\s\S]*?unwrap_or\()20(\))/, '$160$2');
-  assert.notEqual(patched, fs.readFileSync(mainRs, 'utf8'), 'could not build the fixture');
+  // built from the boot sources (never the real ones: a killed mutation probe
+  // could leave them patched). After the F6 split the drain `unwrap_or(20)` lives
+  // in `src/boot/env.rs` and the final runtime step in `src/boot/mod.rs`, so the
+  // fixture concatenates both — exactly what the checker scans by default.
+  const envRs = fs.readFileSync(
+    path.join(REPO, 'crates', 'hydra-server', 'src', 'boot', 'env.rs'),
+    'utf8',
+  );
+  const modRs = fs.readFileSync(
+    path.join(REPO, 'crates', 'hydra-server', 'src', 'boot', 'mod.rs'),
+    'utf8',
+  );
+  const combined = `${envRs}\n${modRs}`;
+  const patched = combined.replace(/(fn parse_shutdown_drain_secs[\s\S]*?unwrap_or\()20(\))/, '$160$2');
+  assert.notEqual(patched, combined, 'could not build the fixture');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'grace-main-'));
   const fixtureMain = path.join(dir, 'main.rs');
   fs.writeFileSync(fixtureMain, patched);

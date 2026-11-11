@@ -18,6 +18,7 @@
 //! version is not ahead of the local one is ignored by the store's revision
 //! gate anyway.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use fred::clients::SubscriberClient;
@@ -272,8 +273,10 @@ pub fn poll_interval_from_env() -> Duration {
 ///
 /// The initial `init`/`subscribe` are awaited (a cluster node already requires
 /// Redis, so a failure here is a startup failure). Once subscribed, the message
-/// loop and the poller run in ONE detached task: a later disconnect is handled
-/// by [`SubscriberClient::manage_subscriptions`] and does not stop the poller.
+/// loop and the poller run as TWO independently supervised tasks: a panic in one
+/// is logged, metered (`hydra_config_watch_restarts_total`) and revived after a
+/// fixed backoff, and never stops the other. A later disconnect is handled by
+/// [`SubscriberClient::manage_subscriptions`] and does not stop the poller.
 ///
 /// # Errors
 /// When the subscriber cannot initialise or subscribe.
@@ -302,214 +305,353 @@ pub async fn spawn_config_watch_on(
     let channel = channel.to_string();
     subscriber.init().await?;
     // Keep auto-resubscription alive for the lifetime of the process. The task
-    // is detached on purpose: dropping this JoinHandle does not stop it, and
-    // the subscriber itself is moved into the watcher task below.
+    // is detached on purpose: dropping this JoinHandle does not stop it, and the
+    // subscriber itself is kept alive by the supervisor factory below. Exactly
+    // one manager per client, ever: a restart must NOT re-spawn it.
     drop(subscriber.manage_subscriptions());
     subscriber.subscribe(channel.as_str()).await?;
-    let mut rx = subscriber.message_rx();
+    let rx = subscriber.message_rx();
     // Start the liveness clock at watcher start (not at 0): the alert is
     // `time() - gauge > 3× poll interval`, and leaving the gauge unset would
     // make a healthy node fire it for the whole first poll interval on boot.
     crate::admin::metrics::record_config_watch_ok();
 
-    tokio::spawn(async move {
-        // Keep the client alive with the task; dropping it would close the
-        // subscribed connection.
-        let _subscriber = subscriber;
-        let mut ticker = tokio::time::interval(poll);
-        // After a long stall, do not fire a burst of catch-up ticks.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick completes immediately; consume it so the first probe
-        // happens one interval after startup, not during it.
-        ticker.tick().await;
+    // The already-subscribed receiver is handed to the FIRST factory
+    // invocation; every restart re-runs `init`/`subscribe` for a NEW receiver
+    // instead of reusing a dead one. The slot is taken once, before any await.
+    let first_rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+    let pubsub_factory = {
+        let subscriber = subscriber.clone();
+        let store = store.clone();
+        let channel = channel.clone();
+        let first_rx = Arc::clone(&first_rx);
+        move || {
+            let subscriber = subscriber.clone();
+            let store = store.clone();
+            let channel = channel.clone();
+            let first_rx = Arc::clone(&first_rx);
+            async move {
+                let pending = first_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let rx = match pending {
+                    Some(rx) => rx,
+                    None => {
+                        // Restart path: re-run `init`/`subscribe` and take a NEW
+                        // receiver. `manage_subscriptions` is deliberately NOT
+                        // re-spawned (one manager per client, ever).
+                        //
+                        // The old connection may still be subscribed during this
+                        // re-subscribe, so a message can arrive twice. That is
+                        // HARMLESS: the store's revision gate ignores an
+                        // already-applied revision, the coalescer folds a burst
+                        // into one reload, and the poll backstop re-checks anyway.
+                        // Do not "fix" this into unsubscribing first — a dropped
+                        // subscription window would lose messages instead.
+                        if let Err(e) = subscriber.init().await {
+                            tracing::warn!(
+                                error = %e,
+                                "config-bus subscriber re-init failed; supervisor will retry"
+                            );
+                            return;
+                        }
+                        if let Err(e) = subscriber.subscribe(channel.as_str()).await {
+                            tracing::warn!(
+                                error = %e,
+                                "config-bus subscriber re-subscribe failed; supervisor will retry"
+                            );
+                            return;
+                        }
+                        subscriber.message_rx()
+                    }
+                };
+                run_pubsub(subscriber, store, channel, rx).await;
+            }
+        }
+    };
 
-        let mut coalescer = ReloadCoalescer::default();
+    // Two INDEPENDENT supervised tasks. A panic in either is caught by
+    // `supervise`, metered and revived; one dying must not stop the other.
+    tokio::spawn(supervise(PUBSUB_TASK, pubsub_factory));
+    let poll_factory = move || {
+        let store = store.clone();
+        async move { run_poll(store, poll).await }
+    };
+    tokio::spawn(supervise(POLL_TASK, poll_factory));
 
-        loop {
-            // Recomputed every iteration: a message branch may arm or extend the
-            // deadline, and the timer future below must see the NEW value.
-            let deadline = coalescer.deadline();
-            tokio::select! {
-                message = rx.recv() => {
-                    match message {
-                        Ok(message) => {
-                            let Some(payload) = message.value.as_string() else {
+    Ok(())
+}
+
+/// One run of the pub/sub consumer.
+///
+/// Returning (or panicking) hands control back to [`supervise`], which decides
+/// whether/how to revive it. `_subscriber` is held for the whole run so the
+/// subscribed connection is not dropped while messages can still arrive.
+async fn run_pubsub(
+    _subscriber: SubscriberClient,
+    store: ConfigStore,
+    channel: String,
+    mut rx: tokio::sync::broadcast::Receiver<fred::types::Message>,
+) {
+    let mut coalescer = ReloadCoalescer::default();
+
+    loop {
+        // Recomputed every iteration: a message branch may arm or extend the
+        // deadline, and the timer future below must see the NEW value.
+        let deadline = coalescer.deadline();
+        tokio::select! {
+            message = rx.recv() => {
+                match message {
+                    Ok(message) => {
+                        let Some(payload) = message.value.as_string() else {
+                            tracing::warn!(
+                                channel = %channel,
+                                "ignoring config-bus message with a non-string payload"
+                            );
+                            continue;
+                        };
+                        let changed: ConfigChanged = match serde_json::from_str(&payload) {
+                            Ok(changed) => changed,
+                            Err(e) => {
+                                // A malformed message is a warning, never a panic: one bad
+                                // publisher must not take a node's watcher down.
                                 tracing::warn!(
                                     channel = %channel,
-                                    "ignoring config-bus message with a non-string payload"
+                                    error = %e,
+                                    "ignoring malformed config-bus message"
                                 );
                                 continue;
-                            };
-                            let changed: ConfigChanged = match serde_json::from_str(&payload) {
-                                Ok(changed) => changed,
-                                Err(e) => {
-                                    // A malformed message is a warning, never a panic: one bad
-                                    // publisher must not take a node's watcher down.
-                                    tracing::warn!(
-                                        channel = %channel,
-                                        error = %e,
-                                        "ignoring malformed config-bus message"
-                                    );
-                                    continue;
-                                }
-                            };
-                            // The store's revision gate is authoritative; this comparison
-                            // avoids even arming the timer for an already-applied or stale
-                            // message.
-                            if changed.version > store.version() {
-                                // Do NOT reload per message: a burst of writes would
-                                // rebuild the whole snapshot per notification. Arm or
-                                // extend the trailing debounce; the timer branch below
-                                // performs ONE reload against the latest revision.
-                                if coalescer.note(Instant::now()) {
-                                    crate::admin::metrics::record_config_reload_coalesced();
-                                }
                             }
-                            // Liveness: a WELL-FORMED message was handled, whether or not it
-                            // advanced the snapshot (a reload that failed still proves the
-                            // watcher task is alive). Malformed/non-string payloads do not
-                            // refresh this: a stream of garbage must not mask a wedged
-                            // watcher in the alert `time() - gauge > 3× poll interval`.
-                            crate::admin::metrics::record_config_watch_ok();
+                        };
+                        // The store's revision gate is authoritative; this comparison
+                        // avoids even arming the timer for an already-applied or stale
+                        // message.
+                        if changed.version > store.version() {
+                            // Do NOT reload per message: a burst of writes would
+                            // rebuild the whole snapshot per notification. Arm or
+                            // extend the trailing debounce; the timer branch below
+                            // performs ONE reload against the latest revision.
+                            if coalescer.note(Instant::now()) {
+                                crate::admin::metrics::record_config_reload_coalesced();
+                            }
                         }
-                        Err(e) => match classify_recv_error(&e) {
-                            RecvFault::Lagged(missed) => {
-                                // The receiver fell behind the broadcast ring buffer, so the
-                                // message that advanced the shared revision may be GONE. Do
-                                // not wait for the next poll tick: probe the watermark and
-                                // apply the missing revision now. This stays quiet (PubSub),
-                                // so a lagged consumer cannot relay another node's change.
-                                crate::admin::metrics::record_config_bus_lagged(missed);
-                                tracing::warn!(
-                                    channel = %channel,
-                                    missed,
-                                    "config-bus receiver lagged; reconciling immediately"
-                                );
-                                match store.has_newer_revision().await {
-                                    Ok(true) => {
-                                        if let Err(e) = store
-                                            .reload_external(false, ReloadSource::PubSub)
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "config-bus lag recovery reload failed; poll fallback will retry"
-                                            );
-                                        }
-                                    }
-                                    Ok(false) => {
-                                        // Nothing newer survived the lag: the lost messages were
-                                        // already-applied revisions.
-                                    }
-                                    Err(e) => {
+                        // Liveness: a WELL-FORMED message was handled, whether or not it
+                        // advanced the snapshot (a reload that failed still proves the
+                        // watcher task is alive). Malformed/non-string payloads do not
+                        // refresh this: a stream of garbage must not mask a wedged
+                        // watcher in the alert `time() - gauge > 3× poll interval`.
+                        crate::admin::metrics::record_config_watch_ok();
+                    }
+                    Err(e) => match classify_recv_error(&e) {
+                        RecvFault::Lagged(missed) => {
+                            // The receiver fell behind the broadcast ring buffer, so the
+                            // message that advanced the shared revision may be GONE. Do
+                            // not wait for the next poll tick: probe the watermark and
+                            // apply the missing revision now. This stays quiet (PubSub),
+                            // so a lagged consumer cannot relay another node's change.
+                            crate::admin::metrics::record_config_bus_lagged(missed);
+                            tracing::warn!(
+                                channel = %channel,
+                                missed,
+                                "config-bus receiver lagged; reconciling immediately"
+                            );
+                            match store.has_newer_revision().await {
+                                Ok(true) => {
+                                    if let Err(e) = store
+                                        .reload_external(false, ReloadSource::PubSub)
+                                        .await
+                                    {
                                         tracing::warn!(
                                             error = %e,
-                                            "config-bus lag recovery probe failed; poll fallback will retry"
+                                            "config-bus lag recovery reload failed; poll fallback will retry"
                                         );
                                     }
                                 }
-                                // Deliberately do NOT refresh the liveness gauge here: a
-                                // lagging subscriber is not proof that it handled the change.
-                            }
-                            RecvFault::Closed => {
-                                // No senders remain. A closed receiver is not fatal (the poll
-                                // loop below still converges), but looping without a pause
-                                // would hot-spin when no messages can ever arrive. Keep the
-                                // liveness gauge untouched so the dead subscription remains
-                                // alertable instead of looking healthy.
-                                tracing::warn!(
-                                    channel = %channel,
-                                    error = %e,
-                                    backoff_ms = CLOSED_RECV_BACKOFF.as_millis(),
-                                    "config-bus message stream closed; backing off"
-                                );
-                                tokio::time::sleep(CLOSED_RECV_BACKOFF).await;
-                            }
-                        },
-                    }
-                }
-                // Trailing-debounce fire. Guarded on a pending deadline: with no
-                // pending reload this future is `pending()` and can never win.
-                _ = async {
-                    match deadline {
-                        Some(until) => tokio::time::sleep_until(until).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    // CLEAR BEFORE RELOADING. The reload below awaits the store
-                    // lock and rebuild; a notification that arrives during it is
-                    // still in the broadcast buffer and must re-arm this timer on
-                    // the next loop iteration. Taking the state first also means
-                    // a failed reload cannot leave a stuck pending flag.
-                    if coalescer.take_pending().is_some() {
-                        // One cheap probe, then at most ONE rebuild. The probe may
-                        // be false if a poll/lag path already applied the change.
-                        match store.has_newer_revision().await {
-                            Ok(true) => {
-                                if let Err(e) = store
-                                    .reload_external(false, ReloadSource::PubSub)
-                                    .await
-                                {
-                                    // Choice: rely on the poll backstop rather than
-                                    // re-arming. The pending state is already clear,
-                                    // so there is no stuck timer; the next poll (or
-                                    // a later notification) retries.
+                                Ok(false) => {
+                                    // Nothing newer survived the lag: the lost messages were
+                                    // already-applied revisions.
+                                }
+                                Err(e) => {
                                     tracing::warn!(
                                         error = %e,
-                                        "coalesced config-bus reload failed; poll fallback will retry"
+                                        "config-bus lag recovery probe failed; poll fallback will retry"
                                     );
                                 }
                             }
-                            Ok(false) => {
-                                // Nothing newer survived: the burst was applied
-                                // by the poll/lag path, or the messages were for
-                                // revisions this node already served.
-                            }
-                            Err(e) => {
+                            // Deliberately do NOT refresh the liveness gauge here: a
+                            // lagging subscriber is not proof that it handled the change.
+                        }
+                        RecvFault::Closed => {
+                            // No senders remain. A closed receiver is not fatal (the poll
+                            // loop below still converges), but looping without a pause
+                            // would hot-spin when no messages can ever arrive. Keep the
+                            // liveness gauge untouched so the dead subscription remains
+                            // alertable instead of looking healthy.
+                            tracing::warn!(
+                                channel = %channel,
+                                error = %e,
+                                backoff_ms = CLOSED_RECV_BACKOFF.as_millis(),
+                                "config-bus message stream closed; backing off"
+                            );
+                            tokio::time::sleep(CLOSED_RECV_BACKOFF).await;
+                        }
+                    },
+                }
+            }
+            // Trailing-debounce fire. Guarded on a pending deadline: with no
+            // pending reload this future is `pending()` and can never win.
+            _ = async {
+                match deadline {
+                    Some(until) => tokio::time::sleep_until(until).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // CLEAR BEFORE RELOADING. The reload below awaits the store
+                // lock and rebuild; a notification that arrives during it is
+                // still in the broadcast buffer and must re-arm this timer on
+                // the next loop iteration. Taking the state first also means
+                // a failed reload cannot leave a stuck pending flag.
+                if coalescer.take_pending().is_some() {
+                    // One cheap probe, then at most ONE rebuild. The probe may
+                    // be false if a poll/lag path already applied the change.
+                    match store.has_newer_revision().await {
+                        Ok(true) => {
+                            if let Err(e) = store
+                                .reload_external(false, ReloadSource::PubSub)
+                                .await
+                            {
+                                // Choice: rely on the poll backstop rather than
+                                // re-arming. The pending state is already clear,
+                                // so there is no stuck timer; the next poll (or
+                                // a later notification) retries.
                                 tracing::warn!(
                                     error = %e,
-                                    "coalesced config-bus revision probe failed; poll fallback will retry"
+                                    "coalesced config-bus reload failed; poll fallback will retry"
                                 );
                             }
                         }
-                    }
-                }
-                _ = ticker.tick() => {
-                    // Cheap probe first: one SELECT, no row rebuild or decryption. Only a
-                    // genuinely newer shared revision triggers the paired-read reload.
-                    match store.has_newer_revision().await {
-                        Ok(newer) => {
-                            if newer {
-                                if let Err(e) = store
-                                    .reload_external(false, ReloadSource::Poll)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "config poll reload failed; will retry next tick"
-                                    );
-                                }
-                            }
-                            // The tick completed: the probe answered and any reload it
-                            // triggered was attempted, so the watcher task is alive even if
-                            // the reload itself failed. A probe ERROR does NOT refresh this
-                            // gauge: that is a broken liveness check, and the alert should
-                            // fire rather than be papered over.
-                            crate::admin::metrics::record_config_watch_ok();
+                        Ok(false) => {
+                            // Nothing newer survived: the burst was applied
+                            // by the poll/lag path, or the messages were for
+                            // revisions this node already served.
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "config poll revision probe failed; will retry next tick"
+                                "coalesced config-bus revision probe failed; poll fallback will retry"
                             );
                         }
                     }
                 }
             }
         }
-    });
+    }
+}
 
-    Ok(())
+/// One run of the poll backstop (the documented correctness bound).
+///
+/// The first tick is consumed so the first probe happens one interval after
+/// startup, not during it, and missed ticks are not replayed in a burst. A
+/// panicking `store` hook leaves this task to [`supervise`]; the pub/sub task is
+/// unaffected.
+async fn run_poll(store: ConfigStore, poll: Duration) {
+    let mut ticker = tokio::time::interval(poll);
+    // After a long stall, do not fire a burst of catch-up ticks.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; consume it so the first probe
+    // happens one interval after startup, not during it.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        // Cheap probe first: one SELECT, no row rebuild or decryption. Only a
+        // genuinely newer shared revision triggers the paired-read reload.
+        match store.has_newer_revision().await {
+            Ok(newer) => {
+                if newer {
+                    if let Err(e) = store.reload_external(false, ReloadSource::Poll).await {
+                        tracing::warn!(
+                            error = %e,
+                            "config poll reload failed; will retry next tick"
+                        );
+                    }
+                }
+                // The tick completed: the probe answered and any reload it
+                // triggered was attempted, so the watcher task is alive even if
+                // the reload itself failed. A probe ERROR does NOT refresh this
+                // gauge: that is a broken liveness check, and the alert should
+                // fire rather than be papered over.
+                crate::admin::metrics::record_config_watch_ok();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "config poll revision probe failed; will retry next tick"
+                );
+            }
+        }
+    }
+}
+
+/// `hydra_config_watch_restarts_total{task}` label values.
+const PUBSUB_TASK: &str = "pubsub";
+const POLL_TASK: &str = "poll";
+
+/// Fixed backoff between a supervised task's death and its restart.
+///
+/// Fixed (not exponential) by design: a permanently panicking task must not
+/// hot-spin, and 1 s keeps the watcher responsive without a retry storm. Retrying
+/// as fast as the panic occurs would burn a core and drown the log.
+const SUPERVISE_RESTART_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Keep one named task alive across panics (and unexpected clean exits).
+///
+/// `factory` is re-invoked for every run, so a restart can re-establish its
+/// resource (for the pub/sub consumer: a NEW broadcast receiver). The dead handle
+/// is **awaited before the next spawn**, which is exactly what guarantees at most
+/// one live consumer owns a receiver at a time.
+///
+/// A panic in the spawned future does not unwind this task: it surfaces as a
+/// `JoinError` with `is_panic()`. It is logged, counted, and followed by a fixed
+/// [`SUPERVISE_RESTART_BACKOFF`] before the factory runs again. Cancellation
+/// (runtime shutdown or an explicit abort) ends the loop without restarting.
+async fn supervise<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        // Sequential on purpose: the previous handle is fully awaited (joined)
+        // before a new factory run starts, so two consumers never coexist.
+        let handle = tokio::spawn(factory());
+        match handle.await {
+            Ok(()) => {
+                tracing::warn!(
+                    task = name,
+                    backoff_ms = SUPERVISE_RESTART_BACKOFF.as_millis(),
+                    "config-watch task ended unexpectedly; restarting"
+                );
+                crate::admin::metrics::record_config_watch_restart(name);
+            }
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!(task = name, "config-watch task cancelled; not restarting");
+                break;
+            }
+            Err(error) => {
+                // `is_panic()` is the case this supervisor exists for; any other
+                // JoinError is treated the same (log + bounded restart).
+                tracing::error!(
+                    task = name,
+                    error = %error,
+                    backoff_ms = SUPERVISE_RESTART_BACKOFF.as_millis(),
+                    "config-watch task panicked; restarting"
+                );
+                crate::admin::metrics::record_config_watch_restart(name);
+            }
+        }
+        tokio::time::sleep(SUPERVISE_RESTART_BACKOFF).await;
+    }
 }
 
 #[cfg(test)]
@@ -674,5 +816,64 @@ mod tests {
             Some(t1 + Duration::from_millis(RELOAD_DEBOUNCE_MS)),
             "the new window is anchored at the re-arm instant"
         );
+    }
+
+    /// The supervisor must survive a panicking run, meter it, and revive the task
+    /// with a fresh factory invocation.
+    ///
+    /// `deadline-poll`: a single fixed sleep is either flaky under load or wastes
+    /// wall-clock; the loop yields/sleeps until the effect is observed or the
+    /// deadline passes. No Redis is involved.
+    #[tokio::test]
+    async fn supervise_restarts_a_panicked_task_and_revives_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let revived = Arc::new(AtomicUsize::new(0));
+        let factory = {
+            let runs = Arc::clone(&runs);
+            let revived = Arc::clone(&revived);
+            move || {
+                let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                let revived = Arc::clone(&revived);
+                async move {
+                    if run == 1 {
+                        // Run 1 dies; `supervise` must catch the JoinError.
+                        panic!("supervise test: first run panics");
+                    }
+                    // Run 2 is the revived task: record its effect, then model a
+                    // long-running watcher so the supervisor does not respawn it
+                    // again inside the assertion window.
+                    revived.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        // A task label unique to this test keeps the counter assertion
+        // deterministic despite the process-global registry.
+        let task = "test_supervise_restart";
+        let counter_before = crate::admin::metrics::config_watch_restarts_total(task);
+        let supervisor = tokio::spawn(supervise(task, factory));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let restarted =
+                crate::admin::metrics::config_watch_restarts_total(task) > counter_before;
+            let observed = revived.load(Ordering::SeqCst) >= 1;
+            if restarted && observed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "supervise did not restart+revive before the deadline \
+                 (restarted={restarted}, observed={observed})"
+            );
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 }

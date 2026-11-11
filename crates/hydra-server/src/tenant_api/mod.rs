@@ -53,6 +53,7 @@ use pingora_proxy::Session;
 use std::time::Duration;
 use tracing::debug;
 
+use crate::db::AdminAudit;
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
 use crate::store::ReloadGuard;
@@ -347,6 +348,10 @@ pub async fn dispatch(
         None
     };
     if let Some(write) = write {
+        // The audit row records the verb, but `method` borrows `session`
+        // immutably; the write handler needs `session` mutably, so take an owned
+        // copy here and stop touching the borrow before the gate.
+        let audit_method = method.to_string();
         // Every write route variant names its tenant (it came from the URL), so
         // the accessor — not a hand-written pattern list — is what keeps a new
         // variant from silently dropping out of the URL cross-check below.
@@ -372,7 +377,13 @@ pub async fn dispatch(
             return Ok(true);
         };
         ctx.tenant = Some(authenticated.tenant.clone());
-        return handlers::write(state, session, ctx, &authenticated, write).await;
+        let response = handlers::write(state, session, ctx, &authenticated, write).await?;
+        // Audit ONLY the post-gate write attempt: a 401/403/429/503 refused by
+        // `run_gate` returned above and is never recorded (there is no
+        // authenticated actor to attribute it to). The row is best-effort and
+        // can never change the mutation response.
+        audit_tenant_write(state, &audit_method, path, ctx, &authenticated).await;
+        return Ok(response);
     }
 
     // 2. The READ route (path-only). A miss is a local 404.
@@ -472,6 +483,48 @@ pub async fn dispatch(
         }
         Endpoint::ListUsers => handlers::list_users(state, session, ctx, &authenticated).await,
     }
+}
+
+/// The first `/api/v1/<segment>` path segment, for the tenant audit row's
+/// optional `entity_type` (e.g. `user-groups`). `None` for a path that does not
+/// carry the tenant API prefix.
+fn audit_entity_type(path: &str) -> Option<&str> {
+    path.split_once("/api/v1/")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Record one post-gate tenant write attempt in `admin_audit`.
+///
+/// The actor is the tenant the ACCESS TOKEN resolved to (`authenticated`), never
+/// the tenant id from the URL: the gate rejects a mismatch with `403` before this
+/// point, so the two agree on every row that reaches here, but the authenticated
+/// value is the one that is authoritative. `tenant_id` is the same value, which
+/// is what lets an operator query one tenant's self-service mutations without
+/// scanning the admin rows.
+///
+/// Best-effort by construction ([`crate::admin::record_admin_audit`]): a broken
+/// audit table cannot fail the mutation. No request body, token or key is stored.
+async fn audit_tenant_write(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    ctx: &RequestContext,
+    authenticated: &Authenticated,
+) {
+    let action = method.to_ascii_lowercase();
+    let tenant_id = authenticated.tenant.id.as_str();
+    let entry = AdminAudit {
+        actor: tenant_id,
+        action: &action,
+        method,
+        path,
+        entity_type: audit_entity_type(path),
+        request_id: Some(ctx.trace_id.as_str()),
+        tenant_id: Some(tenant_id),
+    };
+    crate::admin::record_admin_audit(state.store.pool(), &entry).await;
 }
 
 /// Run the tenant API token gate for a request at `path` addressed to the

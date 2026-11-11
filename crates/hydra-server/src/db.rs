@@ -56,7 +56,10 @@ mod reseal;
 mod rows;
 mod tenant;
 
-pub use audit::{insert_admin_audit, AdminAudit};
+pub use audit::{
+    admin_audit_retention_days_from_env, delete_admin_audit_older_than, insert_admin_audit,
+    run_retention_once, spawn_retention_task, AdminAudit, DEFAULT_ADMIN_AUDIT_RETENTION_DAYS,
+};
 pub use backend::{Db, DbConnection, Pool, Tx};
 
 pub use global_role::{
@@ -73,8 +76,16 @@ pub use limit_role::{
     delete_limit_role, get_limit_role, insert_limit_role, list_limit_roles, update_limit_role,
 };
 pub use pool::{
-    begin_read_snapshot, begin_write, bump_config_revision, get_config_version, init_pool,
-    is_retryable, is_unavailable, read_revision, run_migrate, set_config_version, ConfigVersion,
+    begin_read_snapshot, begin_write, bump_config_revision, db_url_satisfies_tls,
+    get_config_version, init_pool, is_begin_write_retryable, is_lock_contention, is_retryable,
+    is_unavailable, read_revision, run_migrate, set_config_version, ConfigVersion,
+};
+// Test-only acquisition seam: the live retry tests in `tests/db_write_lock.rs`
+// supply guardrails directly instead of racing the shared environment.
+#[doc(hidden)]
+pub use pool::{
+    begin_write_attempts, begin_write_first_failure, begin_write_probe_reset,
+    begin_write_with_guardrails, DbGuardrails,
 };
 pub use provider::{
     delete_provider, delete_provider_key, delete_provider_model, get_provider, get_provider_key,

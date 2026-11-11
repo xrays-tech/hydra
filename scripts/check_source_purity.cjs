@@ -127,11 +127,12 @@ const { records, audit } = require('./recorded_exceptions.cjs');
  */
 const EXPECT_SITE_OK = records(process.env.PURITY_EXPECT_OK, [
   [
-    'hydra-server/src/main.rs@d9758f50',
-    'cert store at the TLS listener (main.rs:1163-1166): the store is built UNCONDITIONALLY whenever a ' +
-      'TLS feature is compiled in (main.rs:510-517), and this branch is only reached with a TLS ' +
-      'listener configured — so the Option is None only in a build that cannot reach this line. There ' +
-      'is also no caller to return an error to: this is bootstrap, before any request exists.',
+    'hydra-server/src/boot/listeners.rs@d9758f50',
+    'cert store at the TLS listener (boot/listeners.rs, F6 split of main.rs): the store is built ' +
+      'UNCONDITIONALLY whenever a TLS feature is compiled in (boot/state.rs `build_cert_store`, ' +
+      'called from boot/mod.rs), and this branch is only reached with a TLS listener configured — ' +
+      'so the Option is None only in a build that cannot reach this line. There is also no caller ' +
+      'to return an error to: this is bootstrap, before any request exists.',
   ],
   [
     'hydra-server/src/proxy/provider_client.rs@8e38d65c',

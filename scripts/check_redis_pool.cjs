@@ -25,8 +25,9 @@
  *   R2 no `None` policy: in that file the 4th argument of every `Pool::new(` call is `Some(`.
  *      (`None` is the defect itself; it is invisible until Redis actually goes away.)
  *   R3 the config-bus channel seam (`spawn_config_watch_on` / `with_channel`) is TEST-ONLY:
- *      no `crates/hydra-server/src/**` caller outside `cluster/config_bus.rs`, and `main.rs`
- *      uses the fixed-channel wrappers (`spawn_config_watch` / `RedisConfigNotifier::new`).
+ *      no `crates/hydra-server/src/**` caller outside `cluster/config_bus.rs`, and the boot
+ *      wiring (`boot/fanout.rs`, formerly `main.rs`) uses the fixed-channel wrappers
+ *      (`spawn_config_watch` / `RedisConfigNotifier::new`).
  *
  * The 4th argument is located by taking the argument list of the call and splitting it at
  * top level on commas — not by a regex over the whole file, because the call spans lines and
@@ -122,12 +123,15 @@ function splitArgs(text) {
 // subscribe to a channel nothing publishes on, or publish somewhere no watcher
 // listens. `config_bus.rs` itself is exempt (it defines both and unit-tests them).
 const CONFIG_BUS = 'crates/hydra-server/src/cluster/config_bus.rs';
-const MAIN = 'crates/hydra-server/src/main.rs';
+// The production caller that must use the fixed-channel wrappers. It was
+// `main.rs` before the F6 `main.rs → boot/*` split; the config-bus wiring now
+// lives in `boot/fanout.rs`.
+const SEAM_CALLER = 'crates/hydra-server/src/boot/fanout.rs';
 
 function configBusSeamViolations() {
   const root = path.resolve(CRATES, 'hydra-server/src');
   const bus = path.resolve(CRATES, 'hydra-server/src/cluster/config_bus.rs');
-  const main = path.resolve(CRATES, 'hydra-server/src/main.rs');
+  const seamCaller = path.resolve(CRATES, 'hydra-server/src/boot/fanout.rs');
   if (!fs.existsSync(root)) return { scanned: 0, violations: [] };
   if (!fs.existsSync(bus)) {
     return {
@@ -156,13 +160,13 @@ function configBusSeamViolations() {
       }
     }
   }
-  if (fs.existsSync(main)) {
-    const code = blankCommentsAndStrings(fs.readFileSync(main, 'utf8'));
+  if (fs.existsSync(seamCaller)) {
+    const code = blankCommentsAndStrings(fs.readFileSync(seamCaller, 'utf8'));
     if (!/\bspawn_config_watch\s*\(/.test(code)) {
-      violations.push(`${MAIN}: must start the watcher through \`spawn_config_watch\` (fixed channel)`);
+      violations.push(`${SEAM_CALLER}: must start the watcher through \`spawn_config_watch\` (fixed channel)`);
     }
     if (!/\bRedisConfigNotifier::new\s*\(/.test(code)) {
-      violations.push(`${MAIN}: must construct \`RedisConfigNotifier::new\` (fixed channel)`);
+      violations.push(`${SEAM_CALLER}: must construct \`RedisConfigNotifier::new\` (fixed channel)`);
     }
   }
   return { scanned, violations };

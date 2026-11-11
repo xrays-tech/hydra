@@ -19,6 +19,12 @@ const { spawnSync } = require('node:child_process');
 const GUARD = path.join(__dirname, 'check_gate_entries.cjs');
 const DOC_LINE = '#   cargo build -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --bin hydra\n';
 
+// F7 single-source: the workflow parser both guards now share. These cases pin the SHARED model
+// directly (a block-scalar body line that starts with `- `, a `uses:` step with a `with:` mapping,
+// job-level defaults/`if:`) so a future divergence is caught at the module rather than as a
+// confusing guard outcome.
+const { extractSteps } = require('./lib/ci_steps.cjs');
+
 /** A fixture tree: a WORKFLOW, a gate script, and integration drills.
  *
  * The guard's subject is the tracked workflow since 2026-10-05 (it used to read only the gitignored
@@ -386,4 +392,62 @@ test('CONTROL: an entry with exactly one database backend passes', () => {
   });
   const r = run(root);
   assert.equal(r.status, 0, r.out);
+});
+
+/* The shared parser (scripts/lib/ci_steps.cjs): the facts both guards depend on. */
+test('shared parser: uses steps are not run steps, and a `with:` mapping is not a run continuation', () => {
+  const steps = extractSteps([
+    'name: ci',
+    'jobs:',
+    '  main:',
+    '    steps:',
+    '      - name: setup',
+    '        uses: actions/checkout@v5',
+    '        with:',
+    '          fetch-depth: 0',
+    '          flags: --all',
+    '      - name: build',
+    '        run: |',
+    '          set -e',
+    '          - this dash is shell text, not a step',
+    '          cargo build --bin hydra',
+    '      - name: quiet',
+    '        run: echo ok',
+    '',
+  ].join('\n'));
+  assert.deepEqual(steps.map((s) => s.name), ['build', 'quiet']);
+  assert.equal(steps[0].job, 'main');
+  // The block scalar keeps its LINES (and the `- `-looking line inside it).
+  assert.equal(
+    steps[0].run,
+    'set -e\n- this dash is shell text, not a step\ncargo build --bin hydra',
+  );
+  assert.equal(steps[1].run, 'echo ok');
+});
+
+test('shared parser: job defaults, continue-on-error, and `if: false` are attributed per job', () => {
+  const steps = extractSteps([
+    'jobs:',
+    '  first:',
+    '    defaults:',
+    '      run:',
+    '        working-directory: ./tools',
+    '    steps:',
+    '      - name: lenient',
+    '        continue-on-error: true',
+    '        run: echo ok',
+    '  second:',
+    '    if: false',
+    '    steps:',
+    '      - name: skipped',
+    '        run: true',
+    '',
+  ].join('\n'));
+  assert.equal(steps.length, 2);
+  assert.equal(steps[0].job, 'first');
+  assert.equal(steps[0].dir, './tools');
+  assert.equal(steps[0].lenient, true);
+  assert.equal(steps[0].jobDisabled, false);
+  assert.equal(steps[1].job, 'second');
+  assert.equal(steps[1].jobDisabled, true);
 });

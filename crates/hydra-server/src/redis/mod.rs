@@ -23,6 +23,34 @@
 pub mod breaker;
 pub mod rate_limit;
 
+/// Does `url` carry a non-empty **password** component? This is the pure
+/// predicate behind `HYDRA_REDIS_REQUIRE_AUTH`.
+///
+/// Redis credentials live in the URL authority as `user:password@host`; the
+/// password-only spelling `:password@host` is valid too. A URL with no `@`, a
+/// bare username (`user@host`), or an empty password (`:@host`, `user:@host`)
+/// is **not** authenticated. `rediss://` selects TLS and says nothing about
+/// authentication, so the scheme is deliberately not consulted here: TLS and
+/// auth are separate controls.
+///
+/// Kept free of the process environment and of a live connection so the boot
+/// path can refuse before `RedisBackend::connect`/`build_subscriber`, and so the
+/// accept/reject matrix is unit-testable without Redis.
+#[must_use]
+pub fn redis_url_has_auth(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    // The authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // A password may only contain `@` percent-encoded, so the LAST `@` starts
+    // the host — the same split every URL parser performs.
+    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    matches!(userinfo.split_once(':'), Some((_user, password)) if !password.is_empty())
+}
+
 /// Build the URL that reaches a specific Redis DATABASE index.
 ///
 /// Production always uses `HYDRA_REDIS_URL` verbatim; this exists so the test
@@ -436,6 +464,52 @@ impl RedisBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HYDRA_REDIS_REQUIRE_AUTH` accepts any URL with a non-empty password
+    /// component, in every spelling a Redis client supports.
+    #[test]
+    fn redis_auth_requires_a_non_empty_password_component() {
+        for url in [
+            "redis://:secret@127.0.0.1:6379/0",
+            "rediss://:secret@127.0.0.1:6379/0",
+            "redis://user:secret@127.0.0.1:6379",
+            "rediss://user:secret@redis.internal:6379/1",
+            "redis+unix://user:secret@/run/redis.sock",
+            "redis://:secret@redis.internal:6379?protocol=3",
+        ] {
+            assert!(redis_url_has_auth(url), "{url}");
+        }
+    }
+
+    /// `rediss://` is TLS, not authentication — the scheme alone never satisfies
+    /// the auth requirement.
+    #[test]
+    fn redis_tls_is_not_authentication() {
+        for url in [
+            "redis://127.0.0.1:6379/0",
+            "rediss://127.0.0.1:6379/0",
+            "rediss://redis.internal:6379",
+        ] {
+            assert!(!redis_url_has_auth(url), "{url}");
+        }
+    }
+
+    /// A missing `@`, a username without a password, or an empty password is not
+    /// authentication; malformed input never panics.
+    #[test]
+    fn redis_absent_or_empty_password_is_not_auth() {
+        for url in [
+            "",
+            "not-a-url",
+            "redis://127.0.0.1:6379",
+            "redis://@127.0.0.1:6379",
+            "redis://user@127.0.0.1:6379",
+            "redis://:@127.0.0.1:6379",
+            "redis://user:@127.0.0.1:6379",
+        ] {
+            assert!(!redis_url_has_auth(url), "{url}");
+        }
+    }
 
     /// Regression: the pool must never be built on fred's defaults. A
     /// `default_command_timeout` of 0 disables command timeouts, so a

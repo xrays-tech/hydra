@@ -1065,6 +1065,11 @@ jobs:
       - name: migration parity checker tests
         run: node --test scripts/check_migration_parity.test.cjs
 
+      # Local test-DB hygiene tool (drops leaked hydra_test_%/hydra_tmpl_% via the
+      # psql/mysql CLI). Its tests use an injected fake spawn, so no database.
+      - name: test-DB cleanup tool tests
+        run: node --test scripts/clean-test-dbs.test.cjs
+
       # The operator runbook's config table is a promise: every variable it lists
       # must be read by something. It listed a `HYDRA_LOG` alias that no code has
       # ever read (verified at runtime: HYDRA_LOG=debug logs 0 lines).
