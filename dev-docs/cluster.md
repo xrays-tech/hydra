@@ -108,6 +108,12 @@
    Redis `hydra:config:changed` 发布 `{"version": N, "origin": "<node-id>"}`。
 3. **对端**：订阅者收到消息后走**安静 reload**（不复读、不转发、不再发布）；版本不前进则忽略。
    `ReloadSource::{PubSub,Poll}` 永不再发布，因此不会出现 O(N²) 广播风暴。
+   - **去抖合并**：对端**不逐条消息 reload**。`version > 本地` 的合格消息进入 50 ms 尾随去抖窗口；
+     连续消息会重置窗口，但从**第一条**消息起最多延迟 250 ms。到点先做一次
+     `has_newer_revision()` 探测，再一次安静 reload（一次重建即覆盖整批消息）。
+   - 去抖状态在 reload **开始前**清除：reload 进行期间到达的消息会在下一轮重新计时，不会被
+     pending 标志吞掉；reload 失败时状态也已清除（不会卡住），由轮询兜底重试。
+     `hydra_config_reload_coalesced_total` 统计被合并的消息数（比例信号，不配置告警）。
 4. **轮询兜底**：每个集群节点每 `HYDRA_CONFIG_POLL_MS` 做一次廉价探测
    （只读 `config_revision.version`）。发现比本地新才做完整配对读 reload。这是丢消息或
    Redis 故障时的正确性兜底。
@@ -134,7 +140,7 @@
 | **Redis 不可达** | 数据面共享限流 fail-open、熔断投票不同步、失效传播暂停（按 TTL 过期）；**配置正确性不受影响**：扇出失效后由轮询兜底收敛。单个节点的本地写仍会提交 |
 | **通知丢失** | 对端在下一个 poll 周期发现 revision 前进并收敛；不是数据丢失 |
 | **快照 stale** | 本地 reload 失败会置 `hydra_config_snapshot_stale=1`；写已经提交，响应仍成功。修复导致 reload 失败的行后，`POST /api/v1/reload?force=1` 或下一次成功 reload 会恢复 |
-| **`config_revision` 被回退**（误恢复/手工 SQL） | 节点的本地版本可能已经高于共享 revision，普通 reload 会因“未前进”跳过。用 `POST /api/v1/reload?force=1` 强制重读并收敛 |
+| **`config_revision` 被回退**（误恢复/手工 SQL） | 节点的本地版本可能已经高于共享 revision，普通 reload 会因“未前进”跳过。在该节点执行 `POST /api/v1/reload?force=1`：先递增共享 revision（让对端也看到变化），再重读并**采纳** DB revision（丢弃本地更高的私有水位），恢复正常版本闸门。这是**逐节点**恢复，不是集群一次性动作：本地水位仍高于回退后 revision 的对端，要等共享 revision 越过它（或也在该节点执行 force）才会重新收敛 |
 | **单节点** | 不需要 Redis；本地写后 reload 即可，没有订阅者/轮询 |
 
 `/healthz/leader` **已删除**（404）。`GET /api/v1/cluster/status` 只报告本节点事实：
@@ -189,6 +195,7 @@ Deployment/StatefulSet 指向**托管数据库**即可（StatefulSet 仍可用�
 | `hydra_config_version` | 本节点最后应用的 revision |
 | `hydra_config_snapshot_stale` | 1 = 上次 reload 失败，内存快照落后于数据库 |
 | `hydra_config_bus_lagged_total` | 广播订阅者落后而跳过的消息数；随后立即探测 revision 并安静 reload，不等下一轮轮询 |
+| `hydra_config_reload_coalesced_total` | 被合并进“已排队的 reload”的合格 pub/sub 消息数（突发写的比例信号，不是数据丢失：排队的 reload 会读取最新 revision；不配置告警） |
 
 Watcher 存活时间指标 `hydra_config_watch_last_ok_unixtime` 记录最近一次成功订阅/轮询的
 Unix 秒；配合 `hydra_config_version` 与 `snapshot_stale` 判断是否收敛。
@@ -215,7 +222,9 @@ Unix 秒；配合 `hydra_config_version` 与 `snapshot_stale` 判断是否收敛
 
 - **数据库 HA 就是集群 HA**：共享库不可用时所有节点都不能写配置。没有 raft 的“少数派继续
   写”语义，因为本来就不需要共识。
-- **每次写都做一次完整 reload**（当前规模可接受）；`changed=false` 的 no-op 仍然很便宜。
+- **每次写仍会在写入节点做一次完整 reload**（当前规模可接受）；`changed=false` 的 no-op 仍然很便宜。
+  对端的 pub/sub 路径会把突发消息合并成一次 reload（50 ms 去抖、250 ms 上限），因此扇出侧的
+  重建次数不再与消息条数一一对应。
 - **轮询间隔有代价**：很小会打库，很大则兜底变慢（§4.1）。
 - **租户写限流仍是每节点进程内窗口**：集群总量上界 = N × 单窗口（反 DoS，不是计费）。
 - **没有 peer 存活视图**：`cluster/status` 只报告本节点；Redis 通知失败不代表节点宕机。

@@ -38,7 +38,7 @@ use hydra_server::store::{ConfigNotifier, ConfigStore};
 // integration tests hand-assign 41..=63, and `tests/redis_db_partition.rs`
 // scans the literal `real_redis_pool(<n>)` calls below for collisions).
 //   pub/sub convergence = 41, poll fallback = 42, no-relay = 43,
-//   startup race = 44/45.
+//   startup race = 44/45, burst coalescing = 46.
 
 fn kp() -> Arc<dyn KeyProvider> {
     Arc::new(StaticKeyProvider::new([1u8; 32], 1))
@@ -346,6 +346,87 @@ async fn subscriber_reload_does_not_relay() {
         b_notifier.calls(),
         0,
         "B's subscriber-driven reload must never publish (no broadcast storm)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. A burst of pub/sub notifications is coalesced into a bounded number of
+//     reloads (one per debounce window), not one full rebuild per message.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pubsub_burst_is_coalesced_into_a_bounded_number_of_reloads() {
+    let db = db::testing::isolated().await;
+    let channel = channel("coalesce");
+
+    let store_b = ConfigStore::load(db.pool.clone(), kp())
+        .await
+        .expect("load B");
+    // Every swap is one full rebuild. Count them so "coalesced" is measured, not
+    // assumed: one notification per message would make this equal BURST.
+    let swaps = Arc::new(AtomicU64::new(0));
+    let recorded = swaps.clone();
+    store_b.on_snapshot_change(Arc::new(move |_cfg| {
+        recorded.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let pool = common::real_redis_pool(46).await;
+    let publisher = RedisConfigNotifier::with_channel(pool, "node-a".to_string(), channel.clone());
+
+    // A 120 s poll interval is inert inside this test: any swap observed here
+    // came from the pub/sub path, and the burst must not produce one per message.
+    let subscriber = build_subscriber(&redis_url(46)).expect("subscriber builds");
+    spawn_config_watch_on(
+        store_b.clone(),
+        subscriber,
+        Duration::from_secs(120),
+        &channel,
+    )
+    .await
+    .expect("watcher starts");
+
+    const BURST: usize = 8;
+    for i in 0..BURST {
+        db::insert_provider(&db.pool, &provider(&format!("p-burst-{i}")))
+            .await
+            .expect("insert provider");
+    }
+    let last_version = db::read_revision(&db.pool).await.expect("read revision");
+    assert_eq!(
+        last_version, BURST as u64,
+        "each insert advances the shared revision exactly once"
+    );
+
+    // Publish the whole burst WITHOUT a DB round trip between messages. That is
+    // the tightest realistic stream, and it makes "coalesced rather than one
+    // reload per message" a deterministic assertion instead of a race against
+    // per-insert latency. The DB already holds every revision in the burst.
+    for version in 1..=last_version {
+        publisher
+            .publish(version)
+            .await
+            .expect("publish burst notification");
+    }
+
+    wait_until(
+        "B to converge on the latest burst revision",
+        Duration::from_secs(2),
+        || store_b.version() == last_version && store_b.snapshot().providers.len() == BURST,
+    )
+    .await;
+
+    let swaps = swaps.load(Ordering::SeqCst);
+    assert!(
+        swaps >= 1,
+        "the burst must eventually trigger a reload (otherwise it did not converge via pub/sub)"
+    );
+    assert!(
+        swaps < BURST as u64,
+        "{BURST} notifications must coalesce into fewer than {BURST} reloads, observed {swaps}"
+    );
+    assert_eq!(
+        store_b.snapshot().providers.len(),
+        BURST,
+        "the single bounded reload still applies every entity in the burst"
     );
 }
 

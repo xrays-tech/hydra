@@ -48,6 +48,7 @@
 //! | `hydra_config_version` | gauge | — | `ConfigStore` (local last-applied revision) |
 //! | `hydra_config_watch_last_ok_unixtime` | gauge | — | `cluster::config_bus` watcher (unix seconds of the last completed poll tick / handled pub/sub message; alert when `time() - gauge > 3× poll interval`) |
 //! | `hydra_config_bus_lagged_total` | counter | — | `cluster::config_bus` broadcast receiver (`RecvError::Lagged`; messages skipped before they could be read, followed by an immediate revision probe/reload) |
+//! | `hydra_config_reload_coalesced_total` | counter | — | `cluster::config_bus` reload debounce (well-formed pub/sub notifications folded into a reload already pending; suppressed full rebuilds, not data loss) |
 //! | `hydra_listener_bound` | gauge | protocol | startup self-check in `main` (1 = the configured listener really accepts) |
 //! | `hydra_listener_misconfig_total` | counter | kind | `listeners::plan` notes (certs without a TLS port / a TLS port without certs) |
 //! | `hydra_usage_records_dropped_total` | counter | reason | usage sink (`channel_full` / `channel_closed` / `retention_cap`) |
@@ -183,6 +184,12 @@ struct Metrics {
     /// behind the ring buffer. A non-zero rate is a subscriber that needs the
     /// immediate watermark reconciliation (not just the next poll tick).
     config_bus_lagged: IntCounter,
+    /// Well-formed pub/sub notifications that arrived while a reload was
+    /// already pending and were folded into it by the trailing debounce. A
+    /// non-zero rate is expected under write bursts; it measures full snapshot
+    /// rebuilds the coalescer avoided, not lost changes (the pending reload
+    /// still reads the latest shared revision).
+    config_reload_coalesced: IntCounter,
     /// Usage records the sink dropped, by reason. Billing data loss must be
     /// alertable, not just a WARN in the log (audit §3.9).
     usage_dropped: IntCounterVec,
@@ -494,6 +501,11 @@ fn metrics() -> Option<&'static Metrics> {
             config_bus_lagged: register_int_counter!(
                 "hydra_config_bus_lagged_total",
                 "Config-bus messages skipped because the subscriber lagged behind the broadcast channel"
+            )
+            .ok()?,
+            config_reload_coalesced: register_int_counter!(
+                "hydra_config_reload_coalesced_total",
+                "Config-bus notifications folded into an already-pending reload by the trailing debounce"
             )
             .ok()?,
             // ── Control plane (cluster P1) ────────────────────────────────
@@ -935,6 +947,29 @@ fn record_config_watch_ok_at(unix_secs: u64) {
 pub fn record_config_bus_lagged(missed: u64) {
     if let Some(m) = metrics() {
         m.config_bus_lagged.inc_by(missed);
+    }
+}
+
+/// Count one pub/sub notification that was folded into an already-pending
+/// debounced reload.
+///
+/// This is NOT data loss: the pending reload reads the latest shared revision,
+/// so every coalesced message's change is applied by the reload it joined. The
+/// counter is the scale signal for the coalescing window (full snapshot rebuilds
+/// avoided), not an alert: `hydra_config_reload_duration_seconds` and
+/// `hydra_config_rows_loaded` remain the reload-cost signals.
+pub fn record_config_reload_coalesced() {
+    if let Some(m) = metrics() {
+        m.config_reload_coalesced.inc();
+    }
+}
+
+/// Current value of `hydra_config_reload_coalesced_total` (tests).
+#[must_use]
+pub fn config_reload_coalesced_total() -> u64 {
+    match metrics() {
+        Some(m) => m.config_reload_coalesced.get(),
+        None => 0,
     }
 }
 
@@ -1500,6 +1535,7 @@ mod tests {
         record_config_version(42);
         record_config_bus_lagged(0);
         record_config_bus_lagged(7);
+        record_config_reload_coalesced();
     }
 
     #[test]
@@ -1546,6 +1582,20 @@ mod tests {
         assert!(
             render().contains("hydra_config_bus_lagged_total"),
             "the config-bus lag counter must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn config_reload_coalesced_counter_is_registered_and_increments() {
+        let before = config_reload_coalesced_total();
+        record_config_reload_coalesced();
+        assert!(
+            config_reload_coalesced_total() >= before.saturating_add(1),
+            "the coalesced-reload counter helper must increment the registered series"
+        );
+        assert!(
+            render().contains("hydra_config_reload_coalesced_total"),
+            "the coalesced-reload counter must appear on /metrics"
         );
     }
 

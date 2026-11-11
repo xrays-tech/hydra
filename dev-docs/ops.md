@@ -245,10 +245,14 @@ current when the snapshot was taken. Migrations run at boot.
 > may not match the schema the current binary expects. Keep the matching binary with
 > the backup, or validate the restore on a copy before switching production.
 >
-> ⚠️ **A revision rewind needs one forced reload.** If the restored
+> ⚠️ **A revision rewind needs a forced reload on EACH affected node.** If the restored
 > `config_revision.version` is lower than a node's in-memory version, that node sees
 > "no advance" and skips the normal reload. Run `POST /api/v1/reload?force=1` on it
-> (admin token) to re-read the restored database and converge.
+> (admin token): force bumps the shared revision and the node **adopts** the resulting
+> DB version, discarding its private higher watermark. Peers that are still above the
+> rewound revision remain blind until the shared revision passes them, so repeat the
+> forced reload on every node whose `hydra_config_version` is ahead. This is per-node
+> recovery, not a fleet-wide one-shot.
 
 ClickHouse usage data is backed up with ClickHouse's own tooling; it is not part of
 the configuration database.
@@ -946,13 +950,28 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
   closing the tab signs out). Useful for incident inspection (breaker dead-set,
   health, manual reload, key reveal with audit log).
 
-### 9.0b Config watcher liveness
+### 9.0b Config watcher liveness and pub/sub coalescing
 
 `hydra_config_watch_last_ok_unixtime` (unix seconds of the last successful subscriber
 message or poll probe) is the watcher-liveness gauge. Alert when
 `time() - hydra_config_watch_last_ok_unixtime > 3 * (HYDRA_CONFIG_POLL_MS/1000)` on a
 Redis-configured node; use `hydra_config_version` advancing with writes plus
-`hydra_config_snapshot_stale` as the convergence signal.
+`hydra_config_snapshot_stale` as the convergence signal. A forced reload after a
+revision rewind legitimately moves `hydra_config_version` **down** to the adopted
+shared revision; do not alert on a decrease alone.
+
+The subscriber does **not** rebuild the snapshot for every notification. A
+well-formed `version > hydra_config_version` message arms a **50 ms trailing
+debounce**, extended by later messages but capped at **250 ms from the first**
+one; when it fires the watcher probes `config_revision.version` once and does one
+quiet reload (`source="pubsub"`). The pending state is cleared before that reload,
+so messages arriving during it re-arm instead of being swallowed, and a failed
+reload falls back to the poller rather than a stuck flag.
+`hydra_config_reload_coalesced_total` counts notifications folded into an
+already-pending reload: a burst rate is expected under write bursts and measures
+full rebuilds avoided, **not** data loss (the reload applies the latest revision).
+Do not alert on it; `hydra_config_reload_duration_seconds` /
+`hydra_config_rows_loaded` remain the reload-cost signals.
 
 ### 9.1 Alerting: which metric means what
 
@@ -1065,6 +1084,9 @@ or alert can see why it stopped resolving. Do not write rules against them.
 ```promql
 # reloads by source; "poll changed=true" means pub/sub was missed or Redis was down
 sum by (source, changed) (rate(hydra_config_reload_total[5m]))
+
+# pub/sub notifications folded into one pending reload (burst scale, not loss)
+rate(hydra_config_reload_coalesced_total[5m])
 
 # failed local fanout (poll fallback will repair)
 increase(hydra_config_notify_total{result="error"}[10m])
@@ -1402,7 +1424,13 @@ commit.
   `migrations/mysql/`; PostgreSQL equivalents in `migrations/postgres/`.
 - **Revision rewind** after a restore/manual SQL: a node whose local version is ahead of
   the restored `config_revision` skips the normal reload. Run
-  `POST /api/v1/reload?force=1` on it.
+  `POST /api/v1/reload?force=1` **on that node**. Force bumps the shared revision
+  (if `config_revision <= local`, so peers can see the change), re-reads, and then
+  **adopts** the resulting DB revision instead of keeping a private higher watermark.
+  This is **per-node recovery, not a fleet-wide one-shot**: a peer whose local version
+  is still above the rewound DB revision stays blind until the shared revision passes
+  it (or you run force on that peer too). Repeat on every node that reports a higher
+  `hydra_config_version`, then verify convergence.
 
 ### 13.6b Recovery from a full stop
 
@@ -1411,7 +1439,7 @@ commit.
 | **Database and Redis up** | Start the nodes in any order; each loads the shared DB. No majority/claim window |
 | **Redis down, database up** | Start anyway: data plane serves, shared limits degrade, config fanout degrades to polling. Restore Redis; no restart required |
 | **Database down** | Nodes fail to start (migrations) or serve stale snapshots if already up. Restore the database, then restart/serve. This is the availability boundary |
-| **Restored an older backup** | Use the matching binary, then `POST /api/v1/reload?force=1` on any node whose version is ahead; verify `config_version` converges |
+| **Restored an older backup** | Use the matching binary, then `POST /api/v1/reload?force=1` on **every** node whose version is ahead (force adopts the shared DB revision); verify `config_version` converges on each |
 
 ### 13.7 Known limitations (as of this revision)
 

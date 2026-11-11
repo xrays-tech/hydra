@@ -23,6 +23,7 @@ use std::time::Duration;
 use fred::clients::SubscriberClient;
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use crate::redis::RedisError;
 use crate::store::{ConfigNotifier, ConfigStore, ReloadSource};
@@ -55,6 +56,75 @@ pub const MAX_POLL_MS: u64 = 3_600_000;
 /// refreshes liveness only on a completed tick). Bounded and short: the watcher
 /// stays responsive if the client resubscribes.
 const CLOSED_RECV_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Quiet window for coalescing external (pub/sub) reloads.
+///
+/// A burst of notifications arriving within this window produces ONE reload
+/// against the latest shared revision instead of one full `ConfigData` rebuild
+/// per message (`O(N × rows)`). The window is far below the poll interval and
+/// only delays the fast path; the poll fallback remains the correctness bound.
+pub const RELOAD_DEBOUNCE_MS: u64 = 50;
+
+/// Hard cap on how long a continuous stream may defer a pending reload.
+///
+/// A trailing debounce alone can be starved by a writer that never goes quiet,
+/// so the deadline is the minimum of "quiet until now + debounce" and "first
+/// notification + cap". A continuous stream therefore converges at roughly one
+/// rebuild per (cap + reload duration), rather than unboundedly.
+pub const RELOAD_MAX_DELAY_MS: u64 = 250;
+
+/// Trailing-debounce state for the external reload path.
+///
+/// Pure (all decisions take an explicit `now`) so the edge cases are
+/// unit-testable without sleeping:
+///   * the first note arms a [`RELOAD_DEBOUNCE_MS`] window from that instant;
+///   * every later note while pending extends the quiet window, but the deadline
+///     is capped at [`RELOAD_MAX_DELAY_MS`] after the FIRST note;
+///   * taking a due deadline clears both fields, so a message that arrives while
+///     the reload is in flight re-arms from scratch.
+#[derive(Debug, Default)]
+struct ReloadCoalescer {
+    pending_since: Option<Instant>,
+    pending_until: Option<Instant>,
+}
+
+impl ReloadCoalescer {
+    /// Note one qualifying notification at `now`.
+    ///
+    /// Returns `true` when a reload was already pending (i.e. this message was
+    /// coalesced into it), which is what the metric counts. The returned bool is
+    /// not the reload decision: the caller always lets the deadline fire once.
+    fn note(&mut self, now: Instant) -> bool {
+        let already_pending = self.pending_since.is_some();
+        let since = *self.pending_since.get_or_insert(now);
+        let quiet_until = now + Duration::from_millis(RELOAD_DEBOUNCE_MS);
+        let hard_cap = since + Duration::from_millis(RELOAD_MAX_DELAY_MS);
+        self.pending_until = Some(quiet_until.min(hard_cap));
+        already_pending
+    }
+
+    /// The deadline the watcher should sleep until, if a reload is pending.
+    fn deadline(&self) -> Option<Instant> {
+        self.pending_until
+    }
+
+    /// Clear the pending state and return the deadline that fired.
+    ///
+    /// MUST be called BEFORE the reload starts: while the reload is in flight the
+    /// select cannot read messages, and clearing first means a notification that
+    /// arrived concurrently re-arms instead of being swallowed by the pending
+    /// flag. A failed reload leaves this cleared on purpose; the poll fallback is
+    /// the retry path (and no flag can get stuck).
+    fn take_pending(&mut self) -> Option<Instant> {
+        self.pending_since = None;
+        self.pending_until.take()
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.pending_since.is_some()
+    }
+}
 
 /// The two failure modes of the broadcast receiver, classified separately so
 /// the loop cannot lump a recoverable lag together with a dead channel.
@@ -253,7 +323,12 @@ pub async fn spawn_config_watch_on(
         // happens one interval after startup, not during it.
         ticker.tick().await;
 
+        let mut coalescer = ReloadCoalescer::default();
+
         loop {
+            // Recomputed every iteration: a message branch may arm or extend the
+            // deadline, and the timer future below must see the NEW value.
+            let deadline = coalescer.deadline();
             tokio::select! {
                 message = rx.recv() => {
                     match message {
@@ -279,19 +354,15 @@ pub async fn spawn_config_watch_on(
                                 }
                             };
                             // The store's revision gate is authoritative; this comparison
-                            // avoids even taking the reload lock for an already-applied or
-                            // stale message.
+                            // avoids even arming the timer for an already-applied or stale
+                            // message.
                             if changed.version > store.version() {
-                                if let Err(e) = store
-                                    .reload_external(false, ReloadSource::PubSub)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        version = changed.version,
-                                        origin = %changed.origin,
-                                        error = %e,
-                                        "config-bus reload failed; poll fallback will retry"
-                                    );
+                                // Do NOT reload per message: a burst of writes would
+                                // rebuild the whole snapshot per notification. Arm or
+                                // extend the trailing debounce; the timer branch below
+                                // performs ONE reload against the latest revision.
+                                if coalescer.note(Instant::now()) {
+                                    crate::admin::metrics::record_config_reload_coalesced();
                                 }
                             }
                             // Liveness: a WELL-FORMED message was handled, whether or not it
@@ -355,6 +426,52 @@ pub async fn spawn_config_watch_on(
                                 tokio::time::sleep(CLOSED_RECV_BACKOFF).await;
                             }
                         },
+                    }
+                }
+                // Trailing-debounce fire. Guarded on a pending deadline: with no
+                // pending reload this future is `pending()` and can never win.
+                _ = async {
+                    match deadline {
+                        Some(until) => tokio::time::sleep_until(until).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // CLEAR BEFORE RELOADING. The reload below awaits the store
+                    // lock and rebuild; a notification that arrives during it is
+                    // still in the broadcast buffer and must re-arm this timer on
+                    // the next loop iteration. Taking the state first also means
+                    // a failed reload cannot leave a stuck pending flag.
+                    if coalescer.take_pending().is_some() {
+                        // One cheap probe, then at most ONE rebuild. The probe may
+                        // be false if a poll/lag path already applied the change.
+                        match store.has_newer_revision().await {
+                            Ok(true) => {
+                                if let Err(e) = store
+                                    .reload_external(false, ReloadSource::PubSub)
+                                    .await
+                                {
+                                    // Choice: rely on the poll backstop rather than
+                                    // re-arming. The pending state is already clear,
+                                    // so there is no stuck timer; the next poll (or
+                                    // a later notification) retries.
+                                    tracing::warn!(
+                                        error = %e,
+                                        "coalesced config-bus reload failed; poll fallback will retry"
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                // Nothing newer survived: the burst was applied
+                                // by the poll/lag path, or the messages were for
+                                // revisions this node already served.
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "coalesced config-bus revision probe failed; poll fallback will retry"
+                                );
+                            }
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -476,5 +593,86 @@ mod tests {
         assert_eq!(DEFAULT_POLL_MS, 5_000);
         assert_eq!(MIN_POLL_MS, 50);
         assert_eq!(MAX_POLL_MS, 3_600_000);
+    }
+
+    #[test]
+    fn coalescer_first_note_sets_the_debounce_deadline() {
+        let t0 = Instant::now();
+        let mut c = ReloadCoalescer::default();
+        assert_eq!(c.deadline(), None, "no notification means no deadline");
+
+        assert!(
+            !c.note(t0),
+            "the first notification starts the window, it is not a coalesced one"
+        );
+        assert_eq!(
+            c.deadline(),
+            Some(t0 + Duration::from_millis(RELOAD_DEBOUNCE_MS)),
+            "the first note arms a 50 ms quiet window"
+        );
+    }
+
+    #[test]
+    fn coalescer_extends_quiet_window_but_caps_at_max_delay() {
+        let t0 = Instant::now();
+        let mut c = ReloadCoalescer::default();
+        assert!(!c.note(t0));
+
+        // A note 30 ms later extends the quiet window to t0 + 80 ms and is
+        // counted as coalesced.
+        assert!(c.note(t0 + Duration::from_millis(30)));
+        assert_eq!(
+            c.deadline(),
+            Some(t0 + Duration::from_millis(80)),
+            "inside the window the debounce restarts from the new note"
+        );
+
+        // A long continuous stream cannot push the deadline past the hard cap.
+        assert!(c.note(t0 + Duration::from_millis(200)));
+        assert_eq!(
+            c.deadline(),
+            Some(t0 + Duration::from_millis(250)),
+            "the deadline is the first note's cap, not this note's quiet window"
+        );
+        assert!(
+            c.note(t0 + Duration::from_millis(240)),
+            "still pending, still coalescing"
+        );
+        assert_eq!(
+            c.deadline(),
+            Some(t0 + Duration::from_millis(250)),
+            "every later note is clamped to the first note's cap"
+        );
+    }
+
+    #[test]
+    fn coalescer_take_clears_state_and_a_later_note_rearms() {
+        let t0 = Instant::now();
+        let mut c = ReloadCoalescer::default();
+        c.note(t0);
+        assert!(c.is_pending());
+
+        assert_eq!(
+            c.take_pending(),
+            Some(t0 + Duration::from_millis(RELOAD_DEBOUNCE_MS)),
+            "the due deadline is taken"
+        );
+        assert!(!c.is_pending(), "taking a deadline clears the pending flag");
+        assert_eq!(c.deadline(), None, "a cleared coalescer has no deadline");
+        assert_eq!(c.take_pending(), None, "taking twice is harmless");
+
+        // The reload is now "in flight"; a notification that arrives after the
+        // take must re-arm from scratch (not be swallowed by stale state).
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(
+            !c.note(t1),
+            "the re-arm starts a fresh burst, not a coalesced one"
+        );
+        assert!(c.is_pending());
+        assert_eq!(
+            c.deadline(),
+            Some(t1 + Duration::from_millis(RELOAD_DEBOUNCE_MS)),
+            "the new window is anchored at the re-arm instant"
+        );
     }
 }

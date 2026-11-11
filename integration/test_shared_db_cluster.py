@@ -79,10 +79,12 @@ TENANT_ID = "t-drill"
 TENANT_DOMAIN = "drill.local"
 MODEL = "echo"
 
-# Short poll so the missed-message leg finishes quickly, while the pub/sub legs assert the
-# pubsub counter (not just convergence), so a fast poll cannot make them green for the wrong
-# reason. Override with HYDRA_CONFIG_POLL_MS when investigating convergence.
-POLL_MS = int(os.environ.get("HYDRA_CONFIG_POLL_MS", "200"))
+# A3/A4/A5/A7 assert that convergence came from Redis pub/sub, so their nodes use a
+# 60s poll: the fallback cannot tick inside the test window. A6 (Redis blocked) restarts
+# all nodes with FALLBACK_POLL_MS so the poll backstop converges quickly. Override either
+# value only when triaging convergence.
+POLL_MS = int(os.environ.get("HYDRA_SHARED_DB_POLL_MS", "60000"))
+FALLBACK_POLL_MS = int(os.environ.get("HYDRA_SHARED_DB_FALLBACK_POLL_MS", "200"))
 STARTUP_BUDGET = float(os.environ.get("HYDRA_SHARED_DB_STARTUP_BUDGET", "60"))
 CONVERGE_BUDGET = float(os.environ.get("HYDRA_SHARED_DB_CONVERGE_BUDGET", "10"))
 REDIS_DB = int(os.environ.get("HYDRA_SHARED_DB_REDIS_DB", "58"))
@@ -342,6 +344,18 @@ def main():
         )
 
         # ------------------------------------------------------------------ A6: Redis outage
+        # A3/A4/A5 used the 60s pub/sub-only poll. For the outage and write-anywhere
+        # legs, restart all three with the short fallback poll: A6 needs a poll tick,
+        # and A7 must converge even if the Redis reconnect window swallowed the last
+        # notification. The earlier pubsub-only proof has already passed.
+        for n in nodes:
+            n.kill()
+            n.poll_ms = FALLBACK_POLL_MS
+            n.start()
+        for n in nodes:
+            if not wait_for(n.healthy, STARTUP_BUDGET, f"{n.name} to restart with the fallback poll"):
+                print(f"[shared-db] CANNOT VERIFY: {n.name} did not restart for A6", file=sys.stderr)
+                return 2
         poll_c0 = C.reload_source("poll")
         announce("blocking Redis for all nodes", f"relay :{relay_port}")
         relay.set_blocked(True)

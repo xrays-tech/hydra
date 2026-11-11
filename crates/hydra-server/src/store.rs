@@ -861,6 +861,20 @@ impl ConfigStore {
         // the same". Bump inside a write transaction first, then re-read the
         // paired rows/version so this node and every other process converge.
         if force && db_version <= local {
+            if local > db_version {
+                // The DB was rewound (restore / manual SQL) below this node's
+                // watermark. Force is the PER-NODE recovery: after the bump and
+                // re-read below this node ADOPTS the shared revision, so its
+                // private higher watermark is discarded instead of pinning it
+                // blind forever. Peers with a higher local watermark remain
+                // blind until the shared revision passes them; run force on each.
+                tracing::warn!(
+                    target: "hydra::store",
+                    local,
+                    db_version,
+                    "config revision skew: local watermark is ahead of the shared DB; force reload will adopt the DB revision"
+                );
+            }
             let _ = db::bump_config_revision(&self.pool).await?;
             (rows, db_version) = load_config_rows(&self.pool, self.key_provider.as_ref()).await?;
         }
@@ -868,7 +882,14 @@ impl ConfigStore {
         let new_cfg = config_from_rows(&rows)?;
         #[cfg(feature = "proxy")]
         let rows_loaded = config_row_count(&new_cfg);
-        let new_version = db_version.max(local + 1);
+        // Adopt the shared authority. On the normal path `db_version > local`,
+        // so this is the same value the old `max(db_version, local + 1)` picked.
+        // After a force bump/re-read it is the BUMPED DB revision even when the
+        // DB was rewound below `local`: that is the only way to restore the
+        // version gate (a private `local + 1` watermark would keep the node
+        // ahead of the shared revision and make every later normal reload a
+        // no-op). See `dev-docs/cluster.md` / `ops.md` for the runbook.
+        let new_version = db_version;
 
         self.inner.store(Arc::new(new_cfg));
         {
@@ -1226,6 +1247,65 @@ mod tests {
             "force must swap even with unchanged rows"
         );
         assert_eq!(store.version(), before + 1, "force advances the version");
+    }
+
+    /// Force recovery from a revision rewind: adopt the shared revision rather
+    /// than preserving a private higher watermark.
+    ///
+    /// Scenario: the DB was restored/manually rewound below this node's applied
+    /// version. A normal reload sees "no advance" forever, so force bumps the
+    /// shared revision (so peers can see the change) and then adopts the
+    /// resulting DB version. Content is still served, and the next normal
+    /// reload is a no-op because the node now matches the authority.
+    #[tokio::test]
+    async fn force_reload_adopts_the_rewound_shared_revision() {
+        let pool = crate::db::testing::setup_pool().await;
+        let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
+
+        // Put real content in the DB and move the shared revision to 100.
+        seed_change(&pool, "p-rewind").await;
+        crate::db::set_config_version(&pool, 100)
+            .await
+            .expect("set the shared revision high");
+        assert!(
+            store.reload_local(false).await.expect("advance to 100"),
+            "a newer shared revision must swap the snapshot"
+        );
+        assert_eq!(store.version(), 100);
+        assert!(
+            store.snapshot().providers.contains_key("p-rewind"),
+            "the snapshot serves the content written before the rewind"
+        );
+
+        // Rewind the DB below the local watermark: a normal reload is blind.
+        crate::db::set_config_version(&pool, 5)
+            .await
+            .expect("rewind the shared revision");
+        assert!(
+            !store.reload_local(false).await.expect("normal reload"),
+            "a rewound revision is not an advance, so the normal path is a no-op"
+        );
+        assert_eq!(store.version(), 100, "the local watermark stayed high");
+
+        // Force bumps the shared revision (5 -> 6), re-reads, and adopts it.
+        assert!(
+            store.reload_local(true).await.expect("force reload"),
+            "force must rebuild and swap even after a rewind"
+        );
+        assert_eq!(
+            store.version(),
+            6,
+            "force adopts the bumped shared revision, not max(6, local + 1)"
+        );
+        assert!(
+            store.snapshot().providers.contains_key("p-rewind"),
+            "the rewritten snapshot still serves the DB content"
+        );
+        assert!(
+            !store.reload_local(false).await.expect("post-force no-op"),
+            "once local == DB the next normal reload is a no-op (no permanent skew)"
+        );
+        assert_eq!(store.version(), 6);
     }
 
     /// A changed DB reload bumps the version AND swaps the served snapshot.
