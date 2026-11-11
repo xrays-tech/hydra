@@ -94,6 +94,12 @@
 - `delete_tenant` 在写事务里使用**带租户范围的文本协议 DELETE**（`.persistent(false)`），
   避免 MySQL 1615 `Prepared statement needs to be re-prepared`。这是实现细节，运维无需动作；
   备份/ restore 与普通 SQL 不受影响。
+- **`rows_affected` 语义不同，不能当作正确性判据**：PostgreSQL 报告的是 *matched* 行数，
+  MySQL 报告的是 *changed* 行数。对同一行做值完全相同的 `UPDATE`，PG 会报 1 行、MySQL 报
+  0 行。Hydra 用写事务里的显式存在性探测判断 404，不依赖该计数；值未变的更新在两个后端
+  都返回成功。唯一可见差异是这种 no-op 可能在 PG 上仍递增 `config_revision`、在 MySQL 上不
+  递增——最多带来一次无害的 `changed=false` reload。不要从原始行数推断“不存在”“写入丢失”或
+  据此告警。
 
 ---
 
@@ -214,8 +220,14 @@ Unix 秒；配合 `hydra_config_version` 与 `snapshot_stale` 判断是否收敛
 - **数据库本身是高价值资产**：它持有租户、用户、api-key 摘要与密文凭据。限制网络访问、
   使用独立凭据、加密备份。
 - **每个节点都有自己的管理口与 admin token**；管理口仍应只绑内网/回环。
-- **Redis 建议 ACL + 内网隔离**；生产用托管多 AZ。Redis 只承载数据面近似状态与配置通知，
-  不是配置权威。
+- **Redis 只在内网/回环可达**，生产用托管多 AZ。它承载数据面近似状态与配置通知，不是配置
+  权威。
+- **配置通道必须限制发布权限**：`hydra:config:changed` 只允许 Hydra 节点所用的 Redis 用户
+  发布（Redis ACL 限制 `PUBLISH`），不要暴露公网或复用多租户 Redis。伪造消息**不能注入
+  配置**——订阅者只会以数据库为准重新读取，内容不来自消息——但它能让每个订阅节点触发一次
+  以数据库为准的 reload（每节点一次全量快照重建），因此未授权的发布者是读放大/拒绝服务
+  向量，而不是配置完整性依赖。丢掉发布权限也不影响正确性：`HYDRA_CONFIG_POLL_MS` 轮询
+  兜底仍会收敛。
 
 ---
 

@@ -17,7 +17,7 @@ use hydra_core::model::{
     TenantAccessToken, TenantModel, TenantProvider, User, UserGroup,
 };
 use pingora_core::protocols::http::ServerSession;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 // `Engine` and `RngCore` look unused: both are METHOD PROVIDERS — `Engine` for
 // `.encode` on the base64url alphabet, `RngCore` for `.fill_bytes` on the CSPRNG.
 // The deps are on the `db` feature, which `proxy` (and therefore this module)
@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use base64::Engine;
 use rand::RngCore;
 
-use super::AdminState;
+use super::{AdminState, WriteCtx};
 use crate::admin::metrics;
 use crate::http::{head_chars, now_rfc3339, tail_chars};
-use crate::store::{ReloadGuard, ReloadSource};
+use crate::store::ReloadSource;
 
 /// A fully-built HTTP response (the `ServeHttp` return type).
 pub(super) type Resp = Response<Vec<u8>>;
@@ -236,7 +236,7 @@ fn limit_role_body(state: &AdminState, role: &LimitRole) -> serde_json::Value {
 
 /// Reload after a committed admin write.
 ///
-/// `write_guard` is the store reload guard the router already holds for the
+/// `ctx.guard` is the store reload guard the router already holds for the
 /// mutation; when present the call goes through
 /// [`crate::store::ConfigStore::reload_with`] and never re-takes the lock.
 /// The `None` fallback exists so a direct/test caller that is not inside the
@@ -247,12 +247,8 @@ fn limit_role_body(state: &AdminState, role: &LimitRole) -> serde_json::Value {
 /// this function only logs the failure. The write response still reports
 /// success: the DB transaction committed, and a later reload recovers the
 /// snapshot.
-async fn reload_best_effort(
-    state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
-    trace_id: &str,
-) {
-    let result = match write_guard {
+async fn reload_best_effort(state: &AdminState, ctx: &WriteCtx<'_>) {
+    let result = match ctx.guard {
         Some(guard) => {
             state
                 .store
@@ -268,7 +264,7 @@ async fn reload_best_effort(
         // That must be impossible to miss in logs and alertable from /metrics.
         tracing::error!(
             target: "hydra::admin",
-            trace_id, error = %e,
+            trace_id = ctx.trace_id, error = %e,
             "post-write reload_all FAILED: the in-memory config snapshot is now STALE              (design §5.3 keeps the old snapshot; admin writes will keep returning              2xx while having no runtime effect until a reload succeeds)"
         );
     }
@@ -402,30 +398,42 @@ fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8], trace_id: &str) -> Resu
     })
 }
 
+/// Read, size-limit and parse one JSON request body.
+///
+/// This is the ONE body-read path shared by every admin write handler: it keeps
+/// the existing 1 MiB cap / 413 `request_body_too_large`, the 400
+/// `invalid_json` envelope and `ctx.trace_id`, so a migrated handler has no
+/// opportunity to drift from the contract.
+pub(super) async fn read_json_body<T: DeserializeOwned>(
+    session: &mut ServerSession,
+    ctx: &WriteCtx<'_>,
+) -> Result<T, Box<Resp>> {
+    // Boxed so the `Err` variant stays cheap to move through the handler stack;
+    // call sites unbox it when returning the response. This keeps the documented
+    // body/parse error responses byte-for-byte and avoids a lint suppression.
+    let body = read_body(session, ctx.trace_id).await.map_err(Box::new)?;
+    parse_body(&body, ctx.trace_id).map_err(Box::new)
+}
+
 // ===========================================================================
 // Providers
 // ===========================================================================
 
 pub(super) async fn provider_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_providers(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut p: Provider = match parse_body(&body, trace_id) {
+        let mut p: Provider = match read_json_body(session, ctx).await {
             Ok(p) => p,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         if p.id.is_empty() {
             p.id = gen_id();
@@ -437,70 +445,65 @@ pub(super) async fn provider_collection(
         if p.updated_at.is_empty() {
             p.updated_at = ts;
         }
-        if let Some(r) = endpoint_error(&p, trace_id) {
+        if let Some(r) = endpoint_error(&p, ctx.trace_id) {
             return r;
         }
         match crate::db::insert_provider(state.db(), &p).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &p)
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn provider_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_provider(state.db(), id).await {
             Ok(p) => ok_json(200, &p),
             Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "provider not found", trace_id)
+                err_json(404, "not_found", "provider not found", ctx.trace_id)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let mut p: Provider = match parse_body(&body, trace_id) {
+            let mut p: Provider = match read_json_body(session, ctx).await {
                 Ok(p) => p,
-                Err(r) => return r,
+                Err(r) => return *r,
             };
             p.id = id.to_string();
             p.updated_at = now_ts();
-            if let Some(r) = endpoint_error(&p, trace_id) {
+            if let Some(r) = endpoint_error(&p, ctx.trace_id) {
                 return r;
             }
             match crate::db::update_provider(state.db(), &p).await {
                 Ok(()) => {}
-                Err(e) => return db_err_resp(e, trace_id),
+                Err(e) => return db_err_resp(e, ctx.trace_id),
             }
             match crate::db::get_provider(state.db(), id).await {
                 Ok(p) => {
-                    reload_best_effort(state, write_guard, trace_id).await;
+                    reload_best_effort(state, ctx).await;
                     ok_json(200, &p)
                 }
-                Err(_) => err_json(404, "not_found", "provider not found", trace_id),
+                Err(_) => err_json(404, "not_found", "provider not found", ctx.trace_id),
             }
         }
         "DELETE" => match crate::db::delete_provider(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -510,80 +513,72 @@ pub(super) async fn provider_item(
 
 pub(super) async fn provider_model_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_provider_models(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let m: ProviderModel = match parse_body(&body, trace_id) {
+        let m: ProviderModel = match read_json_body(session, ctx).await {
             Ok(m) => m,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         match crate::db::insert_provider_model(state.db(), &m).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &m)
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn provider_model_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_provider_model(state.db(), id).await {
             Ok(m) => ok_json(200, &m),
-            Err(e) if is_not_found(&e) => err_json(404, "not_found", "model not found", trace_id),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) if is_not_found(&e) => {
+                err_json(404, "not_found", "model not found", ctx.trace_id)
+            }
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let mut m: ProviderModel = match parse_body(&body, trace_id) {
+            let mut m: ProviderModel = match read_json_body(session, ctx).await {
                 Ok(m) => m,
-                Err(r) => return r,
+                Err(r) => return *r,
             };
             m.id = id.to_string();
             match crate::db::update_provider_model(state.db(), &m).await {
                 Ok(()) => {}
-                Err(e) => return db_err_resp(e, trace_id),
+                Err(e) => return db_err_resp(e, ctx.trace_id),
             }
             match crate::db::get_provider_model(state.db(), id).await {
                 Ok(m) => {
-                    reload_best_effort(state, write_guard, trace_id).await;
+                    reload_best_effort(state, ctx).await;
                     ok_json(200, &m)
                 }
-                Err(_) => err_json(404, "not_found", "model not found", trace_id),
+                Err(_) => err_json(404, "not_found", "model not found", ctx.trace_id),
             }
         }
         "DELETE" => match crate::db::delete_provider_model(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -593,11 +588,10 @@ pub(super) async fn provider_model_item(
 
 pub(super) async fn provider_key_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     query: Option<&str>,
-    trace_id: &str,
 ) -> Resp {
     // `?reveal=1` is accepted for backward-compat but is now a no-op: the
     // admin API NEVER returns plaintext provider keys (P1-5). An admin-token
@@ -620,16 +614,12 @@ pub(super) async fn provider_key_collection(
                     .collect();
                 ok_json(200, &out)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut k: ProviderKey = match parse_body(&body, trace_id) {
+        let mut k: ProviderKey = match read_json_body(session, ctx).await {
             Ok(k) => k,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         // A provider key must carry a real credential: an empty value would be
         // stored as an authoritative-but-useless key, so every request routed to
@@ -639,7 +629,7 @@ pub(super) async fn provider_key_collection(
                 400,
                 "invalid_api_key",
                 "api_key must not be empty",
-                trace_id,
+                ctx.trace_id,
             );
         }
         if k.id.is_empty() {
@@ -650,9 +640,9 @@ pub(super) async fn provider_key_collection(
         }
         match crate::db::insert_provider_key(state.db(), state.key_provider.as_ref(), &k).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         // Never echo plaintext back (P1-5) — re-expose only via the masked DTO.
         let masked = hydra_core::rewrite::mask_key(&k.api_key);
         let dto = ProviderKeyDto {
@@ -663,17 +653,16 @@ pub(super) async fn provider_key_collection(
         };
         ok_json(201, &dto)
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn provider_key_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => {
@@ -688,18 +677,16 @@ pub(super) async fn provider_key_item(
                     };
                     ok_json(200, &dto)
                 }
-                Err(e) if is_not_found(&e) => err_json(404, "not_found", "key not found", trace_id),
-                Err(e) => db_err_resp(e, trace_id),
+                Err(e) if is_not_found(&e) => {
+                    err_json(404, "not_found", "key not found", ctx.trace_id)
+                }
+                Err(e) => db_err_resp(e, ctx.trace_id),
             }
         }
         "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let mut k: ProviderKey = match parse_body(&body, trace_id) {
+            let mut k: ProviderKey = match read_json_body(session, ctx).await {
                 Ok(k) => k,
-                Err(r) => return r,
+                Err(r) => return *r,
             };
             // PUT is an OVERWRITE (upsert), so an empty credential must never be
             // accepted: it would silently destroy the working key that was there
@@ -709,7 +696,7 @@ pub(super) async fn provider_key_item(
                     400,
                     "invalid_api_key",
                     "api_key must not be empty",
-                    trace_id,
+                    ctx.trace_id,
                 );
             }
             k.id = id.to_string();
@@ -722,9 +709,9 @@ pub(super) async fn provider_key_item(
             match crate::db::upsert_provider_key(state.db(), state.key_provider.as_ref(), &k).await
             {
                 Ok(()) => {}
-                Err(e) => return db_err_resp(e, trace_id),
+                Err(e) => return db_err_resp(e, ctx.trace_id),
             }
-            reload_best_effort(state, write_guard, trace_id).await;
+            reload_best_effort(state, ctx).await;
             let masked = hydra_core::rewrite::mask_key(&k.api_key);
             let dto = ProviderKeyDto {
                 id: k.id,
@@ -736,12 +723,12 @@ pub(super) async fn provider_key_item(
         }
         "DELETE" => match crate::db::delete_provider_key(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -935,10 +922,9 @@ fn resolved_cert_write(action: CertWrite) -> Option<(Option<String>, Option<Stri
 
 pub(super) async fn tenant_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_tenants(state.db()).await {
@@ -949,16 +935,12 @@ pub(super) async fn tenant_collection(
                     .collect();
                 ok_json(200, &views)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let up: TenantUpsert = match parse_body(&body, trace_id) {
+        let up: TenantUpsert = match read_json_body(session, ctx).await {
             Ok(u) => u,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         let mut t = up.tenant;
         if t.id.is_empty() {
@@ -980,7 +962,7 @@ pub(super) async fn tenant_collection(
             &up.cert_key_pem,
             t.cert_file.as_deref(),
             t.cert_key.as_deref(),
-            trace_id,
+            ctx.trace_id,
         ) {
             Ok(a) => a,
             Err(r) => return r,
@@ -1000,37 +982,34 @@ pub(super) async fn tenant_collection(
         )
         .await
         {
-            return db_err_resp(e, trace_id);
+            return db_err_resp(e, ctx.trace_id);
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &TenantView::from_state(state, t))
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn tenant_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_tenant(state.db(), id).await {
             Ok(t) => ok_json(200, &TenantView::from_state(state, t)),
-            Err(e) if is_not_found(&e) => err_json(404, "not_found", "tenant not found", trace_id),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) if is_not_found(&e) => {
+                err_json(404, "not_found", "tenant not found", ctx.trace_id)
+            }
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let up: TenantUpsert = match parse_body(&body, trace_id) {
+            let up: TenantUpsert = match read_json_body(session, ctx).await {
                 Ok(u) => u,
-                Err(r) => return r,
+                Err(r) => return *r,
             };
             let mut t = up.tenant;
             t.id = id.to_string();
@@ -1042,7 +1021,7 @@ pub(super) async fn tenant_item(
                 &up.cert_key_pem,
                 t.cert_file.as_deref(),
                 t.cert_key.as_deref(),
-                trace_id,
+                ctx.trace_id,
             ) {
                 Ok(a) => a,
                 Err(r) => return r,
@@ -1059,27 +1038,27 @@ pub(super) async fn tenant_item(
             )
             .await
             {
-                return db_err_resp(e, trace_id);
+                return db_err_resp(e, ctx.trace_id);
             }
             match crate::db::get_tenant(state.db(), id).await {
                 Ok(t) => {
-                    reload_best_effort(state, write_guard, trace_id).await;
+                    reload_best_effort(state, ctx).await;
                     ok_json(200, &TenantView::from_state(state, t))
                 }
                 Err(e) if is_not_found(&e) => {
-                    err_json(404, "not_found", "tenant not found", trace_id)
+                    err_json(404, "not_found", "tenant not found", ctx.trace_id)
                 }
-                Err(e) => db_err_resp(e, trace_id),
+                Err(e) => db_err_resp(e, ctx.trace_id),
             }
         }
         "DELETE" => match crate::db::delete_tenant(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -1089,123 +1068,111 @@ pub(super) async fn tenant_item(
 
 pub(super) async fn tenant_provider_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_tenant_providers(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut tp: TenantProvider = match parse_body(&body, trace_id) {
+        let mut tp: TenantProvider = match read_json_body(session, ctx).await {
             Ok(tp) => tp,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         if tp.id.is_empty() {
             tp.id = gen_id();
         }
         match crate::db::insert_tenant_provider(state.db(), &tp).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &tp)
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn tenant_provider_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_tenant_provider(state.db(), id).await {
             Ok(tp) => ok_json(200, &tp),
             Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "tenant_provider not found", trace_id)
+                err_json(404, "not_found", "tenant_provider not found", ctx.trace_id)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "DELETE" => match crate::db::delete_tenant_provider(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
 pub(super) async fn tenant_model_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_tenant_models(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut tm: TenantModel = match parse_body(&body, trace_id) {
+        let mut tm: TenantModel = match read_json_body(session, ctx).await {
             Ok(tm) => tm,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         if tm.id.is_empty() {
             tm.id = gen_id();
         }
         match crate::db::insert_tenant_model(state.db(), &tm).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &tm)
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn tenant_model_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_tenant_model(state.db(), id).await {
             Ok(tm) => ok_json(200, &tm),
             Err(e) if is_not_found(&e) => {
-                err_json(404, "not_found", "tenant_model not found", trace_id)
+                err_json(404, "not_found", "tenant_model not found", ctx.trace_id)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "DELETE" => match crate::db::delete_tenant_model(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -1389,10 +1356,9 @@ fn masked_limit_role(role: &LimitRole) -> LimitRole {
 
 pub(super) async fn limit_role_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_limit_roles(state.db(), state.key_provider.as_ref()).await {
@@ -1400,20 +1366,16 @@ pub(super) async fn limit_role_collection(
                 let masked: Vec<LimitRole> = rows.iter().map(masked_limit_role).collect();
                 ok_json(200, &masked)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "POST" {
-        let body = match read_body(session, trace_id).await {
-            Ok(b) => b,
-            Err(r) => return r,
-        };
-        let mut r: LimitRole = match parse_body(&body, trace_id) {
+        let mut r: LimitRole = match read_json_body(session, ctx).await {
             Ok(r) => r,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
         // D-11 (2026-10-09): refuse the dead dimension BEFORE anything is persisted.
         if let Some(provider) = r.matching_provider.as_deref() {
-            return matching_provider_write_error(provider, trace_id);
+            return matching_provider_write_error(provider, ctx.trace_id);
         }
         if r.id.is_empty() {
             r.id = gen_id();
@@ -1423,64 +1385,61 @@ pub(super) async fn limit_role_collection(
         }
         match crate::db::insert_limit_role(state.db(), state.key_provider.as_ref(), &r).await {
             Ok(()) => {}
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         }
-        reload_best_effort(state, write_guard, trace_id).await;
+        reload_best_effort(state, ctx).await;
         ok_json(201, &limit_role_body(state, &r))
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
 pub(super) async fn limit_role_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await
         {
             Ok(r) => ok_json(200, &masked_limit_role(&r)),
-            Err(e) if is_not_found(&e) => err_json(404, "not_found", "role not found", trace_id),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) if is_not_found(&e) => {
+                err_json(404, "not_found", "role not found", ctx.trace_id)
+            }
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
         "PUT" => {
-            let body = match read_body(session, trace_id).await {
-                Ok(b) => b,
-                Err(r) => return r,
-            };
-            let mut r: LimitRole = match parse_body(&body, trace_id) {
+            let mut r: LimitRole = match read_json_body(session, ctx).await {
                 Ok(r) => r,
-                Err(resp) => return resp,
+                Err(resp) => return *resp,
             };
             // D-11 (2026-10-09): refuse the dead dimension BEFORE anything is persisted.
             if let Some(provider) = r.matching_provider.as_deref() {
-                return matching_provider_write_error(provider, trace_id);
+                return matching_provider_write_error(provider, ctx.trace_id);
             }
             r.id = id.to_string();
             match crate::db::update_limit_role(state.db(), state.key_provider.as_ref(), &r).await {
                 Ok(()) => {}
-                Err(e) => return db_err_resp(e, trace_id),
+                Err(e) => return db_err_resp(e, ctx.trace_id),
             }
             match crate::db::get_limit_role(state.db(), state.key_provider.as_ref(), id).await {
                 Ok(r) => {
-                    reload_best_effort(state, write_guard, trace_id).await;
+                    reload_best_effort(state, ctx).await;
                     ok_json(200, &limit_role_body(state, &r))
                 }
-                Err(_) => err_json(404, "not_found", "role not found", trace_id),
+                Err(_) => err_json(404, "not_found", "role not found", ctx.trace_id),
             }
         }
         "DELETE" => match crate::db::delete_limit_role(state.db(), id).await {
             Ok(()) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -1944,18 +1903,13 @@ fn global_role_write_warnings(role: &GlobalRole) -> Vec<String> {
 ///    failure is logged and marks the snapshot stale without failing the response.
 async fn global_role_put(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     path_id: Option<String>,
-    trace_id: &str,
 ) -> Resp {
-    let body = match read_body(session, trace_id).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let req: GlobalRoleWrite = match parse_body(&body, trace_id) {
+    let req: GlobalRoleWrite = match read_json_body(session, ctx).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let id = match path_id {
@@ -1968,11 +1922,11 @@ async fn global_role_put(
 
     let existing: Vec<GlobalRole> = match crate::db::list_global_roles(state.db()).await {
         Ok(rows) => rows,
-        Err(e) => return db_err_resp(e, trace_id),
+        Err(e) => return db_err_resp(e, ctx.trace_id),
     };
     let previous = existing.iter().find(|r| r.id == id);
 
-    let dims: RoleDims = match load_role_dims(state, trace_id).await {
+    let dims: RoleDims = match load_role_dims(state, ctx.trace_id).await {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -1996,14 +1950,14 @@ async fn global_role_put(
     };
 
     if let Some(reason) = global_role_write_error(&role, &dims) {
-        return err_json(400, "invalid_role", &reason, trace_id);
+        return err_json(400, "invalid_role", &reason, ctx.trace_id);
     }
 
     let warnings = global_role_write_warnings(&role);
     for warning in &warnings {
         tracing::warn!(
             target: "hydra::admin",
-            trace_id,
+            trace_id = ctx.trace_id,
             role_id = %role.id,
             "global_role write: {warning}",
         );
@@ -2014,10 +1968,10 @@ async fn global_role_put(
     let providers = normalize_providers(&role.provider_ids);
     match crate::db::upsert_global_role_with_providers(state.db(), &role, &providers).await {
         Ok(_) => {}
-        Err(e) => return db_err_resp(e, trace_id),
+        Err(e) => return db_err_resp(e, ctx.trace_id),
     }
 
-    reload_best_effort(state, write_guard, trace_id).await;
+    reload_best_effort(state, ctx).await;
 
     let mut out = serde_json::to_value(&role).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut out {
@@ -2045,17 +1999,12 @@ const MAX_BULK_ROLES: usize = 5_000;
 /// transaction and is followed by ONE reload/publish.
 pub(super) async fn global_role_bulk(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
-    trace_id: &str,
 ) -> Resp {
-    let body = match read_body(session, trace_id).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let req: GlobalRolesBulkBody = match parse_body(&body, trace_id) {
+    let req: GlobalRolesBulkBody = match read_json_body(session, ctx).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if req.roles.len() > MAX_BULK_ROLES {
         return err_json(
@@ -2066,7 +2015,7 @@ pub(super) async fn global_role_bulk(
                  request — split it into smaller chunks",
                 req.roles.len()
             ),
-            trace_id,
+            ctx.trace_id,
         );
     }
     if req.roles.is_empty() {
@@ -2075,9 +2024,9 @@ pub(super) async fn global_role_bulk(
 
     let existing: Vec<GlobalRole> = match crate::db::list_global_roles(state.db()).await {
         Ok(rows) => rows,
-        Err(e) => return db_err_resp(e, trace_id),
+        Err(e) => return db_err_resp(e, ctx.trace_id),
     };
-    let dims: RoleDims = match load_role_dims(state, trace_id).await {
+    let dims: RoleDims = match load_role_dims(state, ctx.trace_id).await {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -2096,7 +2045,7 @@ pub(super) async fn global_role_bulk(
                 400,
                 "duplicate_id",
                 &format!("id {id:?} appears more than once in this bulk request"),
-                trace_id,
+                ctx.trace_id,
             );
         }
         let previous = existing.iter().find(|r| r.id == id);
@@ -2124,13 +2073,13 @@ pub(super) async fn global_role_bulk(
                 400,
                 "invalid_role",
                 &format!("role {:?}: {reason}", role.id),
-                trace_id,
+                ctx.trace_id,
             );
         }
         for warning in global_role_write_warnings(&role) {
             tracing::warn!(
                 target: "hydra::admin",
-                trace_id,
+                trace_id = ctx.trace_id,
                 role_id = %role.id,
                 "global_role bulk write: {warning}",
             );
@@ -2157,10 +2106,10 @@ pub(super) async fn global_role_bulk(
 
     match crate::db::upsert_global_roles_bulk(state.db(), &roles).await {
         Ok(()) => {}
-        Err(e) => return db_err_resp(e, trace_id),
+        Err(e) => return db_err_resp(e, ctx.trace_id),
     }
 
-    reload_best_effort(state, write_guard, trace_id).await;
+    reload_best_effort(state, ctx).await;
 
     ok_json(200, &serde_json::json!({"roles": out_roles}))
 }
@@ -2174,20 +2123,19 @@ pub(super) async fn global_role_bulk(
 /// identically (plan §3.4 determinism).
 pub(super) async fn global_role_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
-    trace_id: &str,
 ) -> Resp {
     if method == "GET" {
         match crate::db::list_global_roles(state.db()).await {
             Ok(rows) => ok_json(200, &rows),
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         }
     } else if method == "PUT" {
-        global_role_put(state, write_guard, session, None, trace_id).await
+        global_role_put(state, ctx, session, None).await
     } else {
-        method_not_allowed(trace_id)
+        method_not_allowed(ctx.trace_id)
     }
 }
 
@@ -2198,30 +2146,29 @@ pub(super) async fn global_role_collection(
 /// there ⇒ 404 (the provider child rows go with it through `ON DELETE CASCADE`).
 pub(super) async fn global_role_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::list_global_roles(state.db()).await {
             Ok(rows) => match rows.iter().find(|r| r.id == id) {
                 Some(role) => ok_json(200, role),
-                None => err_json(404, "not_found", "global role not found", trace_id),
+                None => err_json(404, "not_found", "global role not found", ctx.trace_id),
             },
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        "PUT" => global_role_put(state, write_guard, session, Some(id.to_string()), trace_id).await,
+        "PUT" => global_role_put(state, ctx, session, Some(id.to_string())).await,
         "DELETE" => match crate::db::delete_global_role(state.db(), id).await {
-            Ok(0) => err_json(404, "not_found", "global role not found", trace_id),
+            Ok(0) => err_json(404, "not_found", "global role not found", ctx.trace_id),
             Ok(_) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        _ => method_not_allowed(trace_id),
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -2518,11 +2465,10 @@ fn normalize_expires_at(raw: Option<&str>) -> Result<Option<String>, String> {
 /// be a dangling credential the moment its INSERT met the FK.
 pub(super) async fn tenant_access_token_collection(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     method: &str,
     tenant_id: &str,
-    trace_id: &str,
 ) -> Resp {
     match method {
         "GET" => match crate::db::list_tenant_access_tokens(state.db()).await {
@@ -2534,12 +2480,10 @@ pub(super) async fn tenant_access_token_collection(
                     .collect();
                 ok_json(200, &views)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
-        "POST" => {
-            tenant_access_token_create(state, write_guard, session, tenant_id, trace_id).await
-        }
-        _ => method_not_allowed(trace_id),
+        "POST" => tenant_access_token_create(state, ctx, session, tenant_id).await,
+        _ => method_not_allowed(ctx.trace_id),
     }
 }
 
@@ -2549,36 +2493,31 @@ pub(super) async fn tenant_access_token_collection(
 /// (see [`tenant_access_token_collection`]'s note on why 404 beats an FK 400).
 async fn tenant_access_token_create(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     session: &mut ServerSession,
     tenant_id: &str,
-    trace_id: &str,
 ) -> Resp {
     match crate::db::get_tenant(state.db(), tenant_id).await {
         Ok(_) => {}
         Err(e) if is_not_found(&e) => {
-            return err_json(404, "not_found", "tenant not found", trace_id);
+            return err_json(404, "not_found", "tenant not found", ctx.trace_id);
         }
-        Err(e) => return db_err_resp(e, trace_id),
+        Err(e) => return db_err_resp(e, ctx.trace_id),
     }
 
-    let body = match read_body(session, trace_id).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let req: AccessTokenWrite = match parse_body(&body, trace_id) {
+    let req: AccessTokenWrite = match read_json_body(session, ctx).await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let name: String = match access_token_name_or_error(req.name.as_deref()) {
         Ok(v) => v,
-        Err(reason) => return err_json(400, "invalid_name", &reason, trace_id),
+        Err(reason) => return err_json(400, "invalid_name", &reason, ctx.trace_id),
     };
 
     let expires_at: Option<String> = match normalize_expires_at(req.expires_at.as_deref()) {
         Ok(v) => v,
-        Err(reason) => return err_json(400, "invalid_expires_at", &reason, trace_id),
+        Err(reason) => return err_json(400, "invalid_expires_at", &reason, ctx.trace_id),
     };
 
     // `UNIQUE(tenant_id, name)` pre-checked from the CURRENT rows so the answer is
@@ -2586,7 +2525,7 @@ async fn tenant_access_token_create(
     let existing: Vec<TenantAccessToken> =
         match crate::db::list_tenant_access_tokens(state.db()).await {
             Ok(rows) => rows,
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         };
     if existing
         .iter()
@@ -2596,7 +2535,7 @@ async fn tenant_access_token_create(
             409,
             "duplicate_name",
             "this tenant already has an access token with that name",
-            trace_id,
+            ctx.trace_id,
         );
     }
 
@@ -2633,16 +2572,16 @@ async fn tenant_access_token_create(
                     409,
                     "duplicate_name",
                     "another request created a token with that name first",
-                    trace_id,
+                    ctx.trace_id,
                 );
             }
         }
-        return db_err_resp(e, trace_id);
+        return db_err_resp(e, ctx.trace_id);
     }
 
     // The DB row is committed; a reload failure only marks the in-memory
     // snapshot stale and is deliberately NOT turned into a failed write.
-    reload_best_effort(state, write_guard, trace_id).await;
+    reload_best_effort(state, ctx).await;
 
     ok_json(
         201,
@@ -2670,33 +2609,32 @@ async fn tenant_access_token_create(
 /// of tenants they are not allowed to see.
 pub(super) async fn tenant_access_token_item(
     state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
+    ctx: &WriteCtx<'_>,
     method: &str,
     tenant_id: &str,
     token_id: &str,
-    trace_id: &str,
 ) -> Resp {
     if method != "DELETE" {
-        return method_not_allowed(trace_id);
+        return method_not_allowed(ctx.trace_id);
     }
 
     let existing: Vec<TenantAccessToken> =
         match crate::db::list_tenant_access_tokens(state.db()).await {
             Ok(rows) => rows,
-            Err(e) => return db_err_resp(e, trace_id),
+            Err(e) => return db_err_resp(e, ctx.trace_id),
         };
     match existing.iter().find(|r| r.id == token_id) {
-        None => err_json(404, "not_found", "access token not found", trace_id),
+        None => err_json(404, "not_found", "access token not found", ctx.trace_id),
         Some(r) if r.tenant_id != tenant_id => {
-            err_json(404, "not_found", "access token not found", trace_id)
+            err_json(404, "not_found", "access token not found", ctx.trace_id)
         }
         Some(_) => match crate::db::delete_tenant_access_token(state.db(), token_id).await {
-            Ok(0) => err_json(404, "not_found", "access token not found", trace_id),
+            Ok(0) => err_json(404, "not_found", "access token not found", ctx.trace_id),
             Ok(_) => {
-                reload_best_effort(state, write_guard, trace_id).await;
+                reload_best_effort(state, ctx).await;
                 empty(204)
             }
-            Err(e) => db_err_resp(e, trace_id),
+            Err(e) => db_err_resp(e, ctx.trace_id),
         },
     }
 }

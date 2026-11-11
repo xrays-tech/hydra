@@ -56,7 +56,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_ENCRYPTION_KEY_VERSION` | master-key version tag written to new ciphertext (default 1). A rotation sets the NEW version here (positive integer; `0`/garbage is refused at startup rather than silently defaulted). |
 | `HYDRA_ENCRYPTION_KEY_PREVIOUS` (+ `_PREVIOUS_VERSION`) | the OLD master key during a rotation window: with it set, the provider keeps a key ring so existing ciphertext still opens while `HYDRA_RESEAL_SECRETS=1` rewrites every row. Drop both after a clean re-seal report. |
 | `HYDRA_RESEAL_SECRETS` | *(unset)* | **One-shot maintenance switch**: set to `1`, `true`, `yes` or `on` (case-insensitive) to re-seal every stored secret under `HYDRA_ENCRYPTION_KEY`/`_VERSION` and EXIT — the process does not serve traffic in this mode. Run it once during a rotation, with the old key still present in `HYDRA_ENCRYPTION_KEY_PREVIOUS`; the report (`provider_keys=… tenant_certs=… limit_keys=… already_current=… failed=…`) decides the exit code, and `failed` non-empty means **do not delete the previous key**. A row whose version already equals the current one is re-verified by actually opening it, so "already current" means "opens under the current key" — measured live 2026-09-30 with a row *labelled* current but sealed with other material: it is reported as `reseal FAILED: … labelled key_version 2 (the CURRENT version) but it does NOT open under the current key …`, exit 1. `0`/`false`/`no`/`off` (and unset) mean "serve normally" as you would expect. **Any other value is REFUSED at startup** (`exit 1`, with the offending value echoed): before 2026-09-30 every unrecognised value — `YES`, `on`, `TRUE`, `reseal`, `2` — silently fell through to "serve traffic normally", so a typo in this one-shot command left the operator with a healthy-looking node and **no indication that the rotation never ran** (measured in `integration/test_key_rotation_live.py`). See §3. |
-| `HYDRA_DB_URL` | *(compiled-backend fallback)* | **Required in practice.** Shared PostgreSQL/MySQL URL. The scheme must match the compiled backend (`db-postgres` ⇒ `postgres://…`, `db-mysql` ⇒ `mysql://…`); there is no runtime driver switch. |
+| `HYDRA_DB_URL` | *(compiled-backend fallback)* | **Required in practice.** Shared PostgreSQL/MySQL URL. The scheme must match the compiled backend (`db-postgres` ⇒ `postgres://…`, `db-mysql` ⇒ `mysql://…`); there is no runtime driver switch. **Production transport:** add `sslmode=verify-full` (PostgreSQL) or `ssl-mode=VERIFY_IDENTITY` (MySQL) and verify the server certificate/hostname; `require`/`REQUIRED`/`prefer`/`PREFERRED`/`disable` are not acceptable. See §1.3. |
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy **plaintext** listener. Always bound — the listener topology is derived from configuration only, never from whether tenants have certs (see `dev-docs/bug-2026-09-16-tenant-cert-flips-listener-to-tls.md`). |
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
@@ -150,6 +150,22 @@ at the DB boundary. The master key (`HYDRA_ENCRYPTION_KEY`, §1.2) is the primar
 protection — a stolen database dump alone is useless without it. Harden the database
 itself: a dedicated least-privilege account, network ACLs / TLS, encrypted storage and
 encrypted backups. The old per-file `chmod 0600`/`data/` instructions no longer apply.
+
+#### Production transport checklist — the DB link is part of the trust boundary
+
+The shared database holds **every tenant**, every client api-key hash, and every sealed
+provider key/certificate private key. Its transport is therefore not ordinary backend
+traffic; losing its confidentiality or server authentication loses the control plane.
+
+- **PostgreSQL:** the URL must carry `sslmode=verify-full` (encrypt **and** verify the
+  certificate chain plus the server hostname). `require` encrypts without hostname
+  verification; `prefer`/`disable` may not encrypt at all.
+- **MySQL:** the URL must carry `ssl-mode=VERIFY_IDENTITY`. `REQUIRED` encrypts but does
+  not verify the server identity; `PREFERRED`/`DISABLED` are not acceptable.
+- **Credentials in the shipped compose manifests are local-dev/drill only.** They are not
+  production credentials; use a dedicated least-privilege account and deliver the URL
+  through a secret mechanism (Kubernetes secret, External Secrets, root-owned
+  `EnvironmentFile`).
 
 #### Rotating the master key (`HYDRA_ENCRYPTION_KEY`) — supported procedure
 
@@ -279,6 +295,21 @@ second home in the node's own SQLite database, and migration `0013` **drops that
 §"Destructive upgrade" below for what to do before upgrading. A cluster node
 loads the same shared database; there is no replica rebuild from a leader and no
 `db::restore_config` any more.
+
+### 1.5 Admin audit table (design only — NOT implemented in this phase)
+
+A future hardening phase should add an append-only `admin_audit` table to the same shared
+database. Every admin/tenant-API mutation would insert exactly one row **in the same
+serialized write transaction** as the data change and the `config_revision` bump, so the
+audit record commits if and only if the change commits — there is no “changed but not
+audited” window. The row would carry `actor` (admin or tenant identity), `action`
+(verb/route), `entity` (table + id), `request_id` (the `X-Hydra-Trace-Id`), and
+`timestamp`; secrets are redacted (only masked key material, never plaintext).
+
+This is **design only**: no table, migration, write hook, retention job or export exists
+in this phase. Retention, export (e.g. to a SIEM) and tamper-evidence are a separate
+decision. The same append-only write path could later serve as a transactional outbox,
+but that is also not part of the current shared-DB baseline.
 
 ---
 
@@ -560,7 +591,7 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 > * **Write the DIGEST form** — `sha256:<64 lowercase hex>` (decision D-16③) — when that matters: it
 >   matches the same key and stores **nothing recoverable at all**, not even under the master key
 >   (`printf %s "$KEY" | sha256sum`, then prefix the hex with `sha256:`).
-> * the **raw** form also fires (measured on the leader: `[200, 200, 429, 429]` for
+> * the **raw** form also fires (measured on a live node: `[200, 200, 429, 429]` for
 >   `sk-raw-only-probe-77`; before the fix the same leg measured `[200, 200, 200, 200]`, i.e. a
 >   quota that looked configured and enforced nothing) — use it only when you accept the exposure
 >   above, e.g. a throwaway key;
@@ -591,7 +622,7 @@ curl -X POST .../api/v1/limit-roles -H "Authorization: Bearer $T" -d '{
 >   the node log right after it; no explicit `POST /reload` needed). **Since 2026-10-08 (decision D-17)
 >   the write response ALSO carries them**: `POST`/`PUT /api/v1/limit-roles` answers with a `warnings`
 >   array — **always present, possibly empty** — holding exactly the warnings whose subject is the role
->   you just wrote, so a script no longer has to read the leader's log to learn that the role it created
+>   you just wrote, so a script no longer has to read the node log to learn that the role it created
 >   is unsound (e.g. a key-scoped role without a tenant scope is a shared cross-tenant budget;
 >   `crates/hydra-server/tests/admin_api.rs::limit_role_write_returns_the_warnings_for_that_role`
 >   pins both the non-empty and the empty case). The former "can never match" example — a role with a
@@ -1392,6 +1423,19 @@ The connection pool uses `redis::reconnect_policy()` (retry forever, 1 s, jitter
 `hydra_control_poll_total{result="rate_limit_error"}`: it counts fail-open decisions and
 stops growing once Redis is back.
 
+### 13.5a Config-channel ACL: Redis is internal-only
+
+`hydra:config:changed` is a notification channel, not a configuration source. Restrict
+`PUBLISH` on it to the Redis user the Hydra nodes authenticate as (Redis ACL), and keep
+Redis reachable only on a private network/loopback (never a public listener and never a
+shared multi-tenant Redis). A forged message **cannot inject configuration** — every
+subscriber re-reads the shared database, which is authoritative — but it can make every
+node perform a DB-authoritative reload, so an unauthenticated publisher is a
+read-amplification/denial-of-service vector: each spoofed message can trigger a full
+snapshot rebuild per subscribed node (subject to the §9.0b coalescing window). Losing
+publish permission is not a correctness failure: the `HYDRA_CONFIG_POLL_MS` fallback
+still converges.
+
 ### 13.5b Shutdown drain vs `terminationGracePeriodSeconds`
 
 `HYDRA_SHUTDOWN_DRAIN_SECS` (default **20**) is how long Pingora may spend draining
@@ -1428,6 +1472,14 @@ commit.
   `limit_window`); `delete_tenant` uses a scoped text-protocol delete to avoid MySQL 1615.
   Use `mysqldump --single-transaction` for backups. Greenfield migrations live in
   `migrations/mysql/`; PostgreSQL equivalents in `migrations/postgres/`.
+- **`rows_affected` means different things per backend — never a correctness signal.**
+  PostgreSQL reports *matched* rows; MySQL reports *changed* rows. Re-`PUT`ting a
+  value-identical row therefore reports `1` modified on PostgreSQL but `0` on MySQL.
+  Hydra decides existence with an explicit in-transaction probe, not from this count, and
+  a legitimate no-op update still returns success on both. The observable divergence is
+  only that such a no-op may bump `config_revision` on PostgreSQL and not on MySQL, which
+  at worst causes a harmless no-op reload (`changed=false`) on the cluster. Do not infer
+  “not found”, “lost write” or an alert from a raw row count.
 - **Revision rewind** after a restore/manual SQL: a node whose local version is ahead of
   the restored `config_revision` skips the normal reload. Run
   `POST /api/v1/reload?force=1` **on that node**. Force bumps the shared revision

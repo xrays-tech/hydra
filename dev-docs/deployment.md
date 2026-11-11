@@ -8,6 +8,21 @@
 
 ---
 
+## 0. 生产安全检查清单（最低要求）
+
+- **数据库传输必须加密并校验服务端身份**：PostgreSQL 连接串带 `sslmode=verify-full`，
+  MySQL 连接串带 `ssl-mode=VERIFY_IDENTITY`。`require`/`REQUIRED`/`prefer`/`PREFERRED`/
+  `disable` 不够——它们要么不加密，要么不验证证书里的主机名，不能作为生产配置。
+- **共享库属于信任边界本身**：它持有**所有租户**的身份与配置、全部 client api-key 摘要，
+  以及用 `HYDRA_ENCRYPTION_KEY` 封装的 provider key / 证书私钥。DB 链路的机密性与身份校验
+  不是“可选加固”，泄露或篡改它等同于泄露整个控制面。
+- **compose 清单里的 DB 用户名/口令/URL 只用于本地开发与演练**，不是生产凭据。生产必须用
+  独立的最小权限账号，并通过 secret 管理分发。
+- **Redis 只在内网/回环可达**，`hydra:config:changed` 的 `PUBLISH` 必须用 Redis ACL 限制到
+  Hydra 节点（见 `cluster.md` §8、`ops.md` §13.5a）。
+
+---
+
 ## 1. 构建
 
 Hydra 的数据库后端在**编译期**选择，恰好一个：
@@ -81,7 +96,8 @@ systemctl daemon-reload && systemctl enable --now hydra
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8081/api/v1/health   # → 200
 ```
 
-迁移在启动时执行。数据库凭据用独立账号，并限制网络访问。备份/恢复见 §6。
+迁移在启动时执行。数据库凭据用独立账号，并限制网络访问；生产连接串必须按 §0 启用
+`sslmode=verify-full` / `ssl-mode=VERIFY_IDENTITY`。备份/恢复见 §6。
 
 ### 2.2 docker-compose（单节点全栈）
 
@@ -316,7 +332,7 @@ kubectl -n hydra exec deploy/hydra -- sh -c \
 
 | 变量 | 单节点 | 集群 | 说明 |
 |---|---|---|---|
-| `HYDRA_DB_URL` | **必填** | **必填，所有节点相同** | PostgreSQL/MySQL URL；scheme 必须匹配编译后端 |
+| `HYDRA_DB_URL` | **必填** | **必填，所有节点相同** | PostgreSQL/MySQL URL；scheme 必须匹配编译后端。生产必须带 `sslmode=verify-full`（PG）或 `ssl-mode=VERIFY_IDENTITY`（MySQL），见 §0 |
 | `HYDRA_REDIS_URL` | 不设置 | **必填** | 集群开关；数据面共享状态 + 配置扇出 |
 | `HYDRA_CONFIG_POLL_MS` | — | 默认 `5000` | revision 探测兜底；`0`/垃圾值回退 5000 |
 | `HYDRA_NODE_ID` | 自动 | 建议每台不同 | 默认 hostname，其次随机 |

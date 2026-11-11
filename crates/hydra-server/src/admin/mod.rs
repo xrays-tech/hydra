@@ -35,7 +35,19 @@ use tracing::warn;
 use crate::crypto::KeyProvider;
 use crate::proxy::admission::AdmissionControl;
 use crate::proxy::breaker_wrap::CircuitBreaker;
-use crate::store::ConfigStore;
+use crate::store::{ConfigStore, ReloadGuard};
+
+/// Everything a mutation handler needs from the router: the reload guard the
+/// router holds across the DB write + reload, and the request's trace id.
+///
+/// The guard is built ONCE per mutation by the router. Handlers pass this one
+/// value through instead of threading `Option<&ReloadGuard>` and `trace_id`
+/// separately, so a write handler cannot accidentally reload without the guard
+/// or answer an error with the wrong trace id.
+pub(crate) struct WriteCtx<'a> {
+    pub(crate) guard: Option<&'a ReloadGuard<'a>>,
+    pub(crate) trace_id: &'a str,
+}
 
 pub mod cluster_api;
 pub mod handlers;
@@ -458,6 +470,12 @@ impl AdminService {
         } else {
             None
         };
+        // One packed context for every mutation-capable handler below: the
+        // router holds the guard from BEFORE the DB write through reload+publish.
+        let ctx = WriteCtx {
+            guard: _write_guard.as_ref(),
+            trace_id,
+        };
         let Some(rest) = path.strip_prefix("/api/v1/") else {
             return handlers::err_json(404, "not_found", "unknown path", trace_id);
         };
@@ -538,21 +556,19 @@ impl AdminService {
             if parts.len() == 3 {
                 return handlers::tenant_access_token_collection(
                     &self.state,
-                    _write_guard.as_ref(),
+                    &ctx,
                     session,
                     method,
                     &tenant_id,
-                    trace_id,
                 )
                 .await;
             }
             return handlers::tenant_access_token_item(
                 &self.state,
-                _write_guard.as_ref(),
+                &ctx,
                 method,
                 &tenant_id,
                 parts[3],
-                trace_id,
             )
             .await;
         }
@@ -563,13 +579,7 @@ impl AdminService {
         // Bulk Global Role upsert: `/global-roles/bulk` would otherwise be read
         // as the item id `bulk` by the generic match below.
         if resource == "global-roles" && id == Some("bulk") && method == "PUT" {
-            return handlers::global_role_bulk(
-                &self.state,
-                _write_guard.as_ref(),
-                session,
-                trace_id,
-            )
-            .await;
+            return handlers::global_role_bulk(&self.state, &ctx, session).await;
         }
         // Reject paths deeper than resource[/id].
         if parts.len() > 2 {
@@ -578,143 +588,52 @@ impl AdminService {
         let state = &self.state;
         match (resource, id) {
             ("providers", None) => {
-                handlers::provider_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::provider_collection(state, &ctx, session, method).await
             }
             ("providers", Some(id)) => {
-                handlers::provider_item(state, _write_guard.as_ref(), session, method, id, trace_id)
-                    .await
+                handlers::provider_item(state, &ctx, session, method, id).await
             }
             ("provider-models", None) => {
-                handlers::provider_model_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::provider_model_collection(state, &ctx, session, method).await
             }
             ("provider-models", Some(id)) => {
-                handlers::provider_model_item(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    id,
-                    trace_id,
-                )
-                .await
+                handlers::provider_model_item(state, &ctx, session, method, id).await
             }
             ("provider-keys", None) => {
-                handlers::provider_key_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    query,
-                    trace_id,
-                )
-                .await
+                handlers::provider_key_collection(state, &ctx, session, method, query).await
             }
             ("provider-keys", Some(id)) => {
-                handlers::provider_key_item(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    id,
-                    trace_id,
-                )
-                .await
+                handlers::provider_key_item(state, &ctx, session, method, id).await
             }
-            ("tenants", None) => {
-                handlers::tenant_collection(state, _write_guard.as_ref(), session, method, trace_id)
-                    .await
-            }
-            ("tenants", Some(id)) => {
-                handlers::tenant_item(state, _write_guard.as_ref(), session, method, id, trace_id)
-                    .await
-            }
+            ("tenants", None) => handlers::tenant_collection(state, &ctx, session, method).await,
+            ("tenants", Some(id)) => handlers::tenant_item(state, &ctx, session, method, id).await,
             ("tenant-providers", None) => {
-                handlers::tenant_provider_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::tenant_provider_collection(state, &ctx, session, method).await
             }
             ("tenant-providers", Some(id)) => {
-                handlers::tenant_provider_item(state, _write_guard.as_ref(), method, id, trace_id)
-                    .await
+                handlers::tenant_provider_item(state, &ctx, method, id).await
             }
             ("tenant-models", None) => {
-                handlers::tenant_model_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::tenant_model_collection(state, &ctx, session, method).await
             }
             ("tenant-models", Some(id)) => {
-                handlers::tenant_model_item(state, _write_guard.as_ref(), method, id, trace_id)
-                    .await
+                handlers::tenant_model_item(state, &ctx, method, id).await
             }
             ("limit-roles", None) => {
-                handlers::limit_role_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::limit_role_collection(state, &ctx, session, method).await
             }
             ("limit-roles", Some(id)) => {
-                handlers::limit_role_item(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    id,
-                    trace_id,
-                )
-                .await
+                handlers::limit_role_item(state, &ctx, session, method, id).await
             }
             // Global Roles (plan §3.4): GET answers every rule incl. the DISABLED
             // ones, PUT create-or-replaces the rule AND its provider set in ONE
             // transaction, DELETE removes it (`ON DELETE CASCADE` drops the provider
             // child rows). See `handlers::global_role_collection` for the write order.
             ("global-roles", None) => {
-                handlers::global_role_collection(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    trace_id,
-                )
-                .await
+                handlers::global_role_collection(state, &ctx, session, method).await
             }
             ("global-roles", Some(id)) => {
-                handlers::global_role_item(
-                    state,
-                    _write_guard.as_ref(),
-                    session,
-                    method,
-                    id,
-                    trace_id,
-                )
-                .await
+                handlers::global_role_item(state, &ctx, session, method, id).await
             }
             // The user hierarchy, READ (plan §3.5). The cascading global-role UI
             // needs to render `role → users → keys`, and without these three paths
