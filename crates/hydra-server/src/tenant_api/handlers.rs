@@ -31,8 +31,8 @@ use hydra_core::tenant_api::TenantWriteRoute;
 use crate::http::{head_chars, now_rfc3339, tail_chars};
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
-use crate::store::{ReloadGuard, ReloadSource};
-use crate::tenant_api::{respond_json, Authenticated};
+use crate::store::ReloadSource;
+use crate::tenant_api::{respond_json, Authenticated, TenantWriteCtx};
 /// The body of `GET /whoami`.
 ///
 /// Every field is either the tenant's own non-secret configuration or a fact the
@@ -560,33 +560,23 @@ fn hierarchy_rows(cfg: &ConfigData) -> usize {
 /// `PUT /tenant/{tenant_id}/api/v1/user-groups`
 async fn user_group_upsert(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(body) => body,
-        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: UserGroupUpsertBody = match parse_body(&raw) {
+    let req: UserGroupUpsertBody = match read_json_body(
+        session,
+        write_ctx,
+        "a valid user-group upsert ({id?, name, enabled?})",
+    )
+    .await
+    {
         Ok(parsed) => parsed,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!(
-                    "request body is not a valid user-group upsert ({{id?, name, enabled?}}): {e}"
-                ),
-            )
-            .await;
-        }
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
     };
 
     let name = req.name.trim();
@@ -722,8 +712,7 @@ async fn user_group_upsert(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     // Echo the row as it now stands: the write is confirmable without a read,
     // and `config_version` is what a later call reconciles against.
@@ -739,12 +728,11 @@ async fn user_group_upsert(
 /// `DELETE /tenant/{tenant_id}/api/v1/user-groups/{id}`
 async fn user_group_delete(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
@@ -823,7 +811,7 @@ async fn user_group_delete(
         .await;
     }
 
-    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let _ = commit_and_publish(state, write_ctx, tenant_id).await?;
     // A deletion is reported by ABSENCE: 204, no body — the same convention as
     // the api-key revocation and the identity-plane DELETE family.
     super::respond_raw(session, ctx, 204, Vec::new()).await
@@ -832,31 +820,23 @@ async fn user_group_delete(
 /// `PUT /tenant/{tenant_id}/api/v1/users`
 async fn user_upsert(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(body) => body,
-        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: UserUpsertBody = match parse_body(&raw) {
+    let req: UserUpsertBody = match read_json_body(
+        session,
+        write_ctx,
+        "a valid user upsert ({id?, user_group_id, external_id?, name, enabled?})",
+    )
+    .await
+    {
         Ok(parsed) => parsed,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!("request body is not a valid user upsert ({{id?, user_group_id, external_id?, name, enabled?}}): {e}"),
-            )
-                .await;
-        }
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
     };
 
     // The group is validated against THIS TENANT's groups (the FK is
@@ -1065,8 +1045,7 @@ async fn user_upsert(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     respond_json(
         session,
@@ -1085,34 +1064,23 @@ async fn user_upsert(
 /// transaction followed by ONE reload.
 async fn user_bulk_upsert(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(body) => body,
-        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: UsersBulkBody = match parse_body(&raw) {
+    let req: UsersBulkBody = match read_json_body(
+        session,
+        write_ctx,
+        "a valid user bulk upsert ({users:[{id?, user_group_id, external_id?, name, enabled?}]})",
+    )
+    .await
+    {
         Ok(parsed) => parsed,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!(
-                    "request body is not a valid user bulk upsert \
-                     ({{users:[{{id?, user_group_id, external_id?, name, enabled?}}]}}): {e}"
-                ),
-            )
-            .await;
-        }
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
     };
     if req.users.len() > MAX_BULK_ENTRIES {
         return reject_oversized_bulk(session, ctx, req.users.len()).await;
@@ -1347,8 +1315,7 @@ async fn user_bulk_upsert(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     respond_json(
         session,
@@ -1365,34 +1332,23 @@ async fn user_bulk_upsert(
 /// tenant-locally, written in ONE transaction and reloaded ONCE.
 async fn user_group_bulk_upsert(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(body) => body,
-        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: UserGroupsBulkBody = match parse_body(&raw) {
+    let req: UserGroupsBulkBody = match read_json_body(
+        session,
+        write_ctx,
+        "a valid user-group bulk upsert ({user_groups:[{id?, name, enabled?}]})",
+    )
+    .await
+    {
         Ok(parsed) => parsed,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!(
-                    "request body is not a valid user-group bulk upsert \
-                     ({{user_groups:[{{id?, name, enabled?}}]}}): {e}"
-                ),
-            )
-            .await;
-        }
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
     };
     if req.user_groups.len() > MAX_BULK_ENTRIES {
         return reject_oversized_bulk(session, ctx, req.user_groups.len()).await;
@@ -1553,8 +1509,7 @@ async fn user_group_bulk_upsert(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     respond_json(
         session,
@@ -1574,34 +1529,23 @@ async fn user_group_bulk_upsert(
 /// in the response body.
 async fn user_api_key_bulk_create(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(body) => body,
-        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: ApiKeysBulkBody = match parse_body(&raw) {
+    let req: ApiKeysBulkBody = match read_json_body(
+        session,
+        write_ctx,
+        "a valid api-key bulk mint ({keys:[{user_id, name, expires_at?}]})",
+    )
+    .await
+    {
         Ok(parsed) => parsed,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!(
-                    "request body is not a valid api-key bulk mint \
-                     ({{keys:[{{user_id, name, expires_at?}}]}}): {e}"
-                ),
-            )
-            .await;
-        }
+        Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
     };
     if req.keys.len() > MAX_BULK_ENTRIES {
         return reject_oversized_bulk(session, ctx, req.keys.len()).await;
@@ -1778,8 +1722,7 @@ async fn user_api_key_bulk_create(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     respond_json(
         session,
@@ -1802,12 +1745,11 @@ async fn user_api_key_bulk_create(
 /// T10's tidy-up, not this endpoint's.
 async fn user_delete(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
@@ -1852,7 +1794,7 @@ async fn user_delete(
         .await;
     }
 
-    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let _ = commit_and_publish(state, write_ctx, tenant_id).await?;
     // 204, no body — reported by ABSENCE like every other delete here.
     super::respond_raw(session, ctx, 204, Vec::new()).await
 }
@@ -2030,12 +1972,11 @@ pub async fn list_user_api_keys(
 /// atoms; the plaintext never touches the DB, a log line, or an error body.
 async fn user_api_key_create(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     user_id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
@@ -2054,22 +1995,9 @@ async fn user_api_key_create(
         .await;
     }
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(b) => b,
+    let req: ApiKeyCreateBody = match read_json_body(session, write_ctx, "valid JSON").await {
+        Ok(parsed) => parsed,
         Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: ApiKeyCreateBody = match parse_body(&raw) {
-        Ok(r) => r,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!("request body is not valid JSON: {e}"),
-            )
-            .await;
-        }
     };
     let name = req.name.trim();
     if name.is_empty() {
@@ -2213,8 +2141,7 @@ async fn user_api_key_create(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     // The plaintext is shown ONCE, here, and never re-derivable. `key_hash` is
     // deliberately absent from the body as well: a display-only view of a key
@@ -2243,16 +2170,14 @@ async fn user_api_key_create(
 // Route params (user_id, key_id), request context, auth, and the reload guard
 // are all distinct inputs; grouping them into a struct would obscure the
 // anti-enumeration pairing documented above without changing the call shape.
-#[allow(clippy::too_many_arguments)]
 async fn user_api_key_delete(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     user_id: &str,
     key_id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
@@ -2296,7 +2221,7 @@ async fn user_api_key_delete(
             .await;
     }
 
-    let _ = commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let _ = commit_and_publish(state, write_ctx, tenant_id).await?;
     // Revocation is reported by absence: 204, no body, like every other
     // identity-plane DELETE here. An ABSENT id is answered by the pairing
     // above as 404 — a caller naming a key it does not own must not be told
@@ -2312,12 +2237,11 @@ async fn user_api_key_delete(
 /// credential and no provider row.
 async fn user_billing_set(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
+    write_ctx: &TenantWriteCtx<'_>,
     session: &mut Session,
     ctx: &mut RequestContext,
     auth: &Authenticated,
     user_id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<bool> {
     let tenant_id = &auth.tenant.id;
     let cfg = state.store.snapshot();
@@ -2337,22 +2261,9 @@ async fn user_billing_set(
         }
     };
 
-    let raw = match super::read_body(session, trace_id).await {
-        Ok(b) => b,
+    let req: BillingBody = match read_json_body(session, write_ctx, "valid JSON").await {
+        Ok(parsed) => parsed,
         Err((status, body)) => return super::respond_raw(session, ctx, status, body).await,
-    };
-    let req: BillingBody = match parse_body(&raw) {
-        Ok(r) => r,
-        Err(e) => {
-            return super::respond_error(
-                session,
-                ctx,
-                400,
-                "invalid_request",
-                &format!("request body is not valid JSON: {e}"),
-            )
-            .await;
-        }
     };
     // Two spellings, validated by hand so the message NAMES them. Case is
     // normalised; surrounding whitespace is not significant.
@@ -2398,8 +2309,7 @@ async fn user_billing_set(
         .await;
     }
 
-    let version =
-        commit_and_publish(state, reload_guard, session, ctx, tenant_id, trace_id).await?;
+    let version = commit_and_publish(state, write_ctx, tenant_id).await?;
 
     // The caller gets the row as it now stands, so the write is confirmable
     // without a second round-trip (and without a `GET /users` route, which this
@@ -2430,21 +2340,18 @@ async fn user_billing_set(
 /// this goes through the locked entry point and never re-takes the lock.
 async fn commit_and_publish(
     state: &AppState,
-    reload_guard: &ReloadGuard<'_>,
-    _session: &mut Session,
-    _ctx: &mut RequestContext,
+    write_ctx: &TenantWriteCtx<'_>,
     tenant_id: &str,
-    trace_id: &str,
 ) -> pingora_core::Result<u64> {
     match state
         .store
-        .reload_with(reload_guard, false, ReloadSource::Local)
+        .reload_with(write_ctx.guard, false, ReloadSource::Local)
         .await
     {
         Ok(changed) => tracing::debug!(
             target: "hydra::tenant_api",
             tenant = %tenant_id,
-            trace_id = %trace_id,
+            trace_id = %write_ctx.trace_id,
             changed,
             "post-write reload tail complete"
         ),
@@ -2452,7 +2359,7 @@ async fn commit_and_publish(
             tracing::error!(
                 target: "hydra::tenant_api",
                 tenant = %tenant_id,
-                trace_id = %trace_id,
+                trace_id = %write_ctx.trace_id,
                 error = %e,
                 "post-write reload FAILED: the write IS committed but the in-memory config \
                  snapshot is now STALE (marked in the store, alert gauge set); the response \
@@ -2507,6 +2414,31 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> 
     serde_json::from_slice(bytes).map_err(|e| e.to_string())
 }
 
+/// Read, bound and parse one tenant write body.
+///
+/// Preserves the tenant contract exactly: `super::read_body` owns the 1 MiB
+/// cap / 413 / drain behaviour, and a parse failure is 400 `invalid_request`
+/// (never the admin API's `invalid_json`). `expected` is the phrase after
+/// "request body is not", so each handler keeps its existing, shape-specific
+/// message and a caller can tell which body it should have sent.
+pub(super) async fn read_json_body<T: serde::de::DeserializeOwned>(
+    session: &mut Session,
+    write_ctx: &TenantWriteCtx<'_>,
+    expected: &str,
+) -> Result<T, (u16, Vec<u8>)> {
+    let raw = super::read_body(session, write_ctx.trace_id).await?;
+    parse_body(&raw).map_err(|e| {
+        (
+            400,
+            super::error_body(
+                "invalid_request",
+                &format!("request body is not {expected}: {e}"),
+                write_ctx.trace_id,
+            ),
+        )
+    })
+}
+
 /// The identity-plane write endpoints: gate (already done) -> handler on THIS node.
 pub async fn write(
     state: &AppState,
@@ -2515,48 +2447,35 @@ pub async fn write(
     auth: &Authenticated,
     route: TenantWriteRoute<'_>,
 ) -> pingora_core::Result<bool> {
+    // The trace id is cloned out of `ctx` BEFORE `write_ctx` borrows it: the
+    // handlers still take `ctx: &mut RequestContext`, so `write_ctx` cannot hold
+    // a borrow through it.
     let trace_id = ctx.trace_id.clone();
     // ONE write at a time, from BEFORE the DB mutation through the reload tail:
     // the store's reload lock serialises the snapshot swap with concurrent writes.
-    let _write_guard = state.store.reload_guard().await;
+    let write_guard = state.store.reload_guard().await;
+    let write_ctx = TenantWriteCtx {
+        guard: &write_guard,
+        trace_id: &trace_id,
+    };
     match route {
         // T6 (D-7 + D-5): these write ROWS in the identity tables, not the config
         // tree, and the boundary they DO need (which user inside this tenant) is carried
         // on the route variant.
         TenantWriteRoute::CreateUserApiKey { user_id, .. } => {
-            return user_api_key_create(
-                state,
-                &_write_guard,
-                session,
-                ctx,
-                auth,
-                user_id,
-                &trace_id,
-            )
-            .await;
+            return user_api_key_create(state, &write_ctx, session, ctx, auth, user_id).await;
         }
         TenantWriteRoute::CreateUserApiKeysBulk { .. } => {
-            return user_api_key_bulk_create(state, &_write_guard, session, ctx, auth, &trace_id)
-                .await;
+            return user_api_key_bulk_create(state, &write_ctx, session, ctx, auth).await;
         }
         TenantWriteRoute::DeleteUserApiKey {
             user_id, key_id, ..
         } => {
-            return user_api_key_delete(
-                state,
-                &_write_guard,
-                session,
-                ctx,
-                auth,
-                user_id,
-                key_id,
-                &trace_id,
-            )
-            .await;
+            return user_api_key_delete(state, &write_ctx, session, ctx, auth, user_id, key_id)
+                .await;
         }
         TenantWriteRoute::SetUserBilling { user_id, .. } => {
-            return user_billing_set(state, &_write_guard, session, ctx, auth, user_id, &trace_id)
-                .await;
+            return user_billing_set(state, &write_ctx, session, ctx, auth, user_id).await;
         }
         // T5 writes: the user-group and user rows. Like the identity writes above,
         // each handler reads its OWN body and runs its own statement plus
@@ -2564,24 +2483,22 @@ pub async fn write(
         // flat suffix parses above) and in the path for the two deletes, so only the
         // delete arms bind `id`.
         TenantWriteRoute::UpsertUserGroup { .. } => {
-            return user_group_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
+            return user_group_upsert(state, &write_ctx, session, ctx, auth).await;
         }
         TenantWriteRoute::UpsertUserGroupsBulk { .. } => {
-            return user_group_bulk_upsert(state, &_write_guard, session, ctx, auth, &trace_id)
-                .await;
+            return user_group_bulk_upsert(state, &write_ctx, session, ctx, auth).await;
         }
         TenantWriteRoute::DeleteUserGroup { id, .. } => {
-            return user_group_delete(state, &_write_guard, session, ctx, auth, id, &trace_id)
-                .await;
+            return user_group_delete(state, &write_ctx, session, ctx, auth, id).await;
         }
         TenantWriteRoute::UpsertUser { .. } => {
-            return user_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
+            return user_upsert(state, &write_ctx, session, ctx, auth).await;
         }
         TenantWriteRoute::UpsertUsersBulk { .. } => {
-            return user_bulk_upsert(state, &_write_guard, session, ctx, auth, &trace_id).await;
+            return user_bulk_upsert(state, &write_ctx, session, ctx, auth).await;
         }
         TenantWriteRoute::DeleteUser { id, .. } => {
-            return user_delete(state, &_write_guard, session, ctx, auth, id, &trace_id).await;
+            return user_delete(state, &write_ctx, session, ctx, auth, id).await;
         }
     }
 }

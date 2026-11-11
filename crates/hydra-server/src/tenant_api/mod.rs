@@ -55,6 +55,7 @@ use tracing::debug;
 
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::AppState;
+use crate::store::ReloadGuard;
 
 /// The reserved data-plane prefix. Everything under it is answered by this
 /// module and never reaches the proxy pipeline.
@@ -830,6 +831,19 @@ pub(super) async fn respond_json<T: serde::Serialize>(
     Ok(true)
 }
 
+/// The tenant write handlers' packed context: the reload guard the dispatcher
+/// holds across the DB mutation + reload tail, plus the request trace id.
+///
+/// Deliberately a SEPARATE type from `admin::WriteCtx`: the two APIs have
+/// different error contracts (`admin` says `invalid_json`, the tenant API says
+/// `invalid_request`) and different guards (`admin` optional, tenant always
+/// held), and a shared type would invite one surface's contract to leak into the
+/// other.
+pub(super) struct TenantWriteCtx<'a> {
+    pub(super) guard: &'a ReloadGuard<'a>,
+    pub(super) trace_id: &'a str,
+}
+
 /// Read the whole request body, bounded.
 ///
 /// The tenant API is a control surface: its bodies are a key list, never a
@@ -880,7 +894,7 @@ pub(super) async fn read_body(
 /// envelope "always carries `code` and `trace_id`" — and `trace_id` is the only
 /// thing that ties a 413 to the log line that explains it. Built with
 /// `serde_json` rather than a format string so the escaping cannot drift.
-fn error_body(code: &str, message: &str, trace_id: &str) -> Vec<u8> {
+pub(super) fn error_body(code: &str, message: &str, trace_id: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "error": { "code": code, "message": message, "trace_id": trace_id }
     }))
