@@ -24,6 +24,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "tenant_access_token",
     "global_role",
     "global_role_provider",
+    "admin_audit",
     "hydra_lock",
     "config_revision",
     "_sqlx_migrations",

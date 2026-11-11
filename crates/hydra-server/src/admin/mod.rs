@@ -24,9 +24,10 @@
 //! - **Database-authoritative writes**: every admin mutation writes the shared
 //!   relational database directly. There is no leader, lease or forwarding path.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::db::Pool;
+use crate::db::{AdminAudit, Pool};
 use async_trait::async_trait;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
@@ -94,6 +95,35 @@ fn peer_ip(session: &ServerSession) -> String {
         },
         // An in-process harness (or a unix peer) has no IP: one shared bucket.
         None => "unknown".to_string(),
+    }
+}
+
+/// True for the methods the admin router audits as mutation attempts.
+fn is_audited_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
+}
+
+/// The first `/api/v1/<segment>` path segment, for the audit row's optional
+/// `entity_type`. `None` for `/metrics` or a path outside the API prefix.
+fn audit_entity_type(path: &str) -> Option<&str> {
+    path.strip_prefix("/api/v1/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Log the FIRST admin-audit insert failure only; the metric carries the rate.
+///
+/// A broken audit schema would otherwise log on every mutation, drowning the
+/// alertable counter. The process-wide latch is deliberately one-way: recovery
+/// is visible in `hydra_admin_audit_write_total{result="ok"}`.
+fn note_admin_audit_failure(error: &sqlx::Error) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            target: "hydra::admin",
+            error = %error,
+            "admin_audit insert failed: audit trail is DEGRADED, but mutation responses are unaffected (see hydra_admin_audit_write_total)"
+        );
     }
 }
 
@@ -446,7 +476,53 @@ impl AdminService {
 
     /// The lightweight router (method + path-segment match, design §13.1).
     /// Every non-`/metrics` route is under `/api/v1/`.
+    ///
+    /// Audits every AUTHENTICATED mutation attempt after the handler returns.
+    /// Best-effort: the handler's response is authoritative and is never changed
+    /// by an audit failure (see [`Self::write_admin_audit`]).
     async fn route(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        session: &mut ServerSession,
+        trace_id: &str,
+    ) -> Resp {
+        let response = self
+            .route_inner(method, path, query, session, trace_id)
+            .await;
+        if is_audited_method(method) {
+            self.write_admin_audit(method, path, trace_id).await;
+        }
+        response
+    }
+
+    /// Append exactly one redacted audit row for a mutation attempt.
+    ///
+    /// Deliberately pool-level and best-effort, NOT part of the config-write
+    /// transaction: an audit-schema problem must not roll back or fail the
+    /// mutation. The first failure logs once per process (the metric is the
+    /// durable signal, so a broken audit table cannot spam every request).
+    async fn write_admin_audit(&self, method: &str, path: &str, trace_id: &str) {
+        let action = method.to_ascii_lowercase();
+        let entry = AdminAudit {
+            actor: "admin",
+            action: &action,
+            method,
+            path,
+            entity_type: audit_entity_type(path),
+            request_id: Some(trace_id),
+        };
+        match crate::db::insert_admin_audit(self.state.db(), &entry).await {
+            Ok(()) => crate::admin::metrics::record_admin_audit_write("ok"),
+            Err(e) => {
+                crate::admin::metrics::record_admin_audit_write("error");
+                note_admin_audit_failure(&e);
+            }
+        }
+    }
+
+    async fn route_inner(
         &self,
         method: &str,
         path: &str,

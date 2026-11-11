@@ -60,6 +60,7 @@
 //! | `hydra_invalidation_trimmed_total` | counter | — | invalidation stream trim task (entries dropped; whether or not a bump was needed) |
 //! | `hydra_invalidation_generation_bumps_total` | counter | — | invalidation stream trim task (drops that a live consumer had NOT applied ⇒ consumers must treat old cached state as unsafe) |
 //! | `hydra_admin_auth_failures_total` | counter | result | failed credential checks on the admin port, per GATE (result=<gate>_denied|<gate>_throttled, gate=admin|cluster) |
+//! | `hydra_admin_audit_write_total` | counter | result | best-effort `admin_audit` insert outcomes (result=ok\|error); an error means audit coverage is degraded, the mutation response is unaffected |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -207,6 +208,9 @@ struct Metrics {
     /// shipped `RUST_LOG=info`), so a brute-force run against the single secret
     /// gating every provider key was completely invisible.
     admin_auth_failures: IntCounterVec,
+    /// Best-effort `admin_audit` insert outcomes (`result=ok|error`). An error
+    /// means audit coverage is degraded; the mutation response is unaffected.
+    admin_audit_write: IntCounterVec,
     invalidation_trimmed: IntCounter,
     /// Trims that dropped an entry a LIVE consumer had not applied. Each one
     /// means consumers must treat cached state derived from the stream tail as
@@ -518,6 +522,12 @@ fn metrics() -> Option<&'static Metrics> {
             admin_auth_failures: register_int_counter_vec!(
                 "hydra_admin_auth_failures_total",
                 "Failed credential attempts on the admin port, by gate and outcome (admin|cluster _denied|_throttled)",
+                &["result"]
+            )
+            .ok()?,
+            admin_audit_write: register_int_counter_vec!(
+                "hydra_admin_audit_write_total",
+                "Best-effort admin mutation audit insert outcomes (result=ok|error)",
                 &["result"]
             )
             .ok()?,
@@ -1078,6 +1088,26 @@ pub fn admin_auth_failures_total(result: &str) -> f64 {
     }
 }
 
+/// Count one best-effort admin audit insert outcome (`result` = "ok" | "error").
+///
+/// `error` is the ONLY signal that the append-only audit trail is degraded: the
+/// router deliberately keeps the mutation response unchanged when the insert
+/// fails, so without this counter the loss would be invisible.
+pub fn record_admin_audit_write(result: &str) {
+    if let Some(m) = metrics() {
+        m.admin_audit_write.with_label_values(&[result]).inc();
+    }
+}
+
+/// Current value of `hydra_admin_audit_write_total{result}` (tests).
+#[must_use]
+pub fn admin_audit_write_total(result: &str) -> f64 {
+    match metrics() {
+        Some(m) => m.admin_audit_write.with_label_values(&[result]).get() as f64,
+        None => 0.0,
+    }
+}
+
 /// Count entries the invalidation trim dropped.
 pub fn record_invalidation_trimmed(entries: i64) {
     if let Some(m) = metrics() {
@@ -1536,6 +1566,8 @@ mod tests {
         record_config_bus_lagged(0);
         record_config_bus_lagged(7);
         record_config_reload_coalesced();
+        record_admin_audit_write("ok");
+        record_admin_audit_write("error");
     }
 
     #[test]
@@ -1596,6 +1628,20 @@ mod tests {
         assert!(
             render().contains("hydra_config_reload_coalesced_total"),
             "the coalesced-reload counter must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn admin_audit_write_counter_is_registered_and_increments() {
+        let before = admin_audit_write_total("ok");
+        record_admin_audit_write("ok");
+        assert!(
+            admin_audit_write_total("ok") >= before + 1.0,
+            "the admin-audit helper must increment the registered series"
+        );
+        assert!(
+            render().contains("hydra_admin_audit_write_total"),
+            "the admin-audit outcome counter must appear on /metrics"
         );
     }
 

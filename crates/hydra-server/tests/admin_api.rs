@@ -3258,3 +3258,147 @@ async fn user_hierarchy_reads_http() {
         assert_eq!(r.status(), 405, "{verb} {path} must be refused, not served");
     }
 }
+
+// ===========================================================================
+// H6.6 — append-only admin mutation audit
+// ===========================================================================
+
+/// Every authenticated mutation attempt writes exactly one redacted audit row;
+/// a read writes none. The row carries the operator surface, verb, method, full
+/// path, path-derived entity type and the request trace id.
+#[tokio::test]
+async fn admin_audit_records_mutations_but_not_reads() {
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    async fn audit_count(pool: &hydra_server::db::Pool) -> i64 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_audit")
+            .fetch_one(pool)
+            .await
+            .expect("count admin_audit");
+        count
+    }
+
+    assert_eq!(audit_count(state.db()).await, 0, "fresh database");
+
+    // Read-only requests must not insert.
+    for _ in 0..2 {
+        let r = req(
+            port,
+            reqwest::Method::GET,
+            "/api/v1/health",
+            Some(TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(audit_count(state.db()).await, 0, "GETs must not be audited");
+
+    let provider = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(r.status(), 201);
+    assert_eq!(
+        audit_count(state.db()).await,
+        1,
+        "one mutation attempt = exactly one audit row"
+    );
+
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT actor, action, method, path, entity_type, request_id FROM admin_audit",
+    )
+    .fetch_one(state.db())
+    .await
+    .expect("read the audit row");
+    assert_eq!(row.0, "admin");
+    assert_eq!(row.1, "post");
+    assert_eq!(row.2, "POST");
+    assert_eq!(row.3, "/api/v1/providers");
+    assert_eq!(row.4.as_deref(), Some("providers"));
+    let request_id = row.5.expect("request_id is populated");
+    assert!(
+        request_id.starts_with("hydra-") && !request_id.is_empty(),
+        "request_id must carry the request trace id, got {request_id:?}"
+    );
+
+    // A subsequent read still inserts nothing.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/providers",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(audit_count(state.db()).await, 1);
+}
+
+/// Audit storage is best-effort: if the table is missing/broken, the mutation's
+/// own response is unchanged (success stays success, failure keeps its status),
+/// and the degradation is counted instead of silently swallowed.
+#[tokio::test]
+async fn admin_audit_insert_failure_does_not_fail_the_mutation() {
+    use hydra_server::admin::metrics;
+
+    let state = admin_state().await;
+    let port = start_admin(state.clone());
+
+    // Simulate a broken/absent audit schema. This test owns an isolated DB.
+    sqlx::query("DROP TABLE admin_audit")
+        .execute(state.db())
+        .await
+        .expect("drop admin_audit to simulate a broken audit store");
+    let before = metrics::admin_audit_write_total("error");
+
+    // A mutation that fails on its own keeps its exact response.
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some("{ not valid json"),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        400,
+        "the mutation's own error must not become an audit error"
+    );
+
+    // A successful mutation still succeeds.
+    let provider = r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#;
+    let r = req(
+        port,
+        reqwest::Method::POST,
+        "/api/v1/providers",
+        Some(TOKEN),
+        Some(provider),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        201,
+        "a successful mutation must not fail because the audit insert failed"
+    );
+
+    let after = metrics::admin_audit_write_total("error");
+    assert!(
+        after >= before + 2.0,
+        "each failed audit insert must be counted (before={before}, after={after})"
+    );
+}

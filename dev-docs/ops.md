@@ -296,20 +296,42 @@ second home in the node's own SQLite database, and migration `0013` **drops that
 loads the same shared database; there is no replica rebuild from a leader and no
 `db::restore_config` any more.
 
-### 1.5 Admin audit table (design only — NOT implemented in this phase)
+### 1.5 Admin audit table (implemented; retention/export separate)
 
-A future hardening phase should add an append-only `admin_audit` table to the same shared
-database. Every admin/tenant-API mutation would insert exactly one row **in the same
-serialized write transaction** as the data change and the `config_revision` bump, so the
-audit record commits if and only if the change commits — there is no “changed but not
-audited” window. The row would carry `actor` (admin or tenant identity), `action`
-(verb/route), `entity` (table + id), `request_id` (the `X-Hydra-Trace-Id`), and
-`timestamp`; secrets are redacted (only masked key material, never plaintext).
+Migration `0002_admin_audit` adds an append-only `admin_audit` table to the shared
+database. The admin router records every **authenticated admin mutation attempt**
+(POST/PUT/DELETE/PATCH) after the handler returns; read-only GETs are not audited. The
+tenant API is not audited in this phase.
 
-This is **design only**: no table, migration, write hook, retention job or export exists
-in this phase. Retention, export (e.g. to a SIEM) and tamper-evidence are a separate
-decision. The same append-only write path could later serve as a transactional outbox,
-but that is also not part of the current shared-DB baseline.
+Columns:
+
+| column | meaning |
+|---|---|
+| `id` | database-generated row id |
+| `actor` | the admin surface (`admin`); no tenant identity in this phase |
+| `action` | lowercased HTTP verb (`post`, `put`, …) |
+| `method` | original HTTP method (`POST`, `PUT`, …) |
+| `path` | full `/api/v1/...` request path |
+| `entity_type` | first path segment after `/api/v1/` (e.g. `tenants`), when present |
+| `request_id` | the request's `X-Hydra-Trace-Id` / `error.trace_id` |
+| `created_at` | database `CURRENT_TIMESTAMP` in UTC |
+
+The row is redacted by construction: no request body, token, provider key, certificate or
+other secret is stored.
+
+The insert is **best-effort at the router level**, deliberately NOT part of the
+config-write transaction. A mutation therefore keeps its own success/error response even
+if audit storage is missing or broken. `hydra_admin_audit_write_total{result="ok|error"}`
+is the degradation signal; the first insert failure per process is also logged once,
+rather than once per request. This means the audit table is not transactionally coupled
+to a mutation: a committed write whose audit insert failed is not retried automatically.
+
+`created_at` is the schema's first DB-native timestamp column; the config tables store
+TEXT-formatted ISO stamps. A future export should not assume one uniform timestamp format
+across tables.
+
+Retention, export (e.g. to a SIEM), tamper-evidence and a transactional-outbox upgrade
+remain separate decisions; none is implemented here.
 
 ---
 

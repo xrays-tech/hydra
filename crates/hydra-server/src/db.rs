@@ -46,6 +46,7 @@ pub mod dialect;
 #[doc(hidden)]
 pub mod testing;
 
+mod audit;
 mod global_role;
 mod identity;
 mod limit_role;
@@ -55,6 +56,7 @@ mod reseal;
 mod rows;
 mod tenant;
 
+pub use audit::{insert_admin_audit, AdminAudit};
 pub use backend::{Db, DbConnection, Pool, Tx};
 
 pub use global_role::{
