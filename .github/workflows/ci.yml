@@ -199,10 +199,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (deny warnings, optional features)
-        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/usage-greptimedb,hydra-server/db-postgres -- -D warnings
 
       - name: Build workspace (optional features)
-        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-postgres
+        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/usage-greptimedb,hydra-server/db-postgres
 
       # ORDER MATTERS: keep this step BEFORE the full suite. A step that follows a
       # failing one never executes, which would make this automated guard for the
@@ -216,10 +216,10 @@ jobs:
       # ephemeral ports), and the ClickHouse-dependent ignored tests live in
       # `live-deps`.
       - name: Ignored test that needs no service (listener limitation)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres --test boot_listeners -- --ignored
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,usage-greptimedb,db-postgres --test boot_listeners -- --ignored
 
       - name: Test hydra-server (optional features)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-postgres
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,usage-greptimedb,db-postgres
 
   # The `db-mysql` half of the backend matrix. Same optional-feature suite as
   # `optional-features`, compiled and run against MySQL 8. The URL uses ROOT because
@@ -274,16 +274,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (deny warnings, mysql backend)
-        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-mysql -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/usage-greptimedb,hydra-server/db-mysql -- -D warnings
 
       - name: Build workspace (mysql backend)
-        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/db-mysql
+        run: cargo build --workspace --features hydra-server/server,hydra-server/cluster-redis,hydra-server/usage-clickhouse,hydra-server/usage-greptimedb,hydra-server/db-mysql
 
       - name: Ignored test that needs no service (listener limitation)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql --test boot_listeners -- --ignored
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,usage-greptimedb,db-mysql --test boot_listeners -- --ignored
 
       - name: Test hydra-server (mysql backend)
-        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,db-mysql
+        run: cargo test -p hydra-server --features server,cluster-redis,usage-clickhouse,usage-greptimedb,db-mysql
 
       - name: Shared-DB cluster + concurrent fanout (mysql backend)
         env:

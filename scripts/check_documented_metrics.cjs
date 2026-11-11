@@ -124,6 +124,7 @@ const NOT_A_METRIC = records(process.env.CDM_NOT_A_METRIC, [
   ['hydra_py', 'the `tools/hydra-py` tool'],
   ['hydra_ts', 'the `tools/hydra-ts` tool'],
   ['hydra_go', 'the `tools/hydra-go` tool'],
+  ['hydra_usage', 'the GreptimeDB database name that `HYDRA_GREPTIMEDB_URL` defaults to, not a metric series (the metric family is `hydra_usage_records_dropped_total`)'],
 ]);
 
 /** Does a crate / tool / Python package / package name carry this `hydra_x` name? */

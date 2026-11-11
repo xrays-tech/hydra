@@ -67,7 +67,7 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_TLS_LISTEN` | *(unset)* | Optional proxy TLS listener, e.g. `0.0.0.0:8443`. **Setting this is what enables HTTPS** — per-tenant certificates are then selected by SNI. Unset with tenant certs present ⇒ the certs are NOT served (logged as an error + `hydra_listener_misconfig_total`); set but the address cannot be bound ⇒ plaintext keeps serving and the failure is logged + counted. Must differ from `HYDRA_LISTEN`. |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
 | `HYDRA_ADMIN_AUDIT_RETENTION_DAYS` | `90` | Retention window, in days, for the append-only `admin_audit` table (§1.5). The daily cleanup deletes rows older than this with a plain `DELETE` (no config lock, no reload); `0` = **keep forever**; a negative value is clamped to `0`, and a missing/unparseable value falls back to `90`. Deleted rows are counted on `hydra_admin_audit_deleted_total`. |
-| `HYDRA_USAGE_SINK` | ***(required — no default)*** | Where usage goes. Accepted values are the registered backends (`dev-docs/usage-backends.md` is the list's owner): `clickhouse` — the shared store every node writes to (needs `HYDRA_CLICKHOUSE_URL`, and a build with `--features usage-clickhouse`; the release scripts build it) — or `none`, which records **nothing** and says so at startup, counts every discarded record on `hydra_usage_records_dropped_total{reason="sink_disabled"}` and answers `503 usage_store_unavailable` on `GET /usage`. Unset ⇒ the process **refuses to start** (ADR-0002 D-1: "where does the billing data go" is a decision, not a guess). `sqlite` was retired on 2026-10-07 and is refused **by name**; it wrote usage into the node's own database, so a cluster's usage was scattered across nodes and the node answering `GET /usage` was usually not the one that recorded the request. |
+| `HYDRA_USAGE_SINK` | ***(required — no default)*** | Where usage goes. Accepted values are the registered backends (`dev-docs/usage-backends.md` is the list's owner): `clickhouse` — the shared store every node writes to (needs `HYDRA_CLICKHOUSE_URL`, and a build with `--features usage-clickhouse`; the release scripts build it) — `greptimedb`, a delivered store (needs `HYDRA_GREPTIMEDB_URL`, and a build with `--features usage-greptimedb`) — or `none`, which records **nothing** and says so at startup, counts every discarded record on `hydra_usage_records_dropped_total{reason="sink_disabled"}` and answers `503 usage_store_unavailable` on `GET /usage`. Unset ⇒ the process **refuses to start** (ADR-0002 D-1: "where does the billing data go" is a decision, not a guess). `sqlite` was retired on 2026-10-07 and is refused **by name**; it wrote usage into the node's own database, so a cluster's usage was scattered across nodes and the node answering `GET /usage` was usually not the one that recorded the request. |
 | `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. **Do not put a path in this URL** — the sink always POSTs to `/`; a path is *trimmed* rather than used (measured 2026-09-30: before that fix `http://host:8123/clickhouse` failed at connect with `invalid port value`, because the path was still glued to the port when it was parsed). **What the sink actually puts on the wire** (measured 2026-09-30 against a mock ClickHouse, `integration/test_clickhouse_sink_wire.py`): `POST /?<your params>&query=INSERT%20INTO%20usage_record%20(…)%20SETTINGS%20…%20FORMAT%20JSONEachRow`, with the usage **row values in the request BODY** as one JSON object per line — **not** as `param_*` query parameters (that binding form belongs to the usage *reader*, `usage/backends/clickhouse/mod.rs` — moved there from `usage_query.rs` by ADR-0002 T1.3). Useful when diagnosing from a network capture: the SQL appears percent-encoded in the URL, the row values do not, and `client_api_key` in the body is **masked** (`sk*******-1`), never the tenant's real key. |
 | `RUST_LOG` | `info` (set by the image + every compose file) | `tracing` env filter — `main.rs:172` uses `EnvFilter::from_default_env()`. **`HYDRA_LOG` is NOT read**: it was listed here as an alias until 2026-09-29 and has never existed in code (`grep -rn HYDRA_LOG crates/ scripts/ tools/ environment/` is empty). Measured 2026-09-29 on a live instance: started with **only** `HYDRA_LOG=debug` it logs **0 lines** (while `/health` and the API still answer 200), with `RUST_LOG=debug` it logs ~130 lines — so an operator reaching for the documented alias during an incident gets no extra logging. Also note `info` is a **deployment** default, not a binary default: with neither variable set the same instance logs **0 lines** (`from_default_env()` defaults to ERROR-level), and the shipped `Dockerfile`/compose files are what set `RUST_LOG=info`. |
 | `HYDRA_TENANT_API` | `on` | Master switch for the tenant API on the data plane (`/tenant/…`). `off`/`0`/`false` ⇒ the prefix is not intercepted at all and the process behaves exactly as before the API existed. |
@@ -83,6 +83,28 @@ disk at runtime. The release binary is the only artefact you ship.
 | `HYDRA_CLICKHOUSE_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read, independent of the writer's `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS`. |
 | `HYDRA_CLICKHOUSE_IO_TIMEOUT_MS` | `15000` | Deadline for ONE write attempt (the response to an `INSERT`). A flush that trips it is **retried** with the same `insert_deduplication_token`, so a slow ClickHouse costs latency inside the flush budget rather than a lost batch; the buffer keeps up to `MAX_RETAINED` (10 000) rows in the meantime. |
 | `HYDRA_CLICKHOUSE_CONNECT_TIMEOUT_MS` | `3000` | Deadline for the TCP connect to ClickHouse. Distinct from the write deadline on purpose: a black-holed host must fail the batch quickly so the retry/backoff loop can report it (`hydra_usage_records_dropped_total`) instead of holding the flush for the full write budget. |
+| `HYDRA_GREPTIMEDB_URL` | *(unset)* | GreptimeDB HTTP SQL endpoint, e.g. `http://user:pass@greptimedb:4000/hydra_usage` (**required when `HYDRA_USAGE_SINK=greptimedb`**; the backend refuses to start without it). Form `http://user:pass@host:4000/<db>`: credentials are sent as HTTP **Basic** auth, the path is the database, and the database defaults to `hydra_usage` when the path is empty. The table is `usage_record` and is created on `open` (`CREATE DATABASE/TABLE IF NOT EXISTS`). **`https://` is refused at startup** — this backend has no TLS transport (terminate TLS in a proxy); same policy and reasoning as `HYDRA_CLICKHOUSE_URL`. |
+| `HYDRA_GREPTIMEDB_CONNECT_TIMEOUT_MS` | `2000` | Deadline for the TCP connect to GreptimeDB. A black-holed host must fail the batch quickly so the retry/backoff loop can report it on `hydra_usage_records_dropped_total` rather than holding the flush for the full write budget. |
+| `HYDRA_GREPTIMEDB_IO_TIMEOUT_MS` | `5000` | Deadline for ONE write attempt (the response to an `INSERT`) against GreptimeDB. Retries of a flush are **idempotent** via the backend's merge key (`append_mode=false` + `PRIMARY KEY (tenant_id, trace_id)` + `ts TIME INDEX`), so a slow server costs latency inside the flush budget rather than a double-counted batch. |
+| `HYDRA_GREPTIMEDB_QUERY_TIMEOUT_MS` | `5000` | Deadline for an E3 read against GreptimeDB, independent of the writer's `HYDRA_GREPTIMEDB_IO_TIMEOUT_MS`. |
+
+Choosing GreptimeDB instead of ClickHouse (the backend is delivered and compiled with
+`--features usage-greptimedb`; it is **not** implied by `server`):
+
+```bash
+# on EVERY node — same URL; the DB defaults to hydra_usage when the path is empty
+HYDRA_USAGE_SINK=greptimedb
+HYDRA_GREPTIMEDB_URL=http://user:pass@greptimedb:4000/hydra_usage
+# optional deadlines (shown with their defaults)
+HYDRA_GREPTIMEDB_CONNECT_TIMEOUT_MS=2000
+HYDRA_GREPTIMEDB_IO_TIMEOUT_MS=5000
+HYDRA_GREPTIMEDB_QUERY_TIMEOUT_MS=5000
+```
+
+> GreptimeDB usage rows are backed up with GreptimeDB's own tooling, not the Hydra
+> configuration database. The backend creates the `hydra_usage` database and the
+> `usage_record` table on `open` (`append_mode=false`, `PRIMARY KEY (tenant_id, trace_id)`,
+> `ts TIME INDEX`, `ttl=90d`); no init container or manual DDL is required.
 
 > **Known listener limitation (recorded here, not hidden in a test):** the startup
 > planner compares listener addresses as **strings**, so the *same port on different
@@ -1387,9 +1409,9 @@ is longer than the test window.
 - **Single static admin token.** No RBAC, no token rotation (v2, §16.6 / §13.3).
 - **No web UI auth** beyond the in-memory token prompt. The UI is a power-user tool; for
   fleet management use the REST API.
-- **PostgreSQL and MySQL are the only config stores.** ClickHouse is the shared usage store
-  (`clickhouse`, mandatory in practice) or metering is explicitly off (`none`). SQLite is
-  deleted, including tests/dev.
+- **PostgreSQL and MySQL are the only config stores.** ClickHouse and GreptimeDB are the shared
+  usage stores (`clickhouse`, or the delivered `greptimedb`) or metering is explicitly off (`none`).
+  SQLite is deleted, including tests/dev.
 
 For the remaining v2 backlog see design §16.6.
 
@@ -1438,7 +1460,7 @@ There are no per-node config volumes, no raft ports, and no membership step. Scr
 | `HYDRA_NODE_ID` | Stable node identity for logs, fanout origin and breaker votes. Defaults to hostname, then random. |
 | `HYDRA_ADMIN_TOKEN` | Required; every node serves its own admin API. |
 | `HYDRA_ENCRYPTION_KEY` | Master key, identical fleet-wide. |
-| `HYDRA_USAGE_SINK` | `clickhouse` (+ `HYDRA_CLICKHOUSE_URL`) or `none`. Required, no default. |
+| `HYDRA_USAGE_SINK` | `clickhouse` (+ `HYDRA_CLICKHOUSE_URL`), `greptimedb` (+ `HYDRA_GREPTIMEDB_URL`, delivered), or `none`. Required, no default. |
 
 Other runtime knobs (unchanged by the cluster rewrite):
 

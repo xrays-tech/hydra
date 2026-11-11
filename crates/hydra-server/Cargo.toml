@@ -116,6 +116,14 @@ usage-clickhouse = ["dep:base64"]
 # Not a delivered backend: see `dev-docs/usage-backends.md`.
 usage-tdengine = []
 
+# GreptimeDB usage backend (ADR-0002 §5.2): the GreptimeDB HTTP SQL API, the pattern's second new
+# insertion. STANDALONE — deliberately NOT implied by `server`, so enabling it does not change the
+# default build or the hard-gate counts; the optional-features job is where it runs.
+# `base64` is declared because the transport builds `Authorization: Basic <user:pass>` from the URL
+# credentials. It is already pulled in by `db`; declared here so this backend's dependency is
+# explicit rather than inherited by accident.
+usage-greptimedb = ["dep:base64"]
+
 # Redis backbone: shared rate limits / breaker votes and the invalidation
 # stream ride one Redis. Opt-in so the default single-node build keeps zero
 # external deps. `fred` is the fixed

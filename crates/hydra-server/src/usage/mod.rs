@@ -25,12 +25,19 @@ pub use engine::UsageSink;
 pub use query::UsageQuery;
 
 pub mod backends;
-/// The shared batching engine. It has exactly ONE user today (the ClickHouse backend), so a build
-/// without `usage-clickhouse` compiles it unused — which is what the attribute says, rather than
-/// deleting the machinery that the next backend is supposed to reuse (ADR-0002 §4 step 2: a backend
-/// gets the delivery policy for free; re-implementing it would be a second policy with its own
-/// drop-accounting, and the drop counters are what an operator alerts on).
-#[cfg_attr(not(feature = "usage-clickhouse"), allow(dead_code, unused_imports))]
+/// The shared batching engine. Every usage backend that has a sink (ClickHouse, TDengine,
+/// GreptimeDB) is built on it, so a build with none of those features compiles it unused — which is
+/// what the attribute says, rather than deleting the machinery the next backend is supposed to reuse
+/// (ADR-0002 §4 step 2: a backend gets the delivery policy for free; re-implementing it would be a
+/// second policy with its own drop-accounting, and the drop counters are what an operator alerts on).
+#[cfg_attr(
+    not(any(
+        feature = "usage-clickhouse",
+        feature = "usage-tdengine",
+        feature = "usage-greptimedb"
+    )),
+    allow(dead_code, unused_imports)
+)]
 pub mod engine;
 pub mod query;
 
@@ -225,6 +232,9 @@ pub enum BackendError {
 pub static REGISTRY: &[&UsageBackend] = &[
     // The shared store every cluster node writes to (ADR-0002: the only delivered backend).
     &backends::clickhouse::DESCRIPTOR,
+    // ADR-0002's second measured insertion: GreptimeDB over its HTTP SQL API. One module + one
+    // feature + this row; it is NOT implied by `server` (see `dev-docs/usage-backends.md`).
+    &backends::greptimedb::DESCRIPTOR,
     // Switching usage OFF is a registered choice, not an absence of one (ADR-0002 D-2).
     &backends::none::DESCRIPTOR,
     // ADR-0002's first NEW backend: the row below is the whole insertion, and the proof that
@@ -440,6 +450,20 @@ mod tests {
             "expected FeatureDisabled, got {err:?}"
         );
         assert!(err.to_string().contains("--features usage-clickhouse"));
+    }
+
+    /// The GreptimeDB arm carries the same contract: without its feature the kind is still known and
+    /// the refusal names the feature to build with (the row is standalone, not implied by `server`).
+    #[cfg(not(feature = "usage-greptimedb"))]
+    #[tokio::test]
+    async fn a_greptimedb_kind_this_build_cannot_serve_names_the_feature() {
+        let cfg = BackendConfig::new(pool().await);
+        let err = open("greptimedb", &cfg).unwrap_err();
+        assert!(
+            matches!(err, BackendError::FeatureDisabled { .. }),
+            "expected FeatureDisabled, got {err:?}"
+        );
+        assert!(err.to_string().contains("--features usage-greptimedb"));
     }
 
     /// `none` is a REGISTERED choice, and it says out loud that it cannot read: no store, no

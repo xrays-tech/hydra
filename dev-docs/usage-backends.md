@@ -115,13 +115,15 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 
 ## 5. 后端矩阵
 
-**先读这句**：`feature` 列只在**已登记**的行（`clickhouse` / `none` / `tdengine`）指真实存在的东西——守卫会核对 `Cargo.toml`。
+**先读这句**：`feature` 列只在**已登记**的行（`clickhouse` / `greptimedb` / `none` / `tdengine`）指真实存在的东西——守卫会核对 `Cargo.toml`。
 标"候选"的行（`influxdb3` / `influxdb2` / `victoriametrics`）的 feature 名是**约定名**：实测 `Cargo.toml` 里 grep 不到它们，
 那几行是**选项空间**（接入前必须先写取舍），不是可用的后端。别照着候选行写 `--features usage-influxdb3`，构建会直接失败。
+**交付的 backend 是 `clickhouse` 与 `greptimedb`**；`none` 是"显式关闭计量"的注册取值；`tdengine` 与其余候选**不是**交付后端。
 
 | kind | 状态 | feature | env | 写 | 读 | 读契约可行性 |
 |---|---|---|---|---|---|---|
-| `clickhouse` | **交付（唯一）** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，**前两个今天在 `ops.md` 没有文档**） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
+| `clickhouse` | **交付** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，均已进 `ops.md` 环境表） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
+| `greptimedb` | **交付** | `usage-greptimedb` | `HYDRA_GREPTIMEDB_URL`（`http://user:pass@host:4000/<db>`，**Basic 认证**，db 默认 `hydra_usage`）+ `recognises`：`_CONNECT_TIMEOUT_MS`（2000）/ `_IO_TIMEOUT_MS`（5000）/ `_QUERY_TIMEOUT_MS`（5000） | `POST /v1/sql?db=<db>`，body `sql=INSERT INTO usage_record (cols) VALUES (…),(…)`（`application/x-www-form-urlencoded`，`X-Greptime-Timezone: UTC`）；启动时 `CREATE DATABASE/TABLE IF NOT EXISTS`；`append_mode=false` + `PRIMARY KEY (tenant_id, trace_id)` + `ts TIME INDEX` 提供重试去重；`https://` 在 `open` 直接拒绝（无 TLS 传输） | 同一个 `POST /v1/sql?db=<db>`，GreptimeDB SQL（`CASE WHEN` 归空键、`substr(created_at,1,10)` 做 day、别名 `group_key`）；**无 HTTP 绑定参数**——租户/窗口是转义后的字面量，分组表达式只允许白名单 | ✅ SQL + 真 `GROUP BY`；实测 DDL/重试去重/读回（§5.5）。SELECT 响应上限 **64 KiB**、编码后的 INSERT body 上限约 **3.5 MiB**（按 512 行或编码后超限分片） |
 | `none` | **交付（D-2 已裁定保留）** | 无（总是编译） | 无 | 丢弃并计数 `sink_disabled` | `ReaderContract::Unavailable{why}` ⇒ `/usage` 回 503 `usage_store_unavailable` | ✅（故意没有存储）必须**显式**选择，启动打 WARN |
 | `tdengine` | **已实现（候选，非交付）；活实例测试通过——但那条测试是 `#[ignore]` 手动的、CI 里 `tdengine` 出现 0 次（实测），所以基线不依赖任何 TDengine 实例** | `usage-tdengine` | `HYDRA_TDENGINE_URL`（`http://user:pass@host:6041/<db>`，**Basic 认证**——实测过的唯一认证形式） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant>') VALUES (…),(…)`，**子表按租户自动创建**；启动时 `CREATE DATABASE/STABLE IF NOT EXISTS` | 同一个 `POST /rest/sql[/db]`，TDengine SQL（`CASE WHEN` 归空键、`last(ts)`、别名 `group_key`、`TO_CHAR` 做 day） | ⚠️ **能用，但有一条硬限制 ⇒ 只能是候选**：TDengine 的**主键就是 `ts`**，同租户同一秒的两条请求会**互相覆盖**（实测：`tokens_in` 111 被 999 覆盖、行数仍为 1；毫秒不同则两行都在）。本后端用 **trace id 派生的亚秒位**规避（确定性 ⇒ 重试仍幂等），但同一秒内两条哈希到同一毫秒的请求仍会塌（约 1/1000），而 TDengine **没有批次去重令牌**。要当计费存储必须换成毫秒级唯一的键。其余实测坑见 §5.1 |
 | `influxdb3` | 候选 | `usage-influxdb3` | 数据库令牌（`Authorization: Bearer …`，端口 **8181**） | `POST /api/v3/write_lp?db=…`，行协议（表**自动创建**，数据库要先建） | `POST /api/v3/query_sql?db=…`（SQL：`DATE_BIN(INTERVAL '1 day', time)`）或 `/api/v3/query_influxql` | ✅ SQL 可用、有 schema-on-write；注意 2026-09-15 起其 Docker `latest` 指向 3 Core（**部署要钉版本 tag**）；docs 页面**未标许可证**（仓库为 Apache-2.0 + MIT） |
@@ -228,6 +230,27 @@ the registry is the ONLY thing that may know a backend by name (ADR-0002 §2.2) 
    **已修**：守卫现在会把 crate **内部**的 `#[ignore]` 测试**每次运行都列出来**（NOTE，不是 FAIL——
    为它们强制一个 service container 是超出该守卫职权的成本），于是"这条测试没人自动跑"不再是
    "没人注意到"。复现配方在模块文档与 §5.1，**手工执行**。
+
+### 5.5 GreptimeDB：交付后端的事实与实测记录（2026-11-11）
+
+`greptimedb` 是 ADR-0002 之后**第二个交付后端**（第一个新模式接入是 TDengine，但 TDengine 只是候选）。
+与 TDengine 不同，它是**交付**的：`dev-docs/ops.md` 环境表有它的 `requires` 行，守卫的
+`CANDIDATE_ENV_DOC` 例外**不**覆盖它。线协议、URL 与 DDL 由
+`crates/hydra-server/src/usage/backends/greptimedb/{mod.rs,transport.rs}` 独占。
+
+| 事实 | 实测/约定结果 |
+|---|---|
+| 端点 | `POST /v1/sql?db=<db>`；`Content-Type: application/x-www-form-urlencoded`；body `sql=<statement>`；`X-Greptime-Timezone: UTC` |
+| URL 形态 | `http://user:pass@host:4000/<db>`，**HTTP Basic 认证**；db 默认 `hydra_usage`，表 `usage_record`；`https://` **在 `open` 拒绝**（本后端没有 TLS 传输，和 ClickHouse 同策） |
+| DDL（canonical，已实测接受） | `CREATE DATABASE IF NOT EXISTS <db>`；`CREATE TABLE IF NOT EXISTS usage_record (… tenant_id STRING, … trace_id STRING, created_at STRING, ts TIMESTAMP TIME INDEX, PRIMARY KEY (tenant_id, trace_id)) WITH ('append_mode' = 'false', 'ttl' = '90d')` |
+| 去重 | `append_mode=false`（默认）+ `PRIMARY KEY (tenant_id, trace_id)` + `ts TIME INDEX`：同一 `(tenant_id, trace_id, ts)` 重试重插会**合并**而不是双计。**没有批次去重令牌**（HTTP SQL 没有）；重试幂等靠这套主键/时间索引语义，超过合并窗口或服务端 TTL 后行为同普通追加存储 |
+| `trace_id` | **去重键的承重字段**，必须非空：写入侧对空 `trace_id` 生成确定性回退键（对行字段做 FNV-1a），再写入 `trace_id` 列；否则同租户同毫秒记录会被折叠 |
+| SELECT 应答 | `{"output":[{"records":{"schema":{"column_schemas":[…]},"rows":[[…]],"total_rows":N}}],…}`；计数器是 **JSON 数字**，`last_seen`（`max(created_at)`）是 **String** |
+| INSERT/DDL 应答 | `{"output":[{"affectedrows":N}],…}`；错误是非 2xx + `{"code":N,"error":"…"}`。**200 不等于成功**：2xx body 里出现顶层 `code`/`error` 同样按失败处理 |
+| 读 SQL | totals：`count(*)`/`sum(tokens_in)`/`sum(tokens_out)`/`sum(cache_hit_tokens)`/`sum(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END)`/`max(created_at)`；分组白名单含 `coalesce(...)`、`substr(created_at,1,10)`，别名 `group_key`（不是 `key`）。实测 `coalesce`/`substr`/`CASE`/`max(created_at)` 均可用 |
+| 参数绑定 | **没有 HTTP 绑定参数**：`tenant_id`/`since`/`until` 一律转义为字面量，分组表达式只允许白名单（绝不把租户 id 当标识符插入） |
+| 大小上限 | SELECT 响应 **64 KiB**（超过/截断 ⇒ `UsageQueryError::ResultTooLarge(64*1024)`）；编码后的 INSERT body 约 **3.5 MiB** 上限，按 512 行或编码后超限分片（量的是编码后的 form body，不是原始 SQL） |
+| 活实例测试 | `#[ignore]`（环境变量 `HYDRA_TEST_GREPTIMEDB_URL`），**不进 CI**：与 TDengine 同策，CI 不为此拉起 service container。本地演练用 `http://127.0.0.1:4400`、默认 db `hydra_usage`——**4400 只是本地演练的映射，不是生产默认**（生产默认端口仍是 4000） |
 
 ## 6. 已知弱点（每次都得手写的部分）
 

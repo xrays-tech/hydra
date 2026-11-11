@@ -70,7 +70,7 @@ const UNDOCUMENTED_OK = new Map(
  * internals — and that occurrence is listed below with its reason, so a SECOND one cannot hide behind
  * it.
  */
-const KIND_LITERALS_OFF_LIMITS = ['clickhouse', 'tdengine'];
+const KIND_LITERALS_OFF_LIMITS = ['clickhouse', 'greptimedb', 'tdengine'];
 
 /** Recorded occurrences that are not "knowing a backend by name", each with the reason. */
 const KIND_LITERAL_OK = [

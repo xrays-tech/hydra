@@ -369,6 +369,36 @@ services:
       clickhouse: { condition: service_healthy }
     restart: "no"
 
+  # ── OPTIONAL usage store: GreptimeDB (HYDRA_USAGE_SINK=greptimedb) ──────────
+  # NOT part of the default stack. Start it explicitly with `--profile greptimedb`,
+  # then point every node at it instead of ClickHouse by setting on all three:
+  #
+  #   HYDRA_USAGE_SINK: "greptimedb"
+  #   HYDRA_GREPTIMEDB_URL: "http://greptimedb:4000/hydra_usage"
+  #
+  # The backend creates the `hydra_usage` database and `usage_record` table on open
+  # (append_mode=false, PRIMARY KEY(tenant_id, trace_id), ts TIME INDEX, ttl=90d),
+  # so no init container is needed. Image is pinned; HTTP SQL is :4000 and `/health`
+  # is the probe (GreptimeDB is a standalone process, not a Hydra node).
+  #
+  #   up:  docker compose -f environment/docker-compose.local.yml --profile greptimedb up -d greptimedb
+  greptimedb:
+    image: greptime/greptimedb:v1.3.0
+    container_name: hydra-local-greptimedb
+    profiles: ["greptimedb"]
+    command: ["standalone", "start"]
+    ports:
+      - "127.0.0.1:4400:4000"   # loopback only; 4400 host-side is a local-drill mapping, not a default
+    volumes:
+      - greptimedb-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
   # ── Local OpenAI-compatible upstream for stability drills ──────────────────
   # No external auth hop: Hydra now authenticates client api-keys internally.
   # The mock returns deterministic chat completions + usage so destructive tests
@@ -429,3 +459,4 @@ volumes:
   mysql-data:
   redis-data:
   clickhouse-data:
+  greptimedb-data:

@@ -236,5 +236,5 @@ test('a literal backend kind outside src/usage is a failure (the T4.3 anti-cheat
 test('the real tree passes, and names every backend', () => {
   const r = spawnSync(process.execPath, [CHECKER], { encoding: 'utf8', cwd: REPO });
   assert.equal(r.status, 0, r.stderr + r.stdout);
-  assert.match(r.stdout, /clickhouse, none, tdengine/);
+  assert.match(r.stdout, /clickhouse, greptimedb, none, tdengine/);
 });

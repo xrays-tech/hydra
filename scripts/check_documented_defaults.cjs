@@ -79,6 +79,7 @@ const UNVERIFIED_OK = records(process.env.CDD_UNVERIFIED_OK, [
   ['HYDRA_RESEAL_SECRETS', 'a one-shot switch documented as OFF; the code parses a vocabulary, not a value'],
   ['HYDRA_TLS_LISTEN', 'documented default is "unset" — the TLS listener is bound iff the variable is set'],
   ['HYDRA_CLICKHOUSE_URL', 'documented default is *(unset)*; it is REQUIRED by the clickhouse backend whenever that backend is selected (the registry declares it, and `check_usage_backends` keeps the declaration and this table in step)'],
+  ['HYDRA_GREPTIMEDB_URL', 'documented default is *(unset)*; it is REQUIRED by the greptimedb backend whenever that backend is selected (the registry declares it, and `check_usage_backends` keeps the declaration and this table in step)'],
   ['HYDRA_USAGE_SINK', 'REQUIRED since ADR-0002 D-1 — there is no default to compare: "where does the billing data go" is a decision, and the code refuses to start without it'],
   ['HYDRA_NODE_ID', 'documented default is derived at startup (host:port), not a literal'],
   ['HYDRA_TRUSTED_PROXIES', 'documented default is empty; the code splits a list, no scalar fallback'],

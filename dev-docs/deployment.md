@@ -298,6 +298,44 @@ spec: { selector: { app: clickhouse }, ports: [{ port: 8123 }] }
 kubectl -n hydra exec deploy/clickhouse -- clickhouse-client --multiquery < environment/clickhouse/init.sql
 ```
 
+GreptimeDB（`HYDRA_USAGE_SINK=greptimedb` 时，交付后端）：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: greptimedb, namespace: hydra }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: greptimedb } }
+  template:
+    metadata: { labels: { app: greptimedb } }
+    spec:
+      containers:
+        - name: greptimedb
+          image: greptime/greptimedb:v1.3.0
+          args: ["standalone", "start"]
+          ports: [{ containerPort: 4000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 4000 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: greptimedb, namespace: hydra }
+spec: { selector: { app: greptimedb }, ports: [{ port: 4000 }] }
+```
+
+要点：
+
+- 镜像固定为 `greptime/greptimedb:v1.3.0`，HTTP SQL 端口 **4000**，健康检查 `/health`
+  （**不是** `/api/v1/health`；GreptimeDB 是独立进程）。
+- 每个 Hydra 节点设 `HYDRA_USAGE_SINK=greptimedb` 和
+  `HYDRA_GREPTIMEDB_URL=http://user:pass@greptimedb:4000/hydra_usage`（db 默认 `hydra_usage`）。
+- 后端在 `open` 时自动 `CREATE DATABASE/TABLE IF NOT EXISTS`（`usage_record`；
+  `append_mode=false`、`PRIMARY KEY (tenant_id, trace_id)`、`ts TIME INDEX`、`ttl=90d`），
+  **不需要**首次建表 Job。
+- `https://` 在启动时被拒绝；若需要 TLS，在 GreptimeDB 前置代理终止 TLS，再用 `http://` 连内网。
+- 用量数据用 GreptimeDB 自己的备份工具；它不在配置库内。
+
 ### 4.4 入口（Ingress）
 
 ```yaml
@@ -351,7 +389,11 @@ kubectl -n hydra exec deploy/hydra -- sh -c \
 | `HYDRA_REDIS_MODE` | — | 只接受 `single` | 设置时校验 |
 | `HYDRA_ADMIN_TOKEN` | 必填 | 每台必填 | 每个节点都有自己的管理 API |
 | `HYDRA_ENCRYPTION_KEY` | 必填 | 必填，全集群一致 | provider key/证书私钥主密钥 |
-| `HYDRA_USAGE_SINK` | **必填，无默认** | 同左 | `clickhouse` 或 `none` |
+| `HYDRA_USAGE_SINK` | **必填，无默认** | 同左 | `clickhouse`、`greptimedb`（交付后端）或 `none` |
+| `HYDRA_GREPTIMEDB_URL` | *(未设置)* | 同左 | GreptimeDB HTTP SQL 端点，形如 `http://user:pass@host:4000/<db>`（Basic 认证；db 默认 `hydra_usage`）。`HYDRA_USAGE_SINK=greptimedb` 时**必填**；`https://` 会在启动时被拒绝（本后端无 TLS 传输，需前置代理终止 TLS） |
+| `HYDRA_GREPTIMEDB_CONNECT_TIMEOUT_MS` | 默认 `2000` | 同左 | 连接 GreptimeDB 的 TCP 建连超时 |
+| `HYDRA_GREPTIMEDB_IO_TIMEOUT_MS` | 默认 `5000` | 同左 | 单次写入（`INSERT` 应答）超时；重试通过合并键幂等 |
+| `HYDRA_GREPTIMEDB_QUERY_TIMEOUT_MS` | 默认 `5000` | 同左 | E3 读的超时，独立于写入超时 |
 | `HYDRA_LISTEN` / `HYDRA_ADMIN_ADDR` | `0.0.0.0:8080` / `127.0.0.1:8081` | 管理口建议 `0.0.0.0:8081` | 代理（明文）/ 管理端口 |
 | `HYDRA_TLS_LISTEN` | *（未设置）* | 同左 | 可选 HTTPS；设置它才启用 TLS |
 
