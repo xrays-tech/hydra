@@ -109,6 +109,10 @@ const UNJUDGED_WITH_EXIT_OK = records(process.env.CTT_UNJUDGED_WITH_EXIT_OK, [
     'scripts/check_redis_pool.test.cjs',
     'the same conditional-harness shape as `check_documented_metrics.test.cjs`',
   ],
+  [
+    'scripts/check_dialect_sql.test.cjs',
+    'the same conditional-harness shape: the summary line runs on the success path, so nothing appended after the conditional exit is dead',
+  ],
 ]);
 
 // Only files that could contain "case" statements: the repository's suite-shaped scripts.

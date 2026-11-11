@@ -794,6 +794,22 @@ async fn tenant_crud_http() {
     )
     .await;
     assert_eq!(r.status(), 204);
+
+    // A PUT naming an id that does not exist is the same 404 as a GET, not a
+    // silent 200 "updated nothing". This exercises `write_tenant(is_create=false)`
+    // + the follow-up `get_tenant` fallback; the H3.1 probe is covered directly
+    // in `db_crud::...` (do not delete that fallback believing the probe covers it).
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/tenants/no-such-tenant",
+        Some(TOKEN),
+        Some(upd),
+    )
+    .await;
+    assert_eq!(r.status(), 404, "missing tenant update must be 404");
+    let v: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(v["error"]["code"], "not_found", "got {v}");
 }
 
 /// Tenant cert content via the admin API (migration 0007): PEM fields are

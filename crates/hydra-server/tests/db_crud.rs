@@ -543,12 +543,37 @@ async fn tenant_grants_and_certificate_crud() {
     upd.enabled = false;
     upd.updated_at = ts(1);
     db::update_tenant(pool, &upd).await.expect("update tenant");
-    rev += 1;
     let got = db::get_tenant(pool, "t1")
         .await
         .expect("get updated tenant");
     assert_eq!(got.name, "renamed");
     assert!(!got.enabled);
+
+    // H3.1: a same-body no-op is a HIT, not a 404. The UPDATE's own
+    // rows_affected is deliberately not the existence signal: it reports
+    // matched-vs-changed rows differently across drivers (and sqlx negotiates
+    // CLIENT_FOUND_ROWS on MySQL), so the explicit probe decides existence.
+    // The revision keeps its existing `commit_write(tx, rows_affected > 0)`
+    // behavior, i.e. at most one bump for this UPDATE and never a second one.
+    let before_noop = revision(pool).await;
+    db::update_tenant(pool, &got)
+        .await
+        .expect("no-op update of an existing tenant");
+    let after_noop = revision(pool).await;
+    assert!(
+        after_noop == before_noop || after_noop == before_noop + 1,
+        "a no-op update may advance at most once: before={before_noop} after={after_noop}"
+    );
+    rev = after_noop;
+    let mut missing = got.clone();
+    missing.id = "missing-tenant".into();
+    assert!(
+        matches!(
+            db::update_tenant(pool, &missing).await,
+            Err(sqlx::Error::RowNotFound)
+        ),
+        "an UPDATE of a missing id must fail before the statement"
+    );
 
     // Replacing the cert may keep the certificate and drop the key.
     db::update_tenant_cert(
@@ -877,16 +902,33 @@ async fn user_hierarchy_crud_bulk_and_cross_tenant_denial() {
         0
     );
     assert_eq!(
-        db::delete_user_api_key(pool, "ta", "kb")
+        db::delete_user_api_key(pool, "ta", "ua", "kb")
             .await
             .expect("cross-tenant key delete is a no-op"),
+        0
+    );
+    // Same tenant, but the key belongs to ANOTHER user: 0 rows, exactly like a
+    // missing id. The route's contract is "no such key for THIS user".
+    assert_eq!(
+        db::delete_user_api_key(pool, "ta", "ua", "ka2")
+            .await
+            .expect("another user's key delete is a no-op"),
         0
     );
     assert_eq!(
         revision(pool).await,
         rev,
-        "cross-tenant denials must not bump"
+        "cross-tenant and cross-user denials must not bump"
     );
+    // The owner's own key is the one that deletes.
+    assert_eq!(
+        db::delete_user_api_key(pool, "ta", "ua", "ka")
+            .await
+            .expect("owner deletes its own key"),
+        1
+    );
+    rev += 1;
+    assert_eq!(revision(pool).await, rev);
 
     // A bulk batch containing one cross-tenant row aborts as a whole.
     let before_groups = db::list_user_groups(pool).await.expect("groups").len();
@@ -906,7 +948,7 @@ async fn user_hierarchy_crud_bulk_and_cross_tenant_denial() {
 
     // Normal tenant-scoped deletes do work.
     assert_eq!(
-        db::delete_user_api_key(pool, "ta", "ka2")
+        db::delete_user_api_key(pool, "ta", "ua2", "ka2")
             .await
             .expect("delete key"),
         1
@@ -1291,7 +1333,7 @@ async fn every_successful_write_bumps_revision_and_noop_does_not() {
     db::delete_user(pool, "t1", "missing")
         .await
         .expect("missing user");
-    db::delete_user_api_key(pool, "t1", "missing")
+    db::delete_user_api_key(pool, "t1", "u", "missing")
         .await
         .expect("missing key");
     db::delete_limit_role(pool, "missing")

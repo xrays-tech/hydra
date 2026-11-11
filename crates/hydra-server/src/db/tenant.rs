@@ -84,10 +84,32 @@ where
 /// Update a tenant's mutable fields (`name`, `domain`, cert paths,
 /// `enabled`, `updated_at`). Blank cert paths are normalized to `NULL`
 /// (same rule as `insert_tenant`).
+///
+/// A missing id is reported as [`sqlx::Error::RowNotFound`] **before** the
+/// UPDATE, because `rows_affected` cannot answer "did this row exist?":
+/// PostgreSQL reports matched rows, while MySQL reports changed rows by default
+/// (unless `CLIENT_FOUND_ROWS` is negotiated). A same-body no-op would therefore
+/// look absent on a changed-rows driver; the explicit probe must not depend on
+/// that setting. Once the probe hits, the UPDATE's own row count is irrelevant —
+/// a no-op still returns `Ok(())`.
+///
+/// Callers that map DB errors to HTTP must map `RowNotFound` to 404. Note that
+/// `admin::handlers::classify_db_err` currently maps it to 500 (pinned by its
+/// own test), so do not route a new `update_tenant` caller through that helper
+/// without first deciding/updating the contract.
 pub async fn update_tenant(pool: &Pool, t: &Tenant) -> Result<(), sqlx::Error> {
     let cert_key = non_empty_path(t.cert_key.as_deref());
     let cert_file = non_empty_path(t.cert_file.as_deref());
     let mut tx = begin_write(pool).await?;
+    let existing: Option<(String,)> = sqlx::query_as(&dialect::sql(
+        "SELECT id FROM tenant WHERE id = ? FOR UPDATE",
+    ))
+    .bind(&t.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if existing.is_none() {
+        return Err(sqlx::Error::RowNotFound);
+    }
     let affected = sqlx::query(&dialect::sql(
         "UPDATE tenant SET name = ?, domain = ?, cert_key = ?, cert_file = ?, \
          enabled = ?, updated_at = ? WHERE id = ?",

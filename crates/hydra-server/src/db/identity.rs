@@ -381,17 +381,27 @@ pub async fn insert_user_api_keys_bulk(
     commit_write(tx, changed).await
 }
 
+/// Delete one user's api-key, scoping the statement by ALL THREE ids.
+///
+/// The route's 404 contract is "no such key **for this user**", not "some key
+/// of this tenant": `id`, `user_id`, and the user's `tenant_id` are predicates
+/// of the same `DELETE`, so a key that exists under another user or another
+/// tenant deletes 0 rows and is indistinguishable from a missing id. Folding
+/// the ownership proof into the statement also removes the old
+/// check-then-delete TOCTOU window.
 pub async fn delete_user_api_key(
     pool: &Pool,
     tenant_id: &str,
-    id: &str,
+    user_id: &str,
+    key_id: &str,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = begin_write(pool).await?;
     let affected = sqlx::query(&dialect::sql(
-        "DELETE FROM user_api_key WHERE id = ? \
+        "DELETE FROM user_api_key WHERE id = ? AND user_id = ? \
          AND user_id IN (SELECT id FROM hydra_user WHERE tenant_id = ?)",
     ))
-    .bind(id)
+    .bind(key_id)
+    .bind(user_id)
     .bind(tenant_id)
     .execute(&mut *tx)
     .await?;

@@ -1219,7 +1219,7 @@ async fn user_bulk_upsert(
                 return super::respond_error(
                     session,
                     ctx,
-                    400,
+                    409,
                     "duplicate_external_id",
                     &format!(
                         "external_id {external:?} appears more than once in this bulk request \
@@ -2272,27 +2272,12 @@ async fn user_api_key_delete(
     }
 
     let pool = state.store.pool();
-    let rows = match crate::db::list_user_api_keys(pool).await {
-        Err(e) => {
-            let (status, code) = crate::admin::handlers::classify_db_err(&e);
-            return super::respond_error(
-                session,
-                ctx,
-                status,
-                code,
-                "the api-key rows could not be read",
-            )
-            .await;
-        }
-        Ok(r) => r,
-    };
-    let owned = rows.iter().any(|k| k.id == key_id && k.user_id == user_id);
-    if !owned {
-        return super::respond_error(session, ctx, 404, "not_found", "no such key for this user")
-            .await;
-    }
-
-    let deleted = match crate::db::delete_user_api_key(pool, tenant_id, key_id).await {
+    // Ownership is a predicate of the DELETE itself, not a prior scan: a key
+    // belonging to another user or another tenant deletes 0 rows, so the
+    // 0-row result is BOTH the anti-enumeration answer and the race backstop
+    // (no check-then-delete window). The snapshot lookup above only keeps the
+    // distinct "no such user in this tenant" answer.
+    let deleted = match crate::db::delete_user_api_key(pool, tenant_id, user_id, key_id).await {
         Ok(n) => n,
         Err(e) => {
             let (status, code) = crate::admin::handlers::classify_db_err(&e);

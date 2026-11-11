@@ -17,7 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
-use hydra_core::model::{Provider, ProviderModel, Tenant, TenantModel, TenantProvider};
+use hydra_core::model::{
+    BillingStatus, Provider, ProviderModel, Tenant, TenantModel, TenantProvider, User, UserApiKey,
+    UserGroup,
+};
 use hydra_server::crypto::StaticKeyProvider;
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::proxy::config::ProxyConfig;
@@ -1488,6 +1491,166 @@ async fn single_node_local_user_write_upsert_and_delete() {
     .await;
     assert_eq!(ds2, 404, "the deleted id is now absent: {dv}");
     assert_eq!(dv["error"]["code"], "not_found", "got {dv}");
+}
+
+/// H3.2: the api-key DELETE is scoped by BOTH the path user and the tenant.
+///
+/// A key id from another tenant, a key id owned by a DIFFERENT user of the
+/// same tenant, and an id that never existed are all the SAME anti-enumeration
+/// 404; only the path user's own key deletes (204).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_api_key_delete_is_scoped_to_the_path_user_and_tenant() {
+    const NOW: &str = "2026-01-01T00:00:00Z";
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    seed_tenant(&pool, "t2", "other.example", None).await;
+
+    let group = |id: &str, tenant: &str| UserGroup {
+        id: id.into(),
+        tenant_id: tenant.into(),
+        name: id.into(),
+        enabled: true,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    let user = |id: &str, tenant: &str, group: &str| User {
+        id: id.into(),
+        tenant_id: tenant.into(),
+        user_group_id: group.into(),
+        external_id: None,
+        name: id.into(),
+        enabled: true,
+        billing_status: BillingStatus::Active,
+        billing_reason: None,
+        billing_updated_at: None,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    let key = |id: &str, user: &str| UserApiKey {
+        id: id.into(),
+        user_id: user.into(),
+        name: id.into(),
+        key_hash: format!("hash-{id}"),
+        key_prefix: "hk_test".into(),
+        key_last4: "last".into(),
+        enabled: true,
+        expires_at: None,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+
+    hydra_server::db::upsert_user_group(&pool, &group("g1", "t1"))
+        .await
+        .expect("g1");
+    hydra_server::db::upsert_user_group(&pool, &group("g2", "t2"))
+        .await
+        .expect("g2");
+    hydra_server::db::upsert_user(&pool, &user("u1", "t1", "g1"))
+        .await
+        .expect("u1");
+    hydra_server::db::upsert_user(&pool, &user("u2", "t1", "g1"))
+        .await
+        .expect("u2");
+    hydra_server::db::upsert_user(&pool, &user("u3", "t2", "g2"))
+        .await
+        .expect("u3");
+    hydra_server::db::insert_user_api_key(&pool, "t1", &key("k-own", "u1"))
+        .await
+        .expect("own key");
+    hydra_server::db::insert_user_api_key(&pool, "t1", &key("k-sibling", "u2"))
+        .await
+        .expect("sibling key");
+    hydra_server::db::insert_user_api_key(&pool, "t2", &key("k-foreign", "u3"))
+        .await
+        .expect("foreign key");
+
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    for key_id in ["k-foreign", "k-sibling", "k-missing"] {
+        let (status, v) = send_write(
+            &root,
+            reqwest::Method::DELETE,
+            &format!("/tenant/t1/api/v1/users/u1/api-keys/{key_id}"),
+            Some(TENANT_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, 404, "{key_id} must not be owned by u1: {v}");
+        assert_eq!(v["error"]["code"], "not_found", "{key_id}: got {v}");
+    }
+
+    // The foreign/sibling deletes above changed nothing.
+    let keys = hydra_server::db::list_user_api_keys(&pool)
+        .await
+        .expect("keys");
+    assert!(keys.iter().any(|k| k.id == "k-sibling"));
+    assert!(keys.iter().any(|k| k.id == "k-foreign"));
+
+    // The path user's OWN key is the one that deletes.
+    let (status, _) = send_write(
+        &root,
+        reqwest::Method::DELETE,
+        "/tenant/t1/api/v1/users/u1/api-keys/k-own",
+        Some(TENANT_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "the owner's own key deletes");
+    let keys = hydra_server::db::list_user_api_keys(&pool)
+        .await
+        .expect("keys");
+    assert!(!keys.iter().any(|k| k.id == "k-own"));
+}
+
+/// H3.3: the intra-bulk `external_id` collision is the same canonical 409 as
+/// the single-user path, not a 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_bulk_duplicate_external_id_is_409() {
+    const NOW: &str = "2026-01-01T00:00:00Z";
+    let pool = common::setup_pool().await;
+    seed_full_tenant(&pool, "t1", "acme.example", Some(TENANT_TOKEN)).await;
+    hydra_server::db::upsert_user_group(
+        &pool,
+        &UserGroup {
+            id: "g1".into(),
+            tenant_id: "t1".into(),
+            name: "g1".into(),
+            enabled: true,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("group");
+    let state = build_state(&pool, TenantApiConfig::default()).await;
+    let root = start_proxy(state);
+
+    let (status, v) = send_write(
+        &root,
+        reqwest::Method::PUT,
+        "/tenant/t1/api/v1/users/bulk",
+        Some(TENANT_TOKEN),
+        Some(json!({
+            "users": [
+                {"id": "usr-a", "user_group_id": "g1", "external_id": "dup", "name": "a", "enabled": true},
+                {"id": "usr-b", "user_group_id": "g1", "external_id": "dup", "name": "b", "enabled": true}
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, 409, "duplicate external_id in one batch: {v}");
+    assert_eq!(
+        v["error"]["code"], "duplicate_external_id",
+        "the canonical code: {v}"
+    );
+    assert!(
+        hydra_server::db::list_users(&pool)
+            .await
+            .expect("users")
+            .is_empty(),
+        "the rejected batch must not insert either row"
+    );
 }
 
 /// No credential at all: 401 from the gate (the same gate a read uses).
