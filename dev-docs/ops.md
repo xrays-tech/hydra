@@ -1413,8 +1413,14 @@ commit.
   Deployment's changing hostname is harmless now; set it explicitly only if you want stable
   log labels.
 - `GET /api/v1/cluster/status` is local-node only: `node_id`, `role`, `config_version`,
-  `db_reachable`, `redis_configured`, `redis_reachable` (currently `null`). There is no
-  peer list or lease holder to inspect.
+  `db_reachable`, `redis_configured`, `redis_reachable` (`true`/`false`/`null`:
+  `null` when no `HYDRA_REDIS_URL` is configured; otherwise a bounded PING through the
+  same shared Redis pool and command timeout). A build WITHOUT the `cluster-redis` feature
+  reports `redis_configured=true, redis_reachable=false` when the URL is set: that URL is
+  inert in such a build, not necessarily a Redis outage. A single `false` under pool
+  saturation is also not an alert; use `hydra_control_poll_total{result="rate_limit_error"}`
+  / the control-plane signals for a real outage. There is no peer list or lease holder to
+  inspect.
 - **Database availability is the cluster availability boundary.** If the DB is down, all
   nodes can still serve their last snapshot but cannot commit writes. Restore DB service
   first; there is no "majority" to assemble.

@@ -145,7 +145,8 @@
 
 `/healthz/leader` **已删除**（404）。`GET /api/v1/cluster/status` 只报告本节点事实：
 `node_id`、`role`、`config_version`、`db_reachable`、`redis_configured`、`redis_reachable`
-（当前该字段为 `null`，健康探测不在这一层）。没有任何 peer/leader/term 字段。
+（`redis_reachable` 为 `true`/`false`/`null`：未配置 Redis 时是 `null`；配置后由一次复用共享连接池、
+受命令超时约束的 PING 探测得出；默认 500ms，可由 `HYDRA_REDIS_COMMAND_TIMEOUT_MS` 调整）。没有任何 peer/leader/term 字段。
 
 ---
 

@@ -410,6 +410,27 @@ impl RedisBackend {
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
+
+    /// A bounded liveness probe for the shared Redis.
+    ///
+    /// It uses the SAME pool and the SAME per-command timeout as every other
+    /// Redis command (see [`DEFAULT_COMMAND_TIMEOUT_MS`]); there is no separate
+    /// probe client or policy. Any error — including the command timeout, an
+    /// uninitialised pool, or a connection that is still reconnecting — is
+    /// reported as `false`, never propagated: this backs an operator-facing
+    /// status field, not a request path.
+    pub async fn ping(&self) -> bool {
+        self.pool.ping::<fred::types::Value>(None).await.is_ok()
+    }
+
+    /// Wrap an existing pool. Only for the crate's own tests: production builds
+    /// the pool through [`RedisBackend::connect`] / [`build_pool`], and the field
+    /// stays private so no caller can install a pool with a different timeout,
+    /// watchdog or reconnect policy.
+    #[cfg(test)]
+    pub(crate) fn from_pool(pool: Pool) -> Self {
+        Self { pool }
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +534,34 @@ mod tests {
             env_millis("HYDRA_TEST_UNSET_MS_KEY_2", DEFAULT_COMMAND_TIMEOUT_MS),
             DEFAULT_COMMAND_TIMEOUT_MS
         );
+    }
+
+    /// `ping` is the bounded liveness probe behind `redis_reachable`. Against a
+    /// real Redis it must report `true`.
+    #[tokio::test]
+    async fn ping_is_true_against_a_real_redis() {
+        let backend = RedisBackend::from_pool(test_redis::isolated_pool().await);
+        assert!(
+            backend.ping().await,
+            "PING must succeed against the live test Redis"
+        );
+    }
+
+    /// Any error/timeout is `false`, never a propagated error: an unreachable
+    /// Redis must not make the status handler fail. The pool carries the normal
+    /// command timeout, so the probe is bounded.
+    #[tokio::test]
+    async fn ping_is_false_and_bounded_for_an_unreachable_redis() {
+        let perf = PerformanceConfig {
+            default_command_timeout: Duration::from_millis(100),
+            ..PerformanceConfig::default()
+        };
+        let pool = build_pool_with("redis://127.0.0.1:1/0", 1, perf).expect("pool builds");
+        let backend = RedisBackend::from_pool(pool);
+        let reachable = tokio::time::timeout(Duration::from_secs(2), backend.ping())
+            .await
+            .expect("PING is bounded by the command timeout");
+        assert!(!reachable, "an unreachable Redis must report false");
     }
 
     /// Round 191: the mode knob must FAIL FAST for anything it does not understand. It used to fall

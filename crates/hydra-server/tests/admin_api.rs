@@ -68,6 +68,30 @@ async fn admin_state_with(auth_fail_per_min: u32) -> Arc<AdminState> {
     Arc::new(state)
 }
 
+/// Same, with the Redis backend the status endpoint probes (cluster builds).
+#[cfg(feature = "cluster-redis")]
+async fn admin_state_with_redis(
+    redis: Option<Arc<hydra_server::redis::RedisBackend>>,
+) -> Arc<AdminState> {
+    let pool = common::setup_pool().await;
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("ConfigStore::load");
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    Arc::new(
+        AdminState::new(
+            pool,
+            store,
+            breaker,
+            key_provider,
+            Some(TOKEN.to_string()),
+            hydra_server::proxy::admission::AdmissionControl::new(),
+        )
+        .with_redis_backend(redis),
+    )
+}
+
 /// Start a real Pingora `Service` hosting `AdminService` on an ephemeral port.
 fn start_admin(state: Arc<AdminState>) -> u16 {
     let port = ephemeral_port();
@@ -1860,6 +1884,92 @@ async fn health_returns_ok() {
     let v: serde_json::Value = r.json().await.expect("json");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["db"], "ok");
+}
+
+// ===========================================================================
+// §2.5 — cluster status: Redis reachability
+// ===========================================================================
+
+/// A single-node process (no `HYDRA_REDIS_URL`) must report `redis_configured:
+/// false` and `redis_reachable: null` — the distinction from "configured but
+/// down" is the whole point of the field.
+#[cfg(not(feature = "cluster-redis"))]
+#[tokio::test]
+async fn cluster_status_without_redis_reports_null() {
+    std::env::remove_var("HYDRA_REDIS_URL");
+    let port = start_admin(admin_state().await);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/cluster/status",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(v["redis_configured"], false);
+    assert!(
+        v["redis_reachable"].is_null(),
+        "no Redis configured must be null, not false: {v}"
+    );
+}
+
+/// With a real backend injected, the endpoint reports `Some(true)` — and the
+/// same endpoint still reports `null` while no `HYDRA_REDIS_URL` is configured
+/// (presence of a backend alone must not imply the operator configured Redis).
+#[cfg(feature = "cluster-redis")]
+#[tokio::test]
+async fn cluster_status_probes_injected_redis_backend() {
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("HYDRA_REDIS_URL");
+        }
+    }
+
+    std::env::remove_var("HYDRA_REDIS_URL");
+    let _guard = EnvGuard;
+
+    let base = std::env::var("HYDRA_TEST_REDIS_URL").unwrap_or_else(|_| {
+        panic!(
+            "HYDRA_TEST_REDIS_URL is not set; this test needs a REAL Redis \
+             (dev-plan 铁律 2: no in-process Redis mock)"
+        )
+    });
+    let backend =
+        hydra_server::redis::RedisBackend::connect(&base, hydra_server::redis::RedisMode::Single)
+            .await
+            .expect("connect to the test Redis");
+    let port = start_admin(admin_state_with_redis(Some(Arc::new(backend))).await);
+
+    let status = |port: u16| async move {
+        let r = req(
+            port,
+            reqwest::Method::GET,
+            "/api/v1/cluster/status",
+            Some(TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        r.json::<serde_json::Value>().await.expect("json")
+    };
+
+    let v = status(port).await;
+    assert_eq!(v["redis_configured"], false);
+    assert!(
+        v["redis_reachable"].is_null(),
+        "without HYDRA_REDIS_URL the field stays null even when a backend exists: {v}"
+    );
+
+    std::env::set_var("HYDRA_REDIS_URL", &base);
+    let v = status(port).await;
+    assert_eq!(v["redis_configured"], true);
+    assert_eq!(
+        v["redis_reachable"], true,
+        "a configured, reachable Redis must report true: {v}"
+    );
 }
 
 // ===========================================================================

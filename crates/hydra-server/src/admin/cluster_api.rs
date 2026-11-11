@@ -26,7 +26,9 @@ struct ClusterStatusDto {
     db_reachable: bool,
     /// Whether a Redis URL is configured for the data plane.
     redis_configured: bool,
-    /// `None` when no Redis health probe is available at this layer.
+    /// `None` when no Redis is configured, otherwise the result of one bounded
+    /// PING against the shared backend. The probe is capped by the normal Redis
+    /// command timeout (500 ms by default), so this endpoint stays cheap.
     redis_reachable: Option<bool>,
 }
 
@@ -39,6 +41,20 @@ pub(super) async fn cluster_status(state: &AdminState, _trace_id: &str) -> Resp 
     let redis_configured = std::env::var("HYDRA_REDIS_URL")
         .ok()
         .is_some_and(|url| !url.trim().is_empty());
+    // `Some(false)` when configured but the backend was not injected: that is
+    // not expected (main injects it for every cluster node), and "unreachable"
+    // is the honest answer when we cannot prove otherwise.
+    #[cfg(feature = "cluster-redis")]
+    let redis_reachable = if redis_configured {
+        match &state.redis {
+            Some(backend) => Some(backend.ping().await),
+            None => Some(false),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cluster-redis"))]
+    let redis_reachable = if redis_configured { Some(false) } else { None };
     let clustered = state.role.is_cluster();
     let dto = ClusterStatusDto {
         cluster: clustered,
@@ -48,7 +64,7 @@ pub(super) async fn cluster_status(state: &AdminState, _trace_id: &str) -> Resp 
         config_version: state.store.version(),
         db_reachable,
         redis_configured,
-        redis_reachable: None,
+        redis_reachable,
     };
     ok_json(200, &dto)
 }

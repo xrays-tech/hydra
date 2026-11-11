@@ -741,6 +741,8 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         invalidation_stream,
         #[cfg(not(feature = "cluster-redis"))]
         invalidation_stream,
+        #[cfg(feature = "cluster-redis")]
+        redis_backend,
         cluster,
     })
 }
@@ -762,6 +764,11 @@ struct BootstrapComponents {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     invalidation_stream: Option<()>,
+    /// The shared Redis backend, handed to the admin status endpoint so its
+    /// `redis_reachable` probe reuses the SAME pool and command timeout as the
+    /// data plane (no second client).
+    #[cfg(feature = "cluster-redis")]
+    redis_backend: Option<hydra_server::redis::RedisBackend>,
     /// Resolved multi-tenant cert store (design §12.1 single source). Built in
     /// `bootstrap` — not in `run_server` — because it registers itself as a
     /// follower of the config snapshot, and a snapshot can be applied (by the
@@ -997,6 +1004,11 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     .with_cluster_identity(c.cluster.node_id.clone(), c.cluster.role);
     #[cfg_attr(not(feature = "cluster-redis"), allow(unused_mut))]
     let mut admin_state = admin_state;
+    // Cluster status Redis probe: inject the SAME backend the data plane uses.
+    #[cfg(feature = "cluster-redis")]
+    {
+        admin_state = admin_state.with_redis_backend(c.redis_backend.map(Arc::new));
+    }
     // Invalidation bus publisher (P4): admin config invalidations are
     // broadcast cluster-wide, not just applied locally.
     #[cfg(feature = "cluster-redis")]

@@ -244,6 +244,12 @@ pub struct AdminState {
     #[cfg(not(feature = "cluster-redis"))]
     #[allow(dead_code)]
     pub invalidation: Option<()>,
+    /// The shared cluster Redis backend, for the bounded `redis_reachable`
+    /// probe in `GET /api/v1/cluster/status`. `main` injects the SAME backend
+    /// the rest of the node uses (one pool, one command timeout), not a second
+    /// probe client. `None` on a single-node build.
+    #[cfg(feature = "cluster-redis")]
+    pub redis: Option<Arc<crate::redis::RedisBackend>>,
     /// The ids of the LIVE data-plane nodes, or `None` when this process did
     /// not inject them. Used by invalidation/fleet reporting to WAIT for the
     /// fleet to confirm an invalidation instead of reporting a boolean that
@@ -305,6 +311,8 @@ impl AdminState {
             #[cfg(not(feature = "cluster-redis"))]
             invalidation: None,
             #[cfg(feature = "cluster-redis")]
+            redis: None,
+            #[cfg(feature = "cluster-redis")]
             live_nodes: None,
             #[cfg(feature = "cluster-redis")]
             converge_timeout: std::time::Duration::from_millis(2_000),
@@ -320,6 +328,18 @@ impl AdminState {
     ) -> Self {
         self.node_id = node_id;
         self.role = role;
+        self
+    }
+
+    /// Inject the shared Redis backend used by `GET /api/v1/cluster/status`.
+    ///
+    /// `main` passes the SAME backend the data plane uses, so the status probe
+    /// shares its pool and command timeout. A single-node build has no such
+    /// backend and keeps the default `None`.
+    #[cfg(feature = "cluster-redis")]
+    #[must_use]
+    pub fn with_redis_backend(mut self, redis: Option<Arc<crate::redis::RedisBackend>>) -> Self {
+        self.redis = redis;
         self
     }
 
