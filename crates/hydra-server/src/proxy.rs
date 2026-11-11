@@ -243,15 +243,16 @@ pub struct HydraProxy {
 }
 
 impl HydraProxy {
-    /// Build with the shared app state. The provider client is constructed
-    /// here (infallible — see [`ProviderClient::new`]).
-    #[must_use]
-    pub fn new(state: Arc<AppState>) -> Self {
+    /// Build with the shared app state. The provider client is constructed here
+    /// (see [`ProviderClient::with_connect_timeout`]); its builder can fail only
+    /// if the TLS backend is unusable, which the caller reports as a boot error
+    /// instead of panicking.
+    pub fn new(state: Arc<AppState>) -> Result<Self, reqwest::Error> {
         let connect_timeout_secs = state.proxy.upstream_connect_timeout_secs;
-        Self {
+        Ok(Self {
             state,
-            provider_client: ProviderClient::with_connect_timeout(connect_timeout_secs),
-        }
+            provider_client: ProviderClient::with_connect_timeout(connect_timeout_secs)?,
+        })
     }
 
     /// The domain used for tenant resolution.

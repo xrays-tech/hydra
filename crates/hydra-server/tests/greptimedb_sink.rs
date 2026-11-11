@@ -339,10 +339,16 @@ async fn the_wire_mock_sees_the_ddl_insert_and_read_and_the_schema_matches() {
         totals_sql.contains("tenant_id = 'tenant-1'"),
         "the tenant must be an escaped literal: {totals_sql}"
     );
+    // The window is a RANGE on the `ts` TIME INDEX, written as bare epoch-millisecond bounds (no
+    // quotes): `2026-11-11T00:00:00Z` = 1794355200000ms, `2026-11-11T01:00:00Z` = 1794358800000ms.
+    // The tenant stays an escaped literal (there is no bind parameter).
     assert!(
-        totals_sql.contains("created_at >= '2026-11-11T00:00:00Z'")
-            && totals_sql.contains("created_at < '2026-11-11T01:00:00Z'"),
-        "the window must be escaped literals: {totals_sql}"
+        totals_sql.contains("ts >= 1794355200000") && totals_sql.contains("ts < 1794358800000"),
+        "the window must be a bare epoch-ms range on `ts`: {totals_sql}"
+    );
+    assert!(
+        !totals_sql.contains("created_at >=") && !totals_sql.contains("created_at <"),
+        "the window must NOT be the old `created_at` string predicate: {totals_sql}"
     );
     assert!(
         totals_sql.contains("max(created_at) AS last_seen"),

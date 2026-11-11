@@ -239,7 +239,7 @@ async fn build_state_with_proxy_config(
 fn start_proxy(state: Arc<AppState>) -> String {
     let port = ephemeral_port();
     let listen_addr = format!("127.0.0.1:{port}");
-    let app = HydraProxy::new(state);
+    let app = HydraProxy::new(state).expect("build HydraProxy");
     let mut server = Server::new(Some(Opt::default())).expect("Server::new");
     server.bootstrap();
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, app);

@@ -20,8 +20,9 @@
 //! * **`trace_id` is load-bearing for that dedup**: if it were empty for two same-tenant rows at the
 //!   same `ts`, they would fold into one. The writer derives a deterministic FNV-1a fallback key
 //!   over the row when `trace_id` is empty, and writes it, so the dedup identity is never blank.
-//! * **There is no HTTP bind parameter**, so `tenant_id` and the window bounds are escaped literals
-//!   and every grouping expression is a whitelist.
+//! * **There is no HTTP bind parameter**, so `tenant_id` is an escaped literal, the read window is
+//!   the `ts` time index expressed as bare epoch-millisecond bounds, and every grouping expression is
+//!   a whitelist.
 //!
 //! # The write path
 //!
@@ -31,9 +32,24 @@
 //!
 //! # The read path
 //!
-//! `GET /usage` is answered from the same table with escaped literals and whitelisted groupings;
-//! [`GreptimedbResponse`] is decoded by this module (schema-name → index), so a shape drift or a
-//! non-numeric counter is a FAILURE, never a zero.
+//! `GET /usage` is answered from the same table. The window is
+//! `ts >= <since_epoch_ms> AND ts < <until_epoch_ms>` — a range predicate on the `ts` TIME INDEX —
+//! while `tenant_id` stays an escaped literal and the groupings stay whitelisted; [`GreptimedbResponse`]
+//! is decoded by this module (schema-name → index), so a shape drift or a non-numeric counter is a
+//! FAILURE, never a zero.
+//!
+//! **Why the `ts` window is equivalent to the old `created_at` string window.** Both `created_at` and
+//! `ts` come from the same row and the same canonical formatter: `created_at` is the fixed-width,
+//! zero-padded all-UTC `YYYY-MM-DDTHH:MM:SSZ` string, and `ts` is exactly `epoch_millis(created_at)`.
+//! On canonical rows the epoch-millisecond map is strictly order-preserving, so
+//! `created_at >= s AND created_at < u` selects the same set as `ts >= ms(s) AND ts < ms(u)` (the
+//! window contract already normalises `since`/`until` to that canonical form, so no lenient parsing
+//! is implied). The only row class that differs is the writer's non-canonical fallback: when
+//! `created_at` cannot be parsed, the writer stores `ts = 0`. Such a row is **invisible to every
+//! real window** under the `ts` predicate (its epoch is 1970-01-01T00:00:00Z) — the same class of
+//! "not in the measured window" as the old string predicate, which also excluded junk that did not
+//! sort inside `[s, u)`. That fallback is a write-side degradation, not a read-side one, and it is
+//! recorded in the module's live-test notes rather than silently widened away.
 
 pub(crate) mod transport;
 
@@ -572,12 +588,24 @@ impl UsageQuery for GreptimedbUsageQuery {
         group_by: GroupBy,
     ) -> Pin<Box<dyn Future<Output = Result<UsageAggregate, UsageQueryError>> + Send + 'a>> {
         Box::pin(async move {
+            // The window bounds arrive in the canonical `%Y-%m-%dT%H:%M:%SZ` form (the `UsageQuery`
+            // contract normalises them, see `tenant_api::time_bound`), so `epoch_millis` is exact and
+            // this `ts` window is equivalent to the old `created_at` string window on canonical rows
+            // (see the module docs for the equivalence and the `ts=0` fallback note). A bound that is
+            // NOT canonical is a refusal, never a silently widened or zeroed window.
+            let since_ms = epoch_millis(since).ok_or_else(|| {
+                UsageQueryError::Decode(format!(
+                    "the usage window start {since:?} is not the canonical `%Y-%m-%dT%H:%M:%SZ` form"
+                ))
+            })?;
+            let until_ms = epoch_millis(until).ok_or_else(|| {
+                UsageQueryError::Decode(format!(
+                    "the usage window end {until:?} is not the canonical `%Y-%m-%dT%H:%M:%SZ` form"
+                ))
+            })?;
             let tenant = escape_sql_string(tenant_id);
-            let since = escape_sql_string(since);
-            let until = escape_sql_string(until);
             let where_clause = format!(
-                "FROM {TABLE} WHERE tenant_id = '{tenant}' AND created_at >= '{since}' \
-                 AND created_at < '{until}'"
+                "FROM {TABLE} WHERE tenant_id = '{tenant}' AND ts >= {since_ms} AND ts < {until_ms}"
             );
 
             let totals_sql = format!(

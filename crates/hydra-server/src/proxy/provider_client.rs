@@ -98,10 +98,9 @@ impl ProviderClient {
     /// `Policy::none()` was added to close, and the surrounding comment claimed the
     /// fallbacks covered it. The builder is only ever fed constant settings, so
     /// "it failed" means the TLS backend is unusable; a client that cannot be built
-    /// that way genuinely has no safe configuration, and `expect` here is a
-    /// deliberate, documented invariant rather than an oversight.
-    #[must_use]
-    pub fn new() -> Self {
+    /// that way genuinely has no safe configuration, so construction returns the
+    /// error instead of panicking.
+    pub fn new() -> Result<Self, reqwest::Error> {
         Self::with_connect_timeout(
             crate::proxy::config::ProxyConfig::default().upstream_connect_timeout_secs,
         )
@@ -115,8 +114,7 @@ impl ProviderClient {
     /// "the request was written" (no failover, to avoid double billing). With it, the connect
     /// phase fails as a reqwest connect error, which is the one class that proves the
     /// upstream never saw the request.
-    #[must_use]
-    pub fn with_connect_timeout(connect_secs: u64) -> Self {
+    pub fn with_connect_timeout(connect_secs: u64) -> Result<Self, reqwest::Error> {
         let connect = Duration::from_secs(connect_secs.max(1));
         let builder = || {
             reqwest::Client::builder()
@@ -125,11 +123,8 @@ impl ProviderClient {
                 .connect_timeout(connect)
                 .redirect(reqwest::redirect::Policy::none())
         };
-        let client = builder()
-            .build()
-            .or_else(|_| builder().build())
-            .expect("a reqwest client with constant settings and no redirects must build");
-        Self { client }
+        let client = builder().build().or_else(|_| builder().build())?;
+        Ok(Self { client })
     }
 
     /// Construct the upstream request for one failover attempt.
@@ -258,12 +253,6 @@ impl ProviderClient {
     }
 }
 
-impl Default for ProviderClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +277,7 @@ mod tests {
             }
         });
 
-        let client = ProviderClient::new();
+        let client = ProviderClient::new().expect("build provider client");
         let req = client
             .client
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -321,7 +310,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             l.local_addr().expect("addr").port()
         };
-        let client = ProviderClient::new();
+        let client = ProviderClient::new().expect("build provider client");
         let req = client
             .client
             .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
@@ -369,7 +358,7 @@ mod tests {
             }
         });
 
-        let client = ProviderClient::new();
+        let client = ProviderClient::new().expect("build provider client");
         let req = client
             .client
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -437,7 +426,7 @@ mod tests {
             }
         });
 
-        let client = ProviderClient::new();
+        let client = ProviderClient::new().expect("build provider client");
         let req = client
             .client
             .post(format!("http://{upstream_addr}/v1/messages"))
@@ -479,7 +468,7 @@ mod tests {
 
     #[test]
     fn build_rewrites_path_and_swaps_key() {
-        let pc = ProviderClient::new();
+        let pc = ProviderClient::new().expect("build provider client");
         let provider = Provider {
             id: "p1".into(),
             key: "openai".into(),
@@ -532,7 +521,7 @@ mod tests {
 
     #[test]
     fn build_applies_endpoint_path_prefix() {
-        let pc = ProviderClient::new();
+        let pc = ProviderClient::new().expect("build provider client");
         let provider = Provider {
             id: "gw".into(),
             key: "gw".into(),
@@ -565,7 +554,7 @@ mod tests {
     /// `anthropic-version` the real API answers 400.
     #[test]
     fn build_uses_x_api_key_and_forwards_anthropic_headers_for_v1_messages() {
-        let pc = ProviderClient::new();
+        let pc = ProviderClient::new().expect("build provider client");
         let provider = Provider {
             id: "p1".into(),
             key: "anthropic".into(),
@@ -604,7 +593,7 @@ mod tests {
     /// may have received (they are meaningless to that family).
     #[test]
     fn build_does_not_forward_anthropic_headers_on_the_openai_path() {
-        let pc = ProviderClient::new();
+        let pc = ProviderClient::new().expect("build provider client");
         let provider = Provider {
             id: "p1".into(),
             key: "openai".into(),

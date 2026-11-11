@@ -41,9 +41,10 @@ function run(fx, extraArgs = [], env = {}) {
   const res = spawnSync(process.execPath, [CHECKER, ...args], {
     encoding: 'utf8',
     // `PURITY_EXPECT_OK: '{}'` REPLACES the repository's registrations: a fixture tree does not contain
-    // `main.rs:1166` or `provider_client.rs:131`, so without this every case would report the two
-    // repository records as stale — the exact failure mode `recorded_exceptions.cjs` documents
-    // ("getting this wrong cost every guard a round of 'nine existing assertions turned red at once'").
+    // the repository's registered `expect` sites (the registry is empty today, but a future record would
+    // make every fixture case report it as stale), so overriding here keeps a fixture self-contained —
+    // the exact failure mode `recorded_exceptions.cjs` documents ("getting this wrong cost every guard a
+    // round of 'nine existing assertions turned red at once'").
     // Cases that exercise the registration pass their own value through `env`.
     env: { ...process.env, PURITY_EXPECT_OK: '{}', ...env },
   });
@@ -81,6 +82,38 @@ test('all four panicking macros are covered', () => {
     assert.equal(r.status, 1, `${macro} was not caught`);
     assert.match(r.stderr, /panicking macro/);
   }
+});
+
+test('production assert!/assert_eq!/assert_ne! fail, while debug_assert* stays allowed', () => {
+  for (const macro of ['assert!', 'assert_eq!', 'assert_ne!']) {
+    const r = run(fixture({ lib: `#![forbid(unsafe_code)]\n\npub fn f() -> bool { ${macro}(true, true) }\n` }));
+    assert.equal(r.status, 1, `${macro} was not caught`);
+    assert.match(r.stderr, /assert!/);
+  }
+  // The `\b` anchor means the assert rule must NOT fire inside `debug_assert!(`, nor
+  // inside `debug_assert_eq!` / `debug_assert_ne!` — those are test/defensive checks.
+  const dbg = run(fixture({
+    lib: '#![forbid(unsafe_code)]\n\npub fn f() -> bool { debug_assert!(true); debug_assert_eq!(1, 1); debug_assert_ne!(1, 2); true }\n',
+  }));
+  assert.equal(dbg.status, 0, `debug_assert* must stay allowed:\n${dbg.stderr}`);
+});
+
+test('the unwrap pattern catches turbofish forms but not non-panicking unwrap_or_else', () => {
+  const turbofish = run(fixture({ lib: '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { let o: Option<u8> = None; o.unwrap::<u8>() }\n' }));
+  assert.equal(turbofish.status, 1, turbofish.stdout);
+  assert.match(turbofish.stderr, /unwrap\(\)/);
+
+  const nonPanicking = run(fixture({ lib: '#![forbid(unsafe_code)]\n\npub fn f() -> u8 { let o: Option<u8> = None; o.unwrap_or_else(|| 0) }\n' }));
+  assert.equal(nonPanicking.status, 0, `unwrap_or_else is not a panic source:\n${nonPanicking.stderr}`);
+});
+
+test('production expect_err() fails (it panics on Ok) while cfg(test) stays allowed', () => {
+  const bad = run(fixture({ lib: '#![forbid(unsafe_code)]\n\npub fn f(r: Result<u8, ()>) -> () { r.expect_err("boom") }\n' }));
+  assert.equal(bad.status, 1, bad.stdout);
+  assert.match(bad.stderr, /expect_err\(\)/);
+
+  const testOnly = run(fixture({ lib: '#![forbid(unsafe_code)]\n\n#[cfg(test)]\nmod tests { fn f(r: Result<u8, ()>) { r.expect_err("test"); } }\n' }));
+  assert.equal(testOnly.status, 0, `cfg(test) expect_err must stay allowed:\n${testOnly.stderr}`);
 });
 
 test('#[cfg(test)] items are not production code', () => {

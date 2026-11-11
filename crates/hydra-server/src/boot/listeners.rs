@@ -102,8 +102,16 @@ pub(crate) fn setup_data_plane(
             hydra_server::listeners::probe_bind(&tls_addr)
         } {
             Ok(()) => {
-                let cert_store = cert_store
-                    .expect("the cert store is built whenever a TLS listener is configured");
+                // The store is built UNCONDITIONALLY whenever a TLS feature is
+                // compiled in (`boot/state.rs::build_cert_store`, called from
+                // `boot/mod.rs`), so this `Option` can only be `None` in a build
+                // that cannot reach this line. Return the boot error instead of
+                // panicking if that ever changes.
+                let Some(cert_store) = cert_store else {
+                    return Err("a TLS listener was configured but no certificate store \
+                                was built; refusing to start"
+                        .into());
+                };
                 match cert_store.build_tls_settings() {
                     Ok(settings) => {
                         proxy_service.add_tls_with_settings(&tls_addr, None, settings);

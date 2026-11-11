@@ -408,7 +408,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
     // Clone the admission controller out of AppState BEFORE c.state is moved
     // into HydraProxy below, so AdminState::new can share the same DashMap.
     let admission = c.state.admission.clone();
-    let app = HydraProxy::new(c.state);
+    let app = HydraProxy::new(c.state)?;
 
     // (3b) Data-plane listeners: config-derived topology, bindability probe,
     // optional downstream TLS, and the external startup self-check.

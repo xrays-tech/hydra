@@ -16,8 +16,11 @@
  * for something production does not satisfy (`expect`).
  *
  * What this checks:
- *   1. Zero `unsafe`, zero `.unwrap()`, zero `panic!/unreachable!/todo!/
- *      unimplemented!` in `crates/<crate>/src/**` OUTSIDE `#[cfg(test)]` items.
+ *   1. Zero `unsafe`, zero `.unwrap`, zero `panic!/unreachable!/todo!/
+ *      unimplemented!` and zero production `assert!/assert_eq!/assert_ne!` in
+ *      `crates/<crate>/src/**` OUTSIDE `#[cfg(test)]` items. The `debug_assert*`
+ *      forms stay allowed (the assert rule is anchored with `\b` so it cannot
+ *      match inside `debug_assert!(`).
  *      Both `#[cfg(test)]` and `#[cfg(all(test, feature = "..."))]` are excluded
  *      — the earlier hand-grep only knew the first form and misread 20+ test
  *      lines as production (`cluster/forward.rs`'s `registry_tests`).
@@ -30,10 +33,11 @@
  *      letting the guard quietly stop matching anything.
  *
  * `.expect(...)` is NOT counted as a violation: the public claim does not name
- * it, and all current production uses assert an unreachable invariant
- * (constant reqwest builds, poisoned-lock recovery, "leader mode only" pool).
- * The sites are printed every run so growth is visible; whether the project
- * should also forbid `expect` in production is an open question (plan D-13).
+ * it, so any surviving production site must be REGISTERED in `EXPECT_SITE_OK`
+ * with its reason (decision D-13). As of 2026-11-11 the production count is 0 —
+ * the two former sites now return a boot error / `Result` — so the registry is
+ * empty, and an unregistered site is a finding while a record whose site
+ * disappeared is a stale claim.
  *
  * Exit codes: 0 clean, 1 a violation, 2 the scan could not be performed.
  */
@@ -68,10 +72,23 @@ const TEST_ONLY_FILES = new Map([
 
 const FORBIDDEN = [
   { name: 'unsafe', re: /\bunsafe\b/ },
-  { name: 'unwrap()', re: /\.unwrap\(\)/ },
+  // The `\b` after `unwrap`/`expect` keeps the NON-panicking `unwrap_or_else` /
+  // `unwrap_or_default` forms out (the character after `unwrap` there is `_`, a word
+  // character, so there is no boundary), while `.unwrap()` and the latent turbofish /
+  // whitespace forms `.unwrap::<T>()` / `.unwrap ()` still match.
+  { name: 'unwrap()', re: /\.unwrap\b/ },
   { name: 'panicking macro', re: /\b(?:panic!|unreachable!|todo!|unimplemented!)/ },
+  // `assert!`, `assert_eq!` and `assert_ne!` panic in production just like `panic!`.
+  // The leading `\b` is load-bearing: `debug_assert!` / `debug_assert_eq!` /
+  // `debug_assert_ne!` contain `assert` preceded by `_` (a word character), so there
+  // is NO word boundary there and the debug variants — which stay allowed — do not
+  // match. `assert_matches!` is intentionally not covered by this rule.
+  { name: 'assert!', re: /\bassert(?:_eq|_ne)?!/ },
+  // `expect_err` panics when the Result is Ok; `.expect\b` cannot catch it
+  // because the `_` after `expect` is a word character (no boundary).
+  { name: 'expect_err()', re: /\.expect_err\b/ },
 ];
-const EXPECT = /\.expect\(/;
+const EXPECT = /\.expect\b/;
 
 class ScanError extends Error {
   constructor(message) {
@@ -125,23 +142,7 @@ const { records, audit } = require('./recorded_exceptions.cjs');
  * every remaining site REGISTERED here and its reason written down. An unregistered site is a finding;
  * a registration whose site disappeared is a stale claim. So the set cannot grow — or rot — in silence.
  */
-const EXPECT_SITE_OK = records(process.env.PURITY_EXPECT_OK, [
-  [
-    'hydra-server/src/boot/listeners.rs@d9758f50',
-    'cert store at the TLS listener (boot/listeners.rs, F6 split of main.rs): the store is built ' +
-      'UNCONDITIONALLY whenever a TLS feature is compiled in (boot/state.rs `build_cert_store`, ' +
-      'called from boot/mod.rs), and this branch is only reached with a TLS listener configured — ' +
-      'so the Option is None only in a build that cannot reach this line. There is also no caller ' +
-      'to return an error to: this is bootstrap, before any request exists.',
-  ],
-  [
-    'hydra-server/src/proxy/provider_client.rs@8e38d65c',
-    'the reqwest client (provider_client.rs:128-131): the builder uses CONSTANT settings and no ' +
-      'redirect policy, and a failed build is retried once with an identical builder — a failure that ' +
-      'survives that retry is a property of the constant set, not of request data, and it happens at ' +
-      'client construction where there is no request to fail.',
-  ],
-]);
+const EXPECT_SITE_OK = records(process.env.PURITY_EXPECT_OK, []);
 
 /** One registered `expect` site's identity: the file, plus a fingerprint of the line itself. */
 function expectKey(relFile, text) {

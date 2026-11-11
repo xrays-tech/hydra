@@ -135,7 +135,7 @@ fn start_tls_server(state: Arc<AppState>, cert_store: &HydraCertStore) -> u16 {
     let addr = format!("127.0.0.1:{port}");
     let mut server = Server::new(Some(Opt::default())).expect("Server::new");
     server.bootstrap();
-    let app = HydraProxy::new(state);
+    let app = HydraProxy::new(state).expect("build HydraProxy");
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, app);
     let settings = cert_store.build_tls_settings().expect("build_tls_settings");
     proxy_service.add_tls_with_settings(&addr, None, settings);

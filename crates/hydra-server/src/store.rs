@@ -700,7 +700,7 @@ impl ConfigStore {
     /// thread, after the swap, with no lock of ours held — it must not block or
     /// panic (a panicking hook would abort a reload that already succeeded).
     pub fn on_snapshot_change(&self, hook: SnapshotHook) {
-        let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hooks = crate::lock_gate(&self.hooks);
         hooks.push(hook);
     }
 
@@ -718,7 +718,7 @@ impl ConfigStore {
     fn notify(&self, cfg: &ConfigData) {
         // Cloned out of the lock before calling: a hook may (re)register.
         let hooks: Vec<SnapshotHook> = {
-            let hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
+            let hooks = crate::lock_gate(&self.hooks);
             hooks.clone()
         };
         for hook in hooks {
@@ -893,7 +893,7 @@ impl ConfigStore {
 
         self.inner.store(Arc::new(new_cfg));
         {
-            let mut last = self.last_rows.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = crate::lock_gate(&self.last_rows);
             *last = Some(rows);
         }
         self.version.store(new_version, Ordering::Release);

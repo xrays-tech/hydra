@@ -104,14 +104,14 @@ server = ["db", "http-client", "proxy", "tls-boringssl"]
 # Dependencies are minimal: the sink talks to ClickHouse over its native HTTP
 # interface (INSERT … FORMAT JSONEachRow) and never uses the `clickhouse` crate
 # (the 0.1 placeholder pin was a W1 leftover — see sink.rs module docs).
-# `base64` is only for HTTP Basic auth when the URL carries `user:pass@` creds.
+# Basic auth is built by the shared `usage::http` encoder (no base64 crate).
 # Compiling the feature adds the ClickHouse usage sink to the binary; the
 # active backend is chosen at runtime by HYDRA_USAGE_SINK.
-usage-clickhouse = ["dep:base64"]
+usage-clickhouse = []
 
 # TDengine usage backend (ADR-0002 §5.1): taosAdapter over HTTP, implemented as the pattern's first
 # new insertion. It needs NO dependency of its own — the transport is a small HTTP/1.1 POST over
-# `tokio` (already a `runtime` dep) and the base64 for Basic auth is written out — which is what
+# `tokio` (already a `runtime` dep) and Basic auth is written by `usage::http` — which is what
 # makes "a backend is one module + one feature + one registry row" true rather than aspirational.
 # Not a delivered backend: see `dev-docs/usage-backends.md`.
 usage-tdengine = []
@@ -119,10 +119,8 @@ usage-tdengine = []
 # GreptimeDB usage backend (ADR-0002 §5.2): the GreptimeDB HTTP SQL API, the pattern's second new
 # insertion. STANDALONE — deliberately NOT implied by `server`, so enabling it does not change the
 # default build or the hard-gate counts; the optional-features job is where it runs.
-# `base64` is declared because the transport builds `Authorization: Basic <user:pass>` from the URL
-# credentials. It is already pulled in by `db`; declared here so this backend's dependency is
-# explicit rather than inherited by accident.
-usage-greptimedb = ["dep:base64"]
+# Basic auth is built by the shared `usage::http` encoder, so this feature needs no base64 crate.
+usage-greptimedb = []
 
 # Redis backbone: shared rate limits / breaker votes and the invalidation
 # stream ride one Redis. Opt-in so the default single-node build keeps zero

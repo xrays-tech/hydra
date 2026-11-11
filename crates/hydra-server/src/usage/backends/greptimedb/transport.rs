@@ -40,6 +40,12 @@
 
 use std::time::Duration;
 
+use crate::usage::http::{self, BasicAuth, Endpoint, Overflow, ReadLimits, Request};
+
+/// Re-exported so `transport::env_millis` / `transport::url_encode` keep resolving after the move to
+/// `usage::http` (the backend's `mod.rs` builds its chunking arithmetic with the shared encoder).
+pub(crate) use crate::usage::http::{env_millis, url_encode};
+
 /// A parsed `HYDRA_GREPTIMEDB_URL`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GreptimedbConfig {
@@ -126,8 +132,8 @@ pub fn parse_greptimedb_url(raw: &str) -> Result<GreptimedbConfig, String> {
     let (user, password) = match userinfo {
         None => (None, None),
         Some(u) => match u.split_once(':') {
-            Some((n, p)) => (Some(percent_decode(n)), Some(percent_decode(p))),
-            None => (Some(percent_decode(u)), None),
+            Some((n, p)) => (Some(http::percent_decode(n)), Some(http::percent_decode(p))),
+            None => (Some(http::percent_decode(u)), None),
         },
     };
 
@@ -197,69 +203,8 @@ fn split_host_port(hostport: &str) -> Result<(&str, u16), String> {
     Ok((host, port))
 }
 
-/// `%XX` → the byte it stands for. Applied to the credentials only: a password with an `@` or `/`
-/// must survive the URL, and the characters a URL cannot carry literally are exactly what this undoes.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A deadline knob: milliseconds from the environment, or `default_ms`.
-#[must_use]
-pub fn env_millis(name: &str, default_ms: u64) -> Duration {
-    match std::env::var(name) {
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
-            _ => {
-                tracing::warn!(
-                    target: "hydra::usage::greptimedb",
-                    variable = name,
-                    value = %v,
-                    "not a positive number of milliseconds; using the default"
-                );
-                Duration::from_millis(default_ms)
-            }
-        },
-        Err(_) => Duration::from_millis(default_ms),
-    }
-}
-
-/// Percent-encode a string for a `application/x-www-form-urlencoded` value (RFC 3986 unreserved
-/// characters kept; everything else `%HH`).
-///
-/// Used for the `db` query parameter AND for the SQL body: an unencoded `&`, `+` or `%` would
-/// silently change what the server receives.
-#[must_use]
-pub fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
-}
+// `percent_decode`, `env_millis` and `url_encode` moved to `crate::usage::http` (the last two
+// re-exported above); the URL parser calls `http::percent_decode` so the one decoder is shared.
 
 /// What GreptimeDB answered, parsed from the body.
 #[derive(Clone, Debug)]
@@ -409,29 +354,12 @@ fn preview(body: &str) -> String {
 }
 
 /// Whether a status line means success. Any 2xx is accepted; everything else is refused by [`send`].
+///
+/// This is GreptimeDB's OWN success policy (a true 2xx gate), deliberately not unified with
+/// ClickHouse's loose `" 200 "` substring or TDengine's envelope-only rule.
 #[must_use]
 pub fn is_ok_status(status_line: &str) -> bool {
-    matches!(status_code(status_line), Some(code) if (200..300).contains(&code))
-}
-
-/// The numeric status code from a response status line, if it parses.
-#[must_use]
-pub fn status_code(status_line: &str) -> Option<u16> {
-    status_line.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// The `Authorization` header value for this configuration: HTTP Basic, or nothing when the URL
-/// carried no credentials.
-#[must_use]
-pub fn authorization_header(cfg: &GreptimedbConfig) -> Option<String> {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    let user = cfg.user.as_deref()?;
-    let password = cfg.password.as_deref().unwrap_or("");
-    Some(format!(
-        "Basic {}",
-        B64.encode(format!("{user}:{password}"))
-    ))
+    matches!(http::status_code(status_line), Some(code) if (200..300).contains(&code))
 }
 
 /// Send one statement to GreptimeDB and parse the answer.
@@ -440,141 +368,67 @@ pub fn authorization_header(cfg: &GreptimedbConfig) -> Option<String> {
 /// response cap returns a `truncated` response — the caller decides between `ResultTooLarge` and a
 /// retry. A 2xx body carrying a top-level `code`/`error` parses to a response with
 /// [`GreptimedbResponse::is_failure`] set.
+///
+/// The cap is the measured SPLIT accounting: the header block is bounded separately from the body, so
+/// `MAX_GREPTIMEDB_RESPONSE` is the **body** cap (see [`crate::usage::http::ReadLimits`]).
 pub async fn send(cfg: &GreptimedbConfig, sql: &str) -> Result<GreptimedbResponse, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let db = cfg.database_or_default();
     let body = format!("sql={}", url_encode(sql));
     let path = format!("/v1/sql?db={}", url_encode(db));
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Greptime-Timezone: UTC\r\nContent-Length: {}\r\nConnection: close\r\n",
-        cfg.host,
-        cfg.port,
-        body.len()
-    );
-    if let Some(auth) = authorization_header(cfg) {
-        request.push_str(&format!("Authorization: {auth}\r\n"));
-    }
-    request.push_str("\r\n");
-    request.push_str(&body);
-
-    let addr = format!("{}:{}", cfg.host, cfg.port);
-    let mut stream =
-        tokio::time::timeout(cfg.connect_timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                format!(
-                    "connecting to {addr} timed out after {:?}",
-                    cfg.connect_timeout
-                )
-            })?
-            .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-
-    let exchange = async {
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| format!("writing the statement to {addr} failed: {e}"))?;
-        stream.flush().await.ok();
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 8192];
-        let mut truncated = false;
-        // Where the body begins (just past the header terminator), once it has been seen. The body
-        // cap only starts counting from there, so `MAX_GREPTIMEDB_RESPONSE` is a BODY cap.
-        let mut body_start: Option<usize> = None;
-        loop {
-            let n = stream
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("reading the answer from {addr} failed: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            if append_capped(&mut raw, &buf[..n], &mut body_start)? {
-                truncated = true;
-                break;
-            }
-        }
-        Ok::<(Vec<u8>, bool), String>((raw, truncated))
+    let endpoint = Endpoint {
+        host: cfg.host.clone(),
+        port: cfg.port,
+        connect_timeout: cfg.connect_timeout,
+        io_timeout: cfg.io_timeout,
     };
+    let auth = cfg.user.as_ref().map(|user| BasicAuth {
+        user: user.clone(),
+        pass: cfg.password.clone().unwrap_or_default(),
+    });
+    let host_header = format!("{}:{}", cfg.host, cfg.port);
+    let request = Request {
+        path_and_query: &path,
+        host_header: &host_header,
+        auth,
+        content_type: Some("application/x-www-form-urlencoded"),
+        extra_headers: &[("X-Greptime-Timezone", "UTC")],
+        body: body.as_bytes(),
+    };
+    let limits = ReadLimits {
+        max_header_bytes: MAX_HEADER_BYTES,
+        max_body_bytes: Some(MAX_GREPTIMEDB_RESPONSE),
+        overflow: Overflow::FlagTruncated,
+    };
+    let resp = http::exchange(&endpoint, &request, &limits).await?;
 
-    let (raw, truncated) = tokio::time::timeout(cfg.io_timeout, exchange)
-        .await
-        .map_err(|_| {
-            format!(
-                "the answer from {addr} did not arrive within {:?}",
-                cfg.io_timeout
-            )
-        })??;
-
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let status_line = text.lines().next().unwrap_or("").to_string();
-    let resp_body = response_body(&text);
-
-    if !is_ok_status(&status_line) {
+    let status_line = resp.status_line;
+    let ok = match resp.status {
+        Some(code) => (200..300).contains(&code),
+        // A status line without a parseable code (a proxy's banner, say) is judged by the same
+        // string gate the contract test pins.
+        None => is_ok_status(&status_line),
+    };
+    if !ok {
+        let body_text = http::response_body(&resp.body);
         return Err(format!(
             "greptimedb refused the statement (status {}): {}",
             status_line.trim(),
-            preview(&resp_body)
+            preview(&body_text)
         ));
     }
-    if truncated {
-        return Ok(GreptimedbResponse::truncated(status_line, resp_body));
+    let body_text = http::response_body(&resp.body);
+    if resp.truncated {
+        return Ok(GreptimedbResponse::truncated(status_line, body_text));
     }
-    let mut parsed = GreptimedbResponse::parse(&resp_body)?;
+    let mut parsed = GreptimedbResponse::parse(&body_text)?;
     parsed.status_line = status_line;
     Ok(parsed)
 }
 
-/// Append a response chunk, enforcing the two caps exactly:
-///
-/// * until the header terminator is seen, the header block may not exceed [`MAX_HEADER_BYTES`] — a
-///   server that never terminates its headers is refused with an actionable error;
-/// * from the first byte after the terminator, the body may not exceed
-///   [`MAX_GREPTIMEDB_RESPONSE`].
-///
-/// Returns `true` when body bytes were discarded because the body cap was crossed. A body that
-/// exactly fills the cap is NOT truncation (the response may still be complete).
-fn append_capped(
-    raw: &mut Vec<u8>,
-    chunk: &[u8],
-    body_start: &mut Option<usize>,
-) -> Result<bool, String> {
-    raw.extend_from_slice(chunk);
-    if body_start.is_none() {
-        if let Some(h) = find_subslice(raw, b"\r\n\r\n") {
-            *body_start = Some(h + 4);
-        } else if raw.len() > MAX_HEADER_BYTES {
-            return Err(format!(
-                "the answer's headers exceeded {MAX_HEADER_BYTES} bytes without a terminator"
-            ));
-        }
-    }
-    if let Some(start) = *body_start {
-        if raw.len().saturating_sub(start) > MAX_GREPTIMEDB_RESPONSE {
-            raw.truncate(start + MAX_GREPTIMEDB_RESPONSE);
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// The first index of `needle` in `hay`.
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-/// The body of an HTTP response, or the whole text when there is no header terminator (so a parse
-/// failure can quote what actually arrived).
-fn response_body(text: &str) -> String {
-    match text.find("\r\n\r\n") {
-        Some(i) => text[i + 4..].to_string(),
-        None => text.to_string(),
-    }
-}
+// `status_code`, `authorization_header`/base64, `append_capped`, `find_subslice` and `response_body`
+// moved to `crate::usage::http` (the first is exposed as `http::status_code`; the last is used
+// above). The GreptimeDB-specific `MAX_HEADER_BYTES`/`MAX_GREPTIMEDB_RESPONSE` caps stay here and
+// feed the shared `ReadLimits`.
 
 #[cfg(test)]
 mod tests {
@@ -655,17 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn url_encode_keeps_unreserved_and_escapes_everything_else() {
-        assert_eq!(url_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
-        assert_eq!(url_encode("a b"), "a%20b");
-        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
-        assert_eq!(url_encode("a+b"), "a%2Bb");
-        assert_eq!(url_encode("a%b"), "a%25b");
-        assert_eq!(url_encode("'"), "%27");
-        assert_eq!(url_encode("SELECT 1"), "SELECT%201");
-    }
-
-    #[test]
     fn only_a_2xx_status_line_is_success() {
         assert!(is_ok_status("HTTP/1.1 200 OK"));
         assert!(is_ok_status("HTTP/1.1 201 Created"));
@@ -675,17 +518,6 @@ mod tests {
         assert!(!is_ok_status(""));
         // The old ClickHouse check matched `" 2000 "`; a real status parse must not.
         assert!(!is_ok_status("HTTP/1.1 2000 Nope"));
-    }
-
-    #[test]
-    fn authorization_is_base64_of_user_and_password() {
-        let cfg = parse_greptimedb_url("http://root:taosdata@h:4000").expect("parses");
-        assert_eq!(
-            authorization_header(&cfg).as_deref(),
-            Some("Basic cm9vdDp0YW9zZGF0YQ==")
-        );
-        let none = parse_greptimedb_url("http://h:4000").expect("parses");
-        assert_eq!(authorization_header(&none), None);
     }
 
     /// A SELECT body: the schema names and the rows must be reachable by index.
@@ -729,62 +561,6 @@ mod tests {
     #[test]
     fn a_non_json_body_is_a_failure() {
         assert!(GreptimedbResponse::parse("<html>login</html>").is_err());
-    }
-
-    #[test]
-    fn the_response_body_is_split_from_the_headers() {
-        assert_eq!(
-            response_body("HTTP/1.1 200 OK\r\n\r\n{\"code\":0}"),
-            "{\"code\":0}"
-        );
-        assert_eq!(response_body("garbage"), "garbage");
-    }
-
-    /// The cap is a BODY cap: the status line and headers do not eat into it.
-    #[test]
-    fn the_body_cap_counts_only_bytes_after_the_headers() {
-        let headers = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
-
-        // Headers plus a small body is complete even though the TOTAL exceeds nothing relevant.
-        let mut raw = Vec::new();
-        let mut body_start = None;
-        assert!(!append_capped(&mut raw, headers.as_bytes(), &mut body_start).expect("fits"));
-        assert_eq!(
-            body_start,
-            Some(headers.len()),
-            "the body starts after the terminator"
-        );
-        assert!(!append_capped(&mut raw, b"0123456789", &mut body_start).expect("fits"));
-        assert_eq!(raw.len(), headers.len() + 10);
-
-        // A body crossing the cap is cut at EXACTLY MAX_GREPTIMEDB_RESPONSE bytes of body.
-        let mut raw = Vec::new();
-        let mut body_start = None;
-        append_capped(&mut raw, headers.as_bytes(), &mut body_start).expect("headers");
-        let over = vec![b'a'; MAX_GREPTIMEDB_RESPONSE + 10];
-        assert!(append_capped(&mut raw, &over, &mut body_start).expect("no header error"));
-        assert_eq!(
-            raw.len() - headers.len(),
-            MAX_GREPTIMEDB_RESPONSE,
-            "the header bytes must not shrink the body cap"
-        );
-
-        // Exactly filling the body cap is not truncation.
-        let mut raw = Vec::new();
-        let mut body_start = None;
-        append_capped(&mut raw, headers.as_bytes(), &mut body_start).expect("headers");
-        let exact = vec![b'a'; MAX_GREPTIMEDB_RESPONSE];
-        assert!(!append_capped(&mut raw, &exact, &mut body_start).expect("fits"));
-        assert_eq!(raw.len() - headers.len(), MAX_GREPTIMEDB_RESPONSE);
-    }
-
-    #[test]
-    fn oversized_headers_are_refused_with_the_bound() {
-        let mut raw = Vec::new();
-        let mut body_start = None;
-        let err = append_capped(&mut raw, &vec![b'a'; MAX_HEADER_BYTES + 1], &mut body_start)
-            .expect_err("a header block this large has no terminator");
-        assert!(err.contains(&MAX_HEADER_BYTES.to_string()), "{err}");
     }
 
     /// A real socket: the request carries the measured shape and an over-cap answer is flagged.

@@ -331,10 +331,7 @@ pub async fn spawn_config_watch_on(
             let channel = channel.clone();
             let first_rx = Arc::clone(&first_rx);
             async move {
-                let pending = first_rx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
+                let pending = crate::lock_gate(&first_rx).take();
                 let rx = match pending {
                     Some(rx) => rx,
                     None => {

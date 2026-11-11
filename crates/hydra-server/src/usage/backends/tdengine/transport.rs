@@ -43,6 +43,12 @@
 
 use std::time::Duration;
 
+use crate::usage::http::{self, BasicAuth, Endpoint, Overflow, ReadLimits, Request};
+
+/// Re-exported so `transport::env_millis` (used by the URL parser here and by call sites elsewhere)
+/// keeps resolving after the move to `usage::http`.
+pub(crate) use crate::usage::http::env_millis;
+
 /// A parsed `HYDRA_TDENGINE_URL`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TdengineConfig {
@@ -116,8 +122,8 @@ pub fn parse_tdengine_url(raw: &str) -> Result<TdengineConfig, String> {
     let (user, password) = match userinfo {
         None => (None, None),
         Some(u) => match u.split_once(':') {
-            Some((n, p)) => (Some(percent_decode(n)), Some(percent_decode(p))),
-            None => (Some(percent_decode(u)), None),
+            Some((n, p)) => (Some(http::percent_decode(n)), Some(http::percent_decode(p))),
+            None => (Some(http::percent_decode(u)), None),
         },
     };
 
@@ -151,48 +157,8 @@ fn split_host_port(hostport: &str) -> Result<(&str, u16), String> {
     Ok((host, port))
 }
 
-/// `%XX` → the byte it stands for. Applied to the credentials only: a password with an `@` or `/`
-/// must survive the URL, and the characters a URL cannot carry literally are exactly what this
-/// undoes.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A deadline knob: milliseconds from the environment, or `default_ms`.
-#[must_use]
-pub fn env_millis(name: &str, default_ms: u64) -> Duration {
-    match std::env::var(name) {
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
-            _ => {
-                tracing::warn!(
-                    target: "hydra::usage::tdengine",
-                    variable = name,
-                    value = %v,
-                    "not a positive number of milliseconds; using the default"
-                );
-                Duration::from_millis(default_ms)
-            }
-        },
-        Err(_) => Duration::from_millis(default_ms),
-    }
-}
+// `percent_decode` and `env_millis` moved to `crate::usage::http` (the latter re-exported above);
+// the URL parser below calls `http::percent_decode` so the one decoder is shared.
 
 /// What taosAdapter answered.
 #[derive(Clone, Debug)]
@@ -289,6 +255,67 @@ fn preview(body: &str) -> String {
     body.chars().take(160).collect()
 }
 
+// ===========================================================================
+// The request
+// ===========================================================================
+
+// `Authorization`/base64 moved to `crate::usage::http::basic_auth_header`: TDengine's
+// dependency-free encoder was its only unique piece, and it is now shared by all three backends.
+
+/// The largest response this transport will read. A metrics store answering a bounded aggregate
+/// cannot need more; a proxy or a login page answering with a stream must not be buffered forever.
+///
+/// TDengine's overflow policy is `Error`: the cap is a hard safety net, not a truncated answer.
+const MAX_BODY: usize = 4 * 1024 * 1024;
+
+/// Send one statement to taosAdapter and parse the envelope.
+///
+/// The body is the SQL text (measured: taosAdapter takes SQL, not JSON), the path carries the
+/// database when the URL named one, and the answer is parsed by [`TdengineResponse::parse`] — which
+/// is what turns "HTTP 200 with `code != 0`" into the error it is.
+///
+/// The success policy is the **envelope**, not the HTTP status: `resp.status` is deliberately not
+/// consulted. The framing and the caps live in [`crate::usage::http`].
+pub async fn send(cfg: &TdengineConfig, sql: &str) -> Result<TdengineResponse, String> {
+    let path = match cfg.database.as_deref() {
+        Some(db) => format!("/rest/sql/{db}"),
+        None => "/rest/sql".to_string(),
+    };
+    let endpoint = Endpoint {
+        host: cfg.host.clone(),
+        port: cfg.port,
+        connect_timeout: cfg.connect_timeout,
+        io_timeout: cfg.io_timeout,
+    };
+    let auth = cfg.user.as_ref().map(|user| BasicAuth {
+        user: user.clone(),
+        pass: cfg.password.clone().unwrap_or_default(),
+    });
+    let host_header = format!("{}:{}", cfg.host, cfg.port);
+    let request = Request {
+        path_and_query: &path,
+        host_header: &host_header,
+        auth,
+        content_type: Some("text/plain; charset=UTF-8"),
+        extra_headers: &[],
+        body: sql.as_bytes(),
+    };
+    let limits = ReadLimits {
+        max_header_bytes: MAX_BODY,
+        max_body_bytes: None,
+        overflow: Overflow::Error,
+    };
+    let resp = http::exchange(&endpoint, &request, &limits).await?;
+    // Chunked framing is stripped before parsing: the size lines are not JSON (measured).
+    let body = http::response_body(&resp.body);
+    TdengineResponse::parse(&body)
+}
+
+// `body_is_complete`, `is_chunked`, `dechunk` and `response_body` moved to `crate::usage::http`:
+// the shared read loop owns the completeness stop, and `response_body` owns chunked decoding.
+// Their unit tests (base64 vectors, Basic auth, chunked framing, completeness) moved there too; the
+// URL-parser and envelope contract tests stay in this file's `tests` module.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,287 +392,5 @@ mod tests {
         assert_eq!(resp.column_index("requests"), Some(0));
         assert_eq!(resp.column_index("TOKENS_IN"), Some(1));
         assert_eq!(resp.column_index("nope"), None);
-    }
-}
-
-// ===========================================================================
-// The request
-// ===========================================================================
-
-/// The `Authorization` header value for this configuration: HTTP Basic, or nothing when the URL
-/// carried no credentials.
-#[must_use]
-pub fn authorization_header(cfg: &TdengineConfig) -> Option<String> {
-    let user = cfg.user.as_deref()?;
-    let password = cfg.password.as_deref().unwrap_or("");
-    Some(format!(
-        "Basic {}",
-        base64(format!("{user}:{password}").as_bytes())
-    ))
-}
-
-/// Minimal base64 (standard alphabet, padded). Written out rather than pulled in: this backend has
-/// no dependencies of its own (ADR-0002 §4 step 3 — a backend's feature declares what it needs, and
-/// this one needs nothing).
-fn base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// The largest response body this transport will read. A metrics store answering a bounded aggregate
-/// cannot need more; a proxy or a login page answering with a stream must not be buffered forever.
-const MAX_BODY: usize = 4 * 1024 * 1024;
-
-/// Send one statement to taosAdapter and parse the envelope.
-///
-/// The body is the SQL text (measured: taosAdapter takes SQL, not JSON), the path carries the
-/// database when the URL named one, and the answer is parsed by [`TdengineResponse::parse`] — which
-/// is what turns "HTTP 200 with `code != 0`" into the error it is.
-pub async fn send(cfg: &TdengineConfig, sql: &str) -> Result<TdengineResponse, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let path = match cfg.database.as_deref() {
-        Some(db) => format!("/rest/sql/{db}"),
-        None => "/rest/sql".to_string(),
-    };
-    let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=UTF-8\r\nConnection: close\r\n",
-        cfg.host,
-        cfg.port,
-        sql.len()
-    );
-    if let Some(auth) = authorization_header(cfg) {
-        request.push_str(&format!("Authorization: {auth}\r\n"));
-    }
-    request.push_str("\r\n");
-    request.push_str(sql);
-
-    let addr = format!("{}:{}", cfg.host, cfg.port);
-    let mut stream =
-        tokio::time::timeout(cfg.connect_timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                format!(
-                    "connecting to {addr} timed out after {:?}",
-                    cfg.connect_timeout
-                )
-            })?
-            .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
-
-    let exchange = async {
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| format!("writing the statement to {addr} failed: {e}"))?;
-        stream.flush().await.ok();
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = stream
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("reading the answer from {addr} failed: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&buf[..n]);
-            if raw.len() > MAX_BODY {
-                return Err(format!(
-                    "the answer from {addr} exceeded {MAX_BODY} bytes; refusing to buffer more"
-                ));
-            }
-            if body_is_complete(&raw) {
-                break;
-            }
-        }
-        Ok::<Vec<u8>, String>(raw)
-    };
-
-    let raw = tokio::time::timeout(cfg.io_timeout, exchange)
-        .await
-        .map_err(|_| {
-            format!(
-                "the answer from {addr} did not arrive within {:?}",
-                cfg.io_timeout
-            )
-        })??;
-
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let body = response_body(&text);
-    // Chunked framing is stripped before parsing: the size lines are not JSON (measured).
-    let body = if is_chunked(&text) {
-        dechunk(&body).unwrap_or(body)
-    } else {
-        body
-    };
-    TdengineResponse::parse(&body)
-}
-
-/// `true` once the headers are in and the body matches `Content-Length` (or the answer is chunked and
-/// has reached its terminator). taosAdapter answers with `Content-Length`; the chunked branch is
-/// there because a reverse proxy in front of it may not.
-fn body_is_complete(raw: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(raw);
-    let Some(head) = text.find("\r\n\r\n") else {
-        return false;
-    };
-    let (headers, body) = text.split_at(head + 4);
-    let lower = headers.to_ascii_lowercase();
-    if lower.contains("transfer-encoding: chunked") {
-        // Complete when the zero-length terminator has arrived — asked of the framing itself, not of
-        // whether the text happens to end with a `0` (a JSON body can).
-        return dechunk(body).is_some();
-    }
-    match lower
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        Some(len) => body.len() >= len,
-        // No length and not chunked: read to EOF (the loop does that when the server closes).
-        None => false,
-    }
-}
-
-/// `true` when the response says its body is chunk-framed.
-fn is_chunked(head_text: &str) -> bool {
-    match head_text.find("\r\n\r\n") {
-        Some(i) => head_text[..i]
-            .to_ascii_lowercase()
-            .contains("transfer-encoding: chunked"),
-        None => false,
-    }
-}
-
-/// Decode a chunked body, or `None` when the framing is not complete yet.
-///
-/// Each chunk is `<size in hex>[;ext]\r\n<bytes>\r\n`, terminated by a zero-size chunk (the
-/// trailing headers are ignored: taosAdapter sends none).
-fn dechunk(body: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut rest = body;
-    loop {
-        let (size_line, after) = rest.split_once("\r\n")?;
-        let size_text = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).ok()?;
-        if size == 0 {
-            return Some(out);
-        }
-        if after.len() < size + 2 {
-            return None;
-        }
-        out.push_str(after.get(..size)?);
-        rest = after.get(size + 2..)?;
-    }
-}
-
-/// The body of an HTTP response, or the whole text when there is no header terminator (so the parse
-/// failure can quote what actually arrived).
-fn response_body(text: &str) -> String {
-    match text.find("\r\n\r\n") {
-        Some(i) => text[i + 4..].to_string(),
-        None => text.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod request_tests {
-    use super::*;
-
-    #[test]
-    fn basic_auth_is_base64_of_user_and_password() {
-        let cfg = parse_tdengine_url("http://root:taosdata@h:6041").expect("parses");
-        assert_eq!(
-            authorization_header(&cfg).as_deref(),
-            Some("Basic cm9vdDp0YW9zZGF0YQ=="),
-            "the measured credential form (`curl -u root:taosdata` sends exactly this)"
-        );
-    }
-
-    #[test]
-    fn no_credentials_means_no_header() {
-        let cfg = parse_tdengine_url("http://h:6041").expect("parses");
-        assert_eq!(authorization_header(&cfg), None);
-    }
-
-    #[test]
-    fn base64_matches_the_reference_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn the_body_is_split_from_the_headers() {
-        assert_eq!(
-            response_body("HTTP/1.1 200 OK\r\n\r\n{\"code\":0}"),
-            "{\"code\":0}"
-        );
-        assert_eq!(response_body("garbage"), "garbage");
-    }
-
-    /// The measured framing: what taosAdapter actually sends.
-    #[test]
-    fn a_chunked_answer_is_decoded_and_an_incomplete_one_is_not_guessed_at() {
-        // `a` = 0x0a = 10 bytes = the length of `{"code":0}` (the real body's size line was `4a`,
-        // for a longer answer; the FRAMING is what this pins, not the payload).
-        let raw =
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n a \r\n{\"code\":0}\r\n0\r\n\r\n"
-                .replace(" a ", "a");
-        let body = response_body(&raw);
-        assert!(is_chunked(&raw));
-        assert_eq!(dechunk(&body).as_deref(), Some("{\"code\":0}"));
-
-        // A body that merely ENDS with a `0` (a count of 10, say) must not read as complete.
-        // `b` = 11 bytes = `{"rows":10}`; the terminator chunk is MISSING, so this must not read as
-        // complete.
-        let half = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\n{\"rows\":10}\r\n";
-        assert_eq!(dechunk(&response_body(half)), None);
-        assert!(!body_is_complete(half.as_bytes()));
-
-        // And a complete one is.
-        let done =
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\n{\"rows\":10}\r\n0\r\n\r\n";
-        assert!(body_is_complete(done.as_bytes()));
-        assert_eq!(
-            dechunk(&response_body(done)).as_deref(),
-            Some("{\"rows\":10}")
-        );
-    }
-
-    #[test]
-    fn completeness_needs_headers_and_the_whole_body() {
-        assert!(!body_is_complete(b"HTTP/1.1 200 OK\r\n"));
-        assert!(!body_is_complete(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc"
-        ));
-        assert!(body_is_complete(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"
-        ));
     }
 }

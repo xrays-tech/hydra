@@ -6,7 +6,12 @@
 //!
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::usage::http::{self, BasicAuth, Endpoint, Overflow, ReadLimits, Request};
+
+/// Re-exported so `transport::env_millis` / `transport::url_encode` / `transport::response_body`
+/// (used by the backend's `mod.rs` and its contract tests) keep resolving after the move to
+/// `usage::http`.
+pub(crate) use crate::usage::http::{env_millis, response_body, url_encode};
 
 /// Configuration parsed once from the ClickHouse URL.
 #[derive(Clone)]
@@ -45,15 +50,8 @@ pub(crate) struct ClickHouseConfig {
 /// An aggregate `SELECT` answer is far smaller than this, so it is bounded too.
 pub(crate) const MAX_CLICKHOUSE_RESPONSE: usize = 64 * 1024;
 
-/// Read `KEY` as a positive millisecond count, falling back to `default_ms`.
-pub(crate) fn env_millis(key: &str, default_ms: u64) -> Duration {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(default_ms))
-}
+// `env_millis` moved to `crate::usage::http::env_millis` (re-exported above) with the other two
+// backends.
 
 /// Parse a ClickHouse URL into transport + credentials. Accepted forms:
 ///
@@ -113,27 +111,8 @@ fn strip_crlf(s: &str) -> String {
     s.chars().filter(|&c| c != '\r' && c != '\n').collect()
 }
 
-/// Percent-encode a string for use in a query-string segment (RFC 3986
-/// unreserved characters kept; everything else `%HH`).
-///
-/// Used for the SQL itself **and** for every `param_*` value: both travel in the
-/// query string, and an unencoded `&`, `+` or `%` in a tenant id or a timestamp
-/// would silently change the bound value (a `+` may even decode to a space).
-pub(crate) fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        }
-    }
-    out
-}
+// `url_encode` moved to `crate::usage::http::url_encode` (re-exported above): ClickHouse is the
+// backend that needs it for both the SQL and every `param_*` value, but the encoder itself is shared.
 
 /// The result of a complete ClickHouse HTTP exchange.
 #[derive(Debug)]
@@ -186,120 +165,64 @@ pub(crate) async fn send(
     // The `param_*` bindings appear only when the caller passes `params`: the usage
     // WRITER passes none — its rows ride in the `FORMAT JSONEachRow` body (measured
     // 2026-09-30 against a mock ClickHouse) — while the tenant API's READER binds.
-    let mut request = String::with_capacity(body.len() + query.len() * 2 + 256);
-    request.push_str("POST /?");
+    let mut path = String::with_capacity(query.len() * 2 + 256);
+    path.push_str("/?");
     if !cfg.query_params.is_empty() {
-        request.push_str(&cfg.query_params);
-        request.push('&');
+        path.push_str(&cfg.query_params);
+        path.push('&');
     }
-    request.push_str("query=");
-    request.push_str(&url_encode(query));
+    path.push_str("query=");
+    path.push_str(&url_encode(query));
     for (k, v) in params {
-        request.push_str("&param_");
-        request.push_str(&url_encode(k));
-        request.push('=');
-        request.push_str(&url_encode(v));
-    }
-    request.push_str(" HTTP/1.1\r\n");
-    request.push_str("Host: ");
-    request.push_str(&cfg.host_port);
-    request.push_str("\r\n");
-    if let Some((user, pass)) = &cfg.auth {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let token = B64.encode(format!("{user}:{pass}"));
-        request.push_str("Authorization: Basic ");
-        request.push_str(&token);
-        request.push_str("\r\n");
-    }
-    request.push_str("Content-Length: ");
-    request.push_str(&body.len().to_string());
-    request.push_str("\r\nConnection: close\r\n\r\n");
-
-    // Every step is deadline-bound (audit §3.9): the writer runs on the single
-    // sink flush task, so one blocked await here would stop ALL usage metering
-    // for the whole node and silently overflow the channel behind it.
-    let hp = cfg.host_port.clone();
-    let mut stream = tokio::time::timeout(
-        cfg.connect_timeout,
-        tokio::net::TcpStream::connect(&cfg.host_port),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "clickhouse connect {hp}: timed out after {}ms",
-            cfg.connect_timeout.as_millis()
-        )
-    })?
-    .map_err(|e| format!("clickhouse connect {hp}: {e}"))?;
-
-    // Header block, then the payload.
-    tokio::time::timeout(cfg.io_timeout, stream.write_all(request.as_bytes()))
-        .await
-        .map_err(|_| {
-            format!(
-                "clickhouse write: timed out after {}ms",
-                cfg.io_timeout.as_millis()
-            )
-        })?
-        .map_err(|e| format!("clickhouse write: {e}"))?;
-    if !body.is_empty() {
-        tokio::time::timeout(cfg.io_timeout, stream.write_all(body))
-            .await
-            .map_err(|_| {
-                format!(
-                    "clickhouse write: timed out after {}ms",
-                    cfg.io_timeout.as_millis()
-                )
-            })?
-            .map_err(|e| format!("clickhouse write: {e}"))?;
-    }
-    tokio::time::timeout(cfg.io_timeout, stream.flush())
-        .await
-        .map_err(|_| {
-            format!(
-                "clickhouse flush: timed out after {}ms",
-                cfg.io_timeout.as_millis()
-            )
-        })?
-        .map_err(|e| format!("clickhouse flush: {e}"))?;
-
-    // Read the response with BOTH a deadline and a size cap. `read_to_end`
-    // alone would wait for EOF: a server that sends a status line and then keeps
-    // the connection open would hang us until the deadline, and a chatty server
-    // could grow `resp` without bound.
-    let mut resp = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        let n = tokio::time::timeout(cfg.io_timeout, stream.read(&mut chunk))
-            .await
-            .map_err(|_| {
-                format!(
-                    "clickhouse read: timed out after {}ms",
-                    cfg.io_timeout.as_millis()
-                )
-            })?
-            .map_err(|e| format!("clickhouse read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        if fill_capped(&mut resp, &chunk[..n]) {
-            // Bytes were discarded: the response crossed the cap on this read.
-            truncated = true;
-            break;
-        }
+        path.push_str("&param_");
+        path.push_str(&url_encode(k));
+        path.push('=');
+        path.push_str(&url_encode(v));
     }
 
-    let status_line = String::from_utf8_lossy(&resp)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let endpoint = endpoint_for(cfg)?;
+    let auth = cfg.auth.as_ref().map(|(user, pass)| BasicAuth {
+        user: user.clone(),
+        pass: pass.clone(),
+    });
+    let request = Request {
+        path_and_query: &path,
+        host_header: &cfg.host_port,
+        auth,
+        content_type: None,
+        extra_headers: &[],
+        body,
+    };
+    // ClickHouse's cap is a TOTAL cap: the whole response may not exceed 64 KiB, and crossing it is
+    // a truncated answer the reader reports as `ResultTooLarge`.
+    let limits = ReadLimits {
+        max_header_bytes: MAX_CLICKHOUSE_RESPONSE,
+        max_body_bytes: None,
+        overflow: Overflow::FlagTruncated,
+    };
+    let resp = http::exchange(&endpoint, &request, &limits).await?;
     Ok(SendResult {
-        status_line,
-        body: resp,
-        truncated,
+        status_line: resp.status_line,
+        body: resp.body,
+        truncated: resp.truncated,
+    })
+}
+
+/// `host:port` → an [`Endpoint`]. `parse_clickhouse_url` deliberately keeps the authority opaque, so
+/// the split the shared transport needs happens here.
+fn endpoint_for(cfg: &ClickHouseConfig) -> Result<Endpoint, String> {
+    let (host, port) = cfg
+        .host_port
+        .rsplit_once(':')
+        .ok_or_else(|| format!("clickhouse address {:?} has no port", cfg.host_port))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("clickhouse address {:?} has an invalid port", cfg.host_port))?;
+    Ok(Endpoint {
+        host: host.to_string(),
+        port,
+        connect_timeout: cfg.connect_timeout,
+        io_timeout: cfg.io_timeout,
     })
 }
 
@@ -313,106 +236,18 @@ pub(crate) fn is_ok_status(status_line: &str) -> bool {
     status_line.contains(" 200 ")
 }
 
-/// The HTTP body of a response, with `Transfer-Encoding: chunked` **decoded**,
-/// trimmed.
-///
-/// ClickHouse frames its answers as chunks (measured: `Transfer-Encoding:
-/// chunked`, no `Content-Length`), so the bytes after the header block begin
-/// with a hex chunk size and end with a `0` chunk. Reading them undecoded yields
-/// `"7C\r\n{...}"`, which a JSON parser rejects with "trailing characters at
-/// line 1 column 2". The **live** ClickHouse test caught exactly that; a
-/// `Content-Length`-based double cannot reproduce it.
-///
-/// Truncation is tolerated: the transport caps the read at
-/// [`MAX_CLICKHOUSE_RESPONSE`], so a cut-off body returns whatever chunk data was
-/// complete. A caller that needs a *valid* body (the reader) fails its own decode
-/// check rather than acting on a partial one.
-pub(crate) fn response_body(resp: &[u8]) -> String {
-    let Some(split) = find_subslice(resp, b"\r\n\r\n") else {
-        return String::new();
-    };
-    let head = String::from_utf8_lossy(&resp[..split]);
-    let body = &resp[split + 4..];
-    let chunked = head.lines().any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.starts_with("transfer-encoding:") && l.contains("chunked")
-    });
-    let decoded = if chunked {
-        dechunk(body)
-    } else {
-        body.to_vec()
-    };
-    String::from_utf8_lossy(&decoded).trim().to_string()
-}
-
-/// Append `chunk` to `resp`, capped at [`MAX_CLICKHOUSE_RESPONSE`].
-///
-/// Returns `true` when any bytes were discarded because the buffer crossed the
-/// cap. A chunk that *exactly* fills the remaining room is NOT truncation: the
-/// response may still be complete (EOF on the next read). Only a chunk that
-/// *exceeds* the room proves bytes were lost.
-fn fill_capped(resp: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    let room = MAX_CLICKHOUSE_RESPONSE.saturating_sub(resp.len());
-    if chunk.len() > room {
-        if room > 0 {
-            resp.extend_from_slice(&chunk[..room]);
-        }
-        true
-    } else {
-        resp.extend_from_slice(chunk);
-        false
-    }
-}
-
-/// The first index of `needle` in `hay`.
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-/// Decode HTTP/1.1 chunked framing. Stops at the terminating `0` chunk, and on
-/// anything malformed or truncated returns what was decoded so far.
-fn dechunk(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut rest = body;
-    // `while let` rather than `loop { let … else { break } }`: the condition is
-    // re-evaluated per iteration in both spellings, and every other exit here is
-    // a `break` (the terminating `0` chunk, a malformed size, a truncated chunk),
-    // which `while let` supports unchanged.
-    while let Some(pos) = find_subslice(rest, b"\r\n") {
-        // A chunk-size line may carry extensions after `;`.
-        let size_line = &rest[..pos];
-        let hex = size_line.split(|b| *b == b';').next().unwrap_or(b"");
-        let Ok(hex) = std::str::from_utf8(hex) else {
-            break;
-        };
-        let Ok(n) = usize::from_str_radix(hex.trim(), 16) else {
-            break;
-        };
-        if n == 0 {
-            break;
-        }
-        let start = pos + 2;
-        let end = start.saturating_add(n);
-        if rest.len() < end {
-            out.extend_from_slice(&rest[start.min(rest.len())..]);
-            break;
-        }
-        out.extend_from_slice(&rest[start..end]);
-        rest = &rest[end..];
-        if rest.starts_with(b"\r\n") {
-            rest = &rest[2..];
-        }
-    }
-    out
-}
+// The HTTP body of a response, with `Transfer-Encoding: chunked` decoded and trimmed, moved to
+// `crate::usage::http::response_body` (re-exported above): ClickHouse's chunked framing is the
+// reason the decoder exists, but it is shared with the other backends.
+//
+// `fill_capped`, `find_subslice` and `dechunk` moved to `crate::usage::http`, where the shared read
+// loop (`ReadLimits`) and `response_body` own the framing and the caps.
 
 #[cfg(feature = "usage-clickhouse")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // -----------------------------------------------------------------------
     // URL parsing (moved here with the parser)
@@ -501,22 +336,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Encoding: the SQL AND every param value travel in the query string
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn url_encode_keeps_unreserved_and_escapes_everything_else() {
-        assert_eq!(url_encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
-        assert_eq!(url_encode("a b"), "a%20b");
-        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
-        assert_eq!(url_encode("a+b"), "a%2Bb");
-        assert_eq!(url_encode("a%b"), "a%25b");
-        assert_eq!(url_encode("'"), "%27");
-        assert_eq!(url_encode("SELECT 1"), "SELECT%201");
-    }
-
-    // -----------------------------------------------------------------------
-    // Status / error classification
+    // Status / error classification (ClickHouse's OWN success policy)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -528,101 +348,8 @@ mod tests {
         assert!(!is_ok_status(""));
     }
 
-    #[test]
-    fn response_body_takes_the_part_after_the_headers() {
-        let resp = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 60\r\nConnection: close\r\n\r\nCode: 60. DB::Exception: Table usage_record does not exist";
-        assert_eq!(
-            response_body(resp),
-            "Code: 60. DB::Exception: Table usage_record does not exist"
-        );
-        // A response with no body is an empty string, not a panic.
-        assert_eq!(response_body(b"HTTP/1.1 200 OK\r\n\r\n"), "");
-    }
-
-    /// ClickHouse frames its answers as chunks, so the bytes after the headers
-    /// are `size\r\ndata\r\n…0\r\n\r\n`. Reading them undecoded is what the
-    /// LIVE instance exposed; a `Content-Length` double cannot.
-    #[test]
-    fn a_chunked_response_is_decoded() {
-        let body = "{\"requests\":\"8\"}";
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
-            body.len(),
-            body
-        );
-        assert_eq!(response_body(resp.as_bytes()), body);
-    }
-
-    /// Multiple chunks, and a chunk extension (`;name=value`), are both legal.
-    #[test]
-    fn multiple_chunks_and_extensions_are_decoded() {
-        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;ext=1\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n";
-        assert_eq!(response_body(resp.as_bytes()), "abcdefg");
-    }
-
-    /// The read is size-capped, so a cut-off chunk must return the complete part
-    /// instead of panicking — the reader then fails its own decode check.
-    #[test]
-    fn a_truncated_chunked_body_returns_what_was_complete() {
-        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n5\r\nxy";
-        assert_eq!(response_body(resp.as_bytes()), "abcdxy");
-    }
-
-    /// A chunked header on a body that is not chunked must not invent data.
-    #[test]
-    fn a_malformed_chunk_size_yields_no_body_rather_than_a_guess() {
-        // `zz` is not hex, so the decoder stops instead of guessing.
-        let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello";
-        assert_eq!(response_body(resp.as_bytes()), "");
-    }
-
-    /// No header terminator at all: nothing to report rather than a panic.
-    #[test]
-    fn a_response_without_a_header_terminator_has_no_body() {
-        assert_eq!(response_body(b"HTTP/1.1 200 OK\r\n"), "");
-    }
-
-    // -----------------------------------------------------------------------
-    // `fill_capped`: the buffer-append decision, tested deterministically
-    // -----------------------------------------------------------------------
-
-    /// A chunk that fits entirely under the cap appends all bytes and reports
-    /// no truncation.
-    #[test]
-    fn fill_capped_under_cap_appends_all() {
-        let mut resp = Vec::new();
-        let truncated = fill_capped(&mut resp, &[0u8; 100]);
-        assert!(!truncated);
-        assert_eq!(resp.len(), 100);
-    }
-
-    /// A chunk that *exactly* fills the remaining room is NOT truncation: the
-    /// response may still be complete (EOF on the next read). This is the case
-    /// the old length-based heuristic (`resp.len() >= MAX`) got wrong.
-    #[test]
-    fn fill_capped_exactly_at_cap_is_not_truncated() {
-        let mut resp = vec![0u8; MAX_CLICKHOUSE_RESPONSE - 10];
-        let truncated = fill_capped(&mut resp, &[0u8; 10]);
-        assert!(
-            !truncated,
-            "exactly filling the cap is a complete response, not truncation"
-        );
-        assert_eq!(resp.len(), MAX_CLICKHOUSE_RESPONSE);
-    }
-
-    /// A chunk that *crosses* the cap must be flagged truncated, and only the
-    /// remaining `room` bytes are appended (the excess is dropped).
-    #[test]
-    fn fill_capped_crossing_cap_is_truncated_and_drops_excess() {
-        let mut resp = vec![0u8; MAX_CLICKHOUSE_RESPONSE - 10];
-        let truncated = fill_capped(&mut resp, &[0u8; 20]);
-        assert!(truncated, "a read that crosses the cap must be flagged");
-        assert_eq!(
-            resp.len(),
-            MAX_CLICKHOUSE_RESPONSE,
-            "only `room` bytes appended; the excess is dropped"
-        );
-    }
+    // `url_encode`, `response_body`, `dechunk` and their unit tests live in `crate::usage::http`;
+    // the transport-specific wire tests below are what stays here.
 
     // -----------------------------------------------------------------------
     // Transport: real sockets, real deadlines

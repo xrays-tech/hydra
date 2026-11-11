@@ -358,9 +358,7 @@ static BEGIN_WRITE_FIRST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 #[doc(hidden)]
 pub fn begin_write_probe_reset() {
     BEGIN_WRITE_ATTEMPTS.store(0, Ordering::SeqCst);
-    *BEGIN_WRITE_FIRST_FAILURE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+    *crate::lock_gate(&BEGIN_WRITE_FIRST_FAILURE) = None;
 }
 
 /// Acquisition attempts recorded since the last [`begin_write_probe_reset`].
@@ -375,18 +373,13 @@ pub fn begin_write_attempts() -> u64 {
 #[doc(hidden)]
 #[must_use]
 pub fn begin_write_first_failure() -> Option<String> {
-    BEGIN_WRITE_FIRST_FAILURE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    crate::lock_gate(&BEGIN_WRITE_FIRST_FAILURE).clone()
 }
 
 /// Record the first retryable acquisition failure, for the live retry tests.
 fn record_first_failure(e: &sqlx::Error) {
     let label = lock_failure_label(e);
-    let mut slot = BEGIN_WRITE_FIRST_FAILURE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slot = crate::lock_gate(&BEGIN_WRITE_FIRST_FAILURE);
     if slot.is_none() {
         *slot = Some(label);
     }
@@ -451,12 +444,24 @@ async fn begin_write_loop(
     guardrails: &DbGuardrails,
     apply_mysql_session_guardrails: bool,
 ) -> Result<Tx<'static>, sqlx::Error> {
+    // RAII waiter gauge: one increment for the WHOLE acquisition (all attempts),
+    // decremented by `Drop` when this function returns — including on the
+    // success path, so the gauge is released before the caller receives the
+    // `Tx` and is never tied to the `Tx`'s lifetime. A panic or an early `?`
+    // inside the acquisition drops the guard and decrements it, so the gauge
+    // cannot leak (the same RAII shape as `FailPersistGuard` below).
+    let _waiter = WriteWaiterGuard::new();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match begin_write_once(pool, guardrails, apply_mysql_session_guardrails).await {
+        let started = std::time::Instant::now();
+        let result = begin_write_once(pool, guardrails, apply_mysql_session_guardrails).await;
+        crate::admin::metrics::record_db_write_acquire(started.elapsed().as_secs_f64());
+        match result {
             Ok(tx) => return Ok(tx),
             Err(e) if attempt < BEGIN_WRITE_MAX_ATTEMPTS && is_begin_write_retryable(&e) => {
+                // A retry is about to be scheduled for a retryable failure.
+                crate::admin::metrics::record_db_write_retry("retry");
                 record_first_failure(&e);
                 let delay = begin_write_retry_delay(attempt - 1);
                 tracing::debug!(
@@ -468,8 +473,41 @@ async fn begin_write_loop(
                 );
                 tokio::time::sleep(delay).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // The retry budget is spent AND the final error is still
+                // retryable: the write is about to surface as `503
+                // storage_busy`. A non-retryable failure is not "exhausted"
+                // (retrying could not have helped), so it is not counted.
+                if attempt == BEGIN_WRITE_MAX_ATTEMPTS && is_begin_write_retryable(&e) {
+                    crate::admin::metrics::record_db_write_retry("exhausted");
+                }
+                return Err(e);
+            }
         }
+    }
+}
+
+/// RAII guard for `hydra_db_write_waiters`: increments the gauge when a caller
+/// enters the write-lock acquisition loop and decrements it on `Drop`.
+///
+/// Scoped to the ACQUISITION only. It is a local of [`begin_write_loop`], so it
+/// is released when that function returns — on the success path that happens
+/// before the caller receives the `Tx`, so it is never tied to the `Tx`
+/// lifetime. `Drop` also runs on a panic or an early `?`, so a failed
+/// acquisition cannot leak the gauge. Mirrors the `FailPersistGuard` pattern
+/// (test fault injection below).
+struct WriteWaiterGuard;
+
+impl WriteWaiterGuard {
+    fn new() -> Self {
+        crate::admin::metrics::record_db_write_waiter_enter();
+        Self
+    }
+}
+
+impl Drop for WriteWaiterGuard {
+    fn drop(&mut self) {
+        crate::admin::metrics::record_db_write_waiter_exit();
     }
 }
 

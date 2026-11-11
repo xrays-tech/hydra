@@ -123,7 +123,7 @@ fn source(&self) -> &'static str;   // 必须等于描述符的 kind
 | kind | 状态 | feature | env | 写 | 读 | 读契约可行性 |
 |---|---|---|---|---|---|---|
 | `clickhouse` | **交付** | `usage-clickhouse` | `HYDRA_CLICKHOUSE_URL`（+ `recognises`：`_CONNECT_TIMEOUT_MS` / `_IO_TIMEOUT_MS` / `_QUERY_TIMEOUT_MS`，均已进 `ops.md` 环境表） | HTTP `POST /?query=INSERT…FORMAT JSONEachRow`，行在 body（`client_api_key` 已掩码），带 `insert_deduplication_token` | HTTP `POST /?query=SELECT…FORMAT JSONEachRow`，`param_*` 绑定 | ✅ SQL + 真 `GROUP BY` + 参数绑定；三个 compose 都已硬编码它，DDL 见 `environment/clickhouse/init.sql` |
-| `greptimedb` | **交付** | `usage-greptimedb` | `HYDRA_GREPTIMEDB_URL`（`http://user:pass@host:4000/<db>`，**Basic 认证**，db 默认 `hydra_usage`）+ `recognises`：`_CONNECT_TIMEOUT_MS`（2000）/ `_IO_TIMEOUT_MS`（5000）/ `_QUERY_TIMEOUT_MS`（5000） | `POST /v1/sql?db=<db>`，body `sql=INSERT INTO usage_record (cols) VALUES (…),(…)`（`application/x-www-form-urlencoded`，`X-Greptime-Timezone: UTC`）；启动时 `CREATE DATABASE/TABLE IF NOT EXISTS`；`append_mode=false` + `PRIMARY KEY (tenant_id, trace_id)` + `ts TIME INDEX` 提供重试去重；`https://` 在 `open` 直接拒绝（无 TLS 传输） | 同一个 `POST /v1/sql?db=<db>`，GreptimeDB SQL（`CASE WHEN` 归空键、`substr(created_at,1,10)` 做 day、别名 `group_key`）；**无 HTTP 绑定参数**——租户/窗口是转义后的字面量，分组表达式只允许白名单 | ✅ SQL + 真 `GROUP BY`；实测 DDL/重试去重/读回（§5.5）。SELECT 响应上限 **64 KiB**、编码后的 INSERT body 上限约 **3.5 MiB**（按 512 行或编码后超限分片） |
+| `greptimedb` | **交付** | `usage-greptimedb` | `HYDRA_GREPTIMEDB_URL`（`http://user:pass@host:4000/<db>`，**Basic 认证**，db 默认 `hydra_usage`）+ `recognises`：`_CONNECT_TIMEOUT_MS`（2000）/ `_IO_TIMEOUT_MS`（5000）/ `_QUERY_TIMEOUT_MS`（5000） | `POST /v1/sql?db=<db>`，body `sql=INSERT INTO usage_record (cols) VALUES (…),(…)`（`application/x-www-form-urlencoded`，`X-Greptime-Timezone: UTC`）；启动时 `CREATE DATABASE/TABLE IF NOT EXISTS`；`append_mode=false` + `PRIMARY KEY (tenant_id, trace_id)` + `ts TIME INDEX` 提供重试去重；`https://` 在 `open` 直接拒绝（无 TLS 传输） | 同一个 `POST /v1/sql?db=<db>`，GreptimeDB SQL（`CASE WHEN` 归空键、`substr(created_at,1,10)` 做 day、别名 `group_key`）；**无 HTTP 绑定参数**——租户是转义后的字面量，窗口是 **`ts` TIME INDEX 上的裸 epoch 毫秒区间**（`ts >= <since_ms> AND ts < <until_ms>`），分组表达式只允许白名单 | ✅ SQL + 真 `GROUP BY`；实测 DDL/重试去重/读回（§5.5）。窗口落在时间索引上 ⇒ `EXPLAIN ANALYZE` 显示 `TimestampRange` 区域裁剪（§5.6）。SELECT 响应 **body** 上限 64 KiB（header 区单独 16 KiB；stage-1 统一后 GreptimeDB 从 total cap 变为 split cap，body 有效上限略增 Δ=header bytes）、编码后的 INSERT body 上限约 **3.5 MiB**（按 512 行或编码后超限分片） |
 | `none` | **交付（D-2 已裁定保留）** | 无（总是编译） | 无 | 丢弃并计数 `sink_disabled` | `ReaderContract::Unavailable{why}` ⇒ `/usage` 回 503 `usage_store_unavailable` | ✅（故意没有存储）必须**显式**选择，启动打 WARN |
 | `tdengine` | **已实现（候选，非交付）；活实例测试通过——但那条测试是 `#[ignore]` 手动的、CI 里 `tdengine` 出现 0 次（实测），所以基线不依赖任何 TDengine 实例** | `usage-tdengine` | `HYDRA_TDENGINE_URL`（`http://user:pass@host:6041/<db>`，**Basic 认证**——实测过的唯一认证形式） | `INSERT INTO <db>.<sub> USING <db>.<stable> TAGS ('<tenant>') VALUES (…),(…)`，**子表按租户自动创建**；启动时 `CREATE DATABASE/STABLE IF NOT EXISTS` | 同一个 `POST /rest/sql[/db]`，TDengine SQL（`CASE WHEN` 归空键、`last(ts)`、别名 `group_key`、`TO_CHAR` 做 day） | ⚠️ **能用，但有一条硬限制 ⇒ 只能是候选**：TDengine 的**主键就是 `ts`**，同租户同一秒的两条请求会**互相覆盖**（实测：`tokens_in` 111 被 999 覆盖、行数仍为 1；毫秒不同则两行都在）。本后端用 **trace id 派生的亚秒位**规避（确定性 ⇒ 重试仍幂等），但同一秒内两条哈希到同一毫秒的请求仍会塌（约 1/1000），而 TDengine **没有批次去重令牌**。要当计费存储必须换成毫秒级唯一的键。其余实测坑见 §5.1 |
 | `influxdb3` | 候选 | `usage-influxdb3` | 数据库令牌（`Authorization: Bearer …`，端口 **8181**） | `POST /api/v3/write_lp?db=…`，行协议（表**自动创建**，数据库要先建） | `POST /api/v3/query_sql?db=…`（SQL：`DATE_BIN(INTERVAL '1 day', time)`）或 `/api/v3/query_influxql` | ✅ SQL 可用、有 schema-on-write；注意 2026-09-15 起其 Docker `latest` 指向 3 Core（**部署要钉版本 tag**）；docs 页面**未标许可证**（仓库为 Apache-2.0 + MIT） |
@@ -247,10 +247,60 @@ the registry is the ONLY thing that may know a backend by name (ADR-0002 §2.2) 
 | `trace_id` | **去重键的承重字段**，必须非空：写入侧对空 `trace_id` 生成确定性回退键（对行字段做 FNV-1a），再写入 `trace_id` 列；否则同租户同毫秒记录会被折叠 |
 | SELECT 应答 | `{"output":[{"records":{"schema":{"column_schemas":[…]},"rows":[[…]],"total_rows":N}}],…}`；计数器是 **JSON 数字**，`last_seen`（`max(created_at)`）是 **String** |
 | INSERT/DDL 应答 | `{"output":[{"affectedrows":N}],…}`；错误是非 2xx + `{"code":N,"error":"…"}`。**200 不等于成功**：2xx body 里出现顶层 `code`/`error` 同样按失败处理 |
-| 读 SQL | totals：`count(*)`/`sum(tokens_in)`/`sum(tokens_out)`/`sum(cache_hit_tokens)`/`sum(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END)`/`max(created_at)`；分组白名单含 `coalesce(...)`、`substr(created_at,1,10)`，别名 `group_key`（不是 `key`）。实测 `coalesce`/`substr`/`CASE`/`max(created_at)` 均可用 |
-| 参数绑定 | **没有 HTTP 绑定参数**：`tenant_id`/`since`/`until` 一律转义为字面量，分组表达式只允许白名单（绝不把租户 id 当标识符插入） |
-| 大小上限 | SELECT 响应 **64 KiB**（超过/截断 ⇒ `UsageQueryError::ResultTooLarge(64*1024)`）；编码后的 INSERT body 约 **3.5 MiB** 上限，按 512 行或编码后超限分片（量的是编码后的 form body，不是原始 SQL） |
+| 读 SQL | totals：`count(*)`/`sum(tokens_in)`/`sum(tokens_out)`/`sum(cache_hit_tokens)`/`sum(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END)`/`max(created_at)`；窗口是 **`ts >= <since_ms> AND ts < <until_ms>`**（`epoch_millis` 把规范 `created_at` 折成裸整数，落在 TIME INDEX 上），分组白名单含 `coalesce(...)`、`substr(created_at,1,10)`，别名 `group_key`（不是 `key`）。实测 `coalesce`/`substr`/`CASE`/`max(created_at)` 均可用 |
+| 参数绑定 | **没有 HTTP 绑定参数**：`tenant_id` 转义为字面量；`since`/`until` 先由 `epoch_millis` 折成 epoch 毫秒**整数**再插入（不再作为字符串字面量）；分组表达式只允许白名单（绝不把租户 id 当标识符插入） |
+| 大小上限 | SELECT **body** 上限 **64 KiB**，header 区单独 16 KiB（超过/截断 ⇒ `UsageQueryError::ResultTooLarge(64*1024)`）；stage-1 统一后由 total cap 改为 split cap，body 有效上限增加 Δ=header bytes。编码后的 INSERT body 约 **3.5 MiB** 上限，按 512 行或编码后超限分片（量的是编码后的 form body，不是原始 SQL） |
 | 活实例测试 | `#[ignore]`（环境变量 `HYDRA_TEST_GREPTIMEDB_URL`），**不进 CI**：与 TDengine 同策，CI 不为此拉起 service container。本地演练用 `http://127.0.0.1:4400`、默认 db `hydra_usage`——**4400 只是本地演练的映射，不是生产默认**（生产默认端口仍是 4000） |
+
+### 5.6 时间索引剪枝与分区实测（2026-11-11，`greptime/greptimedb:v1.3.0`）
+
+**窗口谓词改为 `ts`（本轮已采用）。** 读窗口从 `created_at >= '<s>' AND created_at < '<u>'` 改成
+`ts >= <since_ms> AND ts < <until_ms>`（`epoch_millis` 是写侧同一个解析器）。等价性：规范行上
+`created_at` 是定宽零填充的 UTC 字符串、`ts` 就是它的 epoch 毫秒，毫秒映射保序，所以两种谓词选中
+**同一批规范行**；唯一的差异类是写侧 `created_at` 不可解析时写下的 `ts=0` 回退行——它在任何真实窗口
+里都不可见（1970 年），与旧字符串谓词把"排序不落在 `[s,u)` 里的脏值"排除掉属于同一类可见性损失，
+且发生在写侧、不是读侧放宽。
+
+**实测：裸整数 vs `TIMESTAMP` 字面量。** v1.3.0 **接受裸整数**并与 `TIMESTAMP '…'` 字面量返回同一结果，
+因此采用裸整数（无需回退到 `TIMESTAMP '<canonical created_at>'`）：
+
+```bash
+B=http://127.0.0.1:4400
+# 同一窗口，两种谓词都回 count=2
+curl -s "$B/v1/sql?db=hydra_usage" --data-urlencode \
+  "sql=SELECT count(*) FROM usage_record WHERE tenant_id='probe-t1' AND ts >= 1794355200000 AND ts < 1794358800000"
+curl -s "$B/v1/sql?db=hydra_usage" --data-urlencode \
+  "sql=SELECT count(*) FROM usage_record WHERE tenant_id='probe-t1' AND ts >= TIMESTAMP '2026-11-11T00:00:00Z' AND ts < TIMESTAMP '2026-11-11T01:00:00Z'"
+```
+
+**实测：剪枝证据（`EXPLAIN ANALYZE`）。** `ts` 窗口的 `SeqScan` 带上了具体的时间范围；旧的
+`created_at` 字符串窗口是**未加界**的 `TimestampRange{{[#,#)}}`：
+
+| 谓词 | `SeqScan` 的 `time_range` | 结论 |
+|---|---|---|
+| `ts >= 1794355200000 AND ts < 1794358800000` | `TimestampRange{[1794355200000ms,1794358800000ms)}` | 时间索引按窗口裁剪 |
+| `created_at >= '2026-11-11T00:00:00Z' AND created_at < '2026-11-11T01:00:00Z'` | `TimestampRange{{[#,#)}}` | 无时间裁剪（`FilterExec` 逐行过滤） |
+
+```bash
+curl -s "$B/v1/sql?db=hydra_usage" --data-urlencode \
+  "sql=EXPLAIN ANALYZE SELECT count(*) FROM usage_record WHERE tenant_id='probe-t1' AND ts >= 1794355200000 AND ts < 1794358800000"
+# … SeqScan: …, \"time_range\": \"TimestampRange{[1794355200000ms,1794358800000ms)}\", …
+```
+
+**分区实验：实测后决定不采用（ledger-only，不做原地重分区）。** 在 scratch 库上实测：
+
+- `PARTITION ON COLUMNS (tenant_id) ()` 与 `(ts) ()`（空规则）能建表，但只产生**一个 region**
+  （`EXPLAIN ANALYZE` 的 `partition_count:{"count":1}`），**不剪枝**。
+- 文档式的多 checkpoint 规则（`(tenant_id < 'm', tenant_id < 't', …)`）在 v1.3.0 上被**拒绝**：
+  `Checkpoint … is overlapped` / `is not covered`。能解析的只有**互补覆盖**的两条规则
+  `(tenant_id < 'm', tenant_id >= 'm')`，它确实把查询裁到单个 region（tenant 落在 `>= 'm'` 时
+  `region=(…,1)` 且下推 `tenant_id >= 'm'`；落在 `< 'm'` 时 `region=(…,0)` 且下推
+  `tenant_id < 'm' OR tenant_id IS NULL`）。
+- **不采用的理由**：v1.3.0 最多只能建**固定两桶的字典序切分**；真实租户 id 往往共享前缀
+  （实测里的 `tenant-*` 全在 `>= 'm'` 桶），两桶切分可能把所有租户放进同一个分区，收益不确定，
+  却会让所有新部署的 DDL 形状偏离已验证的 canonical 形态。真正稳定生效的裁剪来自 `ts` TIME INDEX
+  的区间扫描，因此**保持不分区 DDL**。既有表不受影响（`CREATE TABLE IF NOT EXISTS`），且没有
+  in-place repartition。
 
 ## 6. 已知弱点（每次都得手写的部分）
 

@@ -2,7 +2,7 @@
 
 > **Tired of Python LLM gateways that leak gigabytes of RAM at idle and silently mangle your tool calls through lossy OpenAI↔Anthropic translation?**
 >
-> **Hydra is a Rust + Pingora LLM gateway that speaks both OpenAI and Anthropic *natively* — zero protocol conversion, per-tenant TLS, and billing-grade usage metering (cached tokens + TTFT) — running at ~65 MiB RSS with zero `unsafe` and zero production `unwrap`/`panic!`; the only panic sources are 2 `expect()` calls asserting unreachable invariants (both registered, decision D-13).**
+> **Hydra is a Rust + Pingora LLM gateway that speaks both OpenAI and Anthropic *natively* — zero protocol conversion, per-tenant TLS, and billing-grade usage metering (cached tokens + TTFT) — running at ~65 MiB RSS with zero `unsafe`, zero production `unwrap`/`panic!` and **0** `expect()` invariant assertions — the two former sites now return a boot error / `Result` (decision D-13).**
 
 **A high-performance LLM routing gateway.** Route **OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`)** client traffic to upstream model providers — format-homogeneous pass-through (the client's path is preserved end-to-end, including usage parsing), with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, granular usage metering (input/cached/output tokens + TTFT), and per-tenant TLS. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
 
@@ -17,7 +17,7 @@
 | ⚡ | **11,056 RPS** peak throughput | c=25, p99 = 4.39 ms |
 | 🪶 | **65 MiB** RSS under full load | 18.6 → 65.4 MiB; < 0.4% of a 16 GB box |
 | ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency; the model-extraction pass is O(body) (~0.09-1.3 ms/MB), so multi-MB bodies add milliseconds |
-| 🛡️ | **0** production `unwrap`/`panic!`, **2** `expect()` invariant assertions | both crates `#![forbid(unsafe_code)]`; the 2 panic sources are unreachable-invariant assertions — `main.rs` (cert store), `proxy/provider_client.rs`. **Count = what `check_source_purity.cjs` measures; the number is a testable claim, not prose.** |
+| 🛡️ | **0** production `unwrap`/`panic!`, **0** `expect()` invariant assertions | both crates `#![forbid(unsafe_code)]`; the two former `expect()` sites (boot TLS cert store, `proxy/provider_client.rs`) now return a boot error / `Result`. **Count = what `check_source_purity.cjs` measures; the number is a testable claim, not prose.** |
 | 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
 | 🧪 | **core + server** tests (see [`docs/index.html`](docs/index.html) for the exact measured count), `clippy -D warnings` clean | CI hard gate |
 

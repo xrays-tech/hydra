@@ -91,6 +91,15 @@ const CONFIG_RELOAD_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Shared `hydra_lock` acquisition buckets: 1 ms → 30 s. One acquisition is a
+/// `BEGIN` + a seed + a `SELECT … FOR UPDATE` on a healthy DB, so the low
+/// buckets are the normal case; the top of the range is the configured
+/// `HYDRA_DB_LOCK_TIMEOUT_MS` (5 s default) and the ~3× retry budget
+/// (≈15 s) that `begin_write_loop` can spend before it surfaces `503`.
+const DB_WRITE_ACQUIRE_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 /// All `hydra_*` metric handles (minus the tls-owned SNI counter). Registered
 /// exactly once against the default registry.
 struct Metrics {
@@ -265,6 +274,22 @@ struct Metrics {
     /// hot-reloaded at runtime, so a boot-time-only gauge would be permanently
     /// stale in exactly the scenario this alert targets.
     listener_tenant_certs: IntGauge,
+    // ── Shared DB write-lock acquisition (M — retry observability) ────────
+    /// `begin_write` acquisition attempts, by `outcome` (`retry` for a
+    /// retryable failure that was retried, `exhausted` for the final retryable
+    /// failure that surfaces as `503 storage_busy`). Never recorded outside the
+    /// acquisition loop, so a mutation that fails AFTER the lock is held is not
+    /// counted.
+    db_write_retries: IntCounterVec,
+    /// Wall-clock of ONE `begin_write` acquisition attempt (success or
+    /// failure). The histogram answers "how long is a writer waiting on the
+    /// shared lock", which a flat retry counter cannot.
+    db_write_acquire_seconds: Histogram,
+    /// Callers currently inside the `begin_write` acquisition loop. The gauge
+    /// is held by an RAII guard in `db::pool` for exactly the acquisition (see
+    /// the field docs there), so it is released on drop — including on a panic —
+    /// and is never tied to the returned `Tx`'s lifetime.
+    db_write_waiters: IntGauge,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -596,6 +621,24 @@ fn metrics() -> Option<&'static Metrics> {
             listener_tenant_certs: register_int_gauge!(
                 "hydra_listener_tenant_certs",
                 "Tenant certificates present in the config snapshot"
+            )
+            .ok()?,
+            // ── Shared DB write-lock acquisition (M — retry observability) ──
+            db_write_retries: register_int_counter_vec!(
+                "hydra_db_write_retries_total",
+                "Shared write-lock acquisitions retried or exhausted, by outcome (retry|exhausted)",
+                &["outcome"]
+            )
+            .ok()?,
+            db_write_acquire_seconds: register_histogram!(
+                "hydra_db_write_acquire_seconds",
+                "Wall-clock duration of one shared write-lock acquisition attempt",
+                DB_WRITE_ACQUIRE_BUCKETS.to_vec()
+            )
+            .ok()?,
+            db_write_waiters: register_int_gauge!(
+                "hydra_db_write_waiters",
+                "Callers currently acquiring the shared write lock (acquisition loop entries)"
             )
             .ok()?,
         })
@@ -1229,6 +1272,69 @@ pub fn record_listener_tenant_certs(n: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared DB write-lock acquisition (M — DB write retry observability)
+// ---------------------------------------------------------------------------
+
+/// Count one shared write-lock acquisition outcome. `outcome` is `retry` (a
+/// retryable acquisition failure was retried) or `exhausted` (the final attempt
+/// failed retryably — the write is about to surface as `503 storage_busy`).
+///
+/// Recorded ONLY by `db::pool::begin_write_loop`, at the retry branch and at the
+/// give-up branch respectively, so the two outcomes are mutually exclusive per
+/// failed attempt and a post-acquisition mutation failure is never counted.
+pub fn record_db_write_retry(outcome: &str) {
+    if let Some(m) = metrics() {
+        m.db_write_retries.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Observe the wall-clock of ONE `begin_write` acquisition attempt
+/// (`secs`), reported regardless of whether the attempt acquired the lock.
+pub fn record_db_write_acquire(secs: f64) {
+    if let Some(m) = metrics() {
+        m.db_write_acquire_seconds.observe(secs);
+    }
+}
+
+/// Enter the shared write-lock acquisition loop: increment
+/// `hydra_db_write_waiters`.
+///
+/// Paired with [`record_db_write_waiter_exit`] through the RAII guard in
+/// `db::pool` (whose `Drop` calls the exit), so a panic or an early `?` inside
+/// the acquisition cannot leak the gauge.
+pub fn record_db_write_waiter_enter() {
+    if let Some(m) = metrics() {
+        m.db_write_waiters.inc();
+    }
+}
+
+/// Leave the shared write-lock acquisition loop: decrement
+/// `hydra_db_write_waiters`. Only ever called from the guard's `Drop`.
+pub fn record_db_write_waiter_exit() {
+    if let Some(m) = metrics() {
+        m.db_write_waiters.dec();
+    }
+}
+
+/// Current value of `hydra_db_write_waiters` (tests).
+#[must_use]
+pub fn db_write_waiters() -> i64 {
+    match metrics() {
+        Some(m) => m.db_write_waiters.get(),
+        None => 0,
+    }
+}
+
+/// Current value of `hydra_db_write_retries_total{outcome}` (tests).
+#[must_use]
+pub fn db_write_retries_total(outcome: &str) -> f64 {
+    match metrics() {
+        Some(m) => m.db_write_retries.with_label_values(&[outcome]).get() as f64,
+        None => 0.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Admission control metrics (design-admission-queue §10)
 // ---------------------------------------------------------------------------
 
@@ -1738,6 +1844,52 @@ mod tests {
         assert!(
             render().contains("hydra_admin_audit_deleted_total"),
             "the admin-audit retention counter must appear on /metrics"
+        );
+    }
+
+    #[test]
+    fn db_write_observability_helpers_are_registered() {
+        // Counter: delta-based (the registry is process-global).
+        let before = db_write_retries_total("retry");
+        record_db_write_retry("retry");
+        assert!(
+            db_write_retries_total("retry") >= before + 1.0,
+            "the retry helper must increment the registered series"
+        );
+        let before_exhausted = db_write_retries_total("exhausted");
+        record_db_write_retry("exhausted");
+        assert!(
+            db_write_retries_total("exhausted") >= before_exhausted + 1.0,
+            "the exhausted outcome must be a distinct series from retry"
+        );
+
+        // Histogram: observe then assert the registered bucket line is rendered.
+        record_db_write_acquire(0.004);
+        record_db_write_acquire(12.5);
+
+        // Gauge: enter raises it. The post-exit value is NOT asserted: the gauge
+        // is process-global and the live retry tests in `db::pool` may hold a
+        // guard concurrently in a full `--lib` run.
+        let waiters_before = db_write_waiters();
+        record_db_write_waiter_enter();
+        assert!(
+            db_write_waiters() > waiters_before,
+            "enter must raise the waiters gauge"
+        );
+        record_db_write_waiter_exit();
+
+        let out = render();
+        assert!(
+            out.contains("hydra_db_write_retries_total"),
+            "the retry counter must appear on /metrics"
+        );
+        assert!(
+            out.contains("hydra_db_write_acquire_seconds_bucket"),
+            "the acquisition histogram must appear on /metrics"
+        );
+        assert!(
+            out.contains("hydra_db_write_waiters"),
+            "the waiters gauge must appear on /metrics"
         );
     }
 

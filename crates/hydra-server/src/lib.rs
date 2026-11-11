@@ -57,14 +57,17 @@ pub mod crypto;
 /// Use it whenever the guarded value is a plain snapshot; keep `.expect(...)` where a poisoned lock
 /// really does mean an invariant was broken mid-update.
 ///
-/// The gate names BOTH users (2026-10-08, decision D-13): the request path and the config store are
-/// `db`, and the usage backends that own a `Mutex` — TDengine (`usage-tdengine`) and GreptimeDB
-/// (`usage-greptimedb`) — are features that imply no database feature. Gating on `db` alone would
-/// make those combinations fail to compile the moment they used the helper.
+/// The gate names EVERY user (2026-10-08, decision D-13; widened 2026-11-11): the request path and
+/// the config store are `db`, and the usage backends that own a `Mutex` — TDengine
+/// (`usage-tdengine`), GreptimeDB (`usage-greptimedb`) and ClickHouse (`usage-clickhouse`) — are
+/// features that imply no database feature. Gating on `db` alone would make those combinations fail
+/// to compile the moment they used the helper; a ClickHouse-only build is the case that proved the
+/// omission (`usage-clickhouse` does not imply `db`).
 #[cfg(any(
     feature = "db",
     feature = "usage-tdengine",
-    feature = "usage-greptimedb"
+    feature = "usage-greptimedb",
+    feature = "usage-clickhouse"
 ))]
 pub(crate) fn lock_gate<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)

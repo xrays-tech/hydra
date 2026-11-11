@@ -106,6 +106,18 @@ HYDRA_GREPTIMEDB_QUERY_TIMEOUT_MS=5000
 > `usage_record` table on `open` (`append_mode=false`, `PRIMARY KEY (tenant_id, trace_id)`,
 > `ts TIME INDEX`, `ttl=90d`); no init container or manual DDL is required.
 
+> **GreptimeDB usage reads prune on the `ts` TIME INDEX.** `GET /usage` is translated to a
+> `ts >= <since_epoch_ms> AND ts < <until_epoch_ms>` range — bare integers on the time index, with
+> `tenant_id` still an escaped literal — so a window narrows the scan to that time range
+> (`EXPLAIN ANALYZE` shows a bounded `TimestampRange`, e.g.
+> `TimestampRange{[1794355200000ms,1794358800000ms)}`, instead of the unbounded
+> `TimestampRange{{[#,#)}}` the old `created_at` string predicate produced). Partitioning by tenant
+> was measured and **not adopted**: GreptimeDB v1.3.0 only accepts a fixed two-bucket lexicographic
+> split (`PARTITION ON COLUMNS (tenant_id) (tenant_id < 'm', tenant_id >= 'm')`; the documented
+> multi-checkpoint form is rejected), and the split point is arbitrary for real tenant ids, while the
+> `ts` range already prunes. Existing tables are unaffected (`CREATE TABLE IF NOT EXISTS`). See
+> `dev-docs/usage-backends.md` §5.6.
+
 > **Known listener limitation (recorded here, not hidden in a test):** the startup
 > planner compares listener addresses as **strings**, so the *same port on different
 > bind addresses* (`HYDRA_LISTEN=0.0.0.0:8080` together with
@@ -1061,6 +1073,17 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
   reason an operator will actually see first, and the 10 000-record `retention_cap` is much
   harder to reach. Every drop is also logged with `dropped_trace_id` (per-row diagnosis),
   and the counter STOPS growing as soon as the backend answers again.
+- **Shared DB write-lock acquisition** (instrumented only in `begin_write_loop`, so
+  both `begin_write` and its guardrail test seam are covered — never inside a
+  transaction, and a mutation that fails AFTER the lock is held is not counted):
+  `hydra_db_write_waiters` (callers currently in the acquisition loop; RAII-held, so
+  it is released on drop — including a panic — and is never tied to the transaction
+  lifetime), `hydra_db_write_acquire_seconds` (histogram of ONE acquisition attempt;
+  buckets 1 ms → 30 s, the top being the ~3× retry budget), and
+  `hydra_db_write_retries_total{outcome}` (`retry` = a retryable acquisition failure
+  was retried; `exhausted` = the final attempt still failed retryably, so the write
+  surfaces `503 storage_busy`). These counters are process-global; read rates/deltas,
+  not absolute values.
 - **Tracing**: structured logs via `tracing` (`RUST_LOG`). Every request carries
   an `X-Hydra-Trace-Id` echoed to the client and logged end-to-end.
 - **Admin UI**: `http://<admin_addr>/admin/` — same-origin (the token is kept
@@ -1123,6 +1146,7 @@ unmetered: no limit, no counter and only a `debug!` line (filtered out at the sh
 | ~~Replication stalled (upgrade window)~~ | **RETIRED — do not write this rule** | It was `changes(hydra_control_snapshot_version[10m]) == 0 and hydra_control_poll_total{result="ok"} > 0`, and BOTH terms are dead: `hydra_control_snapshot_version` lost its recorder with the polling client (removed with the old control plane; the gauge was still registered and exported as 0, so the rule looked fine) and `result="ok"` is a label value nothing has ever recorded — the only values emitted are `rate_limit_error` and `invalidation_trim_error`. A rule on it could never fire. The facts it was trying to express are covered by the two rows above |
 | **Billing data is being LOST** | `increase(hydra_usage_records_dropped_total[10m]) > 0` | Usage rows the sink could not deliver — the gateway is **under-counting usage, quota and billing** for every drop. `reason="channel_full"` means the sink's backend is down and the bounded channel (batch size, 256) filled while the flush loop was backing off; `retention_cap` means 10 000 rows are already buffered; `channel_closed` means the sink was shut down; `shutdown_unflushed` means the final drain at shutdown failed; **`sink_disabled`** means this node was started with `HYDRA_USAGE_SINK=none`, so every record is discarded by choice (set a real backend to stop it). Every drop also logs `dropped_trace_id`, so a lost row can be traced to its request. Requests are still served normally (losing telemetry never breaks the proxy path — measured), which is exactly why this needs an alert rather than a symptom |
 | Shared limits are OFF (Redis unreachable) | `increase(hydra_control_poll_total{result="rate_limit_error"}[10m]) > 0` | A cluster rate-limit check could not reach Redis, so that role was **failed open** — the request was admitted without its window being consulted (hard-coded direction, `HYDRA_RATE_LIMIT_FAIL_MODE` does not exist). One increment per matched role per affected request, so this is also the "how much traffic is unprotected" signal. Before 2026-09-30 this counter could grow **forever**: the pool was built without a reconnect policy, so a severed connection was never re-dialled and the limits stayed off until a restart (`ops.md` §13.5; measured 90 s with zero reconnect attempts). A flat line at a fixed total is stale, not healthy — check that it stops growing within seconds of Redis returning |
+| Shared write-lock acquisition exhausted | `increase(hydra_db_write_retries_total{outcome="exhausted"}[10m]) > 0` | A write spent the whole `BEGIN_WRITE_MAX_ATTEMPTS` (3) retry budget on retryable lock failures and therefore surfaces **`503 storage_busy`** (the client should back off briefly and retry). `outcome="retry"` alone is the ordinary contention signal and can be non-zero on a busy fleet; only `exhausted` means a writer actually gave up. Worst-case added latency before giving up is ≈3× `HYDRA_DB_LOCK_TIMEOUT_MS` (≈15 s at the default 5 s) plus jitter. Use `hydra_db_write_waiters` for how many writers are queued right now and `hydra_db_write_acquire_seconds` (buckets to 30 s) for the per-attempt distribution |
 
 The label is `protocol`, never `transport` (`hydra_listener_bound` is registered
 with `&["protocol"]`). Note the metric-name family: listener signals live under

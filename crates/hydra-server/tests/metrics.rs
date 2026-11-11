@@ -319,7 +319,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         server.bootstrap();
         let mut proxy_svc = pingora_proxy::http_proxy_service(
             &server.configuration,
-            HydraProxy::new(proxy_state.clone()),
+            HydraProxy::new(proxy_state.clone()).expect("build HydraProxy"),
         );
         proxy_svc.add_tcp(&proxy_addr);
         server.add_service(proxy_svc);
@@ -546,7 +546,7 @@ async fn all_candidates_failed_produces_empty_provider_sample() {
         server.bootstrap();
         let mut proxy_svc = pingora_proxy::http_proxy_service(
             &server.configuration,
-            HydraProxy::new(proxy_state.clone()),
+            HydraProxy::new(proxy_state.clone()).expect("build HydraProxy"),
         );
         proxy_svc.add_tcp(&proxy_addr);
         server.add_service(proxy_svc);

@@ -55,8 +55,13 @@ CREATE TABLE IF NOT EXISTS usage_record (
 ) WITH ('append_mode' = 'false', 'ttl' = '90d');
 ```
 
-- `created_at` stays the canonical fixed-width `YYYY-MM-DDTHH:MM:SSZ` string (read contract compares strings; day grouping uses `substr(created_at,1,10)`).
-- `ts` is derived from `created_at` (epoch ms) only to satisfy the time index; it is not used for window predicates.
+- `created_at` stays the canonical fixed-width `YYYY-MM-DDTHH:MM:SSZ` string (day grouping uses `substr(created_at,1,10)` and `max(created_at)` is the reported `as_of`).
+- `ts` is derived from `created_at` (epoch ms) and **is** the read window predicate:
+  `ts >= <since_ms> AND ts < <until_ms>`, which makes the TIME INDEX prune the scan. **This line
+  previously said `ts` was "not used for window predicates"; that is now false** (W4, 2026-11-11 —
+  see the hardening plan §3 and `dev-docs/usage-backends.md` §5.6). A non-canonical `created_at`
+  writes `ts=0` and is invisible to a real window (write-side fallback, documented in the backend
+  module).
 - `append_mode=false` (default) + primary key + time index gives merge/dedup on retry: the same `(tenant_id, trace_id, ts)` re-inserted folds instead of double-counting. `ttl='90d'` bounds storage.
 - **Risk / fallbacks (live-gated)**: (a) `PRIMARY KEY (tenant_id, trace_id)` + separate `ts TIME INDEX` is the canonical GreptimeDB shape; if the live server rejects it, fall back to `PRIMARY KEY (tenant_id, trace_id, ts)` (same dedup semantics). (b) `TIMESTAMP` is the documented SQL type (millisecond precision by default); if the live server rejects it, try `TIMESTAMPMILLISECOND`. Record whichever is measured in this plan.
 - **`trace_id` is load-bearing for dedup**: it must be non-empty. The writer derives a deterministic fallback key (FNV-1a over the row fields) when an empty `trace_id` arrives, writes that into the `trace_id` column, and unit-tests it; an empty key would otherwise fold same-millisecond records of one tenant.
@@ -71,7 +76,7 @@ CREATE TABLE IF NOT EXISTS usage_record (
 
 ## 5. Reader
 
-- Totals: `count(*) AS requests`, `sum(tokens_in)`, `sum(tokens_out)`, `sum(cache_hit_tokens)`, `sum(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS errors`, `max(created_at) AS last_seen`, `WHERE tenant_id = '<escaped>' AND created_at >= '<since>' AND created_at < '<until>'`.
+- Totals: `count(*) AS requests`, `sum(tokens_in)`, `sum(tokens_out)`, `sum(cache_hit_tokens)`, `sum(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS errors`, `max(created_at) AS last_seen`, `WHERE tenant_id = '<escaped>' AND ts >= <since_ms> AND ts < <until_ms>` (bare epoch-ms bounds on the TIME INDEX; the tenant stays an escaped literal).
 - Grouped: whitelist expressions: `model_key`, `provider_id`, `coalesce(user_id,'')`, `coalesce(user_group_id,'')`, `coalesce(api_key_id,'')`, `substr(created_at,1,10)`; alias `group_key` (not `key`).
 - Decoder: schema-name → index from `output[0].records.schema.column_schemas`; counters accept JSON numbers or numeric strings; `null` aggregate over an empty window = 0 (TDengine precedent); key `null` → `""`; `last_seen` string normalized via `hydra_core::tenant_api::normalize_as_of`; any shape drift is `Decode`, never zero.
 - `source()` returns `"greptimedb"`.

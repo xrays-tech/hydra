@@ -39,6 +39,18 @@ pub mod backends;
     allow(dead_code, unused_imports)
 )]
 pub mod engine;
+/// The shared usage-backend HTTP transport (framing/auth/read/limits). Every backend's
+/// `transport.rs` is built on it; a build with no usage backend compiles it unused, which is what the
+/// attribute says.
+#[cfg_attr(
+    not(any(
+        feature = "usage-clickhouse",
+        feature = "usage-tdengine",
+        feature = "usage-greptimedb"
+    )),
+    allow(dead_code, unused_imports)
+)]
+pub(crate) mod http;
 pub mod query;
 
 /// One environment variable a backend **needs**.
