@@ -716,7 +716,19 @@ const discovered = [];
 const visitedDirs = new Set();
 (function walk(dir) {
   visitedDirs.add(path.relative(ROOT, dir) || ".");
-  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+  // Runtime data volumes can be deliberately unreadable to the invoking user (Postgres requires
+  // its PGDATA directory to be 0700 and owned by uid 999; `prod/data/postgres` is exactly that).
+  // The discovery walk exists to find SOURCE test artifacts, so an unreadable data directory is
+  // skipped rather than crashing the whole guard (measured 2026-11-11: `scandir` EACCES aborted
+  // every rule with a Node stack trace instead of a verdict).
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e && (e.code === "EACCES" || e.code === "EPERM")) return;
+    throw e;
+  }
+  for (const ent of entries) {
     if (ent.isDirectory()) {
       if (SKIP_ANYWHERE.has(ent.name)) continue;
       // Dot-directories are skipped EXCEPT `.github`, which holds helper scripts that must be

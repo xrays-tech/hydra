@@ -1,0 +1,15 @@
+# Local secrets and generated state — never commit (see prod/.gitignore).
+.env
+deploy.env
+
+# Bind-mounted service data.
+data/
+
+# Staged release binary (built by build/build-binary.sh).
+releases/hydra
+
+# Tarballs, image dumps and log dumps.
+*.tar
+*.tar.gz
+images/
+logs/

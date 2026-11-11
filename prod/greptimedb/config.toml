@@ -1,0 +1,14 @@
+# GreptimeDB standalone configuration for the Hydra usage sink (HYDRA_USAGE_SINK=greptimedb).
+#
+# Mounted read-only at /etc/greptimedb/config.toml and selected with `standalone start -c
+# /etc/greptimedb/config.toml` (see docker-compose.yml). data_home is NOT also passed as a CLI
+# flag: one owner avoids a flag/config precedence ambiguity.
+#
+# The HTTP SQL API (the endpoint Hydra uses: POST /v1/sql?db=hydra_usage) is served on 4000,
+# which is also where the /health probe and Hydra's HYDRA_GREPTIMEDB_URL point.
+
+[storage]
+data_home = "/data"
+
+[http]
+addr = "0.0.0.0:4000"

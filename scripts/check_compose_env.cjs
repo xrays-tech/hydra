@@ -47,14 +47,20 @@ const {
 const DEFAULT_REPO = path.resolve(__dirname, '..');
 /** The root to read, overridable so the self-test can run against a fixture tree. */
 const REPO = process.env.COMPOSE_ENV_ROOT ? path.resolve(process.env.COMPOSE_ENV_ROOT) : DEFAULT_REPO;
-/** The image NAME the other compose guards also treat as "this is a Hydra node". */
-const IMAGE_RE = /(^|\/)hydra(-local)?:/;
+/**
+ * The image NAME the other compose guards also treat as "this is a Hydra node".
+ *
+ * `hydra:`/`hydra-local:` are the developer stacks; `hydra-prod:` is the production A/B stack
+ * (`prod/docker-compose.yml`, whose binary is bind-mounted rather than baked into the image).
+ */
+const IMAGE_RE = /(^|\/)hydra(-local|-prod)?:/;
 
 /** The manifests that ship, read as text (never rendered — see the header). */
 const MANIFESTS = [
   'environment/docker-compose.yml',
   'environment/docker-compose.cluster.yml',
   'environment/docker-compose.local.yml',
+  'prod/docker-compose.yml',
 ];
 
 /**

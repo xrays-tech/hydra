@@ -27,7 +27,13 @@ const CHECKER = path.join(__dirname, 'check_compose_env.cjs');
 const REPO = path.resolve(__dirname, '..');
 
 /** A tree with the REAL `CLUSTER_ONLY_ENV` / `RETIRED_CLUSTER_ENV` tables, so the rules are the shipped ones. */
-function tree({ manifests = {}, recipes = {}, owner = true, ownerText = null } = {}) {
+/**
+ * A synthetic tree. `prod/docker-compose.yml` is on the checker's MANIFESTS list (it ships), so
+ * every fixture needs one too. By default it is a minimal clean single node that asks for nothing
+ * beyond `server`, so a fixture's own thesis (a missing cluster-redis, a missing backend, …) is not
+ * drowned out by an unrelated prod requirement.
+ */
+function tree({ manifests = {}, recipes = {}, owner = true, ownerText = null, prodManifest = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compose-env-'));
   if (owner) {
     const ownerDir = path.join(dir, 'crates/hydra-server/src/cluster');
@@ -43,6 +49,14 @@ function tree({ manifests = {}, recipes = {}, owner = true, ownerText = null } =
   fs.mkdirSync(envDir, { recursive: true });
   for (const [name, text] of Object.entries(manifests)) fs.writeFileSync(path.join(envDir, name), text);
   for (const [name, text] of Object.entries(recipes)) fs.writeFileSync(path.join(envDir, name), text);
+  const prodDir = path.join(dir, 'prod');
+  fs.mkdirSync(prodDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(prodDir, 'docker-compose.yml'),
+    prodManifest === null
+      ? ['services:', node('hydra', ['HYDRA_LISTEN: "0.0.0.0:8080"'])].join('\n')
+      : prodManifest,
+  );
   return dir;
 }
 
@@ -86,8 +100,8 @@ test('the real repository tree passes', () => {
   assert.equal(res.status, 0, `${res.status} ${res.stdout}${res.stderr}`);
   assert.match(res.stdout, /none sets any of the 15 variable\(s\) RETIRED_CLUSTER_ENV retires/);
   // The judged counts are asserted so a scan that finds nothing cannot pass: the single-node file
-  // has one hydra service, both multi-node files have three.
-  assert.match(res.stdout, /docker-compose\.yml=1, environment\/docker-compose\.cluster\.yml=3, environment\/docker-compose\.local\.yml=3/);
+  // has one hydra service, both multi-node files have three, and the prod edge stack has one.
+  assert.match(res.stdout, /docker-compose\.yml=1, environment\/docker-compose\.cluster\.yml=3, environment\/docker-compose\.local\.yml=3, prod\/docker-compose\.yml=1/);
 });
 
 test('FALSIFY: a manifest that still sets a RETIRED variable is caught, and the variable is named', () => {

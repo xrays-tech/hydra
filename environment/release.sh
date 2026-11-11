@@ -37,9 +37,9 @@ esac
 
 # Literal lists (read by scripts/check_compose_env.cjs): exactly one backend feature per build.
 if [[ "$DB_BACKEND" == "postgres" ]]; then
-    FEATURES="server,cluster-redis,usage-clickhouse,db-postgres"
+    FEATURES="server,cluster-redis,usage-clickhouse,usage-greptimedb,db-postgres"
 else
-    FEATURES="server,cluster-redis,usage-clickhouse,db-mysql"
+    FEATURES="server,cluster-redis,usage-clickhouse,usage-greptimedb,db-mysql"
 fi
 
 BIN_NAME="hydra"
@@ -50,9 +50,9 @@ echo ">> [1/2] building $BIN_NAME (release, $DB_BACKEND, full feature set) from 
 # Run from the package dir so `--features … --bin hydra` resolves for the [[bin]]
 # hydra target (required-features = ["server"]), matching build.sh — the same
 # feature set, so this binary can serve a cluster deployment too. `usage-clickhouse`
-# is the ONLY usage backend that needs a feature: the retired `sqlite` sink was deleted
+# and `usage-greptimedb` are the delivered usage sinks: the retired `sqlite` sink was deleted
 # with ADR-0002 (2026-10-07) and `HYDRA_USAGE_SINK=sqlite` is now REFUSED BY NAME at
-# startup, so the runtime choice is `clickhouse` or `none`. Cluster mode is
+# startup, so the runtime choice is `clickhouse`, `greptimedb`, or `none`. Cluster mode is
 # `HYDRA_REDIS_URL` presence; there is no raft/Arachne control plane. Exactly one of
 # `db-postgres` / `db-mysql` is compiled in (db/backend.rs refuses neither/both).
 ( cd "$PKG_DIR" && cargo build --release --features "$FEATURES" --bin "$BIN_NAME" )

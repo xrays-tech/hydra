@@ -75,3 +75,19 @@ CODE_REVIEW.md
 # binary", which implied they were load-bearing.
 !bin/
 !bin/hydra
+
+# prod/build/Dockerfile.builder runs `COPY . .` and needs the Rust build inputs, while
+# environment/Dockerfile only needs bin/hydra. Re-include them here and keep the prod
+# runtime state (data/releases/images) out of every build context.
+!**/*.rs
+!**/Cargo.toml
+!**/Cargo.lock
+!rust-toolchain.toml
+!**/build.rs
+prod/data
+prod/releases
+prod/*.tar
+
+# The server embeds the admin UI assets (include_dir!), so the builder needs them.
+!admin-ui
+!admin-ui/**

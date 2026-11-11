@@ -1,0 +1,143 @@
+# Hydra production stack (single edge instance).
+#
+# Hydra IS the edge proxy: one app process terminates plaintext on :80 and per-tenant TLS/SNI on
+# :443 (certificates are provisioned through the admin/config flow and stored in the relational
+# DB). There is no nginx and no A/B pair.
+#
+# Order of operations:
+#   1. build the release binary:      prod/build/build-binary.sh      (writes prod/releases/hydra)
+#   2. generate secrets + dirs:       prod/ops/up.sh                  (does this for you when .env is absent)
+#   3. start:                         prod/ops/up.sh
+#
+# The app binary is NOT baked into the image: `app/Dockerfile` only supplies the runtime
+# (ca-certificates, libgcc, tini, curl) and the non-root uid; `prod/releases/hydra` is bind-mounted
+# read-only.
+#
+# Secrets come from `prod/.env` (gitignored). Non-secret listener settings live in
+# `prod/env/app.env` so they can be reviewed in git.
+
+name: hydra-prod
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    shm_size: 256mb
+    env_file:
+      - ./.env
+    volumes:
+      # `:z` (SELinux relabel shared) so the stack runs on a SELinux host (Fedora); harmless where
+      # SELinux is absent. Read-only files get `:ro,z`.
+      - ./data/postgres:/var/lib/postgresql/data:z
+    stop_grace_period: 30s
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra -d hydra"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - hydra-prod
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      - --requirepass
+      - "${REDIS_PASSWORD}"
+    environment:
+      # The healthcheck expands this inside the container (compose escapes it as `$$`).
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro,z
+      - ./data/redis:/data:z
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - hydra-prod
+
+  greptimedb:
+    image: greptime/greptimedb:v1.3.0
+    restart: unless-stopped
+    # `-c` carries the data home and the HTTP address; see greptimedb/config.toml.
+    # (Do not also pass --data-home/--http-addr here: keeping one owner avoids the
+    # "CLI flag overrides config" ambiguity noted in the deployment runbook.)
+    command:
+      - standalone
+      - start
+      - -c
+      - /etc/greptimedb/config.toml
+    volumes:
+      - ./data/greptimedb:/data:z
+      - ./greptimedb/config.toml:/etc/greptimedb/config.toml:ro,z
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - hydra-prod
+
+  hydra:
+    image: hydra-prod:latest
+    build:
+      context: ./app
+    restart: unless-stopped
+    env_file:
+      - ./.env
+      - ./env/app.env
+    # The two data-store URLs are also spelled inline (same values as .env) so the static compose
+    # guards can judge this manifest even in a checkout where prod/.env is absent: they derive the
+    # required `db-postgres` / `cluster-redis` features from what the manifest asks the binary for.
+    environment:
+      HYDRA_DB_URL: "postgres://hydra:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable"
+      HYDRA_REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+    volumes:
+      - ./releases/hydra:/usr/local/bin/hydra:ro,z
+      - ./.env:/app/.env:ro,z
+      - ./data/app:/app/data:z
+    stop_grace_period: 30s
+    logging: *default-logging
+    ports:
+      - "80:80"                              # plaintext data plane (the edge listener)
+      - "443:443"                            # per-tenant TLS/SNI listener
+      - "${ADMIN_PORT:-18081}:8081"          # admin API; keep this off the public interface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      greptimedb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$HYDRA_ADMIN_TOKEN\" http://127.0.0.1:8081/api/v1/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      - hydra-prod
+
+networks:
+  hydra-prod:
+    name: hydra-prod
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

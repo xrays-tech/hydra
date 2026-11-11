@@ -13,10 +13,11 @@
 # target (which has `required-features = ["server"]`) for the cross target, so the binary is
 # silently skipped. This script does that for you.
 #
-# The image bundles the server + one relational backend + Redis data-plane + ClickHouse usage
-# features so a SINGLE build serves both single-node (no `HYDRA_REDIS_URL` -> zero external deps)
-# and cluster mode (`HYDRA_REDIS_URL` set -> shared Redis rate/breaker state). Config authority is
-# the relational database; there is no raft control plane/leader.
+# The image bundles the server + one relational backend + Redis data-plane + BOTH delivered usage
+# sinks (ClickHouse and GreptimeDB; the runtime `HYDRA_USAGE_SINK` picks one) so a SINGLE build
+# serves both single-node (no `HYDRA_REDIS_URL` -> zero external deps) and cluster mode
+# (`HYDRA_REDIS_URL` set -> shared Redis rate/breaker state). Config authority is the relational
+# database; there is no raft control plane/leader.
 #
 # DB_BACKEND selects the compiled relational backend (default `postgres`):
 #   postgres -> `db-postgres` -> images `hydra:postgres` and `hydra:latest`
@@ -48,9 +49,9 @@ esac
 # Both variants are written as LITERAL feature lists so `scripts/check_compose_env.cjs` can read
 # them without evaluating shell. Exactly one backend feature is active per build.
 if [[ "$DB_BACKEND" == "postgres" ]]; then
-    FEATURES="server,cluster-redis,usage-clickhouse,db-postgres"
+    FEATURES="server,cluster-redis,usage-clickhouse,usage-greptimedb,db-postgres"
 else
-    FEATURES="server,cluster-redis,usage-clickhouse,db-mysql"
+    FEATURES="server,cluster-redis,usage-clickhouse,usage-greptimedb,db-mysql"
 fi
 
 TARGET="x86_64-unknown-linux-gnu"
