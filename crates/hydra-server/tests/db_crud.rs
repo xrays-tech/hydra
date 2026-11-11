@@ -680,6 +680,82 @@ async fn tenant_grants_and_certificate_crud() {
     test_db.cleanup().await;
 }
 
+/// H6.4: the atomic `write_tenant(is_create=false)` update path runs the SAME
+/// existence probe as `update_tenant`; a missing id is `RowNotFound` before any
+/// UPDATE runs, while the create path is unaffected. `rows_affected` cannot be
+/// the signal (PG matched vs MySQL changed), so the probe is the contract.
+#[tokio::test]
+async fn write_tenant_update_probes_existence_and_create_is_unaffected() {
+    let test_db = common::setup_db().await;
+    let pool = &test_db.pool;
+    let kp = kp();
+    let mut rev = revision(pool).await;
+
+    // Create path: unchanged, inserts and bumps the revision.
+    db::write_tenant(
+        pool,
+        &kp,
+        TenantWrite {
+            tenant: &tenant("t1", "one.example", &ts(0)),
+            is_create: true,
+            cert: None,
+        },
+    )
+    .await
+    .expect("create tenant");
+    rev += 1;
+    assert_eq!(revision(pool).await, rev);
+
+    // Update path, existing id: still updates in place.
+    let mut upd = db::get_tenant(pool, "t1").await.expect("get tenant");
+    upd.name = "renamed".into();
+    upd.updated_at = ts(1);
+    db::write_tenant(
+        pool,
+        &kp,
+        TenantWrite {
+            tenant: &upd,
+            is_create: false,
+            cert: None,
+        },
+    )
+    .await
+    .expect("update existing tenant");
+    assert_eq!(
+        db::get_tenant(pool, "t1").await.expect("get updated").name,
+        "renamed"
+    );
+
+    // Update path, missing id: RowNotFound, and no revision bump (transaction
+    // rolled back before commit).
+    let mut missing = upd.clone();
+    missing.id = "missing-write-tenant".into();
+    let before = revision(pool).await;
+    assert!(
+        matches!(
+            db::write_tenant(
+                pool,
+                &kp,
+                TenantWrite {
+                    tenant: &missing,
+                    is_create: false,
+                    cert: None,
+                },
+            )
+            .await,
+            Err(sqlx::Error::RowNotFound)
+        ),
+        "write_tenant(is_create=false) of a missing id must report RowNotFound"
+    );
+    assert_eq!(
+        revision(pool).await,
+        before,
+        "a missing-row write must not advance the revision"
+    );
+
+    test_db.cleanup().await;
+}
+
 #[tokio::test]
 async fn limit_role_crud_and_sealed_matching_key() {
     let test_db = common::setup_db().await;

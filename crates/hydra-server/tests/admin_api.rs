@@ -796,9 +796,10 @@ async fn tenant_crud_http() {
     assert_eq!(r.status(), 204);
 
     // A PUT naming an id that does not exist is the same 404 as a GET, not a
-    // silent 200 "updated nothing". This exercises `write_tenant(is_create=false)`
-    // + the follow-up `get_tenant` fallback; the H3.1 probe is covered directly
-    // in `db_crud::...` (do not delete that fallback believing the probe covers it).
+    // silent 200 "updated nothing". `write_tenant(is_create=false)` now probes
+    // existence inside its transaction and reports `RowNotFound`, which the
+    // handler maps to this 404; the post-write `get_tenant` remains a backstop
+    // for a row deleted between commit and read.
     let r = req(
         port,
         reqwest::Method::PUT,
@@ -808,6 +809,31 @@ async fn tenant_crud_http() {
     )
     .await;
     assert_eq!(r.status(), 404, "missing tenant update must be 404");
+    let v: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(v["error"]["code"], "not_found", "got {v}");
+}
+
+/// H6.4 handler mapping: the write probe's `RowNotFound` must be a 404, not the
+/// 500 `classify_db_err` would produce for a bare `RowNotFound`.
+#[tokio::test]
+async fn tenant_put_missing_id_maps_the_write_probe_to_404() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let body = r#"{"id":"no-such-tenant","name":"T","domain":"missing.example","cert_key":null,"cert_file":null,"enabled":true,"created_at":"","updated_at":""}"#;
+
+    let r = req(
+        port,
+        reqwest::Method::PUT,
+        "/api/v1/tenants/no-such-tenant",
+        Some(TOKEN),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        r.status(),
+        404,
+        "a missing id on PUT must be 404, never 500"
+    );
     let v: serde_json::Value = r.json().await.expect("json");
     assert_eq!(v["error"]["code"], "not_found", "got {v}");
 }
@@ -2894,6 +2920,66 @@ async fn oversized_admin_body_is_rejected_with_413() {
     )
     .await;
     assert_eq!(ok.status(), 201, "the next request must still be served");
+}
+
+/// H6.2: a malformed JSON body on a migrated mutation route is a 400
+/// `invalid_json` carrying the request's trace id, and the same connection is
+/// reusable for the next request. This pins the `read_json_body` envelope (the
+/// H4 refactor) directly: a wrong status/code or a connection left desynced by
+/// the parse failure fails here.
+#[tokio::test]
+async fn malformed_admin_json_is_400_invalid_json_and_keeps_the_connection_usable() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let url = format!("http://127.0.0.1:{port}/api/v1/providers");
+    let relayed = "hydra-admin-invalid-json";
+
+    let mut last = None;
+    let mut response = None;
+    for _ in 0..50 {
+        match client
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .header("x-hydra-trace-id", relayed)
+            .body("{ not valid json")
+            .send()
+            .await
+        {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let r = response.unwrap_or_else(|| panic!("admin server never ready: {last:?}"));
+    assert_eq!(r.status(), 400, "malformed JSON must be a 400");
+    let body: serde_json::Value = r.json().await.expect("json");
+    assert_eq!(
+        body["error"]["code"], "invalid_json",
+        "malformed JSON must answer invalid_json: {body}"
+    );
+    assert_eq!(
+        body["error"]["trace_id"], relayed,
+        "the parse error must carry the request's trace id: {body}"
+    );
+
+    // The SAME client reuses the connection: a valid create still works.
+    let r = client
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .body(r#"{"id":"p1","key":"openai","name":"O","endpoint":"https://api.openai.com","weight":1,"created_at":"","updated_at":""}"#)
+        .send()
+        .await
+        .expect("the connection must be reusable after a parse failure");
+    assert_eq!(r.status(), 201, "the next request must still be served");
 }
 
 /// The admin token is the single secret gating every tenant/provider/api-key

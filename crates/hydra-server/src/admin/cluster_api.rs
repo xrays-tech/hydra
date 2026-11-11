@@ -8,8 +8,8 @@
 use serde::Serialize;
 
 use super::handlers::{err_json, ok_json, Resp};
-use super::AdminState;
-use crate::store::{ReloadGuard, ReloadSource};
+use super::{AdminState, WriteCtx};
+use crate::store::ReloadSource;
 
 /// This node's view of itself. `cluster=false` on a single-node deployment —
 /// the UI then renders just the local Health panel.
@@ -99,15 +99,10 @@ struct ReloadBody {
 /// the reload goes through the locked entry point — one lock only. The store
 /// owns `snapshot_stale` and the `hydra_config_snapshot_stale` gauge, so a
 /// failure here is recorded by the same code that serves the write paths.
-pub(super) async fn reload(
-    state: &AdminState,
-    write_guard: Option<&ReloadGuard<'_>>,
-    force: bool,
-    trace_id: &str,
-) -> Resp {
+pub(super) async fn reload(state: &AdminState, ctx: &WriteCtx<'_>, force: bool) -> Resp {
     // A fatal validation failure is reported as 400 (design §5.3: the old
     // snapshot is retained). Certs follow the swap via the `ConfigStore` hook.
-    let result = match write_guard {
+    let result = match ctx.guard {
         Some(guard) => {
             state
                 .store
@@ -127,7 +122,7 @@ pub(super) async fn reload(
                 400,
                 "reload_failed",
                 &format!("config reload failed (old snapshot retained): {e}"),
-                trace_id,
+                ctx.trace_id,
             );
         }
     };

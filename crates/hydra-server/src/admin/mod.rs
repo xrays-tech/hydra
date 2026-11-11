@@ -497,7 +497,7 @@ impl AdminService {
                     })
                 })
                 .unwrap_or(false);
-            return cluster_api::reload(&self.state, _write_guard.as_ref(), force, trace_id).await;
+            return cluster_api::reload(&self.state, &ctx, force).await;
         }
         // Auth cache invalidation was HERE (`DELETE /api/v1/auth/cache`). It is retired with
         // the external auth-cache surface, so requests to that path now fall through to the

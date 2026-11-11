@@ -1038,6 +1038,13 @@ pub(super) async fn tenant_item(
             )
             .await
             {
+                // `write_tenant(is_create=false)` probes existence inside its
+                // transaction and reports `RowNotFound`; map it to the SAME 404
+                // this path already returned via the post-write `get_tenant`.
+                // Routing it through `db_err_resp` would classify it as 500.
+                if is_not_found(&e) {
+                    return err_json(404, "not_found", "tenant not found", ctx.trace_id);
+                }
                 return db_err_resp(e, ctx.trace_id);
             }
             match crate::db::get_tenant(state.db(), id).await {

@@ -178,6 +178,19 @@ pub async fn write_tenant(
         .await?;
         changed |= affected.rows_affected() > 0;
     } else {
+        // Same existence probe as `update_tenant`, INSIDE this transaction:
+        // `rows_affected` cannot answer "did this row exist?" (PG reports
+        // matched rows, MySQL changed rows), so a same-body no-op must not look
+        // absent. Missing id → RowNotFound; the caller maps it to 404.
+        let existing: Option<(String,)> = sqlx::query_as(&dialect::sql(
+            "SELECT id FROM tenant WHERE id = ? FOR UPDATE",
+        ))
+        .bind(&t.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_none() {
+            return Err(sqlx::Error::RowNotFound);
+        }
         let affected = sqlx::query(&dialect::sql(
             "UPDATE tenant SET name = ?, domain = ?, cert_key = ?, cert_file = ?, \
              enabled = ?, updated_at = ? WHERE id = ?",
