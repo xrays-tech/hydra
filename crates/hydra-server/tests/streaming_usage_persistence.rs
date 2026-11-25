@@ -177,6 +177,20 @@ fn test_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+/// Every SSE response must advertise chunked framing (HYDRA-SSE-001). Without
+/// it Pingora writes a close-delimited body, which an interposed HTTP proxy that
+/// keeps the client connection alive can never terminate. The test client uses
+/// plain `http://` (HTTP/1.1), so the header is asserted on the wire.
+fn assert_chunked(resp: &reqwest::Response) {
+    assert_eq!(
+        resp.headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("chunked"),
+        "SSE must declare chunked framing, or an interposed proxy cannot end the stream"
+    );
+}
+
 /// Retry the request until the proxy is ready (Pingora binds asynchronously).
 async fn send_until_ready(client: &reqwest::Client, url: &str, body: &str) -> reqwest::Response {
     let mut last_err = None;
@@ -327,6 +341,7 @@ async fn openai_streaming_usage_persists_to_the_sink() {
 
     let resp = send_until_ready(&client, &url, body).await;
     assert_eq!(resp.status(), 200);
+    assert_chunked(&resp);
     // Consume the full SSE body so the proxy's logging hook runs (usage is
     // recorded in `logging`, which fires after the response stream completes).
     let resp_body = resp.text().await.expect("body");
@@ -392,6 +407,7 @@ async fn anthropic_coalesced_streaming_usage_persists_to_the_sink() {
 
     let resp = send_until_ready(&client, &url, body).await;
     assert_eq!(resp.status(), 200);
+    assert_chunked(&resp);
     let resp_body = resp.text().await.expect("body");
     assert!(
         resp_body.contains("message_stop"),
@@ -410,5 +426,123 @@ async fn anthropic_coalesced_streaming_usage_persists_to_the_sink() {
         row.cached,
         Some(7),
         "cache_read_input_tokens → cache_hit_tokens (Anthropic-only; proves scanner kind)"
+    );
+}
+
+/// **Error bodies stay length-delimited (429)**: the limit gate's hand-rolled
+/// 429 must advertise `Content-Length` and must not use chunked. A 429 with
+/// neither framing header is close-delimited — the same hang-behind-a-proxy
+/// failure as HYDRA-SSE-001, on routine traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limited_429_uses_content_length_not_chunked() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string(r#"{"id":"ok","object":"chat.completion","choices":[]}"#),
+        )
+        // Exactly two provider calls: req3 is 429'd before routing.
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_routed(&pool, &upstream.uri(), "gpt-4").await;
+    // `seed_routed` installs count=1000; tighten to 2 so the third request is
+    // denied by the count gate.
+    repo::update_limit_role(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        &LimitRole {
+            id: "default".into(),
+            name: "default".into(),
+            matching_key: None,
+            matching_model: None,
+            matching_tenant: Some("t1".into()),
+            matching_provider: None,
+            limit_count: Some(2),
+            limit_token: None,
+            window: "m".into(),
+            enabled: true,
+            created_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("tighten limit role to count=2");
+
+    let (state, _sink) = build_state_with_recording_sink(pool.clone()).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+    for n in 1..=2 {
+        let r = send_until_ready(&client, &url, body).await;
+        assert_eq!(r.status(), 200, "request {n} should pass");
+        let _ = r.text().await.expect("body");
+    }
+    let resp = client
+        .post(&url)
+        .header("authorization", "Bearer test-client-key")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("send third request");
+    assert_eq!(resp.status(), 429, "req3 must be rate-limited");
+    assert!(
+        resp.headers().contains_key("content-length"),
+        "429 body must declare its length"
+    );
+    assert!(
+        !resp.headers().contains_key("transfer-encoding"),
+        "429 body must not be chunked"
+    );
+    let resp_body = resp.text().await.expect("429 body");
+    assert!(resp_body.contains("rate_limited"), "body: {resp_body}");
+}
+
+/// **Error bodies stay length-delimited (forwarded provider error)**: when the
+/// last candidate answers non-2xx, the post-loop path forwards the status with
+/// a materialised JSON body. It must declare `Content-Length`, not fall back to
+/// close-delimited framing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_provider_error_uses_content_length_not_chunked() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .insert_header("content-type", "application/json")
+                .set_body_string(r#"{"error":"model not found"}"#),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_routed(&pool, &upstream.uri(), "gpt-4").await;
+    let (state, _sink) = build_state_with_recording_sink(pool.clone()).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let resp = send_until_ready(&client, &url, body).await;
+    assert_eq!(resp.status(), 404);
+    assert!(
+        resp.headers().contains_key("content-length"),
+        "forwarded error body must declare its length"
+    );
+    assert!(
+        !resp.headers().contains_key("transfer-encoding"),
+        "forwarded error body must not be chunked"
+    );
+    let resp_body = resp.text().await.expect("body");
+    assert!(
+        resp_body.contains("provider_error"),
+        "body: {resp_body}"
     );
 }

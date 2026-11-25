@@ -1368,9 +1368,10 @@ impl ProxyHttp for HydraProxy {
                  \"type\":\"proxy_error\",\"detail\":\"all providers at concurrency capacity\"}}",
             );
             session.set_keepalive(None);
-            let mut resp_header = ResponseHeader::build(503, Some(2))?;
+            let mut resp_header = ResponseHeader::build(503, Some(3))?;
             resp_header.insert_header("Content-Type", "application/json")?;
             resp_header.insert_header("Retry-After", retry_after_secs.to_string())?;
+            resp_header.insert_header("Content-Length", body.len().to_string())?;
             resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
             session
                 .write_response_header(Box::new(resp_header), false)
@@ -1403,8 +1404,9 @@ impl ProxyHttp for HydraProxy {
         // respond_error_with_body maps non-standard codes onto its own; use the
         // explicit header writer when we must preserve a specific upstream code.
         if (400..=599).contains(&last_status) {
-            let mut resp_header = ResponseHeader::build(last_status, Some(1))?;
+            let mut resp_header = ResponseHeader::build(last_status, Some(2))?;
             resp_header.insert_header("Content-Type", "application/json")?;
+            resp_header.insert_header("Content-Length", body.len().to_string())?;
             resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
             session
                 .write_response_header(Box::new(resp_header), false)
@@ -1708,8 +1710,26 @@ impl HydraProxy {
             let _ = resp_header.append_header(name, value);
         }
         let _ = resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id);
+        // Body framing (HYDRA-SSE-001): `transfer-encoding` and `content-length`
+        // are stripped above (reqwest already decoded the upstream chunks), so
+        // without re-declaring chunked Pingora's `init_body_writer_comm` falls
+        // back to close-delimited framing. That ends the body only on TCP close;
+        // an HTTP proxy that keeps the client connection alive never delivers
+        // that close, and the SSE client hangs until its own timeout.
+        //
+        // Only HTTP/1.1 can carry a transfer coding: h2 frames the body itself
+        // (Pingora also strips the header on h2), and an HTTP/1.0 client must
+        // stay close-delimited. 204/304 have no body (RFC 9112 §6.1 forbids TE
+        // on 204); Pingora forces length-0 framing for them anyway.
+        if session.req_header().version == http::Version::HTTP_11
+            && !matches!(status, 204 | 304)
+        {
+            let _ = resp_header.insert_header("Transfer-Encoding", "chunked");
+        }
 
         // Long-lived response — disable keep-alive reuse (Oracle correction #6).
+        // `Transfer-Encoding: chunked` and `Connection: close` are legal together:
+        // the former delimits the body, the latter forbids reuse.
         session.as_downstream_mut().set_keepalive(None);
         session
             .write_response_header(Box::new(resp_header), false)
@@ -1811,8 +1831,9 @@ async fn respond_catalog(
         .map_err(|e| pingora_err(format!("catalog JSON serialisation: {e}")))?;
     ctx.status_code = 200;
     session.set_keepalive(None);
-    let mut resp_header = ResponseHeader::build(200, Some(3))?;
+    let mut resp_header = ResponseHeader::build(200, Some(4))?;
     resp_header.insert_header("Content-Type", "application/json")?;
+    resp_header.insert_header("Content-Length", body.len().to_string())?;
     resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
     session
         .write_response_header(Box::new(resp_header), false)
@@ -1864,9 +1885,10 @@ async fn short_circuit_rate_limited(
     // Round UP to whole seconds and never send 0: `Retry-After: 0` invites an immediate
     // retry, which is exactly the stampede the window exists to stop.
     let secs = wait.map(|w| w.as_secs().max(1)).unwrap_or(1);
-    let mut resp_header = ResponseHeader::build(429, Some(3))?;
+    let mut resp_header = ResponseHeader::build(429, Some(4))?;
     resp_header.insert_header("Content-Type", "application/json")?;
     resp_header.insert_header("Retry-After", secs.to_string())?;
+    resp_header.insert_header("Content-Length", body.len().to_string())?;
     resp_header.insert_header("X-Hydra-Trace-Id", trace_id)?;
     session
         .write_response_header(Box::new(resp_header), false)
